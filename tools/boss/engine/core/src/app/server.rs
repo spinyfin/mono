@@ -904,6 +904,20 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic dispatch-failure recovery reconciler: the pre-spawn
+    // sibling of the orphan-active sweep above. Re-enqueues work items
+    // the engine bounced to Backlog after a pre-spawn dispatch failure
+    // (cube repo ensure, workspace lease, host selection, ...) exhausted
+    // its immediate retries, once `DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS`
+    // has passed, so a transient outage doesn't require a human to
+    // manually restart it. Runs every 60s and fires immediately on boot.
+    let _dispatch_failure_recovery_sweep_handle = crate::dispatch_failure_recovery_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        Duration::from_secs(60),
+    );
+
     // External-tracker reconciler: periodically pulls upstream issue state
     // into Boss's work-item taxonomy. Default cadence: 120 s (2 min) per
     // the design doc's §"Cadence" rationale (Design Q5). Fires immediately

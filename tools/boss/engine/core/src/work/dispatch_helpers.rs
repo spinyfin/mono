@@ -264,24 +264,56 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
             None => latest,
         }
     };
-    let (execution_status, run_status, execution_id, current_run_id) = if let Some(execution) = execution {
-        *queries += 1;
-        let latest_run = query_latest_run(conn, &execution.id)?;
-        let (run_status, run_id) = match latest_run {
-            Some((id, status)) => (Some(status), Some(id)),
-            None => (None, None),
+    let (execution_status, run_status, execution_id, current_run_id, dispatch_retry_at) =
+        if let Some(execution) = execution {
+            *queries += 1;
+            let latest_run = query_latest_run(conn, &execution.id)?;
+            let (run_status, run_id) = match latest_run {
+                Some((id, status)) => (Some(status), Some(id)),
+                None => (None, None),
+            };
+            let dispatch_retry_at = dispatch_retry_at_for_execution(&execution);
+            (
+                Some(execution.status),
+                run_status,
+                Some(execution.id),
+                run_id,
+                dispatch_retry_at,
+            )
+        } else {
+            (None, None, None, None, None)
         };
-        (Some(execution.status), run_status, Some(execution.id), run_id)
+    Ok(TaskRuntime::builder()
+        .work_item_id(work_item_id)
+        .maybe_execution_status(execution_status)
+        .maybe_run_status(run_status)
+        .maybe_execution_id(execution_id)
+        .maybe_current_run_id(current_run_id)
+        .maybe_dispatch_retry_at(dispatch_retry_at)
+        .build())
+}
+
+/// `TaskRuntime.dispatch_retry_at` for one execution: `Some(epoch_secs)`
+/// only while the execution is `ready` but withheld by
+/// `record_pre_start_failure`'s in-process backoff after a pre-spawn
+/// failure — i.e. it has failed at least once and `dispatch_not_before`
+/// is still in the future. `None` for a fresh `ready` execution (no
+/// failure yet — a genuine capacity wait) and once the backoff window
+/// has elapsed (the execution is a normal dispatch candidate again).
+fn dispatch_retry_at_for_execution(execution: &WorkExecution) -> Option<String> {
+    if execution.status != ExecutionStatus::Ready || execution.pre_start_failure_count <= 0 {
+        return None;
+    }
+    let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
+    let now_secs: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if dispatch_not_before > now_secs {
+        Some(dispatch_not_before.to_string())
     } else {
-        (None, None, None, None)
-    };
-    Ok(TaskRuntime {
-        work_item_id: work_item_id.to_owned(),
-        execution_status,
-        run_status,
-        execution_id,
-        current_run_id,
-    })
+        None
+    }
 }
 
 pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {

@@ -120,7 +120,8 @@ final class AwaitingInputKanbanTests: XCTestCase {
             workItemID: "task_1",
             executionStatus: "running",
             runStatus: "active",
-            executionID: "exec-1"
+            executionID: "exec-1",
+            dispatchRetryAt: nil
         )
     }
 }

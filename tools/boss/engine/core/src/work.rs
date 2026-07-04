@@ -51,6 +51,26 @@ pub const ATTENTION_KIND_RECOVERY_PERMANENT: &str = "worker_recovery_permanent_e
 /// worker because the transient-error retry cap was reached.
 pub const ATTENTION_KIND_RECOVERY_EXHAUSTED: &str = "worker_recovery_exhausted";
 
+/// Cooldown after a pre-spawn dispatch failure exhausts
+/// `PRE_START_RETRY_DELAYS` and `bounce_dispatch_failed_to_backlog` parks
+/// the work item in Backlog (`autostart = 0`, `dispatch_failed_reason`
+/// set) before [`crate::dispatch_failure_recovery_sweep`] gives it
+/// another shot. Long relative to the ~65s in-process retry window —
+/// the point of the bounce was to stop hammering a broken host/repo
+/// immediately, so the recovery sweep's cadence is "try again later, in
+/// case the world changed," not a tighter retry.
+pub const DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS: i64 = 10 * 60;
+/// Sliding window for the dispatch-failure-recovery churn guard: once a
+/// work item has produced this many terminal executions inside the
+/// window, the recovery sweep stops re-enqueueing it and leaves it
+/// parked for a human. The attention item `record_pre_start_failure`
+/// raised at the original bounce is the escalation; the sweep does not
+/// raise a second one on every skip.
+pub const DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// Trailing-window terminal-execution count at which the recovery sweep
+/// stops auto-re-enqueueing a work item.
+pub const DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD: i64 = 5;
+
 /// Sliding window for the duplicate-create guard: a non-deleted task/chore
 /// in the same product with the same name created within this many seconds
 /// of the attempted insert causes a `DuplicateTaskError` unless

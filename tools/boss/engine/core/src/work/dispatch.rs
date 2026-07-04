@@ -295,6 +295,67 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Work items previously bounced to Backlog by
+    /// [`Self::bounce_dispatch_failed_to_backlog`] (a pre-spawn dispatch
+    /// failure exhausted its immediate retries), still schedulable, and
+    /// whose `dispatch_failed_at` is older than `min_age_secs` — the
+    /// candidate set for [`crate::dispatch_failure_recovery_sweep`].
+    /// Mirrors [`Self::list_orphan_active_candidates`]'s shape for the
+    /// pre-spawn side of the reconciliation story.
+    pub fn list_dispatch_failed_recovery_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now_secs - min_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks
+             WHERE status IN ('todo', 'active')
+               AND deleted_at IS NULL
+               AND dispatch_failed_reason IS NOT NULL
+               AND autostart = 0
+               AND dispatch_failed_at IS NOT NULL
+               AND CAST(dispatch_failed_at AS INTEGER) < ?1
+             ORDER BY CAST(dispatch_failed_at AS INTEGER) ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Reverse of [`Self::bounce_dispatch_failed_to_backlog`]: re-enable
+    /// `autostart` on a work item the engine previously parked after a
+    /// pre-spawn dispatch failure, so the fresh `ready` execution the
+    /// caller creates next renders as dispatch-pending again instead of
+    /// silently sitting in Backlog. Used by
+    /// [`crate::dispatch_failure_recovery_sweep`] to give a stale
+    /// failure another shot after a cooldown — the same round trip a
+    /// human's `bossctl work start` already performs today. Guarded on
+    /// `dispatch_failed_reason IS NOT NULL` so it's a no-op against a
+    /// work item that isn't actually parked in this state (e.g. a race
+    /// against a human's own retry). Returns `true` iff a row was
+    /// updated.
+    pub fn reenable_autostart_after_dispatch_failure(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let updated = conn.execute(
+            "UPDATE tasks
+             SET autostart = 1,
+                 last_status_actor = 'engine',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status IN ('todo', 'active')
+               AND deleted_at IS NULL
+               AND dispatch_failed_reason IS NOT NULL",
+            params![work_item_id, now],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Re-issue `RequestExecution` for every non-deleted task / chore
     /// whose status is `active` but whose latest execution is terminal
     /// (or which has no execution). This is the engine-startup

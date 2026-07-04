@@ -1634,6 +1634,10 @@ struct WorkTaskRuntime: Hashable {
     /// join task → LiveWorkerState (engine registers LiveWorkerState
     /// with `run_id == execution_id`).
     let executionID: String?
+    /// Unix epoch seconds (decimal string); set only during the engine's
+    /// backoff after a pre-spawn dispatch failure, `nil` for a genuine
+    /// capacity wait. Mirrors `TaskRuntime.dispatch_retry_at` on the wire.
+    let dispatchRetryAt: String?
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by
