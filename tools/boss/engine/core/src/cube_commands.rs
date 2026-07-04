@@ -300,3 +300,368 @@ pub async fn list_repos<T: CubeJsonTransport + ?Sized>(transport: &T) -> Result<
         .context("decoding `cube repo list` payload")?;
     Ok(payload.repos)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    // --- CubeCliError::detail() -------------------------------------------
+
+    /// Build a `CubeCliError` from the three fields that drive `detail()` /
+    /// `clipped_stderr()`; `host` is irrelevant to both so it's fixed.
+    fn err(exit_code: Option<i32>, stderr: &str, stdout: &str) -> CubeCliError {
+        CubeCliError {
+            host: "test-host".to_owned(),
+            exit_code,
+            stderr: stderr.to_owned(),
+            stdout: stdout.to_owned(),
+        }
+    }
+
+    #[test]
+    fn detail_prefers_trimmed_stderr_when_present() {
+        // Non-empty stderr wins outright, and is trimmed.
+        assert_eq!(
+            err(Some(1), "  boom on stderr  \n", "ignored stdout").detail(),
+            "boom on stderr"
+        );
+    }
+
+    #[test]
+    fn detail_falls_back_to_trimmed_stdout_when_stderr_blank() {
+        // Whitespace-only stderr is treated as empty; trimmed stdout is used.
+        assert_eq!(
+            err(Some(2), "   \n\t", "  fallback on stdout \n").detail(),
+            "fallback on stdout"
+        );
+    }
+
+    #[test]
+    fn detail_synthesizes_exit_status_with_code() {
+        // Both streams blank → synthetic clause carrying the exit code.
+        assert_eq!(err(Some(42), "", "   ").detail(), "exit status 42");
+    }
+
+    #[test]
+    fn detail_synthesizes_unknown_status_when_signal_killed() {
+        // Both streams blank and no code (killed by signal) → the documented
+        // "unknown" clause rather than a bogus code.
+        assert_eq!(err(None, "  ", "").detail(), "exit status unknown (killed by signal?)");
+    }
+
+    // --- CubeCliError::clipped_stderr() -----------------------------------
+
+    #[test]
+    fn clipped_stderr_returns_whole_trimmed_when_under_limit() {
+        // Under the limit: the full trimmed stderr comes back with no marker.
+        let e = err(Some(1), "  short trace  ", "");
+        assert_eq!(e.clipped_stderr(64), "short trace");
+    }
+
+    #[test]
+    fn clipped_stderr_returns_whole_trimmed_at_exactly_limit() {
+        // Boundary: len == max is "under or equal", so still returned whole.
+        let e = err(Some(1), "abcde", "");
+        assert_eq!(e.clipped_stderr(5), "abcde");
+    }
+
+    #[test]
+    fn clipped_stderr_clips_ascii_over_limit() {
+        // Over the limit on ASCII: exactly `max` bytes kept, marker appended.
+        let e = err(Some(1), "abcdefghij", "");
+        assert_eq!(e.clipped_stderr(4), "abcd… (clipped)");
+    }
+
+    #[test]
+    fn clipped_stderr_clips_on_char_boundary_without_splitting_codepoint() {
+        // Each `€` is 3 bytes (boundaries at 0,3,6,9,12). max=4 lands mid the
+        // second codepoint; the loop must back up to byte 3 so the slice is
+        // valid UTF-8. If it didn't, slicing would panic.
+        let e = err(Some(1), "€€€€", "");
+        let clipped = e.clipped_stderr(4);
+        assert_eq!(clipped, "€… (clipped)");
+        // Prove we never split a codepoint: the kept prefix is whole chars.
+        assert!(clipped.starts_with('€'));
+    }
+
+    #[test]
+    fn clipped_stderr_can_back_up_to_empty_prefix() {
+        // A single multibyte char with max below its first boundary backs the
+        // end index all the way to 0 rather than panicking mid-codepoint.
+        let e = err(Some(1), "€ padded so it exceeds the limit", "");
+        let clipped = e.clipped_stderr(2);
+        assert_eq!(clipped, "… (clipped)");
+    }
+
+    // --- Command helpers: argv construction + decode ----------------------
+
+    /// A [`CubeJsonTransport`] that records the argv of its single expected
+    /// `run_cube_json` call and replays a canned JSON envelope. Tests assert
+    /// the recorded argv and the decoded handle — observable behavior only.
+    struct RecordingTransport {
+        recorded: Mutex<Option<Vec<String>>>,
+        response: serde_json::Value,
+    }
+
+    impl RecordingTransport {
+        fn new(response: serde_json::Value) -> Self {
+            Self {
+                recorded: Mutex::new(None),
+                response,
+            }
+        }
+
+        /// The argv captured from the (single) `run_cube_json` call.
+        fn argv(&self) -> Vec<String> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("run_cube_json was never called")
+        }
+    }
+
+    #[async_trait]
+    impl CubeJsonTransport for RecordingTransport {
+        async fn run_cube_json(&self, args: &[&str]) -> Result<serde_json::Value> {
+            *self.recorded.lock().unwrap() = Some(args.iter().map(|s| s.to_string()).collect());
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_repo_builds_argv_and_decodes_handle() {
+        let t = RecordingTransport::new(json!({ "repo_id": "repo-123" }));
+        let handle = ensure_repo(&t, "bduff").await.unwrap();
+        // Bare slug routes through the positional `repo ensure <slug>` form.
+        assert_eq!(t.argv(), ["--json", "repo", "ensure", "bduff"]);
+        assert_eq!(
+            handle,
+            CubeRepoHandle {
+                repo_id: "repo-123".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_workspace_omits_optional_flags_by_default() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-1", "workspace_id": "ws-1", "workspace_path": "/tmp/ws-1" }
+        }));
+        let lease = lease_workspace(&t, "repo-1", "do a thing", None, false, &[])
+            .await
+            .unwrap();
+        // No --prefer, no --allow-dirty, no --exclude; but always
+        // --release-on-setup-failure.
+        assert_eq!(
+            t.argv(),
+            [
+                "--json",
+                "workspace",
+                "lease",
+                "repo-1",
+                "--task",
+                "do a thing",
+                "--release-on-setup-failure"
+            ]
+        );
+        assert_eq!(
+            lease,
+            CubeWorkspaceLease {
+                lease_id: "lease-1".to_owned(),
+                workspace_id: "ws-1".to_owned(),
+                workspace_path: PathBuf::from("/tmp/ws-1"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_workspace_emits_all_optional_flags_when_supplied() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-2", "workspace_id": "ws-2", "workspace_path": "/tmp/ws-2" }
+        }));
+        lease_workspace(&t, "repo-1", "resume", Some("ws-pref"), true, &["old-a", "old-b"])
+            .await
+            .unwrap();
+        // --prefer only when Some, --allow-dirty only when true, one
+        // --exclude per excluded id, in that order.
+        assert_eq!(
+            t.argv(),
+            [
+                "--json",
+                "workspace",
+                "lease",
+                "repo-1",
+                "--task",
+                "resume",
+                "--release-on-setup-failure",
+                "--prefer",
+                "ws-pref",
+                "--allow-dirty",
+                "--exclude",
+                "old-a",
+                "--exclude",
+                "old-b",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_workspace_surfaces_missing_lease_id() {
+        // A valid envelope shape but no lease_id → the documented error.
+        let t = RecordingTransport::new(json!({
+            "workspace": { "workspace_id": "ws-3", "workspace_path": "/tmp/ws-3" }
+        }));
+        let err = lease_workspace(&t, "repo-1", "t", None, false, &[]).await.unwrap_err();
+        assert!(err.to_string().contains("missing lease_id"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn create_change_builds_argv_and_decodes_handle() {
+        let t = RecordingTransport::new(json!({ "change": { "change_id": "chg-9" } }));
+        let handle = create_change(&t, Path::new("/tmp/ws-1"), "My title").await.unwrap();
+        assert_eq!(
+            t.argv(),
+            [
+                "--json",
+                "change",
+                "create",
+                "--workspace",
+                "/tmp/ws-1",
+                "--title",
+                "My title"
+            ]
+        );
+        assert_eq!(
+            handle,
+            CubeChangeHandle {
+                change_id: "chg-9".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn release_workspace_builds_argv() {
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        release_workspace(&t, "lease-7").await.unwrap();
+        assert_eq!(t.argv(), ["--json", "workspace", "release", "--lease", "lease-7"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_status_builds_argv_and_decodes() {
+        let t = RecordingTransport::new(json!({
+            "workspace": {
+                "workspace_id": "ws-1",
+                "workspace_path": "/tmp/ws-1",
+                "state": "leased",
+                "lease_id": "lease-1",
+                "holder": "agent-019",
+                "task": "chore",
+                "leased_at_epoch_s": 100,
+                "lease_expires_at_epoch_s": 200
+            }
+        }));
+        let status = workspace_status(&t, Path::new("/tmp/ws-1")).await.unwrap();
+        assert_eq!(t.argv(), ["--json", "workspace", "status", "--workspace", "/tmp/ws-1"]);
+        assert_eq!(status.workspace_id, "ws-1");
+        assert_eq!(status.state, "leased");
+        assert_eq!(status.lease_id.as_deref(), Some("lease-1"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_lease_omits_ttl_when_absent() {
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        heartbeat_lease(&t, "lease-1", None).await.unwrap();
+        assert_eq!(t.argv(), ["--json", "workspace", "heartbeat", "--lease", "lease-1"]);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_lease_emits_ttl_when_supplied() {
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        heartbeat_lease(&t, "lease-1", Some(90)).await.unwrap();
+        assert_eq!(
+            t.argv(),
+            [
+                "--json",
+                "workspace",
+                "heartbeat",
+                "--lease",
+                "lease-1",
+                "--ttl-seconds",
+                "90"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_lease_omits_reason_when_absent() {
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        force_release_lease(&t, "lease-1", None).await.unwrap();
+        assert_eq!(t.argv(), ["--json", "workspace", "force-release", "--lease", "lease-1"]);
+    }
+
+    #[tokio::test]
+    async fn force_release_lease_emits_reason_when_supplied() {
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        force_release_lease(&t, "lease-1", Some("stale holder")).await.unwrap();
+        assert_eq!(
+            t.argv(),
+            [
+                "--json",
+                "workspace",
+                "force-release",
+                "--lease",
+                "lease-1",
+                "--reason",
+                "stale holder"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_builds_argv_and_decodes() {
+        let t = RecordingTransport::new(json!({
+            "workspaces": [
+                {
+                    "workspace_id": "ws-1",
+                    "workspace_path": "/tmp/ws-1",
+                    "state": "free",
+                    "lease_id": null,
+                    "holder": null,
+                    "task": null,
+                    "leased_at_epoch_s": null,
+                    "lease_expires_at_epoch_s": null
+                }
+            ]
+        }));
+        let workspaces = list_workspaces(&t).await.unwrap();
+        assert_eq!(t.argv(), ["--json", "workspace", "list"]);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace_id, "ws-1");
+        assert_eq!(workspaces[0].state, "free");
+    }
+
+    #[tokio::test]
+    async fn list_repos_builds_argv_and_decodes() {
+        let t = RecordingTransport::new(json!({
+            "repos": [
+                {
+                    "repo": "repo-1",
+                    "origin": "git@github.com:spinyfin/mono.git",
+                    "main_branch": "main",
+                    "workspace_root": "/tmp/roots",
+                    "workspace_prefix": "mono-agent"
+                }
+            ]
+        }));
+        let repos = list_repos(&t).await.unwrap();
+        assert_eq!(t.argv(), ["--json", "repo", "list"]);
+        assert_eq!(repos.len(), 1);
+        // `repo` renames to `repo_id`; `source` defaults to None when absent.
+        assert_eq!(repos[0].repo_id, "repo-1");
+        assert_eq!(repos[0].origin, "git@github.com:spinyfin/mono.git");
+        assert_eq!(repos[0].source, None);
+    }
+}
