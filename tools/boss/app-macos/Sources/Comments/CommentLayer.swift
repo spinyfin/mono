@@ -393,10 +393,40 @@ final class CommentLayer: NSObject, ObservableObject {
             comments.compactMap { c in c.lastResolvedWith.map { (c.id, $0) } },
             uniquingKeysWith: { first, _ in first }
         )
+        let priorById = Dictionary(comments.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         comments = wire.map { cw in
             var c = Comment.from(cw.comment, threadEntries: cw.threadEntries)
             if c.lastResolvedWith == nil { c.lastResolvedWith = priorResolved[c.id] }
+            if let prior = priorById[c.id] { mergeUnpersistedStubState(from: prior, into: &c) }
             return c
+        }
+    }
+
+    /// The bucket-1/2/3 stubs (`setIntent`, `runAnswerAgent`, `postFollowup`,
+    /// `reclassifyFollowup`, `reviseDoc`, `resolveRevision`, `reopenRevision`) mutate
+    /// `comments` in place without persisting to the engine — the real RPCs land with
+    /// W3/W4. `reload()` rebuilds `comments` wholesale from the engine's rows, which would
+    /// otherwise silently wipe out an in-flight stub transition (e.g. a user-set intent
+    /// override, or an `answering`/`awaitingFollowup` thread) the next time any reload
+    /// fires (create/dismiss echoes, topic invalidations, reconnect). Re-apply the prior
+    /// local-only state on top of the freshly loaded row so it survives until the engine
+    /// itself reports the same transition (at which point the wire value takes over).
+    private func mergeUnpersistedStubState(from prior: Comment, into c: inout Comment) {
+        if prior.intentOverriddenByUser, c.intent != prior.intent {
+            c.intent = prior.intent
+            c.intentOverriddenByUser = true
+        }
+        let localOnlyStatuses: Set<CommentStatus> = [.answering, .answered, .awaitingFollowup, .inRevision, .resolved]
+        if localOnlyStatuses.contains(prior.status), c.status == .active {
+            c.status = prior.status
+            c.reviseTaskId = c.reviseTaskId ?? prior.reviseTaskId
+            c.statusActor = c.statusActor ?? prior.statusActor
+        }
+        let existingIds = Set(c.threadEntries.map(\.id))
+        let localOnlyEntries = prior.threadEntries.filter { !existingIds.contains($0.id) }
+        if !localOnlyEntries.isEmpty {
+            c.threadEntries.append(contentsOf: localOnlyEntries)
+            c.threadEntries.sort { $0.createdAt < $1.createdAt }
         }
     }
 

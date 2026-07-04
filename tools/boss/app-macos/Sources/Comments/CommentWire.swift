@@ -178,7 +178,7 @@ struct WorkComment: Codable, Equatable, Sendable {
 // MARK: - Wire thread entry (types.rs:2204-2222)
 
 /// The `comment_thread_entries` row as it arrives on the wire. Mapped into the
-/// UI-facing [`CommentThreadEntry`] (which keys on a `UUID` for `Identifiable`).
+/// UI-facing [`CommentThreadEntry`] (which keys on a `String` for `Identifiable`).
 struct WireCommentThreadEntry: Codable, Equatable, Sendable {
     let id: String
     let commentId: String

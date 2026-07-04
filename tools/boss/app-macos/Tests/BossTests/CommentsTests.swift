@@ -184,6 +184,39 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertNotNil(layer.comments[0].reviseTaskId)
     }
 
+    func testReviseDocWithNoUnresolvedCommentsIsNoOp() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        // No comment has been classified directive/larger_change, so there is
+        // nothing to batch.
+        layer.reviseDoc()
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertNil(layer.comments[0].reviseTaskId)
+    }
+
+    func testResolveRevisionMarksAddressedCommentsResolved() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.reviseDoc()
+        let taskId = layer.comments[0].reviseTaskId!
+        layer.resolveRevision(taskId: taskId)
+        XCTAssertEqual(layer.comments[0].status, .resolved)
+        XCTAssertEqual(layer.comments[0].statusActor, "engine")
+    }
+
+    func testReopenRevisionClearsTaskAndShowsReopenedChip() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.reviseDoc()
+        let taskId = layer.comments[0].reviseTaskId!
+        layer.reopenRevision(taskId: taskId)
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertNil(layer.comments[0].reviseTaskId)
+        XCTAssertEqual(layer.comments[0].revisionChipState, .reopened)
+    }
+
     // MARK: - Bucket 2: answer agent (Phase 3d stub, unchanged behaviour)
 
     func testQuestionClassificationEntersAnsweringState() {
@@ -198,6 +231,105 @@ final class CommentLayerTests: XCTestCase {
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.question, for: layer.comments[0])
         try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(layer.comments[0].status, .answered)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
+    }
+
+    func testPostFollowupIgnoredBeforeAnswered() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        // Comment is still `.active` — not yet `.answered` — so the follow-up
+        // composer shouldn't be live.
+        layer.postFollowup(body: "when will this ship?", for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertTrue(layer.comments[0].threadEntries.isEmpty)
+    }
+
+    func testPostFollowupAppendsEntryAndAwaitsReclassification() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(layer.comments[0].status, .answered)
+
+        layer.postFollowup(body: "but what about edge cases?", for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .awaitingFollowup)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .operatorFollowup)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.body, "but what about edge cases?")
+    }
+
+    func testReclassifyFollowupQuestion() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+        layer.postFollowup(body: "one more thing", for: layer.comments[0])
+
+        layer.reclassifyFollowup(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+        XCTAssertEqual(layer.comments[0].intent, .question)
+    }
+
+    func testReclassifyFollowupDirective() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+        layer.postFollowup(body: "please just rename it", for: layer.comments[0])
+
+        layer.reclassifyFollowup(.directive, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertTrue(layer.comments[0].threadEntries.contains { $0.entryKind == .nudge })
+        XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
+    }
+
+    func testReclassifyFollowupIgnoredWhenNotAwaitingFollowup() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        // Comment is `.active`, never entered `.awaitingFollowup`.
+        layer.reclassifyFollowup(.directive, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertNil(layer.comments[0].intent)
+    }
+
+    // MARK: - Reload merges unpersisted stub state (engine-backed path)
+
+    func testApplyListPreservesLocalIntentOverrideAcrossReload() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        layer.setIntent(.directive, for: layer.comments[0])
+        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
+
+        // A reload (e.g. triggered by an unrelated create echo) rebuilds `comments`
+        // wholesale from the engine, which hasn't seen the override yet.
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+
+        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
+    }
+
+    func testApplyListPreservesLocalAnsweringStatusAcrossReload() async throws {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+
+        // Reload before the (real) engine has recorded the transition — the wire
+        // row still reports `.active`.
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(layer.comments[0].status, .answered)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
+
+        // A further reload must not drop the locally-appended answer thread entry.
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
         XCTAssertEqual(layer.comments[0].status, .answered)
         XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
     }
@@ -479,6 +611,39 @@ final class CommentLayerTests: XCTestCase {
         let plain = "the   quick\nbrown fox and the quick brown cat"
         let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: "quick brown", in: plain)
         XCTAssertEqual(ranges.count, 2)
+    }
+
+    func testHighlightingParserMatchesAcrossWhitespaceDifferences() throws {
+        // Simulates a pasteboard selection where the copied text collapsed a
+        // line break + leading spaces into a single space (a common outcome of
+        // copying a multi-line selection out of the rendered view).
+        let source = "the quick\n   brown fox jumps over the lazy dog"
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(exact: "quick brown fox", prefix: "the ", suffix: " jumps")]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+        let offset = plain.distance(from: plain.startIndex, to: plain.range(of: "quick")!.lowerBound)
+        XCTAssertTrue(isHighlighted(at: offset, in: result))
+    }
+
+    func testHighlightingParserUnderlinesInlineCodeAnchor() throws {
+        // Regression guard for the "clobber-proof underline" marker: inline-code
+        // runs get their own backgroundColor from the Boss inline style, which
+        // overwrites a plain comment-highlight background — the colored
+        // underline is the fallback that survives that clobber.
+        let source = "Please rename `flavor` to `variant` everywhere."
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(exact: "flavor", prefix: "rename `", suffix: "` to")]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+        let idx = plain.range(of: "flavor")!.lowerBound
+        let charIdx = result.characters.index(result.characters.startIndex, offsetBy: plain.distance(from: plain.startIndex, to: idx))
+        let hasUnderline = result.runs.contains { run in
+            run.range.contains(charIdx) && run.swiftUI.underlineStyle != nil
+        }
+        XCTAssertTrue(hasUnderline, "Inline-code anchor must carry the fallback underline marker")
     }
 
     // MARK: - SwiftUI layout (unchanged surfaces still render)

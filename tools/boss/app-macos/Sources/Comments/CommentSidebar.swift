@@ -1,9 +1,11 @@
 import SwiftUI
 
-/// Fixed-width (280 pt) right-side panel listing the in-memory comments for
-/// the currently open markdown doc. Appears only when at least one comment
-/// exists. Clicking a row jumps to its anchored text (flashes the highlighted
-/// span orange for ~900 ms). Dismiss button is at the top-right of each card.
+/// Fixed-width (280 pt) right-side panel listing the comments for the
+/// currently open markdown doc (engine-backed and persisted when the doc has
+/// an artifact identity, otherwise in-memory). Appears whenever the layer is
+/// engine-backed, or once at least one comment exists. Clicking a row jumps
+/// to its anchored text (flashes the highlighted span orange for ~900 ms).
+/// Dismiss button is at the top-right of each card.
 struct CommentSidebar: View {
     @ObservedObject var layer: CommentLayer
 

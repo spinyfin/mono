@@ -217,15 +217,10 @@ extension Comment {
 
     /// Lenient ISO-8601 parse of an engine timestamp string; falls back to the
     /// current instant so a malformed value never drops the comment. Shared with
-    /// [`CommentThreadEntry.from`].
+    /// [`CommentThreadEntry.from`]. Delegates to `WorkerStaleness.parse` so both
+    /// call sites share the same cached formatters.
     static func parseWireTimestamp(_ s: String) -> Date {
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFractional.date(from: s) { return d }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        if let d = plain.date(from: s) { return d }
-        return Date()
+        WorkerStaleness.parse(s) ?? Date()
     }
 }
 
