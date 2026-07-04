@@ -157,6 +157,21 @@ private struct WorkerSlotView: View {
                 session: session,
                 liveState: liveState
             )
+            // Pin view identity to the session, not just to this `if`
+            // branch's position in the tree. A slot can be released and
+            // respawned into a NEW session within the same SwiftUI
+            // update pass (no intervening render of the `idlePaneView`
+            // branch to force teardown) — without an explicit `.id()`,
+            // SwiftUI would treat the two sessions as "the same view"
+            // and reuse the OLD `GhosttyTerminalHostView`/libghostty
+            // surface untouched (`updateNSView` never rebinds it), so
+            // the new execution's pane would render against the
+            // PREVIOUS tenant's scrollback under the new header. Keying
+            // on `session.id` (`"run-<runId>"`, unique per execution)
+            // forces `dismantleNSView`/`makeNSView` on every rebind, so
+            // the old surface is always torn down and a fresh one
+            // created before the new run's output ever lands.
+            .id(session.id)
         } else {
             idlePaneView
         }

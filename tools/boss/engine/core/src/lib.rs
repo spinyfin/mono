@@ -78,6 +78,7 @@ pub mod resolution_signal_capture;
 pub mod run_reconcile;
 pub mod runner;
 pub mod settings;
+pub mod spawn_ack_sweep;
 pub mod spawn_flow;
 pub mod ssh_spawn;
 pub use boss_ssh_transport as ssh_transport;
