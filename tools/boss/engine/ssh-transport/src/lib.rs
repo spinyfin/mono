@@ -225,30 +225,57 @@ impl SshTransport {
     }
 
     /// Run a command on the remote via the master connection, passing
-    /// `argv` as separate ssh arguments. Captures stdout + stderr.
+    /// `argv` as separate logical tokens. Captures stdout + stderr.
     ///
-    /// **Quoting contract.** `ssh` concatenates every element of `argv`
-    /// with a single space and hands the resulting string to the *remote
-    /// login shell* via its `-c` mechanism. The remote shell then
-    /// word-splits and evaluates that string as a command line. This
-    /// means:
+    /// **Quoting contract.** `ssh` concatenates every element of its
+    /// trailing command arguments with a single space and hands the
+    /// resulting string to the *remote login shell* via its `-c`
+    /// mechanism, which then word-splits and glob-expands that string.
+    /// To make the remote shell reconstruct exactly the `argv` the
+    /// caller intended — not something re-split on embedded whitespace
+    /// or re-expanded by a stray `*`/`?` — every element is individually
+    /// shell-quoted (via [`shell_quote`]) before being handed to `ssh`.
+    /// So `&["cube", "workspace", "lease", "--task", "fix: a b*c"]`
+    /// reaches the remote as four words plus a fifth that is intact
+    /// even though it contains a space and a glob character.
     ///
-    /// - Simple plain-argv calls like `&["mkdir", "-p", "~/dir"]` work
-    ///   fine — the join is `mkdir -p ~/dir`, which the remote shell
-    ///   evaluates correctly (including `~` expansion).
-    /// - **Multi-word script strings with shell metacharacters (`&&`, `|`,
-    ///   redirects, quoted strings) must NOT be passed as multiple tokens.**
-    ///   For example, `&["sh", "-c", "chmod 0755 f && mv f g"]` produces
-    ///   the remote string `sh -c chmod 0755 f && mv f g`. The remote
-    ///   login shell parses `sh -c chmod` as a command, with `0755` as
-    ///   `$0` and `f` as `$1` — `chmod` runs with zero arguments and
-    ///   prints its usage. Use [`run_shell`] for compound scripts instead.
+    /// **Do not use this for compound scripts.** A script with `&&`,
+    /// `|`, redirects, or its own quoting (e.g.
+    /// `"chmod 0755 f && mv f g"`) must reach the remote shell
+    /// un-quoted so it can interpret those metacharacters — quoting the
+    /// whole thing here would hand the remote shell one literal string
+    /// instead. Use [`run_shell`] for those.
     ///
     /// Does not stream; callers that need a long-running worker stdio
     /// path (e.g. `spawn_worker`) build a fresh `tokio::process::Command`
     /// configured with the same `ControlPath` so they can capture pipes
     /// directly.
     pub async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
+        let quoted: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
+        let quoted_refs: Vec<&str> = quoted.iter().map(String::as_str).collect();
+        self.run_tokens(&quoted_refs, argv).await
+    }
+
+    /// Run a shell script on the remote via the master connection.
+    ///
+    /// Passes `script` as a **single**, un-quoted ssh argument so ssh's
+    /// space-join delivers the intact string to the remote login shell.
+    /// The remote login shell then evaluates the entire string as a
+    /// compound command, handling `&&`, `|`, redirects, quoting, and `~`
+    /// expansion correctly.
+    ///
+    /// Use this in place of `run(&["sh", "-c", script])`, which would
+    /// produce `sh -c <word1> <word2> …` on the remote and mis-parse a
+    /// compound command. See [`run`] for the full quoting contract.
+    pub async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+        self.run_tokens(&[script], &[script]).await
+    }
+
+    /// Shared ssh-invocation body. `tokens` are the exact ssh command
+    /// arguments (already quoted if quoting is wanted); `log_argv` is
+    /// only used for the timeout error message, so callers can log the
+    /// original (pre-quoting) argv for readability.
+    async fn run_tokens(&self, tokens: &[&str], log_argv: &[&str]) -> Result<SshOutput> {
         let mut cmd = Command::new("ssh");
         cmd.args([
             "-o",
@@ -257,13 +284,13 @@ impl SshTransport {
             &format!("ControlPath={}", self.control_socket.display()),
             &self.ssh_target,
         ]);
-        cmd.args(argv);
+        cmd.args(tokens);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
         let output = timeout(SSH_COMMAND_TIMEOUT, cmd.output())
             .await
-            .with_context(|| format!("ssh run timed out for host {} cmd {:?}", self.host_id, argv))?
+            .with_context(|| format!("ssh run timed out for host {} cmd {:?}", self.host_id, log_argv))?
             .with_context(|| format!("ssh run io error for host {}", self.host_id))?;
 
         Ok(SshOutput {
@@ -271,20 +298,6 @@ impl SshTransport {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
-    }
-
-    /// Run a shell script on the remote via the master connection.
-    ///
-    /// Passes `script` as a **single** ssh argument so ssh's space-join
-    /// delivers the intact string to the remote login shell. The remote
-    /// login shell then evaluates the entire string as a compound command,
-    /// handling `&&`, `|`, redirects, quoting, and `~` expansion correctly.
-    ///
-    /// Use this in place of `run(&["sh", "-c", script])`, which would
-    /// produce `sh -c <word1> <word2> …` on the remote and mis-parse a
-    /// compound command. See [`run`] for the full quoting contract.
-    pub async fn run_shell(&self, script: &str) -> Result<SshOutput> {
-        self.run(&[script]).await
     }
 
     /// `scp` a local file to a remote path over the master connection.
@@ -376,6 +389,27 @@ impl SshTransport {
 /// the (purely syntactic) join is unit-testable without spawning ssh.
 pub fn reverse_forward_spec(remote_socket: &str, local_socket: &str) -> String {
     format!("{remote_socket}:{local_socket}")
+}
+
+/// Single-quote `s` for a POSIX shell, escaping embedded single quotes
+/// via the standard `'\''` idiom (close the quote, emit a literal
+/// escaped quote, reopen). Wrapping every token like this is what lets
+/// [`SshTransport::run`]'s argv survive ssh's argv→string join and the
+/// remote shell's re-parse of that string intact — spaces, `*`/`?`
+/// globs, `$`/backtick expansion, and quote characters all lose their
+/// special meaning inside the single quotes.
+pub fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Classify an `scp` or `ssh` stderr blob into one of the Q6 wrapper-
@@ -509,6 +543,72 @@ mod tests {
             broken_joined.starts_with("sh -c chmod"),
             "multi-arg join produces 'sh -c <first-word> ...' — not a compound command: {broken_joined:?}"
         );
+    }
+
+    /// Simulates ssh's own argv→string join followed by the remote
+    /// login shell's re-parse of that string, using a real local `sh`
+    /// in place of the remote one. Each quoted token, run individually
+    /// through `printf '%s'`, must reproduce the original token exactly
+    /// — proving `shell_quote` survives the round trip regardless of
+    /// spaces, quotes, or shell metacharacters.
+    #[test]
+    fn shell_quote_round_trips_through_a_real_shell() {
+        let cases = [
+            "plain",
+            "has spaces",
+            "chore_implementation checkleft: findings must advertise",
+            "glob*chars?",
+            "single'quote",
+            "double\"quote",
+            "dollar$var",
+            "back`tick`",
+            "colon:separated",
+            "combo: a b*c? d'e\"f $g `h` i:j",
+        ];
+        for raw in cases {
+            let quoted = shell_quote(raw);
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {quoted}"))
+                .output()
+                .expect("spawn sh");
+            assert!(output.status.success(), "sh failed for {raw:?}: {output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                raw,
+                "shell_quote round-trip mismatch for {raw:?} (quoted as {quoted:?})"
+            );
+        }
+    }
+
+    /// Reproduces the exact bug scenario end-to-end: a multi-token argv
+    /// (a `cube workspace lease --task "<summary>"` shape) whose free-text
+    /// argument contains spaces, quotes, `:`, `*`, `?`, `$`, and
+    /// backticks. Quote every element the way [`SshTransport::run`]
+    /// does, join with a single space (ssh's own join step), then hand
+    /// the joined string to a real `sh -c` (standing in for the remote
+    /// login shell) and confirm it reconstructs the exact original argv
+    /// — not a word-split or glob-expanded approximation of it.
+    #[test]
+    fn run_style_argv_survives_ssh_join_and_remote_reparse() {
+        let argv = [
+            "cube",
+            "workspace",
+            "lease",
+            "--task",
+            "chore_implementation checkleft: findings must advertise 'quotes' \"more\" *.rs ? $(whoami) `id`",
+        ];
+        let quoted: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
+        let joined = quoted.join(" ");
+        // `set -- <joined>` is the remote shell re-parsing ssh's joined
+        // string into its own positional argv, exactly as `ssh host
+        // <argv...>` hands off to the login shell's command line.
+        let script = format!("set -- {joined}; for a in \"$@\"; do printf '%s\\n' \"$a\"; done");
+        let output = std::process::Command::new("sh").arg("-c").arg(script).output().unwrap();
+        assert!(output.status.success(), "sh failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let got: Vec<&str> = stdout.lines().collect();
+        assert_eq!(got, argv, "remote re-parse must reconstruct the original argv exactly");
     }
 
     #[test]
