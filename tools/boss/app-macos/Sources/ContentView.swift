@@ -3137,6 +3137,12 @@ struct WorkCardPopoverView: View {
     /// from rather than dropping back to the kanban underneath.
     @State private var presentingRepoPicker: Bool = false
 
+    /// Reveals never-started `abandoned` executions in the list below,
+    /// which the Executions section collapses by default behind a
+    /// disclosure since they dominate high-churn work items without
+    /// being interesting to a human reviewing status.
+    @State private var showAllAbandonedAttempts: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
@@ -3385,20 +3391,40 @@ struct WorkCardPopoverView: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 } else {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(executions) { exec in
-                            Button {
-                                openWindow(
-                                    id: "transcript-viewer",
-                                    value: TranscriptViewerRef(taskId: task.id, preselectExecutionId: exec.id)
-                                )
-                            } label: {
-                                ExecutionRow(exec: exec)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                    let neverStartedAbandoned = executions.filter { $0.status == "abandoned" && $0.startedAt == nil }
+                    let visibleExecutions = showAllAbandonedAttempts
+                        ? executions
+                        : executions.filter { !($0.status == "abandoned" && $0.startedAt == nil) }
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(visibleExecutions) { exec in
+                                Button {
+                                    openWindow(
+                                        id: "transcript-viewer",
+                                        value: TranscriptViewerRef(taskId: task.id, preselectExecutionId: exec.id)
+                                    )
+                                } label: {
+                                    ExecutionRow(exec: exec)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                            if !neverStartedAbandoned.isEmpty {
+                                Button {
+                                    showAllAbandonedAttempts.toggle()
+                                } label: {
+                                    Text(
+                                        showAllAbandonedAttempts
+                                            ? "Hide abandoned attempts"
+                                            : "\(neverStartedAbandoned.count) abandoned attempts"
+                                    )
+                                    .font(.caption)
+                                }
+                                .buttonStyle(.link)
+                            }
                         }
                     }
+                    .frame(maxHeight: 240)
                 }
             } else {
                 ProgressView()
