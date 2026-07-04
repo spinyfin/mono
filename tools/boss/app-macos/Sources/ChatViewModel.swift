@@ -1064,24 +1064,44 @@ final class ChatViewModel: ObservableObject {
     /// scroll silently land on nothing (#1249). We reset the board to its
     /// unfiltered state before scrolling so the revealed card is
     /// guaranteed visible.
-    func revealWorkCard(_ taskID: String, productID: String) {
+    ///
+    /// `taskID` itself is not always the card that gets scrolled to/
+    /// highlighted — see `revealCardTarget(for:)`: a revision rolled up
+    /// onto its parent's card redirects to the parent. The returned
+    /// `RevealCardResult` tells the caller (the `reveal_work_item` IPC
+    /// handler) whether a real card was reached, deferred pending a
+    /// product-tree fetch, or unreachable — so it can answer bossctl
+    /// truthfully instead of always claiming success.
+    @discardableResult
+    func revealWorkCard(_ taskID: String, productID: String) -> RevealCardResult {
+        let outcome = revealCardTarget(for: taskID)
+        let hostCardID: String
+        switch outcome {
+        case .revealed(let cardID):
+            hostCardID = cardID
+        case .deferred:
+            hostCardID = taskID
+        case .unreachable:
+            return outcome
+        }
         setNavigationMode(.work)
         clearWorkFiltersForReveal()
-        selectedWorkCardID = taskID
+        selectedWorkCardID = hostCardID
         let isProductSwitch = currentSelectedProductID != productID
         if isProductSwitch {
             selectWorkProduct(productID)
-            pendingRevealScrollID = taskID
+            pendingRevealScrollID = hostCardID
         } else {
-            triggerRevealScroll(taskID)
+            triggerRevealScroll(hostCardID)
         }
-        revealHighlightID = taskID
-        let capturedID = taskID
+        revealHighlightID = hostCardID
+        let capturedID = hostCardID
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             if self?.revealHighlightID == capturedID {
                 self?.revealHighlightID = nil
             }
         }
+        return outcome
     }
 
     /// Reset every board filter that could hide a reveal target so the
@@ -1882,8 +1902,15 @@ final class ChatViewModel: ObservableObject {
                 }
                 engine.sendInterruptWorkerPaneResponse(requestId: requestId, result: result)
             case .revealWorkItem(let workItemId, let productId):
-                revealWorkCard(workItemId, productID: productId)
-                engine.sendRevealWorkItemResponse(requestId: requestId, result: .success)
+                switch revealWorkCard(workItemId, productID: productId) {
+                case .revealed, .deferred:
+                    engine.sendRevealWorkItemResponse(requestId: requestId, result: .success)
+                case .unreachable(let reason):
+                    engine.sendRevealWorkItemResponse(
+                        requestId: requestId,
+                        result: .failure(.internalFailure(reason))
+                    )
+                }
             }
         case .disconnected:
             isConnected = false
