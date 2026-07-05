@@ -1149,6 +1149,7 @@ pub async fn serve(
                 if stats.slow || stats.closed || stats.depth >= LOG_DEPTH_THRESHOLD {
                     tracing::warn!(
                         queue_depth = stats.depth,
+                        priority_depth = stats.priority_depth,
                         oldest_age_ms = stats.oldest_age_ms,
                         slow = stats.slow,
                         closed = stats.closed,

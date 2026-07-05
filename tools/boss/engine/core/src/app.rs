@@ -1270,6 +1270,7 @@ impl ServerState {
                     request_id = %request_id,
                     outcome = ?outcome,
                     queue_depth = stats.depth,
+                    priority_depth = stats.priority_depth,
                     oldest_age_ms = stats.oldest_age_ms,
                     consecutive_failures = streak,
                     "send_to_app: app outbound queue saturated — request undeliverable; \
@@ -1304,6 +1305,7 @@ impl ServerState {
                 tracing::warn!(
                     request_id = %request_id,
                     queue_depth = stats.depth,
+                    priority_depth = stats.priority_depth,
                     oldest_age_ms = stats.oldest_age_ms,
                     slow = stats.slow,
                     consecutive_failures = streak,
@@ -2032,12 +2034,23 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
     }
 }
 
-/// Maximum events that can be queued for one session before we treat the
-/// client as slow. Sized for typical work-invalidation traffic: each
+/// Maximum events that can be queued in one session's **bulk lane** before we
+/// treat the client as slow. Sized for typical work-invalidation traffic: each
 /// mutation emits at most a couple of envelopes, and same-topic
 /// invalidations are coalesced, so 256 absorbs bursts while bounding
 /// memory.
 const MAX_SESSION_QUEUE: usize = 256;
+
+/// Cap on the **priority lane**, which carries only small engine→app control
+/// pushes (`EngineRequest`: reveal, pane-release, spawn, focus, send-input,
+/// interrupt). These are point-to-point requests the engine awaits a reply
+/// to; only a handful are ever in flight at once (spawns are serialized by
+/// the spawn-pane lock). A backlog this deep means the app isn't draining
+/// even tiny control frames — a genuine wedge — so a priority overflow
+/// reports `Slow` (→ [`SendToAppError::SessionWedged`]) rather than growing
+/// memory. Much smaller than [`MAX_SESSION_QUEUE`] because the priority lane
+/// should never hold more than a few entries in healthy operation.
+const MAX_PRIORITY_QUEUE: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 enum EnqueueOutcome {
@@ -2055,16 +2068,33 @@ enum EnqueueOutcome {
 /// envelope has waited — the head-of-line-blocking signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueueStats {
+    /// Combined depth across both lanes (priority + bulk).
     depth: usize,
+    /// Depth of the priority lane alone. Small engine→app control pushes
+    /// drain ahead of bulk snapshot/invalidation traffic, so a healthy
+    /// channel keeps this near zero even while `depth` climbs under bulk
+    /// load — evidence the priority lane is doing its job. If it *does*
+    /// climb, the app is wedged on control frames too.
+    priority_depth: usize,
     oldest_age_ms: u64,
     slow: bool,
     closed: bool,
 }
 
 struct SessionQueue {
-    /// Each entry is `(enqueued_at, envelope)`. The instant is stamped at
-    /// enqueue time (preserved across coalesce) so [`SessionQueue::stats`]
-    /// can report how long the head-of-line envelope has been waiting.
+    /// Priority lane: small engine→app control pushes (`EngineRequest`)
+    /// only, drained ahead of everything in `items`. Each entry is
+    /// `(enqueued_at, envelope)`. Not coalesced — each `EngineRequest` is a
+    /// distinct request awaiting its own reply — and bounded independently
+    /// by [`MAX_PRIORITY_QUEUE`], so a saturated bulk lane never blocks (or
+    /// wedges) a reveal / pane-release. See [`is_priority_event`].
+    priority: VecDeque<(Instant, FrontendEventEnvelope)>,
+    /// Bulk lane: everything that isn't a priority control push — `WorkTree`
+    /// snapshot responses, `TopicEvent` invalidations, list/result replies,
+    /// the `Hello` handshake. Each entry is `(enqueued_at, envelope)`. The
+    /// instant is stamped at enqueue time (preserved across coalesce) so
+    /// [`SessionQueue::stats`] can report how long the head-of-line envelope
+    /// has been waiting.
     items: VecDeque<(Instant, FrontendEventEnvelope)>,
     /// For each topic with a pending unsent TopicEvent, the index of that
     /// envelope in `items` (front-relative; decremented on pop). Lets us
@@ -2083,6 +2113,7 @@ struct SessionQueue {
 impl SessionQueue {
     fn new() -> Self {
         Self {
+            priority: VecDeque::new(),
             items: VecDeque::new(),
             pending_topics: HashMap::new(),
             closed: false,
@@ -2094,6 +2125,27 @@ impl SessionQueue {
         if self.closed {
             return EnqueueOutcome::Closed;
         }
+
+        // Priority lane: a small engine→app control push jumps ahead of bulk
+        // snapshot/invalidation traffic and is admitted even when the bulk
+        // lane has latched `slow`, so a reveal / pane-release never waits out
+        // — or fails behind — a ~2,000-item `WorkTree` drain. This is the
+        // root-cause fix for the `reveal_work_item` `Send(Timeout)` incident.
+        if is_priority_event(&env.payload) {
+            if self.priority.len() >= MAX_PRIORITY_QUEUE {
+                // The app isn't draining even tiny control frames — a genuine
+                // wedge. Report `Slow` so `send_to_app` fails fast as
+                // `SessionWedged` and tears the session down. No latch needed:
+                // the lane doesn't coalesce, so the length check alone bounds
+                // memory and the lane recovers naturally as entries drain.
+                return EnqueueOutcome::Slow;
+            }
+            self.priority.push_back((Instant::now(), env));
+            return EnqueueOutcome::Enqueued;
+        }
+
+        // Bulk lane. The `slow` latch gates only this lane — it must never
+        // reject a priority control push (handled above).
         if self.slow {
             return EnqueueOutcome::Slow;
         }
@@ -2126,6 +2178,14 @@ impl SessionQueue {
     }
 
     fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
+        // Drain the priority lane first: small control pushes always leave
+        // before bulk snapshot/invalidation traffic. The priority lane does
+        // not participate in topic coalescing, so popping from it leaves the
+        // bulk lane's `pending_topics` indices (and the `slow` latch) alone.
+        if let Some((_enqueued_at, env)) = self.priority.pop_front() {
+            return Some(env);
+        }
+
         let (_enqueued_at, env) = self.items.pop_front()?;
         // Indices in `pending_topics` are front-relative; shift them down
         // by one and drop the entry that pointed at the just-popped item.
@@ -2150,13 +2210,18 @@ impl SessionQueue {
     /// flags. Cheap and lock-local — the caller already holds the queue
     /// mutex via [`SessionSink::queue_stats`].
     fn stats(&self) -> QueueStats {
-        let oldest_age_ms = self
-            .items
-            .front()
-            .map(|(enqueued_at, _)| Instant::now().saturating_duration_since(*enqueued_at).as_millis() as u64)
-            .unwrap_or(0);
+        let now = Instant::now();
+        let front_age = |lane: &VecDeque<(Instant, FrontendEventEnvelope)>| {
+            lane.front()
+                .map(|(enqueued_at, _)| now.saturating_duration_since(*enqueued_at).as_millis() as u64)
+                .unwrap_or(0)
+        };
+        // The oldest still-waiting envelope across both lanes — the true
+        // head-of-line-blocking signal.
+        let oldest_age_ms = front_age(&self.priority).max(front_age(&self.items));
         QueueStats {
-            depth: self.items.len(),
+            depth: self.priority.len() + self.items.len(),
+            priority_depth: self.priority.len(),
             oldest_age_ms,
             slow: self.slow,
             closed: self.closed,
@@ -2169,6 +2234,19 @@ fn topic_event_topic(payload: &FrontendEvent) -> Option<String> {
         FrontendEvent::TopicEvent { topic, .. } => Some(topic.clone()),
         _ => None,
     }
+}
+
+/// Whether an outbound envelope belongs in the priority lane. Only small,
+/// latency-sensitive engine→app *control* pushes qualify: the `EngineRequest`
+/// frames the engine issues via [`ServerState::send_to_app`] (reveal,
+/// pane-release, spawn, focus, send-input, interrupt) and then blocks on with
+/// a short (~5s) timeout. Everything else — bulk `WorkTree` snapshot
+/// responses, `TopicEvent` invalidations, list/result replies, `Hello` —
+/// stays in the bulk lane. The predicate is deliberately narrow: the priority
+/// lane only helps if it stays nearly empty, so it must not admit the very
+/// snapshot/invalidation traffic it lets control pushes jump ahead of.
+fn is_priority_event(payload: &FrontendEvent) -> bool {
+    matches!(payload, FrontendEvent::EngineRequest { .. })
 }
 
 /// Outbound side of one connected session: a bounded coalescing queue plus
@@ -2404,6 +2482,7 @@ impl TopicBroker {
                 session_id = %session_id,
                 topic,
                 queue_depth = stats.depth,
+                priority_depth = stats.priority_depth,
                 oldest_age_ms = stats.oldest_age_ms,
                 "slow subscriber: outbound queue full, disconnecting"
             );

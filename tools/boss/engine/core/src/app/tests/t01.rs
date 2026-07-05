@@ -205,6 +205,74 @@ fn queue_stats_reports_depth_and_backpressure_flags() {
     assert!(q.stats().closed);
 }
 
+/// The priority lane is the root-cause fix for the `reveal_work_item` /
+/// `release_worker_pane` Send(Timeout) incident: a small engine→app control
+/// push must be admitted even when the bulk lane is full **and** latched
+/// `slow`, and must drain ahead of the bulk backlog.
+#[test]
+fn priority_event_jumps_ahead_of_saturated_bulk_lane() {
+    let mut q = SessionQueue::new();
+    for i in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            q.enqueue(response_envelope(&format!("bulk-{i}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    // The bulk lane is full and latched slow — a further *bulk* enqueue is
+    // rejected...
+    assert_eq!(q.enqueue(response_envelope("bulk-overflow")), EnqueueOutcome::Slow);
+    assert!(q.slow);
+    // ...but a priority control push is still admitted.
+    assert_eq!(q.enqueue(engine_request_envelope("reveal-1")), EnqueueOutcome::Enqueued);
+
+    // And it drains first, ahead of every queued bulk item.
+    let first = q.pop_front().expect("priority item drains first");
+    assert!(
+        matches!(first.payload, FrontendEvent::EngineRequest { .. }),
+        "priority EngineRequest must leave before any bulk envelope",
+    );
+    // The next envelope out is the head of the bulk lane.
+    let second = q.pop_front().expect("bulk item follows");
+    assert_eq!(second.request_id.as_deref(), Some("bulk-0"));
+}
+
+/// A saturated *priority* lane is the genuine wedge — the app isn't draining
+/// even tiny control frames. It reports `Slow` (→ `SessionWedged`) without a
+/// coalescing latch, and recovers as soon as one entry drains.
+#[test]
+fn priority_lane_reports_slow_when_full_and_recovers_on_drain() {
+    let mut q = SessionQueue::new();
+    for i in 0..MAX_PRIORITY_QUEUE {
+        assert_eq!(
+            q.enqueue(engine_request_envelope(&format!("p-{i}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    // One past the cap reports Slow.
+    assert_eq!(q.enqueue(engine_request_envelope("overflow")), EnqueueOutcome::Slow);
+    // Draining one entry frees a slot — the lane recovers with no latch to clear.
+    assert!(q.pop_front().is_some());
+    assert_eq!(
+        q.enqueue(engine_request_envelope("after-drain")),
+        EnqueueOutcome::Enqueued
+    );
+}
+
+/// `stats()` reports priority-lane depth separately from the combined depth so
+/// an operator can watch the priority lane stay shallow while the bulk lane
+/// backs up (the fix working) — or climb (the app wedged on control frames
+/// too).
+#[test]
+fn queue_stats_reports_priority_depth_separately() {
+    let mut q = SessionQueue::new();
+    q.enqueue(engine_request_envelope("p-1"));
+    q.enqueue(engine_request_envelope("p-2"));
+    q.enqueue(response_envelope("b-1"));
+    let s = q.stats();
+    assert_eq!(s.priority_depth, 2, "priority lane depth reported on its own");
+    assert_eq!(s.depth, 3, "combined depth spans both lanes");
+}
+
 #[tokio::test]
 async fn sink_next_drains_queue_and_returns_none_when_closed() {
     let (tx, _rx) = oneshot::channel::<()>();
@@ -545,21 +613,24 @@ async fn send_to_app_times_out_when_app_silent() {
     assert!(matches!(result, Err(SendToAppError::Timeout)));
 }
 
-/// A saturated outbound queue must fail fast with the distinct
-/// `SessionWedged` error (not a 5s `Timeout`, and not `NotRegistered`),
-/// and tear the wedged session down so a reconnecting app re-registers
-/// cleanly. This is the acceptance criterion: "no app session" vs
-/// "session wedged" are now distinguishable.
+/// A saturated **priority lane** — the app not draining even tiny control
+/// frames — must fail fast with the distinct `SessionWedged` error (not a 5s
+/// `Timeout`, and not `NotRegistered`), and tear the wedged session down so a
+/// reconnecting app re-registers cleanly. This is the acceptance criterion:
+/// "no app session" vs "session wedged" are distinguishable. Note the setup
+/// saturates the *priority* lane, not the bulk lane: a full bulk lane no
+/// longer wedges a control push (that's exactly what the priority lane fixes —
+/// see `send_to_app_admitted_when_only_bulk_lane_saturated`).
 #[tokio::test]
-async fn send_to_app_reports_session_wedged_when_queue_saturated() {
+async fn send_to_app_reports_session_wedged_when_priority_lane_saturated() {
     let server_state = test_server_state();
     let sink = make_session_sink();
-    // Pre-fill the sink to the cap so the send_to_app enqueue latches Slow.
+    // Fill the priority lane to its cap so the send_to_app enqueue reports Slow.
     {
         let mut q = sink.queue.lock().unwrap();
-        for i in 0..MAX_SESSION_QUEUE {
+        for i in 0..MAX_PRIORITY_QUEUE {
             assert_eq!(
-                q.enqueue(response_envelope(&format!("r-{i}"))),
+                q.enqueue(engine_request_envelope(&format!("p-{i}"))),
                 EnqueueOutcome::Enqueued
             );
         }
@@ -586,7 +657,7 @@ async fn send_to_app_reports_session_wedged_when_queue_saturated() {
         .await;
     assert!(
         matches!(result, Err(SendToAppError::SessionWedged)),
-        "saturated outbound queue must fail fast as SessionWedged, got {result:?}",
+        "saturated priority lane must fail fast as SessionWedged, got {result:?}",
     );
     // The wedged session must be torn down — `send_to_app` closes the sink.
     assert!(
@@ -595,6 +666,99 @@ async fn send_to_app_reports_session_wedged_when_queue_saturated() {
     );
     // And the failure is recorded on the channel-health signal.
     assert_eq!(server_state.app_channel_health.snapshot().consecutive_failures, 1);
+}
+
+/// The acceptance criterion for the `reveal_work_item` / `release_worker_pane`
+/// incident: with the **bulk** lane saturated (a ~2,000-item `WorkTree` drain
+/// backed up and latched `slow`), an engine→app control push must still be
+/// delivered — it no longer fails fast as `SessionWedged` the way it did when
+/// both shared one FIFO lane — and it drains *ahead* of the bulk backlog.
+#[tokio::test]
+async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
+    let server_state = test_server_state();
+    let sink = make_session_sink();
+    {
+        let mut q = sink.queue.lock().unwrap();
+        for i in 0..MAX_SESSION_QUEUE {
+            assert_eq!(
+                q.enqueue(response_envelope(&format!("bulk-{i}"))),
+                EnqueueOutcome::Enqueued
+            );
+        }
+        // One past the cap latches the bulk-lane `slow` backpressure flag.
+        assert_eq!(q.enqueue(response_envelope("bulk-overflow")), EnqueueOutcome::Slow);
+        assert!(q.slow, "bulk lane must have latched slow past the cap");
+    }
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_to_app(
+                EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                    run_id: "r".into(),
+                    workspace_path: "/tmp".into(),
+                    slot_id: 1,
+                    initial_input: "claude\n".into(),
+                    env: vec![],
+                    summary: None,
+                    task_title: None,
+                }),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+
+    // Wait for the spawned send to enqueue its control push. With the bulk
+    // lane pre-filled, `next()` would otherwise pop a bulk item the instant
+    // it's called — we must not drain until the EngineRequest is actually in
+    // the priority lane. Its mere presence there already proves the fix:
+    // under the old single-lane design the enqueue would have failed fast as
+    // `SessionWedged` against the saturated queue instead of being admitted.
+    let mut admitted = false;
+    for _ in 0..200 {
+        if !sink.queue.lock().unwrap().priority.is_empty() {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        admitted,
+        "control push must be admitted to the priority lane despite the saturated bulk lane",
+    );
+
+    // The control push jumps ahead of the saturated bulk lane: it is the
+    // first envelope the writer drains, not the 257th.
+    let envelope = sink
+        .next()
+        .await
+        .expect("priority EngineRequest must drain ahead of the bulk backlog");
+    let request_id = match &envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+        other => panic!("expected EngineRequest first, got {other:?}"),
+    };
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::SpawnWorkerPane {
+                result: Ok(crate::protocol::SpawnWorkerPaneResult {
+                    slot_id: 1,
+                    shell_pid: 42,
+                }),
+            },
+        )
+        .await;
+
+    let response = send.await.expect("send task panicked").expect("ok");
+    assert!(
+        matches!(response, EngineToAppResponse::SpawnWorkerPane { result: Ok(_) }),
+        "a control push must round-trip even while the bulk lane is saturated, got {response:?}",
+    );
 }
 
 /// Consecutive engine→app send failures must surface as a single
@@ -607,6 +771,7 @@ async fn engine_health_report_flags_unresponsive_app_channel() {
     let state = test_server_state();
     let stats = QueueStats {
         depth: 220,
+        priority_depth: 0,
         oldest_age_ms: 9_000,
         slow: true,
         closed: false,
