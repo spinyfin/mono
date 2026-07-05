@@ -304,9 +304,11 @@ pub async fn run_one_pass(
             dispatch_events,
             &state,
             &execution,
-            &reason,
-            now_epoch_secs,
-            file_pane_death_attention,
+            ReapOptions {
+                reason: &reason,
+                now_epoch_secs,
+                file_pane_death_attention,
+            },
         )
         .await;
         if reaped {
@@ -386,11 +388,23 @@ pub async fn reap_reported_pane_death(
         dispatch_events,
         &state,
         &execution,
-        &reason,
-        now_epoch_secs,
-        false,
+        ReapOptions {
+            reason: &reason,
+            now_epoch_secs,
+            file_pane_death_attention: false,
+        },
     )
     .await
+}
+
+/// Per-reap parameters that don't identify *what* is being reaped (that's
+/// `state`/`execution`) but *how* to record and report the reap. Bundled
+/// to keep [`reap_dead_execution`]'s argument count under the
+/// `clippy::too_many_arguments` threshold.
+struct ReapOptions<'a> {
+    reason: &'a str,
+    now_epoch_secs: i64,
+    file_pane_death_attention: bool,
 }
 
 /// Shared reap effects for a single dead worker: mark the execution
@@ -410,10 +424,13 @@ async fn reap_dead_execution(
     dispatch_events: &dyn DispatchEventSink,
     state: &LiveWorkerState,
     execution: &WorkExecution,
-    reason: &str,
-    now_epoch_secs: i64,
-    file_pane_death_attention: bool,
+    options: ReapOptions<'_>,
 ) -> bool {
+    let ReapOptions {
+        reason,
+        now_epoch_secs,
+        file_pane_death_attention,
+    } = options;
     let execution_id = &state.run_id;
 
     tracing::info!(

@@ -242,6 +242,24 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         XCTAssertEqual(diedRunIds, ["exec-surface-failed"])
     }
 
+    func testSurfaceFailureGateSuppressesReportWithNoActiveDisplay() {
+        // The transient "no active display" condition (#800) is
+        // recoverable: `installScreenObserverIfNeeded()` retries
+        // `attemptSurfaceCreation()` once a display returns. Reporting
+        // that as a pane death would have the engine reap a
+        // live/not-yet-started execution and redispatch straight back
+        // into the same no-display wall. Only a NULL surface with a
+        // display actually present is a genuine, unrecoverable failure.
+        XCTAssertFalse(
+            GhosttyTerminalHostView.shouldReportSurfaceFailure(hasActiveDisplay: false),
+            "no active display must not be reported as a pane death"
+        )
+        XCTAssertTrue(
+            GhosttyTerminalHostView.shouldReportSurfaceFailure(hasActiveDisplay: true),
+            "a NULL surface with a display present is a genuine failure and must be reported"
+        )
+    }
+
     func testChildExitedReportsPaneDied() {
         // The pane's shell process exited. Worker panes (unlike the
         // Boss pane, which restarts itself) must report this to the

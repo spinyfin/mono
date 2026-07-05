@@ -207,7 +207,9 @@ final class GhosttyTerminalHostView: NSView {
         guard let surface = makeSurface() else {
             session.statusMessage = "Waiting for an active display…"
             installScreenObserverIfNeeded()
-            session.onSurfaceFailed?()
+            if Self.shouldReportSurfaceFailure(hasActiveDisplay: NSScreen.main != nil) {
+                session.onSurfaceFailed?()
+            }
             return
         }
 
@@ -221,6 +223,25 @@ final class GhosttyTerminalHostView: NSView {
         TerminalLoopMonitor.shared.register(self)
         syncGeometry()
         reconcileClaudeMonitor()
+    }
+
+    /// Whether a NULL surface should be reported as a pane death (via
+    /// `session.onSurfaceFailed?()`) or treated as the recoverable #800
+    /// "no active display" condition that `installScreenObserverIfNeeded()`
+    /// is about to retry.
+    ///
+    /// A NULL surface with no active display is not a real failure — it is
+    /// the transient state `attemptSurfaceCreation`'s doc comment describes,
+    /// and reporting it as a death would have the engine reap a
+    /// live/not-yet-started execution (bypassing the dead-pid sweep's grace
+    /// period) and redispatch straight back into the same no-display wall,
+    /// producing a reap/redispatch loop for as long as the display stays
+    /// asleep. A NULL surface while a display *is* present has no such
+    /// recovery path and is a genuine, unrecoverable failure that must
+    /// still be reported. Free function (not gated on any instance state)
+    /// so it is unit-testable without a live surface/window.
+    static func shouldReportSurfaceFailure(hasActiveDisplay: Bool) -> Bool {
+        hasActiveDisplay
     }
 
     /// Build the surface config from `launchSpec` and call
