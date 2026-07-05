@@ -17,6 +17,25 @@ import XCTest
 /// itself can describe what it bans without tripping its own check.
 final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
     func testNoTestFileInvokesARealOpener() throws {
+        #if BOSS_BAZEL_TEST_BUILD
+        // `bazel test` compiles Swift with `-file-prefix-pwd-is-dot`, which
+        // rewrites `#filePath` (used below) to a build-relative path that
+        // doesn't match the runtime cwd — so the filesystem scan below
+        // silently finds nothing under bazel. Under bazel BUILD.bazel instead
+        // runs the same scan as a build action over the real `srcs` list and
+        // bakes the result into `GeneratedRealOpenerScanResult`, so assert on
+        // that instead of re-deriving the source directory at runtime.
+        XCTAssertEqual(
+            GeneratedRealOpenerScanResult.offenders, [],
+            "Tests must not invoke the real OS URL opener:\n\(GeneratedRealOpenerScanResult.offenders.joined(separator: "\n"))"
+        )
+        return
+        #else
+        try runFilesystemScan()
+        #endif
+    }
+
+    private func runFilesystemScan() throws {
         let selfPath = URL(fileURLWithPath: #filePath)
         let testsDir = selfPath.deletingLastPathComponent()
 
