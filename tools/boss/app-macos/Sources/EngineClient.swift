@@ -372,6 +372,29 @@ final class EngineClient: @unchecked Sendable {
     /// consumed, since the unscanned region starts over from the new front.
     private var unscannedPrefixLength = 0
     private var shouldReconnect = false
+    /// Consecutive reconnect attempts since the last completed
+    /// `RegisterAppSession` handshake, used to index `reconnectDelays`.
+    /// Reset to 0 once `app_session_registered` arrives (and on
+    /// `start()`/`stop()`) so a fresh session always begins at the
+    /// shortest delay. Deliberately NOT reset on the raw socket `.ready`
+    /// state — see the reset site for why.
+    private var reconnectAttempt = 0
+    /// Backoff schedule for `scheduleReconnect()`, indexed by
+    /// `reconnectAttempt` and clamped to the last entry once exhausted —
+    /// mirrors the escalating-schedule shape `boss-event`'s
+    /// `DEFAULT_RETRY_DELAYS_MS` uses for the same "reconnect to the
+    /// engine" problem, tuned for a long-lived session instead of a
+    /// short-lived CLI invocation. Without backoff a wedged/restarting
+    /// engine gets hammered with a fresh connect attempt every second.
+    private static let reconnectDelays: [TimeInterval] = [0.5, 1, 2, 4, 8, 15, 30]
+    /// Guards against double-scheduling: a single dropped connection can
+    /// reach `scheduleReconnect()` twice (once from the state handler's
+    /// terminal state, once from the receive loop's EOF/error path), and
+    /// without this guard each call would consume its own `reconnectAttempt`
+    /// slot and leave a stray timer at the wrong (usually shorter) delay
+    /// still armed underneath the one that actually reconnects — corrupting
+    /// the backoff sequence with extra, unwanted connect attempts.
+    private var reconnectScheduled = false
 
     init(socketPath: String) {
         self.socketPath = socketPath
@@ -379,11 +402,15 @@ final class EngineClient: @unchecked Sendable {
 
     func start() {
         shouldReconnect = true
+        reconnectAttempt = 0
+        reconnectScheduled = false
         connect()
     }
 
     func stop() {
         shouldReconnect = false
+        reconnectAttempt = 0
+        reconnectScheduled = false
         connection?.cancel()
         connection = nil
         buffer.removeAll(keepingCapacity: false)
@@ -1662,6 +1689,13 @@ final class EngineClient: @unchecked Sendable {
                 let message = payload["message"] as? String ?? "unknown engine error"
                 emit(.error(message: message))
             case "app_session_registered":
+                // Only a completed handshake counts as "recovered" — resetting
+                // on the raw socket `.ready` state instead would let a session
+                // that connects but is immediately evicted again (e.g. a
+                // trust-check rejection, or the engine tearing down a session
+                // it can't register) hot-loop reconnects at the shortest delay
+                // forever instead of backing off.
+                reconnectAttempt = 0
                 emit(.appSessionRegistered)
             case "engine_pool_config":
                 let workerSlots = (payload["worker_slots"] as? NSNumber)?.intValue ?? 8
@@ -2197,12 +2231,18 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func scheduleReconnect() {
-        guard shouldReconnect else {
+        guard shouldReconnect, !reconnectScheduled else {
             return
         }
+        reconnectScheduled = true
 
-        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self, self.shouldReconnect, self.connection == nil else {
+        let delay = Self.reconnectDelays[min(reconnectAttempt, Self.reconnectDelays.count - 1)]
+        reconnectAttempt += 1
+
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.reconnectScheduled = false
+            guard self.shouldReconnect, self.connection == nil else {
                 return
             }
             self.connect()
