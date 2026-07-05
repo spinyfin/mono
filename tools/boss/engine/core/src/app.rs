@@ -2904,6 +2904,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
             r @ FrontendRequest::UpdateWorkerShellPid { .. } => sessions::handle_update_worker_shell_pid(ctx, r).await,
+            r @ FrontendRequest::WorkerPaneDied { .. } => sessions::handle_worker_pane_died(ctx, r).await,
             r @ FrontendRequest::WorkerPoolSummary => engine_meta::handle_worker_pool_summary(ctx, r).await,
             r @ FrontendRequest::WorkspacePoolSummary => engine_meta::handle_workspace_pool_summary(ctx, r).await,
         }

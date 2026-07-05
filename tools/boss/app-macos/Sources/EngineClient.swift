@@ -962,6 +962,18 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Report that a worker pane died before the engine could observe it
+    /// any other way — either its libghostty surface never attached or
+    /// its shell process exited. The engine reaps the backing execution
+    /// immediately instead of waiting for the next dead-pid sweep pass
+    /// (up to 60s later) or an app restart.
+    func sendWorkerPaneDied(runId: String) {
+        sendLine([
+            "type": "worker_pane_died",
+            "run_id": runId,
+        ])
+    }
+
     /// Ask the engine for all historical executions of `taskId`, newest-first.
     /// The engine replies with `executions_list`. The wire field is
     /// `work_item_id` — the engine's `ListExecutions` request and

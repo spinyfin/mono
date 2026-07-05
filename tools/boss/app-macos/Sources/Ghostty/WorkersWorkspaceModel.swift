@@ -58,6 +58,16 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// `runId` is the raw execution id (without the "run-" session prefix).
     var onShellPidAvailable: ((String, Int32) -> Void)?
 
+    /// Called when a worker pane dies before the engine could observe it
+    /// any other way — its surface never attached (`onSurfaceFailed`) or
+    /// its shell process exited (`onChildExited`, which only worker panes
+    /// wire up; the Boss pane instead restarts itself). `ContentView`
+    /// installs this closure to forward the death to the engine via
+    /// `sendWorkerPaneDied` so reconciliation fires immediately instead of
+    /// waiting for the periodic dead-pid sweep. The `runId` is the raw
+    /// execution id (without the "run-" session prefix).
+    var onPaneDied: ((String) -> Void)?
+
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
     /// always mirror the live engine rather than independently-maintained
@@ -161,6 +171,16 @@ final class WorkersWorkspaceModel: ObservableObject {
                     self.onShellPidAvailable?(capturedRunId, retryPid)
                 }
             }
+        }
+        // Report the pane's death to the engine the moment the app itself
+        // observes it — either the surface never attached at all, or the
+        // shell process exited — instead of waiting for the periodic
+        // dead-pid sweep (up to 60s) or an app restart to notice.
+        session.onSurfaceFailed = { [weak self] in
+            self?.onPaneDied?(capturedRunId)
+        }
+        session.onChildExited = { [weak self] in
+            self?.onPaneDied?(capturedRunId)
         }
         return .success(slotId: slotId, shellPid: 0)
     }

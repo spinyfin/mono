@@ -1645,6 +1645,22 @@ pub enum FrontendRequest {
         patch: WorkItemPatch,
     },
 
+    /// App reports that a worker pane died before the engine could
+    /// observe it any other way — either `ghostty_surface_new` returned
+    /// NULL (surface never attached) or the pane's child process exited
+    /// and the app has no restart-on-exit handler wired up for worker
+    /// panes (only the Boss pane restarts itself). Without this, the
+    /// engine only learns of the dead pane on the next 60s
+    /// `dead_pid_sweep` pass or on app restart. The engine
+    /// reaps the backing execution immediately using the same DB/pool
+    /// effects as the periodic sweep, skipping its grace period and
+    /// PID-liveness probe since the app's report is a direct
+    /// observation, not a speculative signal. Fire-and-forget; no
+    /// response expected.
+    WorkerPaneDied {
+        run_id: String,
+    },
+
     /// Snapshot every engine worker pool's (main, automation, review)
     /// own claimed-slot bookkeeping — capacity, idle count, and each
     /// held slot's `worker_id → execution_id` mapping — cross-referenced

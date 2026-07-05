@@ -207,6 +207,7 @@ final class GhosttyTerminalHostView: NSView {
         guard let surface = makeSurface() else {
             session.statusMessage = "Waiting for an active display…"
             installScreenObserverIfNeeded()
+            session.onSurfaceFailed?()
             return
         }
 
