@@ -347,6 +347,13 @@ enum EngineEvent {
     /// comment paired with its anchor [`CommentResolution`] against the supplied
     /// plain-text projection.
     case commentsResolved(artifactKind: String, artifactId: String, comments: [ResolvedComment])
+    /// Reply to `comments_banner_state` — a read-only `[Revise]`-banner summary
+    /// for the artifact.
+    case commentsBannerState(artifactKind: String, artifactId: String, state: CommentsBannerState)
+    /// Reply to `comments_revise_doc`. Carries no artifact identity (see
+    /// `ReviseDocOutcome`'s definition in `wire.rs`), so the bridge correlates
+    /// it to the call that issued it by send order.
+    case commentsReviseDocResult(outcome: ReviseDocOutcome)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -1182,6 +1189,36 @@ final class EngineClient: @unchecked Sendable {
         ["exact": anchor.exact, "prefix": anchor.prefix, "suffix": anchor.suffix]
     }
 
+    /// Manually reclassify a comment's intent (sidebar badge override).
+    /// Engine replies `comment_result` with the updated `WorkComment`.
+    func sendCommentsSetIntent(commentId: String, intent: String) {
+        sendLine([
+            "type": "comments_set_intent",
+            "comment_id": commentId,
+            "intent": intent,
+        ])
+    }
+
+    /// Read-only `[Revise]`-banner summary for an artifact. Engine replies
+    /// `comments_banner_state`.
+    func sendCommentsBannerState(artifactKind: String, artifactId: String) {
+        sendLine([
+            "type": "comments_banner_state",
+            "artifact_kind": artifactKind,
+            "artifact_id": artifactId,
+        ])
+    }
+
+    /// The `[Revise]`-banner action: batch-address every unaddressed
+    /// directive/larger_change comment on the artifact. Engine replies
+    /// `comments_revise_doc_result`.
+    func sendCommentsReviseDoc(artifactKind: String, artifactId: String) {
+        sendLine([
+            "type": "comments_revise_doc",
+            "artifact_kind": artifactKind,
+            "artifact_id": artifactId,
+        ])
+    }
 
     /// Resolve a project's design-doc pointer. Engine replies with
     /// `project_design_doc_resolved` carrying a
@@ -2117,6 +2154,24 @@ final class EngineClient: @unchecked Sendable {
                 let comments = (payload["comments"] as? [[String: Any]] ?? [])
                     .compactMap { decodeWire(ResolvedComment.self, from: $0) }
                 emit(.commentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments))
+            case "comments_banner_state":
+                let artifactKind = payload["artifact_kind"] as? String ?? ""
+                let artifactId = payload["artifact_id"] as? String ?? ""
+                guard !artifactKind.isEmpty, !artifactId.isEmpty,
+                      let state = decodeWire(CommentsBannerState.self, from: payload)
+                else {
+                    emit(.error(message: "received invalid comments_banner_state payload"))
+                    break
+                }
+                emit(.commentsBannerState(artifactKind: artifactKind, artifactId: artifactId, state: state))
+            case "comments_revise_doc_result":
+                guard let outcomePayload = payload["outcome"] as? [String: Any],
+                      let outcome = decodeWire(ReviseDocOutcome.self, from: outcomePayload)
+                else {
+                    emit(.error(message: "received invalid comments_revise_doc_result payload"))
+                    break
+                }
+                emit(.commentsReviseDocResult(outcome: outcome))
             default:
                 break
             }

@@ -2424,6 +2424,10 @@ final class ChatViewModel: ObservableObject {
             commentBridge.handleCommentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
         case .commentResult(let comment):
             commentBridge.handleCommentResult(comment)
+        case .commentsBannerState(let artifactKind, let artifactId, let state):
+            commentBridge.handleCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId, state: state)
+        case .commentsReviseDocResult(let outcome):
+            commentBridge.handleCommentsReviseDocResult(outcome)
         }
     }
 

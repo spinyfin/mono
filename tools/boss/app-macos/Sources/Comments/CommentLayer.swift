@@ -61,9 +61,17 @@ final class CommentLayer: NSObject, ObservableObject {
     /// captured at mouseUp. Used to count prior occurrences of the quoted text.
     private var anchorTextBeforeSelection: String? = nil
 
-    /// Local stand-in for the engine's `next_id("task")` allocator, used only
-    /// by the `reviseDoc()` stub to synthesize a `revise_task_id`.
-    private var revisionCounter = 0
+    /// The engine's `[Revise]`-banner summary, fetched via `CommentsBannerState`
+    /// alongside every `reload()`. `nil` until the first fetch lands, or always
+    /// on the artifact-less fallback (no engine to fetch from) — [`bannerState`]
+    /// derives locally from `comments` in that case.
+    @Published private var fetchedBannerState: CommentsBannerState? = nil
+    /// Transient feedback from the last `CommentsReviseDoc` reply, for the
+    /// outcomes that don't already show up via a comment reload
+    /// (`NoUnresolvedComments` / `AlreadyInFlight` / `NotApplicable` — a
+    /// `Created` outcome is reflected by the topic-invalidation-triggered
+    /// reload instead). Clears itself a few seconds after being set.
+    @Published private(set) var reviseDocMessage: String? = nil
 
     // NSEvent monitor tokens; stored nonisolated(unsafe) because the opaque Any
     // tokens are installed/removed only on the main actor.
@@ -376,11 +384,17 @@ final class CommentLayer: NSObject, ObservableObject {
         guard let backend, isEngineBacked else { return }
         backend.listComments(
             artifactKind: artifactKind, artifactId: artifactId, includeResolved: showResolved)
+        backend.fetchBannerState(artifactKind: artifactKind, artifactId: artifactId)
         let projection = currentProjection()
         if !projection.isEmpty {
             backend.resolveComments(
                 artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
         }
+    }
+
+    /// Apply a `comments_banner_state` reply.
+    func applyBannerState(_ state: CommentsBannerState) {
+        fetchedBannerState = state
     }
 
     /// Apply a `comments_list` reply: rebuild the comment array from the engine's
@@ -402,21 +416,20 @@ final class CommentLayer: NSObject, ObservableObject {
         }
     }
 
-    /// The bucket-1/2/3 stubs (`setIntent`, `runAnswerAgent`, `postFollowup`,
-    /// `reclassifyFollowup`, `reviseDoc`, `resolveRevision`, `reopenRevision`) mutate
-    /// `comments` in place without persisting to the engine — the real RPCs land with
-    /// W3/W4. `reload()` rebuilds `comments` wholesale from the engine's rows, which would
-    /// otherwise silently wipe out an in-flight stub transition (e.g. a user-set intent
-    /// override, or an `answering`/`awaitingFollowup` thread) the next time any reload
-    /// fires (create/dismiss echoes, topic invalidations, reconnect). Re-apply the prior
-    /// local-only state on top of the freshly loaded row so it survives until the engine
-    /// itself reports the same transition (at which point the wire value takes over).
+    /// The bucket-2 stubs (`runAnswerAgent`, `postFollowup`, `reclassifyFollowup`)
+    /// still mutate `comments` in place without persisting to the engine — the
+    /// real RPCs land with a later phase (3d). `reload()` rebuilds `comments`
+    /// wholesale from the engine's rows, which would otherwise silently wipe out
+    /// an in-flight stub transition (e.g. an `answering`/`awaitingFollowup`
+    /// thread) the next time any reload fires (create/dismiss echoes, topic
+    /// invalidations, reconnect). Re-apply the prior local-only state on top of
+    /// the freshly loaded row so it survives until the engine itself reports the
+    /// same transition (at which point the wire value takes over). `setIntent`/
+    /// `reviseDoc`/reconciliation no longer need this: they persist through the
+    /// engine and wait for the reload to reflect the real row, rather than
+    /// mutating `comments` ahead of it.
     private func mergeUnpersistedStubState(from prior: Comment, into c: inout Comment) {
-        if prior.intentOverriddenByUser, c.intent != prior.intent {
-            c.intent = prior.intent
-            c.intentOverriddenByUser = true
-        }
-        let localOnlyStatuses: Set<CommentStatus> = [.answering, .answered, .awaitingFollowup, .inRevision, .resolved]
+        let localOnlyStatuses: Set<CommentStatus> = [.answering, .answered, .awaitingFollowup]
         if localOnlyStatuses.contains(prior.status), c.status == .active {
             c.status = prior.status
             c.reviseTaskId = c.reviseTaskId ?? prior.reviseTaskId
@@ -474,18 +487,25 @@ final class CommentLayer: NSObject, ObservableObject {
         return CommentAnchor(exact: exact, prefix: prefix, suffix: suffix)
     }
 
-    // MARK: - Intent classification badge (Phase 1d)
+    // MARK: - Intent classification badge
 
-    /// Manually (re)classifies a comment, mirroring the engine's
-    /// `CommentsSetIntent` RPC (`intent_overridden_by='user'`). Phase 1/2
-    /// stub: the engine RPC and re-routing are wired up once the macOS app
-    /// has Phase 2 engine connectivity in place; for now this only updates
-    /// local state so the badge reflects the override immediately.
+    /// Manually (re)classifies a comment. Engine-backed: calls the real
+    /// `CommentsSetIntent` RPC, which sets `intent_overridden_by='user'` and
+    /// re-runs routing from the new intent's entry point server-side — no
+    /// local mutation here, since the RPC's `comment_result` echo (routed
+    /// through `CommentEngineBridge.handleCommentResult`) reloads this layer,
+    /// so the badge, nudge, and revise banner all settle on the engine's
+    /// authoritative state rather than a client-side guess. Artifact-less
+    /// fallback (no persistence to defer to): simulates the same override +
+    /// routing locally so that surface keeps working.
     func setIntent(_ intent: CommentIntent, for comment: Comment) {
+        if let backend, isEngineBacked {
+            backend.setIntent(commentId: comment.id, intent: intent.rawValue)
+            return
+        }
         guard let index = comments.firstIndex(where: { $0.id == comment.id }) else { return }
         comments[index].intent = intent
         comments[index].intentOverriddenByUser = true
-        print("[CommentsSetIntent] comment=\(comment.id) intent=\(intent.rawValue)")
 
         // Mirrors the engine posting an `entry_kind='nudge'` thread entry
         // immediately on directive/larger_change classification (design §
@@ -602,16 +622,23 @@ final class CommentLayer: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - `[Revise]` banner + chips (Phase 2f)
+    // MARK: - `[Revise]` banner + chips
 
     /// Matches the engine's `NUDGE_BODY` (`engine/core/src/app/comments.rs`).
     static let nudgeBody = "This looks like it wants a doc change — click [Revise] to start one."
 
-    /// Read-only `[Revise]`-banner summary, derived locally from `comments`.
-    /// Mirrors `CommentsBannerState` (`comments_banner_state` RPC): `revisable`
-    /// is true iff there's at least one active directive/larger_change
-    /// comment to batch.
+    /// Local stand-in for the engine's `next_id("task")` allocator, used only
+    /// by the artifact-less fallback path of `reviseDoc()` to synthesize a
+    /// `revise_task_id` (there's no engine to mint a real one for).
+    private var revisionCounter = 0
+
+    /// Read-only `[Revise]`-banner summary. Engine-backed: the last
+    /// `CommentsBannerState` fetched alongside `reload()`. Artifact-less
+    /// fallback (no engine to fetch from): derived locally from `comments`,
+    /// mirroring the RPC's own `revisable` rule (at least one active
+    /// directive/larger_change comment to batch).
     var bannerState: CommentsBannerState {
+        if let fetchedBannerState { return fetchedBannerState }
         let unresolvedCount = comments.filter {
             $0.status == .active && ($0.intent == .directive || $0.intent == .largerChange)
         }.count
@@ -620,18 +647,24 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     /// The `[Revise]`-banner action: batch-address every unaddressed
-    /// directive/larger_change comment. Phase 1/2 stub, mirroring
-    /// `handle_comments_revise_doc`'s guarded `active` → `in_revision` batch
-    /// transition locally (design § "Engine RPC surface") — the real
-    /// `CommentsReviseDoc` RPC is wired up once P529 persistence lands.
+    /// directive/larger_change comment. Engine-backed: calls the real
+    /// `CommentsReviseDoc` RPC. On success the engine flips the addressed
+    /// comments to `in_revision` and publishes a `comment_topic`
+    /// invalidation, which reloads this layer with the real task id — no
+    /// local mutation needed here; `applyReviseDocOutcome` handles the reply
+    /// for the outcomes that don't already trigger a reload (nothing to
+    /// address, or a race with another batch). Artifact-less fallback:
+    /// simulates the same guarded `active` → `in_revision` batch transition
+    /// locally, since there's no engine to persist it.
     func reviseDoc() {
+        if let backend, isEngineBacked {
+            backend.reviseDoc(artifactKind: artifactKind, artifactId: artifactId)
+            return
+        }
         let indices = comments.indices.filter {
             comments[$0].status == .active && (comments[$0].intent == .directive || comments[$0].intent == .largerChange)
         }
-        guard !indices.isEmpty else {
-            print("[CommentsReviseDoc] NoUnresolvedComments")
-            return
-        }
+        guard !indices.isEmpty else { return }
         revisionCounter += 1
         let taskId = "T-local-\(revisionCounter)"
         for i in indices {
@@ -644,29 +677,27 @@ final class CommentLayer: NSObject, ObservableObject {
                 comments[i].threadEntries[nudgeIndex].reviseTaskId = taskId
             }
         }
-        print("[CommentsReviseDoc] Created task=\(taskId) addressed=\(indices.count) comments")
     }
 
-    /// Reconciliation on the claiming task reaching a terminal "shipped"
-    /// state (its PR merged) — mirrors `reconcile_comments_for_task`'s
-    /// `Resolved` arm. Phase 1/2 stub: real reconciliation is driven by
-    /// engine pushes on `comment_topic` once P529 persistence lands.
-    func resolveRevision(taskId: String) {
-        for i in comments.indices where comments[i].reviseTaskId == taskId && comments[i].status == .inRevision {
-            comments[i].status = .resolved
-            comments[i].statusActor = "engine"
+    /// Applies the `CommentsReviseDoc` reply once it arrives. `Created` is
+    /// already reflected by the invalidation-triggered `reload()` (the real
+    /// `revise_task_id` comes from the wire); the other outcomes don't touch
+    /// any comment row, so they only need a transient message telling the
+    /// operator why nothing changed.
+    func applyReviseDocOutcome(_ outcome: ReviseDocOutcome) {
+        switch outcome {
+        case .created:
+            return
+        case .noUnresolvedComments:
+            reviseDocMessage = "No unresolved comments to revise."
+        case .alreadyInFlight(let taskId):
+            reviseDocMessage = "Already being revised as \(taskId)."
+        case .notApplicable(let reason):
+            reviseDocMessage = "Can't revise this document: \(reason)"
         }
-    }
-
-    /// Reconciliation on the claiming task being abandoned / its PR closed
-    /// unmerged — mirrors `reconcile_comments_for_task`'s `Reopened` arm:
-    /// the comment goes back on the `[Revise]` banner. Phase 1/2 stub, same
-    /// caveat as `resolveRevision`.
-    func reopenRevision(taskId: String) {
-        for i in comments.indices where comments[i].reviseTaskId == taskId && comments[i].status == .inRevision {
-            comments[i].status = .active
-            comments[i].reviseTaskId = nil
-            comments[i].statusActor = "engine"
+        Task { @MainActor [weak self, message = reviseDocMessage] in
+            try? await Task.sleep(for: .seconds(4))
+            if self?.reviseDocMessage == message { self?.reviseDocMessage = nil }
         }
     }
 

@@ -17,6 +17,14 @@ struct CommentSidebar: View {
                 ReviseBanner(layer: layer)
                 Divider()
             }
+            if let message = layer.reviseDocMessage {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                Divider()
+            }
             if layer.comments.isEmpty {
                 Spacer()
                 Text("No comments yet.")
