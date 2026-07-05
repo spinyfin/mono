@@ -58,6 +58,19 @@ final class InvestigationDocLinkAffordanceTests: XCTestCase {
         await fulfillment(of: [fetched], timeout: 1.0)
         XCTAssertTrue(openedLocalFiles.isEmpty, "must not open a local file when rawContentURL is present")
         XCTAssertNil(model.workErrorMessage)
+        if case .loaded(_, _, let artifact) = model.asyncMarkdownViewerVM.state {
+            XCTAssertEqual(
+                artifact,
+                CommentArtifactRef.prDoc(
+                    repoRemoteURL: "git@github.com:spinyfin/mono.git",
+                    branch: "boss/exec_1",
+                    path: "docs/investigations/x.md"
+                ),
+                "investigation doc-link comments must be engine-backed via the resolved repo/branch/path"
+            )
+        } else {
+            XCTFail("expected .loaded state after fetch; got \(model.asyncMarkdownViewerVM.state)")
+        }
     }
 
     /// A resolved state with no `rawContentURL` (non-GitHub repo / older
