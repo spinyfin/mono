@@ -23,6 +23,19 @@ fn response_envelope(request_id: &str) -> FrontendEventEnvelope {
     FrontendEventEnvelope::response(request_id.to_owned(), FrontendEvent::ProductsList { products: vec![] })
 }
 
+/// A priority-lane envelope: the small engine→app control push
+/// (`EngineRequest`) that `send_to_app` issues and blocks on. Used to
+/// exercise the priority lane independently of the bulk lane.
+fn engine_request_envelope(request_id: &str) -> FrontendEventEnvelope {
+    FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
+        request_id: request_id.to_owned(),
+        request: EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
+            slot_id: 1,
+            kill_grace_seconds: 5,
+        }),
+    })
+}
+
 fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
     topic_event_topic(&env.payload)
 }
