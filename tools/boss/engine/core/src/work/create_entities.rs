@@ -117,6 +117,30 @@ impl WorkDb {
         Ok(projects)
     }
 
+    /// `true` when `project_id` already has a non-terminal surface-sweep
+    /// investigation (incident-002 P6): a `kind='investigation'` task whose
+    /// `created_via` carries the `surface-sweep:` provenance prefix and whose
+    /// status is not terminal. The periodic surface sweep uses this to stage at
+    /// most one open sweep per project — a stable, status-based dedup that does
+    /// not depend on the generic recent-duplicate time window.
+    pub fn has_open_surface_sweep_for_project(&self, project_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM tasks
+                 WHERE project_id = ?1
+                   AND kind = 'investigation'
+                   AND created_via LIKE 'surface-sweep:%'
+                   AND deleted_at IS NULL
+                   AND status NOT IN ('done', 'archived', 'cancelled')
+                 LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;

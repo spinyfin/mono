@@ -66,6 +66,24 @@ pub struct PrReviewContext {
     /// diff-only scoping for whole-PR-state defects (e.g. a duplicated
     /// module tree spread across a diff's unchanged and changed hunks).
     pub last_reviewed_sha: Option<String>,
+    /// Deterministic supersession-language hits found in the PR body, commit
+    /// messages, or comments (incident-002 P3). Each entry is a rendered
+    /// `term — snippet` line. When non-empty the reviewer prompt carries an
+    /// authoritative block requiring a verified design-doc citation for each
+    /// flagged claim. Populated by the caller (the spawn path scans the PR
+    /// narrative); empty here by default.
+    #[builder(default)]
+    pub supersession_flags: Vec<String>,
+    /// Deterministic both-parents deletion-tripwire result (incident-002 P2):
+    /// files a merged parent added and this forward-port/merge resolution
+    /// removed, rename/move-aware. Each entry is a rendered description line.
+    /// When non-empty the reviewer prompt carries an authoritative,
+    /// rationale-independent block: each removed surface must be raised as a
+    /// gating `regression` finding unless a design-doc citation authorises it.
+    /// Populated by the caller for conflict-resolution reviews; empty here by
+    /// default.
+    #[builder(default)]
+    pub merged_parent_deletions: Vec<String>,
 }
 
 /// Which review rubric to apply to a PR.
@@ -772,6 +790,21 @@ pub fn render_reviewer_initial_prompt(
         _ => String::new(),
     };
 
+    // incident-002 P2: rationale-independent both-parents deletion tripwire.
+    // When the engine deterministically found merged-parent surfaces this
+    // resolution removed, the reviewer receives them as authoritative,
+    // must-address context — independent of any "supersedes" narrative.
+    let merged_parent_deletion_block = ctx
+        .map(|c| render_merged_parent_deletion_block(&c.merged_parent_deletions))
+        .unwrap_or_default();
+
+    // incident-002 P3: deterministic supersession-language scan of the PR
+    // narrative. When present, the reviewer must verify a design-doc citation
+    // for each flagged claim.
+    let supersession_flag_block = ctx
+        .map(|c| crate::supersession_scan::render_supersession_flag_block(&c.supersession_flags))
+        .unwrap_or_default();
+
     format!(
         "# PR review\n\
          \n\
@@ -802,6 +835,8 @@ pub fn render_reviewer_initial_prompt(
          **PR:** {pr_url}\n\
          {pr_metadata_block}\n\
          {revision_context_block}\
+         {merged_parent_deletion_block}\
+         {supersession_flag_block}\
          ## Review steps\n\
          \n\
          1. Your workspace is already checked out to the PR head — read \
@@ -897,6 +932,8 @@ pub fn render_reviewer_initial_prompt(
         output_path = output_path,
         pr_metadata_block = pr_metadata_block,
         revision_context_block = revision_context_block,
+        merged_parent_deletion_block = merged_parent_deletion_block,
+        supersession_flag_block = supersession_flag_block,
         pr_ref = pr_ref,
         diff_step = diff_step,
         embedded_diff_section = embedded_diff_section,
@@ -904,6 +941,46 @@ pub fn render_reviewer_initial_prompt(
         rubric = rubric,
         repo_slug = repo_slug,
     )
+}
+
+/// Render the authoritative merged-parent deletion-tripwire block (incident-002
+/// P2). `deletions` are engine-computed, rename/move-aware descriptions of
+/// surfaces a merged parent added and this resolution removed. Returns an empty
+/// string when there are none, so the caller can unconditionally interpolate it.
+///
+/// This is deliberately **rationale-independent**: it is anchored on the fact
+/// that a merged parent lost functionality, not on the worker's stated purpose.
+/// The engine additionally halts auto-progression on a non-empty set (see
+/// `finalize_pr_review_pass`); this block ensures the reviewer also treats each
+/// entry as a gating regression rather than accepting a "supersedes" narrative.
+fn render_merged_parent_deletion_block(deletions: &[String]) -> String {
+    if deletions.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("## Merged-parent deletion tripwire (engine-computed) — CRITICAL\n\n");
+    out.push_str(
+        "This PR resolves a merge / forward-port. The engine diffed the \
+         resolution against **both merge parents** (not just `main`) and found \
+         that it **removes surfaces a MERGED parent added** — functionality that \
+         already landed and that this resolution drops. This is the exact \
+         incident-002 failure class: a forward-port deleting a just-merged \
+         feature and calling it \"superseded\".\n\n\
+         This finding is **rationale-independent** — it is anchored on the fact \
+         that a merged parent lost functionality, NOT on the worker's stated \
+         purpose. A \"supersedes\" / \"obsoletes\" narrative does NOT clear it.\n\n\
+         For EACH removed surface below, raise a `regression` finding UNLESS the \
+         PR cites a specific design doc + section that authorises the removal AND \
+         that section actually supports it. Absent such a citation the surface \
+         must be restored (integrate both parents) or the resolution escalated to \
+         an operator — it must not ship silently.\n\n\
+         Removed merged-parent surfaces (engine-computed, rename/move-aware):\n\n",
+    );
+    for d in deletions {
+        out.push_str(&format!("- {d}\n"));
+    }
+    out.push('\n');
+    out
 }
 
 fn render_rubric_section(scope: &ReviewScope) -> String {
@@ -920,11 +997,29 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
              - **Critical correctness** — logic errors, broken invariants, \
                mishandled errors, race conditions. (`category: \"correctness\"`)\n\
              - **Inadvertent regressions** *(first-class, explicit check)* — \
-               diff against `main` and flag anything dropped that is unrelated \
-               to the PR's stated purpose. Conflict-resolution and forward-port \
-               PRs get extra scrutiny here. This is the T793 check: a live \
-               feature silently removed during a forward-port must be caught. \
-               (`category: \"regression\"`)\n\
+               flag anything dropped that is unrelated to the PR's stated \
+               purpose. For a conflict-resolution / forward-port PR, do NOT diff \
+               against `main` alone — diff against **both merge parents** (the \
+               PR's prior head AND the moved base). Any file or exported surface \
+               that a MERGED parent added and this resolution removes is a \
+               regression **regardless of any \"supersedes\" narrative** — anchor \
+               on the fact of the deletion, not the worker's stated purpose. \
+               This is the T793 / incident-002 check: a live feature silently \
+               removed during a forward-port must be caught. (`category: \
+               \"regression\"`)\n\
+             - **Supersession / obsolescence claims** *(first-class, explicit \
+               check)* — if the PR body, a commit message, or a comment claims \
+               one surface \"supersedes\", \"obsoletes\", \"replaces\", is \
+               \"now-dead\", or is \"orphaned\" (about code a parent added), that \
+               is a DESIGN decision the worker is not authorised to make \
+               unilaterally. Require a specific **design-doc citation** (path + \
+               section) and VERIFY it: read the cited section and confirm it \
+               actually says the surface is replaced. If there is no citation, or \
+               the cited section contradicts the claim (e.g. specifies the two \
+               surfaces as complementary siblings), raise a `regression` finding \
+               — the removal the claim justifies is presumptively wrong. A \
+               component is only \"orphaned\" if something OTHER than this same \
+               PR orphaned it. (`category: \"regression\"`)\n\
              - **Architectural issues** — wrong layer, missed reuse, abstraction \
                that fights the codebase's conventions. (`category: \
                \"architecture\"`)\n\
@@ -1086,6 +1181,81 @@ mod tests {
         assert!(prompt.contains("gh pr diff"));
         assert!(prompt.contains("--repo org/repo"), "prompt must include --repo flag");
         assert!(prompt.contains("org/repo"), "prompt must state the repo slug");
+        // incident-002 P2: the regression rubric must instruct diffing against
+        // BOTH merge parents for forward-ports and anchoring on the fact of the
+        // deletion rather than the worker's narrative.
+        assert!(
+            prompt.contains("both merge parents"),
+            "regression rubric must require diffing against both merge parents",
+        );
+        // incident-002 P3: the reviewer must verify a design-doc citation for
+        // supersession claims.
+        assert!(
+            prompt.contains("Supersession / obsolescence claims"),
+            "rubric must carry the supersession-citation check",
+        );
+        assert!(
+            prompt.contains("design-doc citation"),
+            "supersession check must demand a design-doc citation",
+        );
+    }
+
+    #[test]
+    fn reviewer_prompt_embeds_engine_flagged_blocks_from_context() {
+        let ctx = PrReviewContext {
+            pr_number: 753,
+            base_sha: "base".to_owned(),
+            head_sha: "head".to_owned(),
+            changed_files: vec!["components/PlanEventCard.tsx".to_owned()],
+            diff_content: None,
+            last_reviewed_sha: None,
+            supersession_flags: vec!["**supersedes** — \"...supersedes t16's static badge...\"".to_owned()],
+            merged_parent_deletions: vec![
+                "`components/RecommendationBadge.tsx` — added by a merged parent, removed by this resolution"
+                    .to_owned(),
+            ],
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Forward-port drill-down modal",
+            "Resolve merge conflicts against main.",
+            "https://github.com/org/repo/pull/753",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            Some(&ctx),
+            "org/repo",
+        );
+        // P2 authoritative deletion-tripwire block.
+        assert!(prompt.contains("Merged-parent deletion tripwire (engine-computed)"));
+        assert!(prompt.contains("RecommendationBadge.tsx"));
+        assert!(prompt.contains("rationale-independent"));
+        // P3 authoritative supersession block.
+        assert!(prompt.contains("Supersession-claim citation check (engine-flagged)"));
+        assert!(prompt.contains("supersedes"));
+    }
+
+    #[test]
+    fn reviewer_prompt_omits_engine_blocks_when_context_clean() {
+        let ctx = PrReviewContext {
+            pr_number: 1,
+            base_sha: "b".to_owned(),
+            head_sha: "h".to_owned(),
+            changed_files: vec!["src/lib.rs".to_owned()],
+            diff_content: None,
+            last_reviewed_sha: None,
+            supersession_flags: vec![],
+            merged_parent_deletions: vec![],
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement it.",
+            "https://github.com/org/repo/pull/1",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(!prompt.contains("Merged-parent deletion tripwire"));
+        assert!(!prompt.contains("Supersession-claim citation check (engine-flagged)"));
     }
 
     #[test]
@@ -1122,6 +1292,8 @@ mod tests {
             changed_files: vec!["src/main.rs".to_owned(), "tests/test.rs".to_owned()],
             diff_content: None,
             last_reviewed_sha: None,
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Fix the auth bug",
@@ -1163,6 +1335,8 @@ mod tests {
             changed_files: vec!["src/lib.rs".to_owned()],
             diff_content: Some("diff --git a/src/lib.rs b/src/lib.rs\n+fn new() {}".to_owned()),
             last_reviewed_sha: None,
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -1200,6 +1374,8 @@ mod tests {
             changed_files: vec!["src/lib.rs".to_owned()],
             diff_content: None,
             last_reviewed_sha: None,
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -1306,6 +1482,8 @@ mod tests {
             changed_files: vec!["crates/rec_engine/src/lib.rs".to_owned()],
             diff_content: None,
             last_reviewed_sha: Some("sha_reviewed_at_1843".to_owned()),
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Extract rec_engine into its own crate",
@@ -1350,6 +1528,8 @@ mod tests {
             changed_files: vec!["src/lib.rs".to_owned()],
             diff_content: None,
             last_reviewed_sha: None,
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",

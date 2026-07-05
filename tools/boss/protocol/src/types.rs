@@ -2864,6 +2864,11 @@ pub const CREATED_VIA_ATTENTION: &str = "attention";
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 /// §"Association model".
 pub const CREATED_VIA_DOC_COMMENT_PREFIX: &str = "doc-comment:";
+/// Prefix for the engine-scheduled surface-sweep investigation
+/// (incident-002 P6): `surface-sweep:<project_id>`. The engine's periodic
+/// surface sweep stages one such investigation per design-doc project to
+/// verify the design's §Surfacing inventory still exists in shipped code.
+pub const CREATED_VIA_SURFACE_SWEEP_PREFIX: &str = "surface-sweep:";
 
 /// Documented `created_via` values. The engine canonicalises caller-
 /// supplied strings against this set; values outside it are stored
@@ -2888,6 +2893,7 @@ pub fn is_known_created_via(value: &str) -> bool {
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
         || value.starts_with(CREATED_VIA_DOC_COMMENT_PREFIX)
+        || value.starts_with(CREATED_VIA_SURFACE_SWEEP_PREFIX)
         || value.starts_with("pr-comment:")
 }
 

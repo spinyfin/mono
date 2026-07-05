@@ -659,6 +659,12 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         #[serde(rename = "headRefOid")]
         head_ref_oid: String,
         files: Vec<PrFile>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        commits: Vec<PrCommit>,
+        #[serde(default)]
+        comments: Vec<PrComment>,
     }
 
     #[derive(serde::Deserialize)]
@@ -666,11 +672,31 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         path: String,
     }
 
+    #[derive(serde::Deserialize)]
+    struct PrCommit {
+        #[serde(rename = "messageHeadline", default)]
+        message_headline: String,
+        #[serde(rename = "messageBody", default)]
+        message_body: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PrComment {
+        #[serde(default)]
+        body: String,
+    }
+
     let pr_number: u64 = pr_url.split('/').next_back()?.parse().ok()?;
 
-    let output = crate::gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "baseRefOid,headRefOid,files"])
-        .await
-        .ok()?;
+    let output = crate::gh_invocation::gh_output(&[
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "baseRefOid,headRefOid,files,body,commits,comments",
+    ])
+    .await
+    .ok()?;
 
     if !output.status.success() {
         tracing::warn!(
@@ -692,6 +718,27 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         })
         .ok()?;
 
+    // incident-002 P3: deterministically scan the worker's *narrative*
+    // surfaces (PR body, commit messages, PR comments) for supersession /
+    // obsolescence language. When present, the reviewer is required to verify
+    // a design-doc citation for each flagged claim. The diff itself is
+    // deliberately excluded ("replace" is ubiquitous in source).
+    let mut narrative = String::new();
+    narrative.push_str(&response.body);
+    narrative.push('\n');
+    for c in &response.commits {
+        narrative.push_str(&c.message_headline);
+        narrative.push('\n');
+        narrative.push_str(&c.message_body);
+        narrative.push('\n');
+    }
+    for c in &response.comments {
+        narrative.push_str(&c.body);
+        narrative.push('\n');
+    }
+    let supersession_flags =
+        crate::supersession_scan::hit_lines(&crate::supersession_scan::scan_supersession_language(&narrative));
+
     Some(crate::pr_review::PrReviewContext {
         pr_number,
         base_sha: response.base_ref_oid,
@@ -701,6 +748,10 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         // Filled in by the caller, which has the `WorkDb` handle needed to
         // resolve the review-cycle root for a revision-triggered pass.
         last_reviewed_sha: None,
+        supersession_flags,
+        // Filled in by the caller (the spawn path computes the merge-parent
+        // deletion tripwire for conflict-resolution reviews — incident-002 P2).
+        merged_parent_deletions: Vec::new(),
     })
 }
 
@@ -1859,6 +1910,7 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("    - an **effort hint**: one of `trivial | small | medium | large`.\n");
     out.push_str("    - **explicit dependencies** — which other entries in this list gate this one (use the task names; \"none\" if it can start immediately).\n");
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
+    out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same file (e.g. a compact-view task and a detail-view task that both edit the same component/container). If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
     out.push_str("  - include items that are deferred or explicitly out of scope, marked as `future / not a v1 blocker` rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected.\n");
     out.push_str("  - This section is what P783's auto-populate will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str(&design_questions_manifest_block());
@@ -2307,6 +2359,27 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          the current `main` does not apply cleanly. Your task in step 3 above is to\n\
          resolve the conflicts — **you are not adding new work to this PR.**\n\n",
     );
+    out.push_str(
+        "### Preservation rule (HARD CONSTRAINT — read before resolving)\n\n\
+         A merge/forward-port resolution is a **reconciliation**, not an authoring surface. \
+         Its only correct default is **preserve both sides**:\n\n\
+         - **A resolution must NOT remove functionality introduced by either parent.** If \
+         both `main` and this PR added a feature that now overlaps, integrate them — do not \
+         drop one side to make the conflict disappear. Deleting the harder-to-merge side is \
+         never the default resolution.\n\
+         - **If you believe one side is genuinely superseded, STOP.** Do not delete it and \
+         rationalize the removal. Deletion of code a merged parent added is an operator \
+         decision, not a resolution choice: run `boss engine conflicts mark-failed <attempt-id> \
+         --reason product_decision_required`, comment on the PR explaining the situation, and \
+         do NOT push a resolution that drops the feature.\n\
+         - **Any removal of code a merged parent added must be called out explicitly** in your \
+         PR comment and PR description (see the Removed section in the comment template below) \
+         AND justified with a **specific design-doc citation** (path + section) that authorizes \
+         the removal. \"It looks superseded\", \"it's now orphaned/dead\", or a clean `tsc`/build \
+         is NOT a justification — a component is only \"orphaned\" if something other than this \
+         very resolution orphaned it. Absent a design-doc citation that says one surface \
+         replaces the other, both surfaces must survive.\n\n",
+    );
     out.push_str("### Rebase steps (replaces step 3)\n\n");
     out.push_str(
         "Run the cube rebase command — it encodes the correct jj recipe automatically \
@@ -2405,12 +2478,47 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
     );
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
-    out.push_str("### Post-resolution PR comment template\n\n");
+    out.push_str("### Post-resolution PR comment\n\n");
+    out.push_str(
+        "After you push the resolution, post a PR comment. Build it from the template below, \
+         but two sections are **computed from your actual resolution diff** — do not paste the \
+         placeholders verbatim:\n\n",
+    );
+    out.push_str(
+        "1. **⚠️ Removed section (required, removal-forward).** Compute the set of files and \
+         exported surfaces this resolution DELETES relative to the pre-resolution PR head and \
+         to `main`. Run `jj diff -r @ --summary` (and, if useful, `gh pr diff <n> --repo \
+         <owner/repo>`) and list, prominently and near the top:\n   \
+         - every file the resolution removes (status `D`), and\n   \
+         - every exported symbol / public surface (function, component, type, route, flag) it \
+         removes that a merged parent added.\n   \
+         If the resolution removes NOTHING, write `Removed: none` explicitly — do not omit the \
+         section. A removal that is not listed here is a defect. For each removal, add the \
+         design-doc citation that authorizes it (per the preservation rule above); if you \
+         cannot cite one, you should not be removing it — STOP and escalate instead of \
+         commenting.\n\n",
+    );
+    out.push_str(
+        "2. **Prior-approvals line (conditional — do NOT fabricate a review history).** Only \
+         claim approvals were dismissed if a prior review actually existed. Check it \
+         deterministically:\n   \
+         ```\n   \
+         gh api repos/<owner/repo>/pulls/<n>/reviews --jq 'length'\n   \
+         ```\n   \
+         - If the count is `> 0`: include the line \"Branch force-pushed; per branch \
+         protection, prior approvals have been dismissed.\"\n   \
+         - If the count is `0`: OMIT that line entirely (there were no approvals to dismiss — \
+         stating otherwise fabricates a vetting history).\n\n",
+    );
+    out.push_str("Template:\n\n");
     out.push_str(
         "```\n\
          🤖 boss resolved merge conflicts on this PR after `main` moved.\n\n\
          Resolutions:\n\
          - <per-file resolution summary>\n\n\
+         ⚠️ Removed (computed from the resolution diff):\n\
+         - <removed file / exported surface + design-doc citation authorizing it, or `none`>\n\n\
+         <conditional: only if `gh api .../pulls/<n>/reviews` length > 0>\n\
          Branch force-pushed; per branch protection, prior approvals have been dismissed.\n\
          Re-review when ready.\n\
          ```\n\n",
@@ -3971,6 +4079,35 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
             "base revision directive must still be present:\n{prompt}",
+        );
+        // P1 (incident-002): the preservation rule must be present so a
+        // resolution never silently deletes functionality a merged parent
+        // added.
+        assert!(
+            prompt.contains("Preservation rule (HARD CONSTRAINT"),
+            "conflict fragment must include the preservation rule:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("must NOT remove functionality introduced by either parent"),
+            "preservation rule must forbid dropping either parent's functionality:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("design-doc citation"),
+            "preservation rule must require a design-doc citation for any removal:\n{prompt}",
+        );
+        // P4 (incident-002): the post-resolution comment must be
+        // removal-forward and must not fabricate a review history.
+        assert!(
+            prompt.contains("⚠️ Removed"),
+            "comment template must carry a prominent Removed section:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("pulls/<n>/reviews"),
+            "comment guidance must condition the approvals line on the reviews API:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("OMIT that line"),
+            "comment guidance must tell the worker to omit the approvals line when no review existed:\n{prompt}",
         );
     }
 

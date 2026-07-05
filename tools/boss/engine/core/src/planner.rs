@@ -438,6 +438,21 @@ the root, then a fan-out of independent consumer tasks that each depend only \
 on that root, then an integration / end-to-end task that depends on the \
 fan-out. Edges MUST form a DAG — never introduce a cycle.\n\
 \n\
+When you decide parallelism, weigh not just **functional** independence but \
+also **file** overlap. Two tasks can be independent in design yet edit the \
+same files — e.g. a compact-view task and a detail-view task that both edit \
+the same component/container, or two tasks that both touch one shared route / \
+config / module. Parallelising edit-overlapping siblings schedules a \
+forward-port conflict, and each such conflict is a chance for the later \
+resolution to silently drop the earlier one's work. So: when — and only when \
+— two otherwise-parallel tasks are **clearly and substantially** likely to \
+co-edit the same file(s), add a `blocks` edge so they land in a defined order \
+and note in the dependent task's `description` that it must **forward-port the \
+sibling's changes preservingly** (integrate, never delete). Do NOT over-index \
+on this — a little incidental overlap is not enough; if you serialise every \
+pair that shares a file, every project becomes linear. Parallel throughput \
+stays the default; sequence only on clear, substantial overlap.\n\
+\n\
 Each edge is { \"dependent\": <handle that waits>, \"prerequisite\": <handle \
 that must land first> }. Both endpoints must be handles you emitted.\n\
 \n\
@@ -593,6 +608,12 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("maximise safe parallelism"));
         assert!(SYSTEM_PROMPT.contains("breakdown_found"));
         assert!(SYSTEM_PROMPT.contains("DAG"));
+        // P5-lite (incident-002): the planner must weigh file overlap, but
+        // only serialise on clear/substantial overlap so throughput stays the
+        // default.
+        assert!(SYSTEM_PROMPT.contains("file** overlap"));
+        assert!(SYSTEM_PROMPT.contains("forward-port the sibling's changes preservingly"));
+        assert!(SYSTEM_PROMPT.contains("Parallel throughput stays the default"));
     }
 
     fn response_from(value: Value) -> MessagesResponse {

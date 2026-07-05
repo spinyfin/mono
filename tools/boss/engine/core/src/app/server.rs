@@ -969,6 +969,17 @@ pub async fn serve(
         Arc::new(move || coord_for_dep_unblock.kick()),
     );
 
+    // Surface sweep (incident-002 P6): a daily detection-latency backstop that
+    // stages one design-surface verification investigation per design-doc
+    // project (autostart=false — the operator gates the spend). Bounds "a
+    // design-specified surface silently regressed" from "found days later by
+    // luck" to "found by the next sweep". Inert when no project has a design
+    // doc. See surface_sweep.rs.
+    let _surface_sweep_handle = crate::surface_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        Duration::from_secs(crate::surface_sweep::SURFACE_SWEEP_INTERVAL_SECS),
+    );
+
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,
     // for every enabled `schedule` automation that is due, compute its
     // cron/timezone occurrence, enforce the open-task gate, apply catch-up /

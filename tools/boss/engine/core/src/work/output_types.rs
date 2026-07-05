@@ -16,6 +16,14 @@ pub enum WorkerPrCompletionTarget {
     /// reviewer pass (P992) drives the subsequent `active → in_review`
     /// transition once the review pass resolves (or the timeout fires).
     PendingReview,
+    /// incident-002 P2: the both-parents deletion tripwire fired — this PR
+    /// resolves a merge/forward-port that removed a surface a merged parent
+    /// added. Halt auto-progression: the task lands in `blocked` with
+    /// `blocked_reason = 'deletion_signoff'` and `pr_url` stamped, pending an
+    /// explicit operator sign-off (a human status move back to `in_review`).
+    /// No `task_blocked_signals` row is armed, so the merge poller's auto-clear
+    /// paths (which only probe `merge_conflict` / `ci_failure`) never retire it.
+    BlockedDeletionSignoff,
 }
 
 /// Outcome of [`WorkDb::set_run_transcript_path_if_unset`]. The third
