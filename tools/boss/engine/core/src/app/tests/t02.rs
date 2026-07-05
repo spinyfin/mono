@@ -2011,3 +2011,169 @@ fn tail_lines_from_content_nonzero_larger_than_total_returns_all() {
     assert_eq!(lines, vec!["x", "y"]);
     assert!(!truncated);
 }
+
+// ── live-status disabled-slot persistence ────────────────────────────────
+
+/// Open a bare `WorkDb` on a leaked temp path — enough for the pure
+/// metadata-KV helpers below, which need no product/chore fixtures.
+fn open_temp_work_db() -> WorkDb {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    std::mem::forget(dir);
+    WorkDb::open(path).unwrap()
+}
+
+#[test]
+fn disabled_slots_roundtrip_preserves_set() {
+    let db = open_temp_work_db();
+    persist_live_status_disabled_slots(&db, &[3, 1, 7]).unwrap();
+    let mut loaded = load_live_status_disabled_slots(&db);
+    loaded.sort();
+    assert_eq!(
+        loaded,
+        vec![1, 3, 7],
+        "persisting a slice of slot ids must load back as the same set"
+    );
+}
+
+#[test]
+fn disabled_slots_empty_roundtrips_to_empty() {
+    let db = open_temp_work_db();
+    persist_live_status_disabled_slots(&db, &[]).unwrap();
+    assert!(
+        load_live_status_disabled_slots(&db).is_empty(),
+        "persisting an empty slice must load back as an empty Vec"
+    );
+}
+
+#[test]
+fn disabled_slots_absent_key_loads_empty() {
+    let db = open_temp_work_db();
+    // Never persisted — the metadata row is absent. Must degrade to an
+    // empty Vec rather than erroring (first-boot behaviour).
+    assert!(
+        load_live_status_disabled_slots(&db).is_empty(),
+        "an unset disabled-slot key must load as an empty Vec"
+    );
+}
+
+#[test]
+fn disabled_slots_malformed_entries_are_filtered() {
+    let db = open_temp_work_db();
+    // Write raw malformed metadata directly (bypassing the persist
+    // helper, which only ever emits clean output): whitespace-padded,
+    // non-numeric, empty, and out-of-u8-range entries must all be
+    // dropped, leaving only the valid u8 slots.
+    db.set_metadata("live_status_disabled_slots", " 3 ,x,5,,999").unwrap();
+    let mut loaded = load_live_status_disabled_slots(&db);
+    loaded.sort();
+    assert_eq!(
+        loaded,
+        vec![3, 5],
+        "only well-formed u8 slot ids survive: whitespace is trimmed, junk/empty/overflow dropped"
+    );
+}
+
+// ── dispatch-pause state persistence ─────────────────────────────────────
+
+#[test]
+fn dispatch_paused_state_defaults_when_absent() {
+    let db = open_temp_work_db();
+    assert_eq!(
+        load_dispatch_paused_state(&db),
+        (false, 0),
+        "with no metadata keys set, the state defaults to (not-paused, since 0)"
+    );
+}
+
+#[test]
+fn dispatch_paused_state_reads_paused_and_since() {
+    let db = open_temp_work_db();
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "1700000000")
+        .unwrap();
+    assert_eq!(
+        load_dispatch_paused_state(&db),
+        (true, 1_700_000_000),
+        "paused flag '1' with a numeric since must parse both components"
+    );
+}
+
+#[test]
+fn dispatch_paused_state_since_defaults_to_zero_when_missing_or_garbage() {
+    let db = open_temp_work_db();
+    // Paused, but the since key is absent → since defaults to 0.
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
+    assert_eq!(
+        load_dispatch_paused_state(&db),
+        (true, 0),
+        "missing since key must default the timestamp to 0 while preserving paused=true"
+    );
+    // Non-numeric since value is also treated as 0.
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "not-a-number")
+        .unwrap();
+    assert_eq!(
+        load_dispatch_paused_state(&db),
+        (true, 0),
+        "non-numeric since value must fall back to 0"
+    );
+}
+
+#[test]
+fn dispatch_paused_state_non_one_flag_is_not_paused() {
+    let db = open_temp_work_db();
+    // Any flag value other than exactly "1" reads as not paused, but the
+    // since component is parsed independently.
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0").unwrap();
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "1700000000")
+        .unwrap();
+    let (paused, since) = load_dispatch_paused_state(&db);
+    assert!(!paused, "flag '0' must read as not paused");
+    assert_eq!(
+        since, 1_700_000_000,
+        "the since component still parses independently of the flag"
+    );
+}
+
+// ── duplicate_or_work_error ──────────────────────────────────────────────
+
+#[test]
+fn duplicate_or_work_error_maps_duplicate_to_blocked_event() {
+    use crate::work::DuplicateTaskError;
+    let err = anyhow::Error::new(DuplicateTaskError {
+        existing_id: "task_existing".into(),
+        existing_short_id: 42,
+        name: "Duplicate chore".into(),
+        age_secs: 17,
+    });
+    match duplicate_or_work_error(err) {
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id,
+            existing_short_id,
+            name,
+            age_secs,
+        } => {
+            assert_eq!(existing_id, "task_existing");
+            assert_eq!(existing_short_id, 42);
+            assert_eq!(name, "Duplicate chore");
+            assert_eq!(age_secs, 17);
+        }
+        other => panic!("expected WorkItemDuplicateBlocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_or_work_error_maps_other_error_to_work_error() {
+    // A non-duplicate error must fall through to WorkError carrying the
+    // error's display string.
+    let err = anyhow::anyhow!("database is on fire");
+    match duplicate_or_work_error(err) {
+        FrontendEvent::WorkError { message } => {
+            assert_eq!(
+                message, "database is on fire",
+                "non-duplicate errors carry their Display string verbatim"
+            );
+        }
+        other => panic!("expected WorkError, got {other:?}"),
+    }
+}
