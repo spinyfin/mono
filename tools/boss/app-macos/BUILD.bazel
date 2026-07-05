@@ -160,14 +160,37 @@ macos_unit_test(
     deps = [":boss_mac_app_tests_shard3_lib"],
 )
 
+# TestSourcesDoNotCallRealOpenerTests.swift (which lands in this shard via the
+# glob below) scans all BossTests sources for banned real-OS-opener APIs. Under
+# `swift test`/Xcode it does that scan at test *runtime* using `#filePath`, but
+# `bazel test` compiles Swift with `-file-prefix-pwd-is-dot`, which rewrites
+# `#filePath` to a build-relative path that doesn't match the runtime cwd —
+# scanning at runtime under bazel silently finds nothing. So under bazel we
+# instead run the same scan as a build action, over the real `srcs` Bazel
+# resolved, and bake the result into a generated Swift file the test asserts
+# against (selected via the BOSS_BAZEL_TEST_BUILD compile condition below).
+genrule(
+    name = "generate_real_opener_scan",
+    srcs = glob(
+        ["Tests/BossTests/**/*.swift"],
+        exclude = ["Tests/BossTests/TestSourcesDoNotCallRealOpenerTests.swift"],
+    ),
+    outs = ["GeneratedRealOpenerScanResult.swift"],
+    cmd = "bash $(location Tests/BossTests/scan_for_real_openers.sh) $(SRCS) > $@",
+    tools = ["Tests/BossTests/scan_for_real_openers.sh"],
+)
+
 swift_library(
     name = "boss_mac_app_tests_shard3_lib",
     testonly = True,
     srcs = glob(
         ["Tests/BossTests/**/*.swift"],
         exclude = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS,
-    ),
-    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    ) + [":generate_real_opener_scan"],
+    copts = [
+        "-DTEXTUAL_ENABLE_TEXT_SELECTION",
+        "-DBOSS_BAZEL_TEST_BUILD",
+    ],
     module_name = "BossTestsShard3",
     deps = [":boss_mac_app_lib"],
 )
