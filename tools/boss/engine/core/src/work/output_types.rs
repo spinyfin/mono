@@ -61,6 +61,25 @@ pub struct RemoteRunHandle {
     pub remote_pid: Option<i64>,
 }
 
+/// One non-terminal execution whose latest run landed on a host that is
+/// no longer eligible to run it — the host was disabled (operator
+/// `bossctl hosts disable` or the dispatch-health circuit breaker) or
+/// removed from the registry entirely. Returned by
+/// [`WorkDb::list_nonterminal_executions_on_offline_hosts`] and consumed
+/// by the host-reconcile sweep ([`crate::host_reconcile`]), which
+/// terminalizes the execution, releases its cube lease, and lets the
+/// existing orphan→redispatch machinery re-place the work item on a
+/// still-eligible host. `host_id` is never `'local'` (a local run is
+/// judged by the local-filesystem sweeps, not host state).
+#[derive(Debug, Clone)]
+pub struct HostBoundExecution {
+    pub execution: WorkExecution,
+    /// The offline host the latest run was attributed to (`work_runs.host_id`).
+    pub host_id: String,
+    /// `work_runs.id` of that latest run.
+    pub run_id: String,
+}
+
 /// Result of a successful [`WorkDb::record_worker_pr_completion`] call (also
 /// reused by [`WorkDb::record_worker_no_op_completion`] and
 /// [`WorkDb::record_worker_idle_abandonment`], which finalize an execution
