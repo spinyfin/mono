@@ -119,7 +119,8 @@ impl WorkDb {
                 finished_at TEXT,
                 host_id TEXT NOT NULL DEFAULT 'local',
                 cube_workspace_id TEXT,
-                remote_pid INTEGER
+                remote_pid INTEGER,
+                shell_pid INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS work_runs_execution_idx
@@ -275,6 +276,7 @@ impl WorkDb {
         // so the macOS app (and run-failure paths) can see which host
         // a run executed on.
         crate::host_registry::migrate_work_runs_host_columns(&conn)?;
+        crate::host_registry::migrate_work_runs_shell_pid(&conn)?;
         // Dispatch-time host health circuit breaker (starves-on-broken-host
         // fix): consecutive-failure counter used by
         // `record_host_dispatch_failure` / `_success` to auto-disable a

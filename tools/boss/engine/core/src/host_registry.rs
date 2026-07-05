@@ -141,6 +141,23 @@ pub(crate) fn migrate_work_runs_host_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the `shell_pid` column to `work_runs` on databases created before the
+/// durable-pane-liveness change. It holds the real OS shell pid of a *local*
+/// libghostty worker pane, reported by the macOS app via the
+/// `UpdateWorkerShellPid` RPC once the surface attaches. Unlike `remote_pid`
+/// (the SSH-wrapper handshake pid) this is a local pid the engine can probe
+/// with `kill(pid, 0)` across a restart — the restart-robust signal
+/// [`crate::dead_pane_sweep`] uses to detect a pane that died with its host
+/// app (e.g. an app relaunch) while the execution row is still `waiting_human`
+/// and its cube lease is still green. Idempotent.
+pub(crate) fn migrate_work_runs_shell_pid(conn: &Connection) -> Result<()> {
+    let cols = pragma_columns(conn, "work_runs")?;
+    if !cols.contains(&"shell_pid".to_owned()) {
+        conn.execute("ALTER TABLE work_runs ADD COLUMN shell_pid INTEGER", [])?;
+    }
+    Ok(())
+}
+
 /// Ensure the `local` host row exists. Idempotent — the `INSERT OR IGNORE`
 /// is a no-op on subsequent engine starts.
 pub(crate) fn ensure_local_host(conn: &Connection) -> Result<()> {

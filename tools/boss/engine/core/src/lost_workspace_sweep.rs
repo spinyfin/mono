@@ -61,10 +61,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{ExecutionKind, WorkExecution};
+use boss_protocol::WorkExecution;
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator};
-use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::execution_liveness::execution_workspace_dir_missing;
 use crate::work::WorkDb;
 
@@ -228,65 +228,36 @@ pub async fn reconcile_if_workspace_lost(
          worker pane is gone (prior status `{prior_status}`)"
     );
 
-    match work_db.mark_execution_orphaned(&execution.id, &reason) {
-        Ok(_) => {}
-        Err(err) => {
-            // A concurrent sweep/guard may have finalized it between our
-            // snapshot and now. If it is terminal now, treat as reconciled;
-            // otherwise leave it and let a later pass retry.
-            let already_terminal = work_db
-                .get_execution(&execution.id)
-                .map(|cur| cur.status.is_terminal())
-                .unwrap_or(false);
-            if already_terminal {
-                return true;
-            }
-            tracing::warn!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "lost-workspace reconcile: failed to orphan execution; leaving row as-is",
-            );
-            return false;
-        }
-    }
+    // Funnel the orphan → triage-bookkeeping → dispatch-event flow through the
+    // shared reconciler finalize (see `execution_liveness::finalize_gone_execution`),
+    // the single place that flow lives for both this sweep and `dead_pane_sweep`.
+    let reconciled = crate::execution_liveness::finalize_gone_execution(
+        work_db,
+        dispatch_events,
+        execution,
+        &reason,
+        &format!("its cube workspace `{workspace_path}` is gone"),
+        Stage::LostWorkspaceReconcile,
+        serde_json::json!({
+            "reason": "workspace_dir_missing",
+            "prior_status": prior_status,
+            "workspace_path": workspace_path,
+            "kind": execution.kind.as_str(),
+        }),
+    )
+    .await;
 
-    // Finalize the automation-run bookkeeping for triage executions:
-    // - a triage that created a task before its pane died is recorded as
-    //   `produced_task` with `produced_task_id` (fixes the historical
-    //   crash-before-Stop success-bookkeeping gap);
-    // - otherwise the occurrence is `failed_gave_up`.
-    // Either way this overwrites the pessimistic dispatch-time placeholder
-    // ("dispatched; awaiting triage worker decision …") with the truth.
-    if execution.kind == ExecutionKind::AutomationTriage {
-        crate::execution_liveness::finalize_dead_automation_triage_run(
-            work_db,
-            execution,
-            &format!("its cube workspace `{workspace_path}` is gone"),
+    if reconciled {
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            prior_status,
+            workspace_path = %workspace_path,
+            "lost-workspace reconcile: finalized execution whose workspace directory is gone",
         );
     }
 
-    dispatch_events
-        .emit(
-            DispatchEvent::new(Stage::LostWorkspaceReconcile, Outcome::Ok, &execution.id)
-                .with_work_item(&execution.work_item_id)
-                .with_details(serde_json::json!({
-                    "reason": "workspace_dir_missing",
-                    "prior_status": prior_status,
-                    "workspace_path": workspace_path,
-                    "kind": execution.kind.as_str(),
-                })),
-        )
-        .await;
-
-    tracing::warn!(
-        execution_id = %execution.id,
-        work_item_id = %execution.work_item_id,
-        prior_status,
-        workspace_path = %workspace_path,
-        "lost-workspace reconcile: finalized execution whose workspace directory is gone",
-    );
-
-    true
+    reconciled
 }
 
 #[cfg(test)]

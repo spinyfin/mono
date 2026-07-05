@@ -784,6 +784,23 @@ pub async fn serve(
         crate::lost_workspace_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic pane-death sweep: the restart-robust companion to
+    // `dead_pid_sweep`. That sweep probes the shell pid too, but reads it from
+    // the in-memory live-worker registry, which is EMPTY after an engine
+    // restart — so an app relaunch that killed live panes AND restarted the
+    // engine (an app update) leaves those workers invisible to it. This sweep
+    // reads the DB-persisted `work_runs.shell_pid` instead, so a pane killed
+    // with its host app is reconciled (and its work resumed) on the next boot,
+    // even though the cube lease is still green and the workspace dir survives
+    // (which is why the heartbeat auto-reap and lost-workspace sweep both miss
+    // it). Fires immediately on boot, covering startup recovery.
+    let _dead_pane_sweep_handle = crate::dead_pane_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        crate::dead_pane_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic remote-lease reconciler: the cross-host analogue of the
     // lost-workspace sweep above. `lost_workspace_sweep` deliberately only
     // judges LOCAL runs (a `.exists()` probe is meaningless for a workspace

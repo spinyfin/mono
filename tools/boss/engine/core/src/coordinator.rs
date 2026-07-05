@@ -2123,21 +2123,36 @@ impl ExecutionCoordinator {
                 // three running triage panes, so their rows stayed `waiting_human`
                 // and every subsequent fire died right here with `redundant_spawn`.
                 // Before treating this execution as a redundant duplicate, verify
-                // the blocker is *actually* live: a local execution whose recorded
-                // workspace directory has vanished is a zombie — reconcile it to a
-                // terminal status and proceed with this spawn instead of blocking.
-                if crate::lost_workspace_sweep::reconcile_if_workspace_lost(
+                // the blocker is *actually* live. Two positive-death signals make
+                // a `waiting_human`/`running` blocker a zombie that must not block
+                // this spawn: (1) its recorded workspace directory has vanished
+                // (`lost_workspace`); or (2) its worker pane's durable shell pid is
+                // gone (`pane_death` — the 2026-07-04 app-relaunch wedge, where the
+                // pane died with the host app but the cube lease stayed green and
+                // the workspace dir survived, so only a pid probe reveals it).
+                // Either one reconciles the blocker to terminal and lets this spawn
+                // proceed instead of wedging behind `redundant_spawn` forever.
+                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
                     &live,
                 )
-                .await
-                {
+                .await;
+                let reconciled_dead_pane = !reconciled_lost_workspace
+                    && crate::dead_pane_sweep::reconcile_if_pane_dead(
+                        self.work_db.as_ref(),
+                        self.dispatch_events.as_ref(),
+                        &live,
+                        crate::run_reconcile::current_epoch_s(),
+                    )
+                    .await;
+                if reconciled_lost_workspace || reconciled_dead_pane {
                     tracing::warn!(
                         execution_id = %execution.id,
                         reconciled_execution_id = %live.id,
                         work_item_id = %execution.work_item_id,
-                        "spawn_attempt: prior 'live' execution had a lost workspace (pane gone); \
+                        reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                        "spawn_attempt: prior 'live' execution's worker pane is gone; \
                          reconciled it and proceeding with this spawn",
                     );
                     // Not redundant after all — fall through to the rest of dispatch.
