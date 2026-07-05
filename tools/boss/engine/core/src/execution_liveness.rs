@@ -184,6 +184,58 @@ mod tests {
     use super::*;
     use boss_protocol::{ExecutionKind, ExecutionStatus};
 
+    use crate::dispatch_events::{RecordingDispatchEventSink, Stage};
+    use crate::test_support::{create_test_product_with_repo, open_db};
+    use crate::work::AutomationFireRecord;
+    use boss_protocol::{AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AutomationTrigger, CreateAutomationInput};
+
+    const TEST_REPO: &str = "https://github.com/test/repo";
+
+    fn create_product(db: &WorkDb) -> String {
+        create_test_product_with_repo(db, "test-product", Some(TEST_REPO)).id
+    }
+
+    fn create_automation(db: &WorkDb, product_id: &str) -> String {
+        db.create_automation(
+            CreateAutomationInput::builder()
+                .product_id(product_id.to_owned())
+                .name("daily")
+                .trigger(AutomationTrigger::Schedule {
+                    cron: "0 14 * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                })
+                .standing_instruction("do the thing")
+                .build(),
+        )
+        .unwrap()
+        .id
+    }
+
+    /// Seed the pessimistic dispatch-time run row the scheduler writes at
+    /// fire time (`failed_will_retry` + the "awaiting triage worker decision"
+    /// placeholder) so a `finalize_gone_execution` on the triage kind has an
+    /// `automation_runs` row to finalize — matching production shape.
+    fn seed_dispatch_run(db: &WorkDb, automation_id: &str, triage_execution_id: &str) {
+        db.record_automation_run_and_advance(
+            AutomationFireRecord::builder()
+                .automation_id(automation_id.to_owned())
+                .scheduled_for(1_700_000_000)
+                .started_at(1_700_000_000)
+                .outcome(AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                .detail("dispatched; awaiting triage worker decision (Stop not yet received)")
+                .triage_execution_id(triage_execution_id.to_owned())
+                .build(),
+        )
+        .unwrap();
+    }
+
+    /// The `details` blob a lost-workspace reconcile would attach — the exact
+    /// value is irrelevant to these tests, which assert on whether an event
+    /// was emitted at all, not on its payload.
+    fn reap_details() -> serde_json::Value {
+        serde_json::json!({ "reason": "workspace_dir_missing" })
+    }
+
     fn execution_with_workspace(path: Option<&str>) -> WorkExecution {
         WorkExecution::builder()
             .id("exec_test")
@@ -234,6 +286,138 @@ mod tests {
         assert!(
             !execution_workspace_dir_missing(&exec),
             "an empty workspace_path is not evidence of death"
+        );
+    }
+
+    /// Concurrent-reconciler idempotency (the `Err`-arm `already_terminal`
+    /// branch of [`finalize_gone_execution`]). Two reconcilers snapshot the
+    /// same live triage row; the first to act ("winner") finalizes it and
+    /// emits exactly one dispatch event. The second ("loser") calls
+    /// `finalize_gone_execution` with its now-stale non-terminal snapshot:
+    /// `mark_execution_orphaned` bails because the DB row is already terminal,
+    /// so the loser must still report `true` (the contract's "that still
+    /// counts as reconciled"), must NOT re-finalize the row, and must NOT emit
+    /// a second, spurious event.
+    #[tokio::test]
+    async fn concurrent_loser_reports_reconciled_without_double_finalizing() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = db.create_automation_triage_execution(&automation, TEST_REPO).unwrap();
+        seed_dispatch_run(&db, &automation, &exec.id);
+        assert!(!exec.status.is_terminal(), "precondition: snapshot must be live");
+
+        let sink = RecordingDispatchEventSink::new();
+
+        // Winner: drives the row terminal, finalizes the automation run, and
+        // emits one `lost_workspace_reconcile` event.
+        let winner = finalize_gone_execution(
+            &db,
+            &sink,
+            &exec,
+            "winner reconcile",
+            "its cube workspace is gone",
+            Stage::LostWorkspaceReconcile,
+            reap_details(),
+        )
+        .await;
+        assert!(winner, "the winning reconciler finalizes and returns reconciled");
+
+        let after_win = db.get_execution(&exec.id).unwrap();
+        assert_eq!(after_win.status, ExecutionStatus::Orphaned);
+        assert_eq!(
+            sink.events_for(&exec.id).await.len(),
+            1,
+            "the winner emits exactly one dispatch event"
+        );
+
+        // Loser: same stale (still non-terminal) snapshot. The DB row is now
+        // terminal, so `mark_execution_orphaned` bails and we take the
+        // idempotent `already_terminal` branch.
+        let loser = finalize_gone_execution(
+            &db,
+            &sink,
+            &exec,
+            "loser reconcile",
+            "its cube workspace is gone",
+            Stage::LostWorkspaceReconcile,
+            reap_details(),
+        )
+        .await;
+        assert!(
+            loser,
+            "a row a concurrent reconciler already finalized still counts as reconciled"
+        );
+
+        let after_loss = db.get_execution(&exec.id).unwrap();
+        assert_eq!(
+            after_loss.status,
+            ExecutionStatus::Orphaned,
+            "the loser must not change the already-terminal status"
+        );
+        assert_eq!(
+            after_loss.finished_at, after_win.finished_at,
+            "the loser must not re-stamp finished_at (no double-finalize)"
+        );
+        assert_eq!(
+            sink.events_for(&exec.id).await.len(),
+            1,
+            "the loser must NOT emit a second, spurious dispatch event"
+        );
+
+        // The automation run was finalized once by the winner and left
+        // untouched by the loser — the placeholder is gone, replaced by the
+        // winner's terminal outcome, and not re-processed.
+        let runs = db.list_automation_runs(&automation).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
+    }
+
+    /// Still-live retry path (the `Err`-arm `!already_terminal` branch). When
+    /// `mark_execution_orphaned` fails and the row is NOT observably terminal,
+    /// [`finalize_gone_execution`] must return `false` — so a later sweep pass
+    /// retries — and must NOT emit a dispatch event (nothing was finalized).
+    ///
+    /// We drive this branch with a non-terminal snapshot whose id is absent
+    /// from the DB: `mark_execution_orphaned` fails on the missing row, and
+    /// the terminal-status re-probe (`get_execution`) cannot confirm
+    /// terminality, so `already_terminal` resolves to `false`. That is the
+    /// identical branch a transient orphan failure on a genuinely-live row
+    /// would take (`get_execution` → non-terminal → `false`); a missing row is
+    /// the only orphan failure a unit test can induce without a
+    /// fault-injecting DB or production changes.
+    #[tokio::test]
+    async fn orphan_failure_on_non_terminal_row_returns_false_and_emits_nothing() {
+        let (_dir, db) = open_db();
+        // `execution_with_workspace(None)` builds a live (`waiting_human`)
+        // triage snapshot with id `exec_test`, which does not exist in this
+        // fresh DB.
+        let exec = execution_with_workspace(None);
+        assert!(!exec.status.is_terminal(), "precondition: snapshot must be live");
+        assert!(
+            db.get_execution(&exec.id).is_err(),
+            "precondition: the row must be absent so the orphan fails"
+        );
+
+        let sink = RecordingDispatchEventSink::new();
+        let reconciled = finalize_gone_execution(
+            &db,
+            &sink,
+            &exec,
+            "reconcile a row that cannot be orphaned",
+            "its cube workspace is gone",
+            Stage::LostWorkspaceReconcile,
+            reap_details(),
+        )
+        .await;
+
+        assert!(
+            !reconciled,
+            "an orphan failure on a non-terminal row must report NOT reconciled so a later pass retries"
+        );
+        assert!(
+            sink.events_for(&exec.id).await.is_empty(),
+            "no dispatch event may be emitted when the row was not finalized"
         );
     }
 }
