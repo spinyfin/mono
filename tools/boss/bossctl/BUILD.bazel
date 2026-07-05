@@ -6,6 +6,7 @@ rust_binary(
     srcs = [
         "src/logs.rs",
         "src/main.rs",
+        "src/review.rs",
         "src/tests.rs",
     ],
     compile_data = [

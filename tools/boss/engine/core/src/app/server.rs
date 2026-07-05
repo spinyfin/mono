@@ -949,6 +949,23 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic pr_review dead-review recovery sweep: a `pr_review`
+    // execution that dies (host failure, cube-lease reap, crash) without
+    // ever finalizing leaves its PR silently unreviewed — the producing
+    // task stays `active` with no live execution, but the generic
+    // orphan-active sweep above deliberately excludes these items (see
+    // `list_orphan_active_candidates`'s doc comment) because it has no
+    // notion of `pr_review` as an execution kind and would wrongly spawn a
+    // fresh implementer instead of re-running the reviewer. This sweep
+    // owns that recovery exclusively. Runs every 60s and fires
+    // immediately on boot, same cadence as the orphan sweep.
+    let _pr_review_recovery_handle = crate::pr_review_recovery::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        Duration::from_secs(60),
+    );
+
     // External-tracker reconciler: periodically pulls upstream issue state
     // into Boss's work-item taxonomy. Default cadence: 120 s (2 min) per
     // the design doc's §"Cadence" rationale (Design Q5). Fires immediately
