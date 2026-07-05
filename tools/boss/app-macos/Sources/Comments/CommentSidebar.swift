@@ -276,30 +276,16 @@ private struct FollowupComposer: View {
     }
 }
 
-/// Stands in for the engine's async reclassification of a pending follow-up
-/// while a comment sits in `.awaitingFollowup` — mirrors `IntentBadge`'s
-/// manual-override menu since no live classifier is wired up yet. Picking an
-/// intent here drives `reclassifyFollowup`, the loop-vs-bridge fork (design §
-/// "Follow-up loop" / "Bridging a bucket-2 answer into a revision").
-private struct FollowupClassificationBadge: View {
-    let comment: Comment
-    @ObservedObject var layer: CommentLayer
-
+/// Shown while a posted follow-up awaits the engine's async reclassifier
+/// (design § "Follow-up loop"): the outcome — loop back into bucket 2
+/// (`.answering`) or bridge onto the bucket-1&3 track (`.active`) — arrives
+/// on the artifact's comment-topic push and reloads the layer; there is no
+/// operator action here.
+private struct FollowupClassifyingIndicator: View {
     var body: some View {
-        Menu {
-            ForEach(CommentIntent.allCases, id: \.self) { intent in
-                Button(intent.displayName) {
-                    layer.reclassifyFollowup(intent, for: comment)
-                }
-            }
-        } label: {
-            Label("classifying reply…", systemImage: "ellipsis.circle")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .help("Click to classify this follow-up — a question loops back to the answer agent, a change request moves this comment to the revision track")
+        Label("Reclassifying…", systemImage: "ellipsis.circle")
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
     }
 }
 
@@ -387,16 +373,20 @@ private struct CommentRow: View {
     }
 
     /// The bucket-2 thread-level indicators (design § "Comment/thread state
-    /// machine"): a thinking indicator while the answer agent runs, an
-    /// "Answered" checkmark + follow-up composer once it's replied, or the
-    /// reclassification badge while a just-posted follow-up is pending
-    /// routing. `active`/`resolved`/`inRevision` render nothing here — that
-    /// track has its own `RevisionChip` instead.
+    /// machine"): a thinking indicator while the answer agent actually runs
+    /// (`answer_agent_running`, not just the `.answering` status — see
+    /// `Comment.answerAgentRunning`), an "Answered" checkmark + follow-up
+    /// composer once it's replied, or a passive "reclassifying" indicator
+    /// while a just-posted follow-up awaits the engine's async reclassifier.
+    /// `active`/`resolved`/`inRevision` render nothing here — that track has
+    /// its own `RevisionChip` instead.
     @ViewBuilder
     private var bucketTwoTrack: some View {
         switch comment.status {
         case .answering:
-            ThinkingIndicatorView()
+            if comment.answerAgentRunning {
+                ThinkingIndicatorView()
+            }
         case .answered:
             VStack(alignment: .leading, spacing: 4) {
                 Label("Answered", systemImage: "checkmark.circle")
@@ -405,7 +395,7 @@ private struct CommentRow: View {
                 FollowupComposer(comment: comment, layer: layer)
             }
         case .awaitingFollowup:
-            FollowupClassificationBadge(comment: comment, layer: layer)
+            FollowupClassifyingIndicator()
         case .active, .resolved, .inRevision, .orphaned, .dismissed:
             EmptyView()
         }

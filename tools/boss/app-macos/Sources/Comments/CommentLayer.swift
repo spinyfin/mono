@@ -407,39 +407,10 @@ final class CommentLayer: NSObject, ObservableObject {
             comments.compactMap { c in c.lastResolvedWith.map { (c.id, $0) } },
             uniquingKeysWith: { first, _ in first }
         )
-        let priorById = Dictionary(comments.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         comments = wire.map { cw in
-            var c = Comment.from(cw.comment, threadEntries: cw.threadEntries)
+            var c = Comment.from(cw.comment, threadEntries: cw.threadEntries, answerAgentRunning: cw.answerAgentRunning)
             if c.lastResolvedWith == nil { c.lastResolvedWith = priorResolved[c.id] }
-            if let prior = priorById[c.id] { mergeUnpersistedStubState(from: prior, into: &c) }
             return c
-        }
-    }
-
-    /// The bucket-2 stubs (`runAnswerAgent`, `postFollowup`, `reclassifyFollowup`)
-    /// still mutate `comments` in place without persisting to the engine — the
-    /// real RPCs land with a later phase (3d). `reload()` rebuilds `comments`
-    /// wholesale from the engine's rows, which would otherwise silently wipe out
-    /// an in-flight stub transition (e.g. an `answering`/`awaitingFollowup`
-    /// thread) the next time any reload fires (create/dismiss echoes, topic
-    /// invalidations, reconnect). Re-apply the prior local-only state on top of
-    /// the freshly loaded row so it survives until the engine itself reports the
-    /// same transition (at which point the wire value takes over). `setIntent`/
-    /// `reviseDoc`/reconciliation no longer need this: they persist through the
-    /// engine and wait for the reload to reflect the real row, rather than
-    /// mutating `comments` ahead of it.
-    private func mergeUnpersistedStubState(from prior: Comment, into c: inout Comment) {
-        let localOnlyStatuses: Set<CommentStatus> = [.answering, .answered, .awaitingFollowup]
-        if localOnlyStatuses.contains(prior.status), c.status == .active {
-            c.status = prior.status
-            c.reviseTaskId = c.reviseTaskId ?? prior.reviseTaskId
-            c.statusActor = c.statusActor ?? prior.statusActor
-        }
-        let existingIds = Set(c.threadEntries.map(\.id))
-        let localOnlyEntries = prior.threadEntries.filter { !existingIds.contains($0.id) }
-        if !localOnlyEntries.isEmpty {
-            c.threadEntries.append(contentsOf: localOnlyEntries)
-            c.threadEntries.sort { $0.createdAt < $1.createdAt }
         }
     }
 
@@ -536,19 +507,22 @@ final class CommentLayer: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Bucket 2: answer agent + follow-up loop (Phase 3d thin client)
+    // MARK: - Bucket 2: answer agent + follow-up loop
 
-    /// Canned reply used in place of a real answer-agent run — engine
-    /// connectivity for bucket 2 lands with P529 persistence. Mirrors an
+    /// Canned reply used only by the artifact-less fallback, which has no
+    /// engine to run a real answer agent against. Mirrors an
     /// `entry_kind='answer'` thread entry (design § "Bucket 2").
     static let stubAnswerBody =
-        "This is a stubbed answer — real answer-agent replies land once engine connectivity is wired up."
+        "This is a stubbed answer — real answer-agent replies require an engine-backed artifact."
 
-    /// Simulates the answer agent: after a short "thinking" delay, posts an
-    /// `answer` thread entry and flips `answering → answered`. No-ops if the
-    /// comment has moved off `.answering` in the meantime (e.g. dismissed, or
-    /// manually reclassified away) — mirrors the engine's completion callback
-    /// being guarded on the run's expected state.
+    /// Artifact-less-fallback-only simulation of the answer agent: after a
+    /// short "thinking" delay, posts an `answer` thread entry and flips
+    /// `answering → answered`. No-ops if the comment has moved off
+    /// `.answering` in the meantime (e.g. dismissed, or manually reclassified
+    /// away). Never called on the engine-backed path — there, answer entries
+    /// arrive as real `comment_thread_entries` posted by the engine's answer
+    /// agent via `CommentsPostAnswer` (worker-callable only), and ride in on
+    /// the normal `reload()`/topic-invalidation path.
     private func runAnswerAgent(for commentId: String) {
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(1.5))
@@ -567,18 +541,22 @@ final class CommentLayer: NSObject, ObservableObject {
         }
     }
 
-    /// The operator's reply in an `answered` bucket-2 thread — mirrors the
-    /// engine's `CommentsPostFollowup` RPC. Appends an `operator_followup`
-    /// thread entry and moves the comment to `awaitingFollowup`, where
-    /// `reclassifyFollowup` (driven by the sidebar's classification badge,
-    /// standing in for the real async classifier) decides whether it loops
-    /// back into bucket 2 or bridges to bucket 1&3.
+    /// The operator's reply in an `answered` bucket-2 thread. Engine-backed:
+    /// calls the real `CommentsPostFollowup` RPC, which appends the
+    /// `operator_followup` thread entry, transitions the comment to
+    /// `awaiting_followup`, and kicks off the async reclassifier server-side
+    /// — its loop-vs-bridge outcome arrives on the artifact's comment-topic
+    /// push, which `reload()` picks up, so no local mutation is needed here.
+    /// Artifact-less fallback (no engine to persist to): simulates the same
+    /// transition locally so that surface keeps working.
     func postFollowup(body: String, for comment: Comment) {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let index = comments.firstIndex(where: { $0.id == comment.id }),
-              comments[index].status == .answered
-        else { return }
+        guard !trimmed.isEmpty, comment.status == .answered else { return }
+        if let backend, isEngineBacked {
+            backend.postFollowup(commentId: comment.id, body: trimmed)
+            return
+        }
+        guard let index = comments.firstIndex(where: { $0.id == comment.id }) else { return }
         comments[index].threadEntries.append(
             CommentThreadEntry(
                 id: UUID().uuidString,
@@ -589,37 +567,6 @@ final class CommentLayer: NSObject, ObservableObject {
             )
         )
         comments[index].status = .awaitingFollowup
-        print("[CommentsPostFollowup] comment=\(comment.id)")
-    }
-
-    /// Reclassifies a pending follow-up (design § "Follow-up loop" /
-    /// "Bridging a bucket-2 answer into a revision"). `question` loops back
-    /// into bucket 2 (`answering`, the agent runs again); `directive`/
-    /// `largerChange` bridges the comment onto the bucket-1&3 track
-    /// (`active`, with a nudge entry so the next `[Revise]` batch picks it
-    /// up) — the comment's chip visibly swaps from the bucket-2 thread
-    /// indicators to the `RevisionChip`.
-    func reclassifyFollowup(_ intent: CommentIntent, for comment: Comment) {
-        guard let index = comments.firstIndex(where: { $0.id == comment.id }),
-              comments[index].status == .awaitingFollowup
-        else { return }
-        comments[index].intent = intent
-        switch intent {
-        case .question:
-            comments[index].status = .answering
-            runAnswerAgent(for: comment.id)
-        case .directive, .largerChange:
-            comments[index].status = .active
-            comments[index].threadEntries.append(
-                CommentThreadEntry(
-                    id: UUID().uuidString,
-                    entryKind: .nudge,
-                    author: "engine",
-                    body: Self.nudgeBody,
-                    createdAt: Date()
-                )
-            )
-        }
     }
 
     // MARK: - `[Revise]` banner + chips
