@@ -131,6 +131,13 @@ struct Comment: Identifiable, Equatable {
     var lastResolvedWith: ResolvedWith? = nil
     /// Engine-authored nudge/answer/follow-up entries, oldest first.
     var threadEntries: [CommentThreadEntry] = []
+    /// Mirrors `CommentWithThread.answer_agent_running` — whether an
+    /// answer-agent run is actually in flight for this comment. Only
+    /// meaningful while `status == .answering`; drives the sidebar's
+    /// thinking indicator without trusting a possibly-stale status alone.
+    /// Defaults to `true` for the artifact-less fallback, which has no such
+    /// signal from the engine and relies on `status` alone.
+    var answerAgentRunning: Bool = true
 
     // Persistence provenance carried so the layer can issue mutations without a
     // separate lookup. Empty on the artifact-less in-memory path.
@@ -189,6 +196,7 @@ extension Comment {
     static func from(
         _ wc: WorkComment,
         threadEntries: [WireCommentThreadEntry] = [],
+        answerAgentRunning: Bool = true,
         resolution: CommentResolution? = nil
     ) -> Comment {
         var c = Comment(
@@ -209,6 +217,7 @@ extension Comment {
             resolution.map { ResolvedWith(rawValue: $0.kind) ?? .exact }
             ?? wc.lastResolvedWith.flatMap(ResolvedWith.init(rawValue:))
         c.threadEntries = threadEntries.map(CommentThreadEntry.from)
+        c.answerAgentRunning = answerAgentRunning
         c.artifactKind = wc.artifactKind
         c.artifactId = wc.artifactId
         c.docVersion = wc.docVersion

@@ -305,39 +305,20 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[0].threadEntries.last?.body, "but what about edge cases?")
     }
 
-    func testReclassifyFollowupQuestion() async throws {
+    func testPostFollowupSendsRPCWhenEngineBacked() async throws {
         let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        try await Task.sleep(for: .seconds(2))
-        layer.postFollowup(body: "one more thing", for: layer.comments[0])
-
-        layer.reclassifyFollowup(.question, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].status, .answering)
-        XCTAssertEqual(layer.comments[0].intent, .question)
-    }
-
-    func testReclassifyFollowupDirective() async throws {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        try await Task.sleep(for: .seconds(2))
-        layer.postFollowup(body: "please just rename it", for: layer.comments[0])
-
-        layer.reclassifyFollowup(.directive, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].status, .active)
-        XCTAssertEqual(layer.comments[0].intent, .directive)
-        XCTAssertTrue(layer.comments[0].threadEntries.contains { $0.entryKind == .nudge })
-        XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
-    }
-
-    func testReclassifyFollowupIgnoredWhenNotAwaitingFollowup() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        // Comment is `.active`, never entered `.awaitingFollowup`.
-        layer.reclassifyFollowup(.directive, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].status, .active)
-        XCTAssertNil(layer.comments[0].intent)
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([
+            Self.wireComment(id: "cmt_1", exact: "some text", body: "a note", status: "answered")
+        ])
+        layer.postFollowup(body: "but what about edge cases?", for: layer.comments[0])
+        XCTAssertEqual(backend.postFollowupCalls.count, 1)
+        XCTAssertEqual(backend.postFollowupCalls[0].commentId, "cmt_1")
+        XCTAssertEqual(backend.postFollowupCalls[0].body, "but what about edge cases?")
+        // No local mutation — the engine-backed path waits for the reload
+        // triggered by the topic invalidation the RPC's handler publishes.
+        XCTAssertEqual(layer.comments[0].status, .answered)
     }
 
     // MARK: - Engine-backed path
@@ -738,6 +719,7 @@ final class FakeCommentBackend: CommentBackend {
     var setIntentCalls: [(commentId: String, intent: String)] = []
     var fetchBannerStateCalls: [(kind: String, id: String)] = []
     var reviseDocCalls: [(kind: String, id: String)] = []
+    var postFollowupCalls: [(commentId: String, body: String)] = []
 
     func registerCommentLayer(_ layer: CommentLayer, artifactKind: String, artifactId: String) {
         registerCount += 1
@@ -765,5 +747,8 @@ final class FakeCommentBackend: CommentBackend {
     }
     func reviseDoc(artifactKind: String, artifactId: String) {
         reviseDocCalls.append((artifactKind, artifactId))
+    }
+    func postFollowup(commentId: String, body: String) {
+        postFollowupCalls.append((commentId, body))
     }
 }

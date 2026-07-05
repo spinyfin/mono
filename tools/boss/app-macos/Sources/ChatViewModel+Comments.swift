@@ -27,6 +27,8 @@ protocol CommentBackend: AnyObject {
     func setIntent(commentId: String, intent: String)
     /// Fetch the `[Revise]`-banner summary for an artifact.
     func fetchBannerState(artifactKind: String, artifactId: String)
+    /// Post an operator follow-up reply in a bucket-2 comment's thread.
+    func postFollowup(commentId: String, body: String)
     /// The `[Revise]`-banner action: batch-address every unaddressed
     /// directive/larger_change comment on the artifact.
     func reviseDoc(artifactKind: String, artifactId: String)
@@ -153,6 +155,10 @@ final class CommentEngineBridge: CommentBackend {
 
     func fetchBannerState(artifactKind: String, artifactId: String) {
         engine.sendCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId)
+    }
+
+    func postFollowup(commentId: String, body: String) {
+        engine.sendCommentsPostFollowup(commentId: commentId, body: body, author: author)
     }
 
     func reviseDoc(artifactKind: String, artifactId: String) {

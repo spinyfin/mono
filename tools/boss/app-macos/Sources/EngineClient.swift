@@ -1199,6 +1199,20 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Operator-authored reply in a bucket-2 comment's thread. Only valid
+    /// while the comment is `answered`; the engine transitions it to
+    /// `awaiting_followup` and kicks off the async reclassifier off the
+    /// request's critical path — its outcome arrives on the artifact's
+    /// `comments.artifact.*` topic push, not a direct reply.
+    func sendCommentsPostFollowup(commentId: String, body: String, author: String) {
+        sendLine([
+            "type": "comments_post_followup",
+            "comment_id": commentId,
+            "body": body,
+            "author": author,
+        ])
+    }
+
     /// Read-only `[Revise]`-banner summary for an artifact. Engine replies
     /// `comments_banner_state`.
     func sendCommentsBannerState(artifactKind: String, artifactId: String) {
