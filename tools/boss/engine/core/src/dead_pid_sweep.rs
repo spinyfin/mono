@@ -58,6 +58,16 @@ use crate::work::WorkDb;
 /// is still spinning up and may not have fully exec'd its shell yet.
 pub const DEAD_PID_GRACE_SECS: i64 = 30;
 
+/// `work_attention_items.kind` filed when a pane is reaped specifically
+/// via [`reconcile_orphans_on_reattach`] (an app relaunch killed it),
+/// as opposed to the periodic [`spawn_loop`] pass (crash/OOM/kill-9).
+/// Scoped to the work item (not the execution) and deduped on `open`
+/// status via [`crate::work::WorkDb::upsert_work_item_attention`] so a
+/// relaunch that kills many panes at once — or repeated relaunches
+/// before a human acks — doesn't pile up duplicate rows for the same
+/// chore.
+pub const PANE_DEATH_ATTENTION_KIND: &str = "pane_death_reconcile";
+
 /// Counts from one pass of the sweep; logged at `info` when activity
 /// occurs.
 #[derive(Debug, Default)]
@@ -104,6 +114,7 @@ pub fn spawn_loop(
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
+                false,
             )
             .await
         }
@@ -134,6 +145,13 @@ pub fn spawn_loop(
 /// this checks *process* liveness, not lease health, which the
 /// cube-lease heartbeat keeps refreshing even for dead-process
 /// executions.
+///
+/// Unlike the periodic [`spawn_loop`] pass, every reap here files a
+/// [`PANE_DEATH_ATTENTION_KIND`] attention item on the affected work
+/// item (deduped/rate-limited — see that constant's docs) so an
+/// operator has a durable, dismissable record that the relaunch reset
+/// their in-flight work, not just a `dead_pid_reconcile` line in the
+/// dispatch tail.
 pub async fn reconcile_orphans_on_reattach(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -152,6 +170,7 @@ pub async fn reconcile_orphans_on_reattach(
         live_states.as_ref(),
         coordinator,
         dispatch_events.as_ref(),
+        true,
     )
     .await;
     tracing::info!(
@@ -171,11 +190,20 @@ pub async fn reconcile_orphans_on_reattach(
 /// Takes `coordinator` as `Arc` because kicking the scheduler
 /// requires `Arc<ExecutionCoordinator>` — the kick path spawns a
 /// tokio task that holds a reference.
+///
+/// `file_pane_death_attention` gates whether each reap also files a
+/// [`PANE_DEATH_ATTENTION_KIND`] attention item on the work item. The
+/// periodic [`spawn_loop`] pass (crash/OOM/kill-9 reaps, one execution
+/// at a time) passes `false` — it already has the `dead_pid_reconcile`
+/// dispatch event and firing an attention on every crash would be
+/// noisy. [`reconcile_orphans_on_reattach`] (an app relaunch, which can
+/// reap many panes in one pass) passes `true`.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    file_pane_death_attention: bool,
 ) -> DeadPidSweepOutcome {
     let mut outcome = DeadPidSweepOutcome::default();
     let snapshot = live_states.snapshot();
@@ -328,10 +356,40 @@ pub async fn run_one_pass(
             )
             .await;
 
+        if file_pane_death_attention {
+            file_pane_death_attention_item(work_db, &execution.work_item_id, execution_id);
+        }
+
         outcome.reaped += 1;
     }
 
     outcome
+}
+
+/// File (or no-op onto an already-`open` one) a [`PANE_DEATH_ATTENTION_KIND`]
+/// attention item for `work_item_id`, naming the reaped `execution_id`.
+/// Best-effort: a filing failure is logged and swallowed — an attention
+/// item is a courtesy on top of the reap, not a precondition for it.
+fn file_pane_death_attention_item(work_db: &WorkDb, work_item_id: &str, execution_id: &str) {
+    let title = "App relaunch killed a worker pane".to_owned();
+    let body = format!(
+        "An app relaunch reset this chore: its worker pane's process died along with the \
+         previous app instance, and the engine reconciled execution `{execution_id}` — marking \
+         it orphaned and freeing its pool slot so the orphan sweep can redispatch. No work was \
+         lost beyond the in-progress turn (any uncommitted workspace changes were backed up \
+         where possible).\n\n\
+         This item is informational; dismiss it once you've confirmed the chore resumed. It \
+         won't be re-filed for this chore while it stays open, even if further relaunches kill \
+         subsequent panes."
+    );
+    if let Err(err) = work_db.upsert_work_item_attention(work_item_id, PANE_DEATH_ATTENTION_KIND, &title, &body) {
+        tracing::warn!(
+            work_item_id,
+            execution_id,
+            ?err,
+            "dead-pid sweep: failed to file pane-death attention item (non-fatal)",
+        );
+    }
 }
 
 /// Append an `[engine-reconcile]` audit line to the work item's
@@ -522,7 +580,7 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
 
         assert_eq!(outcome.reaped, 0, "live PID must not be reaped");
         assert_eq!(outcome.alive_skipped, 1);
@@ -559,7 +617,7 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
 
         assert_eq!(outcome.reaped, 0, "zero PID must be skipped");
         assert_eq!(outcome.unknown_pid_skipped, 1);
@@ -597,7 +655,7 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
 
         assert_eq!(outcome.reaped, 0, "grace period must prevent reaping fresh executions");
         assert_eq!(outcome.grace_skipped, 1);
@@ -628,7 +686,7 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
 
         assert_eq!(outcome.reaped, 0, "missing started_at must be treated as too fresh");
         assert_eq!(outcome.grace_skipped, 1);
@@ -659,7 +717,7 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
 
         assert_eq!(
             outcome.reaped, 0,
@@ -695,7 +753,7 @@ mod tests {
         );
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
 
         assert_eq!(outcome.reaped, 1, "dead-PID execution must be reaped");
         assert_eq!(outcome.alive_skipped, 0);
@@ -731,6 +789,15 @@ mod tests {
         assert!(
             desc.contains("[engine-reconcile]"),
             "task description must contain the engine-reconcile audit line; got: {desc:?}",
+        );
+
+        // The periodic sweep (file_pane_death_attention = false) must NOT
+        // file a pane-death attention item — that's reserved for the
+        // reattach path so routine crash reaps stay quiet.
+        let attention_items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attention_items.is_empty(),
+            "periodic dead-pid sweep must not file a pane-death attention item; got: {attention_items:?}",
         );
     }
 
@@ -785,6 +852,72 @@ mod tests {
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
+
+        // Unlike the periodic sweep, the reattach path files a durable
+        // pane-death attention item on the work item.
+        let attention_items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert_eq!(
+            attention_items.len(),
+            1,
+            "reattach reconcile must file exactly one pane-death attention item; got: {attention_items:?}",
+        );
+        assert_eq!(attention_items[0].kind, PANE_DEATH_ATTENTION_KIND);
+        assert_eq!(attention_items[0].status, "open");
+    }
+
+    /// A single app relaunch that kills panes across several redispatch
+    /// generations of the SAME chore must not pile up duplicate attention
+    /// items — the second reattach reconcile against a fresh execution for
+    /// the same (still-unacked) work item reuses the still-open item from
+    /// the first.
+    #[tokio::test]
+    async fn reattach_reconcile_dedupes_pane_death_attention_across_redispatches() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let db = Arc::new(db);
+
+        // First generation: reaped by one reattach reconcile.
+        let first_execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &first_execution_id, dead_pid(), &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&first_execution_id, None).await;
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = reconcile_orphans_on_reattach(
+            db.clone(),
+            live_states.clone(),
+            coordinator.clone(),
+            sink.clone() as Arc<dyn DispatchEventSink>,
+            1111,
+            2222,
+        )
+        .await;
+        assert_eq!(outcome.reaped, 1);
+
+        // Second generation: a fresh execution for the same chore, killed
+        // by a second relaunch before anyone acked the first attention item.
+        let second_execution_id = create_old_execution(&db, &work_item_id);
+        register_slot_with_binding(&live_states, 2, &second_execution_id, dead_pid(), &work_item_id);
+        coordinator.worker_pool().claim_worker(&second_execution_id, None).await;
+        let outcome = reconcile_orphans_on_reattach(
+            db.clone(),
+            live_states.clone(),
+            coordinator.clone(),
+            sink.clone() as Arc<dyn DispatchEventSink>,
+            2222,
+            3333,
+        )
+        .await;
+        assert_eq!(outcome.reaped, 1, "second relaunch must still reap the fresh execution");
+
+        let attention_items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert_eq!(
+            attention_items.len(),
+            1,
+            "repeated relaunches must not pile up duplicate pane-death attention items; got: {attention_items:?}",
+        );
+        assert_eq!(attention_items[0].kind, PANE_DEATH_ATTENTION_KIND);
     }
 
     /// A worker whose process outlived the relaunch (live PID) is never
