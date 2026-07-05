@@ -643,7 +643,7 @@ private extension View {
 /// opens immediately on click and resolves content asynchronously.
 enum MarkdownDocLoadState {
     case loading
-    case loaded(title: String, markdown: String)
+    case loaded(title: String, markdown: String, artifact: CommentArtifactRef?)
     case failed(title: String, message: String)
 }
 
@@ -705,12 +705,13 @@ struct AsyncMarkdownViewerView: View {
             case .loading:
                 ProgressView("Loading…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .loaded(let title, let markdown):
+            case .loaded(let title, let markdown, let artifact):
                 MarkdownViewerView(
                     title: title,
                     source: markdown,
                     projectShortID: vm.pendingRenderProjectShortID ?? "",
-                    clickStartTime: vm.clickStartTime
+                    clickStartTime: vm.clickStartTime,
+                    artifact: artifact
                 )
                 // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
                 // content load, so .onAppear fires even when the window is reused across

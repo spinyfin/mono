@@ -1675,7 +1675,8 @@ final class ChatViewModel: ObservableObject {
                         await self.fetchAndUpdateAsyncMarkdownViewerVM(
                             projectName: projectName,
                             rawURL: rawURL,
-                            projectShortID: shortID
+                            projectShortID: shortID,
+                            artifact: resolved.commentArtifact
                         )
                     }
                 } else {
@@ -1758,12 +1759,16 @@ final class ChatViewModel: ObservableObject {
     /// Fetch raw markdown from `rawURL` and update [[asyncMarkdownViewerVM]]
     /// state. Called after the viewer window is already open in `.loading`
     /// state. Transitions to `.loaded` on success or `.failed` on error so
-    /// the window always resolves to a terminal state.
+    /// the window always resolves to a terminal state. `artifact` (built by
+    /// the caller from the resolved doc's repo/branch/path, mirroring
+    /// `DesignRendererContent.commentArtifact`) is carried into `.loaded` so
+    /// comments on this viewer are engine-backed instead of in-memory.
     @MainActor
     func fetchAndUpdateAsyncMarkdownViewerVM(
         projectName: String,
         rawURL: URL,
-        projectShortID: String
+        projectShortID: String,
+        artifact: CommentArtifactRef? = nil
     ) async {
         let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
         do {
@@ -1775,7 +1780,7 @@ final class ChatViewModel: ObservableObject {
             asyncMarkdownViewerVM.pendingRenderProjectShortID = projectShortID
             asyncMarkdownViewerVM.renderStartTime = Date()
             asyncMarkdownViewerVM.renderContentID = UUID()
-            asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown)
+            asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown, artifact: artifact)
         } catch {
             asyncMarkdownViewerVM.state = .failed(
                 title: title,

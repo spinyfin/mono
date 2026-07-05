@@ -20,7 +20,7 @@ extension ChatViewModel {
             return
         case .broken(let reason):
             workErrorMessage = "Doc pointer is broken: \(reason)"
-        case .resolved(_, _, let webURL, let rawContentURL):
+        case .resolved(let resolved, _, let webURL, let rawContentURL):
             // Prefer fetching via rawContentURL (GitHub API): correct for both
             // the in-review (PR head branch) and merged (main) cases, because
             // the ref is baked into the URL.
@@ -37,7 +37,8 @@ extension ChatViewModel {
                         await self.fetchAndUpdateAsyncMarkdownViewerVM(
                             projectName: displayName,
                             rawURL: rawURL,
-                            projectShortID: shortID
+                            projectShortID: shortID,
+                            artifact: resolved.commentArtifact
                         )
                     }
                 } else {

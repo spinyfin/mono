@@ -377,9 +377,17 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             "expected no local-file open for in-review branch; got: \(openedLocalFiles)"
         )
         // After the fetch settles the VM must be in the loaded state.
-        if case .loaded(let title, let markdown) = model.asyncMarkdownViewerVM.state {
+        if case .loaded(let title, let markdown, let artifact) = model.asyncMarkdownViewerVM.state {
             XCTAssertEqual(title, project.name)
             XCTAssertEqual(markdown, "# Design Doc")
+            XCTAssertEqual(
+                artifact,
+                CommentArtifactRef.prDoc(
+                    repoRemoteURL: "git@github.com:foo/bar.git",
+                    branch: "design-boss-ci-buildkite",
+                    path: "tools/boss/docs/designs/x.md"
+                )
+            )
         } else {
             XCTFail("expected .loaded state after fetch; got \(model.asyncMarkdownViewerVM.state)")
         }
@@ -438,8 +446,16 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             openedLocalFiles.isEmpty,
             "dispatcher must not open a local file when rawContentURL is present; got: \(openedLocalFiles)"
         )
-        if case .loaded(let title, _) = model.asyncMarkdownViewerVM.state {
+        if case .loaded(let title, _, let artifact) = model.asyncMarkdownViewerVM.state {
             XCTAssertEqual(title, project.name)
+            XCTAssertEqual(
+                artifact,
+                CommentArtifactRef.prDoc(
+                    repoRemoteURL: "git@github.com:foo/bar.git",
+                    branch: "main",
+                    path: "tools/boss/docs/designs/x.md"
+                )
+            )
         } else {
             XCTFail("expected .loaded after fetch; got \(model.asyncMarkdownViewerVM.state)")
         }

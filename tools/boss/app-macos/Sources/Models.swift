@@ -643,6 +643,14 @@ struct ResolvedDesignDoc: Codable, Hashable {
         case path
         case kind
     }
+
+    /// The engine-keyed comment artifact (`pr_doc:<repo_remote_url>:<branch>:<path>`)
+    /// this resolved doc corresponds to. `nil` when any component is empty
+    /// (defensive; the engine should never send empty values in practice).
+    var commentArtifact: CommentArtifactRef? {
+        guard !repoRemoteURL.isEmpty, !branch.isEmpty, !path.isEmpty else { return nil }
+        return .prDoc(repoRemoteURL: repoRemoteURL, branch: branch, path: path)
+    }
 }
 
 /// Swift mirror of `boss_protocol::ProjectDesignDocState`. Drives
