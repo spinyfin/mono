@@ -6112,6 +6112,56 @@ mod tests {
         }
     }
 
+    /// The standard completion-handler test harness: a
+    /// [`WorkerCompletionHandler`] wired to the four recording stubs, bundled
+    /// with the stub `Arc`s so post-run assertions can still reach them
+    /// (`cube.release_calls`, `publisher.events`, `pane.calls`,
+    /// `probes.snapshot()`).
+    ///
+    /// The PR detector varies across tests (`StubPrDetector::ok(None)`,
+    /// `detector.clone()`, bespoke detectors, …), so it is a parameter rather
+    /// than baked in. Tests that need extra wiring keep chaining the existing
+    /// `.with_*()` builders on the returned `handler`.
+    struct TestHarness {
+        handler: WorkerCompletionHandler,
+        cube: Arc<StubCubeClient>,
+        publisher: Arc<RecordingPublisher>,
+        pane: Arc<RecordingPaneReleaser>,
+        probes: Arc<RecordingProbeQueuer>,
+    }
+
+    impl TestHarness {
+        /// Build the harness with a default (`Reaped`) pane releaser.
+        fn new(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>) -> Self {
+            Self::with_pane(db, detector, Arc::new(RecordingPaneReleaser::default()))
+        }
+
+        /// Same as [`TestHarness::new`] but with a caller-supplied pane
+        /// releaser — for the few tests that wire a
+        /// `PaneReleaseOutcome::NoLiveWorker` pane to exercise the
+        /// lease-release gate.
+        fn with_pane(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>, pane: Arc<RecordingPaneReleaser>) -> Self {
+            let cube = Arc::new(StubCubeClient::default());
+            let publisher = Arc::new(RecordingPublisher::default());
+            let probes = Arc::new(RecordingProbeQueuer::default());
+            let handler = WorkerCompletionHandler::new(
+                db,
+                detector,
+                cube.clone(),
+                publisher.clone(),
+                pane.clone(),
+                probes.clone(),
+            );
+            Self {
+                handler,
+                cube,
+                publisher,
+                pane,
+                probes,
+            }
+        }
+    }
+
     /// Build a WorkDb plus a chore in `waiting_human` execution state with
     /// a cube lease attached — this is the state the engine is in once
     /// `PaneSpawnRunner::run_execution` has returned and
@@ -6243,12 +6293,10 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane.clone(), probes);
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -6301,12 +6349,10 @@ mod tests {
         db.transition_comment_to_answered(&comment_id).unwrap();
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane.clone(), probes);
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -6416,19 +6462,14 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution_id).await;
 
         // P992 task 7: chore_implementation now enqueues a reviewer and holds
@@ -6501,28 +6542,24 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
-            &execution_id,
-            &BranchNaming::BossExecPrefix,
-            None,
-        )));
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+                &execution_id,
+                &BranchNaming::BossExecPrefix,
+                None,
+            )));
 
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds the task and enqueues reviewer.
@@ -6583,21 +6620,10 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // No `with_staged_pr_urls` call — handler uses the default
         // empty cache. The detector must be invoked.
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds the task and enqueues reviewer.
         assert!(
@@ -6631,28 +6657,18 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::err("jj broken");
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
-            &execution_id,
-            &BranchNaming::BossExecPrefix,
-            None,
-        )));
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+                &execution_id,
+                &BranchNaming::BossExecPrefix,
+                None,
+            )));
 
         // Detector intentionally returns Err — if recheck called it,
         // recheck would surface `DetectorFailed`. With the staged
@@ -6692,26 +6708,16 @@ mod tests {
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Detector returns None → this execution has no PR yet.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/579");
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_staged_pr_urls(staged_pr_urls.clone())
-        // PR #579 belongs to a DIFFERENT execution's branch — simulate
-        // the mismatch that killed T520's worker.
-        .with_branch_verifier(StubBranchVerifier::ok("boss/exec_some_other_exec_id"));
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            // PR #579 belongs to a DIFFERENT execution's branch — simulate
+            // the mismatch that killed T520's worker.
+            .with_branch_verifier(StubBranchVerifier::ok("boss/exec_some_other_exec_id"));
 
         let outcome = handler.recheck_for_pr(&execution_id).await;
         assert_eq!(
@@ -6753,24 +6759,14 @@ mod tests {
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Detector returns None → no real PR for this execution's branch.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok("boss/exec_completely_different_id"));
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_branch_verifier(StubBranchVerifier::ok("boss/exec_completely_different_id"));
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -6811,10 +6807,6 @@ mod tests {
         // would surface as a wrong pr_url, proving the staged URL was
         // (incorrectly) dropped.
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
@@ -6830,16 +6822,10 @@ mod tests {
             "test must exercise a real prefix divergence"
         );
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&divergent_branch));
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_branch_verifier(StubBranchVerifier::ok(&divergent_branch));
 
         let outcome = handler.on_stop(&execution_id).await;
         // P992 (regression fix): chore_implementation advances to in_review and
@@ -6873,19 +6859,14 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution_id).await;
 
         assert_eq!(outcome, StopOutcome::AwaitingInput);
@@ -6932,19 +6913,14 @@ mod tests {
             url: "https://github.com/foo/bar/pull/42".into(),
             reason: "local HEAD abcd1234 is ahead of PR head 9876fedc".into(),
         });
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution_id).await;
 
         match outcome {
@@ -6991,19 +6967,14 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, _, _, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::err("gh broken");
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db,
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db, detector);
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(outcome, StopOutcome::DetectorFailed);
         assert!(cube.release_calls.lock().await.is_empty());
@@ -7018,20 +6989,15 @@ mod tests {
     #[tokio::test]
     async fn unknown_execution_is_a_noop() {
         let detector = StubPrDetector::ok(Some("https://github.com/x/y/pull/1"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let handler = WorkerCompletionHandler::new(
-            db,
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db, detector);
         let outcome = handler.on_stop("not-an-execution").await;
         assert_eq!(outcome, StopOutcome::UnknownExecution);
         assert!(cube.release_calls.lock().await.is_empty());
@@ -7044,19 +7010,10 @@ mod tests {
     async fn force_release_releases_pane_and_cube_lease_then_idempotent() {
         let workspace = tempdir().unwrap();
         let (db, _, _, execution_id) = fixture(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
         handler.force_release(&execution_id).await;
 
@@ -7084,23 +7041,14 @@ mod tests {
     async fn force_release_no_lease_skips_cube_release() {
         let workspace = tempdir().unwrap();
         let (db, _, _, execution_id) = fixture(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // Pre-clear the lease so force_release can confirm it skips
         // cube release when there's nothing to release.
         db.clear_execution_workspace(&execution_id).unwrap();
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
         handler.force_release(&execution_id).await;
         assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
@@ -7118,19 +7066,9 @@ mod tests {
     async fn force_release_mid_spawn_holds_cube_lease() {
         let workspace = tempdir().unwrap();
         let (db, _, _, execution_id) = fixture(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
-        let probes = Arc::new(RecordingProbeQueuer::default());
-
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness { handler, cube, .. } =
+            TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
 
         handler.force_release(&execution_id).await;
 
@@ -7159,19 +7097,9 @@ mod tests {
     async fn cancel_and_release_mid_spawn_cancels_row_but_holds_lease() {
         let workspace = tempdir().unwrap();
         let (db, _, chore_id, execution_id) = fixture(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
-        let probes = Arc::new(RecordingProbeQueuer::default());
-
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness { handler, cube, .. } =
+            TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
 
         handler
             .cancel_and_release(&chore_id, &execution_id, "test: mid-spawn cancel")
@@ -7201,19 +7129,8 @@ mod tests {
     async fn cancel_and_release_with_live_worker_releases_lease() {
         let workspace = tempdir().unwrap();
         let (db, _, chore_id, execution_id) = fixture(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default()); // defaults to Reaped
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
         handler
             .cancel_and_release(&chore_id, &execution_id, "test: live worker cancel")
@@ -7248,19 +7165,10 @@ mod tests {
     async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execution() {
         let workspace = tempdir().unwrap();
         let (db, _, chore_id, execution_id) = fixture_running(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default()); // defaults to Reaped
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
         // This is the call that handle_delete_work_item spawns when it detects
         // a live execution for a work item being deleted.
@@ -7323,19 +7231,9 @@ mod tests {
     async fn delete_while_dispatching_cancels_row_but_holds_lease_for_inflight_spawn() {
         let workspace = tempdir().unwrap();
         let (db, _, chore_id, execution_id) = fixture_running(workspace.path());
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
-        let probes = Arc::new(RecordingProbeQueuer::default());
-
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness { handler, cube, .. } =
+            TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
 
         // This is the call that handle_delete_work_item spawns when it
         // detects a live (here: mid-dispatch) execution for a work item
@@ -7376,18 +7274,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         let (db, _, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes,
-        );
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
 
         // P992 task 7: first Stop enqueues reviewer and holds task in active.
         assert!(matches!(
@@ -7421,19 +7308,14 @@ mod tests {
         let detector = StubPrDetector::ok_status(PrStatus::Merged {
             url: "https://github.com/foo/bar/pull/42".into(),
         });
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution_id).await;
         match outcome {
             StopOutcome::PrMerged { pr_url } => {
@@ -7487,18 +7369,9 @@ mod tests {
         let detector = StubPrDetector::ok_status(PrStatus::Closed {
             url: "https://github.com/foo/bar/pull/9".into(),
         });
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
         assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput);
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
@@ -7543,12 +7416,8 @@ mod tests {
         db.mark_conflict_resolution_running(&attempt.id, "lease-x", "ws-x", "worker-x")
             .unwrap();
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher.clone(), pane, probes);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
         let _ = handler.on_stop(&execution_id).await;
 
         // The chore_implementation execution must not touch the
@@ -7585,22 +7454,8 @@ mod tests {
         }
         let detector = Arc::new(PerBranchDetector);
 
-        let alice_handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        );
-        let bob_handler = WorkerCompletionHandler::new(
-            bob_db.clone(),
-            detector,
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        );
+        let alice_handler = TestHarness::new(db.clone(), detector.clone()).handler;
+        let bob_handler = TestHarness::new(bob_db.clone(), detector).handler;
 
         let alice_outcome = alice_handler.on_stop(&alice_exec).await;
         let bob_outcome = bob_handler.on_stop(&bob_exec).await;
@@ -7713,14 +7568,9 @@ mod tests {
             .unwrap();
         }
 
-        let cube = Arc::new(StubCubeClient::default());
-        let handler = WorkerCompletionHandler::new(
+        let TestHarness { handler, cube, .. } = TestHarness::new(
             db.clone(),
             StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/910")),
-            cube.clone(),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
         );
 
         // The stale occupant's leaked Stop must be ignored.
@@ -7808,19 +7658,14 @@ mod tests {
         let (db, _product_id, chore_id, execution_id) = fixture_running(workspace.path());
 
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector.clone());
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -7855,19 +7700,8 @@ mod tests {
         // Fixture leaves the execution in `waiting_human`; the on-Stop
         // handler should fall through to the detector.
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/501"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
@@ -7895,19 +7729,14 @@ mod tests {
         let detector = StubPrDetector::ok_status(PrStatus::EmptyDiff {
             url: "https://github.com/foo/bar/pull/77".into(),
         });
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution_id).await;
 
         match outcome {
@@ -8026,19 +7855,8 @@ PR #379. PR #379.";
         // returns `None` rather than misbinding to one of the PRs
         // mentioned in the description text.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution.id).await;
         assert_eq!(outcome, StopOutcome::AwaitingInput);
 
@@ -8145,12 +7963,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workers_actual_pr = "https://github.com/spinyfin/mono/pull/500";
         let description_mentioned_pr = "https://github.com/spinyfin/mono/pull/379";
         let detector = StubPrDetector::ok(Some(workers_actual_pr));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher, pane, probes);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
         let outcome = handler.on_stop(&execution.id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
         match outcome {
@@ -8210,19 +8024,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // promote the chore.
         let workers_pr = "https://github.com/foo/bar/pull/415";
         let detector = StubPrDetector::ok(Some(workers_pr));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-
-        let handler = Arc::new(WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        ));
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
+        let handler = Arc::new(handler);
 
         // Wire a no-op MergeProbe — the test exercises only the
         // pending-PR-detection arm of the sweep, not the in-review
@@ -8306,19 +8115,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
         let outcome = handler.recheck_for_pr(&execution_id).await;
         assert_eq!(outcome, StopOutcome::AwaitingInput);
 
@@ -8357,19 +8161,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             url: "https://github.com/foo/bar/pull/42".into(),
             reason: "local HEAD ahead of PR head".into(),
         });
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db,
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db, detector);
         let outcome = handler.recheck_for_pr(&execution_id).await;
         match outcome {
             StopOutcome::StalePr { .. } => {}
@@ -8513,18 +8312,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             url: "https://github.com/spinyfin/mono/pull/433".into(),
             reason: "local commits do not match PR head abc1234".into(),
         });
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector.clone());
 
         struct NoOpProbe;
         #[async_trait]
@@ -8692,10 +8486,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // accidental fall-through would surface as a wrong pr_url on
         // the chore.
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let flags_dir = tempdir().unwrap();
         let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -8704,15 +8494,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         flags.load().unwrap();
         flags.set("detect_pr_cold_fallback", false).unwrap();
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_feature_flags(flags.clone());
+        let TestHarness {
+            handler, pane, probes, ..
+        } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler.with_feature_flags(flags.clone());
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(outcome, StopOutcome::FallbackDisabledByFlag);
@@ -8757,15 +8542,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn recheck_for_pr_skips_detector_when_feature_flag_is_off() {
         let workspace = tempdir().unwrap();
-        let (_db_product_id, execution_id, detector, cube, publisher, pane, probes, db) = {
-            let (db, product_id, _chore_id, execution_id) = fixture(workspace.path());
-            let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
-            let cube = Arc::new(StubCubeClient::default());
-            let publisher = Arc::new(RecordingPublisher::default());
-            let pane = Arc::new(RecordingPaneReleaser::default());
-            let probes = Arc::new(RecordingProbeQueuer::default());
-            (product_id, execution_id, detector, cube, publisher, pane, probes, db)
-        };
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
 
         let flags_dir = tempdir().unwrap();
         let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -8774,15 +8552,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         flags.load().unwrap();
         flags.set("detect_pr_cold_fallback", false).unwrap();
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_feature_flags(flags.clone());
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler.with_feature_flags(flags.clone());
 
         let outcome = handler.recheck_for_pr(&execution_id).await;
         assert_eq!(outcome, StopOutcome::FallbackDisabledByFlag);
@@ -8799,10 +8570,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let flags_dir = tempdir().unwrap();
         let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -8810,15 +8577,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         ));
         flags.load().unwrap(); // missing file → registry default (true)
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_feature_flags(flags);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler.with_feature_flags(flags);
 
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
@@ -8894,25 +8654,20 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // engine sees on a resume because the detector searches by
         // `boss/<new-execution-id>`, which has no PR.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         let verifier = StubBranchVerifier::ok("boss/exec_old");
         // Worker pushed a fix commit: head SHA moved.
         verifier
             .set_head_oid(Ok("2222222222222222222222222222222222222222".into()))
             .await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
@@ -8964,23 +8719,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let head = "1111111111111111111111111111111111111111";
         let (db, _product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head);
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         let verifier = StubBranchVerifier::ok("boss/exec_old");
         // Head SHA matches the snapshot — worker didn't push.
         verifier.set_head_oid(Ok(head.into())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -9025,19 +8771,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // No `chore.pr_url` set; no `pr_head_before` snapshot.
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
@@ -9083,19 +8818,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         .unwrap();
         // Intentionally NOT calling `set_execution_pr_head_before`.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -9137,20 +8861,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Cold-path detector finds no PR on the remediation exec's own
         // branch — exactly the Worf false miss.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // Default cap is 3: nudges 1..=3 fire, the 4th trips.
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
 
         let mut outcomes = Vec::new();
         for _ in 0..4 {
@@ -9223,19 +8941,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Detector finds no PR on the remediation exec's own branch — the
         // same false miss that would otherwise drive the nudge loop.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         // Probe it several times: every Stop must park, never nudge.
         let mut outcomes = Vec::new();
@@ -9290,20 +8997,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_max_unproductive_nudges(2);
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_max_unproductive_nudges(2);
 
         let o1 = handler.on_stop(&execution_id).await;
         let o2 = handler.on_stop(&execution_id).await;
@@ -9425,19 +9127,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
              main; the working copy has no diff.\n\nNO_CHANGES_NEEDED\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -9514,19 +9211,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "## Summary\nI made some progress but have not finished the change yet.\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -9574,11 +9260,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
              [effort-escalation] requested_level=large reason=\"multi-subsystem race; rule-3 missed\"\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -9634,11 +9316,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "I need guidance before proceeding.\n\n[effort-escalation]\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -9669,11 +9347,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "[blocked] reason=\"bazel E0583, survives clean --expunge; need explicit direction\"\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -9710,19 +9384,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "[blocked] reason=\"need a decision on approach A vs B before I can continue\"\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher,
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_max_unproductive_nudges(2); // lower than the number of Stops below
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_max_unproductive_nudges(2); // lower than the number of Stops below
 
         // Fire more Stops than the (lowered) breaker cap. If the blocked
         // marker were not correctly suppressing the breaker, this would
@@ -9786,11 +9455,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "[blocked] reason=\"need a decision on approach A vs B\"\n",
         );
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome1 = handler.on_stop(&execution_id).await;
         assert!(
@@ -9957,19 +9622,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Cold-path detector returns None — correct for revisions which
         // have no branch of their own.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -10090,19 +9744,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
         let outcome = handler.on_stop(&execution.id).await;
         assert!(
@@ -10136,19 +9779,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // First two stops find no PR; the third finds a fresh PR.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
 
         assert!(matches!(
             handler.on_stop(&execution_id).await,
@@ -10194,22 +9826,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         )
         .unwrap();
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         let verifier = StubBranchVerifier::ok("boss/exec_old");
         verifier.set_head_oid(Ok("abcdef0123456789".into())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         // Before the hook: no snapshot.
         assert_eq!(db.get_execution(&execution_id).unwrap().pr_head_before, None);
@@ -10226,24 +9847,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         let verifier = StubBranchVerifier::ok("boss/exec_old");
         // A verifier that would explode if called — we expect it not
         // to be touched at all when no PR is bound.
         verifier.set_head_oid(Err("must not be called".into())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         handler.on_execution_started(&execution_id).await;
         assert_eq!(
@@ -10312,11 +9922,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn recheck_for_pr_late_binds_pr_to_active_task() {
         let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher, pane, probes);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
 
         let candidate = crate::work::LatePrCandidate {
             execution_id: execution_id.clone(),
@@ -10347,11 +9953,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
         let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
         let detector = StubPrDetector::ok(None); // no PR found
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher, pane, probes);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
 
         let candidate = crate::work::LatePrCandidate {
             execution_id: execution_id.clone(),
@@ -10499,25 +10101,20 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Cold-path detector returns None — correct for revisions which
         // have no branch of their own.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         // Branch verifier: SHA moved (worker pushed the revision commit).
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier
             .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
             .await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let outcome = handler.recheck_for_pr(&execution_id).await;
 
@@ -10571,23 +10168,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         // Branch verifier: SHA unchanged.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let outcome = handler.recheck_for_pr(&execution_id).await;
 
@@ -10670,20 +10258,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -10742,20 +10324,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         ))));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -10804,19 +10380,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         verifier.set_body(Ok("unchanged body".into())).await; // identical → no delta
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let _ = handler.on_stop(&execution_id).await;
         assert!(
@@ -10857,20 +10424,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.recheck_for_pr(&execution_id).await;
         assert!(
@@ -10912,20 +10469,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.recheck_for_pr(&execution_id).await;
         assert_eq!(
@@ -10981,20 +10532,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
             .await;
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -11060,20 +10606,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .await;
         // Cold-path detector returns None — revision has no branch of its own.
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -11152,20 +10687,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // landed and the deliverable is satisfied even though we can't prove
         // it via SHA comparison.
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -11244,20 +10774,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::ci_failing(
             failures,
         ))));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(
@@ -11417,10 +10938,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None); // no branch-keyed PR
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // SHA-delta gate: head unchanged → NoContribution.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -11447,16 +10964,16 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
         }
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(Arc::new(CleanMergeProbe));
+        let TestHarness {
+            handler,
+            cube,
+            publisher,
+            pane,
+            probes,
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(CleanMergeProbe));
 
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -11571,25 +11088,16 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
         // The merge commit resolving the conflict landed and CI is clean —
         // direct, SHA-independent evidence the deliverable is satisfied.
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(crate::merge_poller::PrLifecycleState::Open(
             crate::merge_poller::OpenPrStatus::clean(),
         )));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -11640,10 +11148,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // SHA-delta gate: head unchanged → NoContribution.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -11670,16 +11174,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
         }
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(Arc::new(ConflictingMergeProbe));
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(ConflictingMergeProbe));
 
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -11735,10 +11233,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // SHA-delta gate: head unchanged → NoContribution (worker didn't
         // push this run — the conflict was already gone before it started).
@@ -11752,16 +11246,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ci: OpenPrCiStatus::InFlight,
         })));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -11805,11 +11291,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher.clone(), pane, probes);
+        let TestHarness { handler, publisher, .. } = TestHarness::new(db.clone(), detector);
 
         let execution = db.get_execution(&execution_id).unwrap();
         handler
@@ -11860,11 +11342,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher.clone(), pane, probes);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
 
         let execution = db.get_execution(&execution_id).unwrap();
         for outcome in [StopOutcome::AwaitingInput, StopOutcome::DetectorFailed] {
@@ -12040,10 +11518,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
@@ -12062,16 +11536,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
         }
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(Arc::new(OtherFailingProbe));
+        let TestHarness {
+            handler,
+            publisher,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(OtherFailingProbe));
 
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -12129,10 +11602,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
@@ -12150,16 +11619,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
         }
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(Arc::new(TargetFailingProbe));
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(TargetFailingProbe));
 
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -12196,10 +11659,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
@@ -12214,16 +11673,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
         }
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(Arc::new(InFlightProbe));
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(InFlightProbe));
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -12553,19 +12006,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         // Detector for repo-A always finds the expected PR.
         let detector_a = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/10"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector_a.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector_a.clone());
         let outcome = handler.on_stop(&execution_id).await;
 
         // Verify the detector was called with the execution's own repo_remote_url.
@@ -12599,19 +12041,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         let expected_hash_branch = expected_branch_name(&execution_id, &BranchNaming::OpaqueHash, None);
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/77"));
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector.clone(),
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        );
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
@@ -12673,16 +12104,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // The first-review guard must prevent that.
         verifier.set_diff_line_count(Ok(0)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -12703,16 +12128,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Current head == last_reviewed_sha → skip.
         verifier.set_head_oid(Ok(SAME_SHA.to_owned())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -12734,16 +12153,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
         verifier.set_diff_line_count(Ok(0)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -12764,17 +12177,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // 5 changed lines, threshold is 10 → trivial → skip.
         verifier.set_diff_line_count(Ok(5)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier)
-        .with_min_review_changed_lines(10);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier)
+            .with_min_review_changed_lines(10);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -12795,17 +12202,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // 10 changed lines, threshold is 10 → not trivial → review.
         verifier.set_diff_line_count(Ok(10)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier)
-        .with_min_review_changed_lines(10);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier)
+            .with_min_review_changed_lines(10);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -12827,16 +12228,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // must NOT be treated as trivial.
         verifier.set_diff_line_count(Ok(1)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier);
         // min_review_changed_lines uses the default (0 = disabled)
 
         let outcome = handler.on_stop(&execution_id).await;
@@ -12857,16 +12252,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Simulate a GitHub API failure when fetching the PR head OID.
         verifier.set_head_oid(Err("simulated API error".to_owned())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -13125,15 +12514,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker());
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         assert!(
@@ -13177,15 +12560,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker());
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         let revision_task_id = match &outcome {
@@ -13241,15 +12618,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker());
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         assert!(
@@ -13324,18 +12695,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker())
-        .with_structured_output_dir(out_dir.path().to_path_buf())
-        // max=1: first Stop re-prompts (Proceed), second Stop trips.
-        .with_max_unproductive_nudges(1);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker())
+            .with_structured_output_dir(out_dir.path().to_path_buf())
+            // max=1: first Stop re-prompts (Proceed), second Stop trips.
+            .with_max_unproductive_nudges(1);
 
         // First Stop: re-prompt.
         let first = handler.on_stop(&pr_review_exec_id).await;
@@ -13387,16 +12752,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         )
         .unwrap();
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker())
-        .with_structured_output_dir(out_dir.path().to_path_buf());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker())
+            .with_structured_output_dir(out_dir.path().to_path_buf());
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         assert!(
@@ -13434,15 +12793,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture_with_jsonl(workspace.path(), Some(&jsonl));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker());
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         assert!(
@@ -13524,15 +12877,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_pr_state_checker(open_pr_checker());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker());
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         assert!(
@@ -13634,17 +12981,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // diff line count doesn't matter here (cycle bound fires before noop gate).
         verifier.set_diff_line_count(Ok(999)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged)
-        .with_branch_verifier(verifier)
-        .with_max_review_cycles(max_cycles);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged)
+            .with_branch_verifier(verifier)
+            .with_max_review_cycles(max_cycles);
 
         let outcome = handler.on_stop(&execution_id).await;
         // Cycle bound: no reviewer enqueued → task goes straight to in_review.
@@ -13703,17 +13044,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // is never skipped by the trivial rule, but set it anyway for realism).
         verifier.set_diff_line_count(Ok(50)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(staged.clone())
-        .with_branch_verifier(verifier.clone())
-        .with_pr_state_checker(open_pr_checker());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(staged.clone())
+            .with_branch_verifier(verifier.clone())
+            .with_pr_state_checker(open_pr_checker());
 
         let outcome = handler.on_stop(&chore_exec_id).await;
         assert!(
@@ -13827,18 +13162,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let rev_verifier = StubBranchVerifier::ok(&rev_branch);
         rev_verifier.set_diff_line_count(Ok(30)).await;
 
-        let handler3 = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_staged_pr_urls(rev_staged)
-        .with_branch_verifier(rev_verifier)
-        .with_pr_state_checker(open_pr_checker())
-        .with_enable_revision_triggered_reviews(true);
+        let handler3 = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_staged_pr_urls(rev_staged)
+            .with_branch_verifier(rev_verifier)
+            .with_pr_state_checker(open_pr_checker())
+            .with_enable_revision_triggered_reviews(true);
 
         let outcome3 = handler3.on_stop(&rev_exec.id).await;
         assert!(
@@ -13969,17 +13298,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .await;
         verifier.set_diff_line_count(Ok(40)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_branch_verifier(verifier)
-        .with_pr_state_checker(open_pr_checker())
-        .with_enable_revision_triggered_reviews(true);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_branch_verifier(verifier)
+            .with_pr_state_checker(open_pr_checker())
+            .with_enable_revision_triggered_reviews(true);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -14007,16 +13330,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         verifier2
             .set_head_oid(Ok("cccccccccccccccccccccccccccccccccccccccc".into()))
             .await;
-        let handler_off = WorkerCompletionHandler::new(
-            db2.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_branch_verifier(verifier2)
-        .with_pr_state_checker(open_pr_checker());
+        let handler_off = TestHarness::new(db2.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_branch_verifier(verifier2)
+            .with_pr_state_checker(open_pr_checker());
         let outcome_off = handler_off.on_stop(&execution_id2).await;
         assert!(
             !matches!(outcome_off, StopOutcome::ReviewerEnqueued { .. }),
@@ -14052,17 +13369,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .await;
         verifier.set_diff_line_count(Ok(40)).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_branch_verifier(verifier)
-        .with_pr_state_checker(open_pr_checker())
-        .with_enable_revision_triggered_reviews(true);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_branch_verifier(verifier)
+            .with_pr_state_checker(open_pr_checker())
+            .with_enable_revision_triggered_reviews(true);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -14151,17 +13462,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head_before.to_owned())).await;
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            StubPrDetector::ok(None),
-            Arc::new(StubCubeClient::default()),
-            Arc::new(RecordingPublisher::default()),
-            Arc::new(RecordingPaneReleaser::default()),
-            Arc::new(RecordingProbeQueuer::default()),
-        )
-        .with_branch_verifier(verifier)
-        .with_pr_state_checker(open_pr_checker())
-        .with_enable_revision_triggered_reviews(true);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_branch_verifier(verifier)
+            .with_pr_state_checker(open_pr_checker())
+            .with_enable_revision_triggered_reviews(true);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -14208,20 +13513,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -14272,20 +13571,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         })));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler, cube, pane, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution_id).await;
         // Gate must NOT fire — CI in-flight is not a satisfied state.
@@ -14381,20 +13670,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
-        let cube = Arc::new(StubCubeClient::default());
-        let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::default());
-        let probes = Arc::new(RecordingProbeQueuer::default());
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube.clone(),
-            publisher.clone(),
-            pane.clone(),
-            probes.clone(),
-        )
-        .with_branch_verifier(verifier)
-        .with_merge_probe(probe);
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
 
         let outcome = handler.on_stop(&execution.id).await;
         assert!(
