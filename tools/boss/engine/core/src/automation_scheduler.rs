@@ -488,10 +488,6 @@ mod tests {
         }
     }
 
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
     /// Create a daily-2pm-UTC automation. `open_task_limit` default 1.
     fn create_daily_automation(db: &WorkDb, product_id: &str) -> Automation {
         db.create_automation(

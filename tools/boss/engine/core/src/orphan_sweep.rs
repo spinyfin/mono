@@ -324,33 +324,7 @@ mod tests {
     use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name("test chore")
-                    // repo_remote_url omitted: product already has one; the invariant
-                    // disallows setting both.
-                    .build(),
-            )
-            .unwrap();
-        db.update_work_item(
-            &chore.id,
-            WorkItemPatch {
-                status: Some("active".to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        chore.id
-    }
+    use crate::work::{ExecutionStatus, WorkDb};
 
     /// Stamp tasks.updated_at to 10 minutes ago so the age guard passes.
     fn make_old(db: &WorkDb, work_item_id: &str) {
@@ -392,7 +366,7 @@ mod tests {
     async fn redispatches_active_item_with_no_execution() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         let db = Arc::new(db);
@@ -421,7 +395,7 @@ mod tests {
     async fn skips_item_with_live_execution() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         let db = Arc::new(db);
@@ -450,7 +424,7 @@ mod tests {
     async fn no_redispatch_when_all_workers_busy() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         let db = Arc::new(db);
@@ -470,7 +444,7 @@ mod tests {
     async fn churn_guard_skips_repeatedly_failing_item() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -495,7 +469,7 @@ mod tests {
     async fn no_redispatch_for_recently_activated_item() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let _work_item_id = create_active_chore(&db, &product_id);
+        let _work_item_id = create_active_chore(&db, &product_id, "test chore");
         // Deliberately do NOT call make_old — item's updated_at is NOW.
 
         let db = Arc::new(db);
@@ -519,7 +493,7 @@ mod tests {
     async fn skips_item_with_waiting_human_execution() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         // Create a ready execution then force it to waiting_human to simulate
@@ -580,7 +554,7 @@ mod tests {
     async fn running_pr_review_in_review_pool_is_not_abandoned() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         // Create a pr_review execution and force it to `running` to simulate
@@ -649,7 +623,7 @@ mod tests {
     async fn running_pr_review_not_in_any_pool_hits_defense_in_depth_skip() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
         let execution = db

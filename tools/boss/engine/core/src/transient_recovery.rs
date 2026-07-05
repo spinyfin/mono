@@ -700,7 +700,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
     use crate::transient_error::RecoveryPolicy;
-    use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
+    use crate::work::{ExecutionStatus, WorkDb};
 
     // ─── stubs ────────────────────────────────────────────────────────
 
@@ -774,30 +774,6 @@ mod tests {
     }
 
     // ─── helpers ──────────────────────────────────────────────────────
-
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name("test chore")
-                    .build(),
-            )
-            .unwrap();
-        db.update_work_item(
-            &chore.id,
-            WorkItemPatch {
-                status: Some("active".to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        chore.id
-    }
 
     /// Create a `running` execution with a backdated `started_at` (past
     /// the grace window) and a run whose transcript is `transcript_path`.
@@ -895,7 +871,7 @@ mod tests {
     async fn transient_error_nudges_live_idle_worker() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
         let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
@@ -948,7 +924,7 @@ mod tests {
     async fn nudged_worker_still_stalled_falls_back_to_orphan_respawn() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
         let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
@@ -1007,7 +983,7 @@ mod tests {
         // Exercises the pre-nudge behaviour for contexts where nudge is unavailable.
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
         let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
@@ -1059,7 +1035,7 @@ mod tests {
     async fn permanent_error_escalates_and_does_not_resume() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, AUTH_ERROR_LINE]);
         let db = Arc::new(db);
         let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
@@ -1111,7 +1087,7 @@ mod tests {
     async fn transient_error_at_cap_escalates_exhausted() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
         // Already at the cap (3 prior transient resumes).
@@ -1144,7 +1120,7 @@ mod tests {
     async fn worker_that_recovered_on_its_own_is_left_alone() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         // Error, then more work → recovered. extract_worker_error → None.
         let transcript = write_transcript(&dir, "t.jsonl", &[SOCKET_ERROR_LINE, NORMAL_LINE]);
         let db = Arc::new(db);
@@ -1186,7 +1162,7 @@ mod tests {
     async fn resumed_execution_with_no_activity_is_retried() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         // Empty transcript: the resumed session never produced a single
         // hook-visible event.
         let transcript = write_transcript(&dir, "t.jsonl", &[]);
@@ -1247,7 +1223,7 @@ mod tests {
     async fn fresh_execution_with_no_activity_is_left_alone() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[]);
         let db = Arc::new(db);
         let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
@@ -1284,7 +1260,7 @@ mod tests {
     async fn resumed_execution_with_no_activity_at_cap_escalates() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[]);
         let db = Arc::new(db);
         // Already at the cap (3 prior transient resumes).
@@ -1320,7 +1296,7 @@ mod tests {
     async fn fresh_execution_within_grace_is_skipped() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
 
@@ -1370,7 +1346,7 @@ mod tests {
     async fn actively_working_slot_is_not_inspected() {
         let (dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let transcript = write_transcript(&dir, "t.jsonl", &[SOCKET_ERROR_LINE]);
         let db = Arc::new(db);
         let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);

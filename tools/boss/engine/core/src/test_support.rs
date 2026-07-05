@@ -16,7 +16,7 @@ use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
 use crate::runner::{ExecutionRunner, RunOutcome};
-use crate::work::WorkDb;
+use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 use boss_protocol::{CreateProductInput, Product, WorkExecution};
 
 /// The mono repo remote used by the overwhelming majority of tests.
@@ -59,6 +59,35 @@ pub fn create_test_product_with_repo(db: &WorkDb, name: &str, repo_remote_url: O
         worker_branch_prefix: None,
     })
     .unwrap()
+}
+
+/// Create the standard sweep-test product — name `test-product`, repo
+/// remote `https://github.com/test/repo` — and return its id.
+///
+/// The sweep and scheduler test modules all create this exact product
+/// and keep only the id, so this replaces the byte-identical local
+/// `create_product()` each used to hand-roll.
+pub fn create_product(db: &WorkDb) -> String {
+    create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
+}
+
+/// Create a chore named `name` under `product_id`, mark it `active`, and
+/// return its id. This is the general form of the per-module
+/// `create_active_chore` helpers; call sites that hardcoded the name
+/// pass `"test chore"`.
+pub fn create_active_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
+    let chore = db
+        .create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
+        .unwrap();
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    chore.id
 }
 
 /// A [`CubeClient`] test double that never touches cube. Every method

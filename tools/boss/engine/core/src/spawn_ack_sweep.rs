@@ -374,7 +374,7 @@ mod tests {
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
+    use crate::work::{ExecutionStatus, WorkDb};
     use boss_protocol::WorkExecution;
 
     // ─── stubs (mirrors dead_pid_sweep / stale_worker_sweep) ─────────────────
@@ -484,30 +484,6 @@ mod tests {
         (dir, db)
     }
 
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name("test chore")
-                    .build(),
-            )
-            .unwrap();
-        db.update_work_item(
-            &chore.id,
-            WorkItemPatch {
-                status: Some("active".to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        chore.id
-    }
-
     /// Create a `ready` execution for `work_item_id` and stamp its
     /// `started_at` to 5 minutes ago so the grace-period guard passes.
     fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
@@ -562,7 +538,7 @@ mod tests {
     async fn silent_zero_pid_spawn_is_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -623,7 +599,7 @@ mod tests {
     async fn slot_with_reported_pid_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -667,7 +643,7 @@ mod tests {
     async fn slot_with_any_hook_event_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -712,7 +688,7 @@ mod tests {
     async fn recent_started_at_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         use boss_protocol::RequestExecutionInput;
@@ -754,7 +730,7 @@ mod tests {
     async fn non_spawning_activity_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);

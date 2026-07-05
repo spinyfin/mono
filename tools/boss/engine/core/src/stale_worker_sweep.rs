@@ -440,7 +440,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
+    use crate::work::{ExecutionStatus, WorkDb};
 
     // A staleness threshold whose cutoff lands in the *future*, so any
     // `last_event_at` stamped "now" by `apply_event` compares as stale.
@@ -494,30 +494,6 @@ mod tests {
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
-
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name("test chore")
-                    .build(),
-            )
-            .unwrap();
-        db.update_work_item(
-            &chore.id,
-            WorkItemPatch {
-                status: Some("active".to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        chore.id
-    }
 
     /// Create a `ready` execution and stamp `started_at` to 5 minutes ago
     /// so the grace-period guard passes.
@@ -602,7 +578,7 @@ mod tests {
     async fn stale_idle_worker_is_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -668,7 +644,7 @@ mod tests {
     async fn fresh_worker_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -703,7 +679,7 @@ mod tests {
     async fn worker_with_tool_in_flight_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -740,7 +716,7 @@ mod tests {
     async fn non_working_activity_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -773,7 +749,7 @@ mod tests {
     async fn recent_started_at_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         use boss_protocol::RequestExecutionInput;
@@ -826,7 +802,7 @@ mod tests {
     async fn slot_reuse_stale_prior_event_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         // The CURRENT execution started 5 minutes ago (clears the grace
@@ -896,7 +872,7 @@ mod tests {
     async fn reconcile_reaps_process_before_releasing_slot() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);

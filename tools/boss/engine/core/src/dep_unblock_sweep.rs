@@ -201,10 +201,6 @@ mod tests {
     use crate::test_support::*;
     use crate::work::{AddDependencyInput, CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
 
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
     fn create_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
         db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
             .unwrap()

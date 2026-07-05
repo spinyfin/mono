@@ -240,10 +240,6 @@ mod tests {
         (dir, db)
     }
 
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
     fn create_bounced_chore(db: &WorkDb, product_id: &str) -> String {
         let chore = db
             .create_chore(
