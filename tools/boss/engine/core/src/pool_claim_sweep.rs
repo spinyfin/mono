@@ -292,26 +292,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
-
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_active_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-        let chore = db
-            .create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
-            .unwrap();
-        db.update_work_item(
-            &chore.id,
-            WorkItemPatch {
-                status: Some("active".to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        chore.id
-    }
+    use crate::work::WorkDb;
 
     fn create_execution(db: &WorkDb, work_item_id: &str) -> String {
         use boss_protocol::RequestExecutionInput;

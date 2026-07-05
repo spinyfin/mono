@@ -469,31 +469,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name("test chore")
-                    .build(),
-            )
-            .unwrap();
-        db.update_work_item(
-            &chore.id,
-            WorkItemPatch {
-                status: Some("active".to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        chore.id
-    }
+    use crate::work::{ExecutionStatus, WorkDb};
 
     /// Create a `ready` execution for `work_item_id` and stamp its
     /// `started_at` to 5 minutes ago so the grace-period guard passes.
@@ -563,7 +539,7 @@ mod tests {
     async fn live_pid_is_not_reaped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -600,7 +576,7 @@ mod tests {
     async fn zero_pid_slot_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -630,7 +606,7 @@ mod tests {
     async fn recent_started_at_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         use boss_protocol::RequestExecutionInput;
@@ -666,7 +642,7 @@ mod tests {
     async fn missing_started_at_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         use boss_protocol::RequestExecutionInput;
@@ -698,7 +674,7 @@ mod tests {
     async fn terminal_activity_is_skipped() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -733,7 +709,7 @@ mod tests {
     async fn dead_pid_causes_orphan_and_slot_release() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -809,7 +785,7 @@ mod tests {
     async fn reattach_reconcile_reaps_dead_pid() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -874,7 +850,7 @@ mod tests {
     async fn reattach_reconcile_dedupes_pane_death_attention_across_redispatches() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         // First generation: reaped by one reattach reconcile.
@@ -927,7 +903,7 @@ mod tests {
     async fn reattach_reconcile_spares_live_pid() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);

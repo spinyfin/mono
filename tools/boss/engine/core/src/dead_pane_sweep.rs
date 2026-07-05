@@ -302,10 +302,6 @@ mod tests {
         crate::run_reconcile::current_epoch_s()
     }
 
-    fn create_product(db: &WorkDb) -> String {
-        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
     fn create_automation(db: &WorkDb, product_id: &str) -> String {
         db.create_automation(
             CreateAutomationInput::builder()
