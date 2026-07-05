@@ -707,6 +707,179 @@ mod tests {
     }
 
     #[test]
+    fn sibling_of_exe_resolves_boss_engine_next_to_current_exe() {
+        // current_exe lives in a dir that also contains a `boss-engine`
+        // sibling; no env vars set and the workspace's bazel-bin engine
+        // does not exist, so resolution should fall through to the sibling.
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("runfiles");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let fake_exe = exe_dir.join("boss");
+        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        let sibling = exe_dir.join("boss-engine");
+        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        // Workspace root with NO bazel-bin engine built.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+
+        let input = EngineResolverInput {
+            env_cmd: None,
+            env_bin: None,
+            workspace_root: Some(ws.path().to_path_buf()),
+            current_exe: Some(fake_exe.clone()),
+        };
+        let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
+        assert_eq!(cmd.program, sibling.to_string_lossy());
+        assert!(
+            cmd.source.starts_with("sibling of"),
+            "expected sibling source, got {}",
+            cmd.source
+        );
+        assert_eq!(cmd.args, vec!["--socket-path".to_owned(), "/tmp/sock".to_owned()]);
+    }
+
+    #[test]
+    fn sibling_of_exe_resolves_parent_engine_engine_candidate() {
+        // The `boss-engine` sibling is absent, but a `../engine/engine`
+        // relative to the exe's dir exists — the second sibling candidate.
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("boss").join("bin");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let fake_exe = exe_dir.join("boss");
+        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        // Second candidate: exe_dir.parent()/engine/engine == tmp/boss/engine/engine
+        let engine_dir = tmp.path().join("boss").join("engine");
+        std::fs::create_dir_all(&engine_dir).unwrap();
+        let engine_bin = engine_dir.join("engine");
+        std::fs::write(&engine_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let input = EngineResolverInput {
+            env_cmd: None,
+            env_bin: None,
+            workspace_root: None,
+            current_exe: Some(fake_exe.clone()),
+        };
+        let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
+        assert_eq!(cmd.program, engine_bin.to_string_lossy());
+        assert!(
+            cmd.source.starts_with("sibling of"),
+            "expected sibling source, got {}",
+            cmd.source
+        );
+    }
+
+    #[test]
+    fn bazel_bin_miss_falls_through_to_sibling_before_path() {
+        // Ordering guarantee: with a workspace whose bazel-bin engine is
+        // NOT built and a valid sibling next to the exe, the sibling wins
+        // and the PATH fallback is never reached. The attempted chain must
+        // record the bazel-bin miss ahead of the sibling hit.
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("runfiles");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let fake_exe = exe_dir.join("boss");
+        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        let sibling = exe_dir.join("boss-engine");
+        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+
+        let input = EngineResolverInput {
+            env_cmd: None,
+            env_bin: None,
+            workspace_root: Some(ws.path().to_path_buf()),
+            current_exe: Some(fake_exe.clone()),
+        };
+        let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
+        assert_eq!(cmd.program, sibling.to_string_lossy());
+        assert_ne!(cmd.program, "boss-engine", "must not fall through to PATH");
+
+        let chain_text = cmd.attempted.join("\n");
+        assert!(
+            chain_text.contains("bazel-bin lookup miss"),
+            "expected bazel-bin miss in chain, got: {chain_text}"
+        );
+        assert!(
+            chain_text.contains("sibling-of-exe hit"),
+            "expected sibling hit in chain, got: {chain_text}"
+        );
+        assert!(
+            !chain_text.contains("PATH lookup"),
+            "PATH fallback must not be reached, got: {chain_text}"
+        );
+        let miss_idx = chain_text.find("bazel-bin lookup miss").unwrap();
+        let hit_idx = chain_text.find("sibling-of-exe hit").unwrap();
+        assert!(miss_idx < hit_idx, "bazel-bin miss must precede sibling hit");
+    }
+
+    #[test]
+    fn env_cmd_whitespace_only_is_an_empty_command_error() {
+        // A whitespace-only BOSS_ENGINE_CMD shlex-splits to an empty vec.
+        let input = EngineResolverInput {
+            env_cmd: Some("   ".to_owned()),
+            env_bin: None,
+            workspace_root: None,
+            current_exe: None,
+        };
+        let err = resolve_engine_command_with("/tmp/sock", &input).expect_err("whitespace-only command must error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("resolved to an empty command"),
+            "expected empty-command error, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn env_cmd_unbalanced_quote_is_a_parse_error() {
+        // An unbalanced quote makes shlex::split return None.
+        let input = EngineResolverInput {
+            env_cmd: Some("/x/engine \"unterminated".to_owned()),
+            env_bin: None,
+            workspace_root: None,
+            current_exe: None,
+        };
+        let err = resolve_engine_command_with("/tmp/sock", &input).expect_err("unbalanced quote must error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to parse BOSS_ENGINE_CMD"),
+            "expected parse error, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn env_cmd_parses_program_and_multiple_args() {
+        let input = EngineResolverInput {
+            env_cmd: Some("/x/engine --a --b".to_owned()),
+            env_bin: None,
+            workspace_root: None,
+            current_exe: None,
+        };
+        let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
+        assert_eq!(cmd.program, "/x/engine");
+        assert_eq!(cmd.args, vec!["--a".to_owned(), "--b".to_owned()]);
+        assert_eq!(cmd.source, "BOSS_ENGINE_CMD env var");
+    }
+
+    #[test]
+    fn format_engine_command_joins_program_and_args_with_spaces() {
+        assert_eq!(
+            format_engine_command("/x/engine", &["--a".to_owned(), "--b".to_owned()]),
+            "/x/engine --a --b"
+        );
+        // No args -> just the program, no trailing space.
+        assert_eq!(format_engine_command("boss-engine", &[]), "boss-engine");
+    }
+
+    #[test]
+    fn format_resolution_chain_numbers_steps_and_handles_empty() {
+        assert_eq!(format_resolution_chain(&[]), "(none)");
+        let chain = format_resolution_chain(&["first step".to_owned(), "second step".to_owned()]);
+        assert_eq!(chain, "  1. first step\n  2. second step");
+    }
+
+    #[test]
     fn walk_to_workspace_root_returns_none_outside_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         // No MODULE.bazel/WORKSPACE anywhere along the path inside tmp.
