@@ -6657,10 +6657,14 @@ async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<
             existing_short_id,
             name,
             age_secs,
-        } => Err(CliError::conflict(format!(
-            "A task named {name:?} was created {age_secs}s ago as T{existing_short_id} \
-             ({existing_id}); pass --force-duplicate to create another."
-        ))),
+        } => Err(duplicate_blocked_error(
+            "A task named",
+            "to create another.",
+            &existing_id,
+            existing_short_id,
+            &name,
+            age_secs,
+        )),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -6707,10 +6711,14 @@ async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Resul
             existing_short_id,
             name,
             age_secs,
-        } => Err(CliError::conflict(format!(
-            "A chore named {name:?} was created {age_secs}s ago as T{existing_short_id} \
-             ({existing_id}); pass --force-duplicate to create another."
-        ))),
+        } => Err(duplicate_blocked_error(
+            "A chore named",
+            "to create another.",
+            &existing_id,
+            existing_short_id,
+            &name,
+            age_secs,
+        )),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -6730,10 +6738,14 @@ async fn create_investigation(client: &mut BossClient, input: CreateInvestigatio
             existing_short_id,
             name,
             age_secs,
-        } => Err(CliError::conflict(format!(
-            "An investigation named {name:?} was created {age_secs}s ago as T{existing_short_id} \
-             ({existing_id}); pass --force-duplicate to create another."
-        ))),
+        } => Err(duplicate_blocked_error(
+            "An investigation named",
+            "to create another.",
+            &existing_id,
+            existing_short_id,
+            &name,
+            age_secs,
+        )),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -7406,6 +7418,26 @@ async fn create_many_chores(client: &mut BossClient, input: CreateManyChoresInpu
     )
 }
 
+/// Build the `CliError::conflict` returned when the engine rejects a create
+/// with `WorkItemDuplicateBlocked`. Shared by the single-item create paths and
+/// the batch path so their wording stays in sync; `prefix` supplies the leading
+/// noun phrase (e.g. `"A task named"`) and `hint` the trailing `--force-duplicate`
+/// guidance. Callers keep the emitted messages byte-identical to the inlined
+/// versions they replaced.
+fn duplicate_blocked_error(
+    prefix: &str,
+    hint: &str,
+    existing_id: &str,
+    existing_short_id: i64,
+    name: &str,
+    age_secs: i64,
+) -> CliError {
+    CliError::conflict(format!(
+        "{prefix} {name:?} was created {age_secs}s ago as T{existing_short_id} \
+         ({existing_id}); pass --force-duplicate {hint}"
+    ))
+}
+
 fn handle_create_many_response<F>(event: FrontendEvent, context: &str, extract: F) -> Result<Vec<Task>, CliError>
 where
     F: Fn(WorkItem) -> Result<Task, CliError>,
@@ -7417,10 +7449,14 @@ where
             existing_short_id,
             name,
             age_secs,
-        } => Err(CliError::conflict(format!(
-            "Batch rejected: an item named {name:?} was created {age_secs}s ago as \
-             T{existing_short_id} ({existing_id}); pass --force-duplicate to bypass."
-        ))),
+        } => Err(duplicate_blocked_error(
+            "Batch rejected: an item named",
+            "to bypass.",
+            &existing_id,
+            existing_short_id,
+            &name,
+            age_secs,
+        )),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
