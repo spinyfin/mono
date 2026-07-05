@@ -1096,7 +1096,7 @@ mod tests {
     async fn reap_reported_pane_death_bypasses_grace_and_pid_checks() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         use boss_protocol::RequestExecutionInput;
@@ -1173,7 +1173,7 @@ mod tests {
     async fn reap_reported_pane_death_skips_terminal_slot() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
@@ -1211,7 +1211,7 @@ mod tests {
     async fn reap_reported_pane_death_skips_terminal_execution() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let work_item_id = create_active_chore(&db, &product_id);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
         let execution_id = create_old_execution(&db, &work_item_id);
