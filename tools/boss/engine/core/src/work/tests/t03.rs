@@ -10,14 +10,7 @@ fn rescan_orders_candidates_by_updated_at_ascending() {
     let product = create_test_product(&db);
     let mut chore_ids = Vec::new();
     for index in 0..3 {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(format!("Chore {index}"))
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), format!("Chore {index}"));
         chore_ids.push(chore.id);
     }
 
@@ -59,22 +52,8 @@ fn rescan_skips_gated_active_chore_silently() {
     let path = disk_db_path("rescan-gated");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Prereq")
-                .build(),
-        )
-        .unwrap();
-    let dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Dependent")
-                .build(),
-        )
-        .unwrap();
+    let prereq = create_test_chore(&db, product.id.clone(), "Prereq");
+    let dependent = create_test_chore(&db, product.id.clone(), "Dependent");
     // Add the blocks edge BEFORE flipping dependent to active so
     // its kanban transition lands on the gated path. We then set
     // status='active' directly via SQL to mimic state observed in
@@ -113,23 +92,8 @@ fn records_failed_execution_start_attempt() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
 
     let (execution, run) = db
         .fail_execution_start(&execution.id, "worker-1", Some("mono"), "cube workspace lease failed")
@@ -152,23 +116,8 @@ fn finishes_active_run_into_waiting_human_with_attention() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
 
     let (execution, run) = db
         .start_execution_run(
@@ -223,23 +172,8 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
 
     let (execution, run) = db
         .start_execution_run(
@@ -288,14 +222,7 @@ fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("ISO chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "ISO chore");
 
     // Hand-roll an ISO 8601 timestamp into the row to mimic the
     // pre-canonical write path that produced the mixed format.
@@ -329,22 +256,8 @@ fn dependency_add_list_and_remove_round_trip() {
     let path = temp_db_path("deps-crud");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
 
     let edge = db
         .add_dependency(AddDependencyInput {
@@ -435,12 +348,8 @@ fn dependency_add_refuses_cross_product_edges() {
     let db = WorkDb::open(path.clone()).unwrap();
     let p1 = create_test_product_with_repo(&db, "Alpha", Some("git@github.com:spinyfin/alpha.git"));
     let p2 = create_test_product_with_repo(&db, "Beta", Some("git@github.com:spinyfin/beta.git"));
-    let a = db
-        .create_chore(CreateChoreInput::builder().product_id(p1.id).name("Alpha task").build())
-        .unwrap();
-    let b = db
-        .create_chore(CreateChoreInput::builder().product_id(p2.id).name("Beta task").build())
-        .unwrap();
+    let a = create_test_chore(&db, p1.id, "Alpha task");
+    let b = create_test_chore(&db, p2.id, "Beta task");
     let err = db
         .add_dependency(AddDependencyInput {
             dependent: a.id,
@@ -463,22 +372,8 @@ fn deleting_a_task_drops_its_dependency_edges() {
     let path = temp_db_path("deps-delete-cascade");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
         prerequisite: b.id.clone(),
@@ -509,22 +404,8 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
     let path = temp_db_path("deps-auto-block");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
     // Sanity: A starts as `todo` (default).
     let a0 = db.get_work_item(&a.id).unwrap();
     let WorkItem::Chore(t) = a0 else { panic!() };
@@ -563,22 +444,8 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
     let path = temp_db_path("deps-cascade-done");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
         prerequisite: b.id.clone(),
@@ -612,22 +479,8 @@ fn auto_unblock_creates_ready_execution() {
     let path = temp_db_path("auto-unblock-creates-ready-exec");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("prereq")
-                .build(),
-        )
-        .unwrap();
-    let dep = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("dependent")
-                .build(),
-        )
-        .unwrap();
+    let prereq = create_test_chore(&db, product.id.clone(), "prereq");
+    let dep = create_test_chore(&db, product.id.clone(), "dependent");
     db.add_dependency(AddDependencyInput {
         dependent: dep.id.clone(),
         prerequisite: prereq.id.clone(),
@@ -673,30 +526,9 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
     let path = temp_db_path("deps-cascade-multi-prereq");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let prereq_b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
-    let prereq_c = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("C")
-                .build(),
-        )
-        .unwrap();
+    let dependent = create_test_chore(&db, product.id.clone(), "A");
+    let prereq_b = create_test_chore(&db, product.id.clone(), "B");
+    let prereq_c = create_test_chore(&db, product.id.clone(), "C");
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
         prerequisite: prereq_b.id.clone(),
@@ -770,22 +602,8 @@ fn prereq_regression_does_not_re_block_dependents() {
     let path = temp_db_path("deps-cascade-regression");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let dependent = create_test_chore(&db, product.id.clone(), "A");
+    let prereq = create_test_chore(&db, product.id.clone(), "B");
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
         prerequisite: prereq.id.clone(),
@@ -853,22 +671,8 @@ fn cyclic_edges_do_not_loop_the_cascade() {
     let path = temp_db_path("deps-cascade-cycle");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
 
     // Insert both edges directly to bypass `would_create_cycle`
     // and forge a 2-cycle. (The engine refuses to create this
@@ -943,14 +747,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
     };
 
     // Non-revision (chore) dependent — must NOT unblock on in_review.
-    let chore_dep = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("Chore dependent")
-                .build(),
-        )
-        .unwrap();
+    let chore_dep = create_test_chore(&db, product_id.clone(), "Chore dependent");
 
     // Gate both dependents on the parent.
     db.add_dependency(AddDependencyInput {
@@ -1047,14 +844,7 @@ fn manual_block_is_not_auto_unblocked() {
     let path = temp_db_path("deps-manual-block");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
     // Human moves A to `blocked` (no edges yet).
     db.update_work_item(
         &a.id,
@@ -1072,14 +862,7 @@ fn manual_block_is_not_auto_unblocked() {
     // Adding then removing an edge against an already-satisfied
     // prereq should not flip the manually-blocked row off
     // `blocked` (last_status_actor stays `human`).
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let b = create_test_chore(&db, product.id.clone(), "B");
     db.update_work_item(
         &b.id,
         WorkItemPatch {
@@ -1115,22 +898,8 @@ fn refuses_manual_move_off_blocked_while_gated() {
     let path = temp_db_path("deps-refuse-move");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
         prerequisite: b.id.clone(),
@@ -1159,22 +928,8 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
     let path = temp_db_path("deps-dispatcher");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
         prerequisite: b.id.clone(),
@@ -1211,22 +966,8 @@ fn request_execution_refuses_gated_work_item() {
     let path = temp_db_path("deps-req-gated");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("A")
-                .build(),
-        )
-        .unwrap();
-    let b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("B")
-                .build(),
-        )
-        .unwrap();
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
         prerequisite: b.id.clone(),
@@ -1255,22 +996,8 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     let path = temp_db_path("deps-clear-stale-block");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("prereq")
-                .build(),
-        )
-        .unwrap();
-    let dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("dependent")
-                .build(),
-        )
-        .unwrap();
+    let prereq = create_test_chore(&db, product.id.clone(), "prereq");
+    let dependent = create_test_chore(&db, product.id.clone(), "dependent");
     // Add the edge: dependent is gated by prereq.
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
@@ -2213,25 +1940,10 @@ fn blocking_a_running_dependent_cancels_its_execution() {
                 .build(),
         )
         .unwrap();
-    let dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Already running dependent")
-                .build(),
-        )
-        .unwrap();
+    let dependent = create_test_chore(&db, product.id.clone(), "Already running dependent");
 
     // Drive the dependent into the Doing column with a live worker.
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(dependent.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let execution = create_ready_chore_execution(&db, dependent.id.clone());
     db.start_execution_run(
         &execution.id,
         "la-forge",

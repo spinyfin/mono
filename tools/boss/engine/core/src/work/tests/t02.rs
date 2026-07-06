@@ -16,23 +16,8 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
     //     in-flight row. Created via `start_execution_run` so the
     //     lease columns and status flip together exactly the way
     //     the dispatcher does it in production.
-    let chore_a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Active worker")
-                .build(),
-        )
-        .unwrap();
-    let exec_a = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore_a.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore_a = create_test_chore(&db, product.id.clone(), "Active worker");
+    let exec_a = create_ready_chore_execution(&db, chore_a.id.clone());
     db.start_execution_run(
         &exec_a.id,
         "worker-1",
@@ -47,32 +32,11 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
     //     recorded. Must NOT appear: the probe has nothing to
     //     match against cube state, and the existing ghost-active
     //     sweep handles never-dispatched ready rows.
-    let chore_b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stuck in queue")
-                .build(),
-        )
-        .unwrap();
-    db.create_execution(
-        CreateExecutionInput::builder()
-            .work_item_id(chore_b.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build(),
-    )
-    .unwrap();
+    let chore_b = create_test_chore(&db, product.id.clone(), "Stuck in queue");
+    create_ready_chore_execution(&db, chore_b.id.clone());
 
     // (c) Terminal status — must NOT appear regardless of lease.
-    let chore_c = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Already done")
-                .build(),
-        )
-        .unwrap();
+    let chore_c = create_test_chore(&db, product.id.clone(), "Already done");
     db.create_execution(
         CreateExecutionInput::builder()
             .work_item_id(chore_c.id.clone())
@@ -113,23 +77,8 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
     // cube lease — exactly the shape `start_execution_run`
     // produces.  The engine restarts; the probe will classify
     // each row and feed `reconcile_active_dispatch`.
-    let live = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Worker still up")
-                .build(),
-        )
-        .unwrap();
-    let exec_live = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(live.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let live = create_test_chore(&db, product.id.clone(), "Worker still up");
+    let exec_live = create_ready_chore_execution(&db, live.id.clone());
     db.start_execution_run(
         &exec_live.id,
         "worker-1",
@@ -140,23 +89,8 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
     )
     .unwrap();
 
-    let dead = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Worker died with engine")
-                .build(),
-        )
-        .unwrap();
-    let exec_dead = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(dead.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let dead = create_test_chore(&db, product.id.clone(), "Worker died with engine");
+    let exec_dead = create_ready_chore_execution(&db, dead.id.clone());
     db.start_execution_run(
         &exec_dead.id,
         "worker-2",
@@ -167,23 +101,8 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
     )
     .unwrap();
 
-    let unknown = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cube didn't know")
-                .build(),
-        )
-        .unwrap();
-    let exec_unknown = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(unknown.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let unknown = create_test_chore(&db, product.id.clone(), "Cube didn't know");
+    let exec_unknown = create_ready_chore_execution(&db, unknown.id.clone());
     db.start_execution_run(
         &exec_unknown.id,
         "worker-3",
@@ -247,14 +166,7 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
     let path = temp_db_path("request-stale");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stale chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Stale chore");
     let stale = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -302,14 +214,7 @@ fn request_execution_reuses_ready_row_with_no_run_within_pickup_window() {
     let path = temp_db_path("request-ready-no-run-race");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Race chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Race chore");
 
     // First evaluation: no prior execution — creates the first `ready` row.
     let first = db
@@ -361,14 +266,7 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
     let path = temp_db_path("req-ci-remediation-drag");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("CI-failing chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "CI-failing chore");
     // Simulate: chore is active (UI already dragged to Doing),
     // and a previous ci_remediation worker ran but is now gone.
     db.update_work_item(
@@ -527,14 +425,7 @@ fn request_execution_suppressed_when_older_execution_is_live() {
     let path = temp_db_path("redispatch-storm-suppress");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("R693")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "R693");
 
     // The live run (La Forge): created first, so it is the OLDER row.
     let live = db
@@ -603,14 +494,7 @@ fn request_execution_redispatches_when_live_execution_not_claimed() {
     let path = temp_db_path("redispatch-storm-deadworker");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("dead-worker")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "dead-worker");
     let dead = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -652,14 +536,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
     let path = temp_db_path("runtime-follows-live");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("R693")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "R693");
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -699,23 +576,8 @@ fn mark_execution_orphaned_preserves_workspace_and_stamps_run() {
     let path = temp_db_path("reap-orphan");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Orphan candidate")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Orphan candidate");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
     let (_running, run) = db
         .start_execution_run(
             &execution.id,
@@ -756,14 +618,7 @@ fn mark_execution_orphaned_errors_on_already_terminal() {
     let path = temp_db_path("reap-already-terminal");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Already done")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Already done");
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -794,14 +649,7 @@ fn demote_active_work_item_to_todo_resets_active_card() {
     let path = temp_db_path("demote-active-to-todo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stuck in Doing")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Stuck in Doing");
     // Human dragged it to Doing → active, stamped 'human'.
     db.update_work_item(
         &chore.id,
@@ -856,14 +704,7 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
     let path = temp_db_path("reconcile-orphan-workspace");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Resumable orphan")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Resumable orphan");
     // Drive the chore into `active` so reconcile considers it.
     db.update_work_item(
         &chore.id,
@@ -873,15 +714,7 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
         },
     )
     .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
     db.start_execution_run(
         &execution.id,
         "worker-orphan",
@@ -932,14 +765,7 @@ fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
     let path = temp_db_path("reconcile-no-inherit");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cancelled predecessor")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cancelled predecessor");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -948,15 +774,7 @@ fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
         },
     )
     .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
     db.start_execution_run(
         &execution.id,
         "worker-cancel",
@@ -997,14 +815,7 @@ fn request_execution_is_idempotent_when_existing_run_is_live() {
     let path = temp_db_path("request-live");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Live chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Live chore");
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -1038,22 +849,8 @@ fn reconcile_ignores_non_active_chores() {
     let path = temp_db_path("reconcile-non-active");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let _todo_chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stays in backlog")
-                .build(),
-        )
-        .unwrap();
-    let done_chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Already done")
-                .build(),
-        )
-        .unwrap();
+    let _todo_chore = create_test_chore(&db, product.id.clone(), "Stays in backlog");
+    let done_chore = create_test_chore(&db, product.id.clone(), "Already done");
     db.update_work_item(
         &done_chore.id,
         WorkItemPatch {
@@ -1102,14 +899,7 @@ fn reconcile_skips_no_autostart_chore_until_status_changes() {
     // A second chore created normally MUST still be picked up by
     // reconcile (the no-autostart chore must not poison shared
     // reconcile state).
-    let live = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Live")
-                .build(),
-        )
-        .unwrap();
+    let live = create_test_chore(&db, product.id.clone(), "Live");
     let result = db.reconcile_product_executions(&product.id).unwrap();
     assert_eq!(result.created.len(), 1);
     assert_eq!(result.created[0].work_item_id, live.id);
@@ -1142,14 +932,7 @@ fn reconcile_skips_in_review_chore() {
     let path = temp_db_path("in-review-no-dispatch");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Already in review")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Already in review");
 
     // Simulate `boss task update --status in-review`:
     // the chore moves directly from `todo` to `in_review` without
@@ -1252,14 +1035,7 @@ fn cancel_running_execution_demotes_active_task() {
     let path = temp_db_path("cancel-exec-demote");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Running chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Running chore");
     // Manually place the chore in `active` with a `running` execution,
     // simulating what `start_execution_run` does.
     db.update_work_item(
@@ -1313,14 +1089,7 @@ fn stopping_superseded_execution_does_not_demote_row() {
     let path = temp_db_path("cancel-superseded-exec");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Redispatched chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Redispatched chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1406,14 +1175,7 @@ fn rescan_redispatches_active_chore_with_terminal_execution() {
     let path = temp_db_path("rescan-terminal");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stuck chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Stuck chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1449,14 +1211,7 @@ fn rescan_redispatches_active_chore_with_no_execution() {
     let path = temp_db_path("rescan-no-exec");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Pristine chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Pristine chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1482,14 +1237,7 @@ fn rescan_skips_active_chore_with_live_execution() {
     let path = temp_db_path("rescan-live");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Live chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Live chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1498,14 +1246,7 @@ fn rescan_skips_active_chore_with_live_execution() {
         },
     )
     .unwrap();
-    db.create_execution(
-        CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build(),
-    )
-    .unwrap();
+    create_ready_chore_execution(&db, chore.id.clone());
 
     let redispatched = db.rescan_active_dispatch().unwrap();
     assert!(
@@ -1759,26 +1500,11 @@ fn start_execution_run_clears_autostart() {
     let path = temp_db_path("start-run-clears-autostart");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Autostart chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Autostart chore");
     assert!(chore.autostart, "newly created chore should have autostart=true");
 
     // Place a ready execution so start_execution_run can run.
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
     db.start_execution_run(
         &execution.id,
         "worker-1",
@@ -2022,14 +1748,7 @@ fn stale_lease_reclaim_skips_unknown_workspace() {
 fn cancel_exec_with_other_live_exec_does_not_demote_task() {
     let db = WorkDb::open(temp_db_path("cancel-no-demote-with-live")).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Double-dispatched chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Double-dispatched chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {

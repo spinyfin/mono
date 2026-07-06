@@ -5226,14 +5226,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -5301,14 +5294,7 @@ mod tests {
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
 
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Pinned cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Pinned cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Pin the ready execution to the remote host.
@@ -5366,14 +5352,7 @@ mod tests {
         db.set_host_enabled("zakalwe", false).unwrap();
 
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Pinned to disabled")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Pinned to disabled");
         db.reconcile_product_executions(&product.id).unwrap();
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
         db.set_execution_pinned_host(&execution.id, Some("zakalwe")).unwrap();
@@ -5426,14 +5405,7 @@ mod tests {
         db.set_host_enabled("zakalwe", false).unwrap();
 
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Pinned to disabled")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Pinned to disabled");
         db.reconcile_product_executions(&product.id).unwrap();
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
         db.set_execution_pinned_host(&execution.id, Some("zakalwe")).unwrap();
@@ -5519,22 +5491,8 @@ mod tests {
         let origin = "git@github.com:spinyfin/mono.git";
         let product = create_test_product_with_repo(&db, "Boss", Some(origin));
         // Two chores → two executions against the same product/URL.
-        let chore_a = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup A")
-                    .build(),
-            )
-            .unwrap();
-        let chore_b = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup B")
-                    .build(),
-            )
-            .unwrap();
+        let chore_a = create_test_chore(&db, product.id.clone(), "Cleanup A");
+        let chore_b = create_test_chore(&db, product.id.clone(), "Cleanup B");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Cube reports a single repo whose pool config exactly
@@ -5615,14 +5573,7 @@ mod tests {
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let origin = "git@github.com:spinyfin/mono.git";
         let product = create_test_product_with_repo(&db, "Boss", Some(origin));
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let custom_repo = CubeRepoSummary {
@@ -5707,14 +5658,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -5750,14 +5694,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -5826,14 +5763,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -5853,14 +5783,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -5885,14 +5808,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -5940,14 +5856,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -6109,14 +6018,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -6646,14 +6548,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -6745,14 +6640,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -6832,14 +6720,7 @@ mod tests {
                 worker_branch_prefix: None,
             })
             .unwrap();
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Ensure Failure")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Ensure Failure");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -6903,14 +6784,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
         assert!(
             match db.get_work_item(&chore.id).unwrap() {
@@ -6993,14 +6867,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Retry Chore")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Retry Chore");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -7066,14 +6933,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Retry Then Succeed")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Retry Then Succeed");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // `lease_workspace_with_fallback` makes two `lease_workspace`
@@ -7586,14 +7446,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -7641,14 +7494,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Sort struct definitions")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Sort struct definitions");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -7908,22 +7754,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let early = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Old")
-                    .build(),
-            )
-            .unwrap();
-        let late = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("New")
-                    .build(),
-            )
-            .unwrap();
+        let early = create_test_chore(&db, product.id.clone(), "Old");
+        let late = create_test_chore(&db, product.id.clone(), "New");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Bump the later chore's priority — it should run first despite
@@ -7992,14 +7824,7 @@ mod tests {
             .unwrap();
 
         // Older, ordinary chore — created (and thus ready) first.
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Ordinary chore")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Ordinary chore");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Newer merge-conflict-fixing revision — `created_at` is stamped
@@ -8082,14 +7907,7 @@ mod tests {
             })
             .unwrap();
 
-        let _chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Ordinary chore")
-                    .build(),
-            )
-            .unwrap();
+        let _chore = create_test_chore(&db, product.id.clone(), "Ordinary chore");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -8167,14 +7985,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
         db.request_execution(
             RequestExecutionInput::builder()
@@ -8215,14 +8026,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -8275,14 +8079,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -8446,14 +8243,7 @@ mod tests {
 
         let mut chore_ids = Vec::new();
         for index in 0..3 {
-            let chore = db
-                .create_chore(
-                    CreateChoreInput::builder()
-                        .product_id(product.id.clone())
-                        .name(format!("Chore {index}"))
-                        .build(),
-                )
-                .unwrap();
+            let chore = create_test_chore(&db, product.id.clone(), format!("Chore {index}"));
             chore_ids.push(chore.id);
         }
         db.reconcile_product_executions(&product.id).unwrap();
@@ -8545,22 +8335,8 @@ mod tests {
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
 
-        let winner = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Winner")
-                    .build(),
-            )
-            .unwrap();
-        let waiter = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Waiter")
-                    .build(),
-            )
-            .unwrap();
+        let winner = create_test_chore(&db, product.id.clone(), "Winner");
+        let waiter = create_test_chore(&db, product.id.clone(), "Waiter");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -8806,13 +8582,7 @@ mod tests {
         // produces when `--no-autostart` is omitted. Reconcile then
         // promotes each to a `ready` execution row.
         for index in 0..5 {
-            db.create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(format!("Chore {index}"))
-                    .build(),
-            )
-            .unwrap();
+            create_test_chore(&db, product.id.clone(), format!("Chore {index}"));
         }
         db.reconcile_product_executions(&product.id).unwrap();
 
@@ -8867,14 +8637,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let busy = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Already running")
-                    .build(),
-            )
-            .unwrap();
+        let busy = create_test_chore(&db, product.id.clone(), "Already running");
         // A second chore that will sit in `ready` because the
         // configured pool size is 1 and `busy` claimed it.
         let queued = db
@@ -8977,28 +8740,14 @@ mod tests {
         // dispatcher has something to consume the single pool slot.
         // Its run completes via FakeExecutionRunner (WaitingHuman), at
         // which point the pool worker is released and our rescan fires.
-        let warm = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Warm-up")
-                    .build(),
-            )
-            .unwrap();
+        let warm = create_test_chore(&db, product.id.clone(), "Warm-up");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Stuck chore: `active` with a `failed` execution row,
         // mimicking the bug — worker died, kanban card stayed in
         // Doing, and the create-time dispatch path won't ever look
         // at it again.
-        let stuck = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Stuck")
-                    .build(),
-            )
-            .unwrap();
+        let stuck = create_test_chore(&db, product.id.clone(), "Stuck");
         db.update_work_item(
             &stuck.id,
             crate::work::WorkItemPatch {
@@ -9055,14 +8804,7 @@ mod tests {
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
 
-        let warm = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Warm-up")
-                    .build(),
-            )
-            .unwrap();
+        let warm = create_test_chore(&db, product.id.clone(), "Warm-up");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let parked = db
@@ -9195,14 +8937,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Stranded by lost wakeup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Stranded by lost wakeup");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -9325,14 +9060,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Stranded by lost wakeup")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Stranded by lost wakeup");
         // Inserts a `ready` execution row but does NOT call `kick()`.
         // This mirrors the post-mortem evidence: the row exists, the
         // status_transition event was written, but no scheduler ever
@@ -9378,14 +9106,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Age boundary")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Age boundary");
         db.reconcile_product_executions(&product.id).unwrap();
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
 
@@ -9444,14 +9165,7 @@ mod tests {
             .unwrap();
 
         // Create an automation-produced chore and stamp source_automation_id.
-        let auto_chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Automation chore")
-                    .build(),
-            )
-            .unwrap();
+        let auto_chore = create_test_chore(&db, product.id.clone(), "Automation chore");
         {
             let conn = db.connect().unwrap();
             conn.execute(
@@ -9462,14 +9176,7 @@ mod tests {
         }
 
         // Create a regular chore with no source_automation_id.
-        let main_chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Regular chore")
-                    .build(),
-            )
-            .unwrap();
+        let main_chore = create_test_chore(&db, product.id.clone(), "Regular chore");
 
         db.reconcile_product_executions(&product.id).unwrap();
 
@@ -9560,14 +9267,7 @@ mod tests {
             })
             .unwrap();
 
-        let auto_chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Slot-range chore")
-                    .build(),
-            )
-            .unwrap();
+        let auto_chore = create_test_chore(&db, product.id.clone(), "Slot-range chore");
         {
             let conn = db.connect().unwrap();
             conn.execute(
@@ -9647,14 +9347,7 @@ mod tests {
 
         // Two automation-produced chores (pool size will be 1, so the second stays ready).
         for n in 0..2 {
-            let chore = db
-                .create_chore(
-                    CreateChoreInput::builder()
-                        .product_id(product.id.clone())
-                        .name(format!("Auto chore {n}"))
-                        .build(),
-                )
-                .unwrap();
+            let chore = create_test_chore(&db, product.id.clone(), format!("Auto chore {n}"));
             let conn = db.connect().unwrap();
             conn.execute(
                 "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
@@ -9664,13 +9357,7 @@ mod tests {
         }
 
         // One regular chore — must still be dispatched even when the automation pool is full.
-        db.create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Regular chore")
-                .build(),
-        )
-        .unwrap();
+        create_test_chore(&db, product.id.clone(), "Regular chore");
 
         db.reconcile_product_executions(&product.id).unwrap();
 
@@ -9829,13 +9516,7 @@ mod tests {
         let product = create_test_product(&db);
 
         // One regular chore — must still dispatch even when review is full.
-        db.create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Regular chore")
-                .build(),
-        )
-        .unwrap();
+        create_test_chore(&db, product.id.clone(), "Regular chore");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Insert a ready `pr_review` execution. It never reaches the
@@ -10456,14 +10137,7 @@ mod tests {
         let product = create_test_product(&db);
 
         // prereq: a separate chore that has not yet completed.
-        let prereq = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Prereq (still active)")
-                    .build(),
-            )
-            .unwrap();
+        let prereq = create_test_chore(&db, product.id.clone(), "Prereq (still active)");
 
         // dependent: the gated chore. Created with autostart=false so no
         // execution is created automatically.
@@ -10487,15 +10161,7 @@ mod tests {
 
         // Simulate the race: directly insert a `ready` execution as if the
         // autostart flip and reconcile ran before the dep edge committed.
-        let execution = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(dep.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let execution = create_ready_chore_execution(&db, dep.id.clone());
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner::default());
@@ -10684,15 +10350,7 @@ mod tests {
             .unwrap();
 
         // A second, redundant `ready` execution arrives (the one under test).
-        let redundant_exec = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let redundant_exec = create_ready_chore_execution(&db, chore.id.clone());
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner {
@@ -10786,15 +10444,7 @@ mod tests {
         // The "live" blocker: a running execution with a real run on the local
         // host, but whose workspace directory no longer exists on disk — a
         // dead pane the engine never reaped (no Stop hook).
-        let zombie = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let zombie = create_ready_chore_execution(&db, chore.id.clone());
         db.start_execution_run(
             &zombie.id,
             "worker-1",
@@ -10822,15 +10472,7 @@ mod tests {
         .unwrap();
 
         // The new execution the scheduler wants to spawn.
-        let fresh = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let fresh = create_ready_chore_execution(&db, chore.id.clone());
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner {
@@ -11021,14 +10663,7 @@ mod tests {
         let product = create_test_product(&db);
 
         // prereq: a chore that has not yet completed.
-        let prereq = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Prereq (still active)")
-                    .build(),
-            )
-            .unwrap();
+        let prereq = create_test_chore(&db, product.id.clone(), "Prereq (still active)");
 
         // dependent: the gated chore.
         let dep = db
@@ -11050,15 +10685,7 @@ mod tests {
         .unwrap();
 
         // Simulate the timing race: a `ready` execution created before the dep edge committed.
-        let gated_exec = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(dep.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let gated_exec = create_ready_chore_execution(&db, dep.id.clone());
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner {
@@ -11300,28 +10927,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Anti-livelock task")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Anti-livelock task");
         db.reconcile_product_executions(&product.id).unwrap();
 
         // Create a second product and chore to serve as the "occupied" execution.
         // We need a separate DB row for exec-live so get_execution(exec_live.id)
         // returns cube_workspace_id = "mono-agent-037".
         let other_product = create_test_product_named(&db, "OtherProduct");
-        let other_chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(other_product.id.clone())
-                    .name("Live worker chore")
-                    .build(),
-            )
-            .unwrap();
+        let other_chore = create_test_chore(&db, other_product.id.clone(), "Live worker chore");
         db.reconcile_product_executions(&other_product.id).unwrap();
         let exec_live = db.list_executions(Some(&other_chore.id)).unwrap().pop().unwrap();
         // Transition it to running so start_execution_run can set cube_workspace_id.

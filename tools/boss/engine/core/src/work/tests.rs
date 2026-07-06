@@ -98,14 +98,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
 fn setup_product_and_chore() -> (WorkDb, String, String) {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let product = create_test_product_named(&db, "TestProduct");
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Fix thing")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Fix thing");
     (db, product.id, chore.id)
 }
 

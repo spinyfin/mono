@@ -2874,14 +2874,7 @@ fn get_work_tree_instrumented_reports_task_runtime_nplus1() {
 
     const N: usize = 5;
     for i in 0..N {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(format!("Chore {i}"))
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), format!("Chore {i}"));
         // A live (running) execution keeps `query_task_runtime` on its
         // 2-query path: latest-execution is itself live, so no live-fallback
         // lookup, then one latest-run lookup.

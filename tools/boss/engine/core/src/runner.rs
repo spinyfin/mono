@@ -4870,8 +4870,7 @@ mod pane_spawn_tests {
     };
     use crate::test_support::*;
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProjectInput, CreateTaskInput, EffortLevel, Task, WorkExecution,
-        WorkItem,
+        CreateChoreInput, CreateProjectInput, CreateTaskInput, EffortLevel, Task, WorkExecution, WorkItem,
     };
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
@@ -5729,23 +5728,8 @@ mod pane_spawn_tests {
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
-        let chore = work_db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Sort struct definitions")
-                    .build(),
-            )
-            .unwrap();
-        let ready = work_db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&work_db, product.id.clone(), "Sort struct definitions");
+        let ready = create_ready_chore_execution(&work_db, chore.id.clone());
         // Start the run (ready → running, lease attached) — this is the
         // exact state the row is in when the spawn round-trip is in
         // flight — then cancel it, mirroring a kanban drag-to-Backlog

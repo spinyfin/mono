@@ -61,14 +61,7 @@ fn creates_tree_and_soft_deletes_chores() {
                 .build(),
         )
         .unwrap();
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
 
     let tree = db.get_work_tree(&product.id).unwrap();
     assert_eq!(tree.projects.len(), 1);
@@ -94,14 +87,7 @@ fn restore_work_item_clears_tombstone() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Recover me")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Recover me");
     let short_id = chore.short_id.expect("chore has a short id");
 
     db.delete_work_item(&chore.id).unwrap();
@@ -333,22 +319,8 @@ fn work_tree_includes_runtime_status_per_task() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore_idle = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Idle")
-                .build(),
-        )
-        .unwrap();
-    let chore_running = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Running")
-                .build(),
-        )
-        .unwrap();
+    let chore_idle = create_test_chore(&db, product.id.clone(), "Idle");
+    let chore_running = create_test_chore(&db, product.id.clone(), "Running");
     db.reconcile_product_executions(&product.id).unwrap();
 
     // Drive the second chore's execution into a running run.
@@ -405,14 +377,7 @@ fn get_task_runtime_tracks_execution_then_run_id() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Investigate")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Investigate");
 
     // Pre-dispatch: nothing in flight, every field is `None`.
     let pre = db.get_task_runtime(&chore.id).unwrap();
@@ -853,14 +818,7 @@ fn reconciles_missing_executions_for_product_tree() {
                 .build(),
         )
         .unwrap();
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
 
     // Mark the project's auto-created design task done so the
     // first user-created project_task takes the head of the
@@ -1236,23 +1194,8 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
 
     let (execution, run) = db
         .start_execution_run(
@@ -1392,23 +1335,8 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Cleanup")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
     // Drive the chore into the Doing column by starting the run —
     // this is the state cancel is supposed to undo.
     db.start_execution_run(
@@ -1444,14 +1372,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Has PR")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Has PR");
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -1694,14 +1615,7 @@ fn start_execution_does_not_downgrade_done_chores() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Already done")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Already done");
     // Manually mark the chore as done before starting execution.
     db.update_work_item(
         &chore.id,
@@ -1712,15 +1626,7 @@ fn start_execution_does_not_downgrade_done_chores() {
     )
     .unwrap();
 
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
 
     db.start_execution_run(
         &execution.id,
@@ -1752,14 +1658,7 @@ fn reconcile_dispatches_active_chore_with_no_execution() {
     let path = temp_db_path("reconcile-no-exec");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stranded chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Stranded chore");
     // Manually flip to active, mimicking a kanban drag that
     // wrote tasks.status without ever dispatching.
     db.update_work_item(
@@ -1790,14 +1689,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
     let path = temp_db_path("reconcile-terminal");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Bounced chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Bounced chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1834,14 +1726,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
     let path = temp_db_path("reconcile-live");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Live chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Live chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1881,14 +1766,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     let path = temp_db_path("reconcile-stale");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Stale chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Stale chore");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {

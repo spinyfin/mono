@@ -6174,23 +6174,8 @@ mod tests {
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Detect worker stop")
-                    .build(),
-            )
-            .unwrap();
-        let execution = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Detect worker stop");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
 
         let (execution, run) = db
             .start_execution_run(
@@ -6385,14 +6370,7 @@ mod tests {
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Fix CI")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Fix CI");
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         db.update_work_item(
             &chore.id,
@@ -7505,15 +7483,7 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        let exec = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let exec = create_ready_chore_execution(db, chore.id.clone());
         let (_e, run) = db
             .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
             .unwrap();
@@ -7618,23 +7588,8 @@ mod tests {
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Running execution")
-                    .build(),
-            )
-            .unwrap();
-        let execution = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Running execution");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
         // `start_execution_run` flips the row to `running`. Do not
         // follow up with `finish_execution_run` — we want the row to
         // stay in `running` to exercise the AI #6 gate.
@@ -7820,15 +7775,7 @@ PR #379. PR #379.";
                     .build(),
             )
             .unwrap();
-        let execution = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
         let (execution, run) = db
             .start_execution_run(
                 &execution.id,
@@ -7926,15 +7873,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     .build(),
             )
             .unwrap();
-        let execution = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
         let (execution, run) = db
             .start_execution_run(
                 &execution.id,
@@ -8233,15 +8172,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     .build(),
             )
             .unwrap();
-        let exec2 = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore2.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let exec2 = create_ready_chore_execution(&db, chore2.id.clone());
         let (exec2, run2) = db
             .start_execution_run(
                 &exec2.id,
@@ -8273,15 +8204,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     .build(),
             )
             .unwrap();
-        let exec3 = db
-            .create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(chore3.id.clone())
-                    .kind(ExecutionKind::ChoreImplementation)
-                    .status(ExecutionStatus::Ready)
-                    .build(),
-            )
-            .unwrap();
+        let exec3 = create_ready_chore_execution(&db, chore3.id.clone());
         let (exec3, run3) = db
             .start_execution_run(
                 &exec3.id,
@@ -9874,14 +9797,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Late PR chore")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Late PR chore");
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
@@ -13614,14 +13530,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Satisfied Chore Test");
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Implement feature X")
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Implement feature X");
         {
             let conn = db.connect().unwrap();
             conn.execute(

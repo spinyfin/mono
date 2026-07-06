@@ -17,7 +17,9 @@ use crate::coordinator::{
 };
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
-use boss_protocol::{CreateProductInput, Product, WorkExecution};
+use boss_protocol::{
+    CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus, Product, Task, WorkExecution,
+};
 
 /// The mono repo remote used by the overwhelming majority of tests.
 pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
@@ -88,6 +90,40 @@ pub fn create_active_chore(db: &WorkDb, product_id: &str, name: &str) -> String 
     )
     .unwrap();
     chore.id
+}
+
+/// Create a plain chore named `name` under `product_id` and return it.
+///
+/// Unlike [`create_active_chore`], the chore keeps its default status —
+/// this is the bare
+/// `create_chore(CreateChoreInput::builder().product_id(..).name(..).build())`
+/// that the coordinator, completion, runner, and `work` test modules
+/// hand-roll dozens of times. Centralising it means a new field on
+/// [`CreateChoreInput`] touches one site instead of ~50. Args take
+/// `impl Into<String>` so existing call sites lift their expressions
+/// (`product.id.clone()`, `"Cleanup"`, `format!(...)`) verbatim.
+pub fn create_test_chore(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
+    db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
+        .unwrap()
+}
+
+/// Create a `ready` [`ExecutionKind::ChoreImplementation`] execution for
+/// `work_item_id` and return it.
+///
+/// Replaces the byte-identical
+/// `create_execution(CreateExecutionInput::builder().work_item_id(..)
+/// .kind(ChoreImplementation).status(Ready).build())` that the
+/// completion, runner, and coordinator test modules hand-roll ~33
+/// times, so a new field on [`CreateExecutionInput`] touches one site.
+pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>) -> WorkExecution {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap()
 }
 
 /// A [`CubeClient`] test double that never touches cube. Every method
