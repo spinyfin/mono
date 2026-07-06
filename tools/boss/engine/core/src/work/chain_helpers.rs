@@ -468,10 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_pr_number_rejects_trailing_slash() {
-        // A trailing slash adds an empty segment past the number, which is not
-        // canonical and does not parse.
-        assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/42/"), None);
+    fn extract_pr_number_tolerates_trailing_slash() {
+        // The canonical parser ignores a trailing path/query/fragment after the
+        // number (GitHub decorates real PR URLs with `/files`, `?tab=…`, etc.),
+        // so a trailing slash still yields the leading PR number.
+        assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/42/"), Some(42));
     }
 
     #[test]
