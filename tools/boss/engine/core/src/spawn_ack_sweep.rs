@@ -62,7 +62,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{WorkItemPatch, WorkerActivity};
+use boss_protocol::WorkerActivity;
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -266,12 +266,13 @@ pub async fn run_one_pass(
         // Append [engine-reconcile] audit line to the task description
         // so a human inspecting the chore can see why it was reset.
         if let Some(work_item_id) = &state.work_item_id
-            && let Err(err) = append_reconcile_audit(
+            && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
                 work_db,
                 work_item_id,
-                execution_id,
                 now_epoch_secs,
-                grace_secs,
+                &format!(
+                    "spawn-ack timeout (exec {execution_id}) detected — no shell pid or hook event within {grace_secs}s of spawn; chore reset to todo for redispatch"
+                ),
                 recovery_patch.as_deref(),
             )
         {
@@ -318,40 +319,6 @@ pub async fn run_one_pass(
     }
 
     outcome
-}
-
-/// Append an `[engine-reconcile]` audit line to the work item's
-/// description so an operator can see why the chore was reset.
-fn append_reconcile_audit(
-    work_db: &WorkDb,
-    work_item_id: &str,
-    dead_execution_id: &str,
-    now_epoch_secs: i64,
-    grace_secs: i64,
-    recovery_patch: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    let item = work_db.get_work_item(work_item_id)?;
-    let current_desc = match &item {
-        boss_protocol::WorkItem::Product(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
-    };
-    let recovery_note = match recovery_patch {
-        Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
-        None => String::new(),
-    };
-    let audit_line = format!(
-        "\n[engine-reconcile] epoch {now_epoch_secs}: spawn-ack timeout (exec {dead_execution_id}) detected — no shell pid or hook event within {grace_secs}s of spawn; chore reset to todo for redispatch.{recovery_note}"
-    );
-    let new_desc = format!("{current_desc}{audit_line}");
-    work_db.update_work_item(
-        work_item_id,
-        WorkItemPatch {
-            description: Some(new_desc),
-            ..WorkItemPatch::default()
-        },
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
