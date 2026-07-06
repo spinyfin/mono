@@ -2684,20 +2684,13 @@ async fn mark_merged(
 /// Startup sweep (`chore-lifecycle-pr-closed-unmerged.md` Q9 /
 /// `merge-conflict-handling-in-review.md` Phase 6 #17): the first
 /// `run_one_pass` fires immediately on spawn so any chore whose PR
-/// Extract the PR number from a GitHub PR URL.
+/// Extract the PR number from a GitHub PR URL as an `i64` for DB storage.
 ///
-/// Handles common URL shapes:
-/// - `https://github.com/owner/repo/pull/123`
-/// - `https://github.com/owner/repo/pull/123/files`
-/// - `https://github.com/owner/repo/pull/123?foo=1`
-///
-/// Returns `None` when the URL doesn't contain `/pull/<digits>`.
+/// Thin `i64` adaptor over the canonical [`pr_number_from_url`] helper, which
+/// owns the parsing (including tolerance for the `/pull/<N>/files`, `?query`,
+/// and `#fragment` decorations). Returns `None` for any non-canonical URL.
 pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
-    let stripped = pr_url.split('?').next().unwrap_or(pr_url);
-    let stripped = stripped.split('#').next().unwrap_or(stripped);
-    let tail = stripped.rsplit_once("/pull/")?.1;
-    let n = tail.split(|c: char| !c.is_ascii_digit()).next()?;
-    n.parse::<i64>().ok()
+    pr_number_from_url(pr_url).map(|n| n as i64)
 }
 
 /// P992 reviewer-fallback: advance a task from `active` to `in_review` when
@@ -7463,47 +7456,13 @@ mod tests {
         }
     }
 
+    // NOTE: PR-number parsing behavior (standard URL, query/fragment stripping,
+    // trailing-path tolerance, and the strict rejections) is covered by the
+    // canonical parser's tests in `boss_github::pr_url`. `parse_pr_number` here
+    // is now a thin `i64` adaptor over `pr_number_from_url`.
     #[test]
-    fn parse_pr_number_extracts_from_standard_url() {
-        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123"), Some(123),);
-    }
-
-    #[test]
-    fn parse_pr_number_strips_query_and_fragment() {
-        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123?foo=bar"), Some(123),);
-        assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/123#issuecomment-1"),
-            Some(123),
-        );
-        // Query and fragment together.
-        assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/123?foo=bar#frag"),
-            Some(123),
-        );
-    }
-
-    #[test]
-    fn parse_pr_number_stops_at_trailing_path() {
-        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123/files"), Some(123),);
-    }
-
-    #[test]
-    fn parse_pr_number_rejects_missing_pull_segment() {
-        assert_eq!(parse_pr_number("https://github.com/o/r/issues/123"), None);
-        assert_eq!(parse_pr_number("https://github.com/o/r"), None);
-    }
-
-    #[test]
-    fn parse_pr_number_rejects_non_numeric_tail() {
-        // No leading digits after `/pull/` → the digit split yields an empty
-        // first segment, which fails to parse.
-        assert_eq!(parse_pr_number("https://github.com/o/r/pull/abc"), None);
-        assert_eq!(parse_pr_number("https://github.com/o/r/pull/"), None);
-    }
-
-    #[test]
-    fn parse_pr_number_rejects_empty_or_garbage() {
-        assert_eq!(parse_pr_number(""), None);
+    fn parse_pr_number_adapts_to_i64() {
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123"), Some(123));
         assert_eq!(parse_pr_number("not a url at all"), None);
     }
 
