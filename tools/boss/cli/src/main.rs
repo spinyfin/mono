@@ -11,9 +11,9 @@ use boss_protocol::{
     CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution, CreateAttentionInput, CreateAutomationInput,
     CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
     CreateProjectInput, CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
-    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
-    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
+    EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind,
+    FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState,
+    PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
     ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
     WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
@@ -386,6 +386,16 @@ enum TaskCommand {
     /// they are surfaced under the owning row rather than returned alone.
     #[command(name = "by-pr")]
     ByPr(ByPrArgs),
+    /// Look up the work item that owns an execution, by execution id.
+    ///
+    /// Sibling of `by-pr`: given an `exec_…` id (e.g. parsed out of an
+    /// authoring branch name `boss/exec_…`), resolves the task/chore that
+    /// dispatched it. `answer_agent` and `automation_triage` executions
+    /// don't bind a task/chore (their `work_item_id` is a comment id or
+    /// automation id respectively) — those are reported with a pointer to
+    /// the right inspection verb instead of a work-item lookup.
+    #[command(name = "by-exec")]
+    ByExec(ByExecArgs),
     /// Show any leaf work item (task or chore) by id.
     Show(TaskIdArg),
     /// Update any leaf work item (task or chore) by id.
@@ -1934,6 +1944,14 @@ struct ByPrArgs {
     /// single-repo context.
     #[arg(long = "repo")]
     repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ByExecArgs {
+    /// The execution id to resolve (e.g. `exec_18ad6336fedcb190_12`, as
+    /// seen in an authoring branch name `boss/exec_…` or in
+    /// `bossctl agents status`/`bossctl work executions`).
+    execution_id: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -3672,6 +3690,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             })
         }
         TaskCommand::ByPr(args) => run_by_pr(&mut client, ctx, args).await,
+        TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
@@ -7071,6 +7090,64 @@ async fn run_by_pr(client: &mut BossClient, ctx: &RunContext, args: ByPrArgs) ->
             })
         }
     }
+}
+
+async fn get_execution(client: &mut BossClient, id: &str) -> Result<WorkExecution, CliError> {
+    match client
+        .send_request(&FrontendRequest::GetExecution { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::ExecutionResult { execution } => Ok(execution),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("execution fetch", &other)),
+    }
+}
+
+/// Handler for `boss task by-exec <execution-id>`. Resolves an execution
+/// id back to the task/chore that owns it — the inverse of the
+/// execution → PR → work-item chain `by-pr` walks, useful when all you
+/// have is an execution id (e.g. parsed out of an authoring branch name
+/// `boss/exec_…`).
+///
+/// `answer_agent` and `automation_triage` executions don't bind a
+/// task/chore/project: their `work_item_id` is actually a comment id or
+/// automation id respectively (see `WorkDb::create_answer_agent_execution`
+/// / `create_automation_triage_execution`). Those are reported directly
+/// with a pointer to the right inspection verb rather than attempted
+/// against `GetWorkItem`, which would only produce a confusing "unknown
+/// work item" error.
+async fn run_by_exec(client: &mut BossClient, ctx: &RunContext, args: ByExecArgs) -> Result<(), CliError> {
+    let execution = get_execution(client, &args.execution_id).await?;
+    match execution.kind {
+        ExecutionKind::AnswerAgent => {
+            return Err(CliError::application(format!(
+                "execution {} is an answer-agent run bound to comment {} (not a task/chore) — inspect it with \
+                 `bossctl comments show {}`",
+                execution.id, execution.work_item_id, execution.work_item_id
+            )));
+        }
+        ExecutionKind::AutomationTriage => {
+            return Err(CliError::application(format!(
+                "execution {} is an automation-triage run bound to automation {} (not a task/chore) — inspect it \
+                 with `boss automation show {}`",
+                execution.id, execution.work_item_id, execution.work_item_id
+            )));
+        }
+        _ => {}
+    }
+    let item = get_work_item(client, &execution.work_item_id).await?;
+    let (task, label) = expect_leaf_work_item(item)?;
+    let task = with_display_status(task);
+    print_entity(
+        ctx,
+        &serde_json::json!({ label: &task, "execution_id": execution.id }),
+        || {
+            print_task_details(label_titlecase(label), &task, None, false);
+        },
+    )
 }
 
 /// Decide what bind-pr should do given the prior `pr_url` value on

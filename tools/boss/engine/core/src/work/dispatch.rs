@@ -837,6 +837,24 @@ impl WorkDb {
         query_execution(&conn, id).require("execution", id)
     }
 
+    /// `work_executions.host_id` for one execution — the host the
+    /// scheduler attributed the run to. `None` before a run has picked a
+    /// host (not yet dispatched, or a pre-migration row); the engine
+    /// treats an absent value as `"local"`. Backs `bossctl work
+    /// executions`, which otherwise had no way to show which host ran an
+    /// execution without a raw `work_executions`/`work_runs` query.
+    pub fn execution_host_id(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let host: Option<Option<String>> = conn
+            .query_row(
+                "SELECT host_id FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(host.flatten())
+    }
+
     /// Return true if `execution` is a stale prior occupant of a reused
     /// (warm-cached) cube workspace: another live (`running` /
     /// `waiting_human`) execution now claims the same `cube_workspace_id`
