@@ -169,6 +169,10 @@ pub async fn run_one_pass(
                 window_secs = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
                 "orphan sweep: churn guard tripped; skipping redispatch — human attention required",
             );
+            let failing_ids = work_db
+                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff)
+                .unwrap_or_default();
+            work_db.file_churn_guard_parked_attention(&work_item_id, "orphan_sweep", recent_terminal, &failing_ids);
             outcome.churn_skipped += 1;
             continue;
         }
@@ -449,6 +453,61 @@ mod tests {
         assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
         assert_eq!(outcome.redispatched, 0);
         assert!(sink.events().await.is_empty(), "no event on churn skip");
+    }
+
+    /// The churn guard trip must be operator-visible: a `churn_guard_parked`
+    /// attention item is filed against the work item (not just a trace WARN),
+    /// and it resolves automatically the next time a dispatch attempt is made
+    /// against the item — whether that's a later sweep pass once the window
+    /// drains, or an explicit `bossctl work start` bypassing the guard.
+    #[tokio::test]
+    async fn churn_guard_trip_files_and_clears_attention_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+                .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        assert_eq!(outcome.churn_skipped, 1);
+
+        let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        let open: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND && i.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "expected one open churn_guard_parked attention item");
+        assert!(
+            open[0].body_markdown.contains("bossctl work start"),
+            "attention body should point at the manual bypass verb"
+        );
+
+        // Bypassing the guard (the `bossctl work start` path) resolves the
+        // attention immediately, without needing another sweep pass.
+        db.request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+
+        let items_after = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            items_after
+                .iter()
+                .filter(|i| i.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                .all(|i| i.status == "resolved"),
+            "churn_guard_parked attention should auto-resolve on the next dispatch attempt"
+        );
     }
 
     /// Recent-transition guard: freshly-activated item is skipped even with

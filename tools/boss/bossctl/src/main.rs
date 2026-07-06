@@ -1210,24 +1210,43 @@ fn looks_like_name_or_slot(reference: &str) -> bool {
     ROSTER.iter().any(|name| name.eq_ignore_ascii_case(reference))
 }
 
-/// If `selector` looks like a friendly work-item id (`T42`, `t42`, `P7`,
-/// `p7`), resolve it to the primary id via the engine and search `states`
-/// for a live worker running that work item. Returns the matching state,
-/// or `None` when the selector isn't a friendly-id form or no live worker
-/// is found for the resolved item.
-async fn resolve_tnnn_to_live_worker<'a>(
-    client: &mut BossClient,
-    selector: &str,
-    states: &'a [LiveWorkerState],
-) -> Result<Option<&'a LiveWorkerState>> {
-    if selector.len() < 2 {
+/// The primary id of any `WorkItem` variant, for callers that just need a
+/// string to compare/print regardless of kind.
+fn work_item_primary_id(item: &WorkItem) -> &str {
+    match item {
+        WorkItem::Product(p) => p.id.as_str(),
+        WorkItem::Project(p) => p.id.as_str(),
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.id.as_str(),
+    }
+}
+
+/// Resolve `reference` to a work item when it looks like one: a friendly
+/// short id (`T42`, `t42`, `P7`, `p7`) or a primary `task_…` / `proj_…` /
+/// `prod_…` id. Returns `Ok(None)` for anything else (run ids, slot
+/// numbers, crew names) so callers can fall through to their own
+/// resolution — this never errors on a selector that simply isn't a work
+/// item reference.
+async fn resolve_work_item_ref(client: &mut BossClient, reference: &str) -> Result<Option<WorkItem>> {
+    if reference.starts_with("task_") || reference.starts_with("proj_") || reference.starts_with("prod_") {
+        return match client
+            .send_request(&FrontendRequest::GetWorkItem {
+                id: reference.to_owned(),
+            })
+            .await
+            .context("resolving work item")?
+        {
+            FrontendEvent::WorkItemResult { item } => Ok(Some(item)),
+            _ => Ok(None),
+        };
+    }
+    if reference.len() < 2 {
         return Ok(None);
     }
-    let first = selector.as_bytes()[0];
+    let first = reference.as_bytes()[0];
     if first != b'T' && first != b't' && first != b'P' && first != b'p' {
         return Ok(None);
     }
-    let n: i64 = match selector[1..].parse() {
+    let n: i64 = match reference[1..].parse() {
         Ok(n) if n > 0 => n,
         _ => return Ok(None),
     };
@@ -1240,7 +1259,7 @@ async fn resolve_tnnn_to_live_worker<'a>(
         _ => return Ok(None),
     };
     for product in &products {
-        let item = match client
+        if let FrontendEvent::WorkItemResult { item } = client
             .send_request(&FrontendRequest::GetWorkItemByShortId {
                 product_id: product.id.clone(),
                 short_id: n,
@@ -1248,19 +1267,27 @@ async fn resolve_tnnn_to_live_worker<'a>(
             .await
             .context("resolving friendly id")?
         {
-            FrontendEvent::WorkItemResult { item } => item,
-            _ => continue,
-        };
-        let primary_id = match &item {
-            WorkItem::Product(p) => p.id.as_str(),
-            WorkItem::Project(p) => p.id.as_str(),
-            WorkItem::Task(t) | WorkItem::Chore(t) => t.id.as_str(),
-        };
-        if let Some(state) = states.iter().find(|s| s.work_item_id.as_deref() == Some(primary_id)) {
-            return Ok(Some(state));
+            return Ok(Some(item));
         }
     }
     Ok(None)
+}
+
+/// If `selector` looks like a friendly work-item id (`T42`, `t42`, `P7`,
+/// `p7`), resolve it to the primary id via the engine and search `states`
+/// for a live worker running that work item. Returns the matching state,
+/// or `None` when the selector isn't a friendly-id form or no live worker
+/// is found for the resolved item.
+async fn resolve_tnnn_to_live_worker<'a>(
+    client: &mut BossClient,
+    selector: &str,
+    states: &'a [LiveWorkerState],
+) -> Result<Option<&'a LiveWorkerState>> {
+    let Some(item) = resolve_work_item_ref(client, selector).await? else {
+        return Ok(None);
+    };
+    let primary_id = work_item_primary_id(&item);
+    Ok(states.iter().find(|s| s.work_item_id.as_deref() == Some(primary_id)))
 }
 
 /// Resolve `reference` to a live worker's run id, accepting run ids,
@@ -1362,6 +1389,25 @@ async fn agents_status(socket_path: &Option<String>, json: bool, agent: String) 
         Err(_) => {}
     }
 
+    // Not a live worker. If the reference resolves to a work item (T42,
+    // P7, or a primary task_/proj_/prod_ id), report on it directly. This
+    // is the only path available for a work item the engine has *parked*
+    // rather than dispatched — e.g. the orphan-sweep / pr_review-recovery
+    // churn guard: there is no live worker and (if it never got far enough
+    // to spawn one) no `work_runs` row either, so the `GetRun` fallback
+    // below would just error with "no such run".
+    if let Some(work_item) = resolve_work_item_ref(&mut client, &agent).await? {
+        let primary_id = work_item_primary_id(&work_item).to_owned();
+        if let Some(state) = states
+            .iter()
+            .find(|s| s.work_item_id.as_deref() == Some(primary_id.as_str()))
+        {
+            print_live_state(json, state);
+            return Ok(());
+        }
+        return print_parked_work_item_status(&mut client, json, &work_item).await;
+    }
+
     // No live entry and the reference doesn't look like a name or
     // slot — assume it's a historical run id.
     let response = client
@@ -1404,6 +1450,85 @@ async fn agents_status(socket_path: &Option<String>, json: bool, agent: String) 
     };
 
     print_run_lifecycle(json, &run, live, execution.as_ref());
+    Ok(())
+}
+
+/// Report on a work item that resolved from `bossctl agents status`'s
+/// argument but has no live worker backing it — the case a bare `GetRun`
+/// lookup can't handle because the item may never have gotten far enough
+/// to spawn one (e.g. parked by the orphan-sweep / pr_review-recovery churn
+/// guard). Prints the item's own status plus its current execution
+/// (`GetTaskRuntime`) and any open operational attention items
+/// (`ListAttentionItemsForWorkItem`) — the `churn_guard_parked` kind in
+/// particular is exactly the "why is this active with no worker" signal
+/// the coordinator previously had to dig out of the engine trace.
+async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<()> {
+    let primary_id = work_item_primary_id(work_item).to_owned();
+
+    let runtime = match client
+        .send_request(&FrontendRequest::GetTaskRuntime {
+            work_item_id: primary_id.clone(),
+        })
+        .await
+        .context("sending GetTaskRuntime")?
+    {
+        FrontendEvent::TaskRuntimeResult { runtime } => Some(runtime),
+        _ => None,
+    };
+    let attention_items = match client
+        .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
+            work_item_id: primary_id.clone(),
+        })
+        .await
+        .context("sending ListAttentionItemsForWorkItem")?
+    {
+        FrontendEvent::AttentionItemsForWorkItemList { items, .. } => items,
+        _ => Vec::new(),
+    };
+    let open_attention_items: Vec<_> = attention_items
+        .into_iter()
+        .filter(|item| item.status == "open")
+        .collect();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "work_item": work_item,
+                "live_worker_state": serde_json::Value::Null,
+                "task_runtime": runtime,
+                "open_attention_items": open_attention_items,
+            })
+        );
+        return Ok(());
+    }
+
+    let (status, name) = match work_item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => (t.status.as_str().to_owned(), t.name.as_str()),
+        WorkItem::Project(p) => (p.status.as_str().to_owned(), p.name.as_str()),
+        WorkItem::Product(p) => (p.status.clone(), p.name.as_str()),
+    };
+    println!("{primary_id} \"{name}\" — no live worker");
+    println!("  status: {status}");
+    if let Some(runtime) = &runtime {
+        println!(
+            "  current_execution: {} [{}]",
+            runtime.execution_id.as_deref().unwrap_or("-"),
+            runtime
+                .execution_status
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".to_owned())
+        );
+    }
+    if open_attention_items.is_empty() {
+        println!("  (no open attention items)");
+    } else {
+        println!("  open attention items:");
+        for item in &open_attention_items {
+            println!("    [{}] {} (since {})", item.kind, item.title, item.created_at);
+        }
+    }
     Ok(())
 }
 

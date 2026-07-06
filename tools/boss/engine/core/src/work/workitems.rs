@@ -120,16 +120,55 @@ impl WorkDb {
     /// clear stale failure items once a product recovers.
     pub fn resolve_external_tracker_attention(&self, work_item_id: &str, kind: &str) -> Result<()> {
         let conn = self.connect()?;
-        let now = now_string();
-        conn.execute(
-            "UPDATE work_attention_items
-             SET status = 'resolved', resolved_at = ?1
-             WHERE work_item_id = ?2
-               AND kind = ?3
-               AND status = 'open'",
-            params![now, work_item_id, kind],
-        )?;
+        resolve_attention_kind_in_tx(&conn, work_item_id, kind)?;
         Ok(())
+    }
+
+    /// File (idempotently) the operator-visible attention item raised when
+    /// [`crate::orphan_sweep`] or [`crate::pr_review_recovery`] trips the
+    /// shared churn guard and parks a work item instead of auto-redispatching
+    /// it — see [`crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND`]. Reuses
+    /// [`Self::upsert_external_tracker_attention`] so repeated trips across
+    /// sweep passes (every ~60s) don't pile up duplicate rows: the item stays
+    /// open until [`request_execution_in_tx_with_live_check`] resolves it on
+    /// the work item's next dispatch attempt.
+    ///
+    /// Best-effort: the caller has already logged the trip via
+    /// `tracing::warn!`; a failure here is logged and swallowed rather than
+    /// aborting the sweep pass.
+    pub fn file_churn_guard_parked_attention(
+        &self,
+        work_item_id: &str,
+        source: &str,
+        recent_terminal: i64,
+        failing_execution_ids: &[String],
+    ) {
+        let title = format!("Parked by churn guard — {recent_terminal} recent failures");
+        let ids = if failing_execution_ids.is_empty() {
+            "(could not resolve the failing execution ids)".to_owned()
+        } else {
+            failing_execution_ids.join(", ")
+        };
+        let window_hours = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS / 3600;
+        let body = format!(
+            "The `{source}` sweep stopped auto-redispatching this work item: it produced \
+             {recent_terminal} terminal executions within the trailing {window_hours}h window \
+             (threshold {ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD}), which usually means something \
+             structural is broken (a bad host, a repo/config issue) rather than a one-off blip.\n\n\
+             Failing executions: {ids}\n\n\
+             This clears automatically once the window drains below the threshold and the next \
+             sweep pass redispatches successfully. To bypass the guard and retry immediately, run \
+             `bossctl work start {work_item_id}`."
+        );
+        if let Err(err) =
+            self.upsert_external_tracker_attention(work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND, &title, &body)
+        {
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                ?err,
+                "churn guard: failed to file parked attention item",
+            );
+        }
     }
 
     /// Mark every open `worker_escalation` / `worker_blocked` attention item

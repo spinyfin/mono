@@ -123,6 +123,27 @@ pub(crate) fn record_repo_unresolved_attention(conn: &Connection, work_item_id: 
     Ok(())
 }
 
+/// Mark every open attention item of `kind` for `work_item_id` as
+/// resolved, against an already-open connection/transaction. Shared by
+/// [`super::workitems::WorkDb::resolve_external_tracker_attention`]
+/// (opens its own connection) and
+/// [`request_execution_in_tx_with_live_check`] (already inside a
+/// transaction, so it can't call back through a `WorkDb` method that
+/// opens a second connection). Returns the number of rows resolved; a
+/// no-op (`0`) when none were open is expected and not an error.
+pub(crate) fn resolve_attention_kind_in_tx(conn: &Connection, work_item_id: &str, kind: &str) -> Result<usize> {
+    let now = now_string();
+    let rows = conn.execute(
+        "UPDATE work_attention_items
+         SET status = 'resolved', resolved_at = ?1
+         WHERE work_item_id = ?2
+           AND kind = ?3
+           AND status = 'open'",
+        params![now, work_item_id, kind],
+    )?;
+    Ok(rows)
+}
+
 /// Shared precheck for any dispatch trigger (request-execution,
 /// kanban drag-to-Doing). Returns `Ok(())` when the work item
 /// resolves to a repo URL. When it doesn't, writes a sticky
@@ -916,6 +937,20 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                AND dispatch_failed_reason IS NOT NULL",
             params![work_item_id],
         )?;
+
+        // Same reasoning as the dispatch_failed_reason clear just above:
+        // every call into this function is a deliberate fresh dispatch
+        // attempt, so a stale `churn_guard_parked` attention (filed by
+        // `orphan_sweep` / `pr_review_recovery` the last time this item's
+        // terminal-execution count tripped the shared churn guard) is
+        // resolved here unconditionally. This is what makes the park clear
+        // automatically once a sweep's trailing window drains enough to
+        // redispatch again, and immediately when an operator runs `bossctl
+        // work start` to bypass the guard — that path reaches this same
+        // function, and the guard itself only ever lives in the sweeps, so
+        // there is nothing here to bypass. If the fresh attempt fails again,
+        // the next sweep pass re-files the attention.
+        resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
     }
 
     // Multi-repo Q5: route through the single resolver so the

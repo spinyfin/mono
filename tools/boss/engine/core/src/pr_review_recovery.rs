@@ -166,6 +166,15 @@ pub async fn run_one_pass(
                 window_secs = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
                 "pr_review recovery: churn guard tripped; not auto-refiring — human attention required",
             );
+            let failing_ids = work_db
+                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff)
+                .unwrap_or_default();
+            work_db.file_churn_guard_parked_attention(
+                &work_item_id,
+                "pr_review_recovery",
+                recent_terminal,
+                &failing_ids,
+            );
             outcome.churn_skipped += 1;
             continue;
         }
@@ -395,6 +404,33 @@ mod tests {
         assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
         assert_eq!(outcome.refired, 0);
         assert!(sink.events().await.is_empty(), "no event on churn skip");
+
+        // Same operator-visible signal as orphan_sweep's churn guard: a
+        // `churn_guard_parked` attention item, not just a trace WARN.
+        let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|a| a.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND && a.status == "open"),
+            "expected an open churn_guard_parked attention item; got: {attentions:?}"
+        );
+
+        // Bypassing the guard (`bossctl work start`) resolves it immediately.
+        db.request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+        let attentions_after = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attentions_after
+                .iter()
+                .filter(|a| a.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                .all(|a| a.status == "resolved"),
+            "churn_guard_parked attention should auto-resolve on the next dispatch attempt"
+        );
     }
 
     #[tokio::test]
