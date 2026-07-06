@@ -846,14 +846,7 @@ fn effort_and_model_default_to_null_on_fresh_rows() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     assert!(product.default_model.is_none());
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Trivial fix")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Trivial fix");
     assert!(chore.effort_level.is_none());
     assert!(chore.model_override.is_none());
     let _ = std::fs::remove_file(path);
@@ -890,14 +883,7 @@ fn update_chore_sets_and_clears_effort_and_model() {
     let path = temp_db_path("effort-update");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Some work")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Some work");
 
     // Set via update.
     let updated = db
@@ -945,14 +931,7 @@ fn update_chore_rejects_invalid_effort_level() {
     let path = temp_db_path("effort-invalid");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Some work")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Some work");
 
     let err = db
         .update_work_item(
@@ -1026,14 +1005,7 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
     let path = disk_db_path("effort-upgrade");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Legacy chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Legacy chore");
 
     {
         let conn = db.connect().unwrap();
@@ -1111,14 +1083,7 @@ fn migration_leaves_existing_rows_with_null_effort_and_model() {
     // to simulate the upgrade path.
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Pre-migration chore")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Pre-migration chore");
     // Simulate the pre-migration state by NULL-ing whatever the
     // current schema initialised. `create_chore` already stores
     // NULL for `effort_level` / `model_override`, and
@@ -1984,14 +1949,7 @@ fn migration_normalises_empty_effort_level_to_null() {
     let path = disk_db_path("effort-empty-to-null");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Chore with empty effort")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Chore with empty effort");
 
     // Manually write an empty string to simulate a legacy row.
     {

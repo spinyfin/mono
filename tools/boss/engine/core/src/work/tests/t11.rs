@@ -166,23 +166,8 @@ fn resolve_doc_owner_execution_branch_scope_guards_non_design_investigation_task
     let path = temp_db_path("doc-owner-exec-branch-scope-guard");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some(MONO_REPO));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Fix the thing")
-                .build(),
-        )
-        .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Fix the thing");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
 
     let branch = execution_branch(&execution);
     let artifact_id = pr_doc_artifact_id(MONO_REPO, &branch, "docs/whatever.md");

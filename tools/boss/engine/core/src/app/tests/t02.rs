@@ -1263,20 +1263,12 @@ fn resolve_status_actor_returns_human_when_peer_pid_is_none() {
 // ---- in_review_chore_execution ----
 
 fn make_work_db_with_chore() -> (Arc<WorkDb>, String, String) {
-    use crate::work::CreateChoreInput;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
     std::mem::forget(dir);
     let db = Arc::new(WorkDb::open(path).unwrap());
     let product = create_test_product_with_repo(&db, "Test", Some("git@github.com:test/test.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("In-review reap test")
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "In-review reap test");
     (db, product.id, chore.id)
 }
 

@@ -788,14 +788,7 @@ fn rebind_from_unbound_state() {
 #[test]
 fn unique_index_rejects_duplicate_bound_rows() {
     let (db, product_id, chore_id) = setup_product_and_chore();
-    let chore2 = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("Second chore")
-                .build(),
-        )
-        .unwrap();
+    let chore2 = create_test_chore(&db, product_id.clone(), "Second chore");
     let raw = serde_json::json!({});
     db.set_external_ref(&chore_id, "github", "spinyfin/mono#77", &raw)
         .unwrap();
@@ -820,14 +813,7 @@ fn unique_index_rejects_duplicate_bound_rows() {
 #[test]
 fn list_external_refs_includes_unbound_rows() {
     let (db, product_id, chore_id) = setup_product_and_chore();
-    let chore2 = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("Another chore")
-                .build(),
-        )
-        .unwrap();
+    let chore2 = create_test_chore(&db, product_id.clone(), "Another chore");
 
     let raw = serde_json::json!({ "n": 1 });
     db.set_external_ref(&chore_id, "github", "spinyfin/mono#1", &raw)
