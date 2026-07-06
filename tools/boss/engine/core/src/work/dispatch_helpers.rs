@@ -1301,17 +1301,27 @@ pub(crate) fn request_pr_review_in_tx(
     }
 
     if let Some(existing) = existing_nonterminal_pr_review_execution(conn, work_item_id)? {
+        // Same reasoning as the analogous clear in
+        // `request_execution_in_tx_with_live_check`: reaching this point
+        // means a review is (still) live for this item, so any stale
+        // `churn_guard_parked` attention filed by `pr_review_recovery`
+        // is resolved unconditionally — this is what makes the park
+        // clear automatically once the recovery sweep's trailing window
+        // drains enough to re-fire the review.
+        resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         return Ok(existing);
     }
 
-    insert_execution(
+    let execution = insert_execution(
         conn,
         CreateExecutionInput::builder()
             .work_item_id(work_item_id.to_owned())
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Ready)
             .build(),
-    )
+    )?;
+    resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+    Ok(execution)
 }
 
 /// Returns the work item's latest execution when it is a non-terminal

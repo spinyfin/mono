@@ -110,6 +110,21 @@ impl WorkDb {
                  ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL)",
                 params![id, work_item_id, kind, title, body_markdown, now],
             )?;
+        } else {
+            // Refresh the existing open item's title/body rather than
+            // leaving it frozen at whatever it said the first time it
+            // tripped — a caller like the churn guard re-files on every
+            // sweep pass with an updated failure count / execution list,
+            // and a stale snapshot misleads the operator into thinking
+            // nothing has changed since the first trip.
+            tx.execute(
+                "UPDATE work_attention_items
+                    SET title = ?3, body_markdown = ?4
+                  WHERE work_item_id = ?1
+                    AND kind = ?2
+                    AND status = 'open'",
+                params![work_item_id, kind, title, body_markdown],
+            )?;
         }
         tx.commit()?;
         Ok(())

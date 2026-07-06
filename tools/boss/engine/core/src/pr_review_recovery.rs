@@ -434,6 +434,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn churn_guard_park_auto_clears_via_recovery_sweep_once_window_drains() {
+        // Regression test for the real auto-recovery path: the sweep must
+        // clear its own `churn_guard_parked` attention when it successfully
+        // re-fires a review, not just when an operator bypasses the guard
+        // via `bossctl work start`. Unlike
+        // `churn_guard_skips_repeatedly_dying_review`, this drives the
+        // clear through `run_one_pass` / `request_pr_review` — the code
+        // path `pr_review_recovery` actually takes when it heals.
+        let (_dir, db) = open_db();
+        let (work_item_id, _dead_execution_id) =
+            create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/5");
+
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+                .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+        assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
+        assert_eq!(outcome.refired, 0);
+
+        let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|a| a.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND && a.status == "open"),
+            "expected an open churn_guard_parked attention item; got: {attentions:?}"
+        );
+
+        // Simulate the trailing window draining: age the terminal
+        // executions out of `ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`.
+        db.backdate_terminal_executions_for_test(
+            &work_item_id,
+            now_epoch - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS - 1,
+        )
+        .unwrap();
+
+        let outcome_after_drain = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+        assert_eq!(
+            outcome_after_drain.refired, 1,
+            "recovery sweep should auto-refire once the churn window drains"
+        );
+        assert_eq!(outcome_after_drain.churn_skipped, 0);
+
+        let attentions_after = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attentions_after
+                .iter()
+                .filter(|a| a.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                .all(|a| a.status == "resolved"),
+            "churn_guard_parked attention should auto-resolve once the recovery sweep re-fires the review; \
+             got: {attentions_after:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn no_candidates_when_review_completed_normally() {
         let (_dir, db) = open_db();
         let product_id = create_test_product_with_repo(&db, "test-product", Some("https://github.com/test/repo")).id;
