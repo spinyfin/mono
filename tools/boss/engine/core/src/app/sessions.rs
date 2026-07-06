@@ -262,6 +262,45 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
     }
 }
 
+/// Handle the app reporting that a worker pane died — either its
+/// libghostty surface never attached (`ghostty_surface_new` returned
+/// NULL) or its child process exited with no app-side restart handler
+/// for it (only the Boss pane restarts itself).
+///
+/// Reaps the backing execution immediately via
+/// [`crate::dead_pid_sweep::reap_reported_pane_death`] instead of
+/// waiting for the next periodic dead-PID sweep pass (up to 60s later)
+/// or an app restart. Fire-and-forget: the app does not wait for a
+/// response.
+pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state, peer_pid, ..
+    } = ctx;
+    let FrontendRequest::WorkerPaneDied { run_id } = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "worker_pane_died rejected: caller not in app/Boss subtree",
+        );
+        return;
+    }
+    let reaped = crate::dead_pid_sweep::reap_reported_pane_death(
+        server_state.work_db.as_ref(),
+        server_state.live_worker_states.as_ref(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.as_ref(),
+        &run_id,
+        "app reported the worker pane died (surface failed to attach or child process exited)",
+    )
+    .await;
+    if reaped {
+        tracing::info!(run_id = %run_id, "worker_pane_died: execution reaped immediately");
+    }
+}
+
 pub(super) async fn handle_engine_response(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

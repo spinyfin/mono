@@ -172,6 +172,13 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// when the child exits). Boss pane uses this to re-register the
     /// Boss trust root after a restart produces a new shell pid.
     var onSurfaceAttached: (() -> Void)?
+    /// Called on the main actor each time `ghostty_surface_new` returns
+    /// NULL for this session (no active display, or another rejected
+    /// precondition) — the pane never got a shell process at all. Worker
+    /// panes use this to report the death to the engine immediately
+    /// instead of waiting for the periodic dead-pid sweep; the Boss pane
+    /// leaves it nil (it has no engine-tracked execution to reap).
+    var onSurfaceFailed: (() -> Void)?
 
     init(id: String, role: PaneRole, launchSpec: TerminalLaunchSpec) {
         self.id = id

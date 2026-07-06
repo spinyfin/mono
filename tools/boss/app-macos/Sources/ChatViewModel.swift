@@ -1828,6 +1828,15 @@ final class ChatViewModel: ObservableObject {
         engine.sendUpdateWorkerShellPid(runId: runId, shellPid: shellPid)
     }
 
+    /// Called by ContentView when a worker pane's surface fails to attach
+    /// or its child process exits. Reports the death to the engine so it
+    /// can reap the backing execution immediately rather than waiting for
+    /// the next dead-pid sweep pass or an app restart.
+    func workerPaneDied(runId: String) {
+        guard isAppSessionRegistered else { return }
+        engine.sendWorkerPaneDied(runId: runId)
+    }
+
     // MARK: - Event Handling
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?

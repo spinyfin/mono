@@ -362,8 +362,12 @@ final class GhosttyRuntime: @unchecked Sendable {
             }
 
         case .childExited(let exitCode):
-            // Suppress for sessions that handle their own restart (boss pane).
-            if resolved.host?.session.onChildExited == nil {
+            // Suppress for the Boss pane, which handles its own restart
+            // and shows "Picard restarting…" instead. Gated on role
+            // rather than `onChildExited == nil` — worker panes now set
+            // that closure too (to report pane death to the engine), so
+            // a nil-check would wrongly suppress this message for them.
+            if resolved.host?.session.role != .boss {
                 resolved.host?.session.statusMessage = "Command exited (\(exitCode))"
             }
 
@@ -424,12 +428,21 @@ final class GhosttyRuntime: @unchecked Sendable {
         guard let host = hostView(from: userdata) else { return }
         OperationQueue.main.addOperation {
             MainActor.assumeIsolated {
-                if !processAlive, let onExit = host.session.onChildExited {
+                guard !processAlive else {
+                    host.session.statusMessage = "Surface requested close"
+                    return
+                }
+                if host.session.role == .boss, let onExit = host.session.onChildExited {
                     // Boss pane: delegate to the restart callback instead of
                     // showing a bare "Surface closed" message.
                     onExit()
                 } else {
-                    host.session.statusMessage = processAlive ? "Surface requested close" : "Surface closed"
+                    // Worker pane: show the closed status and report the
+                    // death to the engine (if a handler is installed) so
+                    // reconciliation fires immediately instead of waiting
+                    // for the periodic dead-pid sweep.
+                    host.session.statusMessage = "Surface closed"
+                    host.session.onChildExited?()
                 }
             }
         }

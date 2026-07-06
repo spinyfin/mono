@@ -42,11 +42,21 @@
 //!
 //! Runs every 60 seconds and fires once immediately on boot (same
 //! pattern as [`crate::orphan_sweep`]).
+//!
+//! ## Immediate reconciliation
+//!
+//! [`reap_reported_pane_death`] is the event-driven counterpart: the app
+//! calls it (via `FrontendRequest::WorkerPaneDied`) the moment it
+//! directly observes a worker pane die — surface creation failed or the
+//! child process exited — instead of waiting for the next periodic
+//! pass. It shares [`run_one_pass`]'s reap effects but skips the grace
+//! period and PID probe, since the app's report is a direct observation
+//! rather than a speculative one.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{WorkItemPatch, WorkerActivity};
+use boss_protocol::{LiveWorkerState, WorkExecution, WorkItemPatch, WorkerActivity};
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -284,86 +294,219 @@ pub async fn run_one_pass(
             }
         }
 
-        tracing::info!(
-            execution_id,
-            work_item_id = %execution.work_item_id,
-            pid = state.shell_pid,
-            slot_id = state.slot_id,
-            "dead-pid sweep: worker PID not found; reaping execution and releasing slot",
-        );
-
-        // Mark the execution orphaned so the DB reflects the crash and
-        // bossctl agents transcript <exec-id> still works.
         let reason = format!(
             "dead-pid-reconcile: shell PID {} not found; process presumed dead",
             state.shell_pid
         );
-        if let Err(err) = work_db.mark_execution_orphaned(execution_id, &reason) {
-            tracing::warn!(
-                execution_id,
-                ?err,
-                "dead-pid sweep: failed to mark execution orphaned; skipping reap",
-            );
-            continue;
-        }
-
-        // Snapshot the dead worker's uncommitted workspace work to a
-        // durable patch before the slot is released and the workspace
-        // becomes eligible for re-lease/reset. Best-effort: a failed or
-        // empty capture returns None and never blocks the reap.
-        let recovery_patch = crate::recovery_backup::backup_dead_execution(&execution);
-
-        // Append [engine-reconcile] audit line to the task description
-        // so a human inspecting the chore can see why it was reset (and
-        // where to find the recovery patch, if one was captured).
-        if let Some(work_item_id) = &state.work_item_id
-            && let Err(err) = append_reconcile_audit(
-                work_db,
-                work_item_id,
-                execution_id,
+        let reaped = reap_dead_execution(
+            work_db,
+            coordinator.clone(),
+            dispatch_events,
+            &state,
+            &execution,
+            ReapOptions {
+                reason: &reason,
                 now_epoch_secs,
-                recovery_patch.as_deref(),
-            )
-        {
-            tracing::warn!(
-                work_item_id,
-                ?err,
-                "dead-pid sweep: failed to append audit line to description (non-fatal)",
-            );
+                file_pane_death_attention,
+            },
+        )
+        .await;
+        if reaped {
+            outcome.reaped += 1;
         }
-
-        // Release the worker pool slot so the orphan sweep detects
-        // the chore and creates a fresh ready execution for redispatch.
-        // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
-        // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
-        // "auto-worker-N" prefix and release_worker_and_kick routes to the
-        // correct pool via pool_for_worker_id.
-        let worker_id = worker_id_for_slot(state.slot_id);
-        coordinator.release_worker_and_kick(&worker_id, None).await;
-
-        // Structured event for bossctl dispatch tail.
-        dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::DeadPidReconcile, Outcome::Ok, execution_id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_details(serde_json::json!({
-                        "dead_pid": state.shell_pid,
-                        "slot_id": state.slot_id,
-                        "recovery_patch": recovery_patch
-                            .as_deref()
-                            .map(|p| p.display().to_string()),
-                    })),
-            )
-            .await;
-
-        if file_pane_death_attention {
-            file_pane_death_attention_item(work_db, &execution.work_item_id, execution_id);
-        }
-
-        outcome.reaped += 1;
     }
 
     outcome
+}
+
+/// Immediately reap the execution behind `run_id` after the app reports
+/// its worker pane died — either `ghostty_surface_new` returned NULL
+/// (surface never attached) or the pane's child process exited with no
+/// app-side restart handler for it (only the Boss pane restarts itself;
+/// see `FrontendRequest::WorkerPaneDied`).
+///
+/// Unlike [`run_one_pass`], this skips [`DEAD_PID_GRACE_SECS`] and the
+/// `kill(pid, 0)` liveness probe: those exist to protect the periodic
+/// sweep's *speculative* signal (a PID it can no longer find) from
+/// racing a worker that is merely slow to start. Here the app is
+/// reporting a *direct observation* of its own pane, so there is
+/// nothing to protect against racing — waiting the grace period would
+/// only delay reconciliation for no benefit. Returns `true` if an
+/// execution was actually reaped.
+///
+/// Never files a [`PANE_DEATH_ATTENTION_KIND`] attention item — that is
+/// reserved for [`reconcile_orphans_on_reattach`], where a single app
+/// relaunch can kill many panes at once and an operator needs a durable
+/// record. A single reported pane death is comparatively rare and
+/// already surfaced via the `dead_pid_reconcile` dispatch event.
+pub async fn reap_reported_pane_death(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    run_id: &str,
+    detail: &str,
+) -> bool {
+    let Some(state) = live_states.snapshot().into_iter().find(|s| s.run_id == run_id) else {
+        tracing::warn!(
+            run_id,
+            "worker_pane_died: no live slot found for run_id (already released?)"
+        );
+        return false;
+    };
+
+    if is_terminal_activity(state.activity) {
+        // Already finalized via the normal completion path; nothing to do.
+        return false;
+    }
+
+    let execution = match work_db.get_execution(run_id) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(
+                run_id,
+                ?err,
+                "worker_pane_died: failed to look up execution; skipping reap",
+            );
+            return false;
+        }
+    };
+
+    if execution.status.is_terminal() {
+        // Completion path raced the app's report; nothing to do.
+        return false;
+    }
+
+    let now_epoch_secs: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let reason = format!("worker-pane-died: {detail}");
+    reap_dead_execution(
+        work_db,
+        coordinator,
+        dispatch_events,
+        &state,
+        &execution,
+        ReapOptions {
+            reason: &reason,
+            now_epoch_secs,
+            file_pane_death_attention: false,
+        },
+    )
+    .await
+}
+
+/// Per-reap parameters that don't identify *what* is being reaped (that's
+/// `state`/`execution`) but *how* to record and report the reap. Bundled
+/// to keep [`reap_dead_execution`]'s argument count under the
+/// `clippy::too_many_arguments` threshold.
+struct ReapOptions<'a> {
+    reason: &'a str,
+    now_epoch_secs: i64,
+    file_pane_death_attention: bool,
+}
+
+/// Shared reap effects for a single dead worker: mark the execution
+/// orphaned, back up uncommitted workspace work, append the
+/// `[engine-reconcile]` audit line, release the pool slot, emit a
+/// `dead_pid_reconcile` dispatch event, and (when
+/// `file_pane_death_attention` is set) file a durable
+/// [`PANE_DEATH_ATTENTION_KIND`] attention item. Shared between
+/// [`run_one_pass`] and [`reap_reported_pane_death`] so all paths — the
+/// periodic sweep, an app-reattach reconcile, and an authoritative app
+/// report — leave the DB, pool, and audit trail in the same shape.
+/// Returns `false` (with no other effect) if the DB write to mark the
+/// execution orphaned fails.
+async fn reap_dead_execution(
+    work_db: &WorkDb,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    state: &LiveWorkerState,
+    execution: &WorkExecution,
+    options: ReapOptions<'_>,
+) -> bool {
+    let ReapOptions {
+        reason,
+        now_epoch_secs,
+        file_pane_death_attention,
+    } = options;
+    let execution_id = &state.run_id;
+
+    tracing::info!(
+        execution_id,
+        work_item_id = %execution.work_item_id,
+        pid = state.shell_pid,
+        slot_id = state.slot_id,
+        reason,
+        "dead-pid reconcile: reaping execution and releasing slot",
+    );
+
+    // Mark the execution orphaned so the DB reflects the crash and
+    // bossctl agents transcript <exec-id> still works.
+    if let Err(err) = work_db.mark_execution_orphaned(execution_id, reason) {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "dead-pid reconcile: failed to mark execution orphaned; skipping reap",
+        );
+        return false;
+    }
+
+    // Snapshot the dead worker's uncommitted workspace work to a
+    // durable patch before the slot is released and the workspace
+    // becomes eligible for re-lease/reset. Best-effort: a failed or
+    // empty capture returns None and never blocks the reap.
+    let recovery_patch = crate::recovery_backup::backup_dead_execution(execution);
+
+    // Append [engine-reconcile] audit line to the task description
+    // so a human inspecting the chore can see why it was reset (and
+    // where to find the recovery patch, if one was captured).
+    if let Some(work_item_id) = &state.work_item_id
+        && let Err(err) = append_reconcile_audit(
+            work_db,
+            work_item_id,
+            execution_id,
+            now_epoch_secs,
+            recovery_patch.as_deref(),
+        )
+    {
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "dead-pid reconcile: failed to append audit line to description (non-fatal)",
+        );
+    }
+
+    // Release the worker pool slot so the orphan sweep detects
+    // the chore and creates a fresh ready execution for redispatch.
+    // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
+    // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
+    // "auto-worker-N" prefix and release_worker_and_kick routes to the
+    // correct pool via pool_for_worker_id.
+    let worker_id = worker_id_for_slot(state.slot_id);
+    coordinator.release_worker_and_kick(&worker_id, None).await;
+
+    // Structured event for bossctl dispatch tail.
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::DeadPidReconcile, Outcome::Ok, execution_id)
+                .with_work_item(&execution.work_item_id)
+                .with_details(serde_json::json!({
+                    "dead_pid": state.shell_pid,
+                    "slot_id": state.slot_id,
+                    "recovery_patch": recovery_patch
+                        .as_deref()
+                        .map(|p| p.display().to_string()),
+                })),
+        )
+        .await;
+
+    if file_pane_death_attention {
+        file_pane_death_attention_item(work_db, &execution.work_item_id, execution_id);
+    }
+
+    true
 }
 
 /// File (or no-op onto an already-`open` one) a [`PANE_DEATH_ATTENTION_KIND`]
@@ -940,5 +1083,156 @@ mod tests {
             ExecutionStatus::Ready,
             "a live worker's execution must be untouched by re-attach reconcile",
         );
+    }
+
+    // ─── reap_reported_pane_death ───────────────────────────────────────────
+
+    /// The core invariant: an app-reported pane death reaps the execution
+    /// immediately, even though `started_at` is fresh (well within
+    /// `DEAD_PID_GRACE_SECS`) and the "PID" is still alive — neither guard
+    /// applies here because the app's report is a direct observation, not
+    /// a speculative signal to protect against.
+    #[tokio::test]
+    async fn reap_reported_pane_death_bypasses_grace_and_pid_checks() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        use boss_protocol::RequestExecutionInput;
+        let execution = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+        // Stamp started_at = NOW — within the grace window the periodic
+        // sweep would respect, but reap_reported_pane_death must not.
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        db.force_started_at_for_test(&execution.id, now_secs).unwrap();
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        // Still-alive PID (self) — the periodic sweep would never reap this.
+        register_slot_with_binding(&live_states, 1, &execution.id, std::process::id() as i32, &work_item_id);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution.id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let reaped = reap_reported_pane_death(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &execution.id,
+            "surface failed to attach",
+        )
+        .await;
+
+        assert!(reaped, "app-reported pane death must reap immediately");
+
+        let exec = db.get_execution(&execution.id).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::Orphaned);
+
+        let claimed_after = coordinator.worker_pool().claimed_execution_ids().await;
+        assert!(!claimed_after.contains(&execution.id), "pool slot must be released");
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "dead_pid_reconcile");
+    }
+
+    /// No live slot for the reported `run_id` (already released, or the
+    /// app raced a normal completion) is a no-op, not an error.
+    #[tokio::test]
+    async fn reap_reported_pane_death_returns_false_for_unknown_run_id() {
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let reaped = reap_reported_pane_death(
+            db.as_ref(),
+            &live_states,
+            coordinator,
+            sink.as_ref(),
+            "run-does-not-exist",
+            "surface failed to attach",
+        )
+        .await;
+
+        assert!(!reaped);
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// A slot already `Terminated` was finalized via the normal
+    /// completion path; the app's death report must not double-reap it.
+    #[tokio::test]
+    async fn reap_reported_pane_death_skips_terminal_slot() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        live_states.register_spawn(1, &execution_id, "claude-opus-4-7", std::process::id() as i32, None);
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::SessionEnd {
+                session_id: "test-session".to_owned(),
+                reason: "end_turn".to_owned(),
+            },
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let reaped = reap_reported_pane_death(
+            db.as_ref(),
+            &live_states,
+            coordinator,
+            sink.as_ref(),
+            &execution_id,
+            "surface failed to attach",
+        )
+        .await;
+
+        assert!(!reaped, "a Terminated slot must not be reaped again");
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// An execution already terminal in the DB (completion raced the
+    /// app's report) is left untouched.
+    #[tokio::test]
+    async fn reap_reported_pane_death_skips_terminal_execution() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        db.mark_execution_orphaned(&execution_id, "already finalized").unwrap();
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, std::process::id() as i32, &work_item_id);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let reaped = reap_reported_pane_death(
+            db.as_ref(),
+            &live_states,
+            coordinator,
+            sink.as_ref(),
+            &execution_id,
+            "surface failed to attach",
+        )
+        .await;
+
+        assert!(!reaped);
+        assert!(sink.events().await.is_empty());
     }
 }
