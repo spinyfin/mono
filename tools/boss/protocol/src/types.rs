@@ -3582,6 +3582,19 @@ pub struct WorkComment {
     /// §"Association model" / §"Reconciliation".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise_task_id: Option<String>,
+
+    /// When the async classifier gave up after exhausting its retries.
+    /// `NULL` while classification is in flight/pending, and cleared back to
+    /// `NULL` the moment a classification (or manual override) succeeds.
+    /// Lets the UI distinguish "still classifying" from "classification
+    /// failed" instead of showing an indefinite spinner for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_classification_failed_at: Option<String>,
+
+    /// The last classifier error, set alongside
+    /// `intent_classification_failed_at`. `NULL` whenever that is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_classification_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

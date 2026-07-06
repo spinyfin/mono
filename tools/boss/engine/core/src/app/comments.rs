@@ -55,9 +55,13 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
 }
 
 /// Spawn the detached classifier call for a freshly created top-level
-/// comment. Failures (no API key, transport, malformed reply) are logged
-/// and swallowed — the comment simply stays in the `classifying` state
-/// (`intent IS NULL`) with no retry in this phase.
+/// comment. `crate::comment_classifier::classify` already retries transient
+/// failures internally; once those retries are exhausted (no API key,
+/// persistent transport failure, or a reply that still doesn't parse), the
+/// failure is recorded on the comment row
+/// (`intent_classification_failed_at`/`intent_classification_error`) so the
+/// UI can show a terminal failed state instead of an indefinite
+/// "classifying…" spinner.
 fn spawn_comment_classifier(
     server_state: &Arc<ServerState>,
     work_db: &Arc<WorkDb>,
@@ -65,13 +69,6 @@ fn spawn_comment_classifier(
     request_id: &str,
     comment: &WorkComment,
 ) {
-    let Some(api_key) = crate::comment_classifier::resolve_api_key() else {
-        tracing::debug!(
-            comment_id = %comment.id,
-            "comment intent classifier: no API key configured; comment stays in classifying state",
-        );
-        return;
-    };
     let server_state = server_state.clone();
     let work_db = work_db.clone();
     let session_id = session_id.to_owned();
@@ -83,6 +80,27 @@ fn spawn_comment_classifier(
     let artifact_id = comment.artifact_id.clone();
 
     tokio::spawn(async move {
+        let Some(api_key) = crate::comment_classifier::resolve_api_key() else {
+            tracing::debug!(
+                comment_id = %comment_id,
+                "comment intent classifier: no API key configured; recording terminal classification failure",
+            );
+            record_classification_failure(
+                &server_state,
+                &work_db,
+                &session_id,
+                &request_id,
+                &ClassifiedCommentRef {
+                    comment_id: &comment_id,
+                    artifact_kind: &artifact_kind,
+                    artifact_id: &artifact_id,
+                },
+                "no API key configured",
+            )
+            .await;
+            return;
+        };
+
         match crate::comment_classifier::classify(&api_key, &body, &anchor).await {
             Ok(result) => match work_db.set_comment_intent(&comment_id, &result.intent, result.confidence) {
                 Ok(classified) => {
@@ -128,11 +146,69 @@ fn spawn_comment_classifier(
                 tracing::warn!(
                     comment_id = %comment_id,
                     err = %err,
-                    "comment intent classifier: classification call failed; comment stays in classifying state",
+                    "comment intent classifier: classification call failed after exhausting retries; \
+                     recording terminal classification failure",
                 );
+                record_classification_failure(
+                    &server_state,
+                    &work_db,
+                    &session_id,
+                    &request_id,
+                    &ClassifiedCommentRef {
+                        comment_id: &comment_id,
+                        artifact_kind: &artifact_kind,
+                        artifact_id: &artifact_id,
+                    },
+                    &err,
+                )
+                .await;
             }
         }
     });
+}
+
+/// Just enough of a comment's identity for [`record_classification_failure`]
+/// to persist the failure and publish the right invalidation — bundled so
+/// that function stays under the shared arg-count lint rather than taking
+/// `comment_id`/`artifact_kind`/`artifact_id` as three separate parameters.
+struct ClassifiedCommentRef<'a> {
+    comment_id: &'a str,
+    artifact_kind: &'a str,
+    artifact_id: &'a str,
+}
+
+/// Persist a terminal classification failure
+/// (`intent_classification_failed_at`/`intent_classification_error`) and
+/// publish the invalidation so the sidebar drops the "classifying…" spinner
+/// in favor of a failed state. Shared by [`spawn_comment_classifier`]'s
+/// no-API-key and retries-exhausted paths. Errors recording the failure are
+/// logged, not propagated — the comment simply falls back to the
+/// pre-existing behavior of staying in the `classifying` state.
+async fn record_classification_failure(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &ClassifiedCommentRef<'_>,
+    error: &str,
+) {
+    if let Err(err) = work_db.record_comment_classification_failed(comment.comment_id, error) {
+        tracing::warn!(
+            comment_id = %comment.comment_id,
+            err = %err,
+            "comment intent classifier: failed to record terminal classification failure",
+        );
+        return;
+    }
+    publish_comment_invalidation(
+        server_state,
+        session_id,
+        request_id,
+        comment.artifact_kind,
+        comment.artifact_id,
+        "comment_intent_classification_failed",
+    )
+    .await;
 }
 
 /// Spawn a read-only answer-agent run for a freshly `question`-classified

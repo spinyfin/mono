@@ -77,7 +77,8 @@ fn log_orphan_transition(
 const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anchor_json, body, \
      author, status, status_actor, last_resolved_with, plain_text_projection_version, \
      created_at, updated_at, dismissed_at, intent, intent_confidence, intent_classified_at, \
-     intent_overridden_by, revise_task_id";
+     intent_overridden_by, revise_task_id, intent_classification_failed_at, \
+     intent_classification_error";
 
 const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
      (id, artifact_kind, artifact_id, doc_version, anchor_json, body, author, status, \
@@ -463,7 +464,8 @@ impl WorkDb {
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET intent = ?2, intent_confidence = ?3, intent_classified_at = ?4
+             SET intent = ?2, intent_confidence = ?3, intent_classified_at = ?4,
+                 intent_classification_failed_at = NULL, intent_classification_error = NULL
              WHERE id = ?1 AND intent_classified_at IS NULL",
             params![comment_id, intent, confidence, now],
         )?;
@@ -471,6 +473,31 @@ impl WorkDb {
             bail!("comment {comment_id} not found, or already classified");
         }
         query_comment(&conn, comment_id)?.with_context(|| format!("missing comment after intent update: {comment_id}"))
+    }
+
+    /// Record that the async classifier permanently gave up on a comment
+    /// after exhausting its retries (comment-intent-classification design —
+    /// the classifier retry/terminal-state fix). Guarded on
+    /// `intent_classified_at IS NULL`, mirroring [`Self::set_comment_intent`]:
+    /// a comment that has already been successfully classified (or manually
+    /// overridden) must never be knocked back into a failed state by a
+    /// stale/late-arriving failure. Idempotent — re-recording the same
+    /// failure (e.g. a second, independent classifier attempt elsewhere)
+    /// just overwrites the error text and timestamp.
+    pub fn record_comment_classification_failed(&self, comment_id: &str, error: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET intent_classification_failed_at = ?2, intent_classification_error = ?3
+             WHERE id = ?1 AND intent_classified_at IS NULL",
+            params![comment_id, now, error],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or already classified");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after recording classification failure: {comment_id}"))
     }
 
     /// Manually reclassify a comment's intent (`CommentsSetIntent` RPC —
@@ -492,7 +519,8 @@ impl WorkDb {
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user'
+             SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user',
+                 intent_classification_failed_at = NULL, intent_classification_error = NULL
              WHERE id = ?1",
             params![comment_id, intent, now],
         )?;
