@@ -308,11 +308,11 @@ fn resolve_runtime_cwd_with(lookup: impl Fn(&str) -> Option<OsString>) -> Result
 }
 
 fn default_db_path() -> Result<PathBuf> {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(root) = boss_log_files::default_state_root() else {
         bail!("HOME must be set to derive the default Boss database path");
     };
 
-    Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
+    Ok(root.join("state.db"))
 }
 
 #[cfg(test)]

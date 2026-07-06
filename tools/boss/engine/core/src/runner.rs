@@ -140,8 +140,9 @@ pub fn engine_events_socket_path() -> PathBuf {
     if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
         return override_path.into();
     }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/Boss/events.sock")
+    boss_log_files::default_state_root()
+        .unwrap_or_default()
+        .join("events.sock")
 }
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
@@ -211,8 +212,7 @@ impl PaneSpawnRunner {
         let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
         let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
-        let stable_bin_dir =
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Boss/bin"));
+        let stable_bin_dir = boss_log_files::default_state_root().map(|root| root.join("bin"));
         resolve_boss_event_binary(
             &engine_path,
             workspace.as_deref(),

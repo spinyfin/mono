@@ -79,8 +79,7 @@ pub fn default_recovery_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(RECOVERY_DIR_ENV) {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Boss/recovery"))
+    Some(boss_log_files::default_state_root()?.join("recovery"))
 }
 
 /// Map an execution id to a safe single-segment patch filename.

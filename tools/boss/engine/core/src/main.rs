@@ -56,12 +56,7 @@ impl Write for DualLogWriter {
 /// Path for the structured-JSON engine trace file consumed by the Activity
 /// Log viewer in the macOS app. Lives alongside other Boss state files.
 fn engine_trace_jsonl_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join("Library/Application Support/Boss")
-            .join("engine-trace.jsonl"),
-    )
+    Some(boss_log_files::default_state_root()?.join(boss_log_files::ENGINE_TRACE_FILENAME))
 }
 
 fn resolve_log_path() -> PathBuf {
@@ -224,8 +219,7 @@ fn parent_command_line() -> Option<String> {
 }
 
 fn default_state_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
+    Some(boss_log_files::default_state_root()?.join("state.db"))
 }
 
 fn collect_known_socket_paths() -> Vec<PathBuf> {
