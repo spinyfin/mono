@@ -289,9 +289,13 @@ pub fn all_markers() -> impl Iterator<Item = &'static str> {
 /// True iff `text` contains `marker` as a whole-word match,
 /// case-insensitive. "Whole word" follows the design's
 /// `\b<marker>\b` framing: marker characters bordered on each side
-/// by either start/end of string OR a non-alphanumeric, non-`-`
-/// character. The dash is preserved because §Q4's `end-to-end`,
-/// `re-export`, etc. would otherwise break on the internal hyphen.
+/// by either start/end of string OR a boundary character. Boundary
+/// characters are everything except ASCII alphanumerics and `_`
+/// (which count as inside-a-word — see [`is_marker_word_char`]).
+/// The internal hyphens in multi-part markers like §Q4's
+/// `end-to-end` and `re-export` sit *inside* the matched span, so
+/// they never touch a boundary test; a dash *adjacent* to the marker
+/// (e.g. `root-cause` matching `cause`) is a boundary and does match.
 pub fn marker_matches_text(marker: &str, text: &str) -> bool {
     if marker.is_empty() || text.len() < marker.len() {
         return false;
@@ -316,11 +320,14 @@ pub fn marker_matches_text(marker: &str, text: &str) -> bool {
 
 fn is_marker_word_char(b: u8) -> bool {
     // The markers themselves contain ASCII alphanumerics, dashes
-    // (`end-to-end`, `re-export`), and spaces (`root cause`). For
-    // the boundary test we treat alphanumerics and `-` as "inside a
-    // word"; space and punctuation count as boundaries. This keeps
-    // `rename` from matching `prerender` and `cursor` from matching
-    // `precursor`, but lets `cursor.` and `cursor,` match.
+    // (`end-to-end`, `re-export`), and spaces (`root cause`). For the
+    // boundary test we treat alphanumerics and `_` as "inside a
+    // word"; dashes, spaces, and other punctuation count as
+    // boundaries. This keeps `rename` from matching `prerender` and
+    // `cursor` from matching `precursor` (alphabetic neighbours), and
+    // stops `rename` from matching inside `rename_auth` (underscore is
+    // inside-word), but lets `cursor.`, `cursor,`, and `root-cause`
+    // match at a dash/punctuation boundary.
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
@@ -675,6 +682,61 @@ mod tests {
         assert!(!marker_matches_text("cursor", "the precursor design"));
         // Empty haystack / needle.
         assert!(!marker_matches_text("", "anything"));
+        assert!(!marker_matches_text("rename", ""));
+    }
+
+    #[test]
+    fn marker_matches_text_rescans_past_a_failed_boundary_occurrence() {
+        // The `start = abs + 1` continuation: the marker first appears
+        // INSIDE a larger word (boundary check fails) and then again as a
+        // standalone word later in the text. The standalone occurrence must
+        // still match — the loop must not bail after the first embedded hit.
+        assert!(marker_matches_text("cursor", "the precursor and the cursor"));
+        // Symmetric case: standalone first, embedded second — the early
+        // standalone match short-circuits and returns true.
+        assert!(marker_matches_text("cursor", "the cursor and the precursor"));
+        // Two embedded occurrences and no standalone → no match, even though
+        // the marker substring appears twice.
+        assert!(!marker_matches_text("cursor", "precursor and recursor"));
+    }
+
+    #[test]
+    fn marker_matches_text_treats_underscore_as_inside_word() {
+        // Underscore is an inside-word char, so a marker glued to text by an
+        // underscore is NOT a whole-word match on either side.
+        assert!(!marker_matches_text("rename", "rename_auth middleware"));
+        assert!(!marker_matches_text("rename", "auth_rename middleware"));
+        // Digits are inside-word too: `cursor2` / `2cursor` do not match.
+        assert!(!marker_matches_text("cursor", "cursor2 flicker"));
+        assert!(!marker_matches_text("cursor", "fix 2cursor flicker"));
+    }
+
+    #[test]
+    fn marker_matches_text_treats_dash_and_punctuation_as_boundaries() {
+        // Dash is a boundary: `root-cause` is a whole-word hit for `cause`,
+        // and a marker abutting a dash on either side still matches. This
+        // pins the intended contract (implementation-side) rather than the
+        // stale doc claim that `-` is inside-a-word.
+        assert!(marker_matches_text("cause", "root-cause analysis"));
+        assert!(marker_matches_text("cursor", "cursor-blink flicker"));
+        // Period, comma, and parentheses are boundaries too.
+        assert!(marker_matches_text("cursor", "fix cursor. done"));
+        assert!(marker_matches_text("cursor", "fix (cursor) flicker"));
+        assert!(marker_matches_text("cursor", "flicker(cursor)"));
+    }
+
+    #[test]
+    fn marker_matches_text_length_and_empty_guards() {
+        // Early-return length guard: text strictly shorter than the marker
+        // can never contain it, so the scan is skipped.
+        assert!(!marker_matches_text("investigate", "audit"));
+        assert!(!marker_matches_text("rename", "hi"));
+        // Equal length is not short-circuited — an exact match still holds.
+        assert!(marker_matches_text("rename", "rename"));
+        // Empty marker never matches, even against empty text.
+        assert!(!marker_matches_text("", ""));
+        assert!(!marker_matches_text("", "rename"));
+        // Empty text never matches a non-empty marker.
         assert!(!marker_matches_text("rename", ""));
     }
 
