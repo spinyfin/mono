@@ -536,7 +536,9 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{make_session_sink, test_server_state};
     use super::*;
+    use crate::test_support::{create_active_chore, create_product};
 
     /// Pins the `EnginePoolConfig.coordinator_model` push (computed in
     /// `handle_register_app_session` above) to the Max-effort Claude model.
@@ -550,5 +552,173 @@ mod tests {
             .model_menu
             .default_model_for_level)(boss_protocol::EffortLevel::Max);
         assert_eq!(coordinator_model, "fable");
+    }
+
+    fn dispatch_ctx(server_state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
+        Dispatch::builder()
+            .server_state(server_state.clone())
+            .work_db(server_state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("s1")
+            .request_id("req-1")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build()
+    }
+
+    fn create_ready_execution(server_state: &Arc<ServerState>) -> String {
+        let product_id = create_product(&server_state.work_db);
+        let work_item_id = create_active_chore(&server_state.work_db, &product_id, "test chore");
+        server_state
+            .work_db
+            .request_execution(
+                boss_protocol::RequestExecutionInput::builder()
+                    .work_item_id(work_item_id)
+                    .build(),
+            )
+            .unwrap()
+            .id
+    }
+
+    async fn call_nack(server_state: &Arc<ServerState>, run_id: &str) {
+        let sink = make_session_sink();
+        let ctx = dispatch_ctx(server_state, &sink);
+        handle_report_worker_spawn_failed(
+            ctx,
+            FrontendRequest::ReportWorkerSpawnFailed {
+                run_id: run_id.to_owned(),
+                reason: "test-nack".to_owned(),
+            },
+        )
+        .await;
+    }
+
+    /// Guard 1: no live slot at all for `run_id` (already reaped/released,
+    /// or the app raced a NACK for a run the engine never registered) — the
+    /// NACK must be a pure no-op, never touching the execution.
+    #[tokio::test]
+    async fn nack_ignored_when_no_live_slot() {
+        let server_state = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+
+        call_nack(&server_state, &execution_id).await;
+
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "no live slot must leave the execution untouched",
+        );
+    }
+
+    /// Guard 2a: the slot already reported a real shell pid — proof the
+    /// pane actually came up. Reaping here would tear down a live worker.
+    #[tokio::test]
+    async fn nack_ignored_when_shell_pid_already_reported() {
+        let server_state = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 4242, None);
+
+        call_nack(&server_state, &execution_id).await;
+
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "a slot with a reported pid must not be reaped",
+        );
+        assert!(
+            server_state.live_worker_states.get(1).is_some(),
+            "the live slot must not be torn down",
+        );
+    }
+
+    /// Guard 2b: the slot has seen a hook event (proof of life) even though
+    /// it hasn't reported a pid or left `Spawning` yet.
+    #[tokio::test]
+    async fn nack_ignored_when_hook_event_already_seen() {
+        let server_state = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
+        // Resume source is proof of life without flipping activity away
+        // from Spawning, isolating this guard from guard 2c below.
+        server_state.live_worker_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::SessionStart {
+                session_id: "s".to_owned(),
+                source: boss_protocol::SessionStartSource::Resume,
+            },
+        );
+
+        call_nack(&server_state, &execution_id).await;
+
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "a slot with any hook event must not be reaped",
+        );
+        assert!(server_state.live_worker_states.get(1).is_some());
+    }
+
+    /// Guard 2c: the slot's activity already progressed past `Spawning`.
+    #[tokio::test]
+    async fn nack_ignored_when_activity_past_spawning() {
+        let server_state = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
+        server_state.live_worker_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::SessionStart {
+                session_id: "s".to_owned(),
+                source: boss_protocol::SessionStartSource::Startup,
+            },
+        );
+        assert_ne!(
+            server_state.live_worker_states.get(1).unwrap().activity,
+            boss_protocol::WorkerActivity::Spawning,
+            "precondition: Startup source must move activity off Spawning",
+        );
+
+        call_nack(&server_state, &execution_id).await;
+
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "a slot that progressed past Spawning must not be reaped",
+        );
+        assert!(server_state.live_worker_states.get(1).is_some());
+    }
+
+    /// Guard 3: the execution is already terminal (e.g. a duplicate or
+    /// very-late NACK arriving after some other path already finished the
+    /// execution) — must never re-reap a terminal execution.
+    #[tokio::test]
+    async fn nack_ignored_when_execution_already_terminal() {
+        let server_state = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
+        let work_item_id = server_state.work_db.get_execution(&execution_id).unwrap().work_item_id;
+        server_state
+            .work_db
+            .force_execution_status_for_test(&work_item_id, boss_protocol::ExecutionStatus::Completed)
+            .unwrap();
+
+        call_nack(&server_state, &execution_id).await;
+
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Completed,
+            "an already-terminal execution must not be reaped again",
+        );
+        assert!(
+            server_state.live_worker_states.get(1).is_some(),
+            "the live slot must not be torn down for a stale NACK",
+        );
     }
 }

@@ -162,6 +162,19 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// The foreground pid of this pane's PTY, or 0 when the surface is not
     /// yet live. Delegates to `GhosttyTerminalHostView.foregroundPid`.
     var shellPid: Int32 { hostView?.foregroundPid ?? 0 }
+    /// Set by `WorkersWorkspaceModel.releaseWorkerPane` the instant a slot is
+    /// released, before SwiftUI has necessarily torn down the host view.
+    /// `GhosttyTerminalHostView.attemptSurfaceCreation` checks this so a
+    /// display-change retry that fires after release (e.g. the fast-fail
+    /// NACK reaped the execution while a `NSScreen` observer was still
+    /// armed) can't create a fresh surface and spawn a duplicate `claude`
+    /// for an execution the engine has already given up on.
+    private(set) var isReleased = false
+
+    /// Mark this session as released. Idempotent.
+    func markReleased() {
+        isReleased = true
+    }
     private var claudeMonitorTracker = ClaudeMonitorTracker()
     /// Called on the main actor when the pane's child process exits.
     /// Boss pane sets this to a restart closure; worker panes leave it nil.

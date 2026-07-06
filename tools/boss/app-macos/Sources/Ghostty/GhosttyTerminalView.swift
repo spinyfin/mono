@@ -218,6 +218,15 @@ final class GhosttyTerminalHostView: NSView {
     /// retries.
     private func attemptSurfaceCreation() {
         guard surface == nil else { return }
+        // The session's slot may have been released (e.g. the engine
+        // reaped this run off the fast-fail NACK path) while this view's
+        // display-change retry was still armed. Creating a surface now
+        // would start a shell for a run nobody is tracking anymore —
+        // bail and drop the observer instead.
+        guard !session.isReleased else {
+            removeScreenObserver()
+            return
+        }
 
         guard let surface = makeSurface() else {
             session.statusMessage = "Waiting for an active display…"

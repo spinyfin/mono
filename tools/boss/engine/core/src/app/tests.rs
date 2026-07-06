@@ -40,7 +40,7 @@ fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
     topic_event_topic(&env.payload)
 }
 
-fn test_server_state() -> Arc<ServerState> {
+pub(super) fn test_server_state() -> Arc<ServerState> {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
         crate::config::WorkConfig::builder()
@@ -55,7 +55,7 @@ fn test_server_state() -> Arc<ServerState> {
     ServerState::new_arc_with_app_pid(cfg, None, None).unwrap()
 }
 
-fn make_session_sink() -> Arc<SessionSink> {
+pub(super) fn make_session_sink() -> Arc<SessionSink> {
     let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
     Arc::new(SessionSink::new(shutdown_tx))
 }

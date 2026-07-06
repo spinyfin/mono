@@ -259,6 +259,11 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
 
         let foregroundPid = foregroundPid(for: session)
+        // Mark released before nil-ing the slot so a display-change retry
+        // racing this release (see `GhosttyTerminalHostView.attemptSurfaceCreation`)
+        // can't create a fresh surface and spawn a duplicate `claude` for the
+        // run the engine just gave up on.
+        session.markReleased()
 
         targetSlots[index].session = nil
         targetSlots[index].runId = nil
