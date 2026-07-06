@@ -440,10 +440,35 @@ final class CommentLayer: NSObject, ObservableObject {
     /// verbatim from the projection (normalising the pasteboard whitespace), with
     /// up to 64 chars of surrounding context. Falls back to a bare `exact` anchor
     /// when the projection is empty or the occurrence can't be located.
+    ///
+    /// `quoted` comes from `captureCurrentSelection()`, which reads the pasteboard
+    /// after simulating "Copy". For a selection inside a list item, Textual's own
+    /// copy handler (`NSTextInteractionView.copy(_:)`) serialises the selected
+    /// `AttributedString` fragment through its `Formatter.plainText()` — which
+    /// (per the vendored `textual` package's `Formatter+PlainText.swift`)
+    /// reconstructs the item's block structure from presentation intents and
+    /// prepends a `"• "`/`"<n>. "` marker plus two-space-per-level indentation to
+    /// *every* line, even when only part of the item's text was selected. `plain`
+    /// (`CommentProjection.plainText`, built via `AttributedString(markdown:).characters`)
+    /// carries no such decoration — it's a bare flatten of inline text with no
+    /// per-block markers at all. So a selection anywhere inside a list item never
+    /// locates verbatim in `plain`, and used to silently fall back to a bare
+    /// `{exact: quoted}` anchor with no prefix/suffix — which the engine then
+    /// immediately orphaned on the very next resolve, since that decorated
+    /// `exact` string doesn't occur in the projection it resolves against
+    /// either. `stripCopyListDecoration` undoes exactly that known decoration
+    /// before the match is retried, so capture and re-anchor operate on the same
+    /// text space and prefix/suffix context is captured normally.
     static func captureAnchor(quoted: String, occurrenceIndex: Int, in plain: String) -> CommentAnchor {
         let contextLength = 64
         guard !plain.isEmpty else { return CommentAnchor(exact: quoted) }
-        let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: quoted, in: plain)
+        var ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: quoted, in: plain)
+        if occurrenceIndex >= ranges.count {
+            let normalized = stripCopyListDecoration(quoted)
+            if normalized != quoted {
+                ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: normalized, in: plain)
+            }
+        }
         guard occurrenceIndex >= 0, occurrenceIndex < ranges.count else {
             return CommentAnchor(exact: quoted)
         }
@@ -456,6 +481,28 @@ final class CommentLayer: NSObject, ObservableObject {
         let prefix = String(plain[prefixStart..<range.lowerBound])
         let suffix = String(plain[range.upperBound..<suffixEnd])
         return CommentAnchor(exact: exact, prefix: prefix, suffix: suffix)
+    }
+
+    /// Strips the per-line list-item decoration Textual's `Formatter.plainText()`
+    /// adds — a leading run of two-space indents (one per nesting level) followed
+    /// by an optional `"• "` (unordered) or `"<digits>. "` (ordered) marker — so
+    /// pasteboard-copied text from inside a list item recovers the bare inline
+    /// text the `AttributedString.characters`-based plain-text projection
+    /// actually contains. A no-op (returns the input unchanged) for text with no
+    /// such prefix, so it's always safe to try.
+    static func stripCopyListDecoration(_ text: String) -> String {
+        let markerPattern = #"^(?:  )*(?:•[ \t]+|\d+\.[ \t]+)?"#
+        guard let marker = try? NSRegularExpression(pattern: markerPattern) else { return text }
+        return text
+            .components(separatedBy: "\n")
+            .map { line -> String in
+                let range = NSRange(line.startIndex..<line.endIndex, in: line)
+                guard let match = marker.firstMatch(in: line, range: range),
+                      let matchedRange = Range(match.range, in: line)
+                else { return line }
+                return String(line[matchedRange.upperBound...])
+            }
+            .joined(separator: "\n")
     }
 
     // MARK: - Intent classification badge

@@ -8,11 +8,69 @@
 //! artifact when a design doc graduates to a PR.
 
 use super::*;
-use crate::comments_anchor::{AnchorResolution, CommentFuzzyConfig, resolve_anchor};
+use crate::comments_anchor::{AnchorResolution, CommentFuzzyConfig, OrphanReason, resolve_anchor};
 
 /// Default prefix/suffix length (chars) when (re-)extracting an anchor from
 /// plain text. 64 each per design § "Anchoring model" (prefix/suffix length).
 const ANCHOR_CONTEXT_CHARS: usize = 64;
+
+/// Emits the one trace event a comment's `active`/`orphaned` → `orphaned`
+/// transition previously produced none of: before this, diagnosing an orphan
+/// meant reading `anchor_json`/`plain_text_projection_version` out of
+/// `state.db` by hand and re-deriving why `resolve_anchor` gave up. Classifies
+/// [`OrphanReason::NoConfidentMatch`] further into `not_found` (best score
+/// never cleared the bar) vs the two ambiguous cases (a non-unique verbatim
+/// hit, or a fuzzy winner too close to its runner-up) so "the quote is gone"
+/// and "the quote is ambiguous" don't require re-deriving from raw scores.
+fn log_orphan_transition(
+    comment_id: &str,
+    doc_version: &str,
+    anchor_exact: &str,
+    reason: OrphanReason,
+    config: &CommentFuzzyConfig,
+) {
+    let anchor_exact: String = anchor_exact.chars().take(80).collect();
+    match reason {
+        OrphanReason::EmptyExact => tracing::warn!(
+            comment_id,
+            doc_version,
+            anchor_exact,
+            why = "empty_exact",
+            "comment orphaned: anchor has no exact text to locate",
+        ),
+        OrphanReason::ContextTooShort => tracing::warn!(
+            comment_id,
+            doc_version,
+            anchor_exact,
+            why = "context_too_short",
+            "comment orphaned: prefix+exact+suffix context is too short to fuzzy-match, and \
+             didn't match verbatim either",
+        ),
+        OrphanReason::NoConfidentMatch {
+            exact_hits,
+            best_score,
+            second_best_score,
+        } => {
+            let why = if exact_hits > 1 {
+                "ambiguous_verbatim"
+            } else if best_score < config.score_threshold {
+                "not_found"
+            } else {
+                "ambiguous_fuzzy"
+            };
+            tracing::warn!(
+                comment_id,
+                doc_version,
+                anchor_exact,
+                why,
+                exact_hits,
+                best_score,
+                second_best_score,
+                "comment orphaned: no confident anchor match",
+            );
+        }
+    }
+}
 
 /// Column list shared by every `work_comments` SELECT. Order must match
 /// [`map_comment`].
@@ -508,6 +566,7 @@ impl WorkDb {
             if comment.status != COMMENT_STATUS_ACTIVE && comment.status != COMMENT_STATUS_ORPHANED {
                 continue;
             }
+            let was_orphaned = comment.status == COMMENT_STATUS_ORPHANED;
             let resolution = resolve_anchor(plain_text, &comment.anchor, config);
             let wire = match resolution {
                 AnchorResolution::Exact { start, length } => {
@@ -555,13 +614,16 @@ impl WorkDb {
                         score: Some(score),
                     }
                 }
-                AnchorResolution::Orphan => {
+                AnchorResolution::Orphan(reason) => {
                     tx.execute(
                         "UPDATE work_comments
                          SET status = 'orphaned', last_resolved_with = ?2, updated_at = ?3
                          WHERE id = ?1",
                         params![comment.id, RESOLVED_WITH_ORPHAN, now],
                     )?;
+                    if !was_orphaned {
+                        log_orphan_transition(&comment.id, &comment.doc_version, &comment.anchor.exact, reason, config);
+                    }
                     comment.status = COMMENT_STATUS_ORPHANED.to_owned();
                     comment.last_resolved_with = Some(RESOLVED_WITH_ORPHAN.to_owned());
                     comment.updated_at = now.clone();
@@ -625,9 +687,10 @@ impl WorkDb {
                         last_resolved = Some(RESOLVED_WITH_FUZZY);
                         proj_ver = plain_text_projection_version;
                     }
-                    AnchorResolution::Orphan => {
+                    AnchorResolution::Orphan(reason) => {
                         status = COMMENT_STATUS_ORPHANED;
                         last_resolved = Some(RESOLVED_WITH_ORPHAN);
+                        log_orphan_transition(&new_id, &original.doc_version, &original.anchor.exact, reason, config);
                     }
                 }
             }

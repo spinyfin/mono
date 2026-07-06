@@ -80,6 +80,33 @@ fn read_unit_env(key: &str) -> Option<f64> {
         .filter(|v| (0.0..=1.0).contains(v))
 }
 
+/// Why [`resolve_anchor`] gave up and returned [`AnchorResolution::Orphan`].
+/// Carried alongside the orphan outcome purely for diagnostics — callers that
+/// persist an orphan transition should log this so "why did this comment lose
+/// its anchor" doesn't require re-deriving the answer from `state.db` by hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OrphanReason {
+    /// The anchor's `exact` text was empty; there is nothing to locate.
+    EmptyExact,
+    /// The full `prefix + exact + suffix` context is shorter than 2
+    /// characters, too short to bigram-score, and didn't match verbatim
+    /// either.
+    ContextTooShort,
+    /// Neither the exact nor the fuzzy phase produced a confident match.
+    /// `exact_hits` is the number of verbatim `prefix + exact + suffix`
+    /// occurrences found (0 = the quote is simply gone; >1 = the verbatim
+    /// quote is ambiguous). `best_score` / `second_best_score` are the fuzzy
+    /// phase's winner and runner-up Dice scores against
+    /// `config.score_threshold` / `config.second_best_threshold` — a
+    /// `best_score` that cleared the threshold but lost to a too-close
+    /// `second_best_score` means the match was ambiguous, not absent.
+    NoConfidentMatch {
+        exact_hits: usize,
+        best_score: f64,
+        second_best_score: f64,
+    },
+}
+
 /// The outcome of resolving one anchor against a plain-text projection.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AnchorResolution {
@@ -89,8 +116,9 @@ pub enum AnchorResolution {
     /// A unique high-scoring fuzzy window. `start` / `length` locate the
     /// best-effort `exact` span within it.
     Fuzzy { start: usize, length: usize, score: f64 },
-    /// No confident anchor.
-    Orphan,
+    /// No confident anchor. Carries [`OrphanReason`] so the caller can log
+    /// *why* without re-running the resolver.
+    Orphan(OrphanReason),
 }
 
 impl AnchorResolution {
@@ -99,7 +127,7 @@ impl AnchorResolution {
         match self {
             AnchorResolution::Exact { .. } => boss_protocol::RESOLVED_WITH_EXACT,
             AnchorResolution::Fuzzy { .. } => boss_protocol::RESOLVED_WITH_FUZZY,
-            AnchorResolution::Orphan => boss_protocol::RESOLVED_WITH_ORPHAN,
+            AnchorResolution::Orphan(_) => boss_protocol::RESOLVED_WITH_ORPHAN,
         }
     }
 }
@@ -110,7 +138,7 @@ impl AnchorResolution {
 pub fn resolve_anchor(plain_text: &str, anchor: &CommentAnchor, config: &CommentFuzzyConfig) -> AnchorResolution {
     let exact: Vec<char> = anchor.exact.chars().collect();
     if exact.is_empty() {
-        return AnchorResolution::Orphan;
+        return AnchorResolution::Orphan(OrphanReason::EmptyExact);
     }
     let haystack: Vec<char> = plain_text.chars().collect();
     let prefix_len = anchor.prefix.chars().count();
@@ -132,7 +160,7 @@ pub fn resolve_anchor(plain_text: &str, anchor: &CommentAnchor, config: &Comment
     if tlen < 2 {
         // Too short to bigram meaningfully; the exact phase already failed
         // to find a unique verbatim hit, so treat as orphan.
-        return AnchorResolution::Orphan;
+        return AnchorResolution::Orphan(OrphanReason::ContextTooShort);
     }
     let target_bigrams = bigram_counts(&context);
     let target_total: i64 = target_bigrams.values().sum();
@@ -152,7 +180,11 @@ pub fn resolve_anchor(plain_text: &str, anchor: &CommentAnchor, config: &Comment
         };
     }
 
-    AnchorResolution::Orphan
+    AnchorResolution::Orphan(OrphanReason::NoConfidentMatch {
+        exact_hits: exact_hits.len(),
+        best_score,
+        second_best_score: second_best,
+    })
 }
 
 /// Slide a window of length `tlen` over `haystack`, scoring each position's
@@ -327,10 +359,12 @@ mod tests {
         );
         let edited = "Completely different content about distributed systems, \
                       consensus protocols, and write-ahead logging in databases.";
-        assert_eq!(
-            resolve_anchor(edited, &a, &CommentFuzzyConfig::default()),
-            AnchorResolution::Orphan
-        );
+        match resolve_anchor(edited, &a, &CommentFuzzyConfig::default()) {
+            AnchorResolution::Orphan(OrphanReason::NoConfidentMatch { best_score, .. }) => {
+                assert!(best_score < CommentFuzzyConfig::default().score_threshold);
+            }
+            other => panic!("expected orphan/no-confident-match, got {other:?}"),
+        }
     }
 
     #[test]
@@ -344,19 +378,32 @@ mod tests {
         let doc = "configure the primary widget alpha for the main dashboard panel. \
                    --- some unrelated filler text sits in between the two regions --- \
                    configure the primary widget alpha for the main dashboard screen.";
-        assert_eq!(
-            resolve_anchor(doc, &a, &CommentFuzzyConfig::default()),
-            AnchorResolution::Orphan
-        );
+        let cfg = CommentFuzzyConfig::default();
+        match resolve_anchor(doc, &a, &cfg) {
+            AnchorResolution::Orphan(OrphanReason::NoConfidentMatch {
+                best_score,
+                second_best_score,
+                ..
+            }) => {
+                // The whole point of this fixture: the best window clears the
+                // score threshold, but so does the runner-up — ambiguous, not
+                // absent.
+                assert!(best_score >= cfg.score_threshold);
+                assert!(second_best_score >= cfg.second_best_threshold);
+            }
+            other => panic!("expected orphan/no-confident-match, got {other:?}"),
+        }
     }
 
     #[test]
     fn orphan_when_text_absent() {
         let a = anchor("nonexistent quoted span", "", "");
-        assert_eq!(
-            resolve_anchor("totally unrelated document body", &a, &CommentFuzzyConfig::default()),
-            AnchorResolution::Orphan
-        );
+        match resolve_anchor("totally unrelated document body", &a, &CommentFuzzyConfig::default()) {
+            AnchorResolution::Orphan(OrphanReason::NoConfidentMatch { exact_hits, .. }) => {
+                assert_eq!(exact_hits, 0);
+            }
+            other => panic!("expected orphan/no-confident-match, got {other:?}"),
+        }
     }
 
     #[test]
@@ -364,7 +411,7 @@ mod tests {
         let a = anchor("", "p", "s");
         assert_eq!(
             resolve_anchor("anything", &a, &CommentFuzzyConfig::default()),
-            AnchorResolution::Orphan
+            AnchorResolution::Orphan(OrphanReason::EmptyExact)
         );
     }
 

@@ -119,6 +119,63 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(anchor.prefix, "")
     }
 
+    // MARK: - W3C anchor capture — list-item text-space mismatch
+    //
+    // Regression coverage for a comment that orphaned within ~2s of creation
+    // (`anchor_json` `{"exact":"  • binary","prefix":"","suffix":""}`, empty
+    // context, on a doc whose markdown source has no literal "•" — it uses "-"
+    // list syntax). Root cause: `captureCurrentSelection()` reads the selection
+    // via a simulated "Copy", which for Textual's NSTextInteractionView
+    // serialises the selected fragment through `Formatter.plainText()` — that
+    // reconstructs the surrounding list item's block structure from
+    // presentation intents and prepends a "• "/"<n>. " marker plus
+    // two-space-per-level indentation to *every* line, even for a selection
+    // that only covers part of the item. `CommentProjection.plainText` (the
+    // engine-resolved projection) carries none of that decoration — it's a
+    // bare `AttributedString.characters` flatten. So `quoted` never located in
+    // `plain`, and `captureAnchor` silently fell back to a bare, contextless
+    // anchor that the engine's very next `resolve_anchor` orphaned outright,
+    // since that decorated text doesn't occur in the projection either.
+
+    func testCaptureAnchorStripsListMarkerDecorationFromPastedSelection() {
+        let plain = "Embedded (built-in) checks — compiled into the binary"
+        // What a "Copy" of just the word "binary" inside a one-level-deep
+        // unordered list item actually yields on the pasteboard.
+        let quoted = "  • binary"
+        let anchor = CommentLayer.captureAnchor(quoted: quoted, occurrenceIndex: 0, in: plain)
+        XCTAssertEqual(anchor.exact, "binary")
+        // The whole point of the fix: prefix/suffix context is now captured
+        // instead of coming back empty.
+        XCTAssertTrue(anchor.prefix.hasSuffix("compiled into the "))
+        XCTAssertFalse(anchor.prefix.isEmpty)
+    }
+
+    func testCaptureAnchorStripsOrderedListMarkerDecoration() {
+        let plain = "first step second step third step"
+        let anchor = CommentLayer.captureAnchor(quoted: "  2. second step", occurrenceIndex: 0, in: plain)
+        XCTAssertEqual(anchor.exact, "second step")
+        XCTAssertTrue(anchor.prefix.hasSuffix("first step "))
+    }
+
+    func testCaptureAnchorPrefersVerbatimMatchOverDecorationStripping() {
+        // A selection that happens to literally start with "• " in the
+        // projection itself (not list decoration) must still match as-is —
+        // stripping is only attempted once the verbatim match fails.
+        let plain = "notes: • not a list marker here"
+        let anchor = CommentLayer.captureAnchor(quoted: "• not a list marker here", occurrenceIndex: 0, in: plain)
+        XCTAssertEqual(anchor.exact, "• not a list marker here")
+    }
+
+    func testStripCopyListDecorationIsNoOpForUndecoratedText() {
+        XCTAssertEqual(CommentLayer.stripCopyListDecoration("plain text"), "plain text")
+        XCTAssertEqual(CommentLayer.stripCopyListDecoration(""), "")
+    }
+
+    func testStripCopyListDecorationStripsPerLineForMultilineSelections() {
+        let decorated = "  • line one\n  line two"
+        XCTAssertEqual(CommentLayer.stripCopyListDecoration(decorated), "line one\nline two")
+    }
+
     // MARK: - Projection + doc version
 
     func testDocVersionIsDeterministicAndVersionPrefixed() {
