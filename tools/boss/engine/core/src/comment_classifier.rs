@@ -174,11 +174,13 @@ async fn call_classifier(api_key: &str, prompt: String) -> Result<Classification
 /// The prompt asks for an unfenced object, but smaller models (this call
 /// uses Haiku) sometimes wrap the reply in a ```` ```json ```` fence anyway —
 /// defense in depth alongside the prompt instruction, not a replacement for
-/// it. Strips a leading/trailing markdown code fence if present, then narrows
-/// to the first `{`..last `}` span so stray prose before/after the object
-/// (e.g. "Here's the classification: {...}") doesn't break the parse either.
-/// Falls back to the trimmed input unchanged when no braces are found, so
-/// the original text still reaches `serde_json` and produces its own error.
+/// it. Strips a leading/trailing markdown code fence if present, then hands
+/// off to the shared [`crate::json_extract::find_first_balanced_object`]
+/// (string/escape-aware, so a `}` inside a string value or trailing prose
+/// doesn't mis-bound the slice — the same helper `pr_review.rs` uses).
+/// Falls back to the trimmed input unchanged when no balanced object is
+/// found, so the original text still reaches `serde_json` and produces its
+/// own error.
 fn strip_to_json_object(text: &str) -> &str {
     let fenced = text
         .strip_prefix("```json")
@@ -187,10 +189,7 @@ fn strip_to_json_object(text: &str) -> &str {
         .and_then(|rest| rest.strip_suffix("```"))
         .map(str::trim);
     let candidate = fenced.unwrap_or(text);
-    match (candidate.find('{'), candidate.rfind('}')) {
-        (Some(start), Some(end)) if end >= start => &candidate[start..=end],
-        _ => candidate,
-    }
+    crate::json_extract::find_first_balanced_object(candidate).unwrap_or(candidate)
 }
 
 /// The pure parse+validate step of a classifier call: turn the model's raw

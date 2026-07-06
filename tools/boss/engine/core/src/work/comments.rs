@@ -426,7 +426,10 @@ impl WorkDb {
     /// **engine** classification, not a human correction, so it clears
     /// `intent_overridden_by` (any earlier manual override is superseded by
     /// the operator's new reply, not preserved as if the classifier never
-    /// ran) rather than stamping `'user'`.
+    /// ran) rather than stamping `'user'`. Also clears
+    /// `intent_classification_failed_at`/`intent_classification_error`,
+    /// mirroring [`Self::set_comment_intent`] — a successful reclassification
+    /// must not leave a stale failure record from an earlier attempt.
     pub fn reclassify_comment_intent(&self, comment_id: &str, intent: &str, confidence: f64) -> Result<WorkComment> {
         match intent {
             INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
@@ -436,7 +439,8 @@ impl WorkDb {
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET intent = ?2, intent_confidence = ?3, intent_classified_at = ?4, intent_overridden_by = NULL
+             SET intent = ?2, intent_confidence = ?3, intent_classified_at = ?4, intent_overridden_by = NULL,
+                 intent_classification_failed_at = NULL, intent_classification_error = NULL
              WHERE id = ?1",
             params![comment_id, intent, confidence, now],
         )?;
@@ -1203,6 +1207,101 @@ mod tests {
         assert!(db.set_comment_intent(&c.id, "question", 0.5).is_err());
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
         assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+    }
+
+    #[test]
+    fn record_comment_classification_failed_persists_error_and_timestamp() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        let failed = db
+            .record_comment_classification_failed(&c.id, "classifier exhausted retries")
+            .unwrap();
+        assert_eq!(
+            failed.intent_classification_error.as_deref(),
+            Some("classifier exhausted retries")
+        );
+        assert!(failed.intent_classification_failed_at.is_some());
+        assert!(failed.intent.is_none());
+        assert!(failed.intent_classified_at.is_none());
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(
+            reloaded.intent_classification_error.as_deref(),
+            Some("classifier exhausted retries")
+        );
+        assert!(reloaded.intent_classification_failed_at.is_some());
+    }
+
+    #[test]
+    fn record_comment_classification_failed_does_not_clobber_a_classified_comment() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+
+        // A late-arriving failure (e.g. a raced/duplicate classifier attempt)
+        // must not knock an already-classified comment back into a failed
+        // state.
+        assert!(db.record_comment_classification_failed(&c.id, "too late").is_err());
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+        assert!(reloaded.intent_classification_error.is_none());
+        assert!(reloaded.intent_classification_failed_at.is_none());
+    }
+
+    #[test]
+    fn record_comment_classification_failed_does_not_clobber_an_override() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.override_comment_intent(&c.id, "question").unwrap();
+
+        assert!(db.record_comment_classification_failed(&c.id, "too late").is_err());
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("question"));
+        assert!(reloaded.intent_classification_error.is_none());
+    }
+
+    #[test]
+    fn record_comment_classification_failed_is_idempotent_on_re_recording() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.record_comment_classification_failed(&c.id, "first error").unwrap();
+        let second = db.record_comment_classification_failed(&c.id, "second error").unwrap();
+        assert_eq!(second.intent_classification_error.as_deref(), Some("second error"));
+    }
+
+    #[test]
+    fn set_comment_intent_clears_a_prior_classification_failure() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.record_comment_classification_failed(&c.id, "transient error")
+            .unwrap();
+
+        let classified = db.set_comment_intent(&c.id, "directive", 0.8).unwrap();
+        assert!(classified.intent_classification_failed_at.is_none());
+        assert!(classified.intent_classification_error.is_none());
+    }
+
+    #[test]
+    fn reclassify_comment_intent_clears_a_prior_classification_failure() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.record_comment_classification_failed(&c.id, "transient error")
+            .unwrap();
+
+        // reclassify_comment_intent has no `intent_classified_at IS NULL`
+        // guard, so it succeeds even after a recorded failure — and it must
+        // clear the failure columns rather than leaving stale error state
+        // alongside a successful classification.
+        let reclassified = db.reclassify_comment_intent(&c.id, "larger_change", 0.7).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("larger_change"));
+        assert!(reclassified.intent_classification_failed_at.is_none());
+        assert!(reclassified.intent_classification_error.is_none());
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("larger_change"));
+        assert!(reloaded.intent_classification_failed_at.is_none());
+        assert!(reloaded.intent_classification_error.is_none());
     }
 
     #[test]

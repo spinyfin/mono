@@ -32,6 +32,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::json_extract::extract_balanced_object;
+
 /// Authoritative PR metadata fetched from GitHub at reviewer-spawn time.
 ///
 /// Pre-fetched before the reviewer worker starts so the reviewer prompt
@@ -416,45 +418,6 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
         return (last_result, None);
     }
     (None, last_error)
-}
-
-/// Given a string starting with `{`, return the slice covering the balanced
-/// `{…}` object (handling nested braces and string literals). Returns `None`
-/// if the input doesn't start with `{` or the braces are unbalanced.
-fn extract_balanced_object(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    if bytes.first() != Some(&b'{') {
-        return None;
-    }
-    let mut depth: usize = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if in_string {
-            match b {
-                b'\\' => escape_next = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else {
-            match b {
-                b'"' => in_string = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(&s[..=i]);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    None
 }
 
 /// Engine severity gate (design §3 of P992, task 8).
