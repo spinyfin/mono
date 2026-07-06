@@ -130,6 +130,37 @@ pub async fn run_gh(args: &[&str], display: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Query GitHub's GraphQL API to determine whether `pr_url` is currently in
+/// its repository's merge queue. Returns `true` when the PR's `mergeQueueEntry`
+/// is non-null (the PR is queued), and `false` on any error — a non-canonical
+/// URL, a spawn/HTTP failure, a non-zero `gh` exit, or unparseable JSON.
+///
+/// This lives alongside [`gh_output`] because several engine call sites need
+/// the same probe. It deliberately uses the GraphQL API rather than a
+/// `gh pr view --json` field because `mergeQueueEntry` is not exposed as a
+/// `--json` field in all installed versions of the `gh` CLI; the GraphQL API
+/// is stable across versions. Degrades gracefully (returns `false`) so callers
+/// can treat "not in queue" and "couldn't tell" identically.
+pub async fn pr_in_merge_queue(pr_url: &str) -> bool {
+    let Some((owner, repo, number)) = crate::pr_url::parse_pr_url_parts(pr_url) else {
+        return false;
+    };
+    let query = format!(
+        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
+    );
+    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
+    let Ok(out) = output else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    let body: Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // data.repository.pullRequest.mergeQueueEntry — non-null → in queue.
+    !body["data"]["repository"]["pullRequest"]["mergeQueueEntry"].is_null()
+}
+
 // ── CommandGhRunner (production) ──────────────────────────────────────────────
 
 /// Production [`GhRunner`] that spawns the `gh` CLI binary.

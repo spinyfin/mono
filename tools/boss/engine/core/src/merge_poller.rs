@@ -55,6 +55,7 @@ use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrStateChecker, WorkDb};
+use boss_github::gh_runner::pr_in_merge_queue;
 use boss_github::pr_url::{pr_number_from_url, repo_from_pr_url};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
@@ -522,41 +523,11 @@ impl MergeProbe for CommandMergeProbe {
         let mut probe = parse_probe_json(pr_url, &stdout, combined_state.as_deref())?;
         // Query merge-queue status separately via GraphQL since `gh pr view --json`
         // does not expose `mergeQueueEntry` in all installed `gh` versions.
-        probe.in_merge_queue = fetch_merge_queue_status(pr_url).await;
+        // `mergeQueueEntry` is not exposed as a `--json` field in all
+        // installed `gh` versions, so this is a separate GraphQL probe.
+        probe.in_merge_queue = pr_in_merge_queue(pr_url).await;
         Ok(probe)
     }
-}
-
-/// Query GitHub's GraphQL API to determine whether `pr_url` is currently
-/// in the repository's merge queue. Returns `true` when `mergeQueueEntry`
-/// is non-null (the PR is queued), `false` on any error or when not queued.
-///
-/// This is a separate call from the main `gh pr view` probe because
-/// `mergeQueueEntry` is not exposed as a `--json` field in all installed
-/// versions of the `gh` CLI. The GraphQL API is stable and available across
-/// versions.
-async fn fetch_merge_queue_status(pr_url: &str) -> bool {
-    let (Some(owner_repo), Some(number)) = (repo_from_pr_url(pr_url), pr_number_from_url(pr_url)) else {
-        return false;
-    };
-    let (owner, repo) = match owner_repo.split_once('/') {
-        Some(pair) => pair,
-        None => return false,
-    };
-    let query = format!(
-        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
-    );
-    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-    let body: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    // data.repository.pullRequest.mergeQueueEntry — non-null → in queue.
-    !body["data"]["repository"]["pullRequest"]["mergeQueueEntry"].is_null()
 }
 
 /// One `RemovedFromMergeQueueEvent` entry from the PR's timeline.

@@ -12,7 +12,7 @@
 
 use anyhow::{Result, anyhow};
 
-use boss_github::pr_url::parse_pr_url_parts;
+use boss_github::gh_runner::pr_in_merge_queue;
 
 use crate::gh_invocation::gh_output;
 
@@ -60,7 +60,7 @@ pub async fn gh_merge_when_ready(pr_url: &str) -> Result<MergeAction> {
     }
 
     // Re-probe concurrently to determine which outcome occurred.
-    let (is_merged, is_in_queue) = tokio::join!(probe_is_merged(pr_url), probe_in_merge_queue(pr_url),);
+    let (is_merged, is_in_queue) = tokio::join!(probe_is_merged(pr_url), pr_in_merge_queue(pr_url),);
 
     Ok(derive_action(is_in_queue, is_merged))
 }
@@ -77,27 +77,6 @@ pub(crate) fn derive_action(is_in_queue: bool, is_merged: bool) -> MergeAction {
     } else {
         MergeAction::AutoMergeEnabled
     }
-}
-
-/// Returns `true` when `pr_url` is currently in GitHub's merge queue.
-/// Returns `false` on any error (graceful degradation).
-async fn probe_in_merge_queue(pr_url: &str) -> bool {
-    let Some((owner, repo, number)) = parse_pr_url_parts(pr_url) else {
-        return false;
-    };
-    let query = format!(
-        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
-    );
-    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
-    let Ok(out) = output else { return false };
-    if !out.status.success() {
-        return false;
-    }
-    let body: serde_json::Value = match serde_json::from_slice(&out.stdout) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    !body["data"]["repository"]["pullRequest"]["mergeQueueEntry"].is_null()
 }
 
 /// Returns `true` when the PR's GitHub state is `MERGED`.
