@@ -152,3 +152,31 @@ fn envelope_round_trips_through_serde() {
         );
     }
 }
+
+// --- FrontendRequest fire-and-forget NACK ----------------------------------
+
+/// The post-wake spawn NACK serializes with the snake_case `type` tag and
+/// carries the run id + reason, and survives a serde round-trip. Pins the
+/// wire shape the Swift app hand-encodes and the engine's
+/// `handle_report_worker_spawn_failed` decodes.
+#[test]
+fn report_worker_spawn_failed_round_trips_with_expected_tag() {
+    let original = FrontendRequest::ReportWorkerSpawnFailed {
+        run_id: "exec_abc".to_owned(),
+        reason: "ghostty_surface_new returned NULL (no active display)".to_owned(),
+    };
+    let value = serde_json::to_value(&original).unwrap();
+    assert_eq!(value["type"], "report_worker_spawn_failed");
+    assert_eq!(value["run_id"], "exec_abc");
+    assert_eq!(value["reason"], "ghostty_surface_new returned NULL (no active display)");
+
+    let json = serde_json::to_string(&original).unwrap();
+    let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+    match parsed {
+        FrontendRequest::ReportWorkerSpawnFailed { run_id, reason } => {
+            assert_eq!(run_id, "exec_abc");
+            assert_eq!(reason, "ghostty_surface_new returned NULL (no active display)");
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}

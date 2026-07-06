@@ -208,6 +208,11 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
         );
         return;
     }
+    // A real shell pid is proof the app's spawn path is working again — reset
+    // the spawn-capability breaker so its failure window doesn't carry stale
+    // pre-recovery failures into the next outage. (Does not auto-resume a
+    // human-paused dispatch; the operator unpauses after confirming recovery.)
+    server_state.spawn_health.record_success();
     // Persist the pid to the DB FIRST, keyed by run_id (the execution id).
     // The `work_runs` row always exists by now (inserted synchronously at
     // dispatch, before the pane was spawned), so unlike the in-memory slot
@@ -325,6 +330,113 @@ pub(super) async fn handle_spawn_capability_restored(ctx: Dispatch, req: Fronten
     }
     tracing::info!("spawn_capability_restored: kicking scheduler");
     server_state.execution_coordinator.kick();
+}
+
+/// Handle the app proactively reporting that a worker pane's shell never came
+/// up — the `ReportWorkerSpawnFailed` NACK (see the wire-type docs).
+///
+/// This is the fast-fail path for the post-wake false-live spawn. The spawn
+/// RPC was already answered `Ok(shell_pid: 0)` synchronously (the surface is
+/// created asynchronously), so without this the engine would only learn the
+/// shell never started after the 60s [`crate::spawn_ack_sweep`] grace window.
+/// Here we reap the execution the instant the app tells us — the identical
+/// teardown the sweep performs (orphan → pane release → slot release), routed
+/// through the shared [`crate::spawn_ack_sweep::reap_never_started_spawn`] —
+/// and feed the same spawn-capability circuit breaker, so a systemic outage is
+/// caught in seconds instead of churning for hours. Fire-and-forget; no
+/// response.
+pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state, peer_pid, ..
+    } = ctx;
+    let FrontendRequest::ReportWorkerSpawnFailed { run_id, reason } = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "report_worker_spawn_failed rejected: caller not in app/Boss subtree",
+        );
+        return;
+    }
+
+    // Find the live slot this run was spawning into. A NACK for a run with no
+    // live slot (already reaped by the 60s sweep, or released) — or one that
+    // has since shown proof of life (a pid reported, or a hook event, or it
+    // already progressed past `Spawning`) — is stale. Skip it so we never
+    // double-reap or tear down a pane that actually came up.
+    let Some(state) = server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .find(|s| s.run_id == run_id)
+    else {
+        tracing::info!(
+            run_id = %run_id,
+            reason = %reason,
+            "report_worker_spawn_failed: no live slot for run (already reaped/released?); ignoring stale NACK",
+        );
+        return;
+    };
+    if state.shell_pid > 0 || state.last_event_at.is_some() || state.activity != boss_protocol::WorkerActivity::Spawning
+    {
+        tracing::info!(
+            run_id = %run_id,
+            slot_id = state.slot_id,
+            shell_pid = state.shell_pid,
+            activity = ?state.activity,
+            "report_worker_spawn_failed: slot already showed proof of life or progressed; ignoring stale NACK",
+        );
+        return;
+    }
+
+    let execution = match server_state.work_db.get_execution(&run_id) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(
+                run_id = %run_id,
+                ?err,
+                "report_worker_spawn_failed: failed to look up execution; ignoring",
+            );
+            return;
+        }
+    };
+    if execution.status.is_terminal() {
+        tracing::debug!(
+            run_id = %run_id,
+            "report_worker_spawn_failed: execution already terminal; ignoring",
+        );
+        return;
+    }
+
+    tracing::warn!(
+        run_id = %run_id,
+        slot_id = state.slot_id,
+        reason = %reason,
+        "app reported worker-pane spawn failure (no shell); reaping execution immediately",
+    );
+
+    let now_epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let reap_ctx = crate::spawn_ack_sweep::SpawnReapCtx {
+        work_db: server_state.work_db.as_ref(),
+        coordinator: server_state.execution_coordinator.clone(),
+        dispatch_events: server_state.dispatch_events.as_ref(),
+        reaper: server_state.as_ref(),
+        spawn_health: server_state.spawn_health.as_ref(),
+    };
+    crate::spawn_ack_sweep::reap_never_started_spawn(
+        &reap_ctx,
+        &execution,
+        state.slot_id,
+        state.shell_pid,
+        crate::spawn_ack_sweep::ReapCause::AppNack { reason: &reason },
+        now_epoch_secs,
+    )
+    .await;
 }
 
 pub(super) async fn handle_engine_response(ctx: Dispatch, req: FrontendRequest) {

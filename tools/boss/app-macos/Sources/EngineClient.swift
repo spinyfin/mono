@@ -986,6 +986,23 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Report that a worker pane's shell never came up — the libghostty
+    /// surface failed to create (typically `ghostty_surface_new` returning
+    /// NULL when there is no active display after sleep/wake). This is the
+    /// proactive NACK for the false-live spawn: the spawn RPC was already
+    /// answered `Ok(shell_pid: 0)` synchronously because the surface is
+    /// created asynchronously, so this is the only way — short of the
+    /// engine's 60s spawn-ack timeout — the engine learns the shell never
+    /// started. The engine reaps the execution immediately and feeds its
+    /// spawn-capability circuit breaker. Fire-and-forget; no response.
+    func sendReportWorkerSpawnFailed(runId: String, reason: String) {
+        sendLine([
+            "type": "report_worker_spawn_failed",
+            "run_id": runId,
+            "reason": reason,
+        ])
+    }
+
     /// Ask the engine for all historical executions of `taskId`, newest-first.
     /// The engine replies with `executions_list`. The wire field is
     /// `work_item_id` — the engine's `ListExecutions` request and

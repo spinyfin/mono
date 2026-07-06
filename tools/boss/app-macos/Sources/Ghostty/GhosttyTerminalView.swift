@@ -98,6 +98,14 @@ final class GhosttyTerminalHostView: NSView {
     private var screenObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
+    /// Set once we have reported a surface-creation failure to the session
+    /// (`session.onSurfaceCreationFailed`). Dedupes the NACK: `attemptSurfaceCreation`
+    /// can run several times for one spawn (init, `viewDidMoveToWindow`, the
+    /// screen-change observer), but the engine only needs to be told once that
+    /// this spawn produced no shell. Reset to `false` on a successful attach so
+    /// a Boss-pane restart that later fails can report again.
+    private var reportedSurfaceCreationFailure = false
+
     /// os_signpost interval state for an in-flight left-button selection
     /// drag (mouseDown→mouseUp), plus the dropped-frame counter that runs
     /// only for that span. See [[UISignpost]] / [[InteractionFrameCounter]]
@@ -217,11 +225,28 @@ final class GhosttyTerminalHostView: NSView {
             if Self.shouldReportSurfaceFailure(hasActiveDisplay: NSScreen.main != nil) {
                 session.onSurfaceFailed?()
             }
+            // Tell the session the spawn failed so worker panes can NACK the
+            // engine (fail-fast instead of the 60s spawn-ack timeout) and log
+            // a durable diagnostic. Dedupe: the screen observer / window-move
+            // retries call this again, but one report per spawn is enough — the
+            // engine reaps on the first. The pane stays in its surface-less
+            // placeholder either way; if the display returns before the engine
+            // reaps, the retry still recreates the surface.
+            if !reportedSurfaceCreationFailure {
+                reportedSurfaceCreationFailure = true
+                session.onSurfaceCreationFailed?(
+                    "libghostty surface creation failed (ghostty_surface_new returned NULL — "
+                        + "likely no active display after sleep/wake)"
+                )
+            }
             return
         }
 
         self.surface = surface
         removeScreenObserver()
+        // A surface came up: clear the failure latch so a later teardown +
+        // failed recreation (e.g. a Boss-pane restart) can report again.
+        reportedSurfaceCreationFailure = false
         session.statusMessage = nil
         session.attach(hostView: self)
         // Register with the event-loop diagnostics so the 1 Hz sampler can

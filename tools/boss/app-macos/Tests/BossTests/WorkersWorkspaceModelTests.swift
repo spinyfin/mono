@@ -275,6 +275,33 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
 
         XCTAssertEqual(diedRunIds, ["exec-child-exited"])
     }
+
+    func testSurfaceCreationFailureForwardsNackWithRunId() {
+        // The post-sleep false-live spawn: `spawnWorkerPane` wires the
+        // session's `onSurfaceCreationFailed` to the model's `onSpawnFailed`
+        // so the app can NACK the engine (fail-fast) instead of leaving the
+        // spawn to the engine's 60s spawn-ack timeout. Simulate the surface
+        // failing and assert the NACK carries the raw run id and the reason.
+        let model = WorkersWorkspaceModel()
+        var captured: (runId: String, reason: String)?
+        model.onSpawnFailed = { runId, reason in captured = (runId, reason) }
+
+        let result = model.spawnWorkerPane(makeRequest(slot: 2, runId: "exec-nack"))
+        guard case .success = result else {
+            XCTFail("spawn precondition failed: \(result)")
+            return
+        }
+        let session = model.slots.first(where: { $0.slotId == 2 })?.session
+        XCTAssertNotNil(
+            session?.onSurfaceCreationFailed,
+            "spawn must wire the surface-creation-failure callback so a no-display spawn can NACK"
+        )
+
+        session?.onSurfaceCreationFailed?("no active display")
+
+        XCTAssertEqual(captured?.runId, "exec-nack", "NACK must carry the raw execution id")
+        XCTAssertEqual(captured?.reason, "no active display")
+    }
 }
 
 @MainActor

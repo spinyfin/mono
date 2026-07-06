@@ -856,6 +856,7 @@ pub async fn serve(
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         server_state.clone() as Arc<dyn crate::spawn_ack_sweep::SpawnAckReaper>,
+        server_state.spawn_health.clone(),
         Duration::from_secs(60),
         crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS,
     );
