@@ -213,6 +213,22 @@ pub(crate) fn resolve_execution_repo_remote_url(
     })
 }
 
+impl WorkDb {
+    /// Public wrapper for [`resolve_repo_for_work_item`] — the multi-repo
+    /// design's single resolution point (R1 mitigation) — for callers
+    /// outside `work` that need a task's *effective* dispatch repo without
+    /// reading `tasks.repo_remote_url` directly. Reading the column
+    /// directly is wrong for `investigation` (and project-less `design`)
+    /// tasks: their repo is inherited from the owning product's
+    /// `docs_repo` / `design_repo` (or `BOSS_USER_DOCS_REPO`), never
+    /// stamped on the task row itself, so a direct column read sees `NULL`
+    /// even though the task has a perfectly resolvable repo.
+    pub fn resolve_repo_for_task(&self, task_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        resolve_repo_for_work_item(&conn, task_id)
+    }
+}
+
 pub(crate) fn next_task_ordinal(conn: &Connection, project_id: &str) -> Result<i64> {
     let current = conn.query_row(
         "SELECT COALESCE(MAX(ordinal), 0) FROM tasks

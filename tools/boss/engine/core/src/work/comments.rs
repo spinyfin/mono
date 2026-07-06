@@ -144,9 +144,9 @@ impl WorkDb {
 
     /// [`Self::list_comments`], with each comment paired with its
     /// [`CommentThreadEntry`] rows and whether an answer-agent run is
-    /// currently `running` for it — the `CommentsList` read-path shape the
-    /// design specifies (`comment-triggered-document-revisions.md` §"UI /
-    /// thread behavior").
+    /// currently `running` (or has terminally `failed`) for it — the
+    /// `CommentsList` read-path shape the design specifies
+    /// (`comment-triggered-document-revisions.md` §"UI / thread behavior").
     pub fn list_comments_with_thread(
         &self,
         artifact_kind: &str,
@@ -159,10 +159,14 @@ impl WorkDb {
             .map(|comment| {
                 let thread_entries = self.list_comment_thread_entries(&comment.id)?;
                 let answer_agent_running = self.running_answer_agent_run_for_comment(&comment.id)?.is_some();
+                let answer_agent_failed = self
+                    .latest_answer_agent_run_for_comment(&comment.id)?
+                    .is_some_and(|run| run.status == ANSWER_AGENT_RUN_STATUS_FAILED);
                 Ok(CommentWithThread {
                     comment,
                     thread_entries,
                     answer_agent_running,
+                    answer_agent_failed,
                 })
             })
             .collect()

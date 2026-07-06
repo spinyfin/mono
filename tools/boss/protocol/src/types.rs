@@ -2617,6 +2617,15 @@ pub struct CommentWithThread {
     /// `running` — lets the UI show a "thinking" indicator without a
     /// separate poll.
     pub answer_agent_running: bool,
+    /// True iff this comment's *latest* `answer_agent_runs` row is
+    /// `failed` — the spawn never made it to `running` (e.g. the doc
+    /// owner's repo couldn't be resolved) or the run errored out. Lets the
+    /// UI show a distinct failure state instead of leaving an indefinite
+    /// "thinking" indicator with nothing behind it. Cleared automatically
+    /// once a fresh run supersedes the failed one (a follow-up respawn, or
+    /// a manual retry).
+    #[serde(default)]
+    pub answer_agent_failed: bool,
 }
 
 // --- Answer-agent runs (P3a: read-only mini-coordinator answer agent) ---
