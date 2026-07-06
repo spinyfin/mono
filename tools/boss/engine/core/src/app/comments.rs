@@ -161,8 +161,14 @@ async fn spawn_answer_agent(
     request_id: &str,
     comment: &WorkComment,
 ) {
-    let Some(repo_remote_url) = resolve_answer_agent_repo(work_db, comment) else {
-        return;
+    let repo_remote_url = match resolve_answer_agent_repo(work_db, comment) {
+        AnswerAgentRepoResolution::Resolved(url) => url,
+        AnswerAgentRepoResolution::OutOfScope => return,
+        AnswerAgentRepoResolution::Failed(error_kind) => {
+            record_answer_agent_spawn_failure(server_state, work_db, session_id, request_id, comment, 0, error_kind)
+                .await;
+            return;
+        }
     };
 
     // Guarded status flip first (cheapest failure mode, no side effects to
@@ -206,10 +212,6 @@ async fn respawn_answer_agent_for_followup(
     request_id: &str,
     comment: &WorkComment,
 ) {
-    let Some(repo_remote_url) = resolve_answer_agent_repo(work_db, comment) else {
-        return;
-    };
-
     let next_turn = match work_db.latest_answer_agent_run_for_comment(&comment.id) {
         Ok(Some(run)) => run.thread_turn + 1,
         Ok(None) => 0,
@@ -220,6 +222,24 @@ async fn respawn_answer_agent_for_followup(
                 "answer-agent follow-up respawn: failed to look up the latest run; defaulting thread_turn to 0",
             );
             0
+        }
+    };
+
+    let repo_remote_url = match resolve_answer_agent_repo(work_db, comment) {
+        AnswerAgentRepoResolution::Resolved(url) => url,
+        AnswerAgentRepoResolution::OutOfScope => return,
+        AnswerAgentRepoResolution::Failed(error_kind) => {
+            record_answer_agent_spawn_failure(
+                server_state,
+                work_db,
+                session_id,
+                request_id,
+                comment,
+                next_turn,
+                error_kind,
+            )
+            .await;
+            return;
         }
     };
 
@@ -246,15 +266,31 @@ async fn respawn_answer_agent_for_followup(
     .await;
 }
 
-/// Resolve the repo an answer-agent execution should be spawned against:
-/// `resolve_doc_owner`'s owning task's `repo_remote_url`. `None` (logged) if
-/// the comment's artifact has no design/investigation doc owner, or that
-/// owner's task has no repo — either way the spawn is skipped and the
-/// comment is left in its current state (design §"Scope guard"). Shared by
-/// [`spawn_answer_agent`] (P3b) and [`respawn_answer_agent_for_followup`]
-/// (P3c) — the doc-owner/repo lookup is identical for a fresh spawn and a
-/// follow-up re-entry.
-fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> Option<String> {
+/// Outcome of [`resolve_answer_agent_repo`]. `OutOfScope` is the
+/// intentional "no bucket-2 affordance" case (design §"Scope guard") and
+/// leaves the comment untouched with no durable record. `Failed` covers
+/// every other case that keeps a `question`-classified, doc-owned comment
+/// from spawning — these must not fail silently (a WARN log with no
+/// durable trace left the app showing a "thinking" state that never
+/// resolves), so callers record a failed `answer_agent_runs` row for it.
+enum AnswerAgentRepoResolution {
+    Resolved(String),
+    OutOfScope,
+    Failed(&'static str),
+}
+
+/// Resolve the repo an answer-agent execution should be spawned against, for
+/// `resolve_doc_owner`'s owning task. Routes through
+/// [`WorkDb::resolve_repo_for_task`] — the multi-repo design's single
+/// resolution point — rather than reading `tasks.repo_remote_url` directly:
+/// an `investigation` (or project-less `design`) task's repo lives on the
+/// owning product's `docs_repo` / `design_repo` (or `BOSS_USER_DOCS_REPO`),
+/// never stamped on the task row itself, so a direct column read always saw
+/// `NULL` for those kinds even though the task has a perfectly resolvable
+/// repo. Shared by [`spawn_answer_agent`] (P3b) and
+/// [`respawn_answer_agent_for_followup`] (P3c) — the doc-owner/repo lookup
+/// is identical for a fresh spawn and a follow-up re-entry.
+fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> AnswerAgentRepoResolution {
     let doc_owner = match work_db.resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id) {
         Ok(Some(owner)) => owner,
         Ok(None) => {
@@ -264,7 +300,7 @@ fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> Option<
                 artifact_id = %comment.artifact_id,
                 "answer-agent spawn: comment's artifact has no design/investigation doc owner; skipping (out of bucket-2 scope)",
             );
-            return None;
+            return AnswerAgentRepoResolution::OutOfScope;
         }
         Err(err) => {
             tracing::warn!(
@@ -272,40 +308,85 @@ fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> Option<
                 err = %err,
                 "answer-agent spawn: resolve_doc_owner failed; leaving comment as-is",
             );
-            return None;
+            return AnswerAgentRepoResolution::Failed("doc_owner_resolution_failed");
         }
     };
 
-    match work_db.get_work_item(&doc_owner.task_id) {
-        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => match task.repo_remote_url {
-            Some(url) if !url.is_empty() => Some(url),
-            _ => {
-                tracing::warn!(
-                    comment_id = %comment.id,
-                    task_id = %doc_owner.task_id,
-                    "answer-agent spawn: doc owner task has no repo_remote_url; skipping",
-                );
-                None
-            }
-        },
-        Ok(_) => {
+    match work_db.resolve_repo_for_task(&doc_owner.task_id) {
+        Ok(Some(url)) => AnswerAgentRepoResolution::Resolved(url),
+        Ok(None) => {
             tracing::warn!(
                 comment_id = %comment.id,
                 task_id = %doc_owner.task_id,
-                "answer-agent spawn: doc owner did not resolve to a task; skipping",
+                "answer-agent spawn: doc owner task has no resolvable repo; skipping",
             );
-            None
+            AnswerAgentRepoResolution::Failed("repo_unresolved")
         }
         Err(err) => {
             tracing::warn!(
                 comment_id = %comment.id,
                 task_id = %doc_owner.task_id,
                 err = %err,
-                "answer-agent spawn: failed to load doc owner task; skipping",
+                "answer-agent spawn: failed to resolve doc owner task's repo; skipping",
             );
-            None
+            AnswerAgentRepoResolution::Failed("repo_resolution_error")
         }
     }
+}
+
+/// Record that an eligible (doc-owned, `question`-classified) comment's
+/// answer-agent spawn could not proceed, so the failure is durable and
+/// visible instead of a WARN-and-forget that leaves the app's "thinking"
+/// indicator running forever with nothing behind it (see
+/// [`AnswerAgentRepoResolution::Failed`]). The comment's status is left
+/// untouched — it never entered `answering` — but a terminal `failed`
+/// `answer_agent_runs` row now exists for it, and `answer_agent_failed` on
+/// the next `CommentsList`/`comment_topic` read reflects that.
+async fn record_answer_agent_spawn_failure(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &WorkComment,
+    thread_turn: i64,
+    error_kind: &str,
+) {
+    let run = match work_db.create_answer_agent_run(
+        &comment.id,
+        &comment.artifact_kind,
+        &comment.artifact_id,
+        &comment.doc_version,
+        thread_turn,
+    ) {
+        Ok(run) => run,
+        Err(err) => {
+            tracing::error!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: failed to record the failed-spawn tracking run row",
+            );
+            return;
+        }
+    };
+    if let Err(err) = work_db.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_FAILED, None, Some(error_kind))
+    {
+        tracing::error!(
+            comment_id = %comment.id,
+            run_id = %run.id,
+            err = %err,
+            "answer-agent spawn: failed to mark the failed-spawn tracking run row 'failed'",
+        );
+        return;
+    }
+    publish_comment_invalidation(
+        server_state,
+        session_id,
+        request_id,
+        &comment.artifact_kind,
+        &comment.artifact_id,
+        "comment_answer_agent_spawn_failed",
+    )
+    .await;
 }
 
 /// Shared tail of an answer-agent spawn, once the caller has already
@@ -1422,5 +1503,150 @@ mod tests {
             .await
             .expect("a response envelope should have been enqueued");
         assert!(matches!(envelope.payload, FrontendEvent::WorkError { .. }));
+    }
+
+    // --- Answer-agent repo resolution (multi-repo R1: investigation tasks
+    // never carry their own `repo_remote_url`; it's inherited from the
+    // owning product) ---
+
+    const DOC_REPO: &str = "git@github.com:spinyfin/mono.git";
+    const DOC_PATH: &str = "tools/boss/docs/investigations/foo.md";
+
+    /// Stand up a project-less `question`-classified comment owned by a
+    /// fresh investigation task, with the doc pointer wired so
+    /// `resolve_doc_owner` matches it. `docs_repo` / `repo_remote_url` are
+    /// the product-level fields under test — the investigation task itself
+    /// is created with no `repo_remote_url` override, mirroring the real
+    /// bug report (an investigation task reaching `in_review` with that
+    /// column `NULL`).
+    fn seed_investigation_question_comment(
+        work_db: &Arc<WorkDb>,
+        docs_repo: Option<&str>,
+        repo_remote_url: Option<&str>,
+    ) -> WorkComment {
+        let product = work_db
+            .create_product(crate::work::CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: repo_remote_url.map(str::to_owned),
+                design_repo: None,
+                docs_repo: docs_repo.map(str::to_owned),
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let investigation = work_db
+            .create_investigation(
+                boss_protocol::CreateInvestigationInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Investigate the thing")
+                    .build(),
+            )
+            .unwrap();
+        assert!(
+            investigation.repo_remote_url.is_none(),
+            "investigation tasks must not carry their own repo_remote_url override",
+        );
+        work_db
+            .set_task_doc_pointer(&investigation.id, Some(DOC_REPO), Some("main"), Some(DOC_PATH))
+            .unwrap();
+
+        let artifact_id = format!("pr_doc:{DOC_REPO}:main:{DOC_PATH}");
+        let comment = work_db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id,
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "pr_doc".into(),
+                author: "human".into(),
+                body: "Is comment classification working properly now?".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.95).unwrap();
+        work_db.get_comment(&comment.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn resolve_answer_agent_repo_falls_back_to_product_docs_repo_for_investigation_task() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
+
+        match resolve_answer_agent_repo(&work_db, &comment) {
+            AnswerAgentRepoResolution::Resolved(url) => assert_eq!(url, DOC_REPO),
+            _ => panic!("expected Resolved({DOC_REPO})"),
+        }
+    }
+
+    #[test]
+    fn resolve_answer_agent_repo_falls_back_to_product_repo_remote_url_when_no_docs_repo() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        // No `docs_repo` configured — the resolver's next fallback is the
+        // product's default code repo, exactly like real dispatch does for
+        // an investigation-kind task.
+        let comment = seed_investigation_question_comment(&work_db, None, Some(DOC_REPO));
+
+        match resolve_answer_agent_repo(&work_db, &comment) {
+            AnswerAgentRepoResolution::Resolved(url) => assert_eq!(url, DOC_REPO),
+            _ => panic!("expected the product's repo_remote_url fallback to resolve"),
+        }
+    }
+
+    #[test]
+    fn resolve_answer_agent_repo_reports_failed_when_product_has_no_repo_at_all() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let comment = seed_investigation_question_comment(&work_db, None, None);
+
+        match resolve_answer_agent_repo(&work_db, &comment) {
+            AnswerAgentRepoResolution::Failed(error_kind) => assert_eq!(error_kind, "repo_unresolved"),
+            _ => panic!("expected Failed(\"repo_unresolved\") when the product has no repo at all"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_answer_agent_records_a_failed_run_and_leaves_the_comment_active_when_repo_unresolved() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let comment = seed_investigation_question_comment(&work_db, None, None);
+
+        spawn_answer_agent(&server_state, &work_db, "session-1", "req-1", &comment).await;
+
+        // The comment never entered `answering` — the repo never resolved —
+        // but the failure left a durable, terminal trace instead of a
+        // WARN-and-forget with nothing behind it.
+        let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+
+        let run = work_db
+            .latest_answer_agent_run_for_comment(&comment.id)
+            .unwrap()
+            .expect("a failed run row should have been recorded");
+        assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_FAILED);
+        assert_eq!(run.error_kind.as_deref(), Some("repo_unresolved"));
+
+        let with_thread = work_db
+            .list_comments_with_thread("pr_doc", &comment.artifact_id, false)
+            .unwrap();
+        let listed = with_thread
+            .iter()
+            .find(|c| c.comment.id == comment.id)
+            .expect("comment should be listed");
+        assert!(
+            listed.answer_agent_failed,
+            "CommentsList must surface the failed spawn so the app doesn't show an indefinite thinking indicator",
+        );
+        assert!(!listed.answer_agent_running);
+
+        // The invalidation the failure recorder published should have
+        // bumped the work revision (no separate assertion possible without
+        // a live subscriber here, but the call must not panic).
+        let _ = sink;
     }
 }

@@ -138,6 +138,12 @@ struct Comment: Identifiable, Equatable {
     /// Defaults to `true` for the artifact-less fallback, which has no such
     /// signal from the engine and relies on `status` alone.
     var answerAgentRunning: Bool = true
+    /// Mirrors `CommentWithThread.answer_agent_failed` — the comment's
+    /// latest answer-agent run ended `failed` (including a spawn that never
+    /// made it to `running`, e.g. an unresolvable doc-owner repo). Drives
+    /// the sidebar's failure state so a stuck spawn doesn't read as an
+    /// indefinite "thinking" indicator.
+    var answerAgentFailed: Bool = false
 
     // Persistence provenance carried so the layer can issue mutations without a
     // separate lookup. Empty on the artifact-less in-memory path.
@@ -197,6 +203,7 @@ extension Comment {
         _ wc: WorkComment,
         threadEntries: [WireCommentThreadEntry] = [],
         answerAgentRunning: Bool = true,
+        answerAgentFailed: Bool = false,
         resolution: CommentResolution? = nil
     ) -> Comment {
         var c = Comment(
@@ -218,6 +225,7 @@ extension Comment {
             ?? wc.lastResolvedWith.flatMap(ResolvedWith.init(rawValue:))
         c.threadEntries = threadEntries.map(CommentThreadEntry.from)
         c.answerAgentRunning = answerAgentRunning
+        c.answerAgentFailed = answerAgentFailed
         c.artifactKind = wc.artifactKind
         c.artifactId = wc.artifactId
         c.docVersion = wc.docVersion

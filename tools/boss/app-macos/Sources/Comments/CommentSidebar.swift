@@ -248,6 +248,21 @@ private struct ThinkingIndicatorView: View {
     }
 }
 
+/// Shown when a comment's bucket-2 answer-agent spawn never made it to
+/// `running` (or the run itself errored out) — `comment.answerAgentFailed`.
+/// Distinguishes a genuine terminal failure from [`ThinkingIndicatorView`]'s
+/// still-in-flight pulse, so a spawn skip (e.g. an unresolvable doc-owner
+/// repo) reads as "this stopped" rather than an indicator that silently
+/// runs forever with nothing behind it.
+private struct AnswerFailedIndicatorView: View {
+    var body: some View {
+        Label("Couldn't answer", systemImage: "exclamationmark.bubble")
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .help("The answer agent failed to start or run for this comment. Edit the comment or retry later.")
+    }
+}
+
 /// The reply box under an `answered` bucket-2 thread — the UI half of the
 /// engine's `CommentsPostFollowup` RPC (design § "Follow-up loop").
 private struct FollowupComposer: View {
@@ -378,13 +393,23 @@ private struct CommentRow: View {
     /// `Comment.answerAgentRunning`), an "Answered" checkmark + follow-up
     /// composer once it's replied, or a passive "reclassifying" indicator
     /// while a just-posted follow-up awaits the engine's async reclassifier.
-    /// `active`/`resolved`/`inRevision` render nothing here — that track has
-    /// its own `RevisionChip` instead.
+    /// `resolved`/`inRevision`/`orphaned`/`dismissed` render nothing here —
+    /// that track has its own `RevisionChip` instead.
+    ///
+    /// `answerAgentFailed` (`Comment.answerAgentFailed`) takes priority over
+    /// each status's default rendering in `.answering`/`.awaitingFollowup`/
+    /// `.active`: those are exactly the statuses a failed spawn can leave a
+    /// `question`-classified comment sitting in (see
+    /// `record_answer_agent_spawn_failure` in the engine), and without this
+    /// check they'd render either nothing or a perpetual in-progress
+    /// indicator for a run that already gave up.
     @ViewBuilder
     private var bucketTwoTrack: some View {
         switch comment.status {
         case .answering:
-            if comment.answerAgentRunning {
+            if comment.answerAgentFailed {
+                AnswerFailedIndicatorView()
+            } else if comment.answerAgentRunning {
                 ThinkingIndicatorView()
             }
         case .answered:
@@ -395,8 +420,16 @@ private struct CommentRow: View {
                 FollowupComposer(comment: comment, layer: layer)
             }
         case .awaitingFollowup:
-            FollowupClassifyingIndicator()
-        case .active, .resolved, .inRevision, .orphaned, .dismissed:
+            if comment.answerAgentFailed {
+                AnswerFailedIndicatorView()
+            } else {
+                FollowupClassifyingIndicator()
+            }
+        case .active:
+            if comment.answerAgentFailed {
+                AnswerFailedIndicatorView()
+            }
+        case .resolved, .inRevision, .orphaned, .dismissed:
             EmptyView()
         }
     }

@@ -408,7 +408,12 @@ final class CommentLayer: NSObject, ObservableObject {
             uniquingKeysWith: { first, _ in first }
         )
         comments = wire.map { cw in
-            var c = Comment.from(cw.comment, threadEntries: cw.threadEntries, answerAgentRunning: cw.answerAgentRunning)
+            var c = Comment.from(
+                cw.comment,
+                threadEntries: cw.threadEntries,
+                answerAgentRunning: cw.answerAgentRunning,
+                answerAgentFailed: cw.answerAgentFailed
+            )
             if c.lastResolvedWith == nil { c.lastResolvedWith = priorResolved[c.id] }
             return c
         }

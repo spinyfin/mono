@@ -464,7 +464,8 @@ final class CommentLayerTests: XCTestCase {
               "author": "engine", "body": "the answer", "answer_agent_run_id": "aar_1",
               "created_at": "t2" }
           ],
-          "answer_agent_running": true
+          "answer_agent_running": true,
+          "answer_agent_failed": false
         }
         """
         let cwt = try JSONDecoder().decode(CommentWithThread.self, from: Data(json.utf8))
@@ -472,6 +473,7 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(cwt.threadEntries.count, 1)
         XCTAssertEqual(cwt.threadEntries[0].entryKind, "answer")
         XCTAssertTrue(cwt.answerAgentRunning)
+        XCTAssertFalse(cwt.answerAgentFailed)
         // Maps into the UI comment with its thread entry preserved.
         let ui = Comment.from(cwt.comment, threadEntries: cwt.threadEntries)
         XCTAssertEqual(ui.intent, .question)
@@ -681,7 +683,8 @@ final class CommentLayerTests: XCTestCase {
         body: String,
         status: String = "active",
         intent: String? = nil,
-        lastResolvedWith: String? = nil
+        lastResolvedWith: String? = nil,
+        answerAgentFailed: Bool = false
     ) -> CommentWithThread {
         CommentWithThread(
             comment: WorkComment(
@@ -697,7 +700,8 @@ final class CommentLayerTests: XCTestCase {
                 intent: intent
             ),
             threadEntries: [],
-            answerAgentRunning: false
+            answerAgentRunning: false,
+            answerAgentFailed: answerAgentFailed
         )
     }
 }

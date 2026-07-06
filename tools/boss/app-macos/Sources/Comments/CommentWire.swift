@@ -207,11 +207,13 @@ struct CommentWithThread: Codable, Equatable, Sendable {
     let comment: WorkComment
     let threadEntries: [WireCommentThreadEntry]
     let answerAgentRunning: Bool
+    let answerAgentFailed: Bool
 
     enum CodingKeys: String, CodingKey {
         case comment
         case threadEntries = "thread_entries"
         case answerAgentRunning = "answer_agent_running"
+        case answerAgentFailed = "answer_agent_failed"
     }
 }
 
