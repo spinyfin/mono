@@ -703,6 +703,18 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
+    func testCommentSidebarRendersMarkdownReplyBody() {
+        let layer = CommentLayer()
+        layer.addComment(
+            quoted: "the quick brown fox",
+            body: "A **bold** claim with `inline code`.\n\n1. One\n2. Two\n\n```swift\nlet x = 1\n```"
+        )
+        let hosting = NSHostingView(rootView: CommentSidebar(layer: layer))
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
     func testCommentSidebarRendersFuzzyAndOrphanBadges() {
         let layer = CommentLayer()
         let backend = FakeCommentBackend()
