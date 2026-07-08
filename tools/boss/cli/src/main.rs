@@ -19,7 +19,7 @@ use boss_protocol::{
     WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::{Cell, ContentArrangement, Table};
 use serde::Serialize;
 
 mod buildkite_release;
@@ -4583,17 +4583,26 @@ async fn list_automation_tasks(client: &mut BossClient, automation_id: &str) -> 
 // Display helpers for automations
 // ---------------------------------------------------------------------------
 
-fn print_automations_table(automations: &[Automation]) {
+/// Construct a `comfy_table::Table` with the shared dynamic-arrangement
+/// setup every list/detail renderer below repeats: dynamic content
+/// arrangement plus the given header row. The per-column headers and
+/// per-row cells stay at the call site since they differ per table.
+fn new_dynamic_table<H: IntoIterator<Item = impl Into<Cell>>>(header: H) -> Table {
     let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic).set_header([
-        "#",
-        "NAME",
-        "SCHEDULE",
-        "ENABLED",
-        "OPEN",
-        "LAST OUTCOME",
-        "NEXT DUE",
-    ]);
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(header);
+    table
+}
+
+/// Print a rendered table to stdout. Pairs with [`new_dynamic_table`]
+/// so the identical `println!("{table}")` teardown lives in one place.
+fn print_table(table: Table) {
+    println!("{table}");
+}
+
+fn print_automations_table(automations: &[Automation]) {
+    let mut table = new_dynamic_table(["#", "NAME", "SCHEDULE", "ENABLED", "OPEN", "LAST OUTCOME", "NEXT DUE"]);
     for a in automations {
         let short = a.short_id.map(|n| format!("A{n}")).unwrap_or_default();
         let schedule = match &a.trigger {
@@ -4606,7 +4615,7 @@ fn print_automations_table(automations: &[Automation]) {
         let next_due = a.next_due_at.as_deref().unwrap_or("-");
         table.add_row([&short, a.name.as_str(), &schedule, enabled, last_outcome, next_due]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_automation_details(label: &str, a: &Automation) {
@@ -4640,14 +4649,7 @@ fn print_automation_details(label: &str, a: &Automation) {
 }
 
 fn print_automation_runs_table(runs: &[AutomationRun]) {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic).set_header([
-        "SCHEDULED FOR",
-        "OUTCOME",
-        "STARTED",
-        "PRODUCED TASK",
-        "DETAIL",
-    ]);
+    let mut table = new_dynamic_table(["SCHEDULED FOR", "OUTCOME", "STARTED", "PRODUCED TASK", "DETAIL"]);
     for r in runs {
         let produced = r.produced_task_id.as_deref().unwrap_or("-");
         let detail = r.detail.as_deref().unwrap_or("-");
@@ -4664,7 +4666,7 @@ fn print_automation_runs_table(runs: &[AutomationRun]) {
             detail,
         ]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 // ---------------------------------------------------------------------------
@@ -5130,15 +5132,7 @@ async fn dismiss_attention_rpc(
 // ---------------------------------------------------------------------------
 
 fn print_attention_groups_table(groups: &[AttentionGroup]) {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic).set_header([
-        "ID",
-        "SHORT",
-        "KIND",
-        "STATE",
-        "ASSOCIATION",
-        "CREATED",
-    ]);
+    let mut table = new_dynamic_table(["ID", "SHORT", "KIND", "STATE", "ASSOCIATION", "CREATED"]);
     for g in groups {
         let short = g.short_id.map(|n| format!("A{n}")).unwrap_or_default();
         let assoc = g
@@ -5155,7 +5149,7 @@ fn print_attention_groups_table(groups: &[AttentionGroup]) {
             g.created_at.as_str(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_attention_group_details(label: &str, g: &AttentionGroup) {
@@ -5982,10 +5976,7 @@ async fn run_engine_conflicts_command(command: EngineConflictsCommand, ctx: &Run
 }
 
 fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
+    let mut table = new_dynamic_table(vec!["ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for attempt in attempts {
         table.add_row(vec![
             attempt.id.as_str(),
@@ -5996,13 +5987,11 @@ fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
             attempt.created_at.as_str(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec!["FIELD", "VALUE"]);
+    let mut table = new_dynamic_table(vec!["FIELD", "VALUE"]);
     let unset = "<unset>".to_owned();
     let rows: Vec<(&str, String)> = vec![
         ("id", attempt.id.clone()),
@@ -6051,7 +6040,7 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
     for (field, value) in &rows {
         table.add_row(vec![*field, value.as_str()]);
     }
-    println!("{table}");
+    print_table(table);
     if let Some(diag) = &attempt.conflict_diagnosis {
         println!();
         println!("conflict_diagnosis (raw):");
@@ -6060,10 +6049,7 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
 }
 
 fn print_ci_remediations_table(attempts: &[CiRemediation]) {
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["ID", "KIND", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
+    let mut table = new_dynamic_table(vec!["ID", "KIND", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for attempt in attempts {
         table.add_row(vec![
             attempt.id.as_str(),
@@ -6075,13 +6061,11 @@ fn print_ci_remediations_table(attempts: &[CiRemediation]) {
             attempt.created_at.as_str(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_ci_remediation_detail(attempt: &CiRemediation) {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec!["FIELD", "VALUE"]);
+    let mut table = new_dynamic_table(vec!["FIELD", "VALUE"]);
     let unset = "<unset>".to_owned();
     let rows: Vec<(&str, String)> = vec![
         ("id", attempt.id.clone()),
@@ -6128,7 +6112,7 @@ fn print_ci_remediation_detail(attempt: &CiRemediation) {
     for (field, value) in &rows {
         table.add_row(vec![*field, value.as_str()]);
     }
-    println!("{table}");
+    print_table(table);
     if !attempt.failed_checks.is_empty() {
         println!();
         println!("failed_checks (raw):");
@@ -6142,9 +6126,7 @@ fn print_ci_remediation_detail(attempt: &CiRemediation) {
 }
 
 fn print_ci_budget_snapshot(snapshot: &CiBudgetSnapshot) {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec!["FIELD", "VALUE"]);
+    let mut table = new_dynamic_table(vec!["FIELD", "VALUE"]);
     let override_text = match snapshot.per_pr_override {
         Some(n) => n.to_string(),
         None => "<inherit>".to_owned(),
@@ -6161,7 +6143,7 @@ fn print_ci_budget_snapshot(snapshot: &CiBudgetSnapshot) {
     for (field, value) in &rows {
         table.add_row(vec![*field, value.as_str()]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetSnapshot, was_exhausted: bool) {
@@ -6182,10 +6164,7 @@ fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetSnapshot, wa
 }
 
 fn print_engine_attempts_table(attempts: &[EngineAttemptListEntry]) {
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["KIND", "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
+    let mut table = new_dynamic_table(vec!["KIND", "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for row in attempts {
         table.add_row(vec![
             row.kind.as_str(),
@@ -6197,7 +6176,7 @@ fn print_engine_attempts_table(attempts: &[EngineAttemptListEntry]) {
             row.created_at.as_str(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 /// Human-readable rendering for `boss product audit-effort`. The
@@ -6222,17 +6201,14 @@ fn print_effort_audit_report(report: &EffortAuditReport) {
         );
         return;
     }
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "MARKER",
-            "ORIG LEVEL",
-            "MATCHES",
-            "ESCALATIONS",
-            "UNDER-CLASS RATE",
-            "NOTE",
-        ]);
+    let mut table = new_dynamic_table(vec![
+        "MARKER",
+        "ORIG LEVEL",
+        "MATCHES",
+        "ESCALATIONS",
+        "UNDER-CLASS RATE",
+        "NOTE",
+    ]);
     for row in &report.rows {
         let rate = match row.under_class_rate {
             Some(r) => format!("{:.1}%", r * 100.0),
@@ -6248,7 +6224,7 @@ fn print_effort_audit_report(report: &EffortAuditReport) {
             annotation.as_str(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
     println!();
     println!(
         "Threshold for the \"consider promoting\" callout: under-class rate > {:.0}%. \
@@ -8478,14 +8454,11 @@ where
 
 fn print_products_table(products: &[Product]) {
     let show_default_model = products.iter().any(|p| p.default_model.is_some());
-    let mut table = Table::new();
     let mut header = vec!["ID", "SLUG", "NAME", "STATUS", "REPO"];
     if show_default_model {
         header.push("DEFAULT MODEL");
     }
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(header);
+    let mut table = new_dynamic_table(header);
     for product in products {
         let mut row = vec![
             product.id.as_str(),
@@ -8499,12 +8472,11 @@ fn print_products_table(products: &[Product]) {
         }
         table.add_row(row);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_projects_table(projects: &[Project], with_primary_id: bool) {
     let show_short_id = projects.iter().any(|p| p.short_id.is_some());
-    let mut table = Table::new();
     let mut header: Vec<&str> = Vec::new();
     if show_short_id {
         header.push("#");
@@ -8513,9 +8485,7 @@ fn print_projects_table(projects: &[Project], with_primary_id: bool) {
         header.push("ID");
     }
     header.extend_from_slice(&["SLUG", "NAME", "STATUS", "PRIORITY", "GOAL"]);
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(header);
+    let mut table = new_dynamic_table(header);
     for project in projects {
         let mut row: Vec<String> = Vec::new();
         if show_short_id {
@@ -8532,7 +8502,7 @@ fn print_projects_table(projects: &[Project], with_primary_id: bool) {
         row.push(project.goal.clone());
         table.add_row(row);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
@@ -8547,7 +8517,6 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // one — i.e. when the caller passed `--deleted`. Keeps the common
     // live-only listing unchanged. Mirrors the `show_effort` pattern.
     let show_deleted = tasks.iter().any(|t| t.deleted_at.is_some());
-    let mut table = Table::new();
     let mut header: Vec<&str> = Vec::new();
     if show_short_id {
         header.push("#");
@@ -8563,9 +8532,7 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     if show_deleted {
         header.push("DELETED");
     }
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(header);
+    let mut table = new_dynamic_table(header);
     for task in tasks {
         let ordinal = task.ordinal.map(|value| value.to_string()).unwrap_or_default();
         let friendly = boss_protocol::short_id_label(task.short_id).unwrap_or_default();
@@ -8591,7 +8558,7 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         }
         table.add_row(row);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn print_product_details(title: &str, product: &Product) {
@@ -8917,10 +8884,7 @@ fn print_lint_design_docs_table(entries: &[LintDesignDocEntry]) {
         println!("No design-doc pointer issues found.");
         return;
     }
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["SEVERITY", "PROJECT", "PATH", "REASON"]);
+    let mut table = new_dynamic_table(vec!["SEVERITY", "PROJECT", "PATH", "REASON"]);
     for entry in entries {
         table.add_row(vec![
             lint_severity_label(entry.severity).to_owned(),
@@ -8929,7 +8893,7 @@ fn print_lint_design_docs_table(entries: &[LintDesignDocEntry]) {
             entry.reason.clone(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
     println!();
     println!("Suggested fixes:");
     for entry in entries {
@@ -8959,10 +8923,7 @@ fn print_planner_proposal(proposal: &PlannerOutput) {
     if proposal.tasks.is_empty() {
         return;
     }
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["HANDLE", "NAME", "KIND", "EFFORT"]);
+    let mut table = new_dynamic_table(vec!["HANDLE", "NAME", "KIND", "EFFORT"]);
     for task in &proposal.tasks {
         table.add_row(vec![
             task.handle.clone(),
@@ -8971,7 +8932,7 @@ fn print_planner_proposal(proposal: &PlannerOutput) {
             task.effort.as_str().to_owned(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
     if !proposal.edges.is_empty() {
         println!("Dependency edges:");
         for edge in &proposal.edges {
@@ -8989,10 +8950,7 @@ fn print_planner_runs_table(runs: &[PlannerRun]) {
         println!("No planner runs recorded for this project.");
         return;
     }
-    let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["ID", "CALLER", "OUTCOME", "RESULT", "CREATED_AT"]);
+    let mut table = new_dynamic_table(vec!["ID", "CALLER", "OUTCOME", "RESULT", "CREATED_AT"]);
     for run in runs {
         table.add_row(vec![
             run.id.clone(),
@@ -9002,7 +8960,7 @@ fn print_planner_runs_table(runs: &[PlannerRun]) {
             run.created_at.clone(),
         ]);
     }
-    println!("{table}");
+    print_table(table);
 }
 
 fn lint_severity_label(severity: LintSeverity) -> &'static str {
