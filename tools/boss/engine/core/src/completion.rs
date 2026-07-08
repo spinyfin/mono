@@ -2148,7 +2148,35 @@ must not be asked to open one",
                             )),
                         )
                     }
-                    Ok(None) => (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail)),
+                    Ok(None) => match recover_skip_reason(&decision, &transcript) {
+                        // No task was created AND the worker's final message
+                        // plainly concluded there is nothing to do (a clean-repo
+                        // / no-warnings verdict) but it botched the exact skip
+                        // marker. Record `skipped` — symmetric with the
+                        // produced-task marker-recovery above. Without this, a
+                        // run that correctly found nothing loops
+                        // `failed_will_retry` forever, re-running a full session
+                        // to re-prove an already-clean repo.
+                        Some(reason) => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                automation_id = %automation_id,
+                                base_detail,
+                                "triage run created no task and emitted no skip marker, but its \
+                                 final message plainly concluded there is nothing to do; recording \
+                                 as skipped (skip marker-recovery) instead of failed_will_retry",
+                            );
+                            (
+                                AUTOMATION_OUTCOME_SKIPPED,
+                                None,
+                                Some(format!(
+                                    "skipped (marker-recovery): worker concluded no work but \
+                                     emitted no skip marker — {reason}"
+                                )),
+                            )
+                        }
+                        None => (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail)),
+                    },
                     Err(err) => {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -5687,6 +5715,106 @@ fn triage_no_decision_detail(transcript: &TriageTranscript) -> String {
     }
 }
 
+/// The trailing window (in characters) of the collapsed final message that the
+/// skip-recovery conclusion scan considers. Scoped to the *tail* so a
+/// mid-investigation "no warnings in module X" line early in the run cannot trip
+/// a skip; only the worker's closing words count.
+const SKIP_RECOVERY_TAIL_CHARS: usize = 400;
+
+/// Phrases whose presence in the final tail VETO skip-recovery — the worker was
+/// still mid-verification / deferring a decision, not concluding, so the run
+/// must stay `failed_will_retry`. These mirror the field-evidence tails ("I'll
+/// wait for checkleft to finish before deciding", "The authoritative checkleft
+/// run is in progress. Let me wait for it to complete", "Let me do one
+/// confirming check", "Let me broaden the check to the whole repo to be
+/// thorough"). Over-matching here is safe: it only keeps the conservative
+/// `failed_will_retry` default; it can never *cause* a false skip.
+const SKIP_RECOVERY_DEFERRAL_VETOES: &[&str] = &[
+    "wait",
+    "in progress",
+    "still running",
+    "is running",
+    "before deciding",
+    "to be thorough",
+    "one more",
+    "one confirming",
+    "let me ",
+    "i'll ",
+    "i will ",
+    "going to",
+    "let's ",
+];
+
+/// Phrases that affirmatively conclude there is no actionable work — a
+/// clean-repo / no-warnings verdict. At least one must appear in the final tail
+/// for skip-recovery to fire.
+const SKIP_RECOVERY_NO_WORK_SIGNALS: &[&str] = &[
+    "no warnings",
+    "no compiler warning",
+    "no compilation warning",
+    "no clippy",
+    "no lint",
+    "nothing to do",
+    "nothing actionable",
+    "no actionable",
+    "nothing to fix",
+    "no action needed",
+    "no action required",
+    "already clean",
+    "is clean",
+    "are clean",
+    "no issues found",
+    "no findings",
+    "no work to do",
+    "no changes needed",
+];
+
+/// Skip marker-recovery — the symmetric counterpart to the produced-task
+/// marker-recovery in [`WorkerCompletionHandler::finalize_automation_triage`].
+///
+/// When a triage run created **no** task and emitted **no** valid decision
+/// marker, but its final message plainly concluded there is nothing to do, this
+/// returns `Some(reason)` so the run is recorded `skipped` rather than looping
+/// `failed_will_retry` forever (each retry burning a full worker session while
+/// re-proving a repo that is already clean).
+///
+/// Deliberately conservative — a *false* skip merely defers to the automation's
+/// next scheduled fire (cheap), whereas a false `failed_will_retry` re-runs a
+/// whole session. It fires ONLY when:
+/// - the decision is [`TriageDecision::NoDecision`] (not `Ambiguous`: two
+///   markers is a real contract violation, not a forgotten marker), and
+/// - a final assistant message exists (not a `NoPath`/`Unreadable`/no-prose
+///   state — there is nothing to conclude from), and
+/// - the *tail* of that message affirmatively concludes "no work" AND shows no
+///   mid-verification / deferred-intent language (the field-evidence failure
+///   shape, which must stay `failed_will_retry`).
+fn recover_skip_reason(decision: &TriageDecision, transcript: &TriageTranscript) -> Option<String> {
+    if !matches!(decision, TriageDecision::NoDecision) {
+        return None;
+    }
+    let TriageTranscript::FinalMessage(text) = transcript else {
+        return None;
+    };
+    if !tail_concludes_no_work(text) {
+        return None;
+    }
+    Some(tail_snippet(text, 200))
+}
+
+/// Scan the tail of a triage worker's final message for an affirmative
+/// "nothing to do" conclusion with no deferred-intent / mid-verification
+/// language. See [`recover_skip_reason`] for why this is intentionally strict.
+fn tail_concludes_no_work(text: &str) -> bool {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let chars: Vec<char> = one_line.chars().collect();
+    let start = chars.len().saturating_sub(SKIP_RECOVERY_TAIL_CHARS);
+    let tail: String = chars[start..].iter().collect();
+    if SKIP_RECOVERY_DEFERRAL_VETOES.iter().any(|v| tail.contains(v)) {
+        return false;
+    }
+    SKIP_RECOVERY_NO_WORK_SIGNALS.iter().any(|s| tail.contains(s))
+}
+
 /// Collapse `text` to a single-line tail of at most `max_chars` characters for
 /// embedding in a run-history `detail`. Whitespace runs (including newlines)
 /// collapse to single spaces; when truncated, the result is prefixed with `…`
@@ -5819,6 +5947,72 @@ mod tests {
         assert_eq!(TriageTranscript::NoPath.into_message(), None);
         assert_eq!(TriageTranscript::Unreadable.into_message(), None);
         assert_eq!(TriageTranscript::NoAssistantText.into_message(), None);
+    }
+
+    #[test]
+    fn recover_skip_reason_fires_only_on_a_clean_conclusion() {
+        // A plain "nothing to do" conclusion with no deferral → recover as skip.
+        let clean = TriageTranscript::FinalMessage(
+            "I checked the crate: no compiler or clippy warnings. The code is clean, nothing to do.".to_owned(),
+        );
+        assert!(
+            recover_skip_reason(&TriageDecision::NoDecision, &clean).is_some(),
+            "a plain clean-repo conclusion should recover as a skip",
+        );
+
+        // The exact field-evidence mid-verification tails must NOT recover — the
+        // worker never decided, so the run has to stay failed_will_retry.
+        for tail in [
+            "The authoritative checkleft run is in progress. Let me wait for it to complete.",
+            "I'll wait for checkleft to finish before deciding.",
+            "Let me broaden the check to the whole repo to be thorough.",
+            "Let me do one confirming check that clippy genuinely ran.",
+        ] {
+            let t = TriageTranscript::FinalMessage(tail.to_owned());
+            assert_eq!(
+                recover_skip_reason(&TriageDecision::NoDecision, &t),
+                None,
+                "must not skip-recover a mid-verification tail: {tail}",
+            );
+        }
+
+        // No affirmative no-work signal → no recovery (ambiguous silence, not a skip).
+        let vague = TriageTranscript::FinalMessage("I looked around the repository.".to_owned());
+        assert_eq!(recover_skip_reason(&TriageDecision::NoDecision, &vague), None);
+
+        // Ambiguous (two markers) is a real contract violation, never skip-recovered
+        // even if the surrounding prose reads clean.
+        let clean2 = TriageTranscript::FinalMessage("no warnings anywhere; the repo is clean".to_owned());
+        assert_eq!(recover_skip_reason(&TriageDecision::Ambiguous(2), &clean2), None);
+
+        // Non-FinalMessage transcript states carry no prose to conclude from.
+        assert_eq!(
+            recover_skip_reason(&TriageDecision::NoDecision, &TriageTranscript::NoPath),
+            None
+        );
+        assert_eq!(
+            recover_skip_reason(&TriageDecision::NoDecision, &TriageTranscript::Unreadable),
+            None
+        );
+        assert_eq!(
+            recover_skip_reason(&TriageDecision::NoDecision, &TriageTranscript::NoAssistantText),
+            None
+        );
+    }
+
+    #[test]
+    fn skip_recovery_scans_only_the_message_tail() {
+        // "no warnings found" appears only in the HEAD, past the tail window;
+        // the worker then kept reviewing and was cut off without concluding. The
+        // early clean-sounding line must not leak into a false skip.
+        let mut msg = String::from("Early note: no warnings found in the parser module. ");
+        msg.push_str(&"Continuing to review the remaining crates for context. ".repeat(12));
+        let t = TriageTranscript::FinalMessage(msg);
+        assert_eq!(
+            recover_skip_reason(&TriageDecision::NoDecision, &t),
+            None,
+            "a clean line in the head (outside the tail window) must not trigger skip-recovery",
+        );
     }
 
     use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
