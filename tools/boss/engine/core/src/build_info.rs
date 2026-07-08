@@ -35,7 +35,8 @@ use sha2::{Digest, Sha256};
 // BOSS_GIT_SHA and BOSS_BUILD_TIME are always "unknown" (see module docs).
 // BOSS_BUILD_INFO_RS is set to an absolute path by:
 //   - Bazel: via compile_data + $(execpath) in rustc_env (stamped base version)
-//   - Cargo: via build.rs pointing to src/build_info_default.rs ("unknown" fallback)
+//   - Cargo: via build.rs pointing to the shared
+//     tools/boss/build-info/src/build_info_default.rs ("unknown" fallback)
 mod build_info_stamp {
     include!(env!("BOSS_BUILD_INFO_RS"));
 }

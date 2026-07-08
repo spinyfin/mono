@@ -242,6 +242,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bon",
+ "boss-build-info",
  "boss-client",
  "boss-editorial",
  "boss-engine",
@@ -258,6 +259,10 @@ dependencies = [
  "tokio",
  "wiremock",
 ]
+
+[[package]]
+name = "boss-build-info"
+version = "0.1.0"
 
 [[package]]
 name = "boss-claude-client"
@@ -312,6 +317,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-build-info",
  "boss-claude-client",
  "boss-client",
  "boss-conflict-diagnosis",
@@ -450,6 +456,7 @@ name = "bossctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boss-build-info",
  "boss-client",
  "boss-engine",
  "boss-log-files",

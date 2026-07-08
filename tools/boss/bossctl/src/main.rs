@@ -611,24 +611,16 @@ enum ExecutionsAction {
     },
 }
 
-// Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
-// BOSS_BUILD_INFO_RS is set to an absolute path by:
-//   - Bazel: via compile_data + $(execpath) in rustc_env (stamped release value)
-//   - Cargo: via build.rs pointing to src/build_info_default.rs ("unknown" fallback)
-mod build_info_stamp {
-    include!(env!("BOSS_BUILD_INFO_RS"));
-}
-
-fn bossctl_version_string() -> &'static str {
-    build_info_stamp::BOSS_VERSION
-}
+// Per-binary build-info stamp + `version_string` accessor. The
+// include!(env!("BOSS_BUILD_INFO_RS")) must be evaluated in this crate
+// (this rust_binary sets its own rustc_env), so the shared logic is a
+// macro rather than a plain function. See the boss_build_info crate.
+boss_build_info::stamp!();
 
 fn main() -> ExitCode {
     // Intercept --version/-V before Cli::parse() so we print the
     // canonical version string.
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(|s| s.as_str()) == Some("--version") || argv.get(1).map(|s| s.as_str()) == Some("-V") {
-        println!("{}", bossctl_version_string());
+    if boss_build_info::print_version_if_requested(&build_info::version_string("bossctl")) {
         return ExitCode::SUCCESS;
     }
 

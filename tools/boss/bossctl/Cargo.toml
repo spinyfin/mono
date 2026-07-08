@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+boss-build-info = { path = "../build-info" }
 boss-client = { path = "../client" }
 boss-engine = { path = "../engine/core" }
 boss-log-files = { path = "../log-files" }

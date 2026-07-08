@@ -12,9 +12,6 @@ rust_library(
         exclude = [
             # Crate root of the `engine` rust_binary below, not the library.
             "src/main.rs",
-            # include!()'d as a Cargo-only fallback (never a `mod`); compiling it
-            # as a loose source would duplicate its BOSS_* consts.
-            "src/build_info_default.rs",
         ],
     ),
     compile_data = glob(["src/external_tracker/testdata/**"]) + [
@@ -72,6 +69,7 @@ rust_binary(
     ],
     deps = [
         ":engine_lib",
+        "//tools/boss/build-info",
         "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
 )

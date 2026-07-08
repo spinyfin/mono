@@ -5,8 +5,10 @@ fn main() {
     // is never executed during Bazel builds.
     if std::env::var("BOSS_BUILD_INFO_RS").is_err() {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        // Shared default constants live in the boss-build-info crate so
+        // all three Boss binaries fall back to one file (../build-info).
         println!(
-            "cargo:rustc-env=BOSS_BUILD_INFO_RS={}/src/build_info_default.rs",
+            "cargo:rustc-env=BOSS_BUILD_INFO_RS={}/../build-info/src/build_info_default.rs",
             manifest_dir
         );
     }

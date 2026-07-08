@@ -89,9 +89,7 @@ async fn main() -> Result<()> {
     // "boss-engine 0+<sha> built <time>" format and exit cleanly
     // without initialising logging or touching the audit log.
     // Q-Risk-3 from the design doc: this flag did not exist before this change.
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(|s| s.as_str()) == Some("--version") || argv.get(1).map(|s| s.as_str()) == Some("-V") {
-        println!("{}", build_info::version_string("boss-engine"));
+    if boss_build_info::print_version_if_requested(&build_info::version_string("boss-engine")) {
         return Ok(());
     }
 
