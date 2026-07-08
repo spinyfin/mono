@@ -4135,8 +4135,8 @@ async fn run_restore_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskR
     // so we pass the raw selector straight through.
     let item = work_item_with_display_status(restore_work_item(client, args.id.trim()).await?);
     let (label, friendly) = match &item {
-        WorkItem::Task(t) => ("Task", t.short_id.map(|n| format!("T{n}"))),
-        WorkItem::Chore(t) => ("Chore", t.short_id.map(|n| format!("T{n}"))),
+        WorkItem::Task(t) => ("Task", boss_protocol::short_id_label(t.short_id)),
+        WorkItem::Chore(t) => ("Chore", boss_protocol::short_id_label(t.short_id)),
         _ => ("Item", None),
     };
     let friendly = friendly.unwrap_or_else(|| work_item_primary_id(&item).to_owned());
@@ -6859,9 +6859,7 @@ fn repo_url_from_pr_url(pr_url: &str) -> &str {
 /// Friendly `T<n>` id, falling back to the canonical id when a row
 /// somehow lacks a short_id.
 fn friendly_task_id(task: &Task) -> String {
-    task.short_id
-        .map(|n| format!("T{n}"))
-        .unwrap_or_else(|| task.id.clone())
+    boss_protocol::short_id_label(task.short_id).unwrap_or_else(|| task.id.clone())
 }
 
 /// Apply [`with_display_status`] to the owner and every revision in a
@@ -8578,7 +8576,7 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         .set_header(header);
     for task in tasks {
         let ordinal = task.ordinal.map(|value| value.to_string()).unwrap_or_default();
-        let friendly = task.short_id.map(|n| format!("T{n}")).unwrap_or_default();
+        let friendly = boss_protocol::short_id_label(task.short_id).unwrap_or_default();
         let effort_str = task.effort_level.map(|l| l.as_str().to_owned()).unwrap_or_default();
         let mut row: Vec<String> = Vec::new();
         if show_short_id {
