@@ -267,58 +267,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionCoordinator, WorkerPool,
-    };
+    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
     use boss_protocol::WorkExecution;
 
-    struct NoopCube;
-
-    #[async_trait]
-    impl CubeClient for NoopCube {
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!("pr_review_recovery tests don't invoke cube")
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
-        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            Ok(vec![])
-        }
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            Ok(vec![])
-        }
-    }
+    // `NoopCube` comes from `crate::test_support::*`.
 
     struct NoopRunner;
 

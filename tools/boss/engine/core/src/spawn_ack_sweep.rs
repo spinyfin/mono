@@ -327,83 +327,19 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use anyhow::Result;
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionCoordinator, WorkerPool,
-    };
+    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::work::{ExecutionStatus, WorkDb};
-    use boss_protocol::WorkExecution;
 
     // ─── stubs (mirrors dead_pid_sweep / stale_worker_sweep) ─────────────────
-
-    struct NoopCube;
-
-    #[async_trait]
-    impl CubeClient for NoopCube {
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
-        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            Ok(vec![])
-        }
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            Ok(vec![])
-        }
-    }
-
-    struct NoopRunner;
-
-    #[async_trait]
-    impl ExecutionRunner for NoopRunner {
-        async fn run_execution(
-            &self,
-            _worker_id: &str,
-            _execution: &WorkExecution,
-            _work_item: &crate::work::WorkItem,
-            _workspace_path: &std::path::Path,
-            _cube_change_id: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!()
-        }
-    }
+    // `NoopCube` / `NoopRunner` come from `crate::test_support::*`.
 
     /// Records every `reap_worker` call and, at reap time, snapshots
     /// whether the execution's pool slot is still claimed — proves the
