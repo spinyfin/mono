@@ -3359,6 +3359,15 @@ pub struct Task {
     pub dispatch_failed_at: Option<String>,
 }
 
+/// Operator-facing short-id string (`"T2344"`) for a task/chore short id —
+/// never the canonical `task_*` id, which is an internal implementation
+/// detail. Returns `None` when the row lacks a short id so each caller can
+/// apply its own fallback (a generic label, the canonical id, an empty
+/// string, …); use [`Task::short_label`] for the "a task" fallback.
+pub fn short_id_label(short_id: Option<i64>) -> Option<String> {
+    short_id.map(|n| format!("T{n}"))
+}
+
 impl Task {
     /// Operator-facing short form (`"T2344"`) for embedding in human-readable
     /// text — never the canonical `task_*` id, which is an internal
@@ -3366,9 +3375,7 @@ impl Task {
     /// on the (in-practice-unreachable) `short_id = None` case rather than
     /// leaking the canonical id.
     pub fn short_label(&self) -> String {
-        self.short_id
-            .map(|n| format!("T{n}"))
-            .unwrap_or_else(|| "a task".to_owned())
+        short_id_label(self.short_id).unwrap_or_else(|| "a task".to_owned())
     }
 }
 

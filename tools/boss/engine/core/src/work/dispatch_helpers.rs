@@ -1978,7 +1978,7 @@ mod tests {
         let chore = db
             .create_chore(CreateChoreInput::builder().product_id(product).name("chore").build())
             .unwrap();
-        let short_id = chore.short_id.expect("chore has a short id");
+        let friendly_id = boss_protocol::short_id_label(chore.short_id).expect("chore has a short id");
         db.update_work_item(
             &chore.id,
             WorkItemPatch {
@@ -1988,7 +1988,6 @@ mod tests {
             },
         )
         .unwrap();
-        let friendly_id = format!("T{short_id}");
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
         let execution = db.request_pr_review(&friendly_id, &checker).unwrap();
