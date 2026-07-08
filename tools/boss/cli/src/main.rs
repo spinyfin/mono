@@ -27,6 +27,58 @@ mod repo_resolution;
 use boss_github as github_app;
 use git_utils::repo_slug::short_name_for;
 
+/// Send an RPC request and map the engine's reply to a `Result`.
+///
+/// Encapsulates the boilerplate shared by every dedicated RPC wrapper:
+/// it awaits `send_request`, maps transport failures through
+/// [`CliError::internal`], yields the happy-path value on the expected
+/// event variant, maps `WorkError`/`Error` events to
+/// [`CliError::application`], and any other event to [`unexpected_event`]
+/// with the supplied context `$label`.
+///
+/// The common form wraps the happy-path value in `Ok`:
+/// ```ignore
+/// rpc_call!(
+///     client,
+///     FrontendRequest::GetAutomation { id: id.to_owned() },
+///     "automation show",
+///     FrontendEvent::AutomationResult { automation } => automation,
+/// )
+/// ```
+///
+/// When the happy arm already yields a `Result` (e.g. it runs
+/// `expect_product(item)`), prefix the invocation with `try` so the
+/// value is returned as-is instead of being wrapped in `Ok`:
+/// ```ignore
+/// rpc_call!(
+///     try client,
+///     FrontendRequest::CreateProduct { input },
+///     "product create",
+///     FrontendEvent::WorkItemCreated { item } => expect_product(item),
+/// )
+/// ```
+macro_rules! rpc_call {
+    // Internal: run the request and dispatch on the reply. `$result` must
+    // evaluate to the wrapper's `Result` return type.
+    (@run $client:expr, $req:expr, $label:expr, $happy:pat => $result:expr) => {
+        match $client.send_request(&$req).await.map_err(CliError::internal)? {
+            $happy => $result,
+            FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                Err(CliError::application(message))
+            }
+            other => Err(unexpected_event($label, &other)),
+        }
+    };
+    // Happy arm already yields a `Result`; return it unchanged.
+    (try $client:expr, $req:expr, $label:expr, $happy:pat => $value:expr $(,)?) => {
+        rpc_call!(@run $client, $req, $label, $happy => $value)
+    };
+    // Happy arm yields a plain value; wrap it in `Ok`.
+    ($client:expr, $req:expr, $label:expr, $happy:pat => $value:expr $(,)?) => {
+        rpc_call!(@run $client, $req, $label, $happy => Ok($value))
+    };
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
 struct Cli {
@@ -4446,138 +4498,93 @@ fn validate_cron_expression(cron: &str) -> Result<String, CliError> {
 // ---------------------------------------------------------------------------
 
 async fn create_automation(client: &mut BossClient, input: CreateAutomationInput) -> Result<Automation, CliError> {
-    match client
-        .send_request(&FrontendRequest::CreateAutomation { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationCreated { automation } => Ok(automation),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation create", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::CreateAutomation { input },
+        "automation create",
+        FrontendEvent::AutomationCreated { automation } => automation,
+    )
 }
 
 async fn list_automations(client: &mut BossClient, product_id: &str) -> Result<Vec<Automation>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListAutomations {
+    rpc_call!(
+        client,
+        FrontendRequest::ListAutomations {
             product_id: product_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationsList { automations, .. } => Ok(automations),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation list", &other)),
-    }
+        },
+        "automation list",
+        FrontendEvent::AutomationsList { automations, .. } => automations,
+    )
 }
 
 async fn get_automation(client: &mut BossClient, id: &str) -> Result<Automation, CliError> {
-    match client
-        .send_request(&FrontendRequest::GetAutomation { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationResult { automation } => Ok(automation),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation show", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::GetAutomation { id: id.to_owned() },
+        "automation show",
+        FrontendEvent::AutomationResult { automation } => automation,
+    )
 }
 
 async fn update_automation(client: &mut BossClient, id: &str, patch: AutomationPatch) -> Result<Automation, CliError> {
-    match client
-        .send_request(&FrontendRequest::UpdateAutomation {
+    rpc_call!(
+        client,
+        FrontendRequest::UpdateAutomation {
             id: id.to_owned(),
             patch,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationUpdated { automation } => Ok(automation),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation update", &other)),
-    }
+        },
+        "automation update",
+        FrontendEvent::AutomationUpdated { automation } => automation,
+    )
 }
 
 async fn enable_automation(client: &mut BossClient, id: &str) -> Result<Automation, CliError> {
-    match client
-        .send_request(&FrontendRequest::EnableAutomation { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationUpdated { automation } => Ok(automation),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation enable", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::EnableAutomation { id: id.to_owned() },
+        "automation enable",
+        FrontendEvent::AutomationUpdated { automation } => automation,
+    )
 }
 
 async fn disable_automation(client: &mut BossClient, id: &str) -> Result<Automation, CliError> {
-    match client
-        .send_request(&FrontendRequest::DisableAutomation { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationUpdated { automation } => Ok(automation),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation disable", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::DisableAutomation { id: id.to_owned() },
+        "automation disable",
+        FrontendEvent::AutomationUpdated { automation } => automation,
+    )
 }
 
 async fn delete_automation(client: &mut BossClient, id: &str) -> Result<(), CliError> {
-    match client
-        .send_request(&FrontendRequest::DeleteAutomation { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationDeleted { .. } => Ok(()),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation delete", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::DeleteAutomation { id: id.to_owned() },
+        "automation delete",
+        FrontendEvent::AutomationDeleted { .. } => (),
+    )
 }
 
 async fn list_automation_runs(client: &mut BossClient, automation_id: &str) -> Result<Vec<AutomationRun>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListAutomationRuns {
+    rpc_call!(
+        client,
+        FrontendRequest::ListAutomationRuns {
             automation_id: automation_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationRunsList { runs, .. } => Ok(runs),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation runs", &other)),
-    }
+        },
+        "automation runs",
+        FrontendEvent::AutomationRunsList { runs, .. } => runs,
+    )
 }
 
 async fn list_automation_tasks(client: &mut BossClient, automation_id: &str) -> Result<Vec<Task>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListAutomationTasks {
+    rpc_call!(
+        client,
+        FrontendRequest::ListAutomationTasks {
             automation_id: automation_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AutomationTasksList { tasks, .. } => Ok(tasks),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation tasks", &other)),
-    }
+        },
+        "automation tasks",
+        FrontendEvent::AutomationTasksList { tasks, .. } => tasks,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -5039,54 +5046,39 @@ async fn list_attention_groups(
     kind: Option<String>,
     state: Option<String>,
 ) -> Result<Vec<AttentionGroup>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListAttentionGroups {
+    rpc_call!(
+        client,
+        FrontendRequest::ListAttentionGroups {
             product_id: product_id.to_owned(),
             project_id,
             task_id,
             kind,
             state,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AttentionGroupsList { groups, .. } => Ok(groups),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("attention list", &other)),
-    }
+        },
+        "attention list",
+        FrontendEvent::AttentionGroupsList { groups, .. } => groups,
+    )
 }
 
 async fn get_attention_group(client: &mut BossClient, id: &str) -> Result<AttentionGroup, CliError> {
-    match client
-        .send_request(&FrontendRequest::GetAttentionGroup { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AttentionGroupResult { group, .. } => Ok(group),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("attention show", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::GetAttentionGroup { id: id.to_owned() },
+        "attention show",
+        FrontendEvent::AttentionGroupResult { group, .. } => group,
+    )
 }
 
 async fn create_attention_rpc(
     client: &mut BossClient,
     input: CreateAttentionInput,
 ) -> Result<(Attention, AttentionGroup), CliError> {
-    match client
-        .send_request(&FrontendRequest::CreateAttention { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AttentionCreated { attention, group } => Ok((attention, group)),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("attention create", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::CreateAttention { input },
+        "attention create",
+        FrontendEvent::AttentionCreated { attention, group } => (attention, group),
+    )
 }
 
 async fn answer_attention_rpc(
@@ -5096,22 +5088,17 @@ async fn answer_attention_rpc(
     skip: bool,
     dismiss: bool,
 ) -> Result<AttentionGroup, CliError> {
-    match client
-        .send_request(&FrontendRequest::AnswerAttention {
+    rpc_call!(
+        client,
+        FrontendRequest::AnswerAttention {
             id: id.to_owned(),
             answer,
             skip,
             dismiss,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AttentionGroupUpdated { group, .. } => Ok(group),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("attention answer", &other)),
-    }
+        },
+        "attention answer",
+        FrontendEvent::AttentionGroupUpdated { group, .. } => group,
+    )
 }
 
 async fn action_attention_group_rpc(
@@ -5119,20 +5106,15 @@ async fn action_attention_group_rpc(
     id: &str,
     skip_unanswered: bool,
 ) -> Result<AttentionGroup, CliError> {
-    match client
-        .send_request(&FrontendRequest::ActionAttentionGroup {
+    rpc_call!(
+        client,
+        FrontendRequest::ActionAttentionGroup {
             id: id.to_owned(),
             skip_unanswered,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AttentionGroupActioned { group, .. } => Ok(group),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("attention action", &other)),
-    }
+        },
+        "attention action",
+        FrontendEvent::AttentionGroupActioned { group, .. } => group,
+    )
 }
 
 async fn dismiss_attention_rpc(
@@ -5140,20 +5122,15 @@ async fn dismiss_attention_rpc(
     id: &str,
     reason: Option<String>,
 ) -> Result<AttentionGroup, CliError> {
-    match client
-        .send_request(&FrontendRequest::DismissAttention {
+    rpc_call!(
+        client,
+        FrontendRequest::DismissAttention {
             id: id.to_owned(),
             reason,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::AttentionGroupUpdated { group, .. } => Ok(group),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("attention dismiss", &other)),
-    }
+        },
+        "attention dismiss",
+        FrontendEvent::AttentionGroupUpdated { group, .. } => group,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -6296,17 +6273,12 @@ async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
 }
 
 async fn list_products(client: &mut BossClient) -> Result<Vec<Product>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListProducts)
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ProductsList { products } => Ok(products),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("products list", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::ListProducts,
+        "products list",
+        FrontendEvent::ProductsList { products } => products,
+    )
 }
 
 async fn list_projects(
@@ -6314,20 +6286,15 @@ async fn list_projects(
     product_id: &str,
     dep_filter: Option<DependencyFilter>,
 ) -> Result<Vec<Project>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListProjects {
+    rpc_call!(
+        client,
+        FrontendRequest::ListProjects {
             product_id: product_id.to_owned(),
             dep_filter,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ProjectsList { projects, .. } => Ok(projects),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("projects list", &other)),
-    }
+        },
+        "projects list",
+        FrontendEvent::ProjectsList { projects, .. } => projects,
+    )
 }
 
 async fn list_tasks(
@@ -6337,22 +6304,17 @@ async fn list_tasks(
     dep_filter: Option<DependencyFilter>,
     include_deleted: bool,
 ) -> Result<Vec<Task>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListTasks {
+    rpc_call!(
+        client,
+        FrontendRequest::ListTasks {
             product_id: product_id.to_owned(),
             project_id: project_id.map(str::to_owned),
             dep_filter,
             include_deleted,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::TasksList { tasks, .. } => Ok(tasks),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("tasks list", &other)),
-    }
+        },
+        "tasks list",
+        FrontendEvent::TasksList { tasks, .. } => tasks,
+    )
 }
 
 async fn list_chores(
@@ -6361,21 +6323,16 @@ async fn list_chores(
     dep_filter: Option<DependencyFilter>,
     include_deleted: bool,
 ) -> Result<Vec<Task>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListChores {
+    rpc_call!(
+        client,
+        FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
             dep_filter,
             include_deleted,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ChoresList { chores, .. } => Ok(chores),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("chores list", &other)),
-    }
+        },
+        "chores list",
+        FrontendEvent::ChoresList { chores, .. } => chores,
+    )
 }
 
 async fn list_revisions(
@@ -6385,50 +6342,35 @@ async fn list_revisions(
     include_deleted: bool,
     parent_id: Option<String>,
 ) -> Result<Vec<Task>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListRevisions {
+    rpc_call!(
+        client,
+        FrontendRequest::ListRevisions {
             product_id: product_id.to_owned(),
             dep_filter,
             include_deleted,
             parent_id,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::RevisionsList { revisions, .. } => Ok(revisions),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("revisions list", &other)),
-    }
+        },
+        "revisions list",
+        FrontendEvent::RevisionsList { revisions, .. } => revisions,
+    )
 }
 
 async fn find_work_items_by_pr(client: &mut BossClient, pr_number: i64) -> Result<Vec<PrWorkItemMatch>, CliError> {
-    match client
-        .send_request(&FrontendRequest::FindWorkItemsByPr { pr_number })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemsByPrResult { matches, .. } => Ok(matches),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("work items by pr", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::FindWorkItemsByPr { pr_number },
+        "work items by pr",
+        FrontendEvent::WorkItemsByPrResult { matches, .. } => matches,
+    )
 }
 
 async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product, CliError> {
-    match client
-        .send_request(&FrontendRequest::CreateProduct { input })
-        .await
-        .map_err(CliError::internal)?
-    {
+    rpc_call!(
+        try client,
+        FrontendRequest::CreateProduct { input },
+        "product create",
         FrontendEvent::WorkItemCreated { item } => expect_product(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("product create", &other)),
-    }
+    )
 }
 
 async fn set_product_default_model(
@@ -6436,20 +6378,15 @@ async fn set_product_default_model(
     product_id: &str,
     model: Option<String>,
 ) -> Result<Product, CliError> {
-    match client
-        .send_request(&FrontendRequest::SetProductDefaultModel {
+    rpc_call!(
+        try client,
+        FrontendRequest::SetProductDefaultModel {
             product_id: product_id.to_owned(),
             model,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
+        },
+        "set-default-model",
         FrontendEvent::WorkItemUpdated { item } => expect_product(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("set-default-model", &other)),
-    }
+    )
 }
 
 async fn set_product_default_driver(
@@ -6457,20 +6394,15 @@ async fn set_product_default_driver(
     product_id: &str,
     driver: Option<String>,
 ) -> Result<Product, CliError> {
-    match client
-        .send_request(&FrontendRequest::SetProductDefaultDriver {
+    rpc_call!(
+        try client,
+        FrontendRequest::SetProductDefaultDriver {
             product_id: product_id.to_owned(),
             driver,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
+        },
+        "set-default-driver",
         FrontendEvent::WorkItemUpdated { item } => expect_product(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("set-default-driver", &other)),
-    }
+    )
 }
 
 /// Build the kind-specific JSON config for `set-external-tracker` from CLI args.
@@ -6507,50 +6439,35 @@ fn build_external_tracker_config(
 }
 
 async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project, CliError> {
-    match client
-        .send_request(&FrontendRequest::CreateProject { input })
-        .await
-        .map_err(CliError::internal)?
-    {
+    rpc_call!(
+        try client,
+        FrontendRequest::CreateProject { input },
+        "project create",
         FrontendEvent::WorkItemCreated { item } => expect_project(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("project create", &other)),
-    }
+    )
 }
 
 async fn set_project_design_doc(client: &mut BossClient, input: SetProjectDesignDocInput) -> Result<Project, CliError> {
-    match client
-        .send_request(&FrontendRequest::SetProjectDesignDoc { input })
-        .await
-        .map_err(CliError::internal)?
-    {
+    rpc_call!(
+        try client,
+        FrontendRequest::SetProjectDesignDoc { input },
+        "set project design doc",
         FrontendEvent::WorkItemUpdated { item } => expect_project(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("set project design doc", &other)),
-    }
+    )
 }
 
 async fn resolve_project_design_doc(
     client: &mut BossClient,
     project_id: &str,
 ) -> Result<ResolveProjectDesignDocOutput, CliError> {
-    match client
-        .send_request(&FrontendRequest::ResolveProjectDesignDoc {
+    rpc_call!(
+        client,
+        FrontendRequest::ResolveProjectDesignDoc {
             project_id: project_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ProjectDesignDocResolved { output } => Ok(output),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("resolve project design doc", &other)),
-    }
+        },
+        "resolve project design doc",
+        FrontendEvent::ProjectDesignDocResolved { output } => output,
+    )
 }
 
 /// Response shape for `boss project plan` (both the real run and the
@@ -6576,15 +6493,14 @@ async fn plan_project(
     force: bool,
     dry_run: bool,
 ) -> Result<PlanProjectResult, CliError> {
-    match client
-        .send_request(&FrontendRequest::PlanProject {
+    rpc_call!(
+        client,
+        FrontendRequest::PlanProject {
             project_id: project_id.to_owned(),
             force,
             dry_run,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
+        },
+        "plan project",
         FrontendEvent::PlanProjectResult {
             project_id,
             outcome,
@@ -6594,7 +6510,7 @@ async fn plan_project(
             skipped,
             run_id,
             proposal,
-        } => Ok(PlanProjectResult {
+        } => PlanProjectResult {
             project_id,
             outcome,
             message,
@@ -6603,28 +6519,19 @@ async fn plan_project(
             skipped,
             run_id,
             proposal,
-        }),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("plan project", &other)),
-    }
+        },
+    )
 }
 
 async fn release_project(client: &mut BossClient, project_id: &str) -> Result<(String, usize), CliError> {
-    match client
-        .send_request(&FrontendRequest::ReleaseProject {
+    rpc_call!(
+        client,
+        FrontendRequest::ReleaseProject {
             project_id: project_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ReleaseProjectResult { run_id, released, .. } => Ok((run_id, released)),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("release project", &other)),
-    }
+        },
+        "release project",
+        FrontendEvent::ReleaseProjectResult { run_id, released, .. } => (run_id, released),
+    )
 }
 
 async fn unpopulate_project(
@@ -6632,36 +6539,26 @@ async fn unpopulate_project(
     project_id: &str,
     run_id: &str,
 ) -> Result<(Vec<String>, Vec<UnpopulatePreservedTask>), CliError> {
-    match client
-        .send_request(&FrontendRequest::UnpopulateProject {
+    rpc_call!(
+        client,
+        FrontendRequest::UnpopulateProject {
             project_id: project_id.to_owned(),
             run_id: run_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::UnpopulateProjectResult { deleted, preserved, .. } => Ok((deleted, preserved)),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("unpopulate project", &other)),
-    }
+        },
+        "unpopulate project",
+        FrontendEvent::UnpopulateProjectResult { deleted, preserved, .. } => (deleted, preserved),
+    )
 }
 
 async fn list_planner_runs(client: &mut BossClient, project_id: &str) -> Result<Vec<PlannerRun>, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListPlannerRuns {
+    rpc_call!(
+        client,
+        FrontendRequest::ListPlannerRuns {
             project_id: project_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::PlannerRunsList { runs, .. } => Ok(runs),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("list planner runs", &other)),
-    }
+        },
+        "list planner runs",
+        FrontendEvent::PlannerRunsList { runs, .. } => runs,
+    )
 }
 
 async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<Task, CliError> {
@@ -6701,21 +6598,16 @@ async fn create_automation_task(
     name: String,
     description: Option<String>,
 ) -> Result<Task, CliError> {
-    match client
-        .send_request(&FrontendRequest::CreateAutomationTask {
+    rpc_call!(
+        try client,
+        FrontendRequest::CreateAutomationTask {
             automation_id: automation_id.to_owned(),
             name,
             description,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
+        },
+        "automation task create",
         FrontendEvent::WorkItemCreated { item } => expect_chore(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("automation task create", &other)),
-    }
+    )
 }
 
 async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Result<Task, CliError> {
@@ -6816,17 +6708,12 @@ async fn run_create_investigation(
 }
 
 async fn create_revision_rpc(client: &mut BossClient, input: CreateRevisionInput) -> Result<Task, CliError> {
-    match client
-        .send_request(&FrontendRequest::CreateRevision { input })
-        .await
-        .map_err(CliError::internal)?
-    {
+    rpc_call!(
+        try client,
+        FrontendRequest::CreateRevision { input },
+        "revision create",
         FrontendEvent::WorkItemCreated { item } => expect_task(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("revision create", &other)),
-    }
+    )
 }
 
 async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: RevisionListArgs) -> Result<(), CliError> {
@@ -6939,34 +6826,24 @@ async fn run_create_revision(
 }
 
 async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
-    match client
-        .send_request(&FrontendRequest::GetWorkItem { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemResult { item } => Ok(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("work item fetch", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::GetWorkItem { id: id.to_owned() },
+        "work item fetch",
+        FrontendEvent::WorkItemResult { item } => item,
+    )
 }
 
 async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatch) -> Result<WorkItem, CliError> {
-    match client
-        .send_request(&FrontendRequest::UpdateWorkItem {
+    rpc_call!(
+        client,
+        FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
             patch,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemUpdated { item } => Ok(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("work item update", &other)),
-    }
+        },
+        "work item update",
+        FrontendEvent::WorkItemUpdated { item } => item,
+    )
 }
 
 /// Recover a repo's base URL from a PR URL by dropping the
@@ -7093,17 +6970,12 @@ async fn run_by_pr(client: &mut BossClient, ctx: &RunContext, args: ByPrArgs) ->
 }
 
 async fn get_execution(client: &mut BossClient, id: &str) -> Result<WorkExecution, CliError> {
-    match client
-        .send_request(&FrontendRequest::GetExecution { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ExecutionResult { execution } => Ok(execution),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("execution fetch", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::GetExecution { id: id.to_owned() },
+        "execution fetch",
+        FrontendEvent::ExecutionResult { execution } => execution,
+    )
 }
 
 /// Handler for `boss task by-exec <execution-id>`. Resolves an execution
@@ -7572,31 +7444,21 @@ fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
 }
 
 async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliError> {
-    match client
-        .send_request(&FrontendRequest::DeleteWorkItem { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemDeleted { .. } => Ok(()),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("work item delete", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::DeleteWorkItem { id: id.to_owned() },
+        "work item delete",
+        FrontendEvent::WorkItemDeleted { .. } => (),
+    )
 }
 
 async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
-    match client
-        .send_request(&FrontendRequest::RestoreWorkItem { id: id.to_owned() })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemRestored { item } => Ok(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("work item restore", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::RestoreWorkItem { id: id.to_owned() },
+        "work item restore",
+        FrontendEvent::WorkItemRestored { item } => item,
+    )
 }
 
 async fn run_depend_command(command: DependCommand, client: &mut BossClient, ctx: &RunContext) -> Result<(), CliError> {
@@ -7671,65 +7533,45 @@ async fn run_depend_command(command: DependCommand, client: &mut BossClient, ctx
 }
 
 async fn add_dependency(client: &mut BossClient, input: AddDependencyInput) -> Result<WorkItemDependency, CliError> {
-    match client
-        .send_request(&FrontendRequest::AddDependency { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::DependencyAdded { edge } => Ok(edge),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("dependency add", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::AddDependency { input },
+        "dependency add",
+        FrontendEvent::DependencyAdded { edge } => edge,
+    )
 }
 
 async fn remove_dependency(client: &mut BossClient, input: RemoveDependencyInput) -> Result<bool, CliError> {
-    match client
-        .send_request(&FrontendRequest::RemoveDependency { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::DependencyRemoved { removed, .. } => Ok(removed),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("dependency remove", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::RemoveDependency { input },
+        "dependency remove",
+        FrontendEvent::DependencyRemoved { removed, .. } => removed,
+    )
 }
 
 async fn list_dependencies(
     client: &mut BossClient,
     input: ListDependenciesInput,
 ) -> Result<WorkItemDependencyView, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListDependencies { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::DependencyList { view } => Ok(view),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("dependency list", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::ListDependencies { input },
+        "dependency list",
+        FrontendEvent::DependencyList { view } => view,
+    )
 }
 
 async fn list_dependencies_detailed(
     client: &mut BossClient,
     input: ListDependenciesInput,
 ) -> Result<WorkItemDependencyDetail, CliError> {
-    match client
-        .send_request(&FrontendRequest::ListDependenciesDetailed { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::DependencyDetail { detail } => Ok(detail),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("dependency detail", &other)),
-    }
+    rpc_call!(
+        client,
+        FrontendRequest::ListDependenciesDetailed { input },
+        "dependency detail",
+        FrontendEvent::DependencyDetail { detail } => detail,
+    )
 }
 
 async fn list_executions_for_item(client: &mut BossClient, work_item_id: &str) -> Result<Vec<WorkExecution>, CliError> {
@@ -7754,19 +7596,14 @@ async fn list_executions_for_item(client: &mut BossClient, work_item_id: &str) -
 }
 
 async fn get_task_runtime(client: &mut BossClient, work_item_id: &str) -> Result<TaskRuntime, CliError> {
-    match client
-        .send_request(&FrontendRequest::GetTaskRuntime {
+    rpc_call!(
+        client,
+        FrontendRequest::GetTaskRuntime {
             work_item_id: work_item_id.to_owned(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::TaskRuntimeResult { runtime } => Ok(runtime),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("task runtime", &other)),
-    }
+        },
+        "task runtime",
+        FrontendEvent::TaskRuntimeResult { runtime } => runtime,
+    )
 }
 
 fn print_executions_section(executions: &[WorkExecution]) {
@@ -7881,20 +7718,15 @@ fn dependency_status_is_satisfied(id: &str, status: &str) -> bool {
 }
 
 async fn reorder_project_tasks(client: &mut BossClient, project_id: &str, task_ids: &[String]) -> Result<(), CliError> {
-    match client
-        .send_request(&FrontendRequest::ReorderProjectTasks {
+    rpc_call!(
+        client,
+        FrontendRequest::ReorderProjectTasks {
             project_id: project_id.to_owned(),
             task_ids: task_ids.to_vec(),
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::ProjectTasksReordered { .. } => Ok(()),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("task reorder", &other)),
-    }
+        },
+        "task reorder",
+        FrontendEvent::ProjectTasksReordered { .. } => (),
+    )
 }
 
 async fn resolve_product(
@@ -8036,20 +7868,15 @@ async fn get_work_item_by_short_id_rpc(
     product_id: &str,
     short_id: i64,
 ) -> Result<WorkItem, CliError> {
-    match client
-        .send_request(&FrontendRequest::GetWorkItemByShortId {
+    rpc_call!(
+        client,
+        FrontendRequest::GetWorkItemByShortId {
             product_id: product_id.to_owned(),
             short_id,
-        })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemResult { item } => Ok(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("work item fetch by short id", &other)),
-    }
+        },
+        "work item fetch by short id",
+        FrontendEvent::WorkItemResult { item } => item,
+    )
 }
 
 fn work_item_primary_id(item: &WorkItem) -> &str {
