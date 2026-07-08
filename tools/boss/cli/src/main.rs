@@ -7139,15 +7139,33 @@ async fn run_by_exec(client: &mut BossClient, ctx: &RunContext, args: ByExecArgs
         _ => {}
     }
     let item = get_work_item(client, &execution.work_item_id).await?;
-    let (task, label) = expect_leaf_work_item(item)?;
-    let task = with_display_status(task);
-    print_entity(
-        ctx,
-        &serde_json::json!({ label: &task, "execution_id": execution.id }),
-        || {
-            print_task_details(label_titlecase(label), &task, None, false);
-        },
-    )
+    match item {
+        WorkItem::Product(product) => print_entity(
+            ctx,
+            &serde_json::json!({ "product": &product, "execution_id": execution.id }),
+            || {
+                print_product_details("Product", &product);
+            },
+        ),
+        WorkItem::Project(project) => print_entity(
+            ctx,
+            &serde_json::json!({ "project": &project, "execution_id": execution.id }),
+            || {
+                print_project_details("Project", &project, None, false);
+            },
+        ),
+        item => {
+            let (task, label) = expect_leaf_work_item(item)?;
+            let task = with_display_status(task);
+            print_entity(
+                ctx,
+                &serde_json::json!({ label: &task, "execution_id": execution.id }),
+                || {
+                    print_task_details(label_titlecase(label), &task, None, false);
+                },
+            )
+        }
+    }
 }
 
 /// Decide what bind-pr should do given the prior `pr_url` value on

@@ -2144,14 +2144,13 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
     let db_path = resolve_db_path(state_root)?;
     let db = WorkDb::open(db_path).context("opening state.db")?;
     let executions = db.list_executions(Some(work_item_id)).context("listing executions")?;
+    let host_ids = db
+        .execution_host_ids_for_item(work_item_id)
+        .context("resolving execution hosts")?;
     let hosts: Vec<String> = executions
         .iter()
-        .map(|e| {
-            db.execution_host_id(&e.id)
-                .map(|h| h.unwrap_or_else(|| "local".to_owned()))
-        })
-        .collect::<Result<_>>()
-        .context("resolving execution hosts")?;
+        .map(|e| host_ids.get(&e.id).cloned().unwrap_or_else(|| "local".to_owned()))
+        .collect();
 
     if json {
         let entries: Vec<serde_json::Value> = executions

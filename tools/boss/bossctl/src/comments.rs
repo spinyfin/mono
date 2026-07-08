@@ -199,6 +199,9 @@ fn print_comment_detail(c: &WorkComment) {
         "  intent:          {}  (confidence={confidence})",
         c.intent.as_deref().unwrap_or("(unclassified)"),
     );
+    if let Some(classified_at) = &c.intent_classified_at {
+        println!("  classified_at:   {classified_at}");
+    }
     if let Some(actor) = &c.intent_overridden_by {
         println!("  intent_override: {actor}");
     }
