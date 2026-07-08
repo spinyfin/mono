@@ -80,16 +80,23 @@ final class GhosttyTerminalHostView: NSView {
     /// `viewDidMoveToWindow`) can converge the timer without a value
     /// argument; `updateNSView` refreshes it whenever the input changes.
     private var claudeMonitorEnabled: Bool
-    /// Token for the display-configuration observer installed only
-    /// while surface creation has failed. libghostty's
-    /// `ghostty_surface_new` returns NULL when the machine has no
-    /// active display (lid closed with no external monitor, all
-    /// monitors disconnected, display asleep) — the renderer's
-    /// `CVDisplayLinkCreateWithCGDisplays` rejects a display count of
-    /// 0. That is a transient/environmental condition, so instead of
-    /// crashing the app we keep the pane in a surface-less placeholder
-    /// state and retry when the display set changes (#800).
+    /// Tokens for the display-retry observers installed only while
+    /// surface creation has failed. libghostty's `ghostty_surface_new`
+    /// returns NULL when the machine has no active display (lid closed
+    /// with no external monitor, all monitors disconnected, display
+    /// asleep) — the renderer's `CVDisplayLinkCreateWithCGDisplays`
+    /// rejects a display count of 0. That is a transient/environmental
+    /// condition, so instead of crashing the app we keep the pane in a
+    /// surface-less placeholder state and retry when the display set
+    /// changes (#800) or the system wakes from sleep (`screenObserver`
+    /// listens for `NSApplication.didChangeScreenParametersNotification`;
+    /// `wakeObserver` listens for `GhosttyRuntime`'s `.ghosttyDisplaysDidWake`,
+    /// which fires on `NSWorkspace` sleep/wake notifications and does not
+    /// depend on a screen-parameters change actually occurring). Installed
+    /// and removed together — see `installScreenObserverIfNeeded()` /
+    /// `removeScreenObserver()`.
     private var screenObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
 
     /// os_signpost interval state for an in-flight left-button selection
     /// drag (mouseDown→mouseUp), plus the dropped-frame counter that runs
@@ -348,20 +355,33 @@ final class GhosttyTerminalHostView: NSView {
         """
     }
 
-    /// Arm the display-reconfiguration observer (idempotent). Installed
-    /// only while we have no surface. `didChangeScreenParametersNotification`
-    /// fires when a display is connected/disconnected, woken, or the lid
-    /// is opened — exactly the events that flip the active-display count
-    /// back above 0 and let `ghostty_surface_new` succeed on retry.
+    /// Arm the display-retry observers (idempotent). Installed only while
+    /// we have no surface. `didChangeScreenParametersNotification` fires
+    /// when a display is connected/disconnected, woken, or the lid is
+    /// opened; `.ghosttyDisplaysDidWake` fires whenever `GhosttyRuntime`
+    /// observes a system/display wake, whether or not it also produced a
+    /// screen-parameters change — both are events that can flip the
+    /// active-display count back above 0 and let `ghostty_surface_new`
+    /// succeed on retry.
     private func installScreenObserverIfNeeded() {
         guard screenObserver == nil else { return }
-        screenObserver = NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        // addObserver(queue: .main) guarantees main-thread delivery, so
+        // asserting MainActor isolation here is sound.
+        screenObserver = center.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            // addObserver(queue: .main) guarantees main-thread delivery,
-            // so asserting MainActor isolation here is sound.
+            MainActor.assumeIsolated {
+                self?.attemptSurfaceCreation()
+            }
+        }
+        wakeObserver = center.addObserver(
+            forName: .ghosttyDisplaysDidWake,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.attemptSurfaceCreation()
             }
@@ -369,9 +389,14 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     private func removeScreenObserver() {
-        guard let screenObserver else { return }
-        NotificationCenter.default.removeObserver(screenObserver)
-        self.screenObserver = nil
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
+        }
+        if let wakeObserver {
+            NotificationCenter.default.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
     }
 
     @available(*, unavailable)

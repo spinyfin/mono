@@ -1837,6 +1837,15 @@ final class ChatViewModel: ObservableObject {
         engine.sendWorkerPaneDied(runId: runId)
     }
 
+    /// Called by ContentView when `GhosttyRuntime` observes the system's
+    /// displays waking from sleep. Reports it to the engine so a
+    /// worker-pane spawn stranded by the sleep is redispatched
+    /// immediately rather than waiting for the next periodic sweep.
+    func spawnCapabilityRestored() {
+        guard isAppSessionRegistered else { return }
+        engine.sendSpawnCapabilityRestored()
+    }
+
     // MARK: - Event Handling
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?

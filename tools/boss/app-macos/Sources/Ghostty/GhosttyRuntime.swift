@@ -43,6 +43,18 @@ private func ghosttyRuntimeCloseSurface(_ userdata: UnsafeMutableRawPointer?, _ 
     GhosttyRuntime.closeSurface(userdata, processAlive: processAlive)
 }
 
+extension Notification.Name {
+    /// Posted on `NotificationCenter.default` when `GhosttyRuntime` observes
+    /// the system's displays waking from sleep (`NSWorkspace.didWakeNotification`
+    /// / `screensDidWakeNotification`). Panes still in the surface-less
+    /// placeholder state (#800 — `ghostty_surface_new` returned NULL because
+    /// no display was active) observe this to retry `attemptSurfaceCreation()`
+    /// immediately, rather than waiting on `NSApplication.didChangeScreenParametersNotification`
+    /// (which does not reliably fire on every wake) or the next engine spawn
+    /// attempt. See `GhosttyTerminalHostView.installScreenObserverIfNeeded()`.
+    static let ghosttyDisplaysDidWake = Notification.Name("GhosttyDisplaysDidWake")
+}
+
 enum GhosttyBootstrap {
     private static let initialized: Void = {
         // Strip `GHOSTTY_*` env vars from the process environment before
@@ -99,6 +111,17 @@ final class GhosttyRuntime: @unchecked Sendable {
     private let config: ghostty_config_t
     private(set) var app: ghostty_app_t! = nil
     private var observers: [NSObjectProtocol] = []
+    /// Tokens registered on `NSWorkspace.shared.notificationCenter` (a
+    /// different center than `observers`, which uses `NotificationCenter.default`
+    /// — removal must go through the same center that created the token).
+    private var workspaceObservers: [NSObjectProtocol] = []
+
+    /// Invoked after `.ghosttyDisplaysDidWake` is broadcast, once per wake.
+    /// `ContentView` wires this to report "spawn capability restored" to the
+    /// engine (`ChatViewModel.spawnCapabilityRestored()`), so a sleep/wake
+    /// cycle that stranded a worker-pane spawn is redispatched immediately
+    /// instead of waiting for the engine's periodic sweeps.
+    var onDisplaysDidWake: (() -> Void)?
 
     private init() {
         GhosttyBootstrap.ensureInitialized()
@@ -136,6 +159,9 @@ final class GhosttyRuntime: @unchecked Sendable {
         for observer in observers {
             NotificationCenter.default.removeObserver(observer)
         }
+        for observer in workspaceObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
         ghostty_app_free(app)
         ghostty_config_free(config)
     }
@@ -170,6 +196,38 @@ final class GhosttyRuntime: @unchecked Sendable {
                 ghostty_app_set_focus(self.app, false)
             }
         )
+
+        // Sleep/wake: neither notification alone covers every case —
+        // `didWakeNotification` fires on full-system wake (lid open,
+        // `pmset sleepnow`), `screensDidWakeNotification` fires when
+        // displays that slept independently (idle display sleep) wake —
+        // so both drive the same handler. A full-system wake commonly
+        // fires both; the handler is idempotent (broadcast + one engine
+        // notification), so a duplicate is harmless.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleDisplaysDidWake()
+            }
+        )
+        workspaceObservers.append(
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.screensDidWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleDisplaysDidWake()
+            }
+        )
+    }
+
+    private func handleDisplaysDidWake() {
+        NotificationCenter.default.post(name: .ghosttyDisplaysDidWake, object: nil)
+        onDisplaysDidWake?()
     }
 
     fileprivate static func runtime(from userdata: UnsafeMutableRawPointer?) -> GhosttyRuntime? {
