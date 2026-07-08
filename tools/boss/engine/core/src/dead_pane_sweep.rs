@@ -421,6 +421,53 @@ mod tests {
         );
     }
 
+    /// The double-finalize bug this closes: a triage execution whose Stop
+    /// hook already finalized it (via `complete_pane_parked_execution`, the
+    /// production finalizer's completion write) must be `completed` —
+    /// terminal — and therefore invisible to this sweep, even though its
+    /// durable shell pid is (by then, entirely expectedly) dead. Before the
+    /// fix, the finalizer's loop over `active_run_ids_for_execution` found no
+    /// still-open run (`PaneSpawnRunner` already closed the only run row at
+    /// spawn-confirm time), so it silently left the row `waiting_human`
+    /// forever — and this sweep would "reconcile" it a second time, stamping
+    /// a misleading pane-died detail over the true finalize outcome.
+    #[tokio::test]
+    async fn finalized_triage_execution_is_invisible_to_the_sweep() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-finalized", "local", Some(dead_pid()));
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+        assert_eq!(exec.status, ExecutionStatus::WaitingHuman);
+
+        // Simulate the Stop-driven finalizer's completion write — exactly
+        // what `finalize_automation_triage` does today via
+        // `complete_pane_parked_execution`.
+        let completed = db
+            .complete_pane_parked_execution(&exec.id, "completed", Some("automation triage: produced_task"))
+            .unwrap();
+        assert!(completed.is_some(), "a live execution must be completed");
+        let after_finalize = db.get_execution(&exec.id).unwrap();
+        assert_eq!(after_finalize.status, ExecutionStatus::Completed);
+        assert!(after_finalize.finished_at.is_some());
+
+        // The pane-death sweep must now be a no-op: `is_live()` gates the
+        // already-terminal row out before the (still-dead) shell pid is even
+        // probed, so the misleading pane-died reconcile never fires.
+        let sink = NoopDispatchEventSink;
+        let reconciled = reconcile_if_pane_dead(&db, &sink, &after_finalize, now_epoch_secs()).await;
+        assert!(
+            !reconciled,
+            "a finalized triage execution must be invisible to the pane-death sweep"
+        );
+        let final_state = db.get_execution(&exec.id).unwrap();
+        assert_eq!(
+            final_state.status,
+            ExecutionStatus::Completed,
+            "the sweep must not re-finalize (and overwrite) an already-completed execution"
+        );
+    }
+
     /// The lease and workspace columns are preserved (NOT cleared) so the
     /// resume redispatch can reclaim the interrupted work in place.
     #[tokio::test]

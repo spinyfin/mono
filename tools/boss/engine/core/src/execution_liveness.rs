@@ -69,15 +69,20 @@ pub fn execution_workspace_dir_missing(execution: &WorkExecution) -> bool {
 /// `death_reason` is a human-readable clause describing *why* the caller
 /// believes the pane is gone (e.g. "its cube workspace `{path}` is gone" or
 /// "its cube lease `{id}` was no longer tracked after N heartbeat
-/// failures") — it is folded into the recorded detail text. Best-effort:
-/// failures are logged, never propagated, since the execution itself is
-/// already finalized by the time this is called.
+/// failures") — it is folded into the recorded detail text, but only ever as
+/// a demoted diagnostic suffix: the operator-visible detail must lead with
+/// the real outcome (produced a task, or didn't) exactly like the normal
+/// Stop-driven finalize does, not with pane-death forensics — an operator
+/// reading a green "produced task" run should not have to parse "died" to
+/// tell whether it succeeded. Best-effort: failures are logged, never
+/// propagated, since the execution itself is already finalized by the time
+/// this is called.
 pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExecution, death_reason: &str) {
     let automation_id = &execution.work_item_id;
     let (outcome, produced_task_id, detail) = match work_db.find_most_recent_open_task_for_automation(automation_id) {
         Ok(Some(task)) => {
             let detail = format!(
-                "produced_task (dead-pane recovery): task {} was created before the triage pane died; {death_reason}",
+                "produced task {} (recovered after pane death before Stop: {death_reason})",
                 task.short_label()
             );
             (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
@@ -85,7 +90,7 @@ pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExe
         Ok(None) => (
             AUTOMATION_OUTCOME_FAILED_GAVE_UP,
             None,
-            format!("triage pane died before Stop and {death_reason}; no task was produced"),
+            format!("no task was produced (pane died before Stop: {death_reason})"),
         ),
         Err(err) => {
             tracing::warn!(
@@ -97,7 +102,7 @@ pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExe
             (
                 AUTOMATION_OUTCOME_FAILED_GAVE_UP,
                 None,
-                format!("triage pane died before Stop and {death_reason}"),
+                format!("no task was produced (pane died before Stop: {death_reason})"),
             )
         }
     };
@@ -227,6 +232,76 @@ mod tests {
                 .build(),
         )
         .unwrap();
+    }
+
+    /// The operator-visible detail for a `produced_task` dead-pane recovery
+    /// must lead with the success ("produced task {id}"), exactly like the
+    /// normal Stop-driven finalize does, with the pane-death forensics
+    /// demoted to a parenthetical diagnostic suffix — not the other way
+    /// around. An operator staring at a green "produced task" run history
+    /// entry that opens with "... pane died ..." can't tell at a glance
+    /// whether the run failed.
+    #[test]
+    fn dead_pane_recovery_detail_leads_with_the_produced_task_not_the_death() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = db.create_automation_triage_execution(&automation, TEST_REPO).unwrap();
+        seed_dispatch_run(&db, &automation, &exec.id);
+
+        let task = db
+            .create_chore(
+                crate::work::CreateChoreInput::builder()
+                    .product_id(product.as_str())
+                    .name("produced by triage")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.stamp_task_source_automation_for_test(&task.id, &automation, "todo")
+            .unwrap();
+
+        finalize_dead_automation_triage_run(
+            &db,
+            &exec,
+            "its worker shell pid 68417 was gone (pane died with the host app)",
+        );
+
+        let runs = db.list_automation_runs(&automation).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_PRODUCED_TASK);
+        let detail = runs[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.starts_with(&format!("produced task {}", task.short_label())),
+            "detail must lead with the success, got {detail:?}"
+        );
+        assert!(
+            detail.contains("pane died"),
+            "the pane-death forensics must still be present, just demoted, got {detail:?}"
+        );
+    }
+
+    /// The failure-path detail (no task produced) must plainly state that
+    /// first, with the pane-death clause folded in as an explanation rather
+    /// than the leading claim — consistent phrasing with the success path
+    /// above regardless of which outcome fired.
+    #[test]
+    fn dead_pane_recovery_detail_leads_with_no_task_produced_on_failure() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = db.create_automation_triage_execution(&automation, TEST_REPO).unwrap();
+        seed_dispatch_run(&db, &automation, &exec.id);
+
+        finalize_dead_automation_triage_run(&db, &exec, "its cube workspace `/tmp/ws-x` is gone");
+
+        let runs = db.list_automation_runs(&automation).unwrap();
+        assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
+        let detail = runs[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.starts_with("no task was produced"),
+            "detail must lead with the outcome, got {detail:?}"
+        );
     }
 
     /// The `details` blob a lost-workspace reconcile would attach — the exact

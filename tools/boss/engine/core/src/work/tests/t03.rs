@@ -211,6 +211,107 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The bug `complete_pane_parked_execution` closes: a pane-spawn confirmation
+/// (`finish_execution_run` with `WaitingHuman`) already closes the run row
+/// (`finished_at` stamped) the instant the pane comes up, well before the
+/// worker's real Stop hook fires. A Stop-driven finalizer that only closes
+/// still-`active` runs (`active_run_ids_for_execution`) finds nothing here and
+/// is a silent no-op — this is exactly what left automation-triage executions
+/// stuck `waiting_human` forever. `complete_pane_parked_execution` must
+/// unconditionally drive the execution to `completed` regardless.
+#[test]
+fn completes_pane_parked_execution_even_when_its_only_run_is_already_closed() {
+    let path = temp_db_path("complete-pane-parked-closed-run");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
+
+    let (execution, run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+    // Simulate `PaneSpawnRunner`'s spawn-confirm write: the run is closed and
+    // the execution parked `waiting_human` immediately, long before Stop.
+    let (execution, _run, _attention) = db
+        .finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+    assert!(
+        db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
+        "precondition: the spawn-confirm write must have already closed the only run"
+    );
+
+    let completed = db
+        .complete_pane_parked_execution(&execution.id, "completed", Some("automation triage: produced_task"))
+        .unwrap()
+        .expect("a live execution must be completed");
+
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert!(completed.cube_lease_id.is_none());
+    assert!(completed.workspace_path.is_none());
+    assert!(completed.finished_at.is_some());
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// `complete_pane_parked_execution` is safe to call twice — a hook that fires
+/// more than once (or races a concurrent reconciler) must not re-stamp
+/// `finished_at` or otherwise disturb an already-terminal row.
+#[test]
+fn complete_pane_parked_execution_is_idempotent() {
+    let path = temp_db_path("complete-pane-parked-idempotent");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
+    let (execution, _run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+    let first = db
+        .complete_pane_parked_execution(&execution.id, "completed", Some("first"))
+        .unwrap()
+        .expect("first call completes a live execution");
+
+    let second = db
+        .complete_pane_parked_execution(&execution.id, "completed", Some("second"))
+        .unwrap();
+    assert!(
+        second.is_none(),
+        "a second call on an already-terminal execution must be a no-op"
+    );
+    let after = db.get_execution(&execution.id).unwrap();
+    assert_eq!(
+        after.finished_at, first.finished_at,
+        "a repeat call must not re-stamp finished_at"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 // Direct unit coverage of `parse_iso8601_to_epoch` now lives with the
 // consolidated helper in `crate::iso8601`; the end-to-end migration test
 // below exercises it through the real rewrite path.

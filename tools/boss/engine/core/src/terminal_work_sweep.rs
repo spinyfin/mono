@@ -222,20 +222,34 @@ pub async fn run_one_pass(
 
         let execution_terminal = execution.status.is_terminal();
 
+        // `AutomationTriage`'s `work_item_id` is an automation id and
+        // `AnswerAgent`'s is a comment id — neither is a product/project/task,
+        // so `get_work_item` can never resolve them; skip the lookup (and its
+        // per-minute WARN) for these kinds and fall back to the execution
+        // signal alone, exactly as the `Err` arm below already does.
+        let never_task_bound = matches!(
+            execution.kind,
+            boss_protocol::ExecutionKind::AutomationTriage | boss_protocol::ExecutionKind::AnswerAgent
+        );
+
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / cancelled) even though the worker — and possibly its
         // execution — is still alive. A work-item lookup failure falls back
         // to the execution signal alone rather than guessing.
-        let work_item_terminal = match work_db.get_work_item(&execution.work_item_id) {
-            Ok(item) => work_item_is_terminal(&item),
-            Err(err) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    work_item_id = %execution.work_item_id,
-                    ?err,
-                    "terminal-work sweep: failed to look up bound work item; using execution status only",
-                );
-                false
+        let work_item_terminal = if never_task_bound {
+            false
+        } else {
+            match work_db.get_work_item(&execution.work_item_id) {
+                Ok(item) => work_item_is_terminal(&item),
+                Err(err) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "terminal-work sweep: failed to look up bound work item; using execution status only",
+                    );
+                    false
+                }
             }
         };
 
