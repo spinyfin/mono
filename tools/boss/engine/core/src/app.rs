@@ -56,7 +56,11 @@ mod engine_meta;
 mod executions;
 mod external_tracker;
 mod github_auth;
-mod handler_helpers;
+// `pub(crate)` so the spawn-capability circuit breaker (`crate::spawn_health`)
+// can persist its auto-pause through the same `METADATA_KEY_DISPATCH_PAUSED*`
+// keys the human dispatch toggle uses. Individual items stay `pub(crate)`/
+// `pub(super)`; only the module path is widened.
+pub(crate) mod handler_helpers;
 mod hosts;
 mod live_status;
 mod metrics;
@@ -439,6 +443,13 @@ struct ServerState {
     /// `ListWorkerLiveStates` and pushed on the
     /// `worker.live_states` topic whenever any slot changes.
     live_worker_states: Arc<LiveWorkerStateRegistry>,
+    /// Cross-work-item spawn-capability circuit breaker. Fed by both the
+    /// `ReportWorkerSpawnFailed` NACK handler and the periodic
+    /// [`crate::spawn_ack_sweep`]; when too many DISTINCT work items fail to
+    /// spawn a shell in a short window it pauses dispatch and raises one loud
+    /// attention item. Shared with the sweep loop (wired in
+    /// `app::server::serve`). See [`crate::spawn_health`].
+    spawn_health: Arc<crate::spawn_health::SpawnHealthTracker>,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
@@ -1125,6 +1136,7 @@ impl ServerState {
                 .topic_broker(topic_broker)
                 .worker_registry(WorkerRegistry::new())
                 .live_worker_states(live_worker_states)
+                .spawn_health(Arc::new(crate::spawn_health::SpawnHealthTracker::new()))
                 .live_status_manager(Arc::new(LiveStatusManager::new()))
                 .dispatcher_stats(Arc::new(crate::live_status_loop::DispatcherStats::new(
                     metrics_for_dispatcher,
@@ -2904,6 +2916,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::Unsubscribe { .. } => subscriptions::handle_unsubscribe(ctx, r).await,
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
+            r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
+                sessions::handle_report_worker_spawn_failed(ctx, r).await
+            }
             r @ FrontendRequest::UpdateWorkerShellPid { .. } => sessions::handle_update_worker_shell_pid(ctx, r).await,
             r @ FrontendRequest::WorkerPaneDied { .. } => sessions::handle_worker_pane_died(ctx, r).await,
             r @ FrontendRequest::WorkerPoolSummary => engine_meta::handle_worker_pool_summary(ctx, r).await,

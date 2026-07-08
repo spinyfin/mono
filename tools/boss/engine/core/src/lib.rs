@@ -88,6 +88,7 @@ pub mod runner;
 pub mod settings;
 pub mod spawn_ack_sweep;
 pub mod spawn_flow;
+pub mod spawn_health;
 pub mod ssh_spawn;
 pub use boss_ssh_transport as ssh_transport;
 pub mod stale_worker_sweep;

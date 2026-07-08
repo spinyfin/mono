@@ -49,11 +49,13 @@ const META_LIVE_STATUS_DISABLED_SLOTS: &str = "live_status_disabled_slots";
 
 /// Metadata key for the global dispatch-pause flag. `"1"` = paused, `"0"` or
 /// absent = running. Persisted at every toggle so the pause survives an engine
-/// restart.
-pub(super) const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
+/// restart. `pub(crate)` so the spawn-capability circuit breaker
+/// ([`crate::spawn_health`]) can persist the auto-pause it applies through the
+/// same key the human toggle (`handle_set_dispatch_paused`) uses.
+pub(crate) const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
 /// Metadata key storing the epoch-seconds timestamp at which dispatch was last
 /// paused. Zero (or absent) means not paused.
-pub(super) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoch_s";
+pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoch_s";
 
 /// Persist the disabled-slot snapshot to the metadata KV. Called
 /// from the toggle handler. Errors bubble up so the caller can log

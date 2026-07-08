@@ -1304,6 +1304,25 @@ pub enum FrontendRequest {
         task_ids: Vec<String>,
     },
 
+    /// App reports that a worker pane's shell never came up — the
+    /// libghostty surface failed to create (typically `ghostty_surface_new`
+    /// returning NULL when there is no active display after sleep/wake,
+    /// the #800 condition). This is the proactive NACK for the false-live
+    /// spawn: the spawn RPC was already answered `Ok(shell_pid: 0)`
+    /// synchronously because the surface is created asynchronously, so the
+    /// only way the engine learns the shell never started — short of the
+    /// 60s `spawn_ack_sweep` timeout — is this message. The engine reaps
+    /// the execution immediately (mirroring the sweep) and feeds its
+    /// spawn-capability circuit breaker, so a systemic post-wake failure
+    /// is caught in seconds instead of churning for hours. `reason` is a
+    /// short human-readable cause for the orphan record and diagnostics.
+    /// Fire-and-forget; no response expected. Only the registered app
+    /// session may call this.
+    ReportWorkerSpawnFailed {
+        run_id: String,
+        reason: String,
+    },
+
     RequestExecution {
         #[serde(flatten)]
         input: RequestExecutionInput,

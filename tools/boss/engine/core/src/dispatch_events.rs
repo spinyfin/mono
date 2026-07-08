@@ -351,6 +351,34 @@ pub enum Stage {
     /// undispatched 45+ minutes with free slots available). See
     /// `crate::dispatch_failure_recovery_sweep`.
     DispatchFailureRecoveryRedispatch,
+    /// The app proactively reported — via `ReportWorkerSpawnFailed` — that a
+    /// worker pane's shell never came up because the libghostty surface
+    /// failed to create (typically `ghostty_surface_new` returning NULL when
+    /// there is no active display after sleep/wake). Unlike
+    /// [`Stage::SpawnAckTimeout`], which the periodic sweep infers from 60s
+    /// of total silence, this fires the instant the app tells us, so the
+    /// execution is reaped and the slot freed in seconds rather than after
+    /// the grace window. The reap path is identical (orphan → pane teardown →
+    /// slot release), and both feed the same spawn-capability circuit breaker
+    /// (see [`Stage::SpawnCapabilityUnhealthy`]). The `details` object carries
+    /// the app-supplied `reason` and the `slot_id`.
+    SpawnNack,
+    /// The app-spawn-capability circuit breaker tripped: too many worker-pane
+    /// spawns failed across DIFFERENT work items within a short window
+    /// (`ReportWorkerSpawnFailed` NACKs and/or `spawn_ack_timeout` reaps),
+    /// proving the app session's spawn path — not any one work item — is
+    /// broken. This is the fix for the 2026-07-05 post-wake wedge, where
+    /// every pane spawn silently produced no shell for 1.5+ hours and the
+    /// per-work-item churn guard could not catch it because the failures
+    /// were spread across many items. The engine pauses dispatch (so it
+    /// stops burning spawn attempts against a dead app path) and raises a
+    /// single `app_spawn_capability_unhealthy` attention item as ONE loud
+    /// signal, instead of independently churning each work item into its own
+    /// churn guard. Dispatch stays paused until a human resolves the app
+    /// (e.g. wakes the display) and unpauses; a subsequent successful spawn
+    /// resets the breaker. The `details` object carries the
+    /// `distinct_work_items` count that tripped it and the `window_secs`.
+    SpawnCapabilityUnhealthy,
 }
 
 impl Stage {
@@ -390,6 +418,8 @@ impl Stage {
             Stage::HostDrainReconcile => "host_drain_reconcile",
             Stage::SpawnAckTimeout => "spawn_ack_timeout",
             Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
+            Stage::SpawnNack => "spawn_nack",
+            Stage::SpawnCapabilityUnhealthy => "spawn_capability_unhealthy",
         }
     }
 }
@@ -894,6 +924,13 @@ mod tests {
         assert_eq!(Stage::CubeLeaseAutoReap.as_str(), "cube_lease_auto_reap");
         assert_eq!(Stage::RemoteLeaseReconcile.as_str(), "remote_lease_reconcile");
         assert_eq!(Stage::HostDrainReconcile.as_str(), "host_drain_reconcile");
+        assert_eq!(Stage::SpawnAckTimeout.as_str(), "spawn_ack_timeout");
+        assert_eq!(
+            Stage::DispatchFailureRecoveryRedispatch.as_str(),
+            "dispatch_failure_recovery_redispatch"
+        );
+        assert_eq!(Stage::SpawnNack.as_str(), "spawn_nack");
+        assert_eq!(Stage::SpawnCapabilityUnhealthy.as_str(), "spawn_capability_unhealthy");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

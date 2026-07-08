@@ -162,6 +162,19 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// The foreground pid of this pane's PTY, or 0 when the surface is not
     /// yet live. Delegates to `GhosttyTerminalHostView.foregroundPid`.
     var shellPid: Int32 { hostView?.foregroundPid ?? 0 }
+    /// Set by `WorkersWorkspaceModel.releaseWorkerPane` the instant a slot is
+    /// released, before SwiftUI has necessarily torn down the host view.
+    /// `GhosttyTerminalHostView.attemptSurfaceCreation` checks this so a
+    /// display-change retry that fires after release (e.g. the fast-fail
+    /// NACK reaped the execution while a `NSScreen` observer was still
+    /// armed) can't create a fresh surface and spawn a duplicate `claude`
+    /// for an execution the engine has already given up on.
+    private(set) var isReleased = false
+
+    /// Mark this session as released. Idempotent.
+    func markReleased() {
+        isReleased = true
+    }
     private var claudeMonitorTracker = ClaudeMonitorTracker()
     /// Called on the main actor when the pane's child process exits.
     /// Boss pane sets this to a restart closure; worker panes leave it nil.
@@ -179,6 +192,16 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// instead of waiting for the periodic dead-pid sweep; the Boss pane
     /// leaves it nil (it has no engine-tracked execution to reap).
     var onSurfaceFailed: (() -> Void)?
+    /// Called on the main actor when this session's libghostty surface
+    /// FAILS to create (`ghostty_surface_new` returned NULL — typically the
+    /// post-sleep "no active display" condition, #800). Worker panes set
+    /// this to a closure that NACKs the spawn back to the engine
+    /// (`report_worker_spawn_failed`) so it fails fast instead of waiting
+    /// out the 60s spawn-ack timeout, and logs a durable diagnostic. Fired
+    /// at most once per session — the host view dedupes — and never for a
+    /// surface that eventually succeeds. Boss pane leaves this nil.
+    var onSurfaceCreationFailed: ((_ reason: String) -> Void)?
+
 
     init(id: String, role: PaneRole, launchSpec: TerminalLaunchSpec) {
         self.id = id

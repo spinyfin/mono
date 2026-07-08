@@ -1846,6 +1846,16 @@ final class ChatViewModel: ObservableObject {
         engine.sendSpawnCapabilityRestored()
     }
 
+    /// Called by ContentView when a worker pane's libghostty surface fails to
+    /// create so no shell ever comes up (the post-sleep "no active display"
+    /// condition). NACKs the engine so it reaps the execution immediately and
+    /// feeds its spawn-capability circuit breaker, instead of waiting out the
+    /// 60s spawn-ack timeout.
+    func workerPaneSpawnFailed(runId: String, reason: String) {
+        guard isAppSessionRegistered else { return }
+        engine.sendReportWorkerSpawnFailed(runId: runId, reason: reason)
+    }
+
     // MARK: - Event Handling
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?

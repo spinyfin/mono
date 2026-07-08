@@ -195,6 +195,12 @@ struct ContentView: View {
             GhosttyRuntime.shared.onDisplaysDidWake = { [model] in
                 model.spawnCapabilityRestored()
             }
+            // Forward surface-creation failures (no shell came up — the
+            // post-sleep "no active display" condition) so the engine fails
+            // the spawn fast instead of waiting out its 60s spawn-ack timeout.
+            workersWorkspace.onSpawnFailed = { [model] runId, reason in
+                model.workerPaneSpawnFailed(runId: runId, reason: reason)
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)

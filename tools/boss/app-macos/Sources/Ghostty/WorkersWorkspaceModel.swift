@@ -68,6 +68,14 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// execution id (without the "run-" session prefix).
     var onPaneDied: ((String) -> Void)?
 
+    /// Called when a worker pane's libghostty surface FAILS to create so no
+    /// shell ever comes up (the post-sleep "no active display" condition).
+    /// `ContentView` installs this closure to NACK the engine via
+    /// `sendReportWorkerSpawnFailed`, so it fails the spawn fast instead of
+    /// waiting out the 60s spawn-ack timeout. `runId` is the raw execution id;
+    /// `reason` is a short human-readable cause.
+    var onSpawnFailed: ((String, String) -> Void)?
+
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
     /// always mirror the live engine rather than independently-maintained
@@ -121,6 +129,16 @@ final class WorkersWorkspaceModel: ObservableObject {
         } else {
             slotId = slots[index].slotId
         }
+        // Durable, execution-id-correlatable record that we honored the spawn
+        // request — logged BEFORE the asynchronous surface creation so a spawn
+        // that never progresses to an attached surface or a failure is still
+        // visible app-side (the gap the 2026-07-05 post-wake incident hit).
+        SpawnDiagnosticsLog.shared.spawnRequested(
+            runId: request.runId,
+            slotId: slotId,
+            workspacePath: request.workspacePath
+        )
+
         let launchSpec = TerminalLaunchSpec(
             fontSize: 10.0,
             workingDirectory: request.workspacePath,
@@ -155,10 +173,12 @@ final class WorkersWorkspaceModel: ObservableObject {
         // calls ghostty_surface_foreground_pid) to get the real shell pid,
         // then forward it to the engine via update_worker_shell_pid.
         let capturedRunId = request.runId
+        let capturedSlotId = slotId
         session.onSurfaceAttached = { [weak self, weak session] in
             guard let self = self else { return }
             let pid = session?.shellPid ?? 0
             if pid > 0 {
+                SpawnDiagnosticsLog.shared.surfaceAttached(runId: capturedRunId, slotId: capturedSlotId, shellPid: pid)
                 self.onShellPidAvailable?(capturedRunId, pid)
             } else {
                 // Shell may not have called tcsetpgrp yet — retry after a
@@ -168,6 +188,11 @@ final class WorkersWorkspaceModel: ObservableObject {
                     guard let self = self else { return }
                     let retryPid = session?.shellPid ?? 0
                     guard retryPid > 0 else { return }
+                    SpawnDiagnosticsLog.shared.surfaceAttached(
+                        runId: capturedRunId,
+                        slotId: capturedSlotId,
+                        shellPid: retryPid
+                    )
                     self.onShellPidAvailable?(capturedRunId, retryPid)
                 }
             }
@@ -182,6 +207,15 @@ final class WorkersWorkspaceModel: ObservableObject {
         session.onChildExited = { [weak self] in
             self?.onPaneDied?(capturedRunId)
         }
+        // Fail-fast NACK: if the libghostty surface never comes up (the
+        // post-sleep "no active display" condition), tell the engine at once
+        // instead of leaving it to time out after 60s. Also mirror the failure
+        // into the durable spawn diagnostics keyed by execution id.
+        session.onSurfaceCreationFailed = { [weak self] reason in
+            SpawnDiagnosticsLog.shared.surfaceFailed(runId: capturedRunId, reason: reason)
+            self?.onSpawnFailed?(capturedRunId, reason)
+        }
+
         return .success(slotId: slotId, shellPid: 0)
     }
 
@@ -225,6 +259,11 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
 
         let foregroundPid = foregroundPid(for: session)
+        // Mark released before nil-ing the slot so a display-change retry
+        // racing this release (see `GhosttyTerminalHostView.attemptSurfaceCreation`)
+        // can't create a fresh surface and spawn a duplicate `claude` for the
+        // run the engine just gave up on.
+        session.markReleased()
 
         targetSlots[index].session = nil
         targetSlots[index].runId = nil
