@@ -5,6 +5,7 @@
 //! crate so that engine and clients link against the same types.
 
 mod boothby;
+pub mod dedup;
 mod engine_app;
 mod health_wire;
 mod host_registry_wire;
@@ -18,6 +19,10 @@ mod worker_event;
 mod worker_names;
 
 pub use boothby::*;
+pub use dedup::{
+    AttentionBrief, CANDIDATE_ID, CanonicalEdit, DedupDecision, DedupInput, DedupVerdict, EditableField, WorkItemBrief,
+    dedup_decision_schema,
+};
 pub use engine_app::*;
 pub use health_wire::*;
 pub use host_registry_wire::*;
