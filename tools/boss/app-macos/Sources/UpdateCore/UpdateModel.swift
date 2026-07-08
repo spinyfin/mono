@@ -51,6 +51,14 @@ public enum UpdateDownloadState: Equatable, Sendable {
     /// swap failed). The staged bundle remains on disk. This is a terminal state — the
     /// dialog shows an error and does not open a browser.
     case installFailed(version: VersionTuple, reason: String)
+    /// The bundle swap was applied — the new `version` is live on disk — but the app
+    /// has not yet relaunched into it, so the running process is still the old version.
+    /// The update completes on the next quit. `willRelaunch` is `true` when a relaunch
+    /// helper will be armed to reopen Boss automatically on quit (the common case), and
+    /// `false` when the helper is unavailable and the user must reopen Boss manually.
+    /// Reached when the user pressed "Install & Relaunch" but the quit was vetoed (e.g.
+    /// agents still working), or when the helper could not be armed. NOT a failure.
+    case installedPendingRelaunch(version: VersionTuple, willRelaunch: Bool)
 }
 
 // MARK: - UpdateStager
@@ -346,6 +354,18 @@ public final class UpdateModel: ObservableObject {
         downloadState = .installFailed(version: version, reason: reason)
     }
 
+    /// Records that the bundle swap for `version` was applied but the app has not yet
+    /// relaunched into it — the update completes on the next quit. Called by the UI
+    /// when "Install & Relaunch" swapped the bundle but the quit was vetoed (agents
+    /// working), or when no relaunch helper could be armed. `willRelaunch` distinguishes
+    /// whether the helper will reopen Boss automatically. This is a success state, not a
+    /// failure — the new version is already on disk.
+    public func markInstalledPendingRelaunch(version: VersionTuple, willRelaunch: Bool) {
+        modelLog.info(
+            "update install: swap applied, awaiting relaunch version=\(version.description, privacy: .public) willRelaunch=\(willRelaunch, privacy: .public)")
+        downloadState = .installedPendingRelaunch(version: version, willRelaunch: willRelaunch)
+    }
+
     /// User-initiated download of the currently-available update (the result sheet /
     /// badge "Download" button). Stages regardless of mode — the user explicitly
     /// asked for it. Dev builds never stage (auto-install is a non-goal for them);
@@ -373,6 +393,10 @@ public final class UpdateModel: ObservableObject {
         switch downloadState {
         case .downloading(let v, _) where v == version: return
         case .readyToInstall(let v) where v == version: return
+        // Already swapped in and awaiting relaunch: the bundle is installed and the
+        // staged copy consumed. Re-staging would needlessly re-download and revert the
+        // honest "Installed — quit to finish" UI back to "Downloading…". Skip it.
+        case .installedPendingRelaunch(let v, _) where v == version: return
         default: break
         }
         stagingTask?.cancel()

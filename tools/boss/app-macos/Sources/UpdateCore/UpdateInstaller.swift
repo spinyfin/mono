@@ -375,6 +375,37 @@ public struct UpdateInstaller: Sendable {
         )
     }
 
+    /// The `CFBundleShortVersionString` of the bundle currently at the install
+    /// location, or `nil` if it can't be read. Reads the on-disk `Info.plist`
+    /// directly (not `Bundle.main`) so it reflects a swap that `applySwap` has
+    /// already committed even though the running process still hosts the old code.
+    public func installedBundleVersion() -> VersionTuple? {
+        let plistURL = installBundleURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dict = plist as? [String: Any],
+              let short = dict["CFBundleShortVersionString"] as? String else { return nil }
+        return VersionTuple.parse(short)
+    }
+
+    /// The pending swap when it has *already been applied* to disk but not yet
+    /// reconciled — i.e. `applySwap` moved the new bundle into the install location
+    /// (so the live bundle's version now matches the pending record) but we have not
+    /// relaunched into it. `nil` when there is no pending record, it isn't newer than
+    /// `currentVersion`, or the live bundle doesn't match it (swap not actually done).
+    ///
+    /// This is what makes a repeated user-initiated "Install & Relaunch" idempotent:
+    /// the first press consumes the staged `Boss.app` (it is moved, not copied), so a
+    /// second `newestReadyUpdate` finds nothing — but the install genuinely succeeded
+    /// and is only awaiting the relaunch. Callers treat this as success, not a
+    /// missing-staged-bundle failure.
+    public func appliedPendingAwaitingRelaunch(currentVersion: VersionTuple) -> SwapPlan? {
+        guard let pending = pendingSwap(),
+              pending.version > currentVersion,
+              installedBundleVersion() == pending.version else { return nil }
+        return pending
+    }
+
     // MARK: Reconciliation
 
     /// Run once at launch. Completes a pending swap or rolls back a failed one:

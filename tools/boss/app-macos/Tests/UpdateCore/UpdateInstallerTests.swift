@@ -280,6 +280,64 @@ final class UpdateInstallerTests: XCTestCase {
         XCTAssertEqual(installer.reconcileAfterLaunch(currentVersion: v("1.0.27")), .noChange)
     }
 
+    // MARK: Installed bundle version + already-applied idempotency
+
+    func testInstalledBundleVersionReadsInfoPlist() {
+        plantInstalledBundle(marker: "cur", version: "1.0.27")
+        XCTAssertEqual(makeInstaller().installedBundleVersion(), v("1.0.27"))
+    }
+
+    func testInstalledBundleVersionNilWhenNoPlist() {
+        plantInstalledBundle(marker: "cur")  // which.txt only, no Info.plist
+        XCTAssertNil(makeInstaller().installedBundleVersion())
+    }
+
+    /// After a user-initiated swap, the staged `Boss.app` is consumed (moved), so a
+    /// repeat `newestReadyUpdate` finds nothing — but the live bundle matches the still
+    /// pending swap, so `appliedPendingAwaitingRelaunch` reports it as done-awaiting-
+    /// relaunch. This is what makes a second "Install & Relaunch" press idempotent.
+    func testAppliedPendingAwaitingRelaunchAfterSwap() throws {
+        plantInstalledBundle(marker: "old", version: "1.0.27")
+        let ready = plantReadyAndDescribe("1.0.28")
+        let installer = makeInstaller()
+        let plan = try unwrapSwap(installer.planSwap(for: ready, currentVersion: v("1.0.27"), relaunch: true))
+        try installer.applySwap(plan)
+
+        XCTAssertNil(installer.newestReadyUpdate(currentVersion: v("1.0.27")), "staged bundle consumed by the swap")
+        XCTAssertEqual(installer.installedBundleVersion(), v("1.0.28"), "live bundle now reflects the swap")
+        let awaiting = installer.appliedPendingAwaitingRelaunch(currentVersion: v("1.0.27"))
+        XCTAssertEqual(awaiting?.version, v("1.0.28"), "pending swap recognised as already applied")
+    }
+
+    func testAppliedPendingNilWhenNothingPending() {
+        plantInstalledBundle(marker: "cur", version: "1.0.28")
+        XCTAssertNil(makeInstaller().appliedPendingAwaitingRelaunch(currentVersion: v("1.0.27")))
+    }
+
+    /// Once we're running the new version (reconciled), the pending record is no longer
+    /// newer than current, so it must not be reported as awaiting relaunch.
+    func testAppliedPendingNilWhenPendingNotNewerThanCurrent() throws {
+        plantInstalledBundle(marker: "old", version: "1.0.27")
+        let ready = plantReadyAndDescribe("1.0.28")
+        let installer = makeInstaller()
+        let plan = try unwrapSwap(installer.planSwap(for: ready, currentVersion: v("1.0.27"), relaunch: true))
+        try installer.applySwap(plan)
+        XCTAssertNil(installer.appliedPendingAwaitingRelaunch(currentVersion: v("1.0.28")))
+    }
+
+    /// A pending record whose version doesn't match the live bundle (e.g. an external
+    /// rollback replaced the bundle) is not treated as an applied swap.
+    func testAppliedPendingNilWhenLiveBundleDoesNotMatchPending() throws {
+        plantInstalledBundle(marker: "old", version: "1.0.27")
+        let ready = plantReadyAndDescribe("1.0.28")
+        let installer = makeInstaller()
+        let plan = try unwrapSwap(installer.planSwap(for: ready, currentVersion: v("1.0.27"), relaunch: true))
+        try installer.applySwap(plan)
+        // Simulate the live bundle no longer reflecting the pending swap.
+        writeInfoPlist(to: installBundle, version: "1.0.27")
+        XCTAssertNil(installer.appliedPendingAwaitingRelaunch(currentVersion: v("1.0.27")))
+    }
+
     // MARK: Helper invocation
 
     func testHelperInvocationBuildsExpectedArguments() {
@@ -338,11 +396,23 @@ extension UpdateInstallerTests {
     }
 
     /// Create a `.app` directory containing `Contents/which.txt = marker` so moves
-    /// can be verified by identity.
-    private func makeBundle(at url: URL, marker: String) {
+    /// can be verified by identity. When `version` is supplied, also writes a
+    /// `Contents/Info.plist` carrying that `CFBundleShortVersionString` so
+    /// `installedBundleVersion()` can read it after a swap.
+    private func makeBundle(at url: URL, marker: String, version: String? = nil) {
         let contents = url.appendingPathComponent("Contents")
         try? FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
         try? marker.data(using: .utf8)!.write(to: contents.appendingPathComponent("which.txt"))
+        if let version { writeInfoPlist(to: url, version: version) }
+    }
+
+    /// Write `Contents/Info.plist` with `CFBundleShortVersionString = version`.
+    private func writeInfoPlist(to bundle: URL, version: String) {
+        let contents = bundle.appendingPathComponent("Contents")
+        try? FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        let plist: [String: Any] = ["CFBundleShortVersionString": version]
+        let data = try! PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try? data.write(to: contents.appendingPathComponent("Info.plist"))
     }
 
     private func marker(at bundle: URL) -> String? {
@@ -352,8 +422,8 @@ extension UpdateInstallerTests {
         return String(data: data, encoding: .utf8)
     }
 
-    private func plantInstalledBundle(marker: String) {
-        makeBundle(at: installBundle, marker: marker)
+    private func plantInstalledBundle(marker: String, version: String? = nil) {
+        makeBundle(at: installBundle, marker: marker, version: version)
     }
 
     private func writeManifest(version: String, state: UpdateManifest.State, to dir: URL) {
@@ -365,10 +435,12 @@ extension UpdateInstallerTests {
         try? data.write(to: dir.appendingPathComponent("manifest.json"))
     }
 
-    /// Plant a `.ready` staged version: `Updates/<v>/Boss.app` + manifest.
+    /// Plant a `.ready` staged version: `Updates/<v>/Boss.app` + manifest. The staged
+    /// bundle carries an `Info.plist` with its version so that, once swapped into the
+    /// install location, `installedBundleVersion()` reflects it.
     private func plantReadyVersion(_ version: String, marker: String? = nil) {
         let dir = updatesDir.appendingPathComponent(version)
-        makeBundle(at: dir.appendingPathComponent("Boss.app"), marker: marker ?? "staged-\(version)")
+        makeBundle(at: dir.appendingPathComponent("Boss.app"), marker: marker ?? "staged-\(version)", version: version)
         writeManifest(version: version, state: .ready, to: dir)
     }
 
