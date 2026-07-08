@@ -942,6 +942,37 @@ pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendReque
     }
 }
 
+/// Shared tail for the comment-mutation handlers that follow the same shape:
+/// take the single-comment result of a `work_db` mutation, and on `Ok` publish
+/// a comment invalidation with `reason` before sending the `CommentResult`
+/// response, or on `Err` send a work error. Keeps `handle_comments_dismiss`,
+/// `handle_comments_set_status`, and `handle_comments_set_intent` from
+/// duplicating the identical publish + response boilerplate.
+async fn respond_comment_invalidation(
+    server_state: &ServerState,
+    session_id: &str,
+    request_id: &str,
+    sink: &SessionSink,
+    result: anyhow::Result<WorkComment>,
+    reason: &str,
+) {
+    match result {
+        Ok(comment) => {
+            let revision = publish_comment_invalidation(
+                server_state,
+                session_id,
+                request_id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                reason,
+            )
+            .await;
+            send_response_with_revision(sink, request_id, revision, FrontendEvent::CommentResult { comment });
+        }
+        Err(err) => send_work_error(sink, request_id, &err),
+    }
+}
+
 pub(super) async fn handle_comments_dismiss(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -954,23 +985,16 @@ pub(super) async fn handle_comments_dismiss(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::CommentsDismiss { comment_id, actor } = req else {
         unreachable!()
     };
-    {
-        match work_db.dismiss_comment(&comment_id, actor.as_deref()) {
-            Ok(comment) => {
-                let revision = publish_comment_invalidation(
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    &comment.artifact_kind,
-                    &comment.artifact_id,
-                    "comment_dismissed",
-                )
-                .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
-            }
-            Err(err) => send_work_error(&sink, &request_id, &err),
-        }
-    }
+    let result = work_db.dismiss_comment(&comment_id, actor.as_deref());
+    respond_comment_invalidation(
+        &server_state,
+        &session_id,
+        &request_id,
+        &sink,
+        result,
+        "comment_dismissed",
+    )
+    .await;
 }
 
 pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendRequest) {
@@ -990,21 +1014,16 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
     else {
         unreachable!()
     };
-    match work_db.set_comment_status(&comment_id, &status, actor.as_deref()) {
-        Ok(comment) => {
-            let revision = publish_comment_invalidation(
-                &server_state,
-                &session_id,
-                &request_id,
-                &comment.artifact_kind,
-                &comment.artifact_id,
-                "comment_status_changed",
-            )
-            .await;
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
-        }
-        Err(err) => send_work_error(&sink, &request_id, &err),
-    }
+    let result = work_db.set_comment_status(&comment_id, &status, actor.as_deref());
+    respond_comment_invalidation(
+        &server_state,
+        &session_id,
+        &request_id,
+        &sink,
+        result,
+        "comment_status_changed",
+    )
+    .await;
 }
 
 /// Manually reclassify a comment's intent (the sidebar badge's override
@@ -1026,21 +1045,16 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
     let FrontendRequest::CommentsSetIntent { comment_id, intent } = req else {
         unreachable!()
     };
-    match work_db.override_comment_intent(&comment_id, &intent) {
-        Ok(comment) => {
-            let revision = publish_comment_invalidation(
-                &server_state,
-                &session_id,
-                &request_id,
-                &comment.artifact_kind,
-                &comment.artifact_id,
-                "comment_intent_overridden",
-            )
-            .await;
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
-        }
-        Err(err) => send_work_error(&sink, &request_id, &err),
-    }
+    let result = work_db.override_comment_intent(&comment_id, &intent);
+    respond_comment_invalidation(
+        &server_state,
+        &session_id,
+        &request_id,
+        &sink,
+        result,
+        "comment_intent_overridden",
+    )
+    .await;
 }
 
 /// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
