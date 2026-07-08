@@ -2465,7 +2465,14 @@ struct WorkBoardCardView: View {
                 }
             }
 
-            if task.kind == "revision", let prURL = task.revisionParentPrUrl, !prURL.isEmpty {
+            // A revision task's own `prURL` is stamped with the chain root's
+            // PR while an automated review pass holds it (see P992 in the
+            // engine); once that happens it's the identical PR already
+            // rendered above, so only show this second row when it points
+            // somewhere new — otherwise the card displays the same PR link
+            // twice (#1829 duplicate report).
+            if task.kind == "revision", let prURL = task.revisionParentPrUrl, !prURL.isEmpty,
+               !(task.prURL.map { sameGitHubPR($0, prURL) } ?? false) {
                 HStack(alignment: .center, spacing: 6) {
                     PRURLLink(
                         urlString: prURL,

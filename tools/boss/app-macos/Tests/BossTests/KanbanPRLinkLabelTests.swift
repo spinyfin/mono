@@ -38,6 +38,52 @@ final class KanbanPRLinkLabelTests: XCTestCase {
         XCTAssertNil(parseGitHubPRURL("https://github.com/foo/bar/pull/abc"))
     }
 
+    // MARK: - sameGitHubPR
+
+    /// Pins the dedup rule a revision card's footer relies on: once a
+    /// revision's own `prURL` has been stamped with the chain root's PR
+    /// (P992 automated review), the "revises …" row must recognise it's
+    /// the same PR and suppress the duplicate link (mono#1829 report).
+    func testSameGitHubPRTrueForIdenticalURLs() {
+        let url = "https://github.com/linkedin-multiproduct/mono/pull/1829"
+        XCTAssertTrue(sameGitHubPR(url, url))
+    }
+
+    func testSameGitHubPRFalseForDifferentPRNumbers() {
+        XCTAssertFalse(sameGitHubPR(
+            "https://github.com/linkedin-multiproduct/mono/pull/1829",
+            "https://github.com/linkedin-multiproduct/mono/pull/1830"
+        ))
+    }
+
+    func testSameGitHubPRFalseForDifferentRepos() {
+        XCTAssertFalse(sameGitHubPR(
+            "https://github.com/linkedin-multiproduct/mono/pull/1",
+            "https://github.com/linkedin-multiproduct/dev-infra/pull/1"
+        ))
+    }
+
+    func testSameGitHubPRCaseInsensitiveOnOrgAndRepo() {
+        XCTAssertTrue(sameGitHubPR(
+            "https://github.com/LinkedIn-MultiProduct/Mono/pull/1829",
+            "https://github.com/linkedin-multiproduct/mono/pull/1829"
+        ))
+    }
+
+    /// Non-GitHub (or otherwise unparseable) URLs fall back to exact
+    /// string equality rather than silently treating everything as
+    /// distinct.
+    func testSameGitHubPRFallsBackToStringEqualityForUnparseableURLs() {
+        XCTAssertTrue(sameGitHubPR(
+            "https://gitlab.com/foo/bar/-/merge_requests/1",
+            "https://gitlab.com/foo/bar/-/merge_requests/1"
+        ))
+        XCTAssertFalse(sameGitHubPR(
+            "https://gitlab.com/foo/bar/-/merge_requests/1",
+            "https://gitlab.com/foo/bar/-/merge_requests/2"
+        ))
+    }
+
     // MARK: - ambiguousPRRepoNames
 
     /// One PR per repo across the board — the bare `repo#n` label is

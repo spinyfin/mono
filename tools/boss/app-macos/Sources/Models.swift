@@ -1316,6 +1316,22 @@ func parseGitHubPRURL(_ urlString: String) -> (org: String, repo: String, number
     return (org: parts[0], repo: parts[1], number: parts[3])
 }
 
+/// Whether two PR URL strings identify the same GitHub pull request.
+/// Compares the parsed `(org, repo, number)` triple case-insensitively
+/// on org/repo so incidental formatting differences don't defeat the
+/// match; falls back to exact string equality when either URL isn't a
+/// parseable GitHub PR URL. Used to dedup a card's PR-link rows when
+/// two different task fields (e.g. a revision's own `prURL` and its
+/// `revisionParentPrUrl`) happen to resolve to the same PR.
+func sameGitHubPR(_ a: String, _ b: String) -> Bool {
+    if let pa = parseGitHubPRURL(a), let pb = parseGitHubPRURL(b) {
+        return pa.org.lowercased() == pb.org.lowercased()
+            && pa.repo.lowercased() == pb.repo.lowercased()
+            && pa.number == pb.number
+    }
+    return a == b
+}
+
 /// Repo names (lowercased) that appear with two or more distinct orgs
 /// across the supplied card set's PR URLs. A name in this set means
 /// `repo#n` alone is ambiguous on the current board, so the kanban
