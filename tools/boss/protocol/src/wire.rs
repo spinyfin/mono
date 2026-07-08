@@ -1524,6 +1524,19 @@ pub enum FrontendRequest {
         token: String,
     },
 
+    /// App reports that it can once again host worker panes — sent after
+    /// `GhosttyRuntime` observes `NSWorkspace.didWakeNotification` /
+    /// `screensDidWakeNotification` and confirms an active display is
+    /// present. Without this, a sleep/wake cycle that briefly stranded a
+    /// spawn (`ghostty_surface_new` returning NULL for the #800
+    /// no-active-display condition, or an orphaned execution reported via
+    /// `WorkerPaneDied`) only gets redispatched on the next periodic
+    /// sweep/heartbeat tick, which can lag the wake by up to a minute.
+    /// The engine reacts by kicking the scheduler immediately so any work
+    /// stranded by the sleep is redispatched as soon as the app can host
+    /// it again. Fire-and-forget; no response expected.
+    SpawnCapabilityRestored,
+
     /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
     /// and release the cube workspace its execution still holds.
     /// Used by `bossctl agents stop`. Idempotent — duplicate requests

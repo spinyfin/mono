@@ -301,6 +301,32 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
     }
 }
 
+/// App reports that it can once again host worker panes after a
+/// sleep/wake cycle (`GhosttyRuntime` confirmed an active display via
+/// `NSWorkspace.didWakeNotification` / `screensDidWakeNotification`).
+/// Kicks the scheduler immediately so anything stranded by the sleep —
+/// an execution orphaned via `WorkerPaneDied`, or a `ready` row that
+/// never got a slot while the app couldn't host a surface — redispatches
+/// right away instead of waiting for the next periodic sweep or the
+/// scheduler heartbeat.
+pub(super) async fn handle_spawn_capability_restored(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state, peer_pid, ..
+    } = ctx;
+    let FrontendRequest::SpawnCapabilityRestored = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            "spawn_capability_restored rejected: caller not in app/Boss subtree",
+        );
+        return;
+    }
+    tracing::info!("spawn_capability_restored: kicking scheduler");
+    server_state.execution_coordinator.kick();
+}
+
 pub(super) async fn handle_engine_response(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

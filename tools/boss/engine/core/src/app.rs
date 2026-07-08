@@ -2889,6 +2889,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SetProjectDesignDoc { .. } => projects::handle_set_project_design_doc(ctx, r).await,
             r @ FrontendRequest::SetSetting { .. } => engine_meta::handle_set_setting(ctx, r).await,
             r @ FrontendRequest::Shutdown { .. } => sessions::handle_shutdown(ctx, r).await,
+            r @ FrontendRequest::SpawnCapabilityRestored => sessions::handle_spawn_capability_restored(ctx, r).await,
             r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
             r @ FrontendRequest::Subscribe { .. } => subscriptions::handle_subscribe(ctx, r).await,
             r @ FrontendRequest::SyncProductExternalTracker { .. } => {

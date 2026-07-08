@@ -189,6 +189,12 @@ struct ContentView: View {
             workersWorkspace.onPaneDied = { [model] runId in
                 model.workerPaneDied(runId: runId)
             }
+            // Report sleep/wake recovery to the engine so a worker-pane
+            // spawn stranded by the sleep redispatches immediately
+            // instead of waiting for the next periodic sweep.
+            GhosttyRuntime.shared.onDisplaysDidWake = { [model] in
+                model.spawnCapabilityRestored()
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)

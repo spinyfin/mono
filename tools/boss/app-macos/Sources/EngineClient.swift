@@ -974,6 +974,18 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Report that the app can once again host worker panes after a
+    /// sleep/wake cycle — `GhosttyRuntime` observed `NSWorkspace`
+    /// sleep/wake notifications and confirmed an active display is
+    /// present. Lets the engine kick the scheduler immediately instead
+    /// of waiting for the next periodic sweep to redispatch anything the
+    /// sleep stranded. Fire-and-forget; no response expected.
+    func sendSpawnCapabilityRestored() {
+        sendLine([
+            "type": "spawn_capability_restored",
+        ])
+    }
+
     /// Ask the engine for all historical executions of `taskId`, newest-first.
     /// The engine replies with `executions_list`. The wire field is
     /// `work_item_id` — the engine's `ListExecutions` request and
