@@ -1,4 +1,5 @@
 import SwiftUI
+import Textual
 
 /// Fixed-width (280 pt) right-side panel listing the comments for the
 /// currently open markdown doc (engine-backed and persisted when the doc has
@@ -459,9 +460,14 @@ private struct CommentRow: View {
                         )
                 }
 
-                Text(comment.body)
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
+                StructuredText(markdown: comment.body)
+                    .bossMarkdown()
+                    // Scale the shared 17pt-body-relative theme down to match
+                    // this row's previous `.callout` (13pt) size, so replies
+                    // don't jump in size inside the narrow sidebar bubble.
+                    .textual.fontScale(13.0 / 17.0)
+                    .textual.textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 if !comment.threadEntries.isEmpty {
                     ThreadEntriesView(entries: comment.threadEntries)
