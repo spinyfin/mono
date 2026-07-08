@@ -39,6 +39,17 @@ final class CommentLayer: NSObject, ObservableObject {
         didSet { if showResolved != oldValue { reload() } }
     }
 
+    /// Explicit focus-contention escape hatch for the markdown find bar
+    /// (`MarkdownFindBar`). Both it and this layer's type-to-comment key
+    /// monitor want to consume plain-letter keystrokes: the monitor normally
+    /// gates on "does the current first responder have a selection," which
+    /// is not sufficient once a *different* control (the find field) has
+    /// focus but the document still has a stale selection underneath. While
+    /// the find bar has focus it sets this true via `\.suppressTypeToComment`
+    /// (threaded through `WithCommentsModifier`'s environment), which
+    /// unconditionally short-circuits `shouldConsumeKeyEvent` below.
+    var suppressTypeToComment: Bool = false
+
     // MARK: - Engine backing
 
     /// The artifact these comments attach to (`work_item` / `pr_doc`). Empty on
@@ -890,13 +901,13 @@ final class CommentLayer: NSObject, ObservableObject {
     // MARK: - Event handling (called from monitor closures via MainActor.assumeIsolated)
 
     /// Returns true if the key event should be consumed (opens the comment form).
-    private func shouldConsumeKeyEvent(
+    func shouldConsumeKeyEvent(
         chars: String?,
         mods: NSEvent.ModifierFlags,
         window: NSWindow?
     ) -> Bool {
         guard window === hostWindow else { return false }
-        guard !isShowingPopover else { return false }
+        guard !isShowingPopover, !suppressTypeToComment else { return false }
         let cleanMods = mods.intersection(.deviceIndependentFlagsMask)
         guard cleanMods.isSubset(of: [.shift, .capsLock]) else { return false }
         guard
@@ -1082,6 +1093,10 @@ struct WithCommentsModifier: ViewModifier {
         // Binds `layer.hostWindow` so its NSEvent monitors can scope themselves to
         // this viewer's own window instead of reacting to any window in the app.
         .background(CommentLayerWindowBinder(layer: layer).frame(width: 0, height: 0))
+        .environment(\.suppressTypeToComment, Binding(
+            get: { layer.suppressTypeToComment },
+            set: { layer.suppressTypeToComment = $0 }
+        ))
         .onAppear {
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
             layer.installMonitors()
@@ -1139,6 +1154,14 @@ private struct CommentBackendKey: EnvironmentKey {
     static var defaultValue: (any CommentBackend)? { nil }
 }
 
+/// See `CommentLayer.suppressTypeToComment` for the focus-contention rule
+/// this backs. Default is a no-op constant binding so a host with no
+/// `WithCommentsModifier` in its ancestry (e.g. a unit test) reads/writes
+/// harmlessly rather than crashing.
+private struct SuppressTypeToCommentKey: EnvironmentKey {
+    static var defaultValue: Binding<Bool> { .constant(false) }
+}
+
 extension EnvironmentValues {
     var commentedAnchors: [CommentAnchor] {
         get { self[CommentedAnchorsKey.self] }
@@ -1153,5 +1176,10 @@ extension EnvironmentValues {
     var commentBackend: (any CommentBackend)? {
         get { self[CommentBackendKey.self] }
         set { self[CommentBackendKey.self] = newValue }
+    }
+
+    var suppressTypeToComment: Binding<Bool> {
+        get { self[SuppressTypeToCommentKey.self] }
+        set { self[SuppressTypeToCommentKey.self] = newValue }
     }
 }
