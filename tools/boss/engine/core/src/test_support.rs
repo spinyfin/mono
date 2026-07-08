@@ -7,6 +7,7 @@
 //! instead of ~250, and keeps the setup readable at each call site.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use tempfile::TempDir;
 
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+    ExecutionCoordinator, WorkerPool,
 };
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
@@ -197,4 +199,22 @@ impl ExecutionRunner for NoopRunner {
     ) -> Result<RunOutcome> {
         unimplemented!()
     }
+}
+
+/// Construct an [`ExecutionCoordinator`] wired to a `pool_size`-worker
+/// [`WorkerPool`] and the [`NoopCube`]/[`NoopRunner`] test doubles.
+///
+/// The sweep and recovery test modules (`dead_pid_sweep`,
+/// `orphan_sweep`, `pool_claim_sweep`, `spawn_ack_sweep`,
+/// `stale_worker_sweep`, `transient_recovery`,
+/// `dispatch_failure_recovery_sweep`, `pr_review_recovery`) all built
+/// this exact coordinator, so this single helper replaces the
+/// byte-identical copy each used to hand-roll.
+pub fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
+    Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(pool_size),
+        Arc::new(NoopCube),
+        Arc::new(NoopRunner),
+    ))
 }

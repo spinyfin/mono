@@ -261,50 +261,20 @@ fn file_dead_review_attention(work_db: &WorkDb, work_item_id: &str, dead_executi
 mod tests {
     use std::sync::Arc;
 
-    use anyhow::Result;
-    use async_trait::async_trait;
     use boss_protocol::{ExecutionKind, RequestExecutionInput};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
-    use boss_protocol::WorkExecution;
 
-    // `NoopCube` comes from `crate::test_support::*`.
-
-    struct NoopRunner;
-
-    #[async_trait]
-    impl ExecutionRunner for NoopRunner {
-        async fn run_execution(
-            &self,
-            _worker_id: &str,
-            _execution: &WorkExecution,
-            _work_item: &crate::work::WorkItem,
-            _workspace_path: &std::path::Path,
-            _cube_change_id: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!("pr_review_recovery tests don't run executions")
-        }
-    }
+    // `NoopCube` and `NoopRunner` come from `crate::test_support::*`.
 
     fn open_db() -> (TempDir, WorkDb) {
         let dir = TempDir::new().unwrap();
         let db = WorkDb::open(dir.path().join("state.db")).unwrap();
         (dir, db)
-    }
-
-    fn make_coordinator(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
-        Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(1),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        ))
     }
 
     /// Create an active chore with a bound `pr_url` and a dead (orphaned)
@@ -351,7 +321,7 @@ mod tests {
             create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/1");
 
         let db = Arc::new(db);
-        let coordinator = make_coordinator(db.clone());
+        let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
@@ -387,7 +357,7 @@ mod tests {
             create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/2");
 
         let db = Arc::new(db);
-        let coordinator = make_coordinator(db.clone());
+        let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Merged);
 
@@ -418,7 +388,7 @@ mod tests {
         }
 
         let db = Arc::new(db);
-        let coordinator = make_coordinator(db.clone());
+        let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 
@@ -463,7 +433,7 @@ mod tests {
         }
 
         let db = Arc::new(db);
-        let coordinator = make_coordinator(db.clone());
+        let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let checker = FakePrStateChecker::always(PrOpenState::Open);
 

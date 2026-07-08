@@ -288,7 +288,7 @@ mod tests {
     use boss_protocol::WorkItemBinding;
 
     use super::*;
-    use crate::coordinator::{ExecutionCoordinator, MAX_AUTOMATION_POOL_SIZE, WorkerPool};
+    use crate::coordinator::MAX_AUTOMATION_POOL_SIZE;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
@@ -327,18 +327,6 @@ mod tests {
             rusqlite::params![execution_id, epoch.to_string()],
         )
         .unwrap();
-    }
-
-    /// Build an `Arc<ExecutionCoordinator>` whose main pool has
-    /// `main_pool_size` slots and whose automation pool is the default
-    /// full `MAX_AUTOMATION_POOL_SIZE`-slot pool.
-    fn make_coordinator(db: Arc<WorkDb>, main_pool_size: usize) -> Arc<ExecutionCoordinator> {
-        Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(main_pool_size),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        ))
     }
 
     fn register_live_pane(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str) {

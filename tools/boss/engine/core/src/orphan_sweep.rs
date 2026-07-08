@@ -336,15 +336,6 @@ mod tests {
         db.force_updated_at_for_test(work_item_id, old_epoch).unwrap();
     }
 
-    fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
-        Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(pool_size),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        ))
-    }
-
     /// Like `make_coordinator` but also installs a review pool of `review_pool_size`.
     /// Returns both the coordinator and the review pool so the caller can claim slots.
     fn make_coordinator_with_review_pool(

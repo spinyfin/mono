@@ -575,7 +575,6 @@ mod tests {
     use boss_protocol::WorkItemBinding;
 
     use super::*;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
@@ -595,15 +594,6 @@ mod tests {
             .saturating_sub(300) as i64; // 5 minutes ago
         db.force_started_at_for_test(&execution.id, old_started_at).unwrap();
         execution.id
-    }
-
-    fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
-        Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(pool_size),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        ))
     }
 
     /// Register a slot in the live-state registry with the given PID and

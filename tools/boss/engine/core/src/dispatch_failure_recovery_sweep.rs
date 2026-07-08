@@ -206,33 +206,14 @@ pub async fn run_one_pass(
 mod tests {
     use std::sync::Arc;
 
-    use anyhow::Result;
-    use async_trait::async_trait;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb};
-    use boss_protocol::WorkExecution;
 
-    struct NoopRunner;
-
-    #[async_trait]
-    impl ExecutionRunner for NoopRunner {
-        async fn run_execution(
-            &self,
-            _worker_id: &str,
-            _execution: &WorkExecution,
-            _work_item: &crate::work::WorkItem,
-            _workspace_path: &std::path::Path,
-            _cube_change_id: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!("dispatch-failure recovery sweep tests don't run executions")
-        }
-    }
+    // `NoopCube` and `NoopRunner` come from `crate::test_support::*`.
 
     fn open_db() -> (TempDir, WorkDb) {
         let dir = TempDir::new().unwrap();
@@ -278,15 +259,6 @@ mod tests {
             boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t,
             other => panic!("expected a task/chore work item, got {other:?}"),
         }
-    }
-
-    fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
-        Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(pool_size),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        ))
     }
 
     /// A bounced item whose failure is older than the cooldown gets
