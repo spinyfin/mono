@@ -172,18 +172,37 @@ struct UpdateResultSheet: View {
 
             case .readyToInstall(let v) where v == update.version:
                 Button("Install & Relaunch") {
-                    if UpdateLifecycle.installStagedAndRelaunch() {
-                        // Swap applied + helper spawned; quit so it can relaunch us.
+                    switch UpdateLifecycle.installStagedAndRelaunch() {
+                    case .relaunchPending:
+                        // Swap applied; request the quit so the helper (armed at
+                        // terminate) relaunches us. If `terminate` returns, the quit was
+                        // vetoed (e.g. agents still working) — the swap is already on
+                        // disk and completes on the next quit, so reflect that instead
+                        // of leaving the button on "Install & Relaunch".
                         NSApplication.shared.terminate(nil)
-                    } else {
-                        // Install failed (bundle not writable or swap failed).
-                        // Surface a terminal error in the dialog — no browser fallback.
+                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: true)
+                    case .installedNoRelaunch:
+                        // Swap applied but we can't reopen ourselves automatically. Not
+                        // a failure — the user quits Boss to finish.
+                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: false)
+                    case .notInstalled:
+                        // Nothing changed — the live bundle is intact. Surface the
+                        // terminal error in the dialog; no browser fallback.
                         updateModel.markInstallFailed(
                             version: v,
                             reason: "The app bundle could not be updated. Make sure Boss is installed in /Applications and try again."
                         )
-                        // Keep the sheet open so the error is visible.
                     }
+                    // Keep the sheet open so the resulting state is visible.
+                }
+                .keyboardShortcut(.defaultAction)
+
+            case .installedPendingRelaunch(let v, _) where v == update.version:
+                // Swap already applied; the update completes on quit. Offer the quit
+                // (which arms the relaunch helper, when available) rather than a second
+                // install.
+                Button("Quit to Finish") {
+                    NSApplication.shared.terminate(nil)
                 }
                 .keyboardShortcut(.defaultAction)
 
@@ -211,6 +230,10 @@ struct UpdateResultSheet: View {
             return pct > 0 ? "Downloading Boss \(update.version)… \(pct)%" : "Downloading Boss \(update.version)…"
         case .readyToInstall(let v) where v == update.version:
             return "Boss \(update.version) downloaded and verified. Install & Relaunch to apply it now."
+        case .installedPendingRelaunch(let v, let willRelaunch) where v == update.version:
+            return willRelaunch
+                ? "Boss \(update.version) is installed. Quit Boss to finish — it will relaunch on the new version."
+                : "Boss \(update.version) is installed. Quit and reopen Boss to finish updating."
         case .failed(let v, let reason) where v == update.version:
             return "Download failed: \(reason)"
         case .installFailed(let v, let reason) where v == update.version:

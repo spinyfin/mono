@@ -382,13 +382,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateNow
     }
 
-    /// Swap-on-quit (design doc §4): once termination is confirmed, apply any staged
-    /// update in place so the next launch runs the new version. The agents-running
-    /// gate is upstream in `applicationShouldTerminate(_:)` — reaching here means the
-    /// user accepted the quit. Best-effort and non-blocking: a failed swap leaves the
-    /// current bundle untouched, and the startup path retries next launch.
+    /// Swap-on-quit (design doc §4): once termination is confirmed, settle any pending
+    /// update. The agents-running gate is upstream in `applicationShouldTerminate(_:)`
+    /// — reaching here means the user accepted the quit.
+    ///
+    /// Two cases: if a user-initiated "Install & Relaunch" already applied the swap and
+    /// parked a relaunch plan, arm the detached helper *now* — deferring the arm to this
+    /// confirmed-quit point is what stops a vetoed quit from stranding an armed helper.
+    /// Otherwise fall back to the best-effort automatic swap-on-quit. Non-blocking; a
+    /// failed swap leaves the current bundle untouched and the startup path retries.
     func applicationWillTerminate(_ notification: Notification) {
-        UpdateLifecycle.applyQuitSwapIfNeeded()
+        if let plan = UpdateLifecycle.consumePendingRelaunch() {
+            UpdateLifecycle.armRelaunchHelper(for: plan)
+        } else {
+            UpdateLifecycle.applyQuitSwapIfNeeded()
+        }
     }
 
     /// When the last window is closed and workers are still alive, keep

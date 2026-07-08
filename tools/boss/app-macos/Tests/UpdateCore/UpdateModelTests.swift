@@ -502,6 +502,47 @@ final class UpdateModelTests: XCTestCase {
         let count = await recorder.count
         XCTAssertEqual(count, 1, "an already-ready version must not be re-staged")
     }
+
+    func testInstalledPendingRelaunchVersionIsNotReStaged() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager())
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+        XCTAssertEqual(model.downloadState, .readyToInstall(version: Self.mockVersion))
+
+        // Simulate "Install & Relaunch" applying the swap and the quit being vetoed:
+        // the version is installed on disk and only awaiting relaunch.
+        model.markInstalledPendingRelaunch(version: Self.mockVersion, willRelaunch: true)
+
+        // A later automatic poll rediscovers the same version. It must NOT re-stage it —
+        // re-downloading the already-installed bundle would revert the honest
+        // "Installed — quit to finish" UI back to "Downloading…"/"Install & Relaunch".
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        let count = await recorder.count
+        XCTAssertEqual(count, 1, "an installed-pending-relaunch version must not be re-staged")
+        XCTAssertEqual(
+            model.downloadState,
+            .installedPendingRelaunch(version: Self.mockVersion, willRelaunch: true),
+            "the honest post-swap state must survive a subsequent poll")
+    }
+
+    func testMarkInstalledPendingRelaunchWithHelperSetsState() {
+        let model = makeModel(result: .upToDate)
+        model.markInstalledPendingRelaunch(version: Self.mockVersion, willRelaunch: true)
+        XCTAssertEqual(
+            model.downloadState, .installedPendingRelaunch(version: Self.mockVersion, willRelaunch: true))
+    }
+
+    func testMarkInstalledPendingRelaunchWithoutHelperSetsState() {
+        let model = makeModel(result: .upToDate)
+        model.markInstalledPendingRelaunch(version: Self.mockVersion, willRelaunch: false)
+        XCTAssertEqual(
+            model.downloadState, .installedPendingRelaunch(version: Self.mockVersion, willRelaunch: false))
+    }
 }
 
 // MARK: - Helpers

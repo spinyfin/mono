@@ -74,6 +74,10 @@ struct UpdateSettingsView: View {
             return pct > 0 ? "Downloading Boss \(version)… \(pct)%" : "Downloading Boss \(version)…"
         case .readyToInstall(let version):
             return "Boss \(version) downloaded — will install on quit or relaunch."
+        case .installedPendingRelaunch(let version, let willRelaunch):
+            return willRelaunch
+                ? "Boss \(version) installed — quit to finish; it will relaunch on the new version."
+                : "Boss \(version) installed — quit and reopen to finish updating."
         case .failed(let version, let reason):
             return "Download of Boss \(version) failed: \(reason)"
         case .installFailed(let version, let reason):
@@ -86,7 +90,7 @@ struct UpdateSettingsView: View {
         switch model.downloadState {
         case .downloading:
             ProgressView().controlSize(.small)
-        case .readyToInstall:
+        case .readyToInstall, .installedPendingRelaunch:
             Image(systemName: "arrow.down.circle.fill").foregroundStyle(.green)
         case .failed, .installFailed:
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)

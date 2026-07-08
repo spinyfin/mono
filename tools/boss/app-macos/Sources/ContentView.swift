@@ -5824,14 +5824,38 @@ private struct UpdateBadgePopover: View {
                 }
                 .disabled(true)
 
+            case .installFailed(let v, _) where v == update.version:
+                // A pre-swap install failure (live bundle intact). Terminal — mirror
+                // UpdateResultSheet: show the failure, no re-download affordance. The
+                // "Install failed:" reason is carried by `downloadStatusNote`.
+                Button("Install Failed") {}
+                    .disabled(true)
+
             case .readyToInstall(let v) where v == update.version:
                 Button("Install & Relaunch") {
-                    if UpdateLifecycle.installStagedAndRelaunch() {
+                    switch UpdateLifecycle.installStagedAndRelaunch() {
+                    case .relaunchPending:
+                        // Swap applied; request the quit so the helper relaunches us. If
+                        // `terminate` returns, the quit was vetoed — the swap is already
+                        // on disk and completes on the next quit.
                         NSApplication.shared.terminate(nil)
-                    } else {
-                        NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
+                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: true)
+                    case .installedNoRelaunch:
+                        updateModel.markInstalledPendingRelaunch(version: v, willRelaunch: false)
+                    case .notInstalled:
+                        // Nothing changed — the live bundle is intact. Surface the
+                        // terminal error; no browser fallback.
+                        updateModel.markInstallFailed(
+                            version: v,
+                            reason: "The app bundle could not be updated. Make sure Boss is installed in /Applications and try again.")
                     }
-                    onDismiss()
+                    // Keep the popover open so the resulting state is visible.
+                }
+                .keyboardShortcut(.defaultAction)
+
+            case .installedPendingRelaunch(let v, _) where v == update.version:
+                Button("Quit to Finish") {
+                    NSApplication.shared.terminate(nil)
                 }
                 .keyboardShortcut(.defaultAction)
 
@@ -5857,16 +5881,25 @@ private struct UpdateBadgePopover: View {
             return pct > 0 ? "Downloading… \(pct)%" : "Downloading…"
         case .readyToInstall(let v) where v == update.version:
             return "Downloaded and verified. Install & Relaunch to apply."
+        case .installedPendingRelaunch(let v, let willRelaunch) where v == update.version:
+            return willRelaunch
+                ? "Installed. Quit Boss to finish — it will relaunch on the new version."
+                : "Installed. Quit and reopen Boss to finish updating."
         case .failed(let v, let reason) where v == update.version:
             return "Download failed: \(reason)"
+        case .installFailed(let v, let reason) where v == update.version:
+            return "Install failed: \(reason)"
         default:
             return nil
         }
     }
 
     private var downloadFailed: Bool {
-        if case .failed(let v, _) = updateModel.downloadState, v == update.version { return true }
-        return false
+        switch updateModel.downloadState {
+        case .failed(let v, _) where v == update.version: return true
+        case .installFailed(let v, _) where v == update.version: return true
+        default: return false
+        }
     }
 
     private var releasePageURL: URL? {
