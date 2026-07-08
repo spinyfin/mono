@@ -111,7 +111,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use boss_protocol::{WorkItemPatch, WorkerActivity};
+use boss_protocol::WorkerActivity;
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -459,15 +459,15 @@ pub async fn run_one_pass(
                     "transient-recovery: worker stalled; auto-resuming on same workspace",
                 );
                 release_slot(&coordinator, state.slot_id).await;
-                append_recovery_audit(
+                crate::reconcile_audit::append_reconcile_audit_best_effort(
                     work_db,
                     &work_item_id,
+                    now_epoch_secs,
                     &format!(
                         "{stall_reason}; auto-resuming attempt {attempt}/{max} after {secs}s backoff",
                         max = policy.max_attempts(),
                         secs = backoff.as_secs(),
                     ),
-                    now_epoch_secs,
                 );
                 dispatch_events
                     .emit(
@@ -582,38 +582,6 @@ async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, slot_id: u8) {
     // the correct pool via pool_for_worker_id.
     let worker_id = worker_id_for_slot(slot_id);
     coordinator.release_worker_and_kick(&worker_id, None).await;
-}
-
-/// Append an `[engine-reconcile]` audit line to the work item's
-/// description so the recovery is visible in the chore detail. Best
-/// effort — a failure here never blocks recovery.
-fn append_recovery_audit(work_db: &WorkDb, work_item_id: &str, note: &str, now_epoch_secs: i64) {
-    let item = match work_db.get_work_item(work_item_id) {
-        Ok(i) => i,
-        Err(err) => {
-            tracing::warn!(work_item_id, ?err, "transient-recovery: audit lookup failed");
-            return;
-        }
-    };
-    let current_desc = match &item {
-        boss_protocol::WorkItem::Product(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
-    };
-    let new_desc = format!("{current_desc}\n[engine-reconcile] epoch {now_epoch_secs}: {note}.");
-    if let Err(err) = work_db.update_work_item(
-        work_item_id,
-        WorkItemPatch {
-            description: Some(new_desc),
-            ..WorkItemPatch::default()
-        },
-    ) {
-        tracing::warn!(
-            work_item_id,
-            ?err,
-            "transient-recovery: audit append failed (non-fatal)"
-        );
-    }
 }
 
 /// Read the last `max_bytes` of a transcript file and parse the

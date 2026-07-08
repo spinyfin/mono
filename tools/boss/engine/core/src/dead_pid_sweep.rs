@@ -56,7 +56,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{LiveWorkerState, WorkExecution, WorkItemPatch, WorkerActivity};
+use boss_protocol::{LiveWorkerState, WorkExecution, WorkerActivity};
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -463,11 +463,11 @@ async fn reap_dead_execution(
     // so a human inspecting the chore can see why it was reset (and
     // where to find the recovery patch, if one was captured).
     if let Some(work_item_id) = &state.work_item_id
-        && let Err(err) = append_reconcile_audit(
+        && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
             work_item_id,
-            execution_id,
             now_epoch_secs,
+            &format!("dead worker (exec {execution_id}) detected via PID probe; chore reset to todo for redispatch"),
             recovery_patch.as_deref(),
         )
     {
@@ -533,39 +533,6 @@ fn file_pane_death_attention_item(work_db: &WorkDb, work_item_id: &str, executio
             "dead-pid sweep: failed to file pane-death attention item (non-fatal)",
         );
     }
-}
-
-/// Append an `[engine-reconcile]` audit line to the work item's
-/// description so an operator can see why the chore was reset.
-fn append_reconcile_audit(
-    work_db: &WorkDb,
-    work_item_id: &str,
-    dead_execution_id: &str,
-    now_epoch_secs: i64,
-    recovery_patch: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    let item = work_db.get_work_item(work_item_id)?;
-    let current_desc = match &item {
-        boss_protocol::WorkItem::Product(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
-    };
-    let recovery_note = match recovery_patch {
-        Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
-        None => String::new(),
-    };
-    let audit_line = format!(
-        "\n[engine-reconcile] epoch {now_epoch_secs}: dead worker (exec {dead_execution_id}) detected via PID probe; chore reset to todo for redispatch.{recovery_note}"
-    );
-    let new_desc = format!("{current_desc}{audit_line}");
-    work_db.update_work_item(
-        work_item_id,
-        WorkItemPatch {
-            description: Some(new_desc),
-            ..WorkItemPatch::default()
-        },
-    )?;
-    Ok(())
 }
 
 pub(crate) enum PidStatus {

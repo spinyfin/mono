@@ -75,6 +75,7 @@ pub mod pr_review;
 pub mod pr_review_recovery;
 pub mod pr_url_capture;
 pub mod protocol;
+pub(crate) mod reconcile_audit;
 pub mod recovery_backup;
 pub mod remote_lease_reconcile;
 pub mod remote_reattach;
