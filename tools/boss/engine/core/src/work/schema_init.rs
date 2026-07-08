@@ -418,6 +418,12 @@ impl WorkDb {
         // to `attentions` and create the `attention_merges` provenance ledger.
         // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
         migrate_attentions_score_and_merges(&conn)?;
+        // Comment intent classifier terminal-failure surface:
+        // work_comments.intent_classification_failed_at /
+        // intent_classification_error, so a comment whose classifier call
+        // never succeeds shows a failed state instead of an indefinite
+        // "classifying…" spinner. Purely additive.
+        migrate_work_comments_classification_failure_columns(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '23')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

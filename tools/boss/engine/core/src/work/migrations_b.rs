@@ -1668,6 +1668,33 @@ pub(crate) fn migrate_work_comments_intent_columns(conn: &Connection) -> Result<
     Ok(())
 }
 
+/// Add `work_comments.intent_classification_failed_at` /
+/// `intent_classification_error` — the terminal failure surface for the
+/// async intent classifier. Before this, a classifier call that never
+/// succeeded (malformed reply, transport failure, retries exhausted) left
+/// `intent` permanently `NULL` with no distinct trace, so the UI showed the
+/// same indefinite "classifying…" spinner as a call that was merely still in
+/// flight. Purely additive, `NULL` for every existing row. Mirrors
+/// `migrate_work_comments_intent_columns`'s idempotent `ALTER TABLE ADD
+/// COLUMN` pattern.
+pub(crate) fn migrate_work_comments_classification_failure_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "intent_classification_failed_at",
+            "ALTER TABLE work_comments ADD COLUMN intent_classification_failed_at TEXT",
+        ),
+        (
+            "intent_classification_error",
+            "ALTER TABLE work_comments ADD COLUMN intent_classification_error TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "work_comments", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Add `tasks.archived_reason` — a human-readable explanation of *why* the
 /// engine (never a human) auto-archived a row, so `boss task show` can
 /// surface it instead of leaving the operator to reconstruct the reason

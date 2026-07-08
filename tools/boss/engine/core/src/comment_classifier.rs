@@ -39,6 +39,17 @@ const CLASSIFIER_MAX_TOKENS: u32 = 200;
 /// trip." 30s is a generous ceiling for a call this small — the create
 /// request itself never waits on this (it runs detached).
 const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Retry attempts for a single classification (transport failure, non-2xx,
+/// or an unparseable/invalid reply) before giving up. A transient hiccup
+/// (rate limit, brief 5xx, one malformed reply) shouldn't abandon a comment
+/// to an indefinite "classifying" state on the first miss — see
+/// `crate::app::comments::spawn_comment_classifier`, whose caller records a
+/// terminal failure only after this is exhausted.
+const CLASSIFIER_MAX_ATTEMPTS: u32 = 3;
+/// Delay between retry attempts. Small and fixed — this is a detached
+/// background call, not on any request's critical path, so there's no need
+/// for backoff/jitter at this volume.
+const CLASSIFIER_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Resolves the API key for the classifier call: a dedicated billing-bucket
 /// env var, falling back to the shared `ANTHROPIC_API_KEY` — via the shared
@@ -83,7 +94,7 @@ Comment:\n\
 \n\
 Respond with ONLY a JSON object — no explanation, no markdown fences — of the exact \
 shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\": \
-<number between 0.0 and 1.0>}}.",
+<number between 0.0 and 1.0>}}. Do not wrap the JSON in a code fence.",
         prefix = anchor.prefix,
         exact = anchor.exact,
         suffix = anchor.suffix,
@@ -132,7 +143,7 @@ Follow-up reply to classify:\n\
 \n\
 Respond with ONLY a JSON object — no explanation, no markdown fences — of the exact \
 shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\": \
-<number between 0.0 and 1.0>}}.",
+<number between 0.0 and 1.0>}}. Do not wrap the JSON in a code fence.",
         prefix = anchor.prefix,
         exact = anchor.exact,
         suffix = anchor.suffix,
@@ -159,20 +170,45 @@ async fn call_classifier(api_key: &str, prompt: String) -> Result<Classification
     parse_classifier_reply(text)
 }
 
+/// Best-effort extraction of a bare JSON object from a classifier reply.
+/// The prompt asks for an unfenced object, but smaller models (this call
+/// uses Haiku) sometimes wrap the reply in a ```` ```json ```` fence anyway —
+/// defense in depth alongside the prompt instruction, not a replacement for
+/// it. Strips a leading/trailing markdown code fence if present, then hands
+/// off to the shared [`crate::json_extract::find_first_balanced_object`]
+/// (string/escape-aware, so a `}` inside a string value or trailing prose
+/// doesn't mis-bound the slice — the same helper `pr_review.rs` uses).
+/// Falls back to the trimmed input unchanged when no balanced object is
+/// found, so the original text still reaches `serde_json` and produces its
+/// own error.
+fn strip_to_json_object(text: &str) -> &str {
+    let fenced = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_suffix("```"))
+        .map(str::trim);
+    let candidate = fenced.unwrap_or(text);
+    crate::json_extract::find_first_balanced_object(candidate).unwrap_or(candidate)
+}
+
 /// The pure parse+validate step of a classifier call: turn the model's raw
 /// reply text into a validated [`Classification`], independent of transport.
 /// Kept as a standalone helper so its decision behavior (empty-reply,
 /// malformed-JSON, unknown-intent, confidence clamping) is unit-testable
 /// without a network call. [`call_classifier`] invokes it on the response
-/// text — its observable behavior must match what lived inline before.
+/// text — its observable behavior must match what lived inline before,
+/// except that a fenced/prose-wrapped reply is now tolerated rather than
+/// treated as malformed JSON (see [`strip_to_json_object`]).
 fn parse_classifier_reply(text: &str) -> Result<Classification, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("Anthropic returned an empty response".to_owned());
     }
 
-    let reply: ClassifyReply =
-        serde_json::from_str(text).map_err(|e| format!("failed to parse classifier JSON reply: {e} (raw: {text})"))?;
+    let candidate = strip_to_json_object(text);
+    let reply: ClassifyReply = serde_json::from_str(candidate)
+        .map_err(|e| format!("failed to parse classifier JSON reply: {e} (raw: {text})"))?;
 
     match reply.intent.as_str() {
         INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
@@ -185,13 +221,36 @@ fn parse_classifier_reply(text: &str) -> Result<Classification, String> {
     })
 }
 
-/// Make a one-shot classification call for a fresh top-level comment.
-pub async fn classify(api_key: &str, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
-    call_classifier(api_key, build_prompt(body, anchor)).await
+/// Retry [`call_classifier`] up to [`CLASSIFIER_MAX_ATTEMPTS`] times, pausing
+/// [`CLASSIFIER_RETRY_DELAY`] between attempts. Returns the last error once
+/// exhausted — the caller (`spawn_comment_classifier` /
+/// `spawn_followup_classifier`) treats that as the terminal outcome rather
+/// than retrying further itself.
+async fn call_classifier_with_retries(api_key: &str, prompt: String) -> Result<Classification, String> {
+    let mut last_err = String::new();
+    for attempt in 1..=CLASSIFIER_MAX_ATTEMPTS {
+        match call_classifier(api_key, prompt.clone()).await {
+            Ok(classification) => return Ok(classification),
+            Err(err) => {
+                last_err = err;
+                if attempt < CLASSIFIER_MAX_ATTEMPTS {
+                    tokio::time::sleep(CLASSIFIER_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
-/// Make a one-shot classification call for an operator's follow-up reply
-/// (P3c), with the original comment and the thread's prior turns as context.
+/// Make a classification call for a fresh top-level comment, retrying
+/// transient failures (see [`call_classifier_with_retries`]).
+pub async fn classify(api_key: &str, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
+    call_classifier_with_retries(api_key, build_prompt(body, anchor)).await
+}
+
+/// Make a classification call for an operator's follow-up reply (P3c), with
+/// the original comment and the thread's prior turns as context, retrying
+/// transient failures (see [`call_classifier_with_retries`]).
 pub async fn classify_followup(
     api_key: &str,
     original_body: &str,
@@ -199,7 +258,7 @@ pub async fn classify_followup(
     thread: &[CommentThreadEntry],
     followup_body: &str,
 ) -> Result<Classification, String> {
-    call_classifier(
+    call_classifier_with_retries(
         api_key,
         build_followup_prompt(original_body, anchor, thread, followup_body),
     )
@@ -293,6 +352,28 @@ mod tests {
     fn parse_reply_rejects_malformed_json() {
         let err = parse_classifier_reply("not json at all").unwrap_err();
         assert!(err.contains("failed to parse classifier JSON reply"));
+    }
+
+    #[test]
+    fn parse_reply_tolerates_a_json_fenced_reply() {
+        let raw = "```json\n{\"intent\": \"question\", \"confidence\": 0.95}\n```";
+        let classification = parse_classifier_reply(raw).unwrap();
+        assert_eq!(classification.intent, "question");
+        assert_eq!(classification.confidence, 0.95);
+    }
+
+    #[test]
+    fn parse_reply_tolerates_a_bare_fenced_reply() {
+        let raw = "```\n{\"intent\": \"directive\", \"confidence\": 0.8}\n```";
+        let classification = parse_classifier_reply(raw).unwrap();
+        assert_eq!(classification.intent, "directive");
+    }
+
+    #[test]
+    fn parse_reply_tolerates_prose_wrapped_json() {
+        let raw = "Here's the classification: {\"intent\": \"larger_change\", \"confidence\": 0.6} Hope that helps!";
+        let classification = parse_classifier_reply(raw).unwrap();
+        assert_eq!(classification.intent, "larger_change");
     }
 
     #[test]
