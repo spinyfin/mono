@@ -1,0 +1,30 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "build-info",
+    srcs = glob(
+        ["src/**/*.rs"],
+        # Cargo-only fallback: build.rs points BOSS_BUILD_INFO_RS at this
+        # file so `include!(env!(...))` compiles without Bazel. It is
+        # never a `mod` here (the stamp!-generated module in each binary
+        # crate include!s it), so keep it out of this crate's compile.
+        exclude = ["src/build_info_default.rs"],
+    ),
+    crate_name = "boss_build_info",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/cli:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
+)
+
+rust_test(
+    name = "build-info_test",
+    size = "small",
+    crate = ":build-info",
+    edition = "2024",
+)

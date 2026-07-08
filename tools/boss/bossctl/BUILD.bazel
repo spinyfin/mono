@@ -25,6 +25,7 @@ rust_binary(
     },
     visibility = ["//visibility:public"],
     deps = [
+        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/log-files",
@@ -42,6 +43,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/log-files",

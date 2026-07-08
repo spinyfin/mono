@@ -59,6 +59,7 @@ rust_binary(
     ],
     deps = [
         "//lib/rust/git_utils",
+        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/editorial",
         "//tools/boss/github",
@@ -76,6 +77,7 @@ rust_test(
     ),
     deps = [
         "//lib/rust/git_utils",
+        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/editorial",
         "//tools/boss/github",
