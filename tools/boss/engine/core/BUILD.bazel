@@ -72,6 +72,7 @@ rust_binary(
     ],
     deps = [
         ":engine_lib",
+        "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
 )
 
