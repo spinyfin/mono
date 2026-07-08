@@ -61,12 +61,12 @@ use crate::merge_poller::{
 };
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
-#[cfg(test)]
-use crate::work::TaskStatus;
 use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, CreateExecutionInput, FinishExecutionRunInput,
-    PendingMergeCheck, THREAD_ENTRY_KIND_ANSWER, WorkDb, WorkItem, WorkerPrCompletionTarget,
+    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck,
+    THREAD_ENTRY_KIND_ANSWER, WorkDb, WorkItem, WorkerPrCompletionTarget,
 };
+#[cfg(test)]
+use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_github::pr_url::pr_number_from_url;
 
@@ -2212,34 +2212,32 @@ must not be asked to open one",
 
         // Finalise the execution + release pane and cube workspace, mirroring
         // the PR-completion finalizer's release order. Capture the lease id
-        // before `finish_execution_run` nulls the lease columns.
+        // before `complete_pane_parked_execution` nulls the lease columns.
+        //
+        // This unconditionally drives the execution to `completed` — it does
+        // NOT depend on there being a still-`active` work_runs row, because
+        // `PaneSpawnRunner` already closed that row out at spawn-confirm time
+        // (see `complete_pane_parked_execution`'s doc). Looping over
+        // `active_run_ids_for_execution` here (as this used to) found nothing
+        // in the common single-turn case, silently leaving the execution
+        // stuck `waiting_human` — which is exactly what let the pane-death
+        // sweep re-finalize an already-finalized triage run later with a
+        // misleading pane-died detail.
         let lease_id = execution.cube_lease_id.clone();
-        match self.work_db.active_run_ids_for_execution(&execution.id) {
-            Ok(run_ids) => {
-                for run_id in run_ids {
-                    if let Err(err) = self.work_db.finish_execution_run(
-                        FinishExecutionRunInput::builder()
-                            .execution_id(&execution.id)
-                            .run_id(&run_id)
-                            .execution_status(ExecutionStatus::Completed)
-                            .run_status("completed")
-                            .result_summary(format!("automation triage: {outcome}"))
-                            .clear_workspace_lease(true)
-                            .build(),
-                    ) {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            run_id,
-                            ?err,
-                            "failed to finish triage execution run",
-                        );
-                    }
-                }
-            }
-            Err(err) => tracing::warn!(
+        match self.work_db.complete_pane_parked_execution(
+            &execution.id,
+            "completed",
+            Some(&format!("automation triage: {outcome}")),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::debug!(
+                execution_id = %execution.id,
+                "automation triage finalise: execution already terminal; nothing to do",
+            ),
+            Err(err) => tracing::error!(
                 execution_id = %execution.id,
                 ?err,
-                "failed to list active runs for triage finalisation",
+                "failed to finalise triage execution row",
             ),
         }
         if let Some(lease_id) = lease_id.as_deref()
@@ -2348,39 +2346,28 @@ must not be asked to open one",
         };
 
         // Finalise the execution + release pane and cube workspace, mirroring
-        // the triage finalizer's release order. Capture the lease id before
-        // `finish_execution_run` nulls the lease columns.
+        // the triage finalizer's release order and its use of
+        // `complete_pane_parked_execution` (see that finalizer's comment for
+        // why this does not depend on there being a still-`active` run).
         let lease_id = execution.cube_lease_id.clone();
-        match self.work_db.active_run_ids_for_execution(&execution.id) {
-            Ok(run_ids) => {
-                for run_id in run_ids {
-                    if let Err(err) = self.work_db.finish_execution_run(
-                        FinishExecutionRunInput::builder()
-                            .execution_id(&execution.id)
-                            .run_id(&run_id)
-                            .execution_status(ExecutionStatus::Completed)
-                            .run_status("completed")
-                            .result_summary(if replied {
-                                "answer agent: replied"
-                            } else {
-                                "answer agent: no reply posted"
-                            })
-                            .clear_workspace_lease(true)
-                            .build(),
-                    ) {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            run_id,
-                            ?err,
-                            "failed to finish answer-agent execution run",
-                        );
-                    }
-                }
-            }
-            Err(err) => tracing::warn!(
+        match self.work_db.complete_pane_parked_execution(
+            &execution.id,
+            "completed",
+            Some(if replied {
+                "answer agent: replied"
+            } else {
+                "answer agent: no reply posted"
+            }),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::debug!(
+                execution_id = %execution.id,
+                "answer-agent finalise: execution already terminal; nothing to do",
+            ),
+            Err(err) => tracing::error!(
                 execution_id = %execution.id,
                 ?err,
-                "failed to list active runs for answer-agent finalisation",
+                "failed to finalise answer-agent execution row",
             ),
         }
         if let Some(lease_id) = lease_id.as_deref()
@@ -4582,6 +4569,22 @@ manual review."
                 return;
             }
         };
+        // `AutomationTriage`'s `work_item_id` is an automation id and
+        // `AnswerAgent`'s is a comment id — neither is a product/project/task,
+        // so `get_work_item` can never resolve them, and neither kind ever
+        // has a bound PR to snapshot a head SHA for. Skip before paying for
+        // (and warning on) a lookup that structurally cannot succeed.
+        if matches!(
+            execution.kind,
+            ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+        ) {
+            tracing::debug!(
+                execution_id,
+                kind = %execution.kind.as_str(),
+                "execution_started hook: kind never has a bound PR — skipping pr_head_before snapshot"
+            );
+            return;
+        }
         let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id) {
             Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
                 // For revision_implementation executions the task's own

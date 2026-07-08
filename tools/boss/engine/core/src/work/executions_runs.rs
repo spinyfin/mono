@@ -1080,6 +1080,70 @@ impl WorkDb {
         Ok((execution, run, attention_item))
     }
 
+    /// Unconditionally drive a pane-parked execution (`running` or
+    /// `waiting_human`) to the `completed` terminal status, for a Stop-hook
+    /// finalizer whose worker's real decision (a triage marker, an
+    /// answer-agent reply) is resolved well after the pane's *spawn* already
+    /// completed.
+    ///
+    /// Why this exists instead of routing through [`Self::finish_execution_run`]
+    /// via [`Self::active_run_ids_for_execution`]: `PaneSpawnRunner` records
+    /// the spawn itself as the run's completion the instant the pane comes up
+    /// — parking the execution in `waiting_human` with the run's
+    /// `finished_at` already stamped (see `RunWaitState::WaitingHuman`). By
+    /// the time the worker's actual Stop hook fires, `work_runs` normally has
+    /// no row with `finished_at IS NULL` left to find, so a finalizer that
+    /// only closes "active" runs is a silent no-op — the execution stays
+    /// `waiting_human` forever, and the pane-death sweep later "reconciles"
+    /// it a second time with a misleading pane-died detail (the double-finalize
+    /// this closes). This instead closes any run that happens to still be
+    /// open (the rarer multi-turn/nudge case) and unconditionally transitions
+    /// the execution row itself, both in one transaction.
+    ///
+    /// Idempotent: returns `Ok(None)` without writing anything if the
+    /// execution is already terminal, so it is always safe to call from a
+    /// hook handler that may fire more than once, or race a concurrent
+    /// reconciler.
+    pub fn complete_pane_parked_execution(
+        &self,
+        execution_id: &str,
+        run_status: &str,
+        result_summary: Option<&str>,
+    ) -> Result<Option<WorkExecution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() {
+            return Ok(None);
+        }
+
+        let now = now_string();
+        let normalized_summary = normalize_optional_text(result_summary.map(str::to_owned));
+        tx.execute(
+            "UPDATE work_runs
+             SET status = ?2,
+                 result_summary = COALESCE(?3, result_summary),
+                 finished_at = COALESCE(finished_at, ?4)
+             WHERE execution_id = ?1
+               AND finished_at IS NULL",
+            params![execution_id, run_status, normalized_summary, now],
+        )?;
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'completed',
+                 cube_lease_id = NULL,
+                 cube_workspace_id = NULL,
+                 workspace_path = NULL,
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
