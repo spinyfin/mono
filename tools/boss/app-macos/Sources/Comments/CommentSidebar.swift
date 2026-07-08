@@ -196,8 +196,11 @@ private struct ThreadEntriesView: View {
                     Image(systemName: symbolName(for: entry.entryKind))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    Text(entry.body)
-                        .font(.caption)
+                    StructuredText(markdown: entry.body)
+                        .bossMarkdown()
+                        // Scale the shared 17pt-body-relative theme down to
+                        // match this view's previous `.caption` (12pt) size.
+                        .textual.fontScale(12.0 / 17.0)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
