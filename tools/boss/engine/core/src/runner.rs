@@ -686,7 +686,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         body: String,
     }
 
-    let pr_number: u64 = pr_url.split('/').next_back()?.parse().ok()?;
+    let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)?;
 
     let output = crate::gh_invocation::gh_output(&[
         "pr",
