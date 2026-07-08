@@ -26,7 +26,7 @@ use crate::external_tracker::github_oauth::{
 use crate::ipc_log::IpcLogger;
 use crate::live_status_loop::{LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
+use crate::merge_poller::{CommandMergeProbe, MergeProbe, PrReconcilerTargetedKick, spawn_loop as spawn_merge_poller};
 use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
@@ -616,6 +616,15 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
+    /// Targeted companion to `pr_reconciler_kick`: lets a future caller
+    /// (push-event relay, adaptive per-PR timer — see
+    /// `tools/boss/docs/investigations/
+    /// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9)
+    /// request an immediate pass for one specific PR instead of the broad
+    /// "sweep everything" kick. No caller fires this yet; it's plumbed
+    /// through to the poller so that follow-up work has an entry point.
+    #[builder(default)]
+    pr_reconciler_targeted_kick: PrReconcilerTargetedKick,
     /// Kick signal for the automation scheduler loop. Notified by any
     /// automation mutation handler (create, update, enable, disable,
     /// delete) so the scheduler recomputes its min-next-fire sleep

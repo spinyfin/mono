@@ -675,7 +675,10 @@ pub async fn serve(
         ),
         Duration::from_secs(60),
         server_state.metrics.clone(),
-        server_state.pr_reconciler_kick.clone(),
+        (
+            server_state.pr_reconciler_kick.clone(),
+            server_state.pr_reconciler_targeted_kick.clone(),
+        ),
     );
 
     // Periodic dead-PID reconciler: detects worker slots whose backing
