@@ -661,7 +661,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
     use crate::transient_error::RecoveryPolicy;
@@ -746,15 +745,6 @@ mod tests {
             writeln!(f, "{line}").unwrap();
         }
         path.to_string_lossy().into_owned()
-    }
-
-    fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
-        Arc::new(ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(pool_size),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        ))
     }
 
     fn register_idle_slot(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str, work_item_id: &str) {
