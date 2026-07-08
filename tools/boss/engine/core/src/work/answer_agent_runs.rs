@@ -112,6 +112,22 @@ impl WorkDb {
             .map_err(Into::into)
     }
 
+    /// Every answer-agent run for a comment, oldest first — the full history
+    /// [`Self::latest_answer_agent_run_for_comment`] and
+    /// [`Self::running_answer_agent_run_for_comment`] only sample a single row
+    /// of. Backs `bossctl comments show` / `bossctl comments runs`, which
+    /// otherwise had no way to answer "how many answer-agent runs has this
+    /// comment had, and how did each end" without raw SQL against
+    /// `answer_agent_runs`.
+    pub fn list_answer_agent_runs_for_comment(&self, comment_id: &str) -> Result<Vec<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = Self::answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 ORDER BY created_at ASC, id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([comment_id], map_answer_agent_run)?;
+        collect_rows(rows)
+    }
+
     /// The most recent answer-agent run for a comment (by `created_at`, then
     /// `id` as a stable tiebreak). Drives the bridging path — when a follow-up
     /// reclassifies to `directive`/`larger_change`, the latest run's
@@ -362,5 +378,34 @@ mod tests {
         db.complete_answer_agent_run(&run.id, "replied", Some("done"), None)
             .unwrap();
         assert!(db.running_answer_agent_run_for_comment(&comment).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_all_runs_for_comment_returns_full_history_oldest_first() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        assert!(db.list_answer_agent_runs_for_comment(&comment).unwrap().is_empty());
+
+        let first = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        db.complete_answer_agent_run(&first.id, "failed", None, Some("api_error"))
+            .unwrap();
+        let second = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v1", 1)
+            .unwrap();
+        db.complete_answer_agent_run(&second.id, "replied", Some("done"), None)
+            .unwrap();
+
+        let all = db.list_answer_agent_runs_for_comment(&comment).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, first.id);
+        assert_eq!(all[0].status, "failed");
+        assert_eq!(all[1].id, second.id);
+        assert_eq!(all[1].status, "replied");
+
+        // A different comment's history is isolated.
+        let other = make_comment(&db, "t2");
+        assert!(db.list_answer_agent_runs_for_comment(&other).unwrap().is_empty());
     }
 }

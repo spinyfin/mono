@@ -837,6 +837,39 @@ impl WorkDb {
         query_execution(&conn, id).require("execution", id)
     }
 
+    /// `work_executions.host_id` for one execution — the host the
+    /// scheduler attributed the run to. `None` before a run has picked a
+    /// host (not yet dispatched, or a pre-migration row); the engine
+    /// treats an absent value as `"local"`. Backs `bossctl work
+    /// executions`, which otherwise had no way to show which host ran an
+    /// execution without a raw `work_executions`/`work_runs` query.
+    pub fn execution_host_id(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let host: Option<Option<String>> = conn
+            .query_row(
+                "SELECT host_id FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(host.flatten())
+    }
+
+    /// `work_executions.host_id` for every execution of `work_item_id`, in
+    /// one query. Backs `bossctl work executions`, which previously issued
+    /// one [`Self::execution_host_id`] point read per row; batching avoids
+    /// the N+1 query pattern for work items with many executions.
+    pub fn execution_host_ids_for_item(&self, work_item_id: &str) -> Result<HashMap<String, String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT id, host_id FROM work_executions WHERE work_item_id = ?1")?;
+        let rows = stmt.query_map(params![work_item_id], |row| {
+            let id: String = row.get(0)?;
+            let host_id: Option<String> = row.get(1)?;
+            Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
+        })?;
+        collect_rows(rows).map(|entries: Vec<(String, String)>| entries.into_iter().collect())
+    }
+
     /// Return true if `execution` is a stale prior occupant of a reused
     /// (warm-cached) cube workspace: another live (`running` /
     /// `waiting_human`) execution now claims the same `cube_workspace_id`

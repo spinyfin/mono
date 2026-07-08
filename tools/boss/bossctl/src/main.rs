@@ -22,6 +22,7 @@ use boss_engine::work::WorkDb;
 use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 
+mod comments;
 mod logs;
 mod review;
 use boss_engine::dispatch_events::DispatchEvent;
@@ -150,6 +151,16 @@ enum Command {
     Executions {
         #[command(subcommand)]
         action: ExecutionsAction,
+    },
+    /// Read-only inspection of `work_comments` and `answer_agent_runs` rows.
+    ///
+    /// Reads `state.db` directly (same resolution as `metrics`/`hosts`) —
+    /// works even when the engine is wedged. Exists so diagnosing a stuck
+    /// comment thread or a missing answer-agent reply doesn't require raw
+    /// `sqlite3` against `state.db`.
+    Comments {
+        #[command(subcommand)]
+        action: comments::CommentsAction,
     },
     /// Scroll the kanban in the macOS app to a work item's card and
     /// play a short transient highlight. Accepts a short id (`T607`)
@@ -413,6 +424,17 @@ enum WorkAction {
     },
     /// Cancel a queued or running execution.
     Cancel { execution_id: String },
+    /// Full execution history for a work item — every `work_executions`
+    /// row regardless of status, oldest first, with the host each one
+    /// ran on. Reads `state.db` directly (same resolution as
+    /// `metrics`/`hosts`), so it works even when the engine is wedged.
+    /// Exec ids are ready to paste into `bossctl dispatch diagnose`.
+    Executions {
+        work_item_id: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -690,6 +712,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Work {
             action: WorkAction::Cancel { execution_id },
         } => work_cancel(&cli.socket_path, cli.json, execution_id).await,
+        Command::Work {
+            action: WorkAction::Executions {
+                work_item_id,
+                state_root,
+            },
+        } => work_executions(cli.json, state_root, &work_item_id),
         Command::Workspace {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
@@ -796,6 +824,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     state_root,
                 },
         } => executions_prune(cli.json, state_root, older_than_days, keep_per_work_item, dry_run),
+        Command::Comments {
+            action:
+                comments::CommentsAction::List {
+                    task,
+                    artifact,
+                    artifact_kind,
+                    include_resolved,
+                    state_root,
+                },
+        } => comments::comments_list(cli.json, state_root, task, artifact, artifact_kind, include_resolved),
+        Command::Comments {
+            action: comments::CommentsAction::Show { comment_id, state_root },
+        } => comments::comments_show(cli.json, state_root, &comment_id),
+        Command::Comments {
+            action: comments::CommentsAction::Runs { comment_id, state_root },
+        } => comments::comments_runs(cli.json, state_root, &comment_id),
         Command::Reveal { id } => reveal_work_item(&cli.socket_path, cli.json, id).await,
         Command::Logs {
             source,
@@ -2034,7 +2078,7 @@ fn print_execution(json: bool, execution: &WorkExecution) {
 /// default under `state_root` (which itself defaults to
 /// `$HOME/Library/Application Support/Boss`). The explicit
 /// `state_root` arg takes priority over `BOSS_DB_PATH`.
-fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(root) = state_root {
         return Ok(root.join("state.db"));
     }
@@ -2090,6 +2134,64 @@ fn executions_prune(
         );
     }
     Ok(())
+}
+
+/// `bossctl work executions` — full execution history for a work item,
+/// oldest first, with the host each execution ran on. Opens `state.db`
+/// directly via [`resolve_db_path`] (same resolution `metrics`/`hosts`
+/// use), so it works even when the engine is wedged.
+fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) -> Result<()> {
+    let db_path = resolve_db_path(state_root)?;
+    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let executions = db.list_executions(Some(work_item_id)).context("listing executions")?;
+    let host_ids = db
+        .execution_host_ids_for_item(work_item_id)
+        .context("resolving execution hosts")?;
+    let hosts: Vec<String> = executions
+        .iter()
+        .map(|e| host_ids.get(&e.id).cloned().unwrap_or_else(|| "local".to_owned()))
+        .collect();
+
+    if json {
+        let entries: Vec<serde_json::Value> = executions
+            .iter()
+            .zip(hosts.iter())
+            .map(|(exec, host)| {
+                let mut value = serde_json::to_value(exec).unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("host_id".into(), serde_json::Value::String(host.clone()));
+                }
+                value
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "work_item_id": work_item_id,
+                "executions": entries,
+            })
+        );
+    } else if executions.is_empty() {
+        println!("no executions for {work_item_id}");
+    } else {
+        for (exec, host) in executions.iter().zip(hosts.iter()) {
+            print_execution_history_row(exec, host);
+        }
+    }
+    Ok(())
+}
+
+fn print_execution_history_row(exec: &WorkExecution, host: &str) {
+    let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
+    let started = exec.started_at.as_deref().unwrap_or("-");
+    let finished = exec.finished_at.as_deref().unwrap_or("-");
+    println!(
+        "{}  [{}]  kind={}  host={}  workspace={}  created={}  started={}  finished={}",
+        exec.id, exec.status, exec.kind, host, workspace, exec.created_at, started, finished,
+    );
+    if let Some(pr_url) = &exec.pr_url {
+        println!("  pr_url: {pr_url}");
+    }
 }
 
 /// Format a millisecond timestamp as a human-friendly relative age
