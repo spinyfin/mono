@@ -310,9 +310,14 @@ private struct AutomationDetailView: View {
                     // Level 2: show the why from the most recent run's detail.
                     if let detail = runs.first?.detail, !detail.isEmpty {
                         LabeledContent("Reason") {
-                            Text(detail)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(detail)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                if let taskID = runs.first?.producedTaskID {
+                                    ProducedTaskLink(model: model, taskID: taskID)
+                                }
+                            }
                         }
                     }
                     if let nextDue = automation.nextDueAt {
@@ -337,7 +342,7 @@ private struct AutomationDetailView: View {
                 if !runs.isEmpty {
                     AutomationDetailSection(title: "Recent Runs") {
                         ForEach(runs) { run in
-                            AutomationRunRow(run: run)
+                            AutomationRunRow(model: model, run: run)
                         }
                     }
                 }
@@ -467,6 +472,28 @@ enum AutomationTime {
     }()
 }
 
+/// Tappable `"T<short id>"` badge for a produced task, mirroring the
+/// attention association reveal-in-kanban affordance. Renders nothing when
+/// the task isn't in the local cache yet (e.g. a stale run whose task was
+/// later deleted) — never falls back to showing the canonical id.
+private struct ProducedTaskLink: View {
+    @ObservedObject var model: ChatViewModel
+    let taskID: String
+
+    var body: some View {
+        if let task = model.task(withID: taskID), let shortID = task.shortID {
+            Button {
+                model.revealWorkCard(taskID, productID: task.productID)
+            } label: {
+                Text("T\(shortID)")
+                    .font(.system(.caption2, design: .monospaced))
+            }
+            .buttonStyle(.link)
+            .help("Reveal task T\(shortID) in the kanban")
+        }
+    }
+}
+
 private struct AutomationDetailSection<Content: View>: View {
     let title: String
     @ViewBuilder let content: () -> Content
@@ -484,6 +511,7 @@ private struct AutomationDetailSection<Content: View>: View {
 // MARK: - Run history row
 
 private struct AutomationRunRow: View {
+    @ObservedObject var model: ChatViewModel
     let run: AppAutomationRun
 
     var body: some View {
@@ -492,6 +520,9 @@ private struct AutomationRunRow: View {
                 Text(run.outcomeLabel)
                     .font(.caption)
                     .foregroundStyle(runOutcomeColor(for: run.outcome))
+                if let taskID = run.producedTaskID {
+                    ProducedTaskLink(model: model, taskID: taskID)
+                }
                 Spacer(minLength: 0)
                 Text(AutomationTime.relative(run.scheduledFor, now: Date()))
                     .font(.caption2)

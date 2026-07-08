@@ -2076,7 +2076,7 @@ must not be asked to open one",
                         (
                             AUTOMATION_OUTCOME_PRODUCED_TASK,
                             Some(t.id.clone()),
-                            Some(format!("produced task {}", t.id)),
+                            Some(format!("produced task {}", t.short_label())),
                         )
                     }
                     other => {

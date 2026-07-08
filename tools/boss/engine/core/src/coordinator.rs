@@ -2181,11 +2181,10 @@ impl ExecutionCoordinator {
                             &execution.id,
                             boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
                             None,
-                            Some(&format!(
+                            Some(
                                 "dispatch aborted pre-spawn at host_selected: redundant_spawn \
-                                 (superseded by live execution {})",
-                                live.id
-                            )),
+                                 (superseded by another live execution)",
+                            ),
                         )
                     {
                         tracing::warn!(

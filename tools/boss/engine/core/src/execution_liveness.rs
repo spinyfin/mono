@@ -78,7 +78,7 @@ pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExe
         Ok(Some(task)) => {
             let detail = format!(
                 "produced_task (dead-pane recovery): task {} was created before the triage pane died; {death_reason}",
-                task.id
+                task.short_label()
             );
             (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
         }
