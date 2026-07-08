@@ -1202,3 +1202,385 @@ impl WorkDb {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `CreateAttentionInput` with only `kind` set; all other fields default
+    /// to `None`. Individual tests set just the fields they exercise.
+    fn input(kind: &str) -> CreateAttentionInput {
+        CreateAttentionInput {
+            kind: kind.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// A minimal question group. `source_doc_path` is the only content the
+    /// pure producers (`question_artifact_name`, `build_qa_brief`) read.
+    fn question_group(source_doc_path: Option<&str>) -> AttentionGroup {
+        AttentionGroup::builder()
+            .id("atg_q")
+            .product_id("prod_1")
+            .created_at("2026-01-01T00:00:00Z")
+            .grouping_key("question|proj_1|doc:x")
+            .kind("question")
+            .source_kind("design_doc")
+            .maybe_source_doc_path(source_doc_path.map(str::to_owned))
+            .build()
+    }
+
+    /// A minimal answered question member carrying a prompt/answer/anchor.
+    fn answered_member(prompt: &str, answer: &str, anchor: Option<&str>) -> Attention {
+        Attention::builder()
+            .id("atn_1")
+            .group_id("atg_q")
+            .ordinal(1)
+            .answer_state("answered")
+            .created_at("2026-01-01T00:00:00Z")
+            .prompt_text(prompt)
+            .answer(answer)
+            .maybe_source_anchor(anchor.map(str::to_owned))
+            .build()
+    }
+
+    // --- group_is_terminal ---------------------------------------------------
+
+    #[test]
+    fn group_is_terminal_only_for_actioned_and_dismissed() {
+        assert!(group_is_terminal("actioned"));
+        assert!(group_is_terminal("dismissed"));
+        // Open / in-progress states are not terminal.
+        assert!(!group_is_terminal("open"));
+        assert!(!group_is_terminal("partially_answered"));
+        assert!(!group_is_terminal("answered"));
+        // Arbitrary / unknown strings are treated as non-terminal.
+        assert!(!group_is_terminal(""));
+        assert!(!group_is_terminal("Actioned"));
+        assert!(!group_is_terminal("whatever"));
+    }
+
+    // --- content_key ---------------------------------------------------------
+
+    #[test]
+    fn content_key_question_keys_on_type_prompt_and_anchor() {
+        let base = content_key("question", Some("prompt"), Some("Ship it?"), Some("§1"), None);
+        // Same prompt asked about a different anchor is a *different* member.
+        let other_anchor = content_key("question", Some("prompt"), Some("Ship it?"), Some("§2"), None);
+        assert_ne!(base, other_anchor);
+        // A different question_type also changes identity.
+        let other_type = content_key("question", Some("yes_no"), Some("Ship it?"), Some("§1"), None);
+        assert_ne!(base, other_type);
+        // Same inputs collapse to the same key.
+        assert_eq!(
+            base,
+            content_key("question", Some("prompt"), Some("Ship it?"), Some("§1"), None)
+        );
+        // `proposed_name` is irrelevant on the question branch.
+        assert_eq!(
+            base,
+            content_key(
+                "question",
+                Some("prompt"),
+                Some("Ship it?"),
+                Some("§1"),
+                Some("ignored")
+            )
+        );
+    }
+
+    #[test]
+    fn content_key_followup_keys_only_on_proposed_name() {
+        let base = content_key("followup", None, None, None, Some("Add retries"));
+        // Re-phrased description / other fields don't matter — only the name.
+        assert_eq!(
+            base,
+            content_key(
+                "followup",
+                Some("prompt"),
+                Some("different"),
+                Some("anchor"),
+                Some("Add retries")
+            )
+        );
+        // A different name is a different followup.
+        assert_ne!(base, content_key("followup", None, None, None, Some("Add backoff")));
+    }
+
+    #[test]
+    fn content_key_fallback_branch_keys_on_prompt_text() {
+        // Unknown kinds fall through to the `{other}` + prompt_text branch.
+        let a = content_key("weird", None, Some("hello"), None, None);
+        assert_eq!(a, content_key("weird", Some("q"), Some("hello"), Some("x"), Some("y")));
+        assert_ne!(a, content_key("weird", None, Some("world"), None, None));
+        // The kind is part of the fallback key.
+        assert_ne!(a, content_key("odd", None, Some("hello"), None, None));
+    }
+
+    #[test]
+    fn content_key_none_fields_default_to_empty() {
+        assert_eq!(content_key("question", None, None, None, None), "q\u{1f}\u{1f}\u{1f}");
+        assert_eq!(content_key("followup", None, None, None, None), "f\u{1f}");
+    }
+
+    #[test]
+    fn content_key_separator_keeps_field_boundaries_unambiguous() {
+        // Without a separator, ("ab","c") and ("a","bc") would collide. The
+        // unit separator between fields keeps them distinct.
+        let split_a = content_key("question", Some("ab"), Some("c"), Some(""), None);
+        let split_b = content_key("question", Some("a"), Some("bc"), Some(""), None);
+        assert_ne!(split_a, split_b);
+    }
+
+    // --- derive_grouping_key -------------------------------------------------
+
+    #[test]
+    fn derive_grouping_key_question_shape() {
+        let mut i = input("question");
+        i.association_project_id = Some("proj_9".to_owned());
+        i.source_doc_path = Some("docs/plan.md".to_owned());
+        assert_eq!(derive_grouping_key(&i).unwrap(), "question|proj_9|doc:docs/plan.md");
+    }
+
+    #[test]
+    fn derive_grouping_key_question_requires_project_and_doc_path() {
+        // Missing project id.
+        let mut i = input("question");
+        i.source_doc_path = Some("docs/plan.md".to_owned());
+        assert!(derive_grouping_key(&i).is_err());
+
+        // Empty project id is treated as missing.
+        let mut i = input("question");
+        i.association_project_id = Some(String::new());
+        i.source_doc_path = Some("docs/plan.md".to_owned());
+        assert!(derive_grouping_key(&i).is_err());
+
+        // Missing doc path.
+        let mut i = input("question");
+        i.association_project_id = Some("proj_9".to_owned());
+        assert!(derive_grouping_key(&i).is_err());
+
+        // Empty doc path is treated as missing.
+        let mut i = input("question");
+        i.association_project_id = Some("proj_9".to_owned());
+        i.source_doc_path = Some(String::new());
+        assert!(derive_grouping_key(&i).is_err());
+    }
+
+    #[test]
+    fn derive_grouping_key_followup_prefers_source_task_then_association() {
+        // Prefers source_task_id when both are present.
+        let mut i = input("followup");
+        i.source_task_id = Some("task_src".to_owned());
+        i.association_task_id = Some("task_assoc".to_owned());
+        assert_eq!(derive_grouping_key(&i).unwrap(), "followup|task_src");
+
+        // Falls back to association_task_id when source is absent.
+        let mut i = input("followup");
+        i.association_task_id = Some("task_assoc".to_owned());
+        assert_eq!(derive_grouping_key(&i).unwrap(), "followup|task_assoc");
+
+        // An empty source_task_id falls through to association_task_id.
+        let mut i = input("followup");
+        i.source_task_id = Some(String::new());
+        i.association_task_id = Some("task_assoc".to_owned());
+        assert_eq!(derive_grouping_key(&i).unwrap(), "followup|task_assoc");
+    }
+
+    #[test]
+    fn derive_grouping_key_followup_requires_a_task() {
+        // Neither source nor association task id.
+        assert!(derive_grouping_key(&input("followup")).is_err());
+
+        // Both empty is still an error.
+        let mut i = input("followup");
+        i.source_task_id = Some(String::new());
+        i.association_task_id = Some(String::new());
+        assert!(derive_grouping_key(&i).is_err());
+    }
+
+    #[test]
+    fn derive_grouping_key_unknown_kind_errors() {
+        assert!(derive_grouping_key(&input("mystery")).is_err());
+    }
+
+    // --- validate_member_input -----------------------------------------------
+
+    #[test]
+    fn validate_question_accepts_each_valid_type() {
+        for qt in ["yes_no", "prompt"] {
+            let mut i = input("question");
+            i.question_type = Some(qt.to_owned());
+            i.prompt_text = Some("Proceed?".to_owned());
+            assert!(validate_member_input(&i).is_ok(), "type {qt} should validate");
+        }
+        // multiple_choice needs choice_options too.
+        let mut i = input("question");
+        i.question_type = Some("multiple_choice".to_owned());
+        i.prompt_text = Some("Pick one".to_owned());
+        i.choice_options = Some("[\"a\",\"b\"]".to_owned());
+        assert!(validate_member_input(&i).is_ok());
+    }
+
+    #[test]
+    fn validate_question_rejects_bad_type_and_missing_prompt() {
+        // Missing question_type.
+        let mut i = input("question");
+        i.prompt_text = Some("Proceed?".to_owned());
+        assert!(validate_member_input(&i).is_err());
+
+        // Invalid question_type.
+        let mut i = input("question");
+        i.question_type = Some("freeform".to_owned());
+        i.prompt_text = Some("Proceed?".to_owned());
+        assert!(validate_member_input(&i).is_err());
+
+        // Valid type but empty prompt_text.
+        let mut i = input("question");
+        i.question_type = Some("prompt".to_owned());
+        i.prompt_text = Some(String::new());
+        assert!(validate_member_input(&i).is_err());
+
+        // Missing prompt_text entirely.
+        let mut i = input("question");
+        i.question_type = Some("prompt".to_owned());
+        assert!(validate_member_input(&i).is_err());
+    }
+
+    #[test]
+    fn validate_multiple_choice_requires_choice_options() {
+        let mut i = input("question");
+        i.question_type = Some("multiple_choice".to_owned());
+        i.prompt_text = Some("Pick one".to_owned());
+        // No choice_options.
+        assert!(validate_member_input(&i).is_err());
+
+        // Empty choice_options is treated as missing.
+        i.choice_options = Some(String::new());
+        assert!(validate_member_input(&i).is_err());
+    }
+
+    #[test]
+    fn validate_followup_accepts_valid_and_rejects_bad_work_kind() {
+        // Bare name is enough (work kind is optional).
+        let mut i = input("followup");
+        i.proposed_name = Some("Add retries".to_owned());
+        assert!(validate_member_input(&i).is_ok());
+
+        // Each valid work kind is accepted.
+        for wk in ["task", "chore", "project"] {
+            let mut i = input("followup");
+            i.proposed_name = Some("Add retries".to_owned());
+            i.proposed_work_kind = Some(wk.to_owned());
+            assert!(validate_member_input(&i).is_ok(), "work kind {wk} should validate");
+        }
+
+        // Missing / empty proposed_name is rejected.
+        assert!(validate_member_input(&input("followup")).is_err());
+        let mut i = input("followup");
+        i.proposed_name = Some(String::new());
+        assert!(validate_member_input(&i).is_err());
+
+        // A name but an invalid work kind is rejected.
+        let mut i = input("followup");
+        i.proposed_name = Some("Add retries".to_owned());
+        i.proposed_work_kind = Some("epic".to_owned());
+        assert!(validate_member_input(&i).is_err());
+    }
+
+    #[test]
+    fn validate_unknown_kind_errors() {
+        assert!(validate_member_input(&input("mystery")).is_err());
+    }
+
+    // --- parse_effort --------------------------------------------------------
+
+    #[test]
+    fn parse_effort_maps_each_level() {
+        assert_eq!(parse_effort(Some("trivial")), Some(EffortLevel::Trivial));
+        assert_eq!(parse_effort(Some("small")), Some(EffortLevel::Small));
+        assert_eq!(parse_effort(Some("medium")), Some(EffortLevel::Medium));
+        assert_eq!(parse_effort(Some("large")), Some(EffortLevel::Large));
+        assert_eq!(parse_effort(Some("max")), Some(EffortLevel::Max));
+    }
+
+    #[test]
+    fn parse_effort_trims_whitespace() {
+        assert_eq!(parse_effort(Some("  large  ")), Some(EffortLevel::Large));
+    }
+
+    #[test]
+    fn parse_effort_none_for_empty_or_unknown() {
+        assert_eq!(parse_effort(None), None);
+        assert_eq!(parse_effort(Some("")), None);
+        assert_eq!(parse_effort(Some("   ")), None);
+        assert_eq!(parse_effort(Some("humongous")), None);
+        // Case-sensitive: only lowercase variants match.
+        assert_eq!(parse_effort(Some("Large")), None);
+    }
+
+    // --- question_artifact_name ---------------------------------------------
+
+    #[test]
+    fn question_artifact_name_uses_doc_basename() {
+        let g = question_group(Some("docs/designs/plan.md"));
+        assert_eq!(question_artifact_name(&g), "Apply answered questions to plan.md");
+    }
+
+    #[test]
+    fn question_artifact_name_handles_path_without_slash() {
+        let g = question_group(Some("plan.md"));
+        assert_eq!(question_artifact_name(&g), "Apply answered questions to plan.md");
+    }
+
+    #[test]
+    fn question_artifact_name_falls_back_without_doc_path() {
+        assert_eq!(
+            question_artifact_name(&question_group(None)),
+            "Apply answered design questions"
+        );
+        // An empty path is treated as absent.
+        assert_eq!(
+            question_artifact_name(&question_group(Some(""))),
+            "Apply answered design questions"
+        );
+    }
+
+    // --- build_qa_brief ------------------------------------------------------
+
+    #[test]
+    fn build_qa_brief_with_no_answered_has_header_but_no_entries() {
+        let g = question_group(Some("docs/plan.md"));
+        let brief = build_qa_brief(&g, &[]);
+        assert!(brief.contains("docs/plan.md"));
+        assert!(brief.contains("## Answered questions"));
+        // No per-question entries.
+        assert!(!brief.contains("### "));
+        assert!(!brief.contains("**Answer:**"));
+    }
+
+    #[test]
+    fn build_qa_brief_renders_each_answered_question() {
+        let g = question_group(Some("docs/plan.md"));
+        let m1 = answered_member("Ship on Friday?", "Yes", Some("Rollout"));
+        let m2 = answered_member("Use feature flags?", "No", None);
+        let answered = [&m1, &m2];
+        let brief = build_qa_brief(&g, &answered);
+
+        assert!(brief.contains("### Ship on Friday?"));
+        assert!(brief.contains("**Answer:** Yes"));
+        assert!(brief.contains("_Section: Rollout_"));
+        assert!(brief.contains("### Use feature flags?"));
+        assert!(brief.contains("**Answer:** No"));
+    }
+
+    #[test]
+    fn build_qa_brief_intro_differs_when_doc_path_absent() {
+        let with_path = build_qa_brief(&question_group(Some("docs/plan.md")), &[]);
+        assert!(with_path.contains("`docs/plan.md`"));
+
+        let without_path = build_qa_brief(&question_group(None), &[]);
+        assert!(without_path.contains("about this design"));
+        assert!(!without_path.contains('`'));
+    }
+}
