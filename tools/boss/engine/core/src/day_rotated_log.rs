@@ -183,4 +183,150 @@ mod tests {
         assert!(!old_path.exists(), "8-day-old file should be pruned");
         assert!(recent_path.exists(), "3-day-old file should be kept");
     }
+
+    #[test]
+    fn epoch_ms_to_date_epoch_and_out_of_range_fall_back_to_1970() {
+        // The literal epoch instant renders as its true date, not the fallback.
+        assert_eq!(epoch_ms_to_date(0), "1970-01-01");
+
+        // i64::MAX ms is ~292 million years past the epoch — far outside the
+        // range chrono can represent, so `from_timestamp_millis` returns None
+        // and we hit the fallback arm.
+        assert_eq!(epoch_ms_to_date(i64::MAX as u128), "1970-01-01");
+    }
+
+    #[test]
+    fn prune_old_files_leaves_other_prefixes_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let old_date = epoch_ms_to_date(now_ms().saturating_sub(30 * 86_400_000));
+        let mine = dir.path().join(format!("test-{old_date}.jsonl"));
+        let theirs = dir.path().join(format!("other-{old_date}.jsonl"));
+        std::fs::write(&mine, b"mine\n").unwrap();
+        std::fs::write(&theirs, b"theirs\n").unwrap();
+
+        prune_old_files(dir.path(), "test-", RETAIN_DAYS);
+
+        assert!(!mine.exists(), "stale file with matching prefix is pruned");
+        assert!(theirs.exists(), "stale file with a different prefix must be left alone");
+    }
+
+    #[test]
+    fn prune_old_files_ignores_non_jsonl_suffixes() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let old_date = epoch_ms_to_date(now_ms().saturating_sub(30 * 86_400_000));
+        // An in-progress temp file: stale-dated and matching prefix, but not
+        // a completed `.jsonl` — the suffix guard must protect it.
+        let tmp = dir.path().join(format!("test-{old_date}.tmp"));
+        let jsonl = dir.path().join(format!("test-{old_date}.jsonl"));
+        std::fs::write(&tmp, b"partial\n").unwrap();
+        std::fs::write(&jsonl, b"done\n").unwrap();
+
+        prune_old_files(dir.path(), "test-", RETAIN_DAYS);
+
+        assert!(!jsonl.exists(), "stale .jsonl file is pruned");
+        assert!(tmp.exists(), "stale non-.jsonl file must be left alone");
+    }
+
+    #[test]
+    fn prune_old_files_keeps_the_cutoff_date_but_drops_a_day_older() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // The prune comparison is strict (`date_part < cutoff_date`), so a file
+        // dated exactly on the cutoff boundary is retained while one a single
+        // day older is removed.
+        let cutoff_ms = now_ms().saturating_sub(u128::from(RETAIN_DAYS) * 86_400_000);
+        let cutoff_date = epoch_ms_to_date(cutoff_ms);
+        let older_date = epoch_ms_to_date(cutoff_ms.saturating_sub(86_400_000));
+        assert_ne!(cutoff_date, older_date, "boundary dates must differ");
+
+        let on_boundary = dir.path().join(format!("test-{cutoff_date}.jsonl"));
+        let past_boundary = dir.path().join(format!("test-{older_date}.jsonl"));
+        std::fs::write(&on_boundary, b"boundary\n").unwrap();
+        std::fs::write(&past_boundary, b"older\n").unwrap();
+
+        prune_old_files(dir.path(), "test-", RETAIN_DAYS);
+
+        assert!(
+            on_boundary.exists(),
+            "file dated on the cutoff must be kept (comparison is strict)"
+        );
+        assert!(
+            !past_boundary.exists(),
+            "file one day older than the cutoff must be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_old_files_on_missing_dir_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        // Must not panic — the read_dir error is swallowed with an early return.
+        prune_old_files(&missing, "test-", RETAIN_DAYS);
+        assert!(!missing.exists());
+    }
+
+    /// Minimal record exercising the generic writer: carries an explicit
+    /// epoch-millis timestamp so the day it lands in is fully deterministic.
+    #[derive(serde::Serialize)]
+    struct TestRec {
+        ts_epoch_ms: u128,
+        msg: &'static str,
+    }
+
+    impl TimestampedRecord for TestRec {
+        fn ts_epoch_ms(&self) -> u128 {
+            self.ts_epoch_ms
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_task_rotates_across_days_and_prunes_on_rollover() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Pre-seed a stale file (well older than RETAIN_DAYS) that the prune
+        // triggered by the first rollover must remove.
+        let stale_date = epoch_ms_to_date(now_ms().saturating_sub(30 * 86_400_000));
+        let stale = dir.path().join(format!("test-{stale_date}.jsonl"));
+        std::fs::write(&stale, b"stale\n").unwrap();
+
+        // Two explicit instants on consecutive UTC calendar days, far enough in
+        // the future that neither day file is ever a prune candidate regardless
+        // of when this test runs.
+        let day1_ms = 4_070_000_000_000u128;
+        let day2_ms = day1_ms + 86_400_000;
+        let date1 = epoch_ms_to_date(day1_ms);
+        let date2 = epoch_ms_to_date(day2_ms);
+        assert_ne!(date1, date2, "the two records must fall on different days");
+
+        let logger = DayRotatedLogger::new(dir.path(), "test-");
+        logger.emit(TestRec {
+            ts_epoch_ms: day1_ms,
+            msg: "one",
+        });
+        logger.emit(TestRec {
+            ts_epoch_ms: day2_ms,
+            msg: "two",
+        });
+
+        let file1 = dir.path().join(format!("test-{date1}.jsonl"));
+        let file2 = dir.path().join(format!("test-{date2}.jsonl"));
+
+        // Poll for the background writer to flush both files. Generous bound to
+        // tolerate slow CI runners.
+        for _ in 0..200 {
+            if file1.exists() && file2.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(file1.exists(), "first day's file should be written");
+        assert!(file2.exists(), "second day's file should be written (rotation)");
+        assert!(
+            !stale.exists(),
+            "stale pre-seeded file should be pruned when the rollover fires"
+        );
+    }
 }
