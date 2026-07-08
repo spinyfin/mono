@@ -74,8 +74,9 @@ pub fn render_triage_preamble(automation: &Automation, product_name: &str) -> St
 repository.\n\n\
 Standing instruction:\n\n> {instruction}\n\n\
 Decide whether a **single, concrete, actionable** task can be derived from this \
-instruction **right now** in this repository. Investigate the repo as needed to \
-make that call. You are explicitly allowed to conclude that nothing appropriate \
+instruction **right now** in this repository. Investigate the repo with a few \
+targeted, read-only checks (keep it lightweight — see below) to make that call. \
+You are explicitly allowed to conclude that nothing appropriate \
 exists — that is a normal, expected outcome on most runs.\n\n\
 ## You MUST end this run with exactly one decision marker\n\n\
 Your final message must end with **exactly one** of these two lines, and nothing \
@@ -103,6 +104,23 @@ happen inline using read-only tool calls (`grep`/`find`/`cat`, `Bash`, `Read`, \
 `automation: task <id>` marker **in the same response**, immediately after the \
 tool call returns with the task id. Do not stop between the tool call and the \
 marker.\n\n\
+## Keep it lightweight — decide, then stop\n\n\
+Triage is a quick judgement call, NOT an exhaustive verification. Your job is to \
+decide whether a concrete task is derivable — not to prove the repository's \
+state. A few targeted, read-only checks are enough.\n\n\
+- **Decide the moment you have enough signal, then STOP.** Emit your marker as \
+soon as you can tell whether actionable work exists. Do NOT run \"one more \
+confirming check\": re-proving a verdict you already hold is exactly how these \
+runs burn their whole budget and end with no marker.\n\
+- **Do NOT launch repo-wide or whole-repo build / clippy / lint / checkleft / \
+test sweeps, and do NOT run a long build in the background and then idle-poll \
+waiting for it.** Waiting in a loop on a backgrounded build consumes the entire \
+session and produces no decision — this is the dominant reason these runs fail.\n\
+- **If you cannot cheaply confirm that actionable work exists, `skip`.** An \
+inconclusive quick check is grounds to skip, not to escalate to a heavier \
+sweep — the automation fires again on its next schedule. A `skip` is a \
+successful, expected outcome; burning the whole session and stopping without a \
+marker is the only real failure here.\n\n\
 ## Hard guardrails\n\n\
 - **Do NOT do the work yourself.** Do not edit files, do not commit, do not open a \
 PR. A separate worker executes the task you create. Your only deliverable is the \
@@ -176,6 +194,26 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          - **If you run `boss task create --automation`**, emit the\n\
            `automation: task <id>` marker in the **same response**, right after\n\
            the tool call returns the task id. Do not stop between the two.\n\
+         \n\
+         ## Keep it lightweight — decide, then stop\n\
+         \n\
+         Triage is a quick judgement call, NOT an exhaustive verification.\n\
+         Decide whether a concrete task is derivable; do not try to prove the\n\
+         repository's state. A few targeted, read-only checks are enough.\n\
+         \n\
+         - **Decide the moment you have enough signal, then STOP.** Emit your\n\
+           marker as soon as you can tell whether actionable work exists. Do\n\
+           NOT run \"one more confirming check\" — re-proving a verdict you\n\
+           already hold is how these runs burn their whole budget and stop\n\
+           with no marker.\n\
+         - **Do NOT launch repo-wide build / clippy / lint / checkleft / test\n\
+           sweeps, and do NOT background a long build and idle-poll waiting on\n\
+           it.** Waiting in a loop on a backgrounded build consumes the whole\n\
+           session and yields no decision — the dominant failure mode here.\n\
+         - **If you cannot cheaply confirm actionable work exists, `skip`.**\n\
+           An inconclusive quick check is grounds to skip, not to escalate to\n\
+           a heavier sweep — the automation re-fires on its schedule. A skip\n\
+           is a successful outcome; stopping with no marker is the failure.\n\
          \n\
          ## Do NOT do the work (tool calls for these are denied)\n\
          \n\
@@ -500,6 +538,83 @@ mod tests {
         assert!(
             md.contains("same response") || md.contains("same turn"),
             "triage CLAUDE.md must instruct the worker to emit the marker in the same response as the tool call",
+        );
+    }
+
+    #[test]
+    fn triage_claude_md_requires_early_decision_and_forbids_heavy_sweeps() {
+        let md = render_triage_claude_md("lease_lw");
+        let lower = md.to_lowercase();
+        // Decide-then-stop: emit the marker the moment the verdict is known.
+        assert!(
+            lower.contains("decide the moment you have enough signal"),
+            "triage CLAUDE.md must tell the worker to decide as soon as it has a verdict",
+        );
+        assert!(
+            md.contains("one more confirming check"),
+            "triage CLAUDE.md must forbid re-proving a verdict with \"one more confirming check\"",
+        );
+        // The budget-burn anti-pattern: repo-wide sweeps + backgrounded-build idle polling.
+        assert!(
+            lower.contains("repo-wide"),
+            "triage CLAUDE.md must forbid repo-wide build/lint sweeps",
+        );
+        assert!(
+            lower.contains("idle-poll"),
+            "triage CLAUDE.md must forbid idle-polling a backgrounded build",
+        );
+        // Bias to a decision under uncertainty rather than escalating verification.
+        assert!(
+            md.contains("`skip`"),
+            "triage CLAUDE.md must tell the worker to skip when it cannot cheaply confirm work",
+        );
+    }
+
+    #[test]
+    fn preamble_requires_early_decision_and_forbids_heavy_sweeps() {
+        let automation = Automation::builder()
+            .id("auto_lw")
+            .short_id(2i64)
+            .product_id("prod_1")
+            .name("clippy sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("fix any clippy warnings")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build();
+        let preamble = render_triage_preamble(&automation, "My Product");
+        let lower = preamble.to_lowercase();
+        // Decide-then-stop.
+        assert!(
+            lower.contains("decide the moment you have enough signal"),
+            "preamble must tell the worker to decide as soon as it has a verdict",
+        );
+        assert!(
+            preamble.contains("one more confirming check"),
+            "preamble must forbid re-proving a verdict with \"one more confirming check\"",
+        );
+        // No repo-wide sweeps / no backgrounded-build idle polling (the field-evidence
+        // budget-burn shape).
+        assert!(lower.contains("repo-wide"), "preamble must forbid repo-wide sweeps");
+        assert!(
+            lower.contains("idle-poll"),
+            "preamble must forbid idle-polling a backgrounded build",
+        );
+        assert!(
+            lower.contains("background"),
+            "preamble must name the backgrounded-build trap"
+        );
+        // Bias to a decision under uncertainty.
+        assert!(
+            preamble.contains("`skip`"),
+            "preamble must tell the worker to skip when it cannot cheaply confirm work",
+        );
+        assert!(
+            lower.contains("heavier sweep"),
+            "preamble must forbid escalating an inconclusive check to a heavier sweep",
         );
     }
 
