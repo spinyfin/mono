@@ -94,4 +94,54 @@ mod tests {
     fn find_first_balanced_object_returns_none_without_braces() {
         assert_eq!(find_first_balanced_object("no braces here"), None);
     }
+
+    #[test]
+    fn find_first_balanced_object_recovers_after_unbalanced_first_brace() {
+        // The first `{` opens an object that never closes (its inner `{"k": 1}`
+        // balances back to depth 1, then the input ends), so extraction from
+        // offset 0 fails. The scan must keep walking and return the *later*
+        // balanced object rather than giving up with None.
+        let s = r#"{ oops {"k": 1}"#;
+        assert_eq!(find_first_balanced_object(s), Some(r#"{"k": 1}"#));
+    }
+
+    #[test]
+    fn extract_balanced_object_returns_none_on_missing_closing_brace() {
+        assert_eq!(extract_balanced_object(r#"{"a": 1"#), None);
+    }
+
+    #[test]
+    fn find_first_balanced_object_returns_none_on_missing_closing_brace() {
+        assert_eq!(find_first_balanced_object(r#"prefix {"a": 1"#), None);
+    }
+
+    #[test]
+    fn extract_balanced_object_returns_none_on_unterminated_string() {
+        // The `}` that would close the object never appears because the string
+        // literal is never closed, so every subsequent byte is consumed as
+        // string content and the object stays open.
+        assert_eq!(extract_balanced_object(r#"{"a": "oops"#), None);
+    }
+
+    #[test]
+    fn find_first_balanced_object_returns_none_on_unterminated_string() {
+        assert_eq!(find_first_balanced_object(r#"reply: {"a": "oops"#), None);
+    }
+
+    #[test]
+    fn extract_balanced_object_handles_brace_inside_string_at_start() {
+        // The very first content after `{` is a string whose value opens with a
+        // `{`; that brace must not increment depth.
+        let s = r#"{"tmpl": "{unresolved}", "ok": true}"#;
+        assert_eq!(extract_balanced_object(s), Some(s));
+    }
+
+    #[test]
+    fn extract_balanced_object_closes_after_inner_strings_containing_braces() {
+        // Nested object whose inner string values contain unbalanced braces;
+        // the outer object must still close at the correct terminal `}` and the
+        // returned slice must stop there, dropping trailing prose.
+        let s = r#"{"outer": {"a": "{{", "b": "}}"}} trailing"#;
+        assert_eq!(extract_balanced_object(s), Some(r#"{"outer": {"a": "{{", "b": "}}"}}"#));
+    }
 }
