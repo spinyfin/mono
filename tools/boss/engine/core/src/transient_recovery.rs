@@ -661,59 +661,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionCoordinator, WorkerPool,
-    };
+    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
     use crate::transient_error::RecoveryPolicy;
     use crate::work::{ExecutionStatus, WorkDb};
 
     // ─── stubs ────────────────────────────────────────────────────────
-
-    struct NoopCube;
-
-    #[async_trait]
-    impl CubeClient for NoopCube {
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
-        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            Ok(vec![])
-        }
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            Ok(vec![])
-        }
-    }
+    // `NoopCube` / `NoopRunner` come from `crate::test_support::*`.
 
     /// Records which run_ids were nudged. Used to assert nudge behaviour
     /// without needing a real app session.
