@@ -85,6 +85,47 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.pendingQuotedText, "")
     }
 
+    // MARK: - Window-scoped event handling (cross-window event bleed regression)
+
+    /// Regression test: a markdown viewer's `CommentLayer` must judge "is there
+    /// a selection?" against its *own* bound window, not the app-wide key window.
+    /// `NSEvent` local monitors fire for events delivered to any window in the
+    /// app, and `NSApp.keyWindow` can still be a stale, previously-frontmost
+    /// window at the instant a monitor callback runs — checking the global key
+    /// window let a leftover selection in one markdown viewer leak its
+    /// right-click context menu / comment popup into a right-click that
+    /// actually landed on a completely different window (e.g. the main kanban
+    /// window).
+    func testHasCurrentSelectionChecksOwnHostWindowNotAnyWindow() {
+        let layer = CommentLayer()
+        let selectingWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let selectingResponder = SelectableStubResponder(frame: .zero)
+        selectingResponder.hasSelection = true
+        selectingWindow.contentView = selectingResponder
+        selectingWindow.makeFirstResponder(selectingResponder)
+
+        // A distinct window whose own first responder has no selection — mirrors
+        // a second markdown viewer (or the main kanban window) that a monitor
+        // must not mistake for the layer's own selecting window.
+        let otherWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let otherResponder = SelectableStubResponder(frame: .zero)
+        otherResponder.hasSelection = false
+        otherWindow.contentView = otherResponder
+        otherWindow.makeFirstResponder(otherResponder)
+
+        layer.setHostWindow(selectingWindow)
+        XCTAssertTrue(layer.hasCurrentSelection(), "should see the selection in its own bound window")
+
+        layer.setHostWindow(otherWindow)
+        XCTAssertFalse(
+            layer.hasCurrentSelection(),
+            "a selection that lives in a different window must not count as this layer's own")
+    }
+
     // MARK: - W3C anchor capture
 
     func testCaptureAnchorSlicesPrefixAndSuffix() {
@@ -841,5 +882,17 @@ final class FakeCommentBackend: CommentBackend {
     }
     func postFollowup(commentId: String, body: String) {
         postFollowupCalls.append((commentId, body))
+    }
+}
+
+/// Minimal `NSUserInterfaceValidations`-conforming responder that reports
+/// "yes, Copy is valid" — a stand-in for a real text view with an active
+/// selection, used to test `CommentLayer.hasCurrentSelection()`'s
+/// responder-chain walk without depending on real `NSTextView` selection
+/// behavior in a headless test run.
+private final class SelectableStubResponder: NSView, NSUserInterfaceValidations {
+    var hasSelection = false
+    func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        item.action == #selector(NSText.copy(_:)) && hasSelection
     }
 }

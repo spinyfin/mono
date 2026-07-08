@@ -100,6 +100,26 @@ final class CommentLayer: NSObject, ObservableObject {
     /// The live NSPopover, if one is currently visible.
     private var activePopover: NSPopover?
 
+    /// The NSWindow hosting this markdown viewer instance, bound once the SwiftUI
+    /// view mounts (see `CommentLayerWindowBinder`). The monitors installed by
+    /// `installMonitors()` are `NSEvent` *local* monitors, which — despite the
+    /// name — fire for events delivered to any window in the app, not just this
+    /// layer's own window. Every handler below must check the event's `window`
+    /// against this before acting; skipping that check is exactly the
+    /// cross-window "event bleed" bug where right-clicking a kanban card in the
+    /// main window pops a markdown viewer's own context menu / comment popup
+    /// because its monitor reacted to an event meant for a different window.
+    private weak var hostWindow: NSWindow?
+
+    /// Binds this layer to the NSWindow hosting its markdown viewer. Called by
+    /// `CommentLayerWindowBinder` on mount and on every SwiftUI layout pass.
+    /// Until this is set (or if it later becomes nil, e.g. window teardown),
+    /// window-scoped monitors below intentionally match nothing rather than
+    /// falling back to matching any window's events.
+    func setHostWindow(_ window: NSWindow?) {
+        hostWindow = window
+    }
+
     // MARK: - Monitor lifecycle
 
     func installMonitors() {
@@ -116,8 +136,9 @@ final class CommentLayer: NSObject, ObservableObject {
             guard let self else { return event }
             let chars = event.charactersIgnoringModifiers
             let mods = event.modifierFlags
+            let win = event.window
             let consume = MainActor.assumeIsolated {
-                self.shouldConsumeKeyEvent(chars: chars, mods: mods)
+                self.shouldConsumeKeyEvent(chars: chars, mods: mods, window: win)
             }
             return consume ? nil : event
         }
@@ -153,6 +174,7 @@ final class CommentLayer: NSObject, ObservableObject {
         anchorInteractionScreenPoint = nil
         anchorInteractionView = nil
         anchorTextBeforeSelection = nil
+        hostWindow = nil
     }
 
     /// Single coordinate-bridge between an NSEvent's window-space location and a target
@@ -181,7 +203,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// The bounds-containment guard prevents the "Add Comment" button click (which lands
     /// outside the text view) from overwriting a valid earlier anchor.
     private func captureInteractionAnchor(locationInWindow: NSPoint, window: NSWindow?) {
-        guard !isShowingPopover, let window else { return }
+        guard !isShowingPopover, let window, window === hostWindow else { return }
         guard let responder = window.firstResponder as? NSView,
               !(responder is NSTextView) else { return }
         let pointInResponder = windowPointToView(locationInWindow, in: responder)
@@ -772,8 +794,16 @@ final class CommentLayer: NSObject, ObservableObject {
     /// by asking it to validate the "Copy" UI item. Textual's NSTextInteractionView
     /// implements NSUserInterfaceValidations: validateUserInterfaceItem returns true for
     /// "copy" only when there is a non-empty selection.
+    ///
+    /// Checks `hostWindow` (this layer's own window) rather than `NSApp.keyWindow` when
+    /// bound: the app-wide key window can still be a *different*, previously-frontmost
+    /// window at the instant an NSEvent monitor callback runs, which is what let a
+    /// stale selection in one markdown viewer leak a context menu/comment popup into
+    /// whichever window the user actually clicked in. Falls back to `NSApp.keyWindow`
+    /// when unbound (artifact-less unit tests, or the ⌘⇧K SwiftUI shortcut path, which
+    /// SwiftUI only ever invokes while this layer's own window is already key).
     func hasCurrentSelection() -> Bool {
-        guard let firstResponder = NSApp.keyWindow?.firstResponder else { return false }
+        guard let firstResponder = (hostWindow ?? NSApp.keyWindow)?.firstResponder else { return false }
         let copyItem = NSMenuItem(
             title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         var responder: NSResponder? = firstResponder
@@ -862,8 +892,10 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Returns true if the key event should be consumed (opens the comment form).
     private func shouldConsumeKeyEvent(
         chars: String?,
-        mods: NSEvent.ModifierFlags
+        mods: NSEvent.ModifierFlags,
+        window: NSWindow?
     ) -> Bool {
+        guard window === hostWindow else { return false }
         guard !isShowingPopover else { return false }
         let cleanMods = mods.intersection(.deviceIndependentFlagsMask)
         guard cleanMods.isSubset(of: [.shift, .capsLock]) else { return false }
@@ -886,8 +918,9 @@ final class CommentLayer: NSObject, ObservableObject {
     /// space — passing the window point directly inverts Y and pops the menu at
     /// `viewHeight - clickY`. Route through `windowPointToView` to apply the flip.
     private func handleRightClick(locationInWindow: NSPoint, window: NSWindow?) -> Bool {
+        guard let window, window === hostWindow else { return false }
         guard !isShowingPopover, hasCurrentSelection() else { return false }
-        guard let window, let view = window.contentView else { return false }
+        guard let view = window.contentView else { return false }
 
         let menu = NSMenu()
         let target = CommentMenuTarget(layer: self)
@@ -965,6 +998,32 @@ struct CommentArtifactRef: Equatable {
     }
 }
 
+// MARK: - Window binding
+
+/// Zero-size `NSView` that captures its hosting `NSWindow` and forwards it to a
+/// `CommentLayer` so the layer's NSEvent monitors can scope themselves to the
+/// right window (see `CommentLayer.hostWindow`). Mirrors the deferred-capture
+/// pattern used by `WindowMenuRegistrar` in `DesignsView.swift`: the view isn't
+/// attached to a window yet when `makeNSView` runs, so the first capture is
+/// deferred one runloop tick. `updateNSView` re-applies on every SwiftUI layout
+/// pass in case AppKit later reparents the hierarchy into a different window
+/// (e.g. tab detachment).
+private struct CommentLayerWindowBinder: NSViewRepresentable {
+    let layer: CommentLayer
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { [weak layer] in
+            layer?.setHostWindow(view.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        layer.setHostWindow(nsView.window)
+    }
+}
+
 // MARK: - View modifier
 
 /// Wraps a markdown viewer with the full comment affordance:
@@ -1020,6 +1079,9 @@ struct WithCommentsModifier: ViewModifier {
             .frame(width: 0, height: 0)
             .hidden()
         }
+        // Binds `layer.hostWindow` so its NSEvent monitors can scope themselves to
+        // this viewer's own window instead of reacting to any window in the app.
+        .background(CommentLayerWindowBinder(layer: layer).frame(width: 0, height: 0))
         .onAppear {
             layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
             layer.installMonitors()
