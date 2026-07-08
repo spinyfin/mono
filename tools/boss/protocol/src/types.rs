@@ -3359,6 +3359,19 @@ pub struct Task {
     pub dispatch_failed_at: Option<String>,
 }
 
+impl Task {
+    /// Operator-facing short form (`"T2344"`) for embedding in human-readable
+    /// text — never the canonical `task_*` id, which is an internal
+    /// implementation detail. Falls back to a generic, non-identifying label
+    /// on the (in-practice-unreachable) `short_id = None` case rather than
+    /// leaking the canonical id.
+    pub fn short_label(&self) -> String {
+        self.short_id
+            .map(|n| format!("T{n}"))
+            .unwrap_or_else(|| "a task".to_owned())
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !b
 }
