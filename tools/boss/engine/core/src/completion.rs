@@ -6364,38 +6364,10 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RecordingPublisher {
-        events: Mutex<Vec<(String, String, String, String)>>,
-        work_events: Mutex<Vec<(String, String, String)>>,
-        typed_events: Mutex<Vec<(String, boss_protocol::FrontendEvent)>>,
-    }
-
-    #[async_trait]
-    impl ExecutionPublisher for RecordingPublisher {
-        async fn publish(&self, exec_id: &str, work_item_id: &str, status: &str, reason: &str) {
-            self.events.lock().await.push((
-                exec_id.to_owned(),
-                work_item_id.to_owned(),
-                status.to_owned(),
-                reason.to_owned(),
-            ));
-        }
-        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
-            self.work_events
-                .lock()
-                .await
-                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
-        }
-        async fn publish_frontend_event_on_product(&self, product_id: &str, event: boss_protocol::FrontendEvent) {
-            self.typed_events.lock().await.push((product_id.to_owned(), event));
-        }
-    }
-
     /// The standard completion-handler test harness: a
     /// [`WorkerCompletionHandler`] wired to the four recording stubs, bundled
     /// with the stub `Arc`s so post-run assertions can still reach them
-    /// (`cube.release_calls`, `publisher.events`, `pane.calls`,
+    /// (`cube.release_calls`, `publisher.publish_calls`, `pane.calls`,
     /// `probes.snapshot()`).
     ///
     /// The PR detector varies across tests (`StubPrDetector::ok(None)`,
@@ -6922,14 +6894,14 @@ mod tests {
             ["lease-1"],
             "the engine must release the cube lease so the next dispatch can take it",
         );
-        let publisher_events = publisher.events.lock().await.clone();
+        let publisher_events = publisher.publish_calls.lock().await.clone();
         assert!(
             publisher_events
                 .iter()
                 .any(|(_, _, _, reason)| reason == "worker_pr_completed"),
             "expected worker_pr_completed execution event, got {publisher_events:?}",
         );
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events
                 .iter()
@@ -7308,7 +7280,7 @@ mod tests {
             cube.release_calls.lock().await.is_empty(),
             "no PR must NOT release the cube workspace",
         );
-        let events = publisher.events.lock().await.clone();
+        let events = publisher.publish_calls.lock().await.clone();
         assert!(
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
             "expected worker_awaiting_pr event for the no-PR case, got {events:?}",
@@ -7370,7 +7342,7 @@ mod tests {
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
 
-        let events = publisher.events.lock().await.clone();
+        let events = publisher.publish_calls.lock().await.clone();
         assert!(
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
             "stale PR must publish worker_awaiting_pr, got {events:?}",
@@ -7425,7 +7397,7 @@ mod tests {
         assert_eq!(outcome, StopOutcome::UnknownExecution);
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
-        assert!(publisher.events.lock().await.is_empty());
+        assert!(publisher.publish_calls.lock().await.is_empty());
         assert!(probes.snapshot().is_empty(), "unknown executions must NOT queue probes",);
     }
 
@@ -7762,14 +7734,14 @@ mod tests {
             ["lease-1"],
             "merged-at-stop must still release the cube lease",
         );
-        let publisher_events = publisher.events.lock().await.clone();
+        let publisher_events = publisher.publish_calls.lock().await.clone();
         assert!(
             publisher_events
                 .iter()
                 .any(|(_, _, _, reason)| reason == "worker_pr_merged"),
             "expected worker_pr_merged execution event, got {publisher_events:?}",
         );
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events
                 .iter()
@@ -8086,7 +8058,7 @@ mod tests {
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
         assert!(probes.snapshot().is_empty());
-        assert!(publisher.events.lock().await.is_empty());
+        assert!(publisher.publish_calls.lock().await.is_empty());
     }
 
     /// Companion to the running-status gate test: when the execution
@@ -8169,7 +8141,7 @@ mod tests {
             "empty-diff PR must NOT release the pane"
         );
 
-        let events = publisher.events.lock().await.clone();
+        let events = publisher.publish_calls.lock().await.clone();
         assert!(
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
             "empty-diff PR must publish worker_awaiting_pr, got {events:?}",
@@ -8482,7 +8454,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         // Publish reason distinguishes recheck from on-Stop so
         // operators can see which path closed the chore.
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events.iter().any(|(_, _, r)| r == "worker_pr_completed_recheck"),
             "expected worker_pr_completed_recheck publish reason, got {work_events:?}",
@@ -8526,7 +8498,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "recheck must NOT queue probes on the no-PR branch",
         );
         assert!(
-            publisher.events.lock().await.is_empty(),
+            publisher.publish_calls.lock().await.is_empty(),
             "recheck must NOT publish awaiting-input events on the no-PR branch",
         );
         assert!(cube.release_calls.lock().await.is_empty());
@@ -8562,7 +8534,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             probes.snapshot().is_empty(),
             "recheck must NOT queue probes on the stale-PR branch",
         );
-        assert!(publisher.events.lock().await.is_empty());
+        assert!(publisher.publish_calls.lock().await.is_empty());
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
     }
@@ -9065,7 +9037,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ["lease-1"],
             "cube lease must be released after the SHA-delta finalize"
         );
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events.iter().any(|(p, w, _)| p == &product_id && w == &chore_id),
             "work-item invalidation must fire for the chore",
@@ -9425,7 +9397,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         assert!(
             publisher
-                .events
+                .publish_calls
                 .lock()
                 .await
                 .iter()
@@ -9542,7 +9514,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         assert!(
             publisher
-                .events
+                .publish_calls
                 .lock()
                 .await
                 .iter()
@@ -10502,7 +10474,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "cube lease must be released after revision finalises",
         );
         // Work-item changed event must fire so the kanban updates.
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events
                 .iter()
@@ -10937,7 +10909,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "cube lease must be released after revision finalises",
         );
         // Work-item invalidation must fire.
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events
                 .iter()
@@ -11089,7 +11061,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ["lease-1"],
             "cube lease must be released — the slot must not be stranded",
         );
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events
                 .iter()
