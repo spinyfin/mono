@@ -18,6 +18,7 @@
 //! - **Unparseable `repo_remote_url`:** returned as
 //!   [`DocFetchOutcome::FetchFailed`] immediately, before any `gh` call.
 
+use std::future::Future;
 use std::time::Duration;
 
 use tokio::time::sleep;
@@ -67,9 +68,51 @@ pub async fn fetch_design_doc(repo_remote_url: &str, doc_path: &str, ref_name: &
         }
     };
 
+    // Delegate to the injectable retry loop with the production fetch. The
+    // closure moves owned copies of the resolved slug/args so its future is
+    // `'static` and can be re-invoked per attempt; tests substitute a fake
+    // fetch here without touching this classification/retry logic.
+    fetch_with_retry(repo_remote_url, doc_path, ref_name, RETRY_DELAY, move || {
+        do_fetch(
+            owner.to_string(),
+            repo.to_string(),
+            doc_path.to_string(),
+            ref_name.to_string(),
+        )
+    })
+    .await
+}
+
+/// Internal result of a single fetch attempt, before retry logic is applied.
+enum FetchResult {
+    Content(String),
+    NotFound,
+    Error(String),
+}
+
+/// Retry loop shared by production and tests. `fetch` is invoked once per
+/// attempt; the retry/classification policy — 404 short-circuits to
+/// [`DocFetchOutcome::DocMissing`] with no retry, [`FetchResult::Content`]
+/// short-circuits to [`DocFetchOutcome::Content`], and transient
+/// [`FetchResult::Error`]s are retried up to [`MAX_FETCH_ATTEMPTS`] before
+/// yielding [`DocFetchOutcome::FetchFailed`] carrying the last reason — lives
+/// entirely here. The `repo_remote_url`/`doc_path`/`ref_name` args are used
+/// only for log context, not passed to `fetch`; the fetcher captures whatever
+/// it needs itself.
+async fn fetch_with_retry<F, Fut>(
+    repo_remote_url: &str,
+    doc_path: &str,
+    ref_name: &str,
+    retry_delay: Duration,
+    fetch: F,
+) -> DocFetchOutcome
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = FetchResult>,
+{
     let mut last_reason = String::new();
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
-        match do_fetch(owner, repo, doc_path, ref_name).await {
+        match fetch().await {
             FetchResult::Content(text) => return DocFetchOutcome::Content(text),
             FetchResult::NotFound => return DocFetchOutcome::DocMissing,
             FetchResult::Error(reason) => {
@@ -83,7 +126,7 @@ pub async fn fetch_design_doc(repo_remote_url: &str, doc_path: &str, ref_name: &
                 );
                 last_reason = reason;
                 if attempt < MAX_FETCH_ATTEMPTS {
-                    sleep(RETRY_DELAY).await;
+                    sleep(retry_delay).await;
                 }
             }
         }
@@ -92,15 +135,11 @@ pub async fn fetch_design_doc(repo_remote_url: &str, doc_path: &str, ref_name: &
     DocFetchOutcome::FetchFailed { reason: last_reason }
 }
 
-/// Internal result of a single `gh api` call, before retry logic is applied.
-enum FetchResult {
-    Content(String),
-    NotFound,
-    Error(String),
-}
-
-async fn do_fetch(owner: &str, repo: &str, path: &str, ref_name: &str) -> FetchResult {
-    match boss_github::contents::fetch_repo_file(owner, repo, path, ref_name).await {
+/// Production fetch of a single attempt: the thin wrapper over
+/// [`boss_github::contents::fetch_repo_file`] that the injectable
+/// [`fetch_with_retry`] loop drives in production.
+async fn do_fetch(owner: String, repo: String, path: String, ref_name: String) -> FetchResult {
+    match boss_github::contents::fetch_repo_file(&owner, &repo, &path, &ref_name).await {
         Ok(Some(content)) => FetchResult::Content(content),
         Ok(None) => FetchResult::NotFound,
         Err(err) => FetchResult::Error(err.to_string()),
@@ -109,7 +148,97 @@ async fn do_fetch(owner: &str, repo: &str, path: &str, ref_name: &str) -> FetchR
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    /// Drives [`fetch_with_retry`] with a fake fetch that hands back a scripted
+    /// sequence of results (one per attempt) and counts how many times it was
+    /// invoked. Retry delay is zero so the retry path is exercised instantly.
+    /// Returns the outcome plus the observed attempt count.
+    async fn run_scripted(script: Vec<FetchResult>) -> (DocFetchOutcome, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // The script is pulled by attempt index; `Arc` lets the `Fn` closure
+        // read the next scripted result without moving out of the Vec.
+        let script = Arc::new(script);
+        let outcome = {
+            let calls = Arc::clone(&calls);
+            let script = Arc::clone(&script);
+            fetch_with_retry("https://github.com/o/r", "d.md", "main", Duration::ZERO, move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let result = clone_result(&script[n]);
+                std::future::ready(result)
+            })
+            .await
+        };
+        (outcome, calls.load(Ordering::SeqCst))
+    }
+
+    /// `FetchResult` is deliberately not `Clone` in production; the test script
+    /// needs to reproduce a scripted entry on demand, so clone it explicitly.
+    fn clone_result(result: &FetchResult) -> FetchResult {
+        match result {
+            FetchResult::Content(s) => FetchResult::Content(s.clone()),
+            FetchResult::NotFound => FetchResult::NotFound,
+            FetchResult::Error(s) => FetchResult::Error(s.clone()),
+        }
+    }
+
+    #[tokio::test]
+    async fn content_returns_immediately_without_retry() {
+        let (outcome, attempts) = run_scripted(vec![FetchResult::Content("hello".into())]).await;
+        assert!(
+            matches!(outcome, DocFetchOutcome::Content(ref c) if c == "hello"),
+            "expected Content, got {outcome:?}"
+        );
+        assert_eq!(attempts, 1, "a successful fetch must not retry");
+    }
+
+    #[tokio::test]
+    async fn not_found_returns_doc_missing_without_retry() {
+        // Even though more attempts are scripted, a 404 must short-circuit.
+        let (outcome, attempts) =
+            run_scripted(vec![FetchResult::NotFound, FetchResult::Content("unreached".into())]).await;
+        assert!(
+            matches!(outcome, DocFetchOutcome::DocMissing),
+            "expected DocMissing, got {outcome:?}"
+        );
+        assert_eq!(attempts, 1, "a 404 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn transient_errors_exhaust_attempts_then_fetch_failed() {
+        let (outcome, attempts) = run_scripted(vec![
+            FetchResult::Error("boom-1".into()),
+            FetchResult::Error("boom-2".into()),
+            FetchResult::Error("boom-last".into()),
+        ])
+        .await;
+        assert!(
+            matches!(outcome, DocFetchOutcome::FetchFailed { ref reason } if reason == "boom-last"),
+            "expected FetchFailed carrying the last error, got {outcome:?}"
+        );
+        assert_eq!(
+            attempts, MAX_FETCH_ATTEMPTS as usize,
+            "a persistently transient error must be retried up to the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_after_transient_error_short_circuits_remaining_retries() {
+        let (outcome, attempts) = run_scripted(vec![
+            FetchResult::Error("transient".into()),
+            FetchResult::Content("recovered".into()),
+            FetchResult::Content("unreached".into()),
+        ])
+        .await;
+        assert!(
+            matches!(outcome, DocFetchOutcome::Content(ref c) if c == "recovered"),
+            "expected Content once a later attempt succeeds, got {outcome:?}"
+        );
+        assert_eq!(attempts, 2, "must stop retrying as soon as an attempt succeeds");
+    }
 
     #[tokio::test]
     async fn fetch_failed_on_unparseable_url() {
