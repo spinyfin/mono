@@ -2058,7 +2058,7 @@ must not be asked to open one",
             // specific transcript state is folded into the detail below so the
             // run history distinguishes "ran but emitted no marker" from
             // "produced no transcript at all".
-            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText => {
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => {
                 TriageDecision::NoDecision
             }
         };
@@ -2886,6 +2886,21 @@ must not be asked to open one",
     /// successful read. The caller folds these states into the run-history
     /// `detail` so a `failed_will_retry` triage row is diagnosable instead of
     /// collapsing to a bare "no decision marker".
+    ///
+    /// Retries the read with a short bounded backoff (see
+    /// [`TRIAGE_TRANSCRIPT_READ_ATTEMPTS`]) when the transcript parses but
+    /// yields no assistant text. This closes a Stop-boundary flush race: the
+    /// Stop hook can fire — and trigger this finaliser — within milliseconds
+    /// of the worker's final assistant-text line being written, before the
+    /// transcript writer has flushed that line (and the `stop_hook_summary`
+    /// / `turn_duration` lines after it) to disk. A single synchronous read
+    /// in that window sees a transcript that ends exactly at the turn before
+    /// the marker and permanently mis-finalises a correct `skip`/`task`
+    /// decision as `failed_will_retry` (field incident: transcript readback
+    /// found 12 events — precisely the pre-final-message count — while the
+    /// durable file on disk had 15, the 13th being the missing assistant
+    /// text). Re-reading the same durable path a few times catches the write
+    /// once it lands instead of racing it once.
     async fn read_final_triage_message(&self, execution_id: &str) -> TriageTranscript {
         let path = match self.work_db.transcript_path_for_execution(execution_id) {
             Ok(Some(path)) => path,
@@ -2901,56 +2916,77 @@ must not be asked to open one",
                 return TriageTranscript::Unreadable;
             }
         };
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
-                let events = crate::transcript_markdown::parse_transcript(&content);
-                // Collect ALL assistant text turns, not just the last one.
-                //
-                // The triage agent emits its decision marker in the turn AFTER the
-                // `boss task create` Bash call.  The Stop hook can fire before that
-                // post-tool turn is fully flushed to disk, so `iter().rev().find_map`
-                // (which returned only the last AssistantText) would land on the
-                // pre-tool analysis message — which has no marker — and record
-                // `failed_will_retry` even though the task was successfully created.
-                //
-                // Joining all turns mirrors `attentions_detector::extract_assistant_text`
-                // and ensures the marker is found regardless of which turn contains it.
-                // The "exactly one marker" contract still holds: `parse_triage_decision`
-                // enforces it across the combined text.
-                let all_text: Vec<String> = events
-                    .iter()
-                    .filter_map(|e| match &e.kind {
-                        crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => Some(t.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                if all_text.is_empty() {
+
+        let mut last_event_count = 0usize;
+        let mut last_content_len = 0usize;
+        for attempt in 1..=TRIAGE_TRANSCRIPT_READ_ATTEMPTS {
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(err) => {
                     tracing::warn!(
                         execution_id,
-                        transcript_bytes = content.len(),
-                        event_count = events.len(),
-                        "triage finalisation: transcript had no assistant text event",
+                        ?err,
+                        "triage finalisation: failed to read transcript file",
                     );
-                    TriageTranscript::NoAssistantText
-                } else {
-                    tracing::debug!(
-                        execution_id,
-                        transcript_bytes = content.len(),
-                        event_count = events.len(),
-                        assistant_turns = all_text.len(),
-                        "triage finalisation: read all assistant turns for marker scan",
-                    );
-                    TriageTranscript::FinalMessage(all_text.join("\n"))
+                    return TriageTranscript::Unreadable;
                 }
-            }
-            Err(err) => {
-                tracing::warn!(
+            };
+            let events = crate::transcript_markdown::parse_transcript(&content);
+            // Collect ALL assistant text turns, not just the last one.
+            //
+            // The triage agent emits its decision marker in the turn AFTER the
+            // `boss task create` Bash call.  The Stop hook can fire before that
+            // post-tool turn is fully flushed to disk, so `iter().rev().find_map`
+            // (which returned only the last AssistantText) would land on the
+            // pre-tool analysis message — which has no marker — and record
+            // `failed_will_retry` even though the task was successfully created.
+            //
+            // Joining all turns mirrors `attentions_detector::extract_assistant_text`
+            // and ensures the marker is found regardless of which turn contains it.
+            // The "exactly one marker" contract still holds: `parse_triage_decision`
+            // enforces it across the combined text.
+            let all_text: Vec<String> = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !all_text.is_empty() {
+                if attempt > 1 {
+                    tracing::info!(
+                        execution_id,
+                        attempt,
+                        "triage finalisation: assistant text appeared on retry (Stop-boundary flush race recovered)",
+                    );
+                }
+                tracing::debug!(
                     execution_id,
-                    ?err,
-                    "triage finalisation: failed to read transcript file",
+                    transcript_bytes = content.len(),
+                    event_count = events.len(),
+                    assistant_turns = all_text.len(),
+                    "triage finalisation: read all assistant turns for marker scan",
                 );
-                TriageTranscript::Unreadable
+                return TriageTranscript::FinalMessage(all_text.join("\n"));
             }
+            last_event_count = events.len();
+            last_content_len = content.len();
+            if attempt < TRIAGE_TRANSCRIPT_READ_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * u64::from(attempt),
+                ))
+                .await;
+            }
+        }
+        tracing::warn!(
+            execution_id,
+            transcript_bytes = last_content_len,
+            event_count = last_event_count,
+            attempts = TRIAGE_TRANSCRIPT_READ_ATTEMPTS,
+            "triage finalisation: transcript had no assistant text event after flush-race retries",
+        );
+        TriageTranscript::NoAssistantText {
+            event_count: last_event_count,
         }
     }
 
@@ -5659,6 +5695,19 @@ pub enum StopOutcome {
     DbError,
 }
 
+/// Number of transcript-read attempts [`WorkerCompletionHandler::read_final_triage_message`]
+/// makes before concluding a triage transcript genuinely has no assistant
+/// text. Mirrors the linear-backoff shape of `ci_log_reader::run_capture`'s
+/// `ETXTBSY` retry, sized for a local disk flush rather than a subprocess
+/// spawn: attempts sleep `TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * attempt`
+/// between reads, for a worst-case total wait of
+/// `TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * (1+2+3+4) = 300ms` — comfortably
+/// wider than the single-digit-millisecond flush race seen in the field
+/// (assistant text written 33ms before the finaliser's read, which still
+/// lost the race with zero retries).
+const TRIAGE_TRANSCRIPT_READ_ATTEMPTS: u32 = 5;
+const TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS: u64 = 20;
+
 /// Outcome of reading a finished triage execution's final assistant message
 /// from its transcript (see [`WorkerCompletionHandler::read_final_triage_message`]).
 ///
@@ -5678,9 +5727,13 @@ enum TriageTranscript {
     /// A transcript path was recorded but the file could not be read (lookup
     /// error or filesystem read error).
     Unreadable,
-    /// The transcript parsed but contained no assistant text event — the worker
-    /// emitted only tool calls / thinking, or crashed before any prose.
-    NoAssistantText,
+    /// The transcript parsed but contained no assistant text event across
+    /// every retried read (see [`TRIAGE_TRANSCRIPT_READ_ATTEMPTS`]) — the
+    /// worker emitted only tool calls / thinking, or crashed before any
+    /// prose. `event_count` is the non-assistant-text event count from the
+    /// last read, so the run-history detail can distinguish "transcript was
+    /// entirely empty" from "transcript recorded activity but no prose".
+    NoAssistantText { event_count: usize },
 }
 
 impl TriageTranscript {
@@ -5690,7 +5743,7 @@ impl TriageTranscript {
     fn into_message(self) -> Option<String> {
         match self {
             TriageTranscript::FinalMessage(text) => Some(text),
-            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText => None,
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
         }
     }
 }
@@ -5712,9 +5765,22 @@ fn triage_no_decision_detail(transcript: &TriageTranscript) -> String {
              recorded; the worker session may have failed to start)"
             .to_owned(),
         TriageTranscript::Unreadable => "triage transcript could not be read from disk".to_owned(),
-        TriageTranscript::NoAssistantText => "triage transcript contained no assistant \
-             message (worker emitted no prose before stopping)"
+        // Two genuinely different conditions, previously conflated into one
+        // string that asserted "worker emitted no prose" even when the
+        // transcript showed the worker was clearly active (a claim the
+        // event-count evidence didn't support). After
+        // `TRIAGE_TRANSCRIPT_READ_ATTEMPTS` retries drained the Stop-boundary
+        // flush race, `event_count == 0` means the transcript itself never
+        // materialised any content; `event_count > 0` means the worker acted
+        // (tool calls / thinking) but never produced assistant prose.
+        TriageTranscript::NoAssistantText { event_count: 0 } => "triage transcript contained no events at all \
+             (no assistant text, tool calls, or thinking recorded before stopping)"
             .to_owned(),
+        TriageTranscript::NoAssistantText { event_count } => format!(
+            "triage transcript recorded {event_count} event(s) (tool calls / thinking) but no \
+             assistant text after waiting out the Stop-boundary transcript-flush window; worker \
+             emitted no prose before stopping"
+        ),
     }
 }
 
@@ -5937,8 +6003,19 @@ mod tests {
         let unreadable = triage_no_decision_detail(&TriageTranscript::Unreadable);
         assert!(unreadable.contains("could not be read"));
 
-        let no_prose = triage_no_decision_detail(&TriageTranscript::NoAssistantText);
-        assert!(no_prose.contains("no assistant"));
+        // A transcript that never materialised any content vs. one that
+        // recorded activity (tool calls / thinking) but no prose are
+        // distinct conditions — the field incident's conflated string
+        // ("contained no assistant message (worker emitted no prose before
+        // stopping)") asserted the second even when the transcript hadn't
+        // been fully flushed, so the two must now read differently.
+        let no_events = triage_no_decision_detail(&TriageTranscript::NoAssistantText { event_count: 0 });
+        assert!(no_events.contains("no events at all"));
+
+        let no_prose = triage_no_decision_detail(&TriageTranscript::NoAssistantText { event_count: 12 });
+        assert!(no_prose.contains("12 event"));
+        assert!(no_prose.contains("no prose"));
+        assert_ne!(no_events, no_prose);
     }
 
     #[test]
@@ -5949,7 +6026,10 @@ mod tests {
         );
         assert_eq!(TriageTranscript::NoPath.into_message(), None);
         assert_eq!(TriageTranscript::Unreadable.into_message(), None);
-        assert_eq!(TriageTranscript::NoAssistantText.into_message(), None);
+        assert_eq!(
+            TriageTranscript::NoAssistantText { event_count: 12 }.into_message(),
+            None
+        );
     }
 
     #[test]
@@ -5998,7 +6078,10 @@ mod tests {
             None
         );
         assert_eq!(
-            recover_skip_reason(&TriageDecision::NoDecision, &TriageTranscript::NoAssistantText),
+            recover_skip_reason(
+                &TriageDecision::NoDecision,
+                &TriageTranscript::NoAssistantText { event_count: 12 }
+            ),
             None
         );
     }
@@ -6462,6 +6545,171 @@ mod tests {
             )
             .unwrap();
         (db, comment.id, run.id, execution.id)
+    }
+
+    /// Stand up a `ready` `automation_triage` execution bound to a fresh
+    /// automation, started and pane-parked exactly like `PaneSpawnRunner`
+    /// leaves a worker awaiting its Stop hook — the state
+    /// `finalize_automation_triage` (called from `on_stop`) expects to find.
+    /// Returns `(db, automation_id, execution_id)`.
+    fn automation_triage_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = create_test_product(&db);
+        let automation = db
+            .create_automation(boss_protocol::CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Dead code".to_owned(),
+                repo_remote_url: None,
+                trigger: boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * 1-5".to_owned(),
+                    timezone: "America/Los_Angeles".to_owned(),
+                },
+                standing_instruction: "Clean up dead code.".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: Some("cli".to_owned()),
+            })
+            .unwrap();
+        let execution = db
+            .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned worker pane")
+                    .build(),
+            )
+            .unwrap();
+        db.record_automation_run_and_advance(
+            crate::work::AutomationFireRecord::builder()
+                .automation_id(automation.id.clone())
+                .scheduled_for(1_700_000_000i64)
+                .started_at(1_700_000_000i64)
+                .outcome(AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                .triage_execution_id(execution.id.clone())
+                .next_due_at(1_700_086_400i64)
+                .build(),
+        )
+        .unwrap();
+        (db, automation.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn on_stop_finalizes_triage_skip_when_final_message_lands_after_a_flush_race() {
+        // Regression test for the field incident: the Stop hook fired and
+        // triggered `read_final_triage_message`'s first read within
+        // milliseconds of the triage worker writing its final assistant-text
+        // line (carrying `automation: skip — …`) to the transcript — before
+        // that write had been flushed to disk. Without the retry-with-backoff
+        // fix, that first read would see only the 12 pre-final-message events
+        // (the exact field-evidence count: 1 user + 6 thinking + 5 tool
+        // events) and permanently mis-finalise a correct skip decision as
+        // `failed_will_retry`. This asserts the retry recovers the marker
+        // once it lands and the run finalises `skipped` — zero retries, not
+        // the failed/marker-recovery fallback path.
+        let workspace = tempdir().unwrap();
+        let (db, _automation_id, execution_id) = automation_triage_fixture(workspace.path());
+
+        let transcript_path = workspace.path().join(format!("transcript-{execution_id}.jsonl"));
+        let mut partial = String::new();
+        partial.push_str(&format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "text", "text": "triage this repo for dead code"}]}
+            })
+        ));
+        for _ in 0..6 {
+            partial.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "thinking", "thinking": "considering whether this is really dead..."}]}
+                })
+            ));
+        }
+        for _ in 0..5 {
+            partial.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "grep -r dead_code"}}]}
+                })
+            ));
+        }
+        std::fs::write(&transcript_path, partial.as_bytes()).unwrap();
+        db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+            .unwrap();
+
+        // Land the final assistant-text line a few milliseconds after Stop
+        // fires — inside the retry window's ~300ms budget but after the very
+        // first (would-be-losing) read, reproducing the flush race.
+        let flush_path = transcript_path.clone();
+        let flush_handle = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let final_line = format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "automation: skip — only dead_code found is \
+                        intentionally-annotated placeholder state for planned work; no cheaply-confirmable \
+                        removable dead code"}]}
+                })
+            );
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&flush_path)
+                .await
+                .unwrap();
+            file.write_all(final_line.as_bytes()).await.unwrap();
+        });
+
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        flush_handle.await.unwrap();
+
+        match &outcome {
+            StopOutcome::AutomationTriage { outcome } => assert_eq!(outcome, AUTOMATION_OUTCOME_SKIPPED),
+            other => panic!("expected a clean skip outcome recovered from the flush race, got {other:?}"),
+        }
+
+        let run = db
+            .automation_run_for_triage_execution(&execution_id)
+            .unwrap()
+            .expect("automation run row should exist");
+        assert_eq!(run.outcome, AUTOMATION_OUTCOME_SKIPPED);
+        let detail = run.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("only dead_code found"),
+            "detail should carry the worker's actual skip reason, got {detail:?}",
+        );
+        // The parsed `automation: skip` marker path, not the
+        // failed_will_retry / marker-recovery fallback.
+        assert!(
+            !detail.contains("marker-recovery"),
+            "should finalise via the direct marker path, not recovery: {detail:?}",
+        );
     }
 
     #[tokio::test]
