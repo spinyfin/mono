@@ -867,7 +867,6 @@ pub async fn on_resolved(
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -1363,31 +1362,7 @@ mod tests {
         release_should_fail: std::sync::atomic::AtomicBool,
     }
 
-    #[async_trait]
-    impl crate::coordinator::CubeClient for RecordingCubeClient {
-        async fn ensure_repo(&self, _origin: &str) -> anyhow::Result<crate::coordinator::CubeRepoHandle> {
-            unreachable!("not used in conflict_watch tests")
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> anyhow::Result<crate::coordinator::CubeWorkspaceLease> {
-            unreachable!("not used in conflict_watch tests")
-        }
-        async fn create_change(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-        ) -> anyhow::Result<crate::coordinator::CubeChangeHandle> {
-            unreachable!("not used in conflict_watch tests")
-        }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> anyhow::Result<()> {
-            unreachable!("not used in conflict_watch tests")
-        }
+    crate::stub_cube_client! { RecordingCubeClient {
         async fn release_workspace(&self, lease_id: &str) -> anyhow::Result<()> {
             self.releases.lock().await.push(lease_id.to_owned());
             if self.release_should_fail.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1395,12 +1370,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-        async fn workspace_status(
-            &self,
-            _: &std::path::Path,
-        ) -> anyhow::Result<crate::coordinator::CubeWorkspaceStatus> {
-            unreachable!()
         }
         async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> anyhow::Result<()> {
             Ok(())
@@ -1414,7 +1383,7 @@ mod tests {
         async fn list_repos(&self) -> anyhow::Result<Vec<crate::coordinator::CubeRepoSummary>> {
             Ok(Vec::new())
         }
-    }
+    } }
 
     /// Insert a `conflict_resolutions` row in `running` for the given
     /// work item and stamp the parent's `blocked_attempt_id`. Mirrors

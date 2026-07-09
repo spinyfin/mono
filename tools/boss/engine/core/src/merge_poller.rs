@@ -3428,9 +3428,7 @@ mod tests {
     use crate::completion::{
         PaneReleaseOutcome, PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
     };
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
+    use crate::coordinator::{CubeClient, CubeRepoSummary, CubeWorkspaceStatus};
     use crate::test_support::*;
     use crate::work::{
         AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateChoreInput, CreateCommentInput,
@@ -4058,33 +4056,10 @@ mod tests {
         releases: Mutex<Vec<String>>,
     }
 
-    #[async_trait]
-    impl CubeClient for RecordingCubeClient {
-        async fn ensure_repo(&self, _origin: &str) -> Result<crate::coordinator::CubeRepoHandle> {
-            unreachable!("not used in merge_poller tests")
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<crate::coordinator::CubeWorkspaceLease> {
-            unreachable!("not used in merge_poller tests")
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<crate::coordinator::CubeChangeHandle> {
-            unreachable!("not used in merge_poller tests")
-        }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
-            unreachable!("not used in merge_poller tests")
-        }
+    crate::stub_cube_client! { RecordingCubeClient {
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
             self.releases.lock().await.push(lease_id.to_owned());
             Ok(())
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<crate::coordinator::CubeWorkspaceStatus> {
-            unreachable!()
         }
         async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
             Ok(())
@@ -4098,7 +4073,7 @@ mod tests {
         async fn list_repos(&self) -> Result<Vec<crate::coordinator::CubeRepoSummary>> {
             Ok(Vec::new())
         }
-    }
+    } }
 
     #[tokio::test]
     async fn sweep_with_attempt_runs_retire_path_end_to_end() {
@@ -7379,32 +7354,12 @@ mod tests {
 
     struct NoopCubeClient;
 
-    #[async_trait]
-    impl CubeClient for NoopCubeClient {
-        async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
-            unreachable!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unreachable!()
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
-            unreachable!()
-        }
+    crate::stub_cube_client! { NoopCubeClient {
         async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
             Ok(())
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {
             Ok(())
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
-            unreachable!()
         }
         async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
             Ok(())
@@ -7418,7 +7373,7 @@ mod tests {
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             Ok(Vec::new())
         }
-    }
+    } }
 
     fn make_abandoned_chore_with_workspace(db: &WorkDb, name: &str) -> (String, String, String) {
         let product = create_test_product_with_repo(db, &format!("Prod-{name}"), Some("git@github.com:foo/bar.git"));

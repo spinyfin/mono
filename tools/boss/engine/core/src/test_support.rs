@@ -204,6 +204,318 @@ impl ExecutionRunner for NoopRunner {
     }
 }
 
+/// Implement [`CubeClient`](crate::coordinator::CubeClient) for a test
+/// double, spelling out only the methods a given test actually drives.
+/// Every trait method left unlisted is filled in with `unimplemented!()`,
+/// which is exactly what a double wants for the paths it never exercises.
+///
+/// Overrides are written as ordinary `async fn`s with their real bodies
+/// and **must appear in the trait's declaration order** (the order the
+/// arms below enumerate: `ensure_repo`, `lease_workspace`, `create_change`,
+/// `goto_workspace`, `release_workspace`, `workspace_status`,
+/// `heartbeat_lease`, `force_release_lease`, `list_workspaces`,
+/// `list_repos`). The macro emits the `#[async_trait]` impl for you.
+///
+/// ```ignore
+/// stub_cube_client! { RecordingCube {
+///     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
+///         self.releases.lock().await.push(lease_id.to_owned());
+///         Ok(())
+///     }
+/// } }
+/// ```
+#[macro_export]
+macro_rules! stub_cube_client {
+    ($ty:ty { $($body:tt)* }) => {
+        $crate::stub_cube_client!(@munch $ty [] @ensure_repo $($body)*);
+    };
+
+    // ── ensure_repo ─────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @ensure_repo async fn ensure_repo $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn ensure_repo $a -> $r $b] @lease_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @ensure_repo $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn ensure_repo(&self, _origin: &str) -> ::anyhow::Result<$crate::coordinator::CubeRepoHandle> { ::core::unimplemented!() }
+        ] @lease_workspace $($rest)*);
+    };
+
+    // ── lease_workspace ─────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @lease_workspace async fn lease_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn lease_workspace $a -> $r $b] @create_change $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @lease_workspace $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn lease_workspace(&self, _repo_id: &str, _task: &str, _prefer: ::core::option::Option<&str>, _allow_dirty: bool, _exclude: &[&str]) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceLease> { ::core::unimplemented!() }
+        ] @create_change $($rest)*);
+    };
+
+    // ── create_change ───────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @create_change async fn create_change $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn create_change $a -> $r $b] @goto_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @create_change $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn create_change(&self, _workspace_path: &::std::path::Path, _title: &str) -> ::anyhow::Result<$crate::coordinator::CubeChangeHandle> { ::core::unimplemented!() }
+        ] @goto_workspace $($rest)*);
+    };
+
+    // ── goto_workspace ──────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @goto_workspace async fn goto_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @release_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @goto_workspace $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn goto_workspace(&self, _workspace_path: &::std::path::Path, _pr: u64) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @release_workspace $($rest)*);
+    };
+
+    // ── release_workspace ───────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @workspace_status $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @workspace_status $($rest)*);
+    };
+
+    // ── workspace_status ────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @workspace_status async fn workspace_status $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn workspace_status $a -> $r $b] @heartbeat_lease $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @workspace_status $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn workspace_status(&self, _workspace_path: &::std::path::Path) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceStatus> { ::core::unimplemented!() }
+        ] @heartbeat_lease $($rest)*);
+    };
+
+    // ── heartbeat_lease ─────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease async fn heartbeat_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn heartbeat_lease $a -> $r $b] @force_release_lease $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn heartbeat_lease(&self, _lease_id: &str, _ttl_seconds: ::core::option::Option<u64>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @force_release_lease $($rest)*);
+    };
+
+    // ── force_release_lease ─────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @force_release_lease async fn force_release_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn force_release_lease $a -> $r $b] @list_workspaces $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @force_release_lease $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn force_release_lease(&self, _lease_id: &str, _reason: ::core::option::Option<&str>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @list_workspaces $($rest)*);
+    };
+
+    // ── list_workspaces ─────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @list_workspaces async fn list_workspaces $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn list_workspaces $a -> $r $b] @list_repos $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @list_workspaces $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeWorkspaceStatus>> { ::core::unimplemented!() }
+        ] @list_repos $($rest)*);
+    };
+
+    // ── list_repos ──────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @list_repos async fn list_repos $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn list_repos $a -> $r $b] @done $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @list_repos $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*
+            async fn list_repos(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeRepoSummary>> { ::core::unimplemented!() }
+        ] @done $($rest)*);
+    };
+
+    // ── emit ────────────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @done) => {
+        #[::async_trait::async_trait]
+        impl $crate::coordinator::CubeClient for $ty {
+            $($acc)*
+        }
+    };
+}
+
+/// Implement [`HostAdapter`](crate::host_adapter::HostAdapter) for a test
+/// double, spelling out only the methods a given test drives. Every
+/// workspace-lifecycle method and `spawn_worker` left unlisted is filled
+/// in with `unimplemented!()`; `command_repr` defaults to `None`; and the
+/// three trait-defaulted methods (`read_transcript_tail_bytes`,
+/// `reattach_events_forward`, `probe_remote_worker_alive`) fall through to
+/// their trait defaults unless overridden.
+///
+/// `host_id` has no universal default and **must be listed first**;
+/// remaining overrides follow in the trait's declaration order.
+#[macro_export]
+macro_rules! stub_host_adapter {
+    ($ty:ty { $($body:tt)* }) => {
+        $crate::stub_host_adapter!(@munch $ty [] @host_id $($body)*);
+    };
+
+    // ── host_id (required) ──────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @host_id fn host_id $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* fn host_id $a -> $r $b] @ensure_repo $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @host_id $($rest:tt)*) => {
+        ::core::compile_error!("stub_host_adapter! requires `fn host_id(&self) -> &str` as the first method");
+    };
+
+    // ── ensure_repo ─────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @ensure_repo async fn ensure_repo $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn ensure_repo $a -> $r $b] @lease_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @ensure_repo $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn ensure_repo(&self, _origin: &str) -> ::anyhow::Result<$crate::coordinator::CubeRepoHandle> { ::core::unimplemented!() }
+        ] @lease_workspace $($rest)*);
+    };
+
+    // ── lease_workspace ─────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @lease_workspace async fn lease_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn lease_workspace $a -> $r $b] @release_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @lease_workspace $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn lease_workspace(&self, _repo_id: &str, _task: &str, _prefer: ::core::option::Option<&str>, _allow_dirty: bool, _exclude: &[&str]) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceLease> { ::core::unimplemented!() }
+        ] @release_workspace $($rest)*);
+    };
+
+    // ── release_workspace ───────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace async fn release_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn release_workspace $a -> $r $b] @heartbeat_lease $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @release_workspace $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn release_workspace(&self, _lease_id: &str) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @heartbeat_lease $($rest)*);
+    };
+
+    // ── heartbeat_lease ─────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease async fn heartbeat_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn heartbeat_lease $a -> $r $b] @force_release_lease $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @heartbeat_lease $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn heartbeat_lease(&self, _lease_id: &str, _ttl_seconds: ::core::option::Option<u64>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @force_release_lease $($rest)*);
+    };
+
+    // ── force_release_lease ─────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @force_release_lease async fn force_release_lease $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn force_release_lease $a -> $r $b] @create_change $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @force_release_lease $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn force_release_lease(&self, _lease_id: &str, _reason: ::core::option::Option<&str>) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @create_change $($rest)*);
+    };
+
+    // ── create_change ───────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @create_change async fn create_change $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn create_change $a -> $r $b] @goto_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @create_change $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn create_change(&self, _workspace_path: &::std::path::Path, _title: &str) -> ::anyhow::Result<$crate::coordinator::CubeChangeHandle> { ::core::unimplemented!() }
+        ] @goto_workspace $($rest)*);
+    };
+
+    // ── goto_workspace ──────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @goto_workspace async fn goto_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @workspace_status $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @goto_workspace $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn goto_workspace(&self, _workspace_path: &::std::path::Path, _pr: u64) -> ::anyhow::Result<()> { ::core::unimplemented!() }
+        ] @workspace_status $($rest)*);
+    };
+
+    // ── workspace_status ────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @workspace_status async fn workspace_status $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn workspace_status $a -> $r $b] @list_workspaces $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @workspace_status $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn workspace_status(&self, _workspace_path: &::std::path::Path) -> ::anyhow::Result<$crate::coordinator::CubeWorkspaceStatus> { ::core::unimplemented!() }
+        ] @list_workspaces $($rest)*);
+    };
+
+    // ── list_workspaces ─────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @list_workspaces async fn list_workspaces $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn list_workspaces $a -> $r $b] @list_repos $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @list_workspaces $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn list_workspaces(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeWorkspaceStatus>> { ::core::unimplemented!() }
+        ] @list_repos $($rest)*);
+    };
+
+    // ── list_repos ──────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @list_repos async fn list_repos $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn list_repos $a -> $r $b] @command_repr $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @list_repos $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn list_repos(&self) -> ::anyhow::Result<::std::vec::Vec<$crate::coordinator::CubeRepoSummary>> { ::core::unimplemented!() }
+        ] @command_repr $($rest)*);
+    };
+
+    // ── command_repr (defaults to None) ─────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @command_repr fn command_repr $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* fn command_repr $a -> $r $b] @spawn_worker $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @command_repr $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            fn command_repr(&self, _args: &[&str]) -> ::core::option::Option<(::std::string::String, ::std::string::String)> { ::core::option::Option::None }
+        ] @spawn_worker $($rest)*);
+    };
+
+    // ── spawn_worker ────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @spawn_worker async fn spawn_worker $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn spawn_worker $a -> $r $b] @read_transcript_tail_bytes $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @spawn_worker $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*
+            async fn spawn_worker(&self, _worker_id: &str, _execution: &$crate::work::WorkExecution, _work_item: &$crate::work::WorkItem, _workspace_path: &::std::path::Path, _cube_change_id: ::core::option::Option<&str>) -> ::anyhow::Result<$crate::runner::RunOutcome> { ::core::unimplemented!() }
+        ] @read_transcript_tail_bytes $($rest)*);
+    };
+
+    // ── read_transcript_tail_bytes (trait default unless overridden) ─────────
+    (@munch $ty:ty [$($acc:tt)*] @read_transcript_tail_bytes async fn read_transcript_tail_bytes $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn read_transcript_tail_bytes $a -> $r $b] @reattach_events_forward $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @read_transcript_tail_bytes $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @reattach_events_forward $($rest)*);
+    };
+
+    // ── reattach_events_forward (trait default unless overridden) ────────────
+    (@munch $ty:ty [$($acc:tt)*] @reattach_events_forward async fn reattach_events_forward $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn reattach_events_forward $a -> $r $b] @probe_remote_worker_alive $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @reattach_events_forward $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @probe_remote_worker_alive $($rest)*);
+    };
+
+    // ── probe_remote_worker_alive (trait default unless overridden) ──────────
+    (@munch $ty:ty [$($acc:tt)*] @probe_remote_worker_alive async fn probe_remote_worker_alive $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_remote_worker_alive $a -> $r $b] @done $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @probe_remote_worker_alive $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
+    };
+
+    // ── emit ────────────────────────────────────────────────────────────────
+    (@munch $ty:ty [$($acc:tt)*] @done) => {
+        #[::async_trait::async_trait]
+        impl $crate::host_adapter::HostAdapter for $ty {
+            $($acc)*
+        }
+    };
+}
+
 /// Construct an [`ExecutionCoordinator`] wired to a `pool_size`-worker
 /// [`WorkerPool`] and the [`NoopCube`]/[`NoopRunner`] test doubles.
 ///

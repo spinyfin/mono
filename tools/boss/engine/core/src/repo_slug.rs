@@ -206,10 +206,7 @@ mod tests {
 
     // ── async wrapper: the create-handler entry point ────────────────────
 
-    use crate::coordinator::{CubeChangeHandle, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus};
     use anyhow::{Result, anyhow};
-    use async_trait::async_trait;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Minimal `CubeClient` double: serves a fixed repo snapshot (or an
@@ -235,8 +232,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl CubeClient for FakeCube {
+    crate::stub_cube_client! { FakeCube {
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
             match &self.repos {
@@ -244,41 +240,7 @@ mod tests {
                 Err(err) => Err(anyhow!("{err}")),
             }
         }
-        async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
-            unreachable!()
-        }
-        async fn lease_workspace(
-            &self,
-            _repo_id: &str,
-            _task: &str,
-            _prefer: Option<&str>,
-            _allow_dirty: bool,
-            _exclude: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unreachable!()
-        }
-        async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
-            unreachable!()
-        }
-        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
-            unreachable!()
-        }
-        async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
-            unreachable!()
-        }
-        async fn workspace_status(&self, _workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
-            unreachable!()
-        }
-        async fn heartbeat_lease(&self, _lease_id: &str, _ttl: Option<u64>) -> Result<()> {
-            unreachable!()
-        }
-        async fn force_release_lease(&self, _lease_id: &str, _reason: Option<&str>) -> Result<()> {
-            unreachable!()
-        }
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            unreachable!()
-        }
-    }
+    } }
 
     #[tokio::test]
     async fn resolves_slug_field_via_registry() {

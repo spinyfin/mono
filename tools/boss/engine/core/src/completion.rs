@@ -5963,9 +5963,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
+    use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
     use crate::test_support::*;
 
     #[test]
@@ -6292,33 +6290,10 @@ mod tests {
         release_calls: Mutex<Vec<String>>,
     }
 
-    #[async_trait]
-    impl CubeClient for StubCubeClient {
-        async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
-            unreachable!("not used in completion tests")
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unreachable!("not used in completion tests")
-        }
-        async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
-            unreachable!("not used in completion tests")
-        }
-        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
-            unreachable!("not used in completion tests")
-        }
+    crate::stub_cube_client! { StubCubeClient {
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
             self.release_calls.lock().await.push(lease_id.to_owned());
             Ok(())
-        }
-        async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
-            unreachable!("not used in completion tests")
         }
         async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
             Ok(())
@@ -6332,7 +6307,7 @@ mod tests {
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             Ok(Vec::new())
         }
-    }
+    } }
 
     #[derive(Default)]
     struct RecordingPaneReleaser {
