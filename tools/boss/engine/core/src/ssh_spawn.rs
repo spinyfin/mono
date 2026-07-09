@@ -115,20 +115,10 @@ pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
 /// filename charset (run ids are `exec_*` / `run_*`, already safe, but
 /// we defend against anything else).
 pub fn remote_events_socket_path(run_id: &str) -> String {
-    format!("/tmp/boss-events-{}.sock", sanitize_run_id(run_id))
-}
-
-fn sanitize_run_id(run_id: &str) -> String {
-    run_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    format!(
+        "/tmp/boss-events-{}.sock",
+        crate::ssh_transport::sanitize_for_path(run_id)
+    )
 }
 
 // ── Remote command composition ────────────────────────────────────────────────
