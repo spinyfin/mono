@@ -397,6 +397,110 @@ async fn engine_health_report_is_empty_when_api_key_present() {
     );
 }
 
+/// Pausing dispatch must surface a warning-severity `dispatch_paused`
+/// engine-health issue and flip the report's top-level `dispatch_paused`
+/// bool; an un-paused engine must do neither. This is the banner the
+/// macOS app shows so an operator doesn't wonder why nothing new is
+/// starting after `bossctl dispatch pause`.
+#[tokio::test]
+async fn engine_health_report_flags_dispatch_paused() {
+    let state = test_server_state();
+
+    let has_dispatch_issue =
+        |report: &boss_protocol::EngineHealthReport| report.issues.iter().any(|i| i.kind == "dispatch_paused");
+
+    // Default: dispatch is running, so no dispatch_paused issue and the
+    // top-level bool is false.
+    let report = build_engine_health_report(&state);
+    assert!(
+        !report.dispatch_paused,
+        "fresh engine must not report dispatch as paused",
+    );
+    assert!(
+        !has_dispatch_issue(&report),
+        "running dispatch must not raise the dispatch_paused banner",
+    );
+
+    // Pause dispatch through the same coordinator API the human toggle
+    // and the spawn-health circuit breaker use.
+    state.execution_coordinator.set_dispatch_paused(true, 0);
+
+    let report = build_engine_health_report(&state);
+    assert!(
+        report.dispatch_paused,
+        "paused engine must set the top-level dispatch_paused bool",
+    );
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.kind == "dispatch_paused")
+        .expect("dispatch_paused issue must be present once dispatch is paused");
+    assert_eq!(issue.severity, "warning");
+    assert!(
+        !issue.title.is_empty() && !issue.body.is_empty(),
+        "title and body must be populated so the banner has user-visible text",
+    );
+}
+
+/// A wedged `syspolicyd` must surface an error-severity
+/// `syspolicyd_wedged` engine-health issue with the offending pid and
+/// CPU% interpolated into the body so the operator gets the exact
+/// `sudo kill -9 <pid>` remedy; a healthy daemon must raise nothing.
+#[tokio::test]
+async fn engine_health_report_flags_syspolicyd_wedged() {
+    use crate::syspolicyd_monitor::{SATURATION_SAMPLES_TO_ALERT, SyspolicydSample};
+
+    let state = test_server_state();
+
+    let has_wedged_issue =
+        |report: &boss_protocol::EngineHealthReport| report.issues.iter().any(|i| i.kind == "syspolicyd_wedged");
+
+    // Default: the sampler has recorded nothing, so the daemon is not
+    // wedged and no issue is raised.
+    assert!(
+        !has_wedged_issue(&build_engine_health_report(&state)),
+        "a fresh engine with no syspolicyd samples must not raise the wedged banner",
+    );
+
+    // Drive the monitor into the wedged state with the required run of
+    // consecutive saturated samples, exactly as the sampler loop would.
+    for i in 0..SATURATION_SAMPLES_TO_ALERT {
+        state.syspolicyd_health.record_sample(
+            SyspolicydSample {
+                pid: 4242,
+                cpu_pct: 99.0,
+            },
+            i as i64,
+        );
+    }
+    assert!(
+        state.syspolicyd_health.snapshot().wedged,
+        "precondition: monitor must report wedged after the saturation streak",
+    );
+
+    let report = build_engine_health_report(&state);
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.kind == "syspolicyd_wedged")
+        .expect("syspolicyd_wedged issue must be present once the daemon wedges");
+    assert_eq!(issue.severity, "error");
+    assert!(
+        !issue.title.is_empty() && !issue.body.is_empty(),
+        "title and body must be populated so the banner has user-visible text",
+    );
+    assert!(
+        issue.body.contains("4242"),
+        "body must interpolate the wedged pid so the remedy is actionable; got {:?}",
+        issue.body,
+    );
+    assert!(
+        issue.body.contains("99"),
+        "body must interpolate the observed CPU%; got {:?}",
+        issue.body,
+    );
+}
+
 /// Regression guard for the version-mismatch restart path (T460
 /// + the chore that surfaced this gap): engine startup must
 /// call `build_info::init()` so the binary-fingerprint OnceLock
