@@ -15,32 +15,13 @@
 //! "snapshot tests on CLI" / "list shows entries from all three
 //! subsystems with correct `kind` column."
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use boss_client::BossClient;
 use boss_engine::work::{CiRemediationInsertInput, ConflictResolutionInsertInput, WorkDb};
-use boss_protocol::{
-    CreateChoreInput, CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem, WorkItemPatch,
-};
+use boss_protocol::{CreateChoreInput, WorkItemPatch};
 
 use common::{run_boss, run_boss_expect_failure, run_boss_human};
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> {
-    let input = CreateProductInput {
-        name: name.to_owned(),
-        description: None,
-        repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    };
-    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_product};
 
 /// Seed a chore plus one CI remediation row directly through the
 /// engine's `WorkDb`. Returns `(chore_id, attempt_id)`.

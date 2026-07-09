@@ -12,40 +12,10 @@ use std::process::Command;
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{
-    CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest, Product, Project, Task,
-    WorkItem,
-};
+use boss_protocol::{CreateProductInput, CreateProjectInput, CreateTaskInput};
 
 use common::{boss_binary, run_boss};
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
-    }
-}
-
-async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project> {
-    match client.send_request(&FrontendRequest::CreateProject { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Project(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected engine event for project create: {other:?}")),
-    }
-}
-
-async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<Task> {
-    match client.send_request(&FrontendRequest::CreateTask { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Task(t),
-        } => Ok(t),
-        other => Err(anyhow!("unexpected engine event for task create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_product_with, create_project_with, create_task_with};
 
 // Multi-thread runtime: the test launches the `boss` binary as a
 // blocking subprocess via `Command::output()`. With the default
@@ -57,7 +27,7 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -69,7 +39,7 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
         },
     )
     .await?;
-    let project = create_project(
+    let project = create_project_with(
         &mut client,
         CreateProjectInput {
             product_id: product.id.clone(),
@@ -100,7 +70,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -112,7 +82,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
         },
     )
     .await?;
-    let project = create_project(
+    let project = create_project_with(
         &mut client,
         CreateProjectInput {
             product_id: product.id.clone(),
@@ -124,7 +94,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
         },
     )
     .await?;
-    let task = create_task(
+    let task = create_task_with(
         &mut client,
         CreateTaskInput::builder()
             .product_id(product.id.clone())
@@ -160,7 +130,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let primary = create_product(
+    let primary = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -172,7 +142,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
         },
     )
     .await?;
-    let other = create_product(
+    let other = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Mono".to_owned(),
@@ -184,7 +154,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
         },
     )
     .await?;
-    let project = create_project(
+    let project = create_project_with(
         &mut client,
         CreateProjectInput {
             product_id: primary.id.clone(),

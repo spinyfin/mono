@@ -18,10 +18,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use boss_client::BossClient;
 use boss_client::wait_for_socket;
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
+use boss_protocol::{
+    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest, Product,
+    Project, Task, WorkItem,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -70,4 +75,116 @@ impl Drop for TestEngine {
     fn drop(&mut self) {
         self.join.abort();
     }
+}
+
+// ---------------------------------------------------------------------------
+// BossClient-based work-item creation helpers.
+//
+// Every engine-backed CLI test needs to seed a product / project / task /
+// chore over the wire before driving the `boss` binary. Each `create_*`
+// helper sends the matching `FrontendRequest` and unwraps the created item
+// from `FrontendEvent::WorkItemCreated`. The `*_with` variant takes a fully
+// built input; the plain variant is a convenience that fills in stock test
+// values. These previously lived as copy-pasted private fns in ~8 test
+// files.
+// ---------------------------------------------------------------------------
+
+/// Send a `CreateProduct` request and unwrap the created [`Product`].
+pub async fn create_product_with(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
+    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => Ok(p),
+        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
+    }
+}
+
+/// Create a product from a name, with a stock test repo remote.
+pub async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> {
+    create_product_with(
+        client,
+        CreateProductInput {
+            name: name.to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        },
+    )
+    .await
+}
+
+/// Send a `CreateProject` request and unwrap the created [`Project`].
+pub async fn create_project_with(client: &mut BossClient, input: CreateProjectInput) -> Result<Project> {
+    match client.send_request(&FrontendRequest::CreateProject { input }).await? {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Project(p),
+        } => Ok(p),
+        other => Err(anyhow!("unexpected engine event for project create: {other:?}")),
+    }
+}
+
+/// Create a non-autostarting project under `product_id` from a name.
+pub async fn create_project(client: &mut BossClient, product_id: &str, name: &str) -> Result<Project> {
+    create_project_with(
+        client,
+        CreateProjectInput {
+            product_id: product_id.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: false,
+        },
+    )
+    .await
+}
+
+/// Send a `CreateTask` request and unwrap the created [`Task`].
+pub async fn create_task_with(client: &mut BossClient, input: CreateTaskInput) -> Result<Task> {
+    match client.send_request(&FrontendRequest::CreateTask { input }).await? {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => Ok(t),
+        other => Err(anyhow!("unexpected engine event for task create: {other:?}")),
+    }
+}
+
+/// Create a non-autostarting task under `product_id` / `project_id`.
+pub async fn create_task(client: &mut BossClient, product_id: &str, project_id: &str, name: &str) -> Result<Task> {
+    create_task_with(
+        client,
+        CreateTaskInput::builder()
+            .product_id(product_id)
+            .project_id(project_id)
+            .name(name)
+            .autostart(false)
+            .build(),
+    )
+    .await
+}
+
+/// Send a `CreateChore` request and unwrap the created [`Task`]. Accepts
+/// either the `Chore` or `Task` `WorkItem` shape the engine may return.
+pub async fn create_chore_with(client: &mut BossClient, input: CreateChoreInput) -> Result<Task> {
+    match client.send_request(&FrontendRequest::CreateChore { input }).await? {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t) | WorkItem::Task(t),
+        } => Ok(t),
+        other => Err(anyhow!("unexpected engine event for chore create: {other:?}")),
+    }
+}
+
+/// Create a non-autostarting chore under `product_id` from a name.
+pub async fn create_chore(client: &mut BossClient, product_id: &str, name: &str) -> Result<Task> {
+    create_chore_with(
+        client,
+        CreateChoreInput::builder()
+            .product_id(product_id)
+            .name(name)
+            .autostart(false)
+            .build(),
+    )
+    .await
 }

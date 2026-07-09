@@ -14,30 +14,12 @@
 //! Together they pin the inference order the way the rest of the
 //! system (engine dispatch, app rendering) expects to see it.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use boss_client::BossClient;
-use boss_protocol::{CreateChoreInput, CreateProductInput, FrontendEvent, FrontendRequest, Product, Task, WorkItem};
+use boss_protocol::{CreateChoreInput, CreateProductInput};
 
 use common::{run_boss, run_boss_expect_failure};
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
-    }
-}
-
-async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Result<Task> {
-    match client.send_request(&FrontendRequest::CreateChore { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Chore(task) | WorkItem::Task(task),
-        } => Ok(task),
-        other => Err(anyhow!("unexpected engine event for chore create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_chore_with, create_product_with};
 
 /// Multi-repo product: prompt names a known repo → resolver picks it.
 /// This is the "parser" arm of the Q4 inference chain for products
@@ -48,7 +30,7 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     // Product has NO repo (multi-repo product). The known-repo set is
     // bootstrapped from the seed chore's row-level override.
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Work".to_owned(),
@@ -60,7 +42,7 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
         },
     )
     .await?;
-    create_chore(
+    create_chore_with(
         &mut client,
         CreateChoreInput::builder()
             .product_id(product.id.clone())
@@ -99,7 +81,7 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
 async fn chore_create_on_single_repo_product_stores_null_repo_remote_url() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Work".to_owned(),
@@ -140,7 +122,7 @@ async fn chore_create_on_single_repo_product_stores_null_repo_remote_url() -> Re
 async fn chore_create_no_input_with_no_resolution_errors_clearly() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Greenfield".to_owned(),
@@ -188,7 +170,7 @@ async fn chore_create_no_input_with_no_resolution_errors_clearly() -> Result<()>
 async fn chore_create_explicit_repo_rejected_on_single_repo_product() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Work".to_owned(),
@@ -237,7 +219,7 @@ async fn chore_create_explicit_repo_rejected_on_single_repo_product() -> Result<
 async fn chore_create_explicit_repo_accepted_on_multi_repo_product() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Greenfield".to_owned(),

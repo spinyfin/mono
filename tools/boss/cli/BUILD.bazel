@@ -26,6 +26,7 @@ rust_library(
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

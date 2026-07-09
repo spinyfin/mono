@@ -14,19 +14,10 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem};
+use boss_protocol::CreateProductInput;
 
 use common::{run_boss, run_boss_expect_failure};
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_product_with};
 
 // Multi-thread runtime: the test launches the `boss` binary as a
 // blocking subprocess via `Command::output()`. The in-process
@@ -36,7 +27,7 @@ async fn create_product(client: &mut BossClient, input: CreateProductInput) -> R
 async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -87,7 +78,7 @@ async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result
 async fn chore_create_rejects_invalid_effort_level() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -131,7 +122,7 @@ async fn chore_create_rejects_invalid_effort_level() -> Result<()> {
 async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -188,7 +179,7 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
 async fn product_set_default_model_lifecycle_round_trips() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -236,7 +227,7 @@ async fn product_set_default_model_lifecycle_round_trips() -> Result<()> {
 async fn model_override_passes_through_unrecognised_slug() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),

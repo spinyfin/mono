@@ -15,51 +15,20 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{
-    CreateChoreInput, CreateProductInput, EffortLevel, FrontendEvent, FrontendRequest, Product, Task, WorkItem,
-};
+use boss_protocol::{CreateChoreInput, EffortLevel, FrontendEvent, FrontendRequest};
 
 use common::{run_boss, run_boss_human};
-use harness::TestEngine;
+use harness::{TestEngine, create_chore_with, create_product};
 
-async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> {
-    match client
-        .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: name.to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
-        })
-        .await?
-    {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected response for product create: {other:?}")),
-    }
-}
-
-async fn create_chore(client: &mut BossClient, product_id: &str, name: &str, description: &str) -> Result<Task> {
-    match client
-        .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput::builder()
-                .product_id(product_id)
-                .name(name)
-                .description(description)
-                .autostart(false)
-                .build(),
-        })
-        .await?
-    {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Task(t) | WorkItem::Chore(t),
-        } => Ok(t),
-        other => Err(anyhow!("unexpected response for chore create: {other:?}")),
-    }
+/// Build a non-autostarting chore input with a description, for the
+/// escalation-corpus tests below.
+fn chore_input(product_id: &str, name: &str, description: &str) -> CreateChoreInput {
+    CreateChoreInput::builder()
+        .product_id(product_id)
+        .name(name)
+        .description(description)
+        .autostart(false)
+        .build()
 }
 
 async fn record_escalation(
@@ -97,19 +66,19 @@ async fn three_escalation_events_match_recorded_rates() -> Result<()> {
     let product = create_product(&mut client, "Boss").await?;
 
     // Three chores, one per marker — denominators all = 1.
-    let rename_chore = create_chore(&mut client, &product.id, "Rename auth middleware", "Renames the module").await?;
-    let cursor_chore = create_chore(
+    let rename_chore = create_chore_with(
         &mut client,
-        &product.id,
-        "Fix cursor flicker",
-        "Cursor disappears on focus",
+        chore_input(&product.id, "Rename auth middleware", "Renames the module"),
     )
     .await?;
-    let _invest_chore = create_chore(
+    let cursor_chore = create_chore_with(
         &mut client,
-        &product.id,
-        "Investigate the slow path",
-        "Diagnose the root cause",
+        chore_input(&product.id, "Fix cursor flicker", "Cursor disappears on focus"),
+    )
+    .await?;
+    let _invest_chore = create_chore_with(
+        &mut client,
+        chore_input(&product.id, "Investigate the slow path", "Diagnose the root cause"),
     )
     .await?;
 
@@ -218,11 +187,9 @@ async fn multi_marker_event_counts_against_each_marker() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(&mut client, "Boss").await?;
-    let chore = create_chore(
+    let chore = create_chore_with(
         &mut client,
-        &product.id,
-        "Apply the cursor fix",
-        "Apply PR #357 resize-cursor patch",
+        chore_input(&product.id, "Apply the cursor fix", "Apply PR #357 resize-cursor patch"),
     )
     .await?;
     record_escalation(
