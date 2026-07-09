@@ -3021,7 +3021,6 @@ mod tests {
     };
     use crate::coordinator::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionPublisher,
     };
     use crate::test_support::*;
     use crate::work::{
@@ -3135,56 +3134,6 @@ mod tests {
                     raw_merge_state_status: String::new(),
                 }),
             }
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingPublisher {
-        work_events: Mutex<Vec<(String, String, String)>>,
-        frontend_events: Mutex<Vec<boss_protocol::FrontendEvent>>,
-    }
-
-    impl RecordingPublisher {
-        /// Events filtered to exclude poll-state housekeeping events
-        /// (`pr_poll_state_updated`) so lifecycle-focused assertions don't
-        /// have to account for the background sweep's bookkeeping writes.
-        async fn lifecycle_reasons(&self) -> Vec<String> {
-            self.work_events
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, _, reason)| reason != "pr_poll_state_updated")
-                .map(|(_, _, reason)| reason.clone())
-                .collect()
-        }
-
-        /// Count of `CiFailureCleared` frontend events broadcast for `pr_url`.
-        async fn ci_failure_cleared_count(&self, pr_url: &str) -> usize {
-            self.frontend_events
-                .lock()
-                .await
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e,
-                        boss_protocol::FrontendEvent::CiFailureCleared { pr_url: p, .. } if p == pr_url
-                    )
-                })
-                .count()
-        }
-    }
-
-    #[async_trait]
-    impl ExecutionPublisher for RecordingPublisher {
-        async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
-            self.work_events
-                .lock()
-                .await
-                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
-        }
-        async fn publish_frontend_event_on_product(&self, _product_id: &str, event: boss_protocol::FrontendEvent) {
-            self.frontend_events.lock().await.push(event);
         }
     }
 
@@ -3415,7 +3364,7 @@ mod tests {
             }
             other => panic!("expected chore, got {other:?}"),
         }
-        let events = publisher.work_events.lock().await.clone();
+        let events = publisher.events.lock().await.clone();
         assert!(
             events
                 .iter()
@@ -3505,7 +3454,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
 
-        let events = publisher.work_events.lock().await.clone();
+        let events = publisher.events.lock().await.clone();
         assert!(
             events
                 .iter()
@@ -3580,7 +3529,7 @@ mod tests {
             WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
             other => panic!("expected chore, got {other:?}"),
         }
-        let work_events = publisher.work_events.lock().await.clone();
+        let work_events = publisher.events.lock().await.clone();
         assert!(
             work_events
                 .iter()
@@ -3680,7 +3629,7 @@ mod tests {
         // Event trail: conflict in flight → (no work-item event on resolve since
         // parent didn't change status). Poll-state events excluded.
         let reasons: Vec<String> = publisher
-            .work_events
+            .events
             .lock()
             .await
             .iter()
@@ -4345,7 +4294,7 @@ mod tests {
         // with the conflict path (merge_conflict_resolved is also suppressed
         // when the parent never blocked). Poll-state events excluded.
         let reasons: Vec<String> = publisher
-            .work_events
+            .events
             .lock()
             .await
             .iter()
@@ -4436,15 +4385,15 @@ mod tests {
         );
 
         // The AttentionItemCreated frontend event must also have been emitted.
-        let fe = publisher.frontend_events.lock().await;
+        let fe = publisher.typed_events.lock().await;
         let exhausted = fe
             .iter()
-            .filter(|e| matches!(e, boss_protocol::FrontendEvent::CiRemediationExhausted { .. }))
+            .filter(|(_, e)| matches!(e, boss_protocol::FrontendEvent::CiRemediationExhausted { .. }))
             .count();
         assert_eq!(exhausted, 1, "CiRemediationExhausted event must be emitted");
         let attention_created = fe
             .iter()
-            .filter(|e| matches!(e, boss_protocol::FrontendEvent::AttentionItemCreated { .. }))
+            .filter(|(_, e)| matches!(e, boss_protocol::FrontendEvent::AttentionItemCreated { .. }))
             .count();
         assert_eq!(
             attention_created, 1,
@@ -6196,7 +6145,7 @@ mod tests {
         assert!(task_after.blocked_reason.is_none());
 
         // work_item_changed event must have fired.
-        let events = publisher.work_events.lock().await;
+        let events = publisher.events.lock().await;
         assert!(
             events
                 .iter()
@@ -7231,7 +7180,7 @@ mod tests {
 
         // A pr_poll_state_updated event must have been emitted so the macOS
         // kanban refreshes the CI indicator without waiting for a user action.
-        let all_events = publisher.work_events.lock().await.clone();
+        let all_events = publisher.events.lock().await.clone();
         let has_poll_update = all_events
             .iter()
             .any(|(p, w, r)| p == &product && w == &chore && r == "pr_poll_state_updated");
@@ -7310,9 +7259,9 @@ mod tests {
         );
 
         // Sanity: the event carries the right product/work-item identifiers.
-        let events = publisher.frontend_events.lock().await.clone();
+        let events = publisher.typed_events.lock().await.clone();
         assert!(
-            events.iter().any(|e| matches!(
+            events.iter().any(|(_, e)| matches!(
                 e,
                 boss_protocol::FrontendEvent::CiFailureCleared { product_id: p, work_item_id: w, pr_url: u }
                     if p == &product && w == &chore && u == pr

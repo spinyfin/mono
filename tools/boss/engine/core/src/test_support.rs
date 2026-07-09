@@ -222,23 +222,90 @@ pub fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoord
     ))
 }
 
-/// Test-only [`ExecutionPublisher`] that records the calls it receives.
+/// Test-only [`ExecutionPublisher`] that records every call it receives.
 ///
-/// `publish` is a no-op; `publish_work_item_changed` records
-/// `(product_id, work_item_id, reason)` triples into `events`, and
-/// `publish_frontend_event_on_product` records `(product_id, event)`
-/// pairs into `typed_events`. The `conflict_watch` and `ci_watch` test
-/// modules both wanted this exact recorder, so this replaces the
-/// byte-identical copy each used to hand-roll.
+/// All three [`ExecutionPublisher`] call kinds are captured behind public
+/// fields, so a single recorder serves every module that needs to assert on
+/// publisher activity:
+///
+/// - `publish_calls` — `(execution_id, work_item_id, status, reason)` 4-tuples
+///   from [`publish`](ExecutionPublisher::publish).
+/// - `events` — `(product_id, work_item_id, reason)` triples from
+///   [`publish_work_item_changed`](ExecutionPublisher::publish_work_item_changed).
+/// - `typed_events` — `(product_id, event)` pairs from
+///   [`publish_frontend_event_on_product`](ExecutionPublisher::publish_frontend_event_on_product).
+///
+/// The `conflict_watch`, `ci_watch`, `completion`, `coordinator`,
+/// `merge_poller`, and `populator` test modules all previously hand-rolled a
+/// near-duplicate recorder over some subset of these fields; this canonical
+/// copy is a superset of every one, so it replaces all of them. Module-specific
+/// query helpers live in the `impl` block below.
 #[derive(Default)]
 pub struct RecordingPublisher {
+    pub publish_calls: Mutex<Vec<(String, String, String, String)>>,
     pub events: Mutex<Vec<(String, String, String)>>,
     pub typed_events: Mutex<Vec<(String, FrontendEvent)>>,
 }
 
+impl RecordingPublisher {
+    /// `publish_work_item_changed` reasons with poll-state housekeeping
+    /// (`pr_poll_state_updated`) filtered out, so lifecycle-focused assertions
+    /// don't have to account for the background sweep's bookkeeping writes.
+    pub async fn lifecycle_reasons(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, _, reason)| reason != "pr_poll_state_updated")
+            .map(|(_, _, reason)| reason.clone())
+            .collect()
+    }
+
+    /// Count of `CiFailureCleared` frontend events broadcast for `pr_url`.
+    pub async fn ci_failure_cleared_count(&self, pr_url: &str) -> usize {
+        self.typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    FrontendEvent::CiFailureCleared { pr_url: p, .. } if p == pr_url
+                )
+            })
+            .count()
+    }
+
+    /// Count of `AttentionItemCreated` frontend events published.
+    pub async fn attention_items_created(&self) -> usize {
+        self.typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, e)| matches!(e, FrontendEvent::AttentionItemCreated { .. }))
+            .count()
+    }
+
+    /// `Some(n)` — a `WorkItemsCreated` event was published carrying `n`
+    /// items. `None` if no such event was published.
+    pub async fn work_items_created_len(&self) -> Option<usize> {
+        self.typed_events.lock().await.iter().find_map(|(_, e)| match e {
+            FrontendEvent::WorkItemsCreated { items } => Some(items.len()),
+            _ => None,
+        })
+    }
+}
+
 #[async_trait]
 impl ExecutionPublisher for RecordingPublisher {
-    async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
+    async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
+        self.publish_calls.lock().await.push((
+            execution_id.to_owned(),
+            work_item_id.to_owned(),
+            status.to_owned(),
+            reason.to_owned(),
+        ));
+    }
     async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
         self.events
             .lock()

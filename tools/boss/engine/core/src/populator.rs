@@ -1037,7 +1037,6 @@ mod tests {
 
     use crate::test_support::*;
     use boss_protocol::{Confidence, CreateProjectInput, CreateTaskInput, EffortLevel, ProposedEdge, ProposedTask};
-    use tokio::sync::Mutex;
 
     use crate::work::WorkDb;
 
@@ -1124,45 +1123,6 @@ mod tests {
                 PlannerOutcomeKind::Success(out) => PlannerOutcome::Success(out.clone()),
                 PlannerOutcomeKind::NoApiKey => PlannerOutcome::NoApiKey,
             }
-        }
-    }
-
-    /// A recording [`ExecutionPublisher`] fake — captures every typed event
-    /// pushed via `publish_frontend_event_on_product` so tests can assert the
-    /// Populator surfaces `AttentionItemCreated` and `WorkItemsCreated` (this
-    /// module's task 8: attention-item + event surfacing) without a live
-    /// topic broker.
-    #[derive(Default)]
-    struct RecordingPublisher {
-        events: Mutex<Vec<(String, FrontendEvent)>>,
-    }
-
-    #[async_trait]
-    impl ExecutionPublisher for RecordingPublisher {
-        async fn publish(&self, _execution_id: &str, _work_item_id: &str, _status: &str, _reason: &str) {}
-        async fn publish_work_item_changed(&self, _product_id: &str, _work_item_id: &str, _reason: &str) {}
-        async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
-            self.events.lock().await.push((product_id.to_owned(), event));
-        }
-    }
-
-    impl RecordingPublisher {
-        async fn attention_items_created(&self) -> usize {
-            self.events
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, e)| matches!(e, FrontendEvent::AttentionItemCreated { .. }))
-                .count()
-        }
-
-        /// `Some(n)` — a `WorkItemsCreated` event was published carrying `n`
-        /// items. `None` if no such event was published.
-        async fn work_items_created_len(&self) -> Option<usize> {
-            self.events.lock().await.iter().find_map(|(_, e)| match e {
-                FrontendEvent::WorkItemsCreated { items } => Some(items.len()),
-                _ => None,
-            })
         }
     }
 

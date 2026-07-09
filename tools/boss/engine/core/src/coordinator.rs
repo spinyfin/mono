@@ -4718,9 +4718,9 @@ mod tests {
 
     use super::{
         AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, ExecutionPublisher,
-        FrontendEvent, Host, HostAdapter, HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
-        MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, occupying_live_worker, pick_worst_failing_check,
+        CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter,
+        HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
+        REVIEW_WORKER_ID_PREFIX, WorkerPool, occupying_live_worker, pick_worst_failing_check,
         pool_model_override_for_worker_id, slot_id_from_worker_id, worker_id_for_slot,
     };
     use boss_protocol::ExecutionStatus;
@@ -5142,34 +5142,6 @@ mod tests {
                 spawn_config: self.spawn_config.clone(),
             })
         }
-    }
-
-    #[derive(Default)]
-    struct RecordingPublisher {
-        events: Mutex<Vec<(String, String, String, String)>>,
-        work_item_events: Mutex<Vec<(String, String, String)>>,
-    }
-
-    #[async_trait]
-    impl ExecutionPublisher for RecordingPublisher {
-        async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
-            self.events.lock().await.push((
-                execution_id.to_owned(),
-                work_item_id.to_owned(),
-                status.to_owned(),
-                reason.to_owned(),
-            ));
-        }
-
-        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
-            self.work_item_events.lock().await.push((
-                product_id.to_owned(),
-                work_item_id.to_owned(),
-                reason.to_owned(),
-            ));
-        }
-
-        async fn publish_frontend_event_on_product(&self, _product_id: &str, _event: FrontendEvent) {}
     }
 
     async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: ExecutionStatus) {
@@ -8042,7 +8014,7 @@ mod tests {
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
         wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
-        let events = publisher.events.lock().await;
+        let events = publisher.publish_calls.lock().await;
         let reasons: Vec<&str> = events.iter().map(|(_, _, _, reason)| reason.as_str()).collect();
         assert!(reasons.contains(&"execution_started"));
         assert!(reasons.contains(&"execution_run_completed"));
@@ -8058,7 +8030,7 @@ mod tests {
         // "active" after the agent moved to waiting_human. Confirm the
         // coordinator now fires the broadcast on the completion path
         // too — not just on execution-start auto-advance.
-        let work_item_events = publisher.work_item_events.lock().await;
+        let work_item_events = publisher.events.lock().await;
         assert!(
             work_item_events
                 .iter()
@@ -8100,7 +8072,7 @@ mod tests {
         // isn't load-bearing but we assert it's there to confirm the
         // call site is the auto-advance one and not some unrelated
         // future broadcast.
-        let work_item_events = publisher.work_item_events.lock().await;
+        let work_item_events = publisher.events.lock().await;
         assert!(
             work_item_events.iter().any(|(product_id, work_item_id, reason)| {
                 product_id == &product.id && work_item_id == &chore.id && reason == "execution_started_auto_advance"
