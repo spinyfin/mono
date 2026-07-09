@@ -3420,6 +3420,21 @@ pub struct TaskRuntime {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_retry_at: Option<String>,
+
+    /// The dispatcher's current defer reason for this `ready` execution
+    /// (`chain_serialized`, `pool_exhausted`, ...) — mirrors
+    /// `WorkExecution::dispatch_wait_reason`. `None` when the execution
+    /// isn't currently deferred (never attempted yet, or already claimed
+    /// a slot). Distinct from [`Self::dispatch_retry_at`], which is the
+    /// post-failure in-process backoff window, not a capacity/serialization
+    /// wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_reason: Option<String>,
+
+    /// Unix epoch seconds (as a string) since `dispatch_wait_reason` took
+    /// its current value. `None` whenever `dispatch_wait_reason` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_since: Option<String>,
 }
 
 /// How strictly the product's `.github/PULL_REQUEST_TEMPLATE.md`
@@ -3695,6 +3710,22 @@ pub struct WorkExecution {
     /// immediately. Set during pre-start retry backoff windows.
     #[serde(default)]
     pub dispatch_not_before: Option<String>,
+
+    /// The dispatcher's current defer reason for this `ready`
+    /// execution (`chain_serialized`, `pool_exhausted`, ...) — i.e. why
+    /// it hasn't claimed a worker slot yet, distinct from a pool-capacity
+    /// wait vs. a serialization/gating wait. `None` when the execution
+    /// isn't currently deferred (never attempted yet, or already
+    /// claimed a slot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_reason: Option<String>,
+
+    /// Unix epoch seconds (as a string) when `dispatch_wait_reason` was
+    /// first set to its current value — the start of the *current*
+    /// wait, not the most recent poll. `None` whenever
+    /// `dispatch_wait_reason` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_since: Option<String>,
 
     pub finished_at: Option<String>,
     /// SHA of the bound chore PR's head ref at the moment this

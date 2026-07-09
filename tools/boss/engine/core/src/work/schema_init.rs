@@ -424,6 +424,11 @@ impl WorkDb {
         // never succeeds shows a failed state instead of an indefinite
         // "classifying…" spinner. Purely additive.
         migrate_work_comments_classification_failure_columns(&conn)?;
+        // Dispatch-wait surface: work_executions.dispatch_wait_reason /
+        // dispatch_wait_since, so a ready-but-undispatched execution's
+        // kanban card can show the real defer reason (chain_serialized,
+        // pool_exhausted) instead of a generic "Waiting for a slot".
+        migrate_work_executions_dispatch_wait(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '23')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

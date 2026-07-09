@@ -261,6 +261,180 @@ pub fn count_by_stage_outcome(events: &[DispatchEvent]) -> BTreeMap<(String, Str
     out
 }
 
+/// One execution that made it off the ready queue onto a worker slot:
+/// the time from its first `request_recorded` event (dispatch became
+/// ready) to the `worker_claimed`/`ok` event (a slot was actually
+/// claimed). `reason` is the `details.reason` of the last
+/// `worker_claimed`/`skipped` event seen before the claim — i.e. the
+/// defer reason that was finally cleared — or `"none"` when the
+/// execution claimed a slot on its first attempt.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ResolvedWait {
+    pub execution_id: String,
+    pub work_item_id: Option<String>,
+    pub ready_ts_epoch_ms: u128,
+    pub dispatched_ts_epoch_ms: u128,
+    pub wait_ms: u128,
+    pub reason: String,
+}
+
+/// One execution that is `ready` right now but hasn't claimed a slot
+/// yet (and hasn't hit a terminal error) — a currently-blocked item
+/// for `bossctl dispatch stats`'s "top blocked" listing.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockedNow {
+    pub execution_id: String,
+    pub work_item_id: Option<String>,
+    pub ready_ts_epoch_ms: u128,
+    pub wait_so_far_ms: u128,
+    pub reason: String,
+}
+
+/// count / p50 / p95 / max dispatch wait, bucketed by the defer
+/// reason that finally cleared (see [`ResolvedWait::reason`]).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReasonWaitStats {
+    pub reason: String,
+    pub count: usize,
+    pub p50_ms: u128,
+    pub p95_ms: u128,
+    pub max_ms: u128,
+}
+
+/// Full report for `bossctl dispatch stats`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct DispatchWaitReport {
+    pub by_reason: Vec<ReasonWaitStats>,
+    /// Currently-blocked executions, longest-waiting first.
+    pub blocked_now: Vec<BlockedNow>,
+}
+
+/// Reason string used for a [`BlockedNow`] entry that is ready but
+/// hasn't been through a single defer/claim attempt yet (the drain
+/// loop hasn't reached it since it became ready).
+const PENDING_FIRST_ATTEMPT: &str = "pending_first_attempt";
+
+/// Reason string used for a [`ResolvedWait`] entry that claimed a
+/// slot on its very first attempt (no `worker_claimed`/`skipped`
+/// event preceded the claim).
+const NO_DEFERRAL: &str = "none";
+
+/// Compute dispatch-wait statistics over `events` (typically the full
+/// `current.jsonl` stream from [`read_current`]). `now_ms` anchors the
+/// "wait so far" for still-blocked executions. `since_ms`, when set,
+/// drops any event older than it before grouping — the CLI's
+/// `--since` filter.
+///
+/// This is read-only over the existing dispatch-events stream: it
+/// derives wait time and defer reason from events the coordinator
+/// already emits (`request_recorded`, `worker_claimed` ok/skipped);
+/// it does not change dispatch behavior.
+pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Option<u128>) -> DispatchWaitReport {
+    let mut by_execution: BTreeMap<&str, Vec<&DispatchEvent>> = BTreeMap::new();
+    for event in events {
+        if since_ms.is_some_and(|since| event.ts_epoch_ms < since) {
+            continue;
+        }
+        by_execution.entry(event.execution_id.as_str()).or_default().push(event);
+    }
+
+    let mut resolved: Vec<ResolvedWait> = Vec::new();
+    let mut blocked: Vec<BlockedNow> = Vec::new();
+
+    for (execution_id, evs) in &by_execution {
+        // `request_recorded` marks the execution coming off the ready
+        // queue for a dispatch attempt — the closest existing event to
+        // "became ready to dispatch". A timeline with none (e.g. only
+        // reconciler-emitted events) has nothing to measure a wait
+        // against.
+        let Some(ready) = evs.iter().find(|e| e.stage == "request_recorded") else {
+            continue;
+        };
+        let ready_ts = ready.ts_epoch_ms;
+        let work_item_id = ready.work_item_id.clone();
+
+        let last_defer_reason_upto = |upto_ts: Option<u128>| -> String {
+            evs.iter()
+                .rev()
+                .find(|e| {
+                    e.stage == "worker_claimed" && e.outcome == "skipped" && upto_ts.is_none_or(|t| e.ts_epoch_ms <= t)
+                })
+                .and_then(|e| e.details.get("reason").and_then(|v| v.as_str()))
+                .unwrap_or(NO_DEFERRAL)
+                .to_owned()
+        };
+
+        match evs.iter().find(|e| e.stage == "worker_claimed" && e.outcome == "ok") {
+            Some(claimed) => {
+                resolved.push(ResolvedWait {
+                    execution_id: (*execution_id).to_owned(),
+                    work_item_id,
+                    ready_ts_epoch_ms: ready_ts,
+                    dispatched_ts_epoch_ms: claimed.ts_epoch_ms,
+                    wait_ms: claimed.ts_epoch_ms.saturating_sub(ready_ts),
+                    reason: last_defer_reason_upto(Some(claimed.ts_epoch_ms)),
+                });
+            }
+            None if !evs.iter().any(|e| e.outcome == "error") => {
+                let reason = last_defer_reason_upto(None);
+                let reason = if reason == NO_DEFERRAL {
+                    PENDING_FIRST_ATTEMPT.to_owned()
+                } else {
+                    reason
+                };
+                blocked.push(BlockedNow {
+                    execution_id: (*execution_id).to_owned(),
+                    work_item_id,
+                    ready_ts_epoch_ms: ready_ts,
+                    wait_so_far_ms: now_ms.saturating_sub(ready_ts),
+                    reason,
+                });
+            }
+            // A terminal error before ever claiming a slot means dispatch
+            // gave up rather than waited — excluded from wait stats.
+            None => {}
+        }
+    }
+
+    let mut grouped: BTreeMap<String, Vec<u128>> = BTreeMap::new();
+    for r in &resolved {
+        grouped.entry(r.reason.clone()).or_default().push(r.wait_ms);
+    }
+    let mut by_reason: Vec<ReasonWaitStats> = grouped
+        .into_iter()
+        .map(|(reason, mut durations)| {
+            durations.sort_unstable();
+            ReasonWaitStats {
+                count: durations.len(),
+                p50_ms: percentile_ms(&durations, 50.0),
+                p95_ms: percentile_ms(&durations, 95.0),
+                max_ms: durations.last().copied().unwrap_or(0),
+                reason,
+            }
+        })
+        .collect();
+    by_reason.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.reason.cmp(&b.reason)));
+
+    blocked.sort_by_key(|b| std::cmp::Reverse(b.wait_so_far_ms));
+
+    DispatchWaitReport {
+        by_reason,
+        blocked_now: blocked,
+    }
+}
+
+/// Nearest-rank percentile over an already-ascending-sorted slice.
+/// Empty input yields `0`.
+fn percentile_ms(sorted_ascending: &[u128], pct: f64) -> u128 {
+    if sorted_ascending.is_empty() {
+        return 0;
+    }
+    let rank = ((pct / 100.0) * sorted_ascending.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted_ascending.len() - 1);
+    sorted_ascending[idx]
+}
+
 /// One stage stall the detector wants to surface as a
 /// `stage_stalled` event. Carries enough context for the writer to
 /// emit a fully-populated `DispatchEvent` without re-reading the
@@ -718,5 +892,167 @@ mod tests {
         assert!(is_terminal_event(&run_err));
         let pane_err = DispatchEvent::new(Stage::PaneSpawned, Outcome::Error, "e");
         assert!(is_terminal_event(&pane_err));
+    }
+
+    fn ev(stage: Stage, outcome: Outcome, execution_id: &str, ts: u128, details: serde_json::Value) -> DispatchEvent {
+        let mut event = DispatchEvent::new(stage, outcome, execution_id);
+        event.ts_epoch_ms = ts;
+        event.details = details;
+        event
+    }
+
+    #[test]
+    fn compute_wait_stats_buckets_resolved_wait_by_last_defer_reason() {
+        let events = vec![
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-a",
+                0,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Skipped,
+                "exec-a",
+                100,
+                serde_json::json!({"reason": "chain_serialized"}),
+            ),
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Ok,
+                "exec-a",
+                500,
+                serde_json::Value::Null,
+            ),
+            // exec-b dispatches on its first attempt — no defer.
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-b",
+                0,
+                serde_json::Value::Null,
+            ),
+            ev(Stage::WorkerClaimed, Outcome::Ok, "exec-b", 50, serde_json::Value::Null),
+        ];
+        let report = compute_wait_stats(&events, 1_000, None);
+        assert_eq!(report.by_reason.len(), 2);
+        let chain = report
+            .by_reason
+            .iter()
+            .find(|r| r.reason == "chain_serialized")
+            .unwrap();
+        assert_eq!(chain.count, 1);
+        assert_eq!(chain.p50_ms, 500);
+        assert_eq!(chain.max_ms, 500);
+        let none = report.by_reason.iter().find(|r| r.reason == "none").unwrap();
+        assert_eq!(none.count, 1);
+        assert_eq!(none.max_ms, 50);
+        assert!(report.blocked_now.is_empty());
+    }
+
+    #[test]
+    fn compute_wait_stats_lists_currently_blocked_longest_first() {
+        let events = vec![
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-slow",
+                0,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Skipped,
+                "exec-slow",
+                100,
+                serde_json::json!({"reason": "pool_exhausted"}),
+            ),
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-fresh",
+                900,
+                serde_json::Value::Null,
+            ),
+        ];
+        let report = compute_wait_stats(&events, 1_000, None);
+        assert!(report.by_reason.is_empty());
+        assert_eq!(report.blocked_now.len(), 2);
+        assert_eq!(report.blocked_now[0].execution_id, "exec-slow");
+        assert_eq!(report.blocked_now[0].reason, "pool_exhausted");
+        assert_eq!(report.blocked_now[0].wait_so_far_ms, 1_000);
+        assert_eq!(report.blocked_now[1].execution_id, "exec-fresh");
+        assert_eq!(report.blocked_now[1].reason, "pending_first_attempt");
+        assert_eq!(report.blocked_now[1].wait_so_far_ms, 100);
+    }
+
+    #[test]
+    fn compute_wait_stats_excludes_executions_that_errored_before_claiming() {
+        let events = vec![
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-failed",
+                0,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::RunStarted,
+                Outcome::Error,
+                "exec-failed",
+                200,
+                serde_json::Value::Null,
+            ),
+        ];
+        let report = compute_wait_stats(&events, 1_000, None);
+        assert!(report.by_reason.is_empty());
+        assert!(report.blocked_now.is_empty());
+    }
+
+    #[test]
+    fn compute_wait_stats_since_filter_drops_older_events() {
+        let events = vec![
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-old",
+                0,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Ok,
+                "exec-old",
+                100,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::RequestRecorded,
+                Outcome::Ok,
+                "exec-new",
+                500,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Ok,
+                "exec-new",
+                600,
+                serde_json::Value::Null,
+            ),
+        ];
+        let report = compute_wait_stats(&events, 1_000, Some(400));
+        assert_eq!(report.by_reason.len(), 1);
+        assert_eq!(report.by_reason[0].count, 1);
+        assert_eq!(report.by_reason[0].max_ms, 100);
+    }
+
+    #[test]
+    fn percentile_ms_nearest_rank_over_sorted_slice() {
+        let sorted = vec![10, 20, 30, 40, 50];
+        assert_eq!(percentile_ms(&sorted, 50.0), 30);
+        assert_eq!(percentile_ms(&sorted, 95.0), 50);
+        assert_eq!(percentile_ms(&[], 50.0), 0);
     }
 }

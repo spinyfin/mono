@@ -1667,6 +1667,13 @@ struct WorkTaskRuntime: Hashable {
     /// backoff after a pre-spawn dispatch failure, `nil` for a genuine
     /// capacity wait. Mirrors `TaskRuntime.dispatch_retry_at` on the wire.
     let dispatchRetryAt: String?
+    /// The dispatcher's current defer reason for this `ready` execution
+    /// (e.g. `chain_serialized`, `pool_exhausted`), `nil` when it isn't
+    /// currently deferred. Mirrors `TaskRuntime.dispatch_wait_reason`.
+    let dispatchWaitReason: String?
+    /// Unix epoch seconds (decimal string) since `dispatchWaitReason` took
+    /// its current value. Mirrors `TaskRuntime.dispatch_wait_since`.
+    let dispatchWaitSince: String?
 }
 
 /// One row from `work_item_dependencies` — the dependent is gated by

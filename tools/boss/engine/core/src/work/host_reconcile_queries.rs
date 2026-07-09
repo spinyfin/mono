@@ -33,6 +33,7 @@ impl WorkDb {
                     e.created_at, e.started_at, e.finished_at,
                     e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before, e.prefer_is_soft,
                     e.worker_branch_prefix, e.transient_failure_count, e.allow_dirty, e.branch_naming,
+                    e.dispatch_wait_reason, e.dispatch_wait_since,
                     r.host_id, r.id
              FROM work_executions e
              JOIN work_runs r ON r.id = (
@@ -50,8 +51,8 @@ impl WorkDb {
             let execution = map_execution(row)?;
             Ok(HostBoundExecution {
                 execution,
-                host_id: row.get(23)?,
-                run_id: row.get(24)?,
+                host_id: row.get(25)?,
+                run_id: row.get(26)?,
             })
         })?;
         collect_rows(rows)

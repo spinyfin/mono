@@ -1790,6 +1790,9 @@ impl ExecutionCoordinator {
                                 })),
                         )
                         .await;
+                    if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, "chain_serialized") {
+                        tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
+                    }
                     // Leave the row `ready`; do NOT mark any pool exhausted —
                     // other executions in this pass may still dispatch.
                     continue;
@@ -1849,6 +1852,9 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
+                if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, "pool_exhausted") {
+                    tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
+                }
 
                 if is_review {
                     review_pool_exhausted = true;
@@ -1886,6 +1892,9 @@ impl ExecutionCoordinator {
                         .with_worker(&worker_id),
                 )
                 .await;
+            if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
+                tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
+            }
 
             match self.schedule_execution(&execution, &worker_id).await {
                 Ok(()) => {

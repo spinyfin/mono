@@ -117,7 +117,7 @@ pub(crate) fn query_execution(conn: &Connection, id: &str) -> Result<Option<Work
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
                 pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count,
-                allow_dirty, branch_naming
+                allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
          FROM work_executions
          WHERE id = ?1",
         [id],

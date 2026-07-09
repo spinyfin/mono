@@ -2674,7 +2674,9 @@ final class EngineClient: @unchecked Sendable {
             executionStatus: payload["execution_status"] as? String,
             runStatus: payload["run_status"] as? String,
             executionID: payload["execution_id"] as? String,
-            dispatchRetryAt: payload["dispatch_retry_at"] as? String
+            dispatchRetryAt: payload["dispatch_retry_at"] as? String,
+            dispatchWaitReason: payload["dispatch_wait_reason"] as? String,
+            dispatchWaitSince: payload["dispatch_wait_since"] as? String
         )
     }
 

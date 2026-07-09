@@ -422,6 +422,8 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         transient_failure_count: row.get(20)?,
         allow_dirty: row.get::<_, i64>(21)? != 0,
         branch_naming,
+        dispatch_wait_reason: row.get(23)?,
+        dispatch_wait_since: row.get(24)?,
     })
 }
 
