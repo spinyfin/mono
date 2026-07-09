@@ -36,7 +36,8 @@
 //! URL itself, so the poller works fine inside the engine's process
 //! (no workspace context needed).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -452,11 +453,20 @@ impl MergeProbe for NoopMergeProbe {
 
 /// `MergeProbe` that shells out to `gh pr view <url> --json …`.
 #[derive(Debug, Default)]
-pub struct CommandMergeProbe;
+pub struct CommandMergeProbe {
+    /// ETag cache for the commit combined-status REST sub-signal
+    /// (`repos/{owner}/{repo}/commits/{sha}/status`, fetched by
+    /// [`Self::fetch_commit_combined_state_for_empty_rollup`]), keyed by
+    /// the API path. A cached entry lets the next identical request carry
+    /// `If-None-Match` and get back a `304` — which costs no primary REST
+    /// quota — instead of re-fetching and re-parsing an unchanged
+    /// resource (doc: `github-event-detection-webhooks-vs-polling`, §9.2).
+    commit_status_cache: Mutex<HashMap<String, CachedCommitStatus>>,
+}
 
 impl CommandMergeProbe {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -519,7 +529,7 @@ impl MergeProbe for CommandMergeProbe {
         // web UI). The legacy commit-status REST endpoint returns
         // `state:"pending"` in that case, which lets us show a non-green
         // indicator instead of a false-positive green.
-        let combined_state = fetch_commit_combined_state_for_empty_rollup(&stdout, pr_url).await;
+        let combined_state = self.fetch_commit_combined_state_for_empty_rollup(&stdout, pr_url).await;
         let mut probe = parse_probe_json(pr_url, &stdout, combined_state.as_deref())?;
         // Query merge-queue status separately via GraphQL since `gh pr view --json`
         // does not expose `mergeQueueEntry` in all installed `gh` versions.
@@ -609,34 +619,159 @@ fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
     events
 }
 
-/// When `statusCheckRollup` is empty/null in `json_body`, fetches the
-/// legacy commit-status combined state (`pending` / `success` / `failure`
-/// / `error`) from GitHub's REST endpoint and returns it as a lowercase
-/// string. Returns `None` on any error, when the rollup is non-empty
-/// (the caller should rely on rollup data in that case), or when the
-/// commit has zero recorded statuses — GitHub reports `state:"pending"`
-/// even when `total_count == 0`, which would otherwise show up as a stuck
-/// yellow "waiting for CI" icon on PRs in repos with no checks configured.
-async fn fetch_commit_combined_state_for_empty_rollup(json_body: &str, pr_url: &str) -> Option<String> {
-    let root: serde_json::Value = serde_json::from_str(json_body.trim()).ok()?;
-    let rollup = root.get("statusCheckRollup").and_then(|v| v.as_array())?;
-    if !rollup.is_empty() {
-        return None; // non-empty rollup; use rollup data
+/// One cached `ETag` for a commit combined-status REST resource, plus the
+/// combined-state string that resource resolved to the last time it was
+/// fetched. Replayed verbatim on a `304 Not Modified` response, since a
+/// `304` body carries no content.
+#[derive(Debug, Clone)]
+struct CachedCommitStatus {
+    etag: String,
+    state: Option<String>,
+}
+
+/// Outcome of a conditional `gh api -i <path>` REST GET, classified from
+/// the raw process output. `gh` exits non-zero on a `304` (it treats any
+/// non-2xx as an error), so the outcome must be read from the `-i`
+/// status line in stdout rather than from the process exit status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionalGetOutcome {
+    /// A 2xx response with a body and the `ETag` header, if GitHub sent one.
+    Modified { body: String, etag: Option<String> },
+    /// A `304` — the resource is unchanged since the cached `ETag` was captured.
+    NotModified,
+    /// Anything else: a spawn error, a non-2xx/304 status, or a response
+    /// `gh -i` didn't shape the way this parser expects.
+    Failed,
+}
+
+/// Split `gh api -i`'s stdout (HTTP status line, headers, a blank line,
+/// then the body) into `(status_code, etag_header, body)`. Pure so it is
+/// unit-testable without shelling out. Returns `None` when the first line
+/// isn't a parseable status line (e.g. empty/garbled output).
+///
+/// Uses `str::lines()` rather than splitting on a literal `"\n\n"` because
+/// `gh`'s own status line is `\n`-terminated while the header block it
+/// copies verbatim from the HTTP response is `\r\n`-terminated — `lines()`
+/// normalizes both.
+fn parse_include_response(stdout: &str) -> Option<(u16, Option<String>, String)> {
+    let mut lines = stdout.lines();
+    let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let mut etag = None;
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break; // blank line separates headers from the body
+        }
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case("etag")
+        {
+            etag = Some(value.trim().to_owned());
+        }
     }
-    let head_sha = root
-        .get("headRefOid")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?;
-    let repo = repo_from_pr_url(pr_url)?;
-    let api_path = format!("repos/{repo}/commits/{head_sha}/status");
-    let output = gh_output(&["api", &api_path, "--jq", "{state: .state, total_count: .total_count}"])
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    let body = lines.collect::<Vec<_>>().join("\n");
+    Some((status, etag, body.trim().to_owned()))
+}
+
+/// Classify a `gh api -i <path> [-H "If-None-Match: …"]` invocation's raw
+/// output into a [`ConditionalGetOutcome`]. Ignores `output.status` (see
+/// [`ConditionalGetOutcome`]) in favour of the parsed status line.
+fn classify_conditional_output(output: &std::process::Output) -> ConditionalGetOutcome {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_include_response(&stdout) {
+        Some((304, _, _)) => ConditionalGetOutcome::NotModified,
+        Some((status, etag, body)) if (200..300).contains(&status) => ConditionalGetOutcome::Modified { body, etag },
+        _ => ConditionalGetOutcome::Failed,
     }
-    let body = std::str::from_utf8(&output.stdout).ok()?;
-    parse_combined_status_response(body)
+}
+
+/// Apply a [`ConditionalGetOutcome`] for `api_path` against `cache`,
+/// returning the resolved combined-state string. `NotModified` replays the
+/// previously cached state without touching the cache; `Modified` parses
+/// the fresh body and refreshes the cache entry when GitHub sent an
+/// `ETag` (no `ETag` means nothing usable to conditionally request next
+/// time, so the stale entry, if any, is left in place rather than wiped).
+/// Pure w.r.t. the cache map so it is unit-testable without a live `gh`
+/// call.
+fn resolve_and_cache_combined_state(
+    cache: &Mutex<HashMap<String, CachedCommitStatus>>,
+    api_path: &str,
+    outcome: ConditionalGetOutcome,
+) -> Option<String> {
+    match outcome {
+        ConditionalGetOutcome::NotModified => cache
+            .lock()
+            .unwrap()
+            .get(api_path)
+            .and_then(|entry| entry.state.clone()),
+        ConditionalGetOutcome::Modified { body, etag } => {
+            let state = parse_combined_status_response(&body);
+            if let Some(etag) = etag {
+                cache.lock().unwrap().insert(
+                    api_path.to_owned(),
+                    CachedCommitStatus {
+                        etag,
+                        state: state.clone(),
+                    },
+                );
+            }
+            state
+        }
+        ConditionalGetOutcome::Failed => None,
+    }
+}
+
+impl CommandMergeProbe {
+    /// When `statusCheckRollup` is empty/null in `json_body`, fetches the
+    /// legacy commit-status combined state (`pending` / `success` /
+    /// `failure` / `error`) from GitHub's REST endpoint and returns it as
+    /// a lowercase string. Returns `None` on any error, when the rollup
+    /// is non-empty (the caller should rely on rollup data in that
+    /// case), or when the commit has zero recorded statuses — GitHub
+    /// reports `state:"pending"` even when `total_count == 0`, which
+    /// would otherwise show up as a stuck yellow "waiting for CI" icon on
+    /// PRs in repos with no checks configured.
+    ///
+    /// This is the one sub-signal in the probe fetched over REST rather
+    /// than GraphQL, so it's the one that can use a conditional request:
+    /// a cached `ETag` for this resource is sent as `If-None-Match`, and
+    /// an unchanged commit's status comes back as a free `304` instead of
+    /// a full re-fetch (doc: `github-event-detection-webhooks-vs-polling`,
+    /// §9.2).
+    async fn fetch_commit_combined_state_for_empty_rollup(&self, json_body: &str, pr_url: &str) -> Option<String> {
+        let root: serde_json::Value = serde_json::from_str(json_body.trim()).ok()?;
+        let rollup = root.get("statusCheckRollup").and_then(|v| v.as_array())?;
+        if !rollup.is_empty() {
+            return None; // non-empty rollup; use rollup data
+        }
+        let head_sha = root
+            .get("headRefOid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?;
+        let repo = repo_from_pr_url(pr_url)?;
+        let api_path = format!("repos/{repo}/commits/{head_sha}/status");
+
+        let cached_etag = self
+            .commit_status_cache
+            .lock()
+            .unwrap()
+            .get(&api_path)
+            .map(|entry| entry.etag.clone());
+        let if_none_match = cached_etag.map(|etag| format!("If-None-Match: {etag}"));
+        let mut args: Vec<&str> = vec![
+            "api",
+            &api_path,
+            "-i",
+            "--jq",
+            "{state: .state, total_count: .total_count}",
+        ];
+        if let Some(header) = if_none_match.as_deref() {
+            args.push("-H");
+            args.push(header);
+        }
+        let output = gh_output(&args).await.ok()?;
+
+        let outcome = classify_conditional_output(&output);
+        resolve_and_cache_combined_state(&self.commit_status_cache, &api_path, outcome)
+    }
 }
 
 /// Pure parser for GitHub's `repos/{owner}/{repo}/commits/{sha}/status`
@@ -5208,6 +5343,235 @@ mod tests {
 
         // Malformed JSON → None.
         assert_eq!(parse_combined_status_response("not json"), None);
+    }
+
+    // ── ETag conditional-request plumbing ─────────────────────────────
+    //
+    // `gh api -i` mixes line endings: its own status line is `\n`-terminated
+    // while the header block it copies from the raw HTTP response is
+    // `\r\n`-terminated. These fixtures preserve that so the parser is
+    // exercised against the real shape, not an idealized one.
+
+    fn gh_api_include_body(status_line: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut out = format!("{status_line}\n");
+        for (k, v) in headers {
+            out.push_str(&format!("{k}: {v}\r\n"));
+        }
+        out.push_str("\r\n");
+        out.push_str(body);
+        out
+    }
+
+    #[test]
+    fn parse_include_response_extracts_status_and_etag_on_200() {
+        let stdout = gh_api_include_body(
+            "HTTP/2.0 200 OK",
+            &[
+                ("Etag", "W/\"abc123\""),
+                ("Content-Type", "application/json; charset=utf-8"),
+            ],
+            "{\"state\":\"success\",\"total_count\":1}",
+        );
+        let (status, etag, body) = parse_include_response(&stdout).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(etag, Some("W/\"abc123\"".to_owned()));
+        assert_eq!(body, "{\"state\":\"success\",\"total_count\":1}");
+    }
+
+    #[test]
+    fn parse_include_response_handles_304_with_no_body() {
+        let stdout = gh_api_include_body("HTTP/2.0 304 Not Modified", &[("Etag", "\"abc123\"")], "");
+        let (status, etag, body) = parse_include_response(&stdout).unwrap();
+        assert_eq!(status, 304);
+        assert_eq!(etag, Some("\"abc123\"".to_owned()));
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn parse_include_response_is_case_insensitive_on_etag_header_name() {
+        let stdout = gh_api_include_body("HTTP/2.0 200 OK", &[("ETAG", "\"xyz\"")], "{}");
+        assert_eq!(parse_include_response(&stdout).unwrap().1, Some("\"xyz\"".to_owned()));
+    }
+
+    #[test]
+    fn parse_include_response_missing_etag_header_yields_none() {
+        let stdout = gh_api_include_body("HTTP/2.0 200 OK", &[("Content-Type", "application/json")], "{}");
+        assert_eq!(parse_include_response(&stdout).unwrap().1, None);
+    }
+
+    #[test]
+    fn parse_include_response_garbled_output_yields_none() {
+        assert_eq!(parse_include_response(""), None);
+        assert_eq!(parse_include_response("not an http response"), None);
+    }
+
+    #[test]
+    fn classify_conditional_output_maps_200_to_modified_with_etag() {
+        let stdout = gh_api_include_body("HTTP/2.0 200 OK", &[("Etag", "\"v1\"")], "{\"state\":\"pending\"}");
+        let output = std::process::Output {
+            status: test_exit_status(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            classify_conditional_output(&output),
+            ConditionalGetOutcome::Modified {
+                body: "{\"state\":\"pending\"}".to_owned(),
+                etag: Some("\"v1\"".to_owned()),
+            },
+        );
+    }
+
+    #[test]
+    fn classify_conditional_output_maps_304_to_not_modified_despite_nonzero_exit() {
+        // `gh` exits non-zero on a 304 (any non-2xx is an error to it), so
+        // the classifier must key off the parsed status line, not `status`.
+        let stdout = gh_api_include_body("HTTP/2.0 304 Not Modified", &[("Etag", "\"v1\"")], "");
+        let output = std::process::Output {
+            status: test_exit_status(1),
+            stdout: stdout.into_bytes(),
+            stderr: b"gh: HTTP 304".to_vec(),
+        };
+        assert_eq!(classify_conditional_output(&output), ConditionalGetOutcome::NotModified);
+    }
+
+    #[test]
+    fn classify_conditional_output_maps_other_status_to_failed() {
+        let stdout = gh_api_include_body("HTTP/2.0 500 Internal Server Error", &[], "oops");
+        let output = std::process::Output {
+            status: test_exit_status(1),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(classify_conditional_output(&output), ConditionalGetOutcome::Failed);
+    }
+
+    #[test]
+    fn classify_conditional_output_unparseable_stdout_is_failed() {
+        let output = std::process::Output {
+            status: test_exit_status(1),
+            stdout: Vec::new(),
+            stderr: b"gh: could not connect".to_vec(),
+        };
+        assert_eq!(classify_conditional_output(&output), ConditionalGetOutcome::Failed);
+    }
+
+    #[cfg(unix)]
+    fn test_exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn resolve_and_cache_not_modified_replays_cached_state_without_mutating_cache() {
+        let cache: std::sync::Mutex<HashMap<String, CachedCommitStatus>> = std::sync::Mutex::new(HashMap::from([(
+            "repos/o/r/commits/sha1/status".to_owned(),
+            CachedCommitStatus {
+                etag: "\"v1\"".to_owned(),
+                state: Some("success".to_owned()),
+            },
+        )]));
+        let resolved = resolve_and_cache_combined_state(
+            &cache,
+            "repos/o/r/commits/sha1/status",
+            ConditionalGetOutcome::NotModified,
+        );
+        assert_eq!(resolved, Some("success".to_owned()));
+        // Cache entry is untouched by a replay.
+        let entry = cache
+            .lock()
+            .unwrap()
+            .get("repos/o/r/commits/sha1/status")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.etag, "\"v1\"");
+    }
+
+    #[test]
+    fn resolve_and_cache_not_modified_with_no_prior_entry_returns_none() {
+        let cache: std::sync::Mutex<HashMap<String, CachedCommitStatus>> = std::sync::Mutex::new(HashMap::new());
+        let resolved = resolve_and_cache_combined_state(
+            &cache,
+            "repos/o/r/commits/sha1/status",
+            ConditionalGetOutcome::NotModified,
+        );
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_and_cache_modified_parses_body_and_refreshes_etag() {
+        let cache: std::sync::Mutex<HashMap<String, CachedCommitStatus>> = std::sync::Mutex::new(HashMap::from([(
+            "repos/o/r/commits/sha1/status".to_owned(),
+            CachedCommitStatus {
+                etag: "\"stale\"".to_owned(),
+                state: Some("pending".to_owned()),
+            },
+        )]));
+        let outcome = ConditionalGetOutcome::Modified {
+            body: serde_json::json!({"state": "failure", "total_count": 1}).to_string(),
+            etag: Some("\"fresh\"".to_owned()),
+        };
+        let resolved = resolve_and_cache_combined_state(&cache, "repos/o/r/commits/sha1/status", outcome);
+        assert_eq!(resolved, Some("failure".to_owned()));
+        let entry = cache
+            .lock()
+            .unwrap()
+            .get("repos/o/r/commits/sha1/status")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.etag, "\"fresh\"");
+        assert_eq!(entry.state, Some("failure".to_owned()));
+    }
+
+    #[test]
+    fn resolve_and_cache_modified_without_etag_leaves_prior_cache_entry_in_place() {
+        // No ETag on the response means there's nothing usable to send as
+        // `If-None-Match` next time, so the stale cache entry (if any) is
+        // left alone rather than wiped or refreshed with an empty etag.
+        let cache: std::sync::Mutex<HashMap<String, CachedCommitStatus>> = std::sync::Mutex::new(HashMap::from([(
+            "repos/o/r/commits/sha1/status".to_owned(),
+            CachedCommitStatus {
+                etag: "\"v1\"".to_owned(),
+                state: Some("pending".to_owned()),
+            },
+        )]));
+        let outcome = ConditionalGetOutcome::Modified {
+            body: serde_json::json!({"state": "success", "total_count": 1}).to_string(),
+            etag: None,
+        };
+        let resolved = resolve_and_cache_combined_state(&cache, "repos/o/r/commits/sha1/status", outcome);
+        assert_eq!(resolved, Some("success".to_owned()));
+        let entry = cache
+            .lock()
+            .unwrap()
+            .get("repos/o/r/commits/sha1/status")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.etag, "\"v1\"", "stale etag must survive an etag-less refresh");
+    }
+
+    #[test]
+    fn resolve_and_cache_failed_returns_none_and_does_not_mutate_cache() {
+        let cache: std::sync::Mutex<HashMap<String, CachedCommitStatus>> = std::sync::Mutex::new(HashMap::from([(
+            "repos/o/r/commits/sha1/status".to_owned(),
+            CachedCommitStatus {
+                etag: "\"v1\"".to_owned(),
+                state: Some("success".to_owned()),
+            },
+        )]));
+        let resolved =
+            resolve_and_cache_combined_state(&cache, "repos/o/r/commits/sha1/status", ConditionalGetOutcome::Failed);
+        assert_eq!(resolved, None);
+        let entry = cache
+            .lock()
+            .unwrap()
+            .get("repos/o/r/commits/sha1/status")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            entry.etag, "\"v1\"",
+            "a failed fetch must not clobber a good cache entry"
+        );
     }
 
     /// Conflict pre-empts CI in the joint state (design §Q1 dispatch
