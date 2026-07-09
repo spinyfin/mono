@@ -250,6 +250,66 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// Foreign-bucket takeover (T2381/PR#1861 fix): re-bucket a chore/
+    /// project_task currently `blocked: ci_failure` or
+    /// `blocked: ci_failure_exhausted` into `blocked: merge_conflict`.
+    ///
+    /// Unlike [`Self::recanonicalize_blocked_merge_conflict`] (which only
+    /// claims a NULL-reason strand), this explicitly overwrites *another*
+    /// watcher's scalar reason. It exists because a row `ci_watch` flips and
+    /// then fails to return to `in_review` (e.g. the merge-queue-rebounce gap
+    /// that produced T2381) is invisible to every reason-scoped candidate
+    /// list `conflict_watch` would otherwise use — `mark_chore_blocked_merge_conflict`'s
+    /// `status='in_review'` WHERE guard never matches it, so without an
+    /// explicit takeover a live CONFLICTING probe is silently dropped forever.
+    ///
+    /// Callers are responsible for superseding any active `ci_remediations`
+    /// attempt first (conflict pre-empts CI per design §Q1) — this method
+    /// only owns the `tasks` / `task_blocked_signals` transition. The WHERE
+    /// guard requires the CURRENT reason to still be `ci_failure` or
+    /// `ci_failure_exhausted` so a concurrent clear/human move is respected.
+    /// Returns the updated task on the flip; `Ok(None)` on a WHERE-guard
+    /// miss.
+    pub fn retarget_blocked_ci_failure_to_merge_conflict(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET blocked_reason     = 'merge_conflict',
+                    blocked_attempt_id = NULL,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        upsert_task_blocked_signal(&tx, work_item_id, "merge_conflict", None, &now)?;
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after ci_failure->merge_conflict retarget: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// WHERE-guarded flip of a chore/project_task from `in_review`
     /// to `blocked: merge_conflict`. Idempotent — a second call for
     /// a row already in this state updates zero rows and returns
