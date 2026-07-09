@@ -13,14 +13,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tempfile::TempDir;
 
+use tokio::sync::Mutex;
+
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    ExecutionCoordinator, WorkerPool,
+    ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 use boss_protocol::{
-    CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus, Product, Task, WorkExecution,
+    CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus, FrontendEvent, Product, Task,
+    WorkExecution,
 };
 
 /// The mono repo remote used by the overwhelming majority of tests.
@@ -217,4 +220,32 @@ pub fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoord
         Arc::new(NoopCube),
         Arc::new(NoopRunner),
     ))
+}
+
+/// Test-only [`ExecutionPublisher`] that records the calls it receives.
+///
+/// `publish` is a no-op; `publish_work_item_changed` records
+/// `(product_id, work_item_id, reason)` triples into `events`, and
+/// `publish_frontend_event_on_product` records `(product_id, event)`
+/// pairs into `typed_events`. The `conflict_watch` and `ci_watch` test
+/// modules both wanted this exact recorder, so this replaces the
+/// byte-identical copy each used to hand-roll.
+#[derive(Default)]
+pub struct RecordingPublisher {
+    pub events: Mutex<Vec<(String, String, String)>>,
+    pub typed_events: Mutex<Vec<(String, FrontendEvent)>>,
+}
+
+#[async_trait]
+impl ExecutionPublisher for RecordingPublisher {
+    async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
+    async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.events
+            .lock()
+            .await
+            .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
+    }
+    async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
+        self.typed_events.lock().await.push((product_id.to_owned(), event));
+    }
 }

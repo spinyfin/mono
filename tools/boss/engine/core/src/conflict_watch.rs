@@ -872,30 +872,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::coordinator::ExecutionPublisher;
     use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, WorkDb, WorkItem, WorkItemPatch};
-
-    #[derive(Default)]
-    struct RecordingPublisher {
-        events: Mutex<Vec<(String, String, String)>>,
-        typed_events: Mutex<Vec<(String, FrontendEvent)>>,
-    }
-
-    #[async_trait]
-    impl ExecutionPublisher for RecordingPublisher {
-        async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
-            self.events
-                .lock()
-                .await
-                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
-        }
-        async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
-            self.typed_events.lock().await.push((product_id.to_owned(), event));
-        }
-    }
 
     fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
         let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
