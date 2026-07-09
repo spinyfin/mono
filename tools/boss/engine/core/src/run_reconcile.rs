@@ -270,13 +270,10 @@ pub fn current_epoch_s() -> i64 {
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow};
-    use async_trait::async_trait;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
+    use crate::coordinator::CubeWorkspaceStatus;
 
     struct StubCube {
         list_response: Mutex<Result<Vec<CubeWorkspaceStatus>>>,
@@ -297,58 +294,14 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl CubeClient for StubCube {
-        async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn lease_workspace(
-            &self,
-            _repo_id: &str,
-            _task: &str,
-            _prefer: Option<&str>,
-            _allow_dirty: bool,
-            _exclude: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn workspace_status(&self, _workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn heartbeat_lease(&self, _lease_id: &str, _ttl: Option<u64>) -> Result<()> {
-            unimplemented!("not used by probe")
-        }
-
-        async fn force_release_lease(&self, _lease_id: &str, _reason: Option<&str>) -> Result<()> {
-            unimplemented!("not used by probe")
-        }
-
+    crate::stub_cube_client! { StubCube {
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
             // Take ownership of the canned response — Result isn't
             // Clone, and tests fire one probe per StubCube.
             let mut guard = self.list_response.lock().unwrap();
             std::mem::replace(&mut *guard, Err(anyhow!("StubCube already drained")))
         }
-
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            unimplemented!("not used by probe")
-        }
-    }
+    } }
 
     fn execution(id: &str, lease_id: &str, workspace_id: &str) -> WorkExecution {
         WorkExecution::builder()

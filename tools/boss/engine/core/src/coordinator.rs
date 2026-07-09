@@ -4904,8 +4904,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl CubeClient for FakeCubeClient {
+    crate::stub_cube_client! { FakeCubeClient {
         async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
             self.ensure_calls.lock().await.push(origin.to_owned());
             if self.fail_ensure {
@@ -5041,7 +5040,7 @@ mod tests {
             *self.list_repos_calls.lock().await += 1;
             Ok(self.repos.lock().await.clone())
         }
-    }
+    } }
 
     /// Recorded args for each `run` call:
     /// `(worker_id, execution_id, workspace_path, cube_change_id)`.

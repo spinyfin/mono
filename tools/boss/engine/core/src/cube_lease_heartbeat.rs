@@ -924,14 +924,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use anyhow::{Result, anyhow};
-    use async_trait::async_trait;
     use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput, WorkItemBinding};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
+    use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::run_reconcile::{RunReconcileReport, RunReconcileVerdict};
@@ -972,30 +969,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl CubeClient for RecordingCube {
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
+    crate::stub_cube_client! { RecordingCube {
         async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
             self.heartbeats.lock().unwrap().push((lease_id.to_owned(), ttl_seconds));
             if self.fail.load(Ordering::SeqCst) {
@@ -1007,9 +981,6 @@ mod tests {
             self.force_releases.lock().unwrap().push(lease_id.to_owned());
             Ok(())
         }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
             if self.list_workspaces_fail.load(Ordering::SeqCst) {
                 return Err(anyhow!("simulated cube outage: workspace list unavailable"));
@@ -1019,7 +990,7 @@ mod tests {
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             Ok(vec![])
         }
-    }
+    } }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -1617,30 +1588,7 @@ mod tests {
         completed: Mutex<Vec<String>>,
     }
 
-    #[async_trait]
-    impl CubeClient for SlowCube {
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
+    crate::stub_cube_client! { SlowCube {
         async fn heartbeat_lease(&self, lease_id: &str, _ttl: Option<u64>) -> Result<()> {
             if lease_id == "lease-slow" {
                 // Never returns — simulates a hung cube subprocess.
@@ -1650,19 +1598,13 @@ mod tests {
             self.completed.lock().unwrap().push(lease_id.to_owned());
             Ok(())
         }
-        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
             Ok(vec![])
         }
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             Ok(vec![])
         }
-    }
+    } }
 
     /// A hung heartbeat for one slot must NOT block heartbeating of the
     /// remaining slots. The timed-out slot increments `failed`; the other

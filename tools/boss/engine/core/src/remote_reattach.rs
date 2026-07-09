@@ -168,18 +168,13 @@ pub async fn reattach_remote_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
     use crate::host_adapter::HostAdapter;
     use crate::host_registry::Host;
-    use crate::runner::RunOutcome;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, WorkDb, WorkItem};
+    use crate::work::{CreateChoreInput, WorkDb};
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
-    use boss_protocol::{RequestExecutionInput, WorkExecution};
-    use std::path::Path;
+    use boss_protocol::RequestExecutionInput;
     use std::sync::Arc;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -193,60 +188,9 @@ mod tests {
         result: Result<bool, &'static str>,
     }
 
-    #[async_trait]
-    impl HostAdapter for RecordingAdapter {
+    crate::stub_host_adapter! { RecordingAdapter {
         fn host_id(&self) -> &str {
             &self.host_id
-        }
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-            unimplemented!()
-        }
-        async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            unimplemented!()
-        }
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            unimplemented!()
-        }
-        fn command_repr(&self, _: &[&str]) -> Option<(String, String)> {
-            None
-        }
-        async fn spawn_worker(
-            &self,
-            _: &str,
-            _: &WorkExecution,
-            _: &WorkItem,
-            _: &Path,
-            _: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!()
         }
         async fn reattach_events_forward(&self, run_id: &str, _engine_events_socket: &str) -> Result<bool> {
             self.reattached.lock().unwrap().push(run_id.to_owned());
@@ -255,7 +199,7 @@ mod tests {
                 Err(msg) => bail!("{msg}"),
             }
         }
-    }
+    } }
 
     struct StubProvider {
         adapter: Arc<RecordingAdapter>,

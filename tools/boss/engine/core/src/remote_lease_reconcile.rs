@@ -341,18 +341,13 @@ async fn reap_dead_remote_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::{
-        CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::host_registry::Host;
-    use crate::runner::RunOutcome;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, WorkDb, WorkItem};
+    use crate::work::{CreateChoreInput, WorkDb};
     use anyhow::{Result, bail};
     use async_trait::async_trait;
-    use boss_protocol::{ExecutionStatus, RequestExecutionInput, WorkExecution};
-    use std::path::Path;
+    use boss_protocol::{ExecutionStatus, RequestExecutionInput};
     use std::sync::Arc;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -374,29 +369,9 @@ mod tests {
         force_released: Mutex<Vec<(String, Option<String>)>>,
     }
 
-    #[async_trait]
-    impl HostAdapter for StubAdapter {
+    crate::stub_host_adapter! { StubAdapter {
         fn host_id(&self) -> &str {
             &self.host_id
-        }
-        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
-            unimplemented!()
-        }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: &[&str],
-        ) -> Result<CubeWorkspaceLease> {
-            unimplemented!()
-        }
-        async fn release_workspace(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
-            unimplemented!()
         }
         async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
             self.force_released
@@ -405,34 +380,6 @@ mod tests {
                 .push((lease_id.to_owned(), reason.map(str::to_owned)));
             Ok(())
         }
-        async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
-            unimplemented!()
-        }
-        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
-            unimplemented!()
-        }
-        async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
-            unimplemented!()
-        }
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            unimplemented!()
-        }
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            unimplemented!()
-        }
-        fn command_repr(&self, _: &[&str]) -> Option<(String, String)> {
-            None
-        }
-        async fn spawn_worker(
-            &self,
-            _: &str,
-            _: &WorkExecution,
-            _: &WorkItem,
-            _: &Path,
-            _: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!()
-        }
         async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
             match self.probe {
                 Probe::Alive => Ok(Some(true)),
@@ -440,7 +387,7 @@ mod tests {
                 Probe::Error => bail!("ssh probe transport failure"),
             }
         }
-    }
+    } }
 
     struct StubProvider {
         adapter: Arc<StubAdapter>,
