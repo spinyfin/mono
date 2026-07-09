@@ -564,7 +564,7 @@ impl MergeProbe for CommandMergeProbe {
     }
 
     async fn probe_batch(&self, pr_urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
-        probe_batch_via_graphql(pr_urls).await
+        self.probe_batch_via_graphql(pr_urls).await
     }
 }
 
@@ -606,43 +606,156 @@ const PR_PROBE_FIELDS: &str = concat!(
 /// unparseable response) fails every requested PR for this pass — the
 /// sweep already treats individual probe failures as "retry next pass", so
 /// this is a graceful (if pass-wide) degradation, not a crash.
-async fn probe_batch_via_graphql(pr_urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
-    let mut out = HashMap::new();
-    // Dedup while parsing so a URL repeated in the input (e.g. a PR that's
-    // both `in_review` and, defensively, in `stranded_blocked`) costs one
-    // query slot, not two.
-    let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    for url in pr_urls {
-        if out.contains_key(url) || parsed.contains_key(url) {
-            continue;
-        }
-        match parse_pr_url_parts(url) {
-            Some((owner, repo, number)) => {
-                parsed.insert(url.clone(), (owner.to_owned(), repo.to_owned(), number));
-                order.push(url.clone());
+impl CommandMergeProbe {
+    async fn probe_batch_via_graphql(
+        &self,
+        pr_urls: &[String],
+    ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        let mut out = HashMap::new();
+        // Dedup while parsing so a URL repeated in the input (e.g. a PR that's
+        // both `in_review` and, defensively, in `stranded_blocked`) costs one
+        // query slot, not two.
+        let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for url in pr_urls {
+            if out.contains_key(url) || parsed.contains_key(url) {
+                continue;
             }
-            None => {
-                out.insert(url.clone(), Err(format!("`{url}` is not a canonical GitHub PR URL")));
+            match parse_pr_url_parts(url) {
+                Some((owner, repo, number)) => {
+                    parsed.insert(url.clone(), (owner.to_owned(), repo.to_owned(), number));
+                    order.push(url.clone());
+                }
+                None => {
+                    out.insert(url.clone(), Err(format!("`{url}` is not a canonical GitHub PR URL")));
+                }
             }
         }
-    }
-    if order.is_empty() {
-        return out;
-    }
+        if order.is_empty() {
+            return out;
+        }
 
-    // Group by (owner, repo) so multi-PR-per-repo sweeps (the common case)
-    // get one `repository(...)` block instead of one per PR.
+        let (query, alias_map) = build_batch_query(&order, &parsed);
+
+        tracing::debug!(
+            pr_count = order.len(),
+            repo_count = alias_map.len(),
+            "merge poller: batched probe — one GraphQL query for the whole pass",
+        );
+
+        let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
+        let body: serde_json::Value = match output {
+            Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = format!("failed to parse batched probe graphql response: {err}");
+                    for url in &order {
+                        out.insert(url.clone(), Err(msg.clone()));
+                    }
+                    return out;
+                }
+            },
+            // A non-zero exit here isn't necessarily a transport failure: `gh
+            // api graphql` also exits non-zero whenever the response carries a
+            // top-level `errors` array, which GitHub returns (alongside HTTP
+            // 200 and `data.<repo_alias> = null`) whenever a `repository(...)`
+            // alias can't be resolved (repo deleted/renamed/access revoked).
+            // Failing every URL in the pass for that case would let one
+            // tracked PR whose repo has gone away stall reconciliation for
+            // every other PR indefinitely, since `run_one_pass` rebuilds the
+            // same probe set every pass. Fall back to per-PR probing instead,
+            // so the graceful 404 -> `ClosedUnmerged` handling in `probe`
+            // isolates the unresolvable repo from its siblings, exactly like
+            // the pre-batching code did.
+            Ok(o) => {
+                tracing::debug!(
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "merge poller: batched probe graphql call failed — falling back to per-PR probing for this pass",
+                );
+                out.extend(probe_each_individually(&order).await);
+                return out;
+            }
+            Err(err) => {
+                let msg = format!("failed to spawn batched probe `gh api graphql`: {err}");
+                for url in &order {
+                    out.insert(url.clone(), Err(msg.clone()));
+                }
+                return out;
+            }
+        };
+
+        // A 200 response can still carry a top-level `errors` array alongside
+        // partial `data` (e.g. one repo alias resolves, another doesn't). Treat
+        // that the same as the non-zero-exit case above: fall back to per-PR
+        // probing rather than failing every URL in the pass over one bad repo
+        // alias.
+        if body
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            tracing::debug!(
+                errors = %body["errors"],
+                "merge poller: batched probe graphql response carried errors — falling back to per-PR probing for this pass",
+            );
+            out.extend(probe_each_individually(&order).await);
+            return out;
+        }
+
+        for (url, pr_node) in walk_batch_response(&body, &alias_map) {
+            let Some(pr_node) = pr_node else {
+                // No PullRequest for this number any more (force-deleted,
+                // transferred) — same "can't decide it's merged just because
+                // we can't see it" fallback as `probe`'s 404 path.
+                out.insert(
+                    url.clone(),
+                    Ok(PrLifecycleProbe {
+                        url: url.clone(),
+                        state: PrLifecycleState::ClosedUnmerged,
+                        base_ref_oid: None,
+                        head_ref_oid: None,
+                        head_ref_name: None,
+                        base_ref_name: None,
+                        labels: Vec::new(),
+                        review: PrReviewState::Unknown,
+                        in_merge_queue: false,
+                        raw_mergeable: String::new(),
+                        raw_merge_state_status: String::new(),
+                    }),
+                );
+                continue;
+            };
+            let flat = flatten_batched_pr_node(pr_node).to_string();
+            let combined_state = self.fetch_commit_combined_state_for_empty_rollup(&flat, &url).await;
+            let result = parse_probe_json(&url, &flat, combined_state.as_deref()).map_err(|err| err.to_string());
+            out.insert(url.clone(), result);
+        }
+        out
+    }
+}
+
+/// repo_alias -> [(pr_alias, url)] — the aliases [`build_batch_query`] used
+/// to request each PR's node, and that [`walk_batch_response`] uses to find
+/// that same node back out of the response.
+type BatchAliasMap = Vec<(String, Vec<(String, String)>)>;
+
+/// Builds the aliased GraphQL query for a batch of PRs, grouping by (owner,
+/// repo) so multi-PR-per-repo sweeps (the common case) get one
+/// `repository(...)` block instead of one per PR. Returns the query
+/// alongside the alias map needed to walk the response back out.
+///
+/// Pure and side-effect-free so the alias-construction logic — grouping
+/// multiple PRs per repo and multiple repos per batch — can be
+/// unit-tested without a live `gh` call.
+fn build_batch_query(order: &[String], parsed: &HashMap<String, (String, String, u64)>) -> (String, BatchAliasMap) {
     let mut by_repo: std::collections::BTreeMap<(String, String), Vec<&String>> = std::collections::BTreeMap::new();
-    for url in &order {
+    for url in order {
         let (owner, repo, _) = &parsed[url];
         by_repo.entry((owner.clone(), repo.clone())).or_default().push(url);
     }
 
     let mut query = String::from("{");
-    // repo_alias -> [(pr_alias, url)], so the response walk below can find
-    // each PR's node by the same aliases the query used to request it.
-    let mut alias_map: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut alias_map: BatchAliasMap = Vec::new();
     for (repo_idx, ((owner, repo), urls)) in by_repo.iter().enumerate() {
         let repo_alias = format!("repo{repo_idx}");
         query.push_str(&format!(
@@ -661,75 +774,47 @@ async fn probe_batch_via_graphql(pr_urls: &[String]) -> HashMap<String, std::res
         alias_map.push((repo_alias, pr_aliases));
     }
     query.push_str(" }");
+    (query, alias_map)
+}
 
-    tracing::debug!(
-        pr_count = order.len(),
-        repo_count = by_repo.len(),
-        "merge poller: batched probe — one GraphQL query for the whole pass",
-    );
-
-    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
-    let body: serde_json::Value = match output {
-        Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
-            Ok(v) => v,
-            Err(err) => {
-                let msg = format!("failed to parse batched probe graphql response: {err}");
-                for url in &order {
-                    out.insert(url.clone(), Err(msg.clone()));
-                }
-                return out;
-            }
-        },
-        Ok(o) => {
-            let msg = format!(
-                "batched probe `gh api graphql` failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            for url in &order {
-                out.insert(url.clone(), Err(msg.clone()));
-            }
-            return out;
-        }
-        Err(err) => {
-            let msg = format!("failed to spawn batched probe `gh api graphql`: {err}");
-            for url in &order {
-                out.insert(url.clone(), Err(msg.clone()));
-            }
-            return out;
-        }
-    };
-
-    for (repo_alias, pr_aliases) in &alias_map {
+/// Walks the batched GraphQL response body back out by the same aliases
+/// [`build_batch_query`] used to request it, returning for each URL either
+/// its raw PR node (for the caller to flatten + parse) or `None` when the
+/// node came back null (PR force-deleted/transferred).
+///
+/// Pure and side-effect-free so the response-walk — including the
+/// null-node branch — can be unit-tested against a synthetic response
+/// without a live `gh` call.
+fn walk_batch_response<'a>(
+    body: &'a serde_json::Value,
+    alias_map: &BatchAliasMap,
+) -> Vec<(String, Option<&'a serde_json::Value>)> {
+    let mut out = Vec::new();
+    for (repo_alias, pr_aliases) in alias_map {
         let repo_node = &body["data"][repo_alias.as_str()];
         for (pr_alias, url) in pr_aliases {
             let pr_node = &repo_node[pr_alias.as_str()];
-            if pr_node.is_null() {
-                // No PullRequest for this number any more (force-deleted,
-                // transferred) — same "can't decide it's merged just
-                // because we can't see it" fallback as `probe`'s 404 path.
-                out.insert(
-                    url.clone(),
-                    Ok(PrLifecycleProbe {
-                        url: url.clone(),
-                        state: PrLifecycleState::ClosedUnmerged,
-                        base_ref_oid: None,
-                        head_ref_oid: None,
-                        head_ref_name: None,
-                        base_ref_name: None,
-                        labels: Vec::new(),
-                        review: PrReviewState::Unknown,
-                        in_merge_queue: false,
-                        raw_mergeable: String::new(),
-                        raw_merge_state_status: String::new(),
-                    }),
-                );
-                continue;
-            }
-            let flat = flatten_batched_pr_node(pr_node).to_string();
-            let combined_state = fetch_commit_combined_state_for_empty_rollup(&flat, url).await;
-            let result = parse_probe_json(url, &flat, combined_state.as_deref()).map_err(|err| err.to_string());
-            out.insert(url.clone(), result);
+            out.push((url.clone(), if pr_node.is_null() { None } else { Some(pr_node) }));
         }
+    }
+    out
+}
+
+/// Falls back to probing each URL individually via [`CommandMergeProbe::probe`]
+/// when the batched round trip itself failed in a way that isn't isolated
+/// to a single PR (non-zero `gh` exit, or a response carrying a top-level
+/// GraphQL `errors` array). This is what preserves per-PR isolation for
+/// repository-level errors (a tracked PR's repo has been deleted, renamed,
+/// or had access revoked) — `gh api graphql` exits non-zero for those the
+/// same way it would for a genuine transport failure, but unlike a
+/// transport failure, a single unresolvable repo must not stall
+/// reconciliation for every other PR in the pass.
+async fn probe_each_individually(urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+    let probe = CommandMergeProbe::new();
+    let mut out = HashMap::new();
+    for url in urls {
+        let result = probe.probe(url).await.map_err(|err| err.to_string());
+        out.insert(url.clone(), result);
     }
     out
 }
@@ -5240,10 +5325,99 @@ mod tests {
     #[tokio::test]
     async fn probe_batch_via_graphql_rejects_non_canonical_urls_without_a_network_call() {
         let urls = vec!["not-a-pr-url".to_owned(), "https://example.com/o/r/pull/1".to_owned()];
-        let out = probe_batch_via_graphql(&urls).await;
+        let out = CommandMergeProbe::new().probe_batch_via_graphql(&urls).await;
         assert_eq!(out.len(), 2);
         assert!(out["not-a-pr-url"].is_err());
         assert!(out["https://example.com/o/r/pull/1"].is_err());
+    }
+
+    /// Two PRs in one repo plus one PR in a second repo must group into
+    /// exactly two `repository(...)` aliases, with each PR getting its own
+    /// `pullRequest(...)` alias nested inside the right repo block, and the
+    /// alias map must let the response walk find each URL back by those
+    /// same aliases.
+    #[test]
+    fn build_batch_query_groups_multiple_prs_per_repo_and_multiple_repos() {
+        let urls = vec![
+            "https://github.com/acme/widgets/pull/1".to_owned(),
+            "https://github.com/acme/widgets/pull/2".to_owned(),
+            "https://github.com/acme/gadgets/pull/7".to_owned(),
+        ];
+        let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
+        parsed.insert(urls[0].clone(), ("acme".to_owned(), "widgets".to_owned(), 1));
+        parsed.insert(urls[1].clone(), ("acme".to_owned(), "widgets".to_owned(), 2));
+        parsed.insert(urls[2].clone(), ("acme".to_owned(), "gadgets".to_owned(), 7));
+
+        let (query, alias_map) = build_batch_query(&urls, &parsed);
+
+        // BTreeMap ordering of (owner, repo) puts "gadgets" before "widgets".
+        assert_eq!(alias_map.len(), 2, "two distinct repos -> two repo aliases");
+        let (gadgets_alias, gadgets_prs) = &alias_map[0];
+        let (widgets_alias, widgets_prs) = &alias_map[1];
+        assert_eq!(gadgets_alias, "repo0");
+        assert_eq!(widgets_alias, "repo1");
+        assert_eq!(gadgets_prs.len(), 1, "one PR in the gadgets repo");
+        assert_eq!(widgets_prs.len(), 2, "two PRs in the widgets repo");
+        assert_eq!(gadgets_prs[0], ("pr0".to_owned(), urls[2].clone()));
+        assert_eq!(widgets_prs[0], ("pr0".to_owned(), urls[0].clone()));
+        assert_eq!(widgets_prs[1], ("pr1".to_owned(), urls[1].clone()));
+
+        // The query text itself must reference every alias and PR number.
+        assert!(query.contains("repo0: repository(owner: \"acme\", name: \"gadgets\")"));
+        assert!(query.contains("repo1: repository(owner: \"acme\", name: \"widgets\")"));
+        assert!(query.contains("pr0: pullRequest(number: 7)"));
+        assert!(query.contains("pr0: pullRequest(number: 1)"));
+        assert!(query.contains("pr1: pullRequest(number: 2)"));
+    }
+
+    /// The response walk must find each PR node back out by the aliases
+    /// `build_batch_query` produced, and must surface `None` (rather than
+    /// panicking or defaulting to `Some`) for a null node — the shape
+    /// GitHub returns for a force-deleted/transferred PR — while a
+    /// populated sibling PR in the same batch is unaffected.
+    #[test]
+    fn walk_batch_response_finds_nodes_by_alias_and_flags_null_nodes() {
+        let alias_map: BatchAliasMap = vec![
+            (
+                "repo0".to_owned(),
+                vec![
+                    ("pr0".to_owned(), "https://github.com/acme/widgets/pull/1".to_owned()),
+                    ("pr1".to_owned(), "https://github.com/acme/widgets/pull/2".to_owned()),
+                ],
+            ),
+            (
+                "repo1".to_owned(),
+                vec![("pr0".to_owned(), "https://github.com/acme/gadgets/pull/7".to_owned())],
+            ),
+        ];
+        let body = serde_json::json!({
+            "data": {
+                "repo0": {
+                    "pr0": { "state": "OPEN" },
+                    "pr1": null,
+                },
+                "repo1": {
+                    "pr0": { "state": "MERGED" },
+                },
+            }
+        });
+
+        let walked = walk_batch_response(&body, &alias_map);
+        assert_eq!(walked.len(), 3);
+        let by_url: HashMap<String, Option<&serde_json::Value>> = walked.into_iter().collect();
+
+        assert_eq!(
+            by_url["https://github.com/acme/widgets/pull/1"].map(|v| v["state"].clone()),
+            Some(serde_json::json!("OPEN"))
+        );
+        assert_eq!(
+            by_url["https://github.com/acme/widgets/pull/2"], None,
+            "null node -> None"
+        );
+        assert_eq!(
+            by_url["https://github.com/acme/gadgets/pull/7"].map(|v| v["state"].clone()),
+            Some(serde_json::json!("MERGED"))
+        );
     }
 
     /// `(state × mergeability × ci-leaf-set × combined-state)` matrix for
