@@ -522,6 +522,7 @@ private struct MarkdownViewerScrollContent: View {
 
     @Environment(\.commentedAnchors) private var commentedAnchors
     @Environment(\.commentFlashAnchor) private var commentFlashAnchor
+    @Environment(\.suppressTypeToComment) private var suppressTypeToComment
     @State private var parseStartTime: Date? = nil
     @State private var parseLogged = false
     /// Monotonically-increasing counter bumped whenever the highlight state
@@ -531,44 +532,69 @@ private struct MarkdownViewerScrollContent: View {
     /// hashValues and guarantees identity changes on every highlight update.
     @State private var parseVersion: Int = 0
 
+    /// ⌘F find-in-document state, scoped to this viewer window's lifetime —
+    /// see `MarkdownFindState` for why closing the bar doesn't clear `query`.
+    @StateObject private var findState = MarkdownFindState()
+    /// Stable across re-renders via `@State` (a plain stored `let`/`var`
+    /// would be reinitialized — losing the captured `NSScrollView` — every
+    /// time SwiftUI reconstructs this view struct).
+    @State private var scrollController = MarkdownScrollController()
+    @FocusState private var findFieldFocused: Bool
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(title)
-                    .font(.title3.weight(.semibold))
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(spacing: 0) {
+            if findState.isActive {
+                MarkdownFindBar(state: findState, isFocused: $findFieldFocused, onClose: closeFindBar)
                 Divider()
-                StructuredText(source, parser: markdownParser)
-                    .bossMarkdown()
-                    .textual.textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    // Force StructuredText recreation when highlight state changes so the
-                    // new HighlightingMarkdownParser instance is used to re-parse the source.
-                    // StructuredText only re-parses on markup changes; the id() change is the
-                    // trigger that ensures highlight updates are reflected immediately.
-                    // A monotonic counter is used instead of a hashValue-based key to avoid
-                    // hash collisions and guarantee a new identity on every comment update.
-                    .id(parseVersion)
-                    .onChange(of: commentedAnchors) { _, _ in parseVersion &+= 1 }
-                    .onChange(of: commentFlashAnchor) { _, _ in parseVersion &+= 1 }
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(
-                                key: StructuredTextHeightKey.self,
-                                value: geo.size.height
-                            )
-                        }
-                    )
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
-            .frame(maxWidth: 720)
-            .frame(maxWidth: .infinity)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(title)
+                        .font(.title3.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Divider()
+                    StructuredText(source, parser: markdownParser)
+                        .bossMarkdown()
+                        .textual.textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        // Force StructuredText recreation when highlight state changes so the
+                        // new HighlightingMarkdownParser instance is used to re-parse the source.
+                        // StructuredText only re-parses on markup changes; the id() change is the
+                        // trigger that ensures highlight updates are reflected immediately.
+                        // A monotonic counter is used instead of a hashValue-based key to avoid
+                        // hash collisions and guarantee a new identity on every comment/search update.
+                        .id(parseVersion)
+                        .onChange(of: commentedAnchors) { _, _ in parseVersion &+= 1 }
+                        .onChange(of: commentFlashAnchor) { _, _ in parseVersion &+= 1 }
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear.preference(
+                                    key: StructuredTextHeightKey.self,
+                                    value: geo.size.height
+                                )
+                            }
+                        )
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
+                .frame(maxWidth: 720)
+                .frame(maxWidth: .infinity)
+                .background(MarkdownScrollViewCapture(controller: scrollController))
+            }
+            .textSelection(.enabled)
         }
-        .textSelection(.enabled)
         .onAppear {
             parseStartTime = Date()
             parseLogged = false
+            findState.updateSource(source, baseURL: nil)
+        }
+        .onChange(of: source) { _, newSource in
+            findState.updateSource(newSource, baseURL: nil)
+        }
+        .onChange(of: findState.navigationNonce) { _, _ in
+            parseVersion &+= 1
+            guard findState.isActive, let range = findState.currentMatchRange else { return }
+            scrollController.scrollToFraction(Double(range.lowerBound) / Double(max(findState.plainTextLength, 1)))
         }
         .onPreferenceChange(StructuredTextHeightKey.self) { height in
             guard !parseLogged, height > 0, let start = parseStartTime,
@@ -585,15 +611,53 @@ private struct MarkdownViewerScrollContent: View {
                 parseStartTime = nil
             }
         }
+        // Hidden buttons for the standard macOS find shortcuts. ⌘⇧K (Add
+        // Comment) is the nearest neighboring shortcut (WithCommentsModifier)
+        // and doesn't collide with ⌘F/⌘G/⇧⌘G. Next/Previous are disabled
+        // (rather than absent) while there's nothing to navigate, so the
+        // keystroke falls through instead of being silently swallowed.
+        .background {
+            Group {
+                Button("") { openFindBar() }
+                    .keyboardShortcut("f", modifiers: .command)
+                Button("") { findState.selectNext() }
+                    .keyboardShortcut("g", modifiers: .command)
+                    .disabled(!findState.isActive || findState.matches.isEmpty)
+                Button("") { findState.selectPrevious() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!findState.isActive || findState.matches.isEmpty)
+            }
+            .frame(width: 0, height: 0)
+            .hidden()
+        }
+    }
+
+    private func openFindBar() {
+        findState.open()
+        findFieldFocused = true
+    }
+
+    private func closeFindBar() {
+        findState.close()
+        findFieldFocused = false
+        suppressTypeToComment.wrappedValue = false
     }
 
     private var markdownParser: any MarkupParser {
+        let base: any MarkupParser
         if commentedAnchors.isEmpty && commentFlashAnchor == nil {
-            return AttributedStringMarkdownParser.markdown()
+            base = AttributedStringMarkdownParser.markdown()
+        } else {
+            base = HighlightingMarkdownParser(
+                highlightedAnchors: commentedAnchors,
+                flashingAnchor: commentFlashAnchor
+            )
         }
-        return HighlightingMarkdownParser(
-            highlightedAnchors: commentedAnchors,
-            flashingAnchor: commentFlashAnchor
+        guard findState.isActive, !findState.matches.isEmpty else { return base }
+        return SearchHighlightingMarkdownParser(
+            inner: base,
+            matches: findState.matches,
+            currentMatchIndex: findState.currentIndex
         )
     }
 }
