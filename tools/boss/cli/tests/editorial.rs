@@ -9,28 +9,19 @@
 //!   a Boss identifier and for a clean body.
 //! - `boss editorial show` returns an empty list initially.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use boss_client::BossClient;
-use boss_protocol::{CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem};
+use boss_protocol::CreateProductInput;
 
 use common::run_boss;
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected event for product create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_product_with};
 
 /// set-editorial-rules → product show → unset → product show round-trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_then_show_then_unset_editorial_rules() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "EditorialProduct".to_owned(),
@@ -102,7 +93,7 @@ async fn set_then_show_then_unset_editorial_rules() -> Result<()> {
 async fn editorial_test_produces_correct_decision() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "TestDecisionProduct".to_owned(),
@@ -166,7 +157,7 @@ async fn editorial_test_produces_correct_decision() -> Result<()> {
 async fn editorial_show_returns_empty_initially() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "ShowTestProduct".to_owned(),

@@ -14,92 +14,9 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest, Product,
-    Project, Task, WorkItem,
-};
 
 use common::{run_boss, run_boss_expect_failure};
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> {
-    match client
-        .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: name.to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:test/repo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
-        })
-        .await?
-    {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected response for product create: {other:?}")),
-    }
-}
-
-async fn create_project(client: &mut BossClient, product_id: &str, name: &str) -> Result<Project> {
-    match client
-        .send_request(&FrontendRequest::CreateProject {
-            input: CreateProjectInput {
-                product_id: product_id.to_owned(),
-                name: name.to_owned(),
-                description: None,
-                goal: None,
-                autostart: false,
-                no_design_task: false,
-            },
-        })
-        .await?
-    {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Project(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected response for project create: {other:?}")),
-    }
-}
-
-async fn create_task(client: &mut BossClient, product_id: &str, project_id: &str, name: &str) -> Result<Task> {
-    match client
-        .send_request(&FrontendRequest::CreateTask {
-            input: CreateTaskInput::builder()
-                .product_id(product_id)
-                .project_id(project_id)
-                .name(name)
-                .autostart(false)
-                .build(),
-        })
-        .await?
-    {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Task(t),
-        } => Ok(t),
-        other => Err(anyhow!("unexpected response for task create: {other:?}")),
-    }
-}
-
-async fn create_chore(client: &mut BossClient, product_id: &str, name: &str) -> Result<Task> {
-    match client
-        .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput::builder()
-                .product_id(product_id)
-                .name(name)
-                .autostart(false)
-                .build(),
-        })
-        .await?
-    {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Chore(t),
-        } => Ok(t),
-        other => Err(anyhow!("unexpected response for chore create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_chore, create_product, create_project, create_task};
 
 // ── task show — all selector forms ──────────────────────────────────────────
 // `boss task show` accepts any kind (chore_only: false), so we use chores

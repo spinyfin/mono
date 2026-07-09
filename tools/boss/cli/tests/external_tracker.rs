@@ -7,27 +7,18 @@
 //! - missing required flags (e.g. no `--org` for `kind=github`) is rejected.
 //! - `--json` output round-trips the external_tracker_kind / config fields.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use boss_client::BossClient;
-use boss_protocol::{CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem};
+use boss_protocol::CreateProductInput;
 
 use common::{run_boss, run_boss_expect_failure};
-use harness::TestEngine;
-
-async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated {
-            item: WorkItem::Product(p),
-        } => Ok(p),
-        other => Err(anyhow!("unexpected event for product create: {other:?}")),
-    }
-}
+use harness::{TestEngine, create_product_with};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bind_then_show_renders_external_tracker_block() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "Boss".to_owned(),
@@ -100,7 +91,7 @@ async fn bind_then_show_renders_external_tracker_block() -> Result<()> {
 async fn bind_with_reverse_close_flag_persists() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "ReverseCloseProd".to_owned(),
@@ -144,7 +135,7 @@ async fn bind_with_reverse_close_flag_persists() -> Result<()> {
 async fn missing_org_for_github_is_rejected() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "NoBind".to_owned(),
@@ -184,7 +175,7 @@ async fn missing_org_for_github_is_rejected() -> Result<()> {
 async fn missing_kind_without_unset_is_rejected() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product(
+    let product = create_product_with(
         &mut client,
         CreateProductInput {
             name: "NoKind".to_owned(),
