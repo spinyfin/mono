@@ -182,7 +182,11 @@ fn extract_bareword<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 
 /// Extract `key="quoted value"` from `text`. Requires a matching closing
 /// quote on the same line; an unterminated quote yields `None` (malformed).
-fn extract_quoted<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+///
+/// `pub(crate)` so [`crate::deferred_scope`] can reuse it for its own
+/// `summary=`/`reason=` field extraction rather than reimplementing the
+/// same quoted-value scan.
+pub(crate) fn extract_quoted<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("{key}=\"");
     let idx = text.find(&needle)?;
     let rest = &text[idx + needle.len()..];

@@ -1468,6 +1468,16 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // full escalation/blocker marker syntax so a well-formed marker is
         // the default, not a lucky accident — see the function doc for why.
         prompt.push_str(&worker_escalation_protocol_directive());
+        // Flunge T254 (root-caused to T222/PR #765): teach chore/task workers
+        // the `[deferred-scope]` marker so a deliberate scope narrowing is
+        // recorded, not just claimed in prose ("filed as a followup") that
+        // nothing actually tracks.
+        if matches!(
+            execution.kind,
+            ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
+        ) {
+            prompt.push_str(&deferred_scope_directive());
+        }
         // T1868: give a fresh-PR chore/task implementation worker a SANCTIONED
         // way to terminate as "the work was already done". Without it, a worker
         // that correctly finds an empty diff stops and explains — and the
@@ -1784,6 +1794,45 @@ fn worker_escalation_protocol_directive() -> String {
      emit the marker instead. The engine files it as an attention item for the coordinator and \
      pauses the auto-nudge loop for this run until it acks, so you will not be re-prompted to \
      \"produce a PR\" while a marker is pending.\n"
+        .to_string()
+}
+
+/// `[deferred-scope]` marker protocol directive (Flunge T254, root-caused to
+/// T222/PR #765). A worker that deliberately narrows its own scope —
+/// delivers part of the brief and consciously defers a piece of it, rather
+/// than merely running out of turns — had no sanctioned way to record that
+/// decision: task completion is binary (PR merged => done) and nothing
+/// reconciles delivered scope against the brief. The T222 worker wired part
+/// of a feature, deferred the rest because it needed new data plumbing, and
+/// wrote "I've filed it as a followup" in the PR body — workers cannot file
+/// anything, so the remainder silently died until an operator noticed weeks
+/// later. This directive gives deferred scope a parseable channel mirroring
+/// `[effort-escalation]`'s grammar; see [`crate::deferred_scope`] for the
+/// parser and
+/// [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
+/// for what the engine does with it: appends a durable audit line to the
+/// work item's description and files a coordinator-visible attention item.
+fn deferred_scope_directive() -> String {
+    "\n## If you deliver less than the brief asks: declare the gap\n\n\
+     If you consciously decide to narrow scope — implement part of what was asked and \
+     deliberately leave a piece undone (it needs plumbing/data/access this run doesn't have, \
+     it's a genuinely separate concern, etc.) rather than doing it — emit one line per deferred \
+     item in your final response:\n\n\
+     ```\n\
+     [deferred-scope] summary=\"<what you did not deliver>\" reason=\"<why you deferred it>\"\n\
+     ```\n\n\
+     Both fields are double-quoted and required. Example:\n\n\
+     ```\n\
+     [deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline; out of scope for this wiring-only chore\"\n\
+     ```\n\n\
+     Do NOT write \"filed as a followup\", \"tracked separately\", or similar in your PR body or \
+     summary as a substitute — you have no ability to file or track anything, that sentence would \
+     simply be false, and the deferred work will be silently lost with no record. The \
+     `[deferred-scope]` marker is the channel that actually creates one: it is recorded against \
+     this task and surfaced to a human, who decides whether to spin up a followup or accept the \
+     gap. This is distinct from the followups mechanism above, which proposes brand-new \
+     out-of-scope work you noticed — use `[deferred-scope]` specifically for work the brief asked \
+     for that you did not deliver.\n"
         .to_string()
 }
 
@@ -2280,6 +2329,7 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
+    out.push_str(&deferred_scope_directive());
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
@@ -4375,6 +4425,75 @@ mod compose_prompt_tests {
         assert!(
             !prompt.contains("{pr_number}"),
             "revision directive must not emit the literal placeholder {{pr_number}} — it must be interpolated:\n{prompt}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `[deferred-scope]` marker directive (Flunge T254, root-caused to
+    // T222/PR #765)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deferred_scope_directive_present_for_chore_implementation() {
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("[deferred-scope] summary=\"<what you did not deliver>\""),
+            "chore_implementation prompt must teach the [deferred-scope] marker grammar:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("filed as a followup"),
+            "directive must forbid the false \"filed as a followup\" claim:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn deferred_scope_directive_present_for_revision_implementation() {
+        let work_item = revision_task_with_created_via(None, "operator");
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("[deferred-scope] summary=\"<what you did not deliver>\""),
+            "revision_implementation prompt must teach the [deferred-scope] marker grammar:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn deferred_scope_directive_absent_for_answer_agent() {
+        // The answer agent is read-only and never delivers scope against a
+        // brief — it must not be taught a marker it has no reason to emit.
+        let execution = WorkExecution::builder()
+            .id("exec_answer_01")
+            .work_item_id("task-1")
+            .kind(ExecutionKind::AnswerAgent)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains("[deferred-scope]"),
+            "read-only answer-agent prompt must not carry the [deferred-scope] directive:\n{prompt}",
         );
     }
 

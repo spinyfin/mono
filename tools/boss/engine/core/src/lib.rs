@@ -27,6 +27,7 @@ pub mod database_backup;
 pub mod day_rotated_log;
 pub mod dead_pane_sweep;
 pub mod dead_pid_sweep;
+pub mod deferred_scope;
 pub mod dep_unblock_sweep;
 pub mod design_detector;
 pub mod dispatch_events;

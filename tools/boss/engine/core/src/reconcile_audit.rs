@@ -28,18 +28,27 @@ pub(crate) fn append_reconcile_audit(
     reason: &str,
     recovery_patch: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let recovery_note = match recovery_patch {
+        Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
+        None => String::new(),
+    };
+    let audit_line = format!("\n[engine-reconcile] epoch {now_epoch_secs}: {reason}.{recovery_note}");
+    append_description_line(work_db, work_item_id, &audit_line)
+}
+
+/// Append `line` verbatim to `work_item_id`'s description. Shared by
+/// [`append_reconcile_audit`] and [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]
+/// (the `[deferred-scope]` audit trail) — both need the identical
+/// get -> extract-description -> format -> update sequence, differing only
+/// in the line they format.
+pub(crate) fn append_description_line(work_db: &WorkDb, work_item_id: &str, line: &str) -> anyhow::Result<()> {
     let item = work_db.get_work_item(work_item_id)?;
     let current_desc = match &item {
         boss_protocol::WorkItem::Product(p) => p.description.as_str(),
         boss_protocol::WorkItem::Project(p) => p.description.as_str(),
         boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
     };
-    let recovery_note = match recovery_patch {
-        Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
-        None => String::new(),
-    };
-    let audit_line = format!("\n[engine-reconcile] epoch {now_epoch_secs}: {reason}.{recovery_note}");
-    let new_desc = format!("{current_desc}{audit_line}");
+    let new_desc = format!("{current_desc}{line}");
     work_db.update_work_item(
         work_item_id,
         WorkItemPatch {
