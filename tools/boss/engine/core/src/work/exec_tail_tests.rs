@@ -22,50 +22,29 @@ fn item_task(item: WorkItem) -> Task {
     }
 }
 
-/// Linking a work item to an external ref makes it discoverable by
-/// `find_by_external_ref` and surfaces the ref on
-/// `get_task_with_external_ref`, including the derived GitHub `web_url`.
+/// `get_task_with_external_ref` surfaces the ref (including the
+/// unset-until-synced `synced_at`) on a linked work item. The
+/// `set_external_ref` -> `find_by_external_ref` round-trip itself (kind,
+/// canonical_id, raw blob, derived github `web_url`) is already covered by
+/// `t04::set_and_find_external_ref_round_trip` and
+/// `t04::derive_external_ref_web_url_github` — this test only exercises the
+/// net-new `get_task_with_external_ref` path.
 #[test]
 fn set_external_ref_links_and_is_findable() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Reconcile me");
 
-    // Not bound yet → lookup misses.
-    assert!(
-        db.find_by_external_ref("github", "spinyfin/mono#560")
-            .unwrap()
-            .is_none(),
-        "no binding should exist before set_external_ref"
-    );
-
     let raw = json!({ "issue_number": 560, "project_item_id": "PVTI_abc" });
     db.set_external_ref(&chore.id, "github", "spinyfin/mono#560", &raw)
         .unwrap();
 
-    // find_by_external_ref now resolves to the linked task with the ref populated.
-    let found = db
-        .find_by_external_ref("github", "spinyfin/mono#560")
-        .unwrap()
-        .expect("binding should be findable after set_external_ref");
-    assert_eq!(found.id, chore.id, "should resolve back to the linked chore");
-    let ext = found.external_ref.as_ref().expect("external_ref should be populated");
-    assert_eq!(ext.kind, "github");
-    assert_eq!(ext.canonical_id, "spinyfin/mono#560");
-    assert_eq!(ext.raw, raw, "raw blob should round-trip verbatim");
-    assert_eq!(
-        ext.web_url, "https://github.com/spinyfin/mono/issues/560",
-        "github web_url should be derived at read time"
-    );
-    assert!(ext.synced_at.is_none(), "synced_at is unset until a reconcile tick");
-    assert!(ext.unbound_at.is_none(), "a fresh binding is not unbound");
-
-    // get_task_with_external_ref carries the same snapshot.
     let item = item_task(db.get_task_with_external_ref(&chore.id).unwrap());
     let ext = item
         .external_ref
         .expect("external_ref should be present on the work item");
     assert_eq!(ext.canonical_id, "spinyfin/mono#560");
+    assert!(ext.synced_at.is_none(), "synced_at is unset until a reconcile tick");
 }
 
 /// `touch_external_ref_synced_at` stamps the sync marker without altering
@@ -228,9 +207,12 @@ fn reconciler_attach_pr_url_only_when_empty() {
     );
 }
 
-/// `clear_external_ref` marks the binding unbound: it drops out of
-/// `find_by_external_ref` results while retaining its canonical id for
-/// future re-binding.
+/// `clear_external_ref` retains the canonical id (for future re-binding)
+/// while stamping `unbound_at` and clearing `synced_at`. The
+/// find_by_external_ref-drops-the-row half of unbinding is already covered
+/// by `t04::clear_external_ref_hides_from_find`; this test targets the
+/// net-new retention/synced_at assertions visible via
+/// `get_task_with_external_ref`.
 #[test]
 fn clear_external_ref_unbinds_but_retains_canonical_id() {
     let (_dir, db) = open_db();
@@ -240,24 +222,9 @@ fn clear_external_ref_unbinds_but_retains_canonical_id() {
         .unwrap();
     db.touch_external_ref_synced_at(&chore.id).unwrap();
 
-    assert!(
-        db.find_by_external_ref("github", "spinyfin/mono#563")
-            .unwrap()
-            .is_some(),
-        "binding should be active before clearing"
-    );
-
     db.clear_external_ref(&chore.id).unwrap();
 
-    // No longer "found" — unbound rows are excluded from the active lookup.
-    assert!(
-        db.find_by_external_ref("github", "spinyfin/mono#563")
-            .unwrap()
-            .is_none(),
-        "cleared binding must not be findable via find_by_external_ref"
-    );
-
-    // But the canonical id is retained (for re-binding) and synced_at is cleared.
+    // The canonical id is retained (for re-binding) and synced_at is cleared.
     let item = item_task(db.get_task_with_external_ref(&chore.id).unwrap());
     let ext = item.external_ref.expect("ref columns are retained after clear");
     assert_eq!(ext.canonical_id, "spinyfin/mono#563", "canonical id is retained");
