@@ -484,3 +484,283 @@ fn preview_to_event(project_id: String, preview: PreviewOutcome) -> FrontendEven
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use boss_protocol::{Confidence, EffortLevel, PlannerOutput, ProposedEdge, ProposedTask, TaskKind};
+
+    use super::*;
+
+    /// Low-confidence warning fragment appended to the `Staged` message.
+    const STAGED_LOW_CONFIDENCE: &str = "LOW CONFIDENCE";
+
+    fn ptask(handle: &str) -> ProposedTask {
+        ProposedTask {
+            handle: handle.to_owned(),
+            name: format!("task {handle}"),
+            description: "do the thing".to_owned(),
+            kind: TaskKind::ProjectTask,
+            effort: EffortLevel::Small,
+            ordinal: 0,
+        }
+    }
+
+    fn pedge(dependent: &str, prerequisite: &str) -> ProposedEdge {
+        ProposedEdge {
+            dependent: dependent.to_owned(),
+            prerequisite: prerequisite.to_owned(),
+        }
+    }
+
+    fn planner_output(tasks: Vec<ProposedTask>, edges: Vec<ProposedEdge>) -> PlannerOutput {
+        PlannerOutput {
+            tasks,
+            edges,
+            confidence: Confidence::High,
+            breakdown_found: true,
+            notes: String::new(),
+            effort_audit: vec![],
+        }
+    }
+
+    /// Destructure the `PlanProjectResult` event into its fields for
+    /// field-level assertions. Panics if the event is any other variant.
+    fn unwrap_plan_result(
+        event: FrontendEvent,
+    ) -> (
+        String,
+        String,
+        String,
+        usize,
+        usize,
+        usize,
+        Option<String>,
+        Option<PlannerOutput>,
+    ) {
+        match event {
+            FrontendEvent::PlanProjectResult {
+                project_id,
+                outcome,
+                message,
+                created,
+                edges,
+                skipped,
+                run_id,
+                proposal,
+            } => (project_id, outcome, message, created, edges, skipped, run_id, proposal),
+            other => panic!("expected PlanProjectResult, got {other:?}"),
+        }
+    }
+
+    // --- describe_populate_outcome: tag contract --------------------------
+
+    /// Every variant's returned tag must equal `outcome.tag()` — the value
+    /// persisted to `planner_runs.outcome` — so the CLI response and the
+    /// audit row never diverge.
+    #[test]
+    fn describe_tag_matches_outcome_tag_for_every_variant() {
+        let variants = [
+            PopulateOutcome::SkippedAlreadyPopulated,
+            PopulateOutcome::SkippedPreSeeded { existing: 3 },
+            PopulateOutcome::NoBreakdown,
+            PopulateOutcome::EmptyBreakdown,
+            PopulateOutcome::RejectedTooMany { count: 40, max: 25 },
+            PopulateOutcome::RejectedBadGraph,
+            PopulateOutcome::DocMissing,
+            PopulateOutcome::FetchFailed,
+            PopulateOutcome::PlannerFailed,
+            PopulateOutcome::Staged {
+                created: 1,
+                edges: 0,
+                skipped: 0,
+                low_confidence: false,
+            },
+            PopulateOutcome::Errored,
+        ];
+        for outcome in &variants {
+            let (tag, message) = describe_populate_outcome(outcome);
+            assert_eq!(tag, outcome.tag(), "tag mismatch for {outcome:?}");
+            assert!(!message.is_empty(), "empty message for {outcome:?}");
+        }
+    }
+
+    // --- describe_populate_outcome: interpolated values -------------------
+
+    #[test]
+    fn describe_pre_seeded_reports_existing_count() {
+        let (tag, message) = describe_populate_outcome(&PopulateOutcome::SkippedPreSeeded { existing: 7 });
+        assert_eq!(tag, "skipped_pre_seeded");
+        assert!(message.contains('7'), "message missing existing count: {message}");
+    }
+
+    #[test]
+    fn describe_rejected_too_many_reports_count_and_cap() {
+        let (tag, message) = describe_populate_outcome(&PopulateOutcome::RejectedTooMany { count: 42, max: 25 });
+        assert_eq!(tag, "rejected_too_many");
+        assert!(message.contains("42"), "message missing proposed count: {message}");
+        assert!(message.contains("25"), "message missing cap: {message}");
+    }
+
+    #[test]
+    fn describe_staged_reports_created_edges_skipped_counts() {
+        let (tag, message) = describe_populate_outcome(&PopulateOutcome::Staged {
+            created: 5,
+            edges: 4,
+            skipped: 2,
+            low_confidence: false,
+        });
+        assert_eq!(tag, "staged");
+        assert!(message.contains('5'), "message missing created count: {message}");
+        assert!(message.contains('4'), "message missing edges count: {message}");
+        assert!(message.contains('2'), "message missing skipped count: {message}");
+    }
+
+    #[test]
+    fn describe_staged_appends_low_confidence_warning_only_when_flagged() {
+        let (_, high) = describe_populate_outcome(&PopulateOutcome::Staged {
+            created: 3,
+            edges: 1,
+            skipped: 0,
+            low_confidence: false,
+        });
+        assert!(
+            !high.contains(STAGED_LOW_CONFIDENCE),
+            "high-confidence message must not warn: {high}"
+        );
+
+        let (_, low) = describe_populate_outcome(&PopulateOutcome::Staged {
+            created: 3,
+            edges: 1,
+            skipped: 0,
+            low_confidence: true,
+        });
+        assert!(
+            low.contains(STAGED_LOW_CONFIDENCE),
+            "low-confidence message must warn: {low}"
+        );
+    }
+
+    // --- preview_to_event: preview_ prefix + zeroed fields ----------------
+
+    /// Preview tags must always carry the `preview_` prefix so they can never
+    /// be confused with a real run's terminal `planner_runs.outcome` value.
+    #[test]
+    fn preview_tags_are_always_prefixed_preview() {
+        let cases = vec![
+            PreviewOutcome::AlreadyPopulated {
+                outcome: "staged".to_owned(),
+            },
+            PreviewOutcome::PreSeeded { existing: 2 },
+            PreviewOutcome::Terminal {
+                outcome: PopulateOutcome::NoBreakdown,
+                message: "no breakdown".to_owned(),
+            },
+            PreviewOutcome::Valid {
+                output: planner_output(vec![ptask("a")], vec![]),
+                low_confidence: false,
+            },
+        ];
+        for preview in cases {
+            let (_, outcome, ..) = unwrap_plan_result(preview_to_event("proj-1".to_owned(), preview));
+            assert!(outcome.starts_with("preview_"), "tag not prefixed: {outcome}");
+        }
+    }
+
+    #[test]
+    fn preview_already_populated_embeds_live_outcome_and_zeroes_fields() {
+        let event = preview_to_event(
+            "proj-1".to_owned(),
+            PreviewOutcome::AlreadyPopulated {
+                outcome: "running".to_owned(),
+            },
+        );
+        let (project_id, outcome, message, created, edges, skipped, run_id, proposal) = unwrap_plan_result(event);
+        assert_eq!(project_id, "proj-1");
+        assert_eq!(outcome, "preview_already_populated_as_running");
+        assert!(message.contains("running"), "message missing live outcome: {message}");
+        assert_eq!((created, edges, skipped), (0, 0, 0));
+        assert_eq!(run_id, None);
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn preview_pre_seeded_reports_existing_and_zeroes_fields() {
+        let event = preview_to_event("proj-1".to_owned(), PreviewOutcome::PreSeeded { existing: 9 });
+        let (_, outcome, message, created, edges, skipped, run_id, proposal) = unwrap_plan_result(event);
+        assert_eq!(outcome, "preview_pre_seeded");
+        assert!(message.contains('9'), "message missing existing count: {message}");
+        assert_eq!((created, edges, skipped), (0, 0, 0));
+        assert_eq!(run_id, None);
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn preview_terminal_prefixes_inner_tag_and_passes_message_through() {
+        let event = preview_to_event(
+            "proj-1".to_owned(),
+            PreviewOutcome::Terminal {
+                outcome: PopulateOutcome::FetchFailed,
+                message: "could not fetch the doc".to_owned(),
+            },
+        );
+        let (_, outcome, message, created, edges, skipped, run_id, proposal) = unwrap_plan_result(event);
+        assert_eq!(outcome, "preview_fetch_failed");
+        assert_eq!(message, "could not fetch the doc");
+        assert_eq!((created, edges, skipped), (0, 0, 0));
+        assert_eq!(run_id, None);
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn preview_valid_carries_counts_and_proposal() {
+        let output = planner_output(
+            vec![ptask("a"), ptask("b"), ptask("c")],
+            vec![pedge("b", "a"), pedge("c", "a")],
+        );
+        let event = preview_to_event(
+            "proj-1".to_owned(),
+            PreviewOutcome::Valid {
+                output: output.clone(),
+                low_confidence: false,
+            },
+        );
+        let (_, outcome, message, created, edges, skipped, run_id, proposal) = unwrap_plan_result(event);
+        assert_eq!(outcome, "preview_valid");
+        // created/edges track the proposal's own vectors; skipped/run_id stay
+        // at the documented zero/None (nothing was written for a preview).
+        assert_eq!(created, output.tasks.len());
+        assert_eq!(edges, output.edges.len());
+        assert_eq!(skipped, 0);
+        assert_eq!(run_id, None);
+        let proposal = proposal.expect("valid preview must carry the proposal");
+        assert_eq!(proposal.tasks.len(), output.tasks.len());
+        assert_eq!(proposal.edges.len(), output.edges.len());
+        assert!(
+            !message.contains(STAGED_LOW_CONFIDENCE),
+            "unexpected warning: {message}"
+        );
+    }
+
+    #[test]
+    fn preview_valid_appends_low_confidence_warning_only_when_flagged() {
+        let output = planner_output(vec![ptask("a")], vec![]);
+
+        let (_, _, high, ..) = unwrap_plan_result(preview_to_event(
+            "proj-1".to_owned(),
+            PreviewOutcome::Valid {
+                output: output.clone(),
+                low_confidence: false,
+            },
+        ));
+        assert!(!high.contains(STAGED_LOW_CONFIDENCE), "must not warn: {high}");
+
+        let (_, _, low, ..) = unwrap_plan_result(preview_to_event(
+            "proj-1".to_owned(),
+            PreviewOutcome::Valid {
+                output,
+                low_confidence: true,
+            },
+        ));
+        assert!(low.contains(STAGED_LOW_CONFIDENCE), "must warn: {low}");
+    }
+}
