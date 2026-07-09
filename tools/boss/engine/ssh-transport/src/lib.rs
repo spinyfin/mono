@@ -538,11 +538,11 @@ pub fn default_control_socket_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".boss-remote-control"))
 }
 
-/// `host_id` may carry characters that are legal in our id regex
-/// (`[a-zA-Z0-9._@:-]+`) but ambiguous in a filename. Replace anything
-/// outside `[a-zA-Z0-9_-]` with `_` so the socket path is unambiguous
-/// regardless of platform.
-fn sanitize_for_path(id: &str) -> String {
+/// An id (host id, run id, …) may carry characters that are legal in
+/// our id regex (`[a-zA-Z0-9._@:-]+`) but ambiguous in a filename.
+/// Replace anything outside `[a-zA-Z0-9_-]` with `_` so a socket path
+/// built from it is unambiguous regardless of platform.
+pub fn sanitize_for_path(id: &str) -> String {
     id.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
