@@ -3249,6 +3249,50 @@ async fn sweep_stalled_reviewer(
     }
 }
 
+/// Targeted companion to the broad [`Notify`]-based `kick` accepted by
+/// [`spawn_loop`]. Where the broad kick just says "sweep everything now",
+/// a targeted kick additionally names the PR that prompted it — the shape
+/// the doc's push-event and adaptive-per-PR-timer follow-ups
+/// (`tools/boss/docs/investigations/
+/// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9 items 3–4)
+/// need to reconcile exactly one PR instead of triggering a full sweep.
+///
+/// This type only adds the *entry point*: firing it still runs the same
+/// full [`run_one_pass`] sweep as the broad kick (idempotent reconciliation
+/// makes that safe — see the doc's §7 design properties), it just also
+/// records and logs which PR(s) asked for the pass. Scoping the sweep
+/// itself down to a single PR is left to the `reconcile_one(pr_url)` work
+/// in the sibling adaptive-intervals follow-up.
+#[derive(Clone, Default)]
+pub struct PrReconcilerTargetedKick {
+    notify: Arc<Notify>,
+    pending: Arc<Mutex<Vec<String>>>,
+}
+
+impl PrReconcilerTargetedKick {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request an immediate pass to reconcile `pr_url`. Subject to the same
+    /// quiesce window as the broad kick (see [`spawn_loop`]).
+    pub fn kick(&self, pr_url: impl Into<String>) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(pr_url.into());
+        self.notify.notify_one();
+    }
+
+    async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    fn drain_pending(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+}
+
 /// merged or developed a conflict while the engine was offline gets
 /// reconciled on boot. The sweep runs inside the spawned task so
 /// engine startup isn't blocked on `gh`; subsequent passes are
@@ -3260,6 +3304,10 @@ async fn sweep_stalled_reviewer(
 /// recent pass are silently dropped — the periodic tick will pick up
 /// the change soon enough and rapid window-toggle events don't result
 /// in repeated GitHub API calls.
+///
+/// `targeted_kick` is the [`PrReconcilerTargetedKick`] companion — same
+/// quiesce behavior, but callers name the PR that prompted the request so
+/// it shows up in the sweep log.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
@@ -3269,9 +3317,12 @@ pub fn spawn_loop(
     handlers: (Arc<dyn CubeClient>, Arc<WorkerCompletionHandler>),
     interval: Duration,
     metrics: Arc<Registry>,
-    kick: Arc<Notify>,
+    // (broad kick, targeted kick) — bundled to keep the parameter count
+    // under clippy::too_many_arguments.
+    kicks: (Arc<Notify>, PrReconcilerTargetedKick),
 ) -> tokio::task::JoinHandle<()> {
     let (cube_client, completion_handler) = handlers;
+    let (kick, targeted_kick) = kicks;
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         loop {
@@ -3336,6 +3387,25 @@ pub fn spawn_loop(
                             since_last_ms = since_last.as_millis(),
                             quiesce_ms = quiesce_window.as_millis(),
                             "merge poller: kick within quiesce window, absorbing",
+                        );
+                        // continue listening; periodic sleep arm will eventually fire
+                    }
+                    _ = targeted_kick.notified() => {
+                        let pr_urls = targeted_kick.drain_pending();
+                        let since_last = last_run_at.elapsed();
+                        if since_last >= quiesce_window {
+                            tracing::debug!(
+                                ?pr_urls,
+                                since_last_ms = since_last.as_millis(),
+                                "merge poller: targeted kick → immediate sweep",
+                            );
+                            break 'wait;
+                        }
+                        tracing::debug!(
+                            ?pr_urls,
+                            since_last_ms = since_last.as_millis(),
+                            quiesce_ms = quiesce_window.as_millis(),
+                            "merge poller: targeted kick within quiesce window, absorbing",
                         );
                         // continue listening; periodic sleep arm will eventually fire
                     }
@@ -7168,6 +7238,35 @@ mod tests {
         assert!(
             broke_out.is_ok(),
             "kick after quiesce window must break out of wait loop",
+        );
+    }
+
+    /// [`PrReconcilerTargetedKick::kick`] records the PR that requested the
+    /// pass and wakes anyone awaiting [`PrReconcilerTargetedKick::notified`];
+    /// [`PrReconcilerTargetedKick::drain_pending`] returns exactly what was
+    /// recorded and clears it so a second drain sees nothing new.
+    #[tokio::test]
+    async fn targeted_kick_records_and_drains_pr_urls() {
+        use tokio::time::timeout;
+
+        let targeted_kick = PrReconcilerTargetedKick::new();
+        targeted_kick.kick("https://github.com/spinyfin/mono/pull/1");
+        targeted_kick.kick("https://github.com/spinyfin/mono/pull/2");
+
+        timeout(Duration::from_millis(500), targeted_kick.notified())
+            .await
+            .expect("kick() must notify a waiter");
+
+        assert_eq!(
+            targeted_kick.drain_pending(),
+            vec![
+                "https://github.com/spinyfin/mono/pull/1".to_owned(),
+                "https://github.com/spinyfin/mono/pull/2".to_owned(),
+            ],
+        );
+        assert!(
+            targeted_kick.drain_pending().is_empty(),
+            "drain_pending must clear the queue",
         );
     }
 
