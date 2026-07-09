@@ -31,21 +31,28 @@
 //!
 //! [`classify_claude_error`] maps an error string to one of three
 //! classes. The rules are intentionally conservative — when in doubt
-//! we do NOT auto-retry:
+//! we do NOT skip straight to a confirmed non-retryable verdict:
 //!
 //! - [`ErrorClass::Transient`] — retryable infrastructure hiccups:
-//!   socket closed / connection reset / broken pipe, `overloaded_error`
-//!   (HTTP 529), `rate_limit`/HTTP 429, request timeouts, and HTTP 5xx
-//!   (`api_error`, 500/502/503/504, "internal server error", "service
-//!   unavailable", "bad gateway", "gateway timeout").
+//!   socket closed / connection reset / broken pipe, connection refused
+//!   / unable to connect / DNS resolution failure (the canonical
+//!   sleep-wake network-drop signatures), `overloaded_error` (HTTP 529),
+//!   `rate_limit`/HTTP 429, request timeouts, and HTTP 5xx (`api_error`,
+//!   500/502/503/504, "internal server error", "service unavailable",
+//!   "bad gateway", "gateway timeout").
 //! - [`ErrorClass::Permanent`] — non-retryable; retrying would just
 //!   reproduce the failure: `authentication_error`/401,
 //!   `permission_error`/403, `invalid_request_error`/400,
 //!   `not_found_error`/404, `request_too_large`, `billing_error`,
 //!   context-length overflow.
 //! - [`ErrorClass::Indeterminate`] — an API error we recognise as an
-//!   error but cannot confidently bucket. Treated like Permanent by
-//!   the policy (escalate, don't blindly retry).
+//!   error but cannot confidently bucket. [`RecoveryPolicy`] gives it
+//!   the same bounded retry budget as [`ErrorClass::Transient`] (an
+//!   unrecognised message is, by definition, one we haven't seen
+//!   before — it may well be a transient condition under a new error
+//!   string, e.g. a sleep/wake artifact not yet in [`TRANSIENT_MARKERS`]).
+//!   Only once retries are exhausted does it escalate, same as a
+//!   confirmed-transient error that never cleared.
 
 use std::time::Duration;
 
@@ -59,8 +66,22 @@ pub enum ErrorClass {
     /// Non-retryable error — auto-resume would just reproduce it.
     Permanent,
     /// Recognised as an API error but not confidently classifiable.
-    /// The policy treats this like [`ErrorClass::Permanent`].
+    /// The policy gives it the same bounded retry budget as
+    /// [`ErrorClass::Transient`] — see [`RecoveryPolicy::decide`].
     Indeterminate,
+}
+
+impl ErrorClass {
+    /// Label used on dispatch events / attention items so an operator can
+    /// see what the classifier actually detected, independent of *why*
+    /// the policy stopped retrying (see [`EscalateReason`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorClass::Transient => "transient",
+            ErrorClass::Permanent => "permanent",
+            ErrorClass::Indeterminate => "indeterminate",
+        }
+    }
 }
 
 /// Substrings (matched against a lowercased haystack) that mark a
@@ -116,6 +137,18 @@ const TRANSIENT_MARKERS: &[&str] = &[
     "econnreset",
     "connection error",
     "connection aborted",
+    "connection refused",
+    "connectionrefused",
+    "econnrefused",
+    "unable to connect",
+    "network is unreachable",
+    "enetunreach",
+    "no route to host",
+    "ehostunreach",
+    "getaddrinfo",
+    "enotfound",
+    "name resolution",
+    "temporary failure in name resolution",
     "broken pipe",
     "epipe",
     "network error",
@@ -304,11 +337,15 @@ fn entry_text(line: &Value) -> String {
 /// Why a worker is being escalated instead of auto-resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscalateReason {
-    /// The error is non-retryable (auth, billing, invalid request, …).
+    /// The error is confidently non-retryable (auth, billing, invalid
+    /// request, …) — escalated immediately, no retries spent.
     Permanent,
-    /// The error is recognised but not confidently classifiable.
-    Indeterminate,
-    /// The error is transient but the retry cap has been reached.
+    /// The retry cap has been reached. Applies to both a confirmed
+    /// [`ErrorClass::Transient`] error that never cleared and an
+    /// [`ErrorClass::Indeterminate`] one that got the same bounded
+    /// chances and still didn't resolve — the original class is
+    /// reported separately (see [`ErrorClass::as_str`]) so operators
+    /// can tell the two apart.
     RetriesExhausted,
 }
 
@@ -316,7 +353,6 @@ impl EscalateReason {
     pub fn as_str(self) -> &'static str {
         match self {
             EscalateReason::Permanent => "permanent_error",
-            EscalateReason::Indeterminate => "unrecognized_error",
             EscalateReason::RetriesExhausted => "retries_exhausted",
         }
     }
@@ -377,15 +413,21 @@ impl RecoveryPolicy {
     /// resumes have already happened on this work item's chain
     /// (`prior_attempts`, i.e. the dead execution's
     /// `transient_failure_count`).
+    ///
+    /// [`ErrorClass::Transient`] and [`ErrorClass::Indeterminate`] share
+    /// the same bounded retry budget: an unrecognised error is, by
+    /// definition, one this classifier hasn't been taught yet — it may
+    /// well be a transient condition surfacing under a message shape we
+    /// haven't seen (a new API error string, a sleep/wake network
+    /// artifact, …). A few cheap, backed-off retries cost little and let
+    /// it self-heal; only [`ErrorClass::Permanent`] (confidently
+    /// non-retryable) skips straight to escalation with zero attempts.
     pub fn decide(&self, class: ErrorClass, prior_attempts: u32) -> RecoveryDecision {
         match class {
             ErrorClass::Permanent => RecoveryDecision::Escalate {
                 reason: EscalateReason::Permanent,
             },
-            ErrorClass::Indeterminate => RecoveryDecision::Escalate {
-                reason: EscalateReason::Indeterminate,
-            },
-            ErrorClass::Transient => {
+            ErrorClass::Transient | ErrorClass::Indeterminate => {
                 if (prior_attempts as usize) < self.backoff.len() {
                     RecoveryDecision::Resume {
                         attempt: prior_attempts + 1,
@@ -429,6 +471,32 @@ mod tests {
             "Request timed out after 600s",
             "connection reset by peer (ECONNRESET)",
             "write EPIPE: broken pipe",
+        ] {
+            assert_eq!(
+                classify_claude_error(s),
+                ErrorClass::Transient,
+                "expected transient for: {s}",
+            );
+        }
+    }
+
+    /// Regression for the 2026-07-08 sleep/wake incident: the exact error
+    /// text logged by `bossctl dispatch diagnose`
+    /// (`transient_recovery_exhausted`, `class: indeterminate`,
+    /// `prior_attempts: 0`) must classify as transient, plus the closely
+    /// related connection-drop/DNS-failure shapes a network blip can
+    /// surface as.
+    #[test]
+    fn connection_refused_and_network_errors_are_transient() {
+        for s in [
+            "API Error: Unable to connect to API (ConnectionRefused)",
+            "connect ECONNREFUSED 127.0.0.1:443",
+            "Error: connect ECONNREFUSED",
+            "getaddrinfo ENOTFOUND api.anthropic.com",
+            "Error: network is unreachable",
+            "connect ENETUNREACH",
+            "No route to host",
+            "Temporary failure in name resolution",
         ] {
             assert_eq!(
                 classify_claude_error(s),
@@ -654,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn permanent_and_indeterminate_always_escalate() {
+    fn permanent_always_escalates_with_zero_attempts() {
         let policy = RecoveryPolicy::default();
         assert_eq!(
             policy.decide(ErrorClass::Permanent, 0),
@@ -662,10 +730,36 @@ mod tests {
                 reason: EscalateReason::Permanent
             },
         );
+    }
+
+    /// Regression for the 2026-07-08 sleep/wake incident: an unrecognised
+    /// error (e.g. a `ConnectionRefused` message shape the classifier
+    /// hasn't been taught yet) must NOT escalate at `prior_attempts == 0`
+    /// the way a confirmed-permanent error does. It gets the same bounded
+    /// retry budget as `Transient` and only escalates once that is
+    /// genuinely exhausted — this is what lets a transient-but-unrecognised
+    /// network blip self-heal instead of stranding the work item pending
+    /// human attention after zero actual retries.
+    #[test]
+    fn indeterminate_resumes_until_cap_then_escalates() {
+        let policy = RecoveryPolicy::default();
+
+        match policy.decide(ErrorClass::Indeterminate, 0) {
+            RecoveryDecision::Resume { attempt, backoff } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(backoff, Duration::from_secs(30));
+            }
+            other => panic!("expected resume, got {other:?}"),
+        }
+        match policy.decide(ErrorClass::Indeterminate, 2) {
+            RecoveryDecision::Resume { attempt, .. } => assert_eq!(attempt, 3),
+            other => panic!("expected resume, got {other:?}"),
+        }
+        // Cap reached → escalate as retries-exhausted, not immediately.
         assert_eq!(
-            policy.decide(ErrorClass::Indeterminate, 0),
+            policy.decide(ErrorClass::Indeterminate, 3),
             RecoveryDecision::Escalate {
-                reason: EscalateReason::Indeterminate
+                reason: EscalateReason::RetriesExhausted
             },
         );
     }

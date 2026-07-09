@@ -495,11 +495,15 @@ pub async fn run_one_pass(
                 outcome.resumed += 1;
             }
             RecoveryDecision::Escalate { reason } => {
-                let (kind, class_label) = match reason {
-                    EscalateReason::Permanent => (ATTENTION_KIND_RECOVERY_PERMANENT, "permanent"),
-                    EscalateReason::Indeterminate => (ATTENTION_KIND_RECOVERY_PERMANENT, "indeterminate"),
-                    EscalateReason::RetriesExhausted => (ATTENTION_KIND_RECOVERY_EXHAUSTED, "transient"),
+                let kind = match reason {
+                    EscalateReason::Permanent => ATTENTION_KIND_RECOVERY_PERMANENT,
+                    EscalateReason::RetriesExhausted => ATTENTION_KIND_RECOVERY_EXHAUSTED,
                 };
+                // The true classified error class, independent of *why* the
+                // policy stopped retrying: `RetriesExhausted` covers both a
+                // confirmed-transient error that never cleared and an
+                // indeterminate one that got the same bounded chances.
+                let class_label = class.as_str();
                 // Settle the execution so it isn't re-inspected; ignore a
                 // race where another reconciler already marked it terminal.
                 if let Err(err) = work_db.mark_execution_orphaned(
@@ -772,6 +776,8 @@ mod tests {
 
     const SOCKET_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: The socket connection was closed unexpectedly."}]}}"#;
     const AUTH_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: 401 authentication_error: invalid x-api-key"}]}}"#;
+    const CONNECTION_REFUSED_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: Unable to connect to API (ConnectionRefused)"}]}}"#;
+    const UNRECOGNIZED_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: something we have never seen before"}]}}"#;
     const NORMAL_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on the task"}]}}"#;
 
     fn now() -> i64 {
@@ -1027,6 +1033,137 @@ mod tests {
         assert_eq!(outcome.resumed, 0);
         let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert_eq!(attn[0].kind, ATTENTION_KIND_RECOVERY_EXHAUSTED);
+    }
+
+    /// Regression for the 2026-07-08 sleep/wake incident: a
+    /// `ConnectionRefused` error at `prior_attempts == 0` must auto-resume
+    /// (first via the cheap nudge path since the worker is idle), not
+    /// escalate immediately with zero retries attempted.
+    #[tokio::test]
+    async fn connection_refused_resumes_instead_of_escalating_at_zero_attempts() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, CONNECTION_REFUSED_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let nudger = RecordingNudger::new();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut nudged = HashSet::new();
+        let cx = RecoveryContext {
+            work_db: db.as_ref(),
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &RecoveryPolicy::default(),
+            nudger: &nudger,
+        };
+        let outcome = run_one_pass(&cx, &mut nudged, now()).await;
+
+        assert_eq!(
+            outcome.nudged, 1,
+            "ConnectionRefused must classify as transient and take the resume path, not escalate"
+        );
+        assert_eq!(outcome.escalated, 0);
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
+        assert!(
+            db.list_attention_items_for_work_item(&work_item_id).unwrap().is_empty(),
+            "no attention item must be raised for a first-sighting connection-refused error"
+        );
+    }
+
+    /// An error the classifier has never seen before (`Indeterminate`) must
+    /// get the same bounded retry budget as a confirmed-transient error —
+    /// it must NOT escalate at `prior_attempts == 0` the way a confirmed
+    /// `Permanent` error does.
+    #[tokio::test]
+    async fn unrecognized_error_resumes_before_escalating() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, UNRECOGNIZED_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let cx = RecoveryContext {
+            work_db: db.as_ref(),
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &RecoveryPolicy::default(),
+            nudger: &NoopWorkerNudger,
+        };
+        let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
+
+        assert_eq!(
+            outcome.resumed, 1,
+            "an unrecognized error must resume (orphan+respawn, nudger unavailable), not escalate at zero attempts"
+        );
+        assert_eq!(outcome.escalated, 0);
+        assert!(db.list_attention_items_for_work_item(&work_item_id).unwrap().is_empty());
+    }
+
+    /// Once an unrecognized error's retry budget is genuinely exhausted, it
+    /// must still escalate (no infinite loop) — but reported with its true
+    /// class (`indeterminate`), distinguishable from a confirmed-transient
+    /// exhaustion in the dispatch event / attention item.
+    #[tokio::test]
+    async fn unrecognized_error_at_cap_escalates_with_indeterminate_class() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[UNRECOGNIZED_ERROR_LINE]);
+        let db = Arc::new(db);
+        // Already at the cap (3 prior transient resumes).
+        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 3);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let cx = RecoveryContext {
+            work_db: db.as_ref(),
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &RecoveryPolicy::default(),
+            nudger: &NoopWorkerNudger,
+        };
+        let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
+
+        assert_eq!(outcome.escalated, 1, "at cap, must escalate not resume");
+        assert_eq!(outcome.resumed, 0);
+        // Same attention kind as a confirmed-transient exhaustion (both are
+        // "we tried, it kept failing") — orphan_sweep already excludes this
+        // kind pending human resolution, same as before.
+        let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert_eq!(attn[0].kind, ATTENTION_KIND_RECOVERY_EXHAUSTED);
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "transient_recovery_exhausted");
+        assert_eq!(events[0].details["reason"], "retries_exhausted");
+        assert_eq!(
+            events[0].details["class"], "indeterminate",
+            "the true classified error class must be reported, not conflated with the escalate reason"
+        );
     }
 
     #[tokio::test]
