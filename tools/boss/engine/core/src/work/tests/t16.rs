@@ -742,3 +742,390 @@ fn clear_for_attempt_is_noop_on_pr_url_mismatch() {
     assert_eq!(reason.as_deref(), Some("merge_conflict"));
     assert!(merge_conflict_signal_cleared_at(&db, &chore_id).is_none());
 }
+
+// ── CI-budget + blocked-signal helpers ──────────────────────────────────
+//
+// Coverage for the budget/signal cluster in `work/blocking.rs` that the
+// merge poller and the `boss engine ci` verbs drive but that no test
+// exercised directly: `effective_ci_budget`, `ci_budget_snapshot`,
+// `active_blocked_signals`, and the two `rearm_blocked_*_signal` helpers.
+// Each plants DB rows in a specific shape and asserts the return value and
+// the resulting `task_blocked_signals` / `tasks` state — observable
+// behaviour, never SQL internals.
+
+/// Plant `products.ci_attempt_budget` directly so a test can control the
+/// product-level default, including out-of-range values the public setter
+/// would clamp. `None` leaves the column NULL (the COALESCE default of 3).
+fn set_product_ci_budget(db: &WorkDb, product_id: &str, budget: Option<i64>) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE products SET ci_attempt_budget = ?2 WHERE id = ?1",
+        params![product_id, budget],
+    )
+    .unwrap();
+}
+
+/// Plant `tasks.ci_attempt_budget` (the per-PR override) directly, bypassing
+/// `set_ci_attempt_budget`'s server-side clamp so the read-path clamp in
+/// `effective_ci_budget` / `ci_budget_snapshot` can be exercised with values
+/// outside `0..=10`.
+fn set_task_ci_budget_raw(db: &WorkDb, task_id: &str, budget: Option<i64>) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET ci_attempt_budget = ?2 WHERE id = ?1",
+        params![task_id, budget],
+    )
+    .unwrap();
+}
+
+/// Plant `tasks.ci_attempts_used` directly so a test can assert the snapshot
+/// echoes the counter.
+fn set_task_ci_used(db: &WorkDb, task_id: &str, used: i64) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET ci_attempts_used = ?2 WHERE id = ?1",
+        params![task_id, used],
+    )
+    .unwrap();
+}
+
+/// Insert a `task_blocked_signals` row with a caller-chosen `created_at` and
+/// `cleared_at` so ordering and the `cleared_at IS NULL` filter in
+/// `active_blocked_signals` can be pinned deterministically. `(work_item_id,
+/// reason)` is unique, so each call site varies the reason per work item.
+fn insert_signal(db: &WorkDb, work_item_id: &str, reason: &str, created_at: &str, cleared_at: Option<&str>) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO task_blocked_signals (work_item_id, reason, attempt_id, created_at, cleared_at)
+         VALUES (?1, ?2, NULL, ?3, ?4)",
+        params![work_item_id, reason, created_at, cleared_at],
+    )
+    .unwrap();
+}
+
+/// `cleared_at` for the single signal of `reason` on a work item; `None`
+/// means the row is still armed (active).
+fn signal_cleared_at(db: &WorkDb, work_item_id: &str, reason: &str) -> Option<String> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT cleared_at FROM task_blocked_signals
+              WHERE work_item_id = ?1 AND reason = ?2",
+            params![work_item_id, reason],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// `effective_ci_budget` prefers the per-PR override over the product default.
+#[test]
+fn effective_ci_budget_prefers_per_pr_override() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "budget-override");
+    set_product_ci_budget(&db, &product_id, Some(5));
+    let chore = create_test_chore(&db, product_id.clone(), "override").id;
+    set_task_ci_budget_raw(&db, &chore, Some(7));
+    assert_eq!(
+        db.effective_ci_budget(&chore).unwrap(),
+        7,
+        "the per-PR override wins over the product default",
+    );
+}
+
+/// With no per-PR override the product default applies.
+#[test]
+fn effective_ci_budget_falls_back_to_product_default() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "budget-product");
+    set_product_ci_budget(&db, &product_id, Some(6));
+    let chore = create_test_chore(&db, product_id.clone(), "no-override").id;
+    assert_eq!(db.effective_ci_budget(&chore).unwrap(), 6);
+}
+
+/// Neither row carries a value → the documented COALESCE default of 3.
+#[test]
+fn effective_ci_budget_defaults_to_three_when_neither_set() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "budget-default");
+    // `make_revision_product` leaves `products.ci_attempt_budget` NULL, and
+    // a fresh chore carries no per-PR override.
+    let chore = create_test_chore(&db, product_id.clone(), "default").id;
+    assert_eq!(
+        db.effective_ci_budget(&chore).unwrap(),
+        3,
+        "COALESCE fallback of 3 when neither row carries a value",
+    );
+}
+
+/// The effective budget is clamped to `[0, 10]` on both the per-PR override
+/// and the product-default fallback paths.
+#[test]
+fn effective_ci_budget_clamps_to_zero_and_ten() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "budget-clamp");
+
+    // A per-PR override above the hard cap clamps to 10.
+    let high = create_test_chore(&db, product_id.clone(), "high").id;
+    set_task_ci_budget_raw(&db, &high, Some(50));
+    assert_eq!(
+        db.effective_ci_budget(&high).unwrap(),
+        10,
+        "override above 10 clamps to the hard cap",
+    );
+
+    // A negative override clamps to 0.
+    let low = create_test_chore(&db, product_id.clone(), "low").id;
+    set_task_ci_budget_raw(&db, &low, Some(-5));
+    assert_eq!(
+        db.effective_ci_budget(&low).unwrap(),
+        0,
+        "negative override clamps to 0"
+    );
+
+    // A misconfigured *product* default is clamped on the fallback path too.
+    set_product_ci_budget(&db, &product_id, Some(99));
+    let via_product = create_test_chore(&db, product_id.clone(), "via-product").id;
+    assert_eq!(
+        db.effective_ci_budget(&via_product).unwrap(),
+        10,
+        "product default above 10 clamps on the fallback path",
+    );
+}
+
+/// An unknown task falls through to the documented default of 3.
+#[test]
+fn effective_ci_budget_returns_three_for_unknown_task() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    assert_eq!(
+        db.effective_ci_budget("chr_does_not_exist").unwrap(),
+        3,
+        "a missing task yields the documented default of 3",
+    );
+}
+
+/// `active_blocked_signals` returns only `cleared_at IS NULL` rows for the
+/// given work item, ordered `created_at ASC` then `reason ASC`. Cleared rows
+/// and rows belonging to other work items are excluded.
+#[test]
+fn active_blocked_signals_filters_cleared_and_orders() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "active-signals");
+    let chore = create_test_chore(&db, product_id.clone(), "signals").id;
+    let other = create_test_chore(&db, product_id.clone(), "other").id;
+
+    // Two active rows planted out of created_at order; a same-created_at row
+    // to exercise the reason ASC tiebreak; a cleared row (excluded); and an
+    // active row on a different work item (excluded).
+    insert_signal(&db, &chore, "ci_failure", "300", None);
+    insert_signal(&db, &chore, "merge_conflict", "100", None);
+    insert_signal(&db, &chore, "dependency", "100", None); // same created_at → reason ASC first
+    insert_signal(&db, &chore, "review_feedback", "200", Some("250")); // cleared → excluded
+    insert_signal(&db, &other, "ci_failure", "050", None); // other work item → excluded
+
+    let got: Vec<(String, Option<String>)> = db
+        .active_blocked_signals(&chore)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.reason, s.cleared_at))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("dependency".to_owned(), None),
+            ("merge_conflict".to_owned(), None),
+            ("ci_failure".to_owned(), None),
+        ],
+        "only active rows for this work item, ordered created_at ASC then reason ASC",
+    );
+}
+
+/// `ci_budget_snapshot` reports every field and clamps only `effective`; the
+/// raw per-PR override is echoed unclamped.
+#[test]
+fn ci_budget_snapshot_reports_all_fields_and_clamps_effective() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "snapshot-fields");
+    set_product_ci_budget(&db, &product_id, Some(4));
+    let chore = create_test_chore(&db, product_id.clone(), "snap").id;
+    set_task_ci_budget_raw(&db, &chore, Some(50));
+    set_task_ci_used(&db, &chore, 2);
+    set_blocking_state(&db, &chore, "blocked", Some("ci_failure"), Some(&pr(1)), "100");
+
+    let snap = db
+        .ci_budget_snapshot(&chore)
+        .unwrap()
+        .expect("snapshot for a live task");
+    assert_eq!(snap.work_item_id, chore);
+    assert_eq!(
+        snap.per_pr_override,
+        Some(50),
+        "the raw stored override is echoed unclamped"
+    );
+    assert_eq!(snap.product_default, 4);
+    assert_eq!(snap.effective, 10, "effective clamps the override to the hard cap");
+    assert_eq!(snap.used, 2);
+    assert_eq!(snap.blocked_reason.as_deref(), Some("ci_failure"));
+}
+
+/// The snapshot's `blocked_reason` is populated only when the task's status
+/// is actually `blocked`; a stale reason on a non-blocked row is suppressed.
+#[test]
+fn ci_budget_snapshot_blocked_reason_only_when_blocked() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "snapshot-reason");
+    let chore = create_test_chore(&db, product_id.clone(), "reason").id;
+
+    // A stale blocked_reason on an in_review row must not leak into the snapshot.
+    set_blocking_state(&db, &chore, "in_review", Some("ci_failure"), Some(&pr(1)), "100");
+    let snap = db.ci_budget_snapshot(&chore).unwrap().expect("snapshot exists");
+    assert_eq!(
+        snap.blocked_reason, None,
+        "blocked_reason is suppressed unless status is blocked",
+    );
+    // No override, product default NULL → 3; used defaults to 0.
+    assert_eq!(snap.per_pr_override, None);
+    assert_eq!(snap.product_default, 3);
+    assert_eq!(snap.effective, 3);
+    assert_eq!(snap.used, 0);
+
+    // Once genuinely blocked, the reason surfaces.
+    set_blocking_state(&db, &chore, "blocked", Some("merge_conflict"), Some(&pr(1)), "100");
+    let snap = db.ci_budget_snapshot(&chore).unwrap().unwrap();
+    assert_eq!(snap.blocked_reason.as_deref(), Some("merge_conflict"));
+}
+
+/// The snapshot is `None` for an unknown id and for a soft-deleted task.
+#[test]
+fn ci_budget_snapshot_none_for_missing_and_deleted() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "snapshot-missing");
+    assert!(db.ci_budget_snapshot("chr_does_not_exist").unwrap().is_none());
+
+    let chore = create_test_chore(&db, product_id.clone(), "deleted").id;
+    soft_delete(&db, &chore);
+    assert!(
+        db.ci_budget_snapshot(&chore).unwrap().is_none(),
+        "a soft-deleted task yields no snapshot",
+    );
+}
+
+/// `rearm_blocked_merge_conflict_signal` returns true and arms a fresh
+/// `merge_conflict` signal when the parent is `blocked: merge_conflict`.
+#[test]
+fn rearm_blocked_merge_conflict_signal_true_and_arms() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "rearm-mc");
+    let chore = create_test_chore(&db, product_id.clone(), "mc").id;
+    // Blocked on merge_conflict with NO signal row (the stale-clear shape).
+    set_blocking_state(&db, &chore, "blocked", Some("merge_conflict"), Some(&pr(1)), "100");
+    assert!(active_signal_reasons(&db, &chore).is_empty(), "no signal before re-arm");
+
+    assert!(
+        db.rearm_blocked_merge_conflict_signal(&chore).unwrap(),
+        "task is blocked: merge_conflict → true",
+    );
+    assert_eq!(
+        active_signal_reasons(&db, &chore),
+        vec!["merge_conflict"],
+        "the signal is armed active",
+    );
+}
+
+/// A previously-cleared signal row is re-armed (its `cleared_at` reset to
+/// NULL) rather than duplicated — the T230 premature-clear recovery.
+#[test]
+fn rearm_blocked_merge_conflict_signal_rearms_a_cleared_row() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "rearm-mc-cleared");
+    let chore = create_test_chore(&db, product_id.clone(), "mc").id;
+    set_blocking_state(&db, &chore, "blocked", Some("merge_conflict"), Some(&pr(1)), "100");
+    insert_signal(&db, &chore, "merge_conflict", "100", Some("150"));
+    assert!(
+        signal_cleared_at(&db, &chore, "merge_conflict").is_some(),
+        "the row starts cleared",
+    );
+
+    assert!(db.rearm_blocked_merge_conflict_signal(&chore).unwrap());
+    assert_eq!(
+        signal_cleared_at(&db, &chore, "merge_conflict"),
+        None,
+        "the cleared row is re-armed to active",
+    );
+}
+
+/// The merge-conflict re-arm returns false and arms nothing when the parent
+/// is not blocked, or is blocked on a different reason.
+#[test]
+fn rearm_blocked_merge_conflict_signal_false_on_wrong_state() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "rearm-mc-false");
+
+    // Not blocked (in_review) → false.
+    let not_blocked = create_test_chore(&db, product_id.clone(), "in-review").id;
+    set_blocking_state(&db, &not_blocked, "in_review", None, Some(&pr(1)), "100");
+    assert!(!db.rearm_blocked_merge_conflict_signal(&not_blocked).unwrap());
+    assert!(active_signal_reasons(&db, &not_blocked).is_empty());
+
+    // Blocked on ci_failure (wrong reason) → false.
+    let wrong_reason = create_test_chore(&db, product_id.clone(), "ci").id;
+    set_blocking_state(&db, &wrong_reason, "blocked", Some("ci_failure"), Some(&pr(2)), "100");
+    assert!(!db.rearm_blocked_merge_conflict_signal(&wrong_reason).unwrap());
+    assert!(active_signal_reasons(&db, &wrong_reason).is_empty());
+}
+
+/// `rearm_blocked_ci_failure_signal` returns true for both `ci_failure` and
+/// `ci_failure_exhausted` parents, arming a signal whose reason mirrors the
+/// parent's exact CI blocked reason.
+#[test]
+fn rearm_blocked_ci_failure_signal_true_for_failure_and_exhausted() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "rearm-ci");
+
+    let failing = create_test_chore(&db, product_id.clone(), "failing").id;
+    set_blocking_state(&db, &failing, "blocked", Some("ci_failure"), Some(&pr(1)), "100");
+    assert!(db.rearm_blocked_ci_failure_signal(&failing).unwrap());
+    assert_eq!(active_signal_reasons(&db, &failing), vec!["ci_failure"]);
+
+    let exhausted = create_test_chore(&db, product_id.clone(), "exhausted").id;
+    set_blocking_state(
+        &db,
+        &exhausted,
+        "blocked",
+        Some("ci_failure_exhausted"),
+        Some(&pr(2)),
+        "100",
+    );
+    assert!(db.rearm_blocked_ci_failure_signal(&exhausted).unwrap());
+    assert_eq!(
+        active_signal_reasons(&db, &exhausted),
+        vec!["ci_failure_exhausted"],
+        "the armed signal mirrors the parent's exact CI reason",
+    );
+}
+
+/// The CI re-arm returns false and arms nothing when the parent is not
+/// blocked, or is blocked on a non-CI reason.
+#[test]
+fn rearm_blocked_ci_failure_signal_false_on_wrong_state() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "rearm-ci-false");
+
+    // Not blocked (in_review) → false.
+    let not_blocked = create_test_chore(&db, product_id.clone(), "in-review").id;
+    set_blocking_state(&db, &not_blocked, "in_review", None, Some(&pr(1)), "100");
+    assert!(!db.rearm_blocked_ci_failure_signal(&not_blocked).unwrap());
+    assert!(active_signal_reasons(&db, &not_blocked).is_empty());
+
+    // Blocked on merge_conflict (a non-CI reason) → false.
+    let wrong_reason = create_test_chore(&db, product_id.clone(), "merge-conflict").id;
+    set_blocking_state(
+        &db,
+        &wrong_reason,
+        "blocked",
+        Some("merge_conflict"),
+        Some(&pr(2)),
+        "100",
+    );
+    assert!(!db.rearm_blocked_ci_failure_signal(&wrong_reason).unwrap());
+    assert!(active_signal_reasons(&db, &wrong_reason).is_empty());
+}
