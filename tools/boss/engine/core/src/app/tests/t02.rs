@@ -1260,6 +1260,90 @@ fn resolve_status_actor_returns_human_when_peer_pid_is_none() {
     );
 }
 
+// --- constant_time_eq regression suite ---
+//
+// Pins the equality contract of the constant-time comparator used
+// to gate the shutdown-RPC / session token check
+// (`sessions.rs::495`). These tests cover behavior — the equality
+// contract — not the timing/xor internals: identical inputs match,
+// any single differing byte (front/middle/back) fails, a length
+// mismatch fails, and two empty slices match.
+
+#[test]
+fn constant_time_eq_true_for_identical_non_empty_slices() {
+    let a = b"correct-horse-battery-staple";
+    assert!(
+        constant_time_eq(a, a),
+        "identical non-empty byte slices must compare equal",
+    );
+    // Distinct allocations with the same contents must also match —
+    // guard against an accidental pointer-identity shortcut.
+    let b = a.to_vec();
+    assert!(
+        constant_time_eq(a, &b),
+        "equal-content byte slices from distinct allocations must compare equal",
+    );
+}
+
+#[test]
+fn constant_time_eq_false_for_first_byte_difference() {
+    let a = b"token-value-xyz";
+    let mut b = a.to_vec();
+    b[0] ^= 0x01;
+    assert!(
+        !constant_time_eq(a, &b),
+        "a difference in the first byte must compare unequal",
+    );
+}
+
+#[test]
+fn constant_time_eq_false_for_middle_byte_difference() {
+    let a = b"token-value-xyz";
+    let mut b = a.to_vec();
+    let mid = b.len() / 2;
+    b[mid] ^= 0x01;
+    assert!(
+        !constant_time_eq(a, &b),
+        "a difference in a middle byte must compare unequal",
+    );
+}
+
+#[test]
+fn constant_time_eq_false_for_last_byte_difference() {
+    let a = b"token-value-xyz";
+    let mut b = a.to_vec();
+    let last = b.len() - 1;
+    b[last] ^= 0x01;
+    assert!(
+        !constant_time_eq(a, &b),
+        "a difference in the last byte must compare unequal",
+    );
+}
+
+#[test]
+fn constant_time_eq_false_for_length_mismatch() {
+    assert!(
+        !constant_time_eq(b"short", b"longer-token"),
+        "slices of differing length must compare unequal",
+    );
+    // One empty, one non-empty is the boundary case of a length
+    // mismatch — the length guard must reject it, not treat the
+    // empty accumulator as a match.
+    assert!(
+        !constant_time_eq(b"", b"nonempty"),
+        "empty vs non-empty must compare unequal",
+    );
+    assert!(
+        !constant_time_eq(b"nonempty", b""),
+        "non-empty vs empty must compare unequal",
+    );
+}
+
+#[test]
+fn constant_time_eq_true_for_two_empty_slices() {
+    assert!(constant_time_eq(b"", b""), "two empty slices must compare equal",);
+}
+
 // ---- in_review_chore_execution ----
 
 fn make_work_db_with_chore() -> (Arc<WorkDb>, String, String) {
