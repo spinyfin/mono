@@ -146,6 +146,24 @@ const PRE_START_RETRY_DELAYS: [Duration; 3] =
 /// risk.
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// `work_attention_items.kind` filed when a `ready` execution has been
+/// repeatedly deferred behind the SAME `chain_serialized` live sibling for
+/// at least [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`] — the 2026-07-09 T251
+/// incident (`task_18c07e0a815e6bd0_1de`): the dispatcher re-evaluated and
+/// re-deferred every ~10s for ~20 minutes with zero durable, user-visible
+/// signal, so a human only noticed by grepping `engine-trace.jsonl`. Filed
+/// once per stall (idempotent via [`WorkDb::upsert_work_item_attention`])
+/// and resolved via [`WorkDb::resolve_external_tracker_attention`] the
+/// moment the row is no longer chain-serialized (dispatched, or the sibling
+/// was reconciled dead — see [`ExecutionCoordinator::live_chain_sibling`]).
+pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall";
+
+/// How long a `ready` execution may sit deferred behind the same live chain
+/// sibling before [`CHAIN_SERIALIZED_STALL_ATTENTION_KIND`] fires. Set
+/// comfortably below the ~20-minute silent stall observed in the T251
+/// incident so a human is alerted well before that point going forward.
+pub const CHAIN_SERIALIZED_STALL_THRESHOLD_SECS: i64 = 900;
+
 /// Owns the per-run cube lease heartbeat task. Dropping the guard
 /// aborts the heartbeat — used at the end of `run_execution` so the
 /// heartbeat cannot outlive its lease.
@@ -1632,6 +1650,125 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Resolve `WorkDb::live_execution_elsewhere_in_chain` the way every
+    /// caller actually needs it: as "is another execution on this PR/chain
+    /// genuinely still alive", not "does a row exist whose `status` column
+    /// says `running`/`waiting_human`".
+    ///
+    /// `status IN ('running', 'waiting_human')` is a *paper* liveness
+    /// signal — a row can sit `waiting_human` forever after its worker died
+    /// without a `Stop` hook (the 2026-06-14 incident this exact gap
+    /// re-created for chain-serialization: T251 / `exec_18af40745c552070_26`,
+    /// a 56-day-old `waiting_human` zombie with no live pane, wedged every
+    /// subsequent execution on its PR/chain behind `chain_serialized` in a
+    /// ~10s dispatcher loop until a human noticed and ran `bossctl agents
+    /// reap` by hand). `schedule_execution`'s double-spawn guard already
+    /// runs the sibling through the same-work-item zombie reconcilers before
+    /// treating it as blocking (see the "Liveness gate" comment there); this
+    /// applies the identical reconciliation to the *cross-work-item* chain
+    /// sibling this guard inspects, using the same two positive-evidence
+    /// checks: [`crate::lost_workspace_sweep::reconcile_if_workspace_lost`]
+    /// (cube workspace directory gone) and
+    /// [`crate::dead_pane_sweep::reconcile_if_pane_dead`] (durable shell pid
+    /// is `ESRCH`). Both only ever act on positive evidence of death, so
+    /// this can only ever *unblock* a wrongly-serialized dispatch — it can
+    /// never falsely treat a genuinely live sibling as dead.
+    ///
+    /// Reconciling one dead sibling can reveal a second, older live sibling
+    /// earlier in the chain (a further `waiting_human` execution masked
+    /// behind the one just reaped), so the check re-queries in a small
+    /// bounded loop rather than returning after a single reconciliation.
+    async fn live_chain_sibling(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
+        const MAX_RECONCILE_ATTEMPTS: u8 = 4;
+        for _ in 0..MAX_RECONCILE_ATTEMPTS {
+            let Some(sibling) = self.work_db.live_execution_elsewhere_in_chain(work_item_id)? else {
+                return Ok(None);
+            };
+            let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
+                self.work_db.as_ref(),
+                self.dispatch_events.as_ref(),
+                &sibling,
+            )
+            .await;
+            let reconciled_dead_pane = !reconciled_lost_workspace
+                && crate::dead_pane_sweep::reconcile_if_pane_dead(
+                    self.work_db.as_ref(),
+                    self.dispatch_events.as_ref(),
+                    &sibling,
+                    crate::run_reconcile::current_epoch_s(),
+                )
+                .await;
+            if !reconciled_lost_workspace && !reconciled_dead_pane {
+                return Ok(Some(sibling));
+            }
+            tracing::warn!(
+                work_item_id,
+                reconciled_execution_id = %sibling.id,
+                reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
+                 reconciled it and re-checking for a still-live sibling",
+            );
+        }
+        // Exhausted retries without converging on a stable answer (e.g. a
+        // pathological chain with many zombies reconciling one per pass).
+        // Fail closed: treat whatever is there now as live rather than risk
+        // co-dispatching two workers onto the same shared jj backing store.
+        self.work_db.live_execution_elsewhere_in_chain(work_item_id)
+    }
+
+    /// After `execution` has sat `ready` and chain-serialized for at least
+    /// [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`], file a durable
+    /// [`CHAIN_SERIALIZED_STALL_ATTENTION_KIND`] attention on its work item
+    /// so a human notices without grepping `engine-trace.jsonl` — the T251
+    /// incident sat in this exact state, re-deferred every ~10s, for ~20
+    /// silent minutes before a human found it by hand.
+    ///
+    /// Uses `execution.created_at` as the "stuck since" clock: a `ready`
+    /// row is re-evaluated every drain pass, so its age is a reasonable
+    /// proxy for how long it has been waiting (a row that spent time in
+    /// `waiting_dependency` before promotion only makes this an
+    /// under-estimate, never a false alarm). Idempotent — repeated calls
+    /// while the stall persists are a no-op after the first.
+    fn surface_chain_serialized_stall_if_overdue(&self, execution: &WorkExecution, sibling: &WorkExecution) {
+        let Some(created_at) = execution.created_at.parse::<i64>().ok() else {
+            return;
+        };
+        let elapsed = crate::run_reconcile::current_epoch_s() - created_at;
+        if elapsed < CHAIN_SERIALIZED_STALL_THRESHOLD_SECS {
+            return;
+        }
+        let title = "Execution stuck behind a chain-serialized sibling".to_owned();
+        let body = format!(
+            "Execution `{}` (work item `{}`) has been deferred for ~{} minutes with \
+             `reason=chain_serialized`, waiting behind live sibling execution `{}` \
+             (work item `{}`).\n\n\
+             If that sibling is actually still working, this will clear on its own once \
+             it finishes. If it is actually a dead worker (its pane exited without a `Stop` \
+             hook), the engine's periodic zombie sweeps (`lost_workspace_sweep` / \
+             `dead_pane_sweep`) reconcile it automatically on their next pass; if it \
+             persists, `bossctl agents reap {}` clears it by hand.",
+            execution.id,
+            execution.work_item_id,
+            elapsed / 60,
+            sibling.id,
+            sibling.work_item_id,
+            sibling.id,
+        );
+        if let Err(err) = self.work_db.upsert_work_item_attention(
+            &execution.work_item_id,
+            CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+            &title,
+            &body,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "drain: failed to raise chain_serialized_stall attention",
+            );
+        }
+    }
+
     /// Drain every currently-`ready` execution. Returns the reason the
     /// drain stopped so the caller can decide whether to re-enter
     /// immediately (queue empty + pending wakeup) or yield (pool
@@ -1767,9 +1904,11 @@ impl ExecutionCoordinator {
             // row stays `ready` and re-attempts on the next kick (which fires
             // when the live sibling reaps), so it runs strictly after it.
             // `schedule_execution` re-checks this as the chokepoint backstop
-            // for the `force_dispatch` path. See
-            // `WorkDb::live_execution_elsewhere_in_chain`.
-            match self.work_db.live_execution_elsewhere_in_chain(&execution.work_item_id) {
+            // for the `force_dispatch` path. Goes through `live_chain_sibling`
+            // (not the raw `WorkDb` query) so a `waiting_human` sibling whose
+            // worker pane is actually dead doesn't wedge this row forever —
+            // see that method's docs for the T251 incident this closes.
+            match self.live_chain_sibling(&execution.work_item_id).await {
                 Ok(Some(sibling)) => {
                     tracing::info!(
                         execution_id = %execution.id,
@@ -1793,11 +1932,27 @@ impl ExecutionCoordinator {
                     if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, "chain_serialized") {
                         tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
                     }
+                    self.surface_chain_serialized_stall_if_overdue(&execution, &sibling);
                     // Leave the row `ready`; do NOT mark any pool exhausted —
                     // other executions in this pass may still dispatch.
                     continue;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // No longer (or never) chain-serialized — clear any stall
+                    // attention a prior pass raised for this work item so it
+                    // doesn't linger `open` once dispatch actually proceeds.
+                    if let Err(err) = self.work_db.resolve_external_tracker_attention(
+                        &execution.work_item_id,
+                        CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "drain: failed to resolve chain_serialized_stall attention on unblock",
+                        );
+                    }
+                }
                 Err(err) => {
                     // Fail open: a DB error must not wedge the queue. The
                     // `schedule_execution` backstop still guards the spawn.
@@ -2263,7 +2418,11 @@ impl ExecutionCoordinator {
         // abandon: the execution stays `ready` and is re-attempted on the
         // next scheduler kick (which fires when the live sibling reaps), so
         // it runs strictly after the live one finishes.
-        match self.work_db.live_execution_elsewhere_in_chain(&execution.work_item_id) {
+        //
+        // Goes through `live_chain_sibling` (not the raw `WorkDb` query) so
+        // this backstop shares the pre-claim guard's zombie reconciliation —
+        // see that method's docs.
+        match self.live_chain_sibling(&execution.work_item_id).await {
             Ok(Some(sibling)) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -2826,7 +2985,11 @@ impl ExecutionCoordinator {
         // same-PR workers in DIFFERENT cube workspaces still share one
         // backing store and corrupt each other, which this catches. On a
         // violation we release the lease and refuse rather than interleave.
-        match self.work_db.live_execution_elsewhere_in_chain(&execution.work_item_id) {
+        //
+        // Goes through `live_chain_sibling` for the same reason as the other
+        // two call sites: a `waiting_human` "sibling" that is actually a
+        // dead worker must not refuse this spawn forever.
+        match self.live_chain_sibling(&execution.work_item_id).await {
             Ok(Some(sibling)) => {
                 tracing::error!(
                     execution_id = %execution.id,
@@ -4726,11 +4889,12 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
-        AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter,
-        HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-        REVIEW_WORKER_ID_PREFIX, WorkerPool, occupying_live_worker, pick_worst_failing_check,
-        pool_model_override_for_worker_id, slot_id_from_worker_id, worker_id_for_slot,
+        AUTOMATION_WORKER_ID_PREFIX, CHAIN_SERIALIZED_STALL_ATTENTION_KIND, CHAIN_SERIALIZED_STALL_THRESHOLD_SECS,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter, HostAdapterProvider,
+        MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool,
+        occupying_live_worker, pick_worst_failing_check, pool_model_override_for_worker_id, slot_id_from_worker_id,
+        worker_id_for_slot,
     };
     use boss_protocol::ExecutionStatus;
 
@@ -10625,6 +10789,223 @@ mod tests {
         assert!(
             cube.lease_calls.lock().await.is_empty(),
             "no cube workspace may be leased while serialized behind a live chain sibling",
+        );
+    }
+
+    /// T251 incident (2026-07-09, `exec_18af40745c552070_26`): the chain
+    /// single-writer guard must not treat a `waiting_human` chain sibling as
+    /// live forever when its worker pane is actually dead (workspace
+    /// directory gone, no `Stop` hook). The auto-dispatcher's pre-claim
+    /// `chain_serialized` check — the path that actually looped every ~10s
+    /// in the incident — must reconcile the zombie via the same
+    /// `lost_workspace_sweep` logic the double-spawn guard already uses, and
+    /// let the ready revision dispatch instead of deferring indefinitely.
+    #[tokio::test]
+    async fn chain_serialized_pre_claim_reconciles_lost_workspace_zombie_and_dispatches() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1852";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            // Revision hanging off the chain root (same PR, different work item).
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_t251', product_id, 'revision', 'Resolve merge conflict against main', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // The chain root's execution: a `waiting_human` zombie whose recorded
+        // workspace directory no longer exists — exactly the 56-day-old
+        // `exec_18af40745c552070_26` from the incident (a dead pane, no `Stop`
+        // hook, no live pane per `bossctl agents status`).
+        let root_exec = create_ready_chore_execution(&db, root_id.clone());
+        db.start_execution_run(
+            &root_exec.id,
+            "worker-1",
+            "repo-1",
+            "lease-1",
+            "mono-agent-t251",
+            "/nonexistent/old-root/mono-agent-t251",
+        )
+        .unwrap();
+        let root_run = db
+            .active_run_ids_for_execution(&root_exec.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("root has a run");
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&root_exec.id)
+                .run_id(&root_run)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+
+        // Ready conflict-resolution revision execution targeting the same PR —
+        // this is the row that looped `chain_serialized` every ~10s in the
+        // incident.
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_t251")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        // Drive the real auto-dispatch path (not `force_dispatch`), since the
+        // incident's silent 10s loop was the pre-claim guard in
+        // `drain_ready_queue`, not the `schedule_execution` backstop.
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &revision_exec.id, ExecutionStatus::Running).await;
+
+        // The zombie chain root was reconciled to a terminal status, not left
+        // wedging every future dispatch behind it.
+        let root_after = db.get_execution(&root_exec.id).unwrap();
+        assert_eq!(
+            root_after.status,
+            ExecutionStatus::Orphaned,
+            "the lost-workspace zombie chain sibling must be finalized; got {:?}",
+            root_after.status,
+        );
+
+        // No lingering `chain_serialized` deferrals once the zombie clears.
+        let revision_events = recording.events_for(&revision_exec.id).await;
+        assert!(
+            !revision_events
+                .iter()
+                .any(
+                    |e| e.details.get("reason").and_then(|v| v.as_str()) == Some("chain_serialized")
+                        && e.stage == "worker_claimed"
+                ),
+            "the revision must not be permanently deferred behind a dead sibling; got {revision_events:#?}",
+        );
+    }
+
+    /// Part (c) of the T251 fix: once a `ready` execution has sat
+    /// chain-serialized behind a genuinely live sibling for longer than
+    /// [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`], a durable, user-visible
+    /// `chain_serialized_stall` attention must be raised on its work item —
+    /// the incident sat in this exact state for ~20 minutes with the only
+    /// signal being a `engine-trace.jsonl` line repeating every ~10s.
+    #[tokio::test]
+    async fn chain_serialized_stall_raises_durable_attention_after_threshold() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1853";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_stall', product_id, 'revision', 'Resolve merge conflict', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Genuinely live root execution: no run attached, so the zombie
+        // reconcilers have zero evidence either way and correctly leave it
+        // alone (this must stay `chain_serialized`, not get reconciled away).
+        let _root_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_stall")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        // Backdate `created_at` well past the stall threshold — simulates the
+        // T251 incident's ~20 minutes of silent re-defers without a real sleep.
+        {
+            let conn = db.connect().unwrap();
+            let stale_created_at =
+                (crate::run_reconcile::current_epoch_s() - CHAIN_SERIALIZED_STALL_THRESHOLD_SECS - 60).to_string();
+            conn.execute(
+                "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+                rusqlite::params![revision_exec.id, stale_created_at],
+            )
+            .unwrap();
+        }
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        coordinator.kick();
+
+        let mut items = Vec::new();
+        for _ in 0..100 {
+            items = db.list_attention_items_for_work_item("task_rev_stall").unwrap();
+            if !items.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), 1, "expected exactly one attention item; got {items:#?}");
+        assert_eq!(items[0].kind, CHAIN_SERIALIZED_STALL_ATTENTION_KIND);
+        assert_eq!(items[0].status, "open");
+
+        // Still `ready` (deferred, not abandoned) — the root is genuinely alive.
+        let after = db.get_execution(&revision_exec.id).unwrap();
+        assert_eq!(
+            after.status,
+            ExecutionStatus::Ready,
+            "a stall attention must not itself change the execution's status; got {:?}",
+            after.status,
         );
     }
 
