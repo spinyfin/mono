@@ -155,7 +155,7 @@ const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// once per stall (idempotent via [`WorkDb::upsert_work_item_attention`])
 /// and resolved via [`WorkDb::resolve_external_tracker_attention`] the
 /// moment the row is no longer chain-serialized (dispatched, or the sibling
-/// was reconciled dead — see [`ExecutionCoordinator::live_chain_sibling`]).
+/// was reconciled dead — see [`ExecutionCoordinator::live_chain_siblings`]).
 pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall";
 
 /// How long a `ready` execution may sit deferred behind the same live chain
@@ -1697,42 +1697,57 @@ impl ExecutionCoordinator {
     /// earlier in the chain (a further `waiting_human` execution masked
     /// behind the one just reaped), so the check re-queries in a small
     /// bounded loop rather than returning after a single reconciliation.
-    async fn live_chain_sibling(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
+    /// Returns EVERY live chain sibling of `work_item_id`, reconciling
+    /// zombies along the way. `resolve_chain_hold`'s
+    /// review-bypass decision must be made against the full set: the
+    /// underlying `member_ids` walk is chain-root-first
+    /// ([`crate::work::dispatch::WorkDb::live_executions_elsewhere_in_chain`]),
+    /// so trusting only the first live sibling lets a root `pr_review` mask
+    /// a live descendant *writer* — reintroducing the exact two-writer
+    /// T1577/T1815 hazard this guard exists to prevent.
+    async fn live_chain_siblings(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         const MAX_RECONCILE_ATTEMPTS: u8 = 4;
         for _ in 0..MAX_RECONCILE_ATTEMPTS {
-            let Some(sibling) = self.work_db.live_execution_elsewhere_in_chain(work_item_id)? else {
-                return Ok(None);
-            };
-            let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
-                self.work_db.as_ref(),
-                self.dispatch_events.as_ref(),
-                &sibling,
-            )
-            .await;
-            let reconciled_dead_pane = !reconciled_lost_workspace
-                && crate::dead_pane_sweep::reconcile_if_pane_dead(
+            let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
+            if siblings.is_empty() {
+                return Ok(siblings);
+            }
+            let mut any_reconciled = false;
+            for sibling in &siblings {
+                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
-                    &sibling,
-                    crate::run_reconcile::current_epoch_s(),
+                    sibling,
                 )
                 .await;
-            if !reconciled_lost_workspace && !reconciled_dead_pane {
-                return Ok(Some(sibling));
+                let reconciled_dead_pane = !reconciled_lost_workspace
+                    && crate::dead_pane_sweep::reconcile_if_pane_dead(
+                        self.work_db.as_ref(),
+                        self.dispatch_events.as_ref(),
+                        sibling,
+                        crate::run_reconcile::current_epoch_s(),
+                    )
+                    .await;
+                if reconciled_lost_workspace || reconciled_dead_pane {
+                    any_reconciled = true;
+                    tracing::warn!(
+                        work_item_id,
+                        reconciled_execution_id = %sibling.id,
+                        reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                        "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
+                         reconciled it and re-checking for still-live siblings",
+                    );
+                }
             }
-            tracing::warn!(
-                work_item_id,
-                reconciled_execution_id = %sibling.id,
-                reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
-                "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
-                 reconciled it and re-checking for a still-live sibling",
-            );
+            if !any_reconciled {
+                return Ok(siblings);
+            }
         }
         // Exhausted retries without converging on a stable answer (e.g. a
         // pathological chain with many zombies reconciling one per pass).
         // Fail closed: treat whatever is there now as live rather than risk
         // co-dispatching two workers onto the same shared jj backing store.
-        self.work_db.live_execution_elsewhere_in_chain(work_item_id)
+        self.work_db.live_executions_elsewhere_in_chain(work_item_id)
     }
 
     /// Resolve the per-PR single-writer chain check for `execution`,
@@ -1757,6 +1772,16 @@ impl ExecutionCoordinator {
     /// review-findings, operator-filed) waiting behind a review — keeps
     /// serializing exactly as before; only this one combination bypasses.
     ///
+    /// The bypass decision is made against **every** live chain sibling, not
+    /// just the first one a naive single-sibling lookup would return. The chain
+    /// walk is root-first, so trusting a single sibling meant a live
+    /// `pr_review` on the chain root could mask a live *writer* further down
+    /// the chain (a descendant conflict-fix revision) — bypassing would then
+    /// co-dispatch a second writer alongside that still-live one, the exact
+    /// two-writer T1577/T1815 hazard this guard exists to prevent. So the
+    /// bypass only fires when EVERY live sibling is a review; if even one is
+    /// a non-review (writer), this fails closed to `Blocked`.
+    ///
     /// Shared by all three chain-guard call sites (`drain_ready_queue`'s
     /// pre-claim check, `schedule_execution`'s pre-lease backstop, and its
     /// post-lease TOCTOU assertion) so the bypass decision — and therefore
@@ -1765,20 +1790,31 @@ impl ExecutionCoordinator {
     /// the pipeline could re-defer what an earlier one just bypassed,
     /// wedging the row in a defer loop instead of actually dispatching it.
     async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
-        let Some(sibling) = self.live_chain_sibling(&execution.work_item_id).await? else {
+        let siblings = self.live_chain_siblings(&execution.work_item_id).await?;
+        let Some(first_sibling) = siblings.first().cloned() else {
             return Ok(ChainHold::Clear);
         };
-        let is_review_sibling = sibling.kind == ExecutionKind::PrReview;
+        let all_review_siblings = siblings.iter().all(|s| s.kind == ExecutionKind::PrReview);
         let is_conflict_revision = matches!(
             self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
             Ok(DispatchClass::MergeConflictRevision)
         );
-        if is_review_sibling && is_conflict_revision {
-            Ok(ChainHold::ReviewBypassed(sibling))
+        if all_review_siblings && is_conflict_revision {
+            Ok(ChainHold::ReviewBypassed(first_sibling))
         } else {
+            // Prefer surfacing a non-review (writer) sibling in the
+            // `Blocked` outcome when one is present, since that is the
+            // actually-blocking reason — a mix of a review and a writer
+            // sibling should report the writer, not the review, in trace
+            // output and wait-reason labeling.
+            let sibling = siblings
+                .iter()
+                .find(|s| s.kind != ExecutionKind::PrReview)
+                .cloned()
+                .unwrap_or(first_sibling);
             Ok(ChainHold::Blocked {
                 sibling,
-                review_held: is_review_sibling,
+                review_held: all_review_siblings,
             })
         }
     }
@@ -1974,7 +2010,7 @@ impl ExecutionCoordinator {
             // for the `force_dispatch` path. Goes through `resolve_chain_hold`
             // (not the raw `WorkDb` query) so a `waiting_human` sibling whose
             // worker pane is actually dead doesn't wedge this row forever —
-            // see `live_chain_sibling`'s docs for the T251 incident this
+            // see `live_chain_siblings`'s docs for the T251 incident this
             // closes — and so a merge-conflict-fix revision never waits
             // behind a read-only review (see `resolve_chain_hold`'s docs for
             // the T270/T258 priority-inversion incident this closes).
@@ -10679,6 +10715,119 @@ mod tests {
         assert!(
             !cube.lease_calls.lock().await.is_empty(),
             "a cube workspace must be leased — the review sibling must not block the lease",
+        );
+    }
+
+    /// The correctness gap this revision closes: a live `pr_review` on the
+    /// chain root must NOT mask a live *writer* on a chain descendant. Sets
+    /// up a root review PLUS a live descendant writer (another
+    /// merge-conflict-fix revision execution, already running) and confirms
+    /// a SECOND ready merge-conflict revision on the same chain is still
+    /// `Blocked` (no workspace leased) — not `ReviewBypassed`. Before the
+    /// `resolve_chain_hold`/`live_chain_siblings` fix, the root-first single-
+    /// sibling walk would have returned only the review, bypassed, and
+    /// co-dispatched a second writer alongside the still-live descendant
+    /// writer — the exact T1577/T1815 two-writer hazard this guard exists to
+    /// prevent.
+    #[tokio::test]
+    async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_descendant_writer() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
+                 SELECT 'task_rev_conflict_writer', product_id, 'revision', 'Resolve conflicts A', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_a'
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
+                 SELECT 'task_rev_conflict_second', product_id, 'revision', 'Resolve conflicts B', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_b'
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Live PR review on the chain root — read-only.
+        let _root_review_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        // Live WRITER on a chain descendant — the first conflict-fix
+        // revision, already dispatched and still running.
+        let _descendant_writer_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_conflict_writer".to_owned())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Running)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        // A second, ready merge-conflict revision on the same chain.
+        let revision_exec_b = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_conflict_second".to_owned())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&revision_exec_b.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&revision_exec_b, &worker_id).await;
+        assert!(
+            result.is_err(),
+            "a second conflict revision must NOT bypass when a live descendant writer is masked \
+             behind the root review: {result:?}",
+        );
+        let after_defer = db.get_execution(&revision_exec_b.id).unwrap();
+        assert_eq!(
+            after_defer.status,
+            ExecutionStatus::Ready,
+            "deferred revision must remain ready, got {:?}",
+            after_defer.status,
+        );
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased while a live writer sibling exists elsewhere in the chain, \
+             even if a review is also live",
         );
     }
 

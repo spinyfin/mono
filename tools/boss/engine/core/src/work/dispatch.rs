@@ -993,6 +993,28 @@ impl WorkDb {
     /// the chain collapses to the work item itself, so this returns `None`
     /// and the behaviour is identical to the historical per-work-item guard.
     pub fn live_execution_elsewhere_in_chain(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
+        Ok(self
+            .live_executions_elsewhere_in_chain(work_item_id)?
+            .into_iter()
+            .next())
+    }
+
+    /// Return EVERY live (`running` / `waiting_human`) execution belonging to
+    /// ANY *other* work item in the same revision chain as `work_item_id` —
+    /// not just the first one encountered. See
+    /// [`Self::live_execution_elsewhere_in_chain`] for the chain-walk
+    /// rationale and the tombstone-inclusive note; that method is now a thin
+    /// "first result" wrapper around this one.
+    ///
+    /// Callers that need to decide "is EVERY live sibling a review" (as
+    /// opposed to "is there at least one live sibling") must use this rather
+    /// than the singular form: `member_ids` walks the chain root-first, so
+    /// the singular form can return a root `pr_review` while masking a live
+    /// writer further down the chain — exactly the gap that let a
+    /// root-review bypass wrongly co-dispatch a second writer alongside a
+    /// still-live descendant writer (the T1577/T1815 hazard this guard
+    /// exists to prevent).
+    pub fn live_executions_elsewhere_in_chain(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let root_id = chain_root(&conn, work_item_id)?;
         let mut member_ids = Vec::with_capacity(4);
@@ -1005,6 +1027,7 @@ impl WorkDb {
         // let a second worker start on the same PR branch (the T1577/T1815
         // hazard this guard exists to prevent).
         member_ids.extend(collect_chain_revision_ids_including_deleted(&conn, &root_id)?);
+        let mut live_executions = Vec::new();
         for member_id in &member_ids {
             if member_id == work_item_id {
                 continue;
@@ -1024,11 +1047,11 @@ impl WorkDb {
                     map_execution,
                 )
                 .optional()?;
-            if live.is_some() {
-                return Ok(live);
+            if let Some(live) = live {
+                live_executions.push(live);
             }
         }
-        Ok(None)
+        Ok(live_executions)
     }
 
     /// Mark an execution `abandoned` without touching any other
