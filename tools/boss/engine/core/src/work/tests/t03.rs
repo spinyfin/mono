@@ -1021,6 +1021,37 @@ fn refuses_manual_move_off_blocked_while_gated() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A manual move from `blocked` to `archived` is allowed even while
+/// gating prereqs remain: archiving is a stronger "abandon" signal
+/// than a normal move, so it must not be blocked by the same gate
+/// that guards `active`/`ready` transitions.
+#[test]
+fn allows_manual_archive_off_blocked_while_gated() {
+    let path = temp_db_path("deps-allow-archive-move");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let a = create_test_chore(&db, product.id.clone(), "A");
+    let b = create_test_chore(&db, product.id.clone(), "B");
+    db.add_dependency(AddDependencyInput {
+        dependent: a.id.clone(),
+        prerequisite: b.id.clone(),
+        relation: None,
+    })
+    .unwrap();
+    db.update_work_item(
+        &a.id,
+        WorkItemPatch {
+            status: Some("archived".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let a_after = db.get_work_item(&a.id).unwrap();
+    let WorkItem::Chore(t) = a_after else { panic!() };
+    assert_eq!(t.status, TaskStatus::Archived);
+    let _ = std::fs::remove_file(path);
+}
+
 /// Reconcile downgrades a gated dependent's execution to
 /// `waiting_dependency` instead of `ready`. When the prereq
 /// completes, a follow-up reconcile promotes it back to `ready`.

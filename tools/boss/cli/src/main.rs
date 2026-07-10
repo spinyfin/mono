@@ -2190,6 +2190,10 @@ struct RevisionListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     include_deleted: bool,
 
+    /// Include archived revisions in the listing. See `boss task list --help`.
+    #[arg(long = "include-archived")]
+    include_archived: bool,
+
     /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
     /// ids (e.g. `T651`) or full `task_<hex>` ids.
     #[arg(long)]
@@ -6721,7 +6725,7 @@ async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: Rev
             match_term: args.match_term.as_deref(),
             ids: &args.id,
             limit: args.limit,
-            include_archived: false,
+            include_archived: args.include_archived,
         },
         None,
         product.repo_remote_url.as_deref(),

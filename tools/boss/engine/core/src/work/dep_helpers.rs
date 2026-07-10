@@ -526,7 +526,7 @@ pub(crate) fn refuse_manual_move_off_blocked_while_gated(
     previous_status: &str,
     new_status: &str,
 ) -> Result<()> {
-    if previous_status != "blocked" || new_status == "blocked" {
+    if previous_status != "blocked" || new_status == "blocked" || new_status == "archived" {
         return Ok(());
     }
     let gating = deps::gating_prereqs_for(conn, work_item_id)?;
