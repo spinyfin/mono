@@ -353,6 +353,17 @@ impl Populator {
         }
     }
 
+    /// Whether a project task's kind counts as evidence of operator
+    /// pre-seeding for the [`Self::preview`] / [`Self::run_claimed`] refusal
+    /// gate. Excludes `design` (the project's own auto-created design task)
+    /// and `revision` (review-revision tasks belong to the design task's own
+    /// PR chain, not to operator-added implementation work) — everything
+    /// else (`project_task`, `investigation`, `task`, `chore`, `followup`)
+    /// counts.
+    fn is_pre_seed_kind(kind: &str) -> bool {
+        kind != TaskKind::Design.as_str() && kind != TaskKind::Revision.as_str()
+    }
+
     /// Resolve a project's `kind = 'design'` task id — every project has
     /// exactly one, auto-created at `ordinal = 0` when the project is
     /// created. Used by [`Self::run_operator`] to build the same
@@ -414,7 +425,7 @@ impl Populator {
         let project_tasks = db.list_project_task_briefs(project_id)?;
         let existing_impl = project_tasks
             .iter()
-            .filter(|(_, _, kind)| kind != TaskKind::Design.as_str())
+            .filter(|(_, _, kind)| Self::is_pre_seed_kind(kind))
             .count();
         if existing_impl > 0 && !force {
             return Ok(PreviewOutcome::PreSeeded {
@@ -443,16 +454,16 @@ impl Populator {
         //    if the operator already put implementation tasks here, the
         //    Planner cannot reason about *why*, so merging risks duplicate or
         //    contradictory edges. Refuse and surface the `--force` escape.
-        //    Counts *any* non-design kind (not just project_task/investigation)
-        //    so the "any non-design task" contract holds even for a stray
-        //    `task`/`revision`/`followup` row on the project. `force` (the
-        //    operator's `--force` flag) bypasses this refusal — the
-        //    Materializer's `(name, project_id)` dedup makes the merge
+        //    Counts genuine implementation kinds only — design tasks and
+        //    revision tasks (review-revisions on the design task's own PR
+        //    chain) are excluded, since neither one is operator pre-seeding.
+        //    `force` (the operator's `--force` flag) bypasses this refusal —
+        //    the Materializer's `(name, project_id)` dedup makes the merge
         //    additive, never destructive, either way.
         let project_tasks = db.list_project_task_briefs(&ctx.project_id)?;
         let existing_impl = project_tasks
             .iter()
-            .filter(|(_, _, kind)| kind != TaskKind::Design.as_str())
+            .filter(|(_, _, kind)| Self::is_pre_seed_kind(kind))
             .count();
         if existing_impl > 0 && !force {
             let n = existing_impl;
@@ -1038,7 +1049,7 @@ mod tests {
     use crate::test_support::*;
     use boss_protocol::{Confidence, CreateProjectInput, CreateTaskInput, EffortLevel, ProposedEdge, ProposedTask};
 
-    use crate::work::WorkDb;
+    use crate::work::{WorkDb, next_id, now_string};
 
     // ---- fixtures ----------------------------------------------------------
 
@@ -1336,6 +1347,59 @@ mod tests {
         // created, so no `WorkItemsCreated` event should have been published.
         assert_eq!(publisher.attention_items_created().await, 1);
         assert_eq!(publisher.work_items_created_len().await, None);
+    }
+
+    /// Insert a `kind = 'revision'` task bound to the project, mirroring an
+    /// AI-review revision on the design task's own PR chain (e.g. what
+    /// `merge_trigger` observed as T264 under design task T261).
+    fn insert_project_revision_row(db: &WorkDb, product_id: &str, project_id: &str, parent_task_id: &str) -> String {
+        let conn = db.connect().unwrap();
+        let id = next_id("task");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, created_at, updated_at, autostart, parent_task_id)
+             VALUES (?1, ?2, ?3, 'revision', 'Address review findings', '', 'todo', ?4, ?4, 0, ?5)",
+            rusqlite::params![id, product_id, project_id, now, parent_task_id],
+        )
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn design_revision_alone_does_not_count_as_pre_seeded() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        // Only the auto-created design task plus a review-revision on its own
+        // PR chain — no operator pre-seeding. The merge trigger must still
+        // populate.
+        insert_project_revision_row(&db, &product_id, &project_id, &design_id);
+
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
+        );
+        let publisher = RecordingPublisher::default();
+        let outcome = Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            DEFAULT_MAX_TASKS,
+            &publisher,
+        )
+        .await;
+        assert!(
+            matches!(outcome, PopulateOutcome::Staged { .. }),
+            "expected populate to proceed despite the design revision, got {outcome:?}"
+        );
+        // The revision and the newly staged planner task both remain,
+        // alongside the design task itself (3 rows total on the project;
+        // `list_project_task_briefs` — the source of the pre-seed count —
+        // isn't restricted to the `project_task`/`design`/`investigation`
+        // kinds that `list_tasks` narrows to).
+        let briefs = db.list_project_task_briefs(&project_id).unwrap();
+        assert_eq!(briefs.len(), 3);
+        assert!(briefs.iter().any(|(_, _, kind)| kind == "revision"));
+        assert!(briefs.iter().any(|(_, name, _)| name == "Task A"));
     }
 
     // ---- fetch / plan failures leave nothing behind ------------------------
