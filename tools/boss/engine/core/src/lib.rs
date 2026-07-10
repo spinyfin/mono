@@ -96,7 +96,6 @@ pub use boss_ssh_transport as ssh_transport;
 pub mod stale_worker_sweep;
 pub mod structured_output;
 pub mod supersession_scan;
-pub mod surface_sweep;
 pub(crate) mod sweep_loop;
 pub mod syspolicyd_monitor;
 pub mod terminal_work_sweep;
