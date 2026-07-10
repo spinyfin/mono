@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 
 mod comments;
+mod dispatch_stats;
 mod logs;
 mod review;
 use boss_engine::dispatch_events::DispatchEvent;
@@ -270,6 +271,24 @@ enum DispatchAction {
     /// Show the current dispatch-pause state (paused/running and, if paused,
     /// when it was paused).
     State,
+    /// Aggregate how long ready work items wait for a worker slot,
+    /// broken down by the defer reason that finally cleared
+    /// (`chain_serialized`, `pool_exhausted`, ...), plus the current
+    /// top blocked items with their reason and wait so far. Read-only
+    /// over `dispatch-events/current.jsonl` — no engine RPC, no
+    /// change to dispatch behavior.
+    Stats {
+        /// Override the Boss state root.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// Only consider events at or after this relative duration ago
+        /// (e.g. `30m`, `6h`, `2d`). Defaults to all recorded events.
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of currently-blocked items to print.
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+    },
 }
 
 /// Output format for `bossctl agents transcript --format`.
@@ -751,6 +770,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Dispatch {
             action: DispatchAction::State,
         } => dispatch_state(&cli.socket_path, cli.json).await,
+        Command::Dispatch {
+            action: DispatchAction::Stats { state_root, since, top },
+        } => dispatch_stats::dispatch_stats(cli.json, state_root, since.as_deref(), top),
         Command::Metrics {
             action: MetricsAction::List { prefix, state_root },
         } => metrics_list(cli.json, state_root, prefix.as_deref()),

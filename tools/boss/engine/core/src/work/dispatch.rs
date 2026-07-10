@@ -785,7 +785,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -798,7 +798,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -821,7 +821,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
                  FROM work_executions
                  WHERE work_item_id = ?1",
             )?;
@@ -925,7 +925,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -955,7 +955,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1014,7 +1014,7 @@ impl WorkDb {
                     "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                             created_at, started_at, finished_at,
-                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
                      FROM work_executions
                      WHERE work_item_id = ?1
                        AND status IN ('running', 'waiting_human')
@@ -1063,6 +1063,48 @@ impl WorkDb {
             rusqlite::params![execution_id],
         )?;
         Ok(affected > 0)
+    }
+
+    /// Record `reason` as this `ready` execution's current dispatch-wait
+    /// defer reason (`chain_serialized`, `pool_exhausted`, ...), mirroring
+    /// the reason already logged to `dispatch_events` at the same call
+    /// site. Only stamps `dispatch_wait_since` when the reason is new
+    /// (previously `NULL` or a different reason) so it reflects the start
+    /// of the *current* wait, not the most recent drain pass that found
+    /// the same blocker still in place. Used by the kanban card to render
+    /// the real wait cause instead of a generic "Waiting for a slot" (see
+    /// module docs on [`Self::live_execution_elsewhere_in_chain`] for the
+    /// `chain_serialized` incident this surfaces).
+    pub fn set_dispatch_wait_reason(&self, execution_id: &str, reason: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        conn.execute(
+            "UPDATE work_executions
+             SET dispatch_wait_since = CASE
+                     WHEN dispatch_wait_reason IS ?2 THEN dispatch_wait_since
+                     ELSE ?3
+                 END,
+                 dispatch_wait_reason = ?2
+             WHERE id = ?1",
+            rusqlite::params![execution_id, reason, now],
+        )?;
+        Ok(())
+    }
+
+    /// Clear `dispatch_wait_reason` / `dispatch_wait_since` — called the
+    /// moment an execution claims a worker slot (or otherwise leaves the
+    /// deferred-ready state) so a stale reason doesn't linger once
+    /// dispatch has actually succeeded.
+    pub fn clear_dispatch_wait_reason(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions
+             SET dispatch_wait_reason = NULL,
+                 dispatch_wait_since = NULL
+             WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )?;
+        Ok(())
     }
 
     /// Retire a `revision_implementation` execution that turned out to be

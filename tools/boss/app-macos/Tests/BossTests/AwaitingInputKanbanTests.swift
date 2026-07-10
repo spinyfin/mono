@@ -121,7 +121,9 @@ final class AwaitingInputKanbanTests: XCTestCase {
             executionStatus: "running",
             runStatus: "active",
             executionID: "exec-1",
-            dispatchRetryAt: nil
+            dispatchRetryAt: nil,
+            dispatchWaitReason: nil,
+            dispatchWaitSince: nil
         )
     }
 }

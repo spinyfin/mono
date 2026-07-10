@@ -87,6 +87,39 @@ pub(crate) fn migrate_work_executions_metadata_fix_columns(conn: &Connection) ->
     Ok(())
 }
 
+/// `dispatch_wait_reason` + `dispatch_wait_since`: the dispatcher's
+/// current defer reason (`chain_serialized`, `pool_exhausted`, ...) for a
+/// `ready` execution that hasn't claimed a worker slot yet, and when that
+/// reason first applied. Distinct from `dispatch_failed_reason` on
+/// `tasks` (a terminal give-up) — this is a live, in-progress wait. Set by
+/// the two `WorkerClaimed`/`Skipped` sites in `coordinator::drain_ready`
+/// (mirroring the reason already logged to `dispatch_events`), and cleared
+/// the moment the execution claims a slot. `dispatch_wait_since` is only
+/// stamped when the reason changes (or was previously unset) so it
+/// reflects the start of the *current* wait, not the most recent poll.
+/// Lets the kanban card render the real cause instead of a generic
+/// "Waiting for a slot" (see T251 incident: chain_serialized read as slot
+/// exhaustion for ~20 minutes with 8+ free slots). Both `NULL` for the
+/// overwhelming majority of rows (anything not currently deferred).
+/// Idempotent.
+pub(crate) fn migrate_work_executions_dispatch_wait(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "dispatch_wait_reason",
+            "ALTER TABLE work_executions ADD COLUMN dispatch_wait_reason TEXT",
+        ),
+        (
+            "dispatch_wait_since",
+            "ALTER TABLE work_executions ADD COLUMN dispatch_wait_since TEXT",
+        ),
+    ] {
+        if !work_executions_has_column(conn, column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Add `tasks.parent_task_id` — the soft FK that ties a `revision` task
 /// to the task whose PR it targets — and the accompanying index so the
 /// coordinator can walk the chain efficiently. Mirrors the

@@ -1547,6 +1547,25 @@ struct SidebarProductPicker: View {
     }
 }
 
+/// Friendly label for `WorkTaskRuntime.dispatchWaitReason` (mirrors
+/// `TaskRuntime.dispatch_wait_reason` / the dispatcher's `details.reason`
+/// on the `worker_claimed`/skipped dispatch event). Falls back to the raw
+/// reason string for any value this hasn't been taught yet, so a new
+/// engine-side defer reason still renders something useful instead of a
+/// blank card.
+private func dispatchWaitReasonLabel(_ reason: String) -> String {
+    switch reason {
+    case "chain_serialized":
+        return "Waiting — blocked behind a live PR sibling"
+    case "pool_exhausted":
+        return "Waiting — worker pool full"
+    case "pending_first_attempt":
+        return "Waiting for a slot"
+    default:
+        return "Waiting — \(reason)"
+    }
+}
+
 /// Wrapper for a single kanban card. Observes `LiveWorkerStateStore`
 /// so live-state pushes invalidate the card without touching
 /// `ContentView` or `ChatViewModel`. Doing-column cards re-resolve
@@ -1626,6 +1645,18 @@ private struct WorkBoardCardItem: View {
             guard column == .doing else { return nil }
             if isDispatchRetryPending, let dispatchRetryAtRaw = runtime?.dispatchRetryAt {
                 return "Retrying dispatch — next attempt \(AutomationTime.relative(dispatchRetryAtRaw, now: Date()))"
+            }
+            // The dispatcher's real defer reason, when known — replaces the
+            // generic "Waiting for a slot" so an operator isn't sent hunting
+            // for free capacity when the actual cause is serialization or
+            // gating (the T251 incident: `chain_serialized` read as slot
+            // exhaustion for ~20 minutes with 8+ slots free).
+            if isDispatchPending, let reason = runtime?.dispatchWaitReason {
+                let label = dispatchWaitReasonLabel(reason)
+                if let sinceRaw = runtime?.dispatchWaitSince {
+                    return "\(label) (\(AutomationTime.relative(sinceRaw, now: Date())))"
+                }
+                return label
             }
             if isDispatchPending { return "Waiting for a slot" }
             if isResolvingConflicts { return nil }
