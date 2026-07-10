@@ -155,7 +155,7 @@ const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// once per stall (idempotent via [`WorkDb::upsert_work_item_attention`])
 /// and resolved via [`WorkDb::resolve_external_tracker_attention`] the
 /// moment the row is no longer chain-serialized (dispatched, or the sibling
-/// was reconciled dead — see [`ExecutionCoordinator::live_chain_sibling`]).
+/// was reconciled dead — see [`ExecutionCoordinator::live_chain_siblings`]).
 pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall";
 
 /// How long a `ready` execution may sit deferred behind the same live chain
@@ -163,6 +163,25 @@ pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall"
 /// comfortably below the ~20-minute silent stall observed in the T251
 /// incident so a human is alerted well before that point going forward.
 pub const CHAIN_SERIALIZED_STALL_THRESHOLD_SECS: i64 = 900;
+
+/// Outcome of [`ExecutionCoordinator::resolve_chain_hold`] for one execution.
+enum ChainHold {
+    /// No other chain member is live; dispatch may proceed normally.
+    Clear,
+    /// A live sibling genuinely blocks dispatch; the caller must defer
+    /// (pre-claim / pre-lease) or refuse (post-lease). `review_held` is
+    /// `true` when the blocking sibling is a `pr_review` execution — a
+    /// review-vs-something-else hold, as opposed to a writer-vs-writer
+    /// hold — purely for trace/UI labeling; the caller still treats both
+    /// as equally blocking.
+    Blocked { sibling: WorkExecution, review_held: bool },
+    /// A live `pr_review` sibling was found but bypassed: `execution` is a
+    /// merge-conflict-fix revision, and reviews are read-only so cannot
+    /// race the shared jj backing store the guard protects (see
+    /// `resolve_chain_hold`'s doc comment). The caller may proceed but
+    /// should log the bypass so the trace distinguishes it from `Clear`.
+    ReviewBypassed(WorkExecution),
+}
 
 /// Owns the per-run cube lease heartbeat task. Dropping the guard
 /// aborts the heartbeat — used at the end of `run_execution` so the
@@ -1675,42 +1694,126 @@ impl ExecutionCoordinator {
     /// earlier in the chain (a further `waiting_human` execution masked
     /// behind the one just reaped), so the check re-queries in a small
     /// bounded loop rather than returning after a single reconciliation.
-    async fn live_chain_sibling(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
+    /// Returns EVERY live chain sibling of `work_item_id`, reconciling
+    /// zombies along the way. `resolve_chain_hold`'s
+    /// review-bypass decision must be made against the full set: the
+    /// underlying `member_ids` walk is chain-root-first
+    /// ([`crate::work::dispatch::WorkDb::live_executions_elsewhere_in_chain`]),
+    /// so trusting only the first live sibling lets a root `pr_review` mask
+    /// a live descendant *writer* — reintroducing the exact two-writer
+    /// T1577/T1815 hazard this guard exists to prevent.
+    async fn live_chain_siblings(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         const MAX_RECONCILE_ATTEMPTS: u8 = 4;
         for _ in 0..MAX_RECONCILE_ATTEMPTS {
-            let Some(sibling) = self.work_db.live_execution_elsewhere_in_chain(work_item_id)? else {
-                return Ok(None);
-            };
-            let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
-                self.work_db.as_ref(),
-                self.dispatch_events.as_ref(),
-                &sibling,
-            )
-            .await;
-            let reconciled_dead_pane = !reconciled_lost_workspace
-                && crate::dead_pane_sweep::reconcile_if_pane_dead(
+            let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
+            if siblings.is_empty() {
+                return Ok(siblings);
+            }
+            let mut any_reconciled = false;
+            for sibling in &siblings {
+                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
-                    &sibling,
-                    crate::run_reconcile::current_epoch_s(),
+                    sibling,
                 )
                 .await;
-            if !reconciled_lost_workspace && !reconciled_dead_pane {
-                return Ok(Some(sibling));
+                let reconciled_dead_pane = !reconciled_lost_workspace
+                    && crate::dead_pane_sweep::reconcile_if_pane_dead(
+                        self.work_db.as_ref(),
+                        self.dispatch_events.as_ref(),
+                        sibling,
+                        crate::run_reconcile::current_epoch_s(),
+                    )
+                    .await;
+                if reconciled_lost_workspace || reconciled_dead_pane {
+                    any_reconciled = true;
+                    tracing::warn!(
+                        work_item_id,
+                        reconciled_execution_id = %sibling.id,
+                        reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
+                        "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
+                         reconciled it and re-checking for still-live siblings",
+                    );
+                }
             }
-            tracing::warn!(
-                work_item_id,
-                reconciled_execution_id = %sibling.id,
-                reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
-                "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
-                 reconciled it and re-checking for a still-live sibling",
-            );
+            if !any_reconciled {
+                return Ok(siblings);
+            }
         }
         // Exhausted retries without converging on a stable answer (e.g. a
         // pathological chain with many zombies reconciling one per pass).
         // Fail closed: treat whatever is there now as live rather than risk
         // co-dispatching two workers onto the same shared jj backing store.
-        self.work_db.live_execution_elsewhere_in_chain(work_item_id)
+        self.work_db.live_executions_elsewhere_in_chain(work_item_id)
+    }
+
+    /// Resolve the per-PR single-writer chain check for `execution`,
+    /// applying the review-yields-to-conflict-fix carve-out: a live
+    /// `pr_review` sibling never blocks a merge-conflict-fix revision
+    /// (`DispatchClass::MergeConflictRevision`).
+    ///
+    /// Rationale (the 2026-07-10 T270/T258 priority-inversion incident): a
+    /// `pr_review` execution is strictly read-only — never writes, commits,
+    /// or pushes (enforced by the reviewer CLAUDE.md, its tool denylist, and
+    /// its prompt mandate; see `crate::pr_review` module docs) — so it
+    /// cannot participate in the writer-vs-writer T1577/T1815 hazard this
+    /// guard exists to prevent (two *writers* rebasing/rewriting each
+    /// other's commits on the shared jj backing store). Meanwhile a pending
+    /// merge-conflict fix is urgent and, once it lands, immediately
+    /// invalidates whatever the in-flight review was looking at anyway —
+    /// the completion path's revision-triggered-review re-fire
+    /// (`enable_revision_triggered_reviews`) already spawns a fresh review
+    /// pass against the new head, so nothing is lost by not waiting for the
+    /// stale one to finish. Every other pairing — writer vs writer, writer
+    /// vs anything else, or a *non*-conflict revision (CI-fix,
+    /// review-findings, operator-filed) waiting behind a review — keeps
+    /// serializing exactly as before; only this one combination bypasses.
+    ///
+    /// The bypass decision is made against **every** live chain sibling, not
+    /// just the first one a naive single-sibling lookup would return. The chain
+    /// walk is root-first, so trusting a single sibling meant a live
+    /// `pr_review` on the chain root could mask a live *writer* further down
+    /// the chain (a descendant conflict-fix revision) — bypassing would then
+    /// co-dispatch a second writer alongside that still-live one, the exact
+    /// two-writer T1577/T1815 hazard this guard exists to prevent. So the
+    /// bypass only fires when EVERY live sibling is a review; if even one is
+    /// a non-review (writer), this fails closed to `Blocked`.
+    ///
+    /// Shared by all three chain-guard call sites (`drain_ready_queue`'s
+    /// pre-claim check, `schedule_execution`'s pre-lease backstop, and its
+    /// post-lease TOCTOU assertion) so the bypass decision — and therefore
+    /// whether a merge-conflict revision ever gets refused — is identical
+    /// at every checkpoint. Without that consistency a checkpoint later in
+    /// the pipeline could re-defer what an earlier one just bypassed,
+    /// wedging the row in a defer loop instead of actually dispatching it.
+    async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
+        let siblings = self.live_chain_siblings(&execution.work_item_id).await?;
+        let Some(first_sibling) = siblings.first().cloned() else {
+            return Ok(ChainHold::Clear);
+        };
+        let all_review_siblings = siblings.iter().all(|s| s.kind == ExecutionKind::PrReview);
+        let is_conflict_revision = matches!(
+            self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
+            Ok(DispatchClass::MergeConflictRevision)
+        );
+        if all_review_siblings && is_conflict_revision {
+            Ok(ChainHold::ReviewBypassed(first_sibling))
+        } else {
+            // Prefer surfacing a non-review (writer) sibling in the
+            // `Blocked` outcome when one is present, since that is the
+            // actually-blocking reason — a mix of a review and a writer
+            // sibling should report the writer, not the review, in trace
+            // output and wait-reason labeling.
+            let sibling = siblings
+                .iter()
+                .find(|s| s.kind != ExecutionKind::PrReview)
+                .cloned()
+                .unwrap_or(first_sibling);
+            Ok(ChainHold::Blocked {
+                sibling,
+                review_held: all_review_siblings,
+            })
+        }
     }
 
     /// After `execution` has sat `ready` and chain-serialized for at least
@@ -1901,32 +2004,42 @@ impl ExecutionCoordinator {
             // row stays `ready` and re-attempts on the next kick (which fires
             // when the live sibling reaps), so it runs strictly after it.
             // `schedule_execution` re-checks this as the chokepoint backstop
-            // for the `force_dispatch` path. Goes through `live_chain_sibling`
+            // for the `force_dispatch` path. Goes through `resolve_chain_hold`
             // (not the raw `WorkDb` query) so a `waiting_human` sibling whose
             // worker pane is actually dead doesn't wedge this row forever —
-            // see that method's docs for the T251 incident this closes.
-            match self.live_chain_sibling(&execution.work_item_id).await {
-                Ok(Some(sibling)) => {
+            // see `live_chain_siblings`'s docs for the T251 incident this
+            // closes — and so a merge-conflict-fix revision never waits
+            // behind a read-only review (see `resolve_chain_hold`'s docs for
+            // the T270/T258 priority-inversion incident this closes).
+            match self.resolve_chain_hold(&execution).await {
+                Ok(ChainHold::Blocked { sibling, review_held }) => {
+                    let reason = if review_held {
+                        "chain_serialized_review_held"
+                    } else {
+                        "chain_serialized"
+                    };
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
                         live_sibling_execution_id = %sibling.id,
                         live_sibling_work_item_id = %sibling.work_item_id,
                         pool = pool_label,
-                        "spawn_attempt status=ready -> deferred reason=chain_serialized"
+                        review_held,
+                        "spawn_attempt status=ready -> deferred reason={reason}"
                     );
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
                                 .with_work_item(&execution.work_item_id)
                                 .with_details(serde_json::json!({
-                                    "reason": "chain_serialized",
+                                    "reason": reason,
+                                    "review_held": review_held,
                                     "live_sibling_execution_id": sibling.id,
                                     "live_sibling_work_item_id": sibling.work_item_id,
                                 })),
                         )
                         .await;
-                    if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, "chain_serialized") {
+                    if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, reason) {
                         tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
                     }
                     self.surface_chain_serialized_stall_if_overdue(&execution, &sibling);
@@ -1934,7 +2047,48 @@ impl ExecutionCoordinator {
                     // other executions in this pass may still dispatch.
                     continue;
                 }
-                Ok(None) => {
+                Ok(ChainHold::ReviewBypassed(sibling)) => {
+                    // Reviews are read-only — a pending merge-conflict fix
+                    // must not wait the length of a review run behind one.
+                    // Fall through and dispatch this pass; the review keeps
+                    // running (it will self-terminate normally, and its
+                    // findings will already be stale against the fix's
+                    // upcoming push — `enable_revision_triggered_reviews`
+                    // fires a fresh pass once it lands).
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        live_sibling_execution_id = %sibling.id,
+                        live_sibling_work_item_id = %sibling.work_item_id,
+                        pool = pool_label,
+                        "spawn_attempt status=ready -> chain_hold_bypassed reason=review_yields_to_conflict_fix"
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "chain_hold_bypassed": "review_yields_to_conflict_fix",
+                                    "review_held": true,
+                                    "live_sibling_execution_id": sibling.id,
+                                    "live_sibling_work_item_id": sibling.work_item_id,
+                                })),
+                        )
+                        .await;
+                    if let Err(err) = self.work_db.resolve_external_tracker_attention(
+                        &execution.work_item_id,
+                        CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "drain: failed to resolve chain_serialized_stall attention on bypass",
+                        );
+                    }
+                    // Fall through to normal dispatch below.
+                }
+                Ok(ChainHold::Clear) => {
                     // No longer (or never) chain-serialized — clear any stall
                     // attention a prior pass raised for this work item so it
                     // doesn't linger `open` once dispatch actually proceeds.
@@ -2416,16 +2570,21 @@ impl ExecutionCoordinator {
         // next scheduler kick (which fires when the live sibling reaps), so
         // it runs strictly after the live one finishes.
         //
-        // Goes through `live_chain_sibling` (not the raw `WorkDb` query) so
+        // Goes through `resolve_chain_hold` (not the raw `WorkDb` query) so
         // this backstop shares the pre-claim guard's zombie reconciliation —
-        // see that method's docs.
-        match self.live_chain_sibling(&execution.work_item_id).await {
-            Ok(Some(sibling)) => {
+        // see that method's docs — and its review-yields-to-conflict-fix
+        // carve-out, so a merge-conflict revision the pre-claim check in
+        // `drain_ready_queue` just bypassed isn't immediately re-deferred
+        // here (which would otherwise wedge it in a defer loop instead of
+        // ever actually dispatching).
+        match self.resolve_chain_hold(execution).await {
+            Ok(ChainHold::Blocked { sibling, review_held }) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
                     live_sibling_execution_id = %sibling.id,
                     live_sibling_work_item_id = %sibling.work_item_id,
+                    review_held,
                     "spawn_attempt: deferred — another execution on the same PR/chain is live; \
                      serializing behind it rather than co-dispatching onto the shared jj store",
                 );
@@ -2448,6 +2607,7 @@ impl ExecutionCoordinator {
                             .with_worker(worker_id)
                             .with_details(serde_json::json!({
                                 "reason": "chain_serialized_backstop",
+                                "review_held": review_held,
                                 "live_sibling_execution_id": sibling.id,
                                 "live_sibling_work_item_id": sibling.work_item_id,
                             })),
@@ -2461,7 +2621,17 @@ impl ExecutionCoordinator {
                     sibling.work_item_id,
                 ));
             }
-            Ok(None) => {}
+            Ok(ChainHold::ReviewBypassed(sibling)) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    live_sibling_execution_id = %sibling.id,
+                    live_sibling_work_item_id = %sibling.work_item_id,
+                    "spawn_attempt: proceeding — live sibling is a read-only pr_review, \
+                     bypassed for this merge-conflict revision",
+                );
+            }
+            Ok(ChainHold::Clear) => {}
             Err(err) => {
                 // Non-fatal: proceed rather than blocking all dispatches.
                 // The post-lease assertion below is the defense-in-depth
@@ -2983,11 +3153,16 @@ impl ExecutionCoordinator {
         // backing store and corrupt each other, which this catches. On a
         // violation we release the lease and refuse rather than interleave.
         //
-        // Goes through `live_chain_sibling` for the same reason as the other
+        // Goes through `resolve_chain_hold` for the same reason as the other
         // two call sites: a `waiting_human` "sibling" that is actually a
-        // dead worker must not refuse this spawn forever.
-        match self.live_chain_sibling(&execution.work_item_id).await {
-            Ok(Some(sibling)) => {
+        // dead worker must not refuse this spawn forever, and a live
+        // `pr_review` sibling must not refuse a merge-conflict revision the
+        // earlier checkpoints already bypassed for it (see
+        // `resolve_chain_hold`'s docs) — otherwise this defense-in-depth
+        // assertion would defeat the bypass right before the irreversible
+        // spawn step.
+        match self.resolve_chain_hold(execution).await {
+            Ok(ChainHold::Blocked { sibling, review_held }) => {
                 tracing::error!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -2995,6 +3170,7 @@ impl ExecutionCoordinator {
                     cube_workspace_id = %lease.workspace_id,
                     live_sibling_execution_id = %sibling.id,
                     live_sibling_work_item_id = %sibling.work_item_id,
+                    review_held,
                     "REFUSING spawn: another execution on the same PR/chain went live after the \
                      pre-claim guard — refusing rather than handing two same-PR workers the shared \
                      jj backing store (single-writer invariant)",
@@ -3009,6 +3185,7 @@ impl ExecutionCoordinator {
                             .with_cube_workspace(&lease.workspace_id)
                             .with_details(serde_json::json!({
                                 "reason": "chain_sibling_went_live",
+                                "review_held": review_held,
                                 "live_sibling_execution_id": sibling.id,
                                 "live_sibling_work_item_id": sibling.work_item_id,
                             })),
@@ -3032,7 +3209,7 @@ impl ExecutionCoordinator {
                     sibling.work_item_id,
                 ));
             }
-            Ok(None) => {}
+            Ok(ChainHold::ReviewBypassed(_)) | Ok(ChainHold::Clear) => {}
             Err(err) => {
                 // Fail open: a DB error here must not wedge dispatch. The
                 // pre-claim guard already covered the common case.
@@ -10455,6 +10632,363 @@ mod tests {
         assert!(
             !cube.lease_calls.lock().await.is_empty(),
             "a cube workspace must be leased once the chain is clear",
+        );
+    }
+
+    /// The chore_18c0da77bef326b0_840 fix: a live `pr_review` sibling is
+    /// strictly read-only, so it must NOT chain-serialize a merge-conflict-
+    /// fix revision behind it — the priority inversion where the fix waited
+    /// the full length of a review run (T270/T258, 2026-07-10). Unlike
+    /// [`schedule_execution_defers_revision_behind_live_chain_sibling`]
+    /// (whose live sibling is a writer and must still block), this revision
+    /// must dispatch immediately even though the review is still live.
+    #[tokio::test]
+    async fn schedule_execution_bypasses_live_review_sibling_for_merge_conflict_revision() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
+                 SELECT 'task_rev_conflict_bypass', product_id, 'revision', 'Resolve conflicts', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_bypass'
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Live PR review on the chain root — read-only, must not block.
+        let _root_review_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        // Ready merge-conflict revision execution targeting the same PR.
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_conflict_bypass")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&revision_exec.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&revision_exec, &worker_id).await;
+        assert!(
+            result.is_ok(),
+            "merge-conflict revision must bypass a live read-only pr_review sibling: {result:?}",
+        );
+        assert!(
+            !cube.lease_calls.lock().await.is_empty(),
+            "a cube workspace must be leased — the review sibling must not block the lease",
+        );
+    }
+
+    /// The correctness gap this revision closes: a live `pr_review` on the
+    /// chain root must NOT mask a live *writer* on a chain descendant. Sets
+    /// up a root review PLUS a live descendant writer (another
+    /// merge-conflict-fix revision execution, already running) and confirms
+    /// a SECOND ready merge-conflict revision on the same chain is still
+    /// `Blocked` (no workspace leased) — not `ReviewBypassed`. Before the
+    /// `resolve_chain_hold`/`live_chain_siblings` fix, the root-first single-
+    /// sibling walk would have returned only the review, bypassed, and
+    /// co-dispatched a second writer alongside the still-live descendant
+    /// writer — the exact T1577/T1815 two-writer hazard this guard exists to
+    /// prevent.
+    #[tokio::test]
+    async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_descendant_writer() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
+                 SELECT 'task_rev_conflict_writer', product_id, 'revision', 'Resolve conflicts A', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_a'
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id, created_via)
+                 SELECT 'task_rev_conflict_second', product_id, 'revision', 'Resolve conflicts B', '', 'todo', '1', '1', ?1, 'merge-conflict:crz_b'
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Live PR review on the chain root — read-only.
+        let _root_review_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        // Live WRITER on a chain descendant — the first conflict-fix
+        // revision, already dispatched and still running.
+        let _descendant_writer_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_conflict_writer".to_owned())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Running)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        // A second, ready merge-conflict revision on the same chain.
+        let revision_exec_b = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_conflict_second".to_owned())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&revision_exec_b.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&revision_exec_b, &worker_id).await;
+        assert!(
+            result.is_err(),
+            "a second conflict revision must NOT bypass when a live descendant writer is masked \
+             behind the root review: {result:?}",
+        );
+        let after_defer = db.get_execution(&revision_exec_b.id).unwrap();
+        assert_eq!(
+            after_defer.status,
+            ExecutionStatus::Ready,
+            "deferred revision must remain ready, got {:?}",
+            after_defer.status,
+        );
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased while a live writer sibling exists elsewhere in the chain, \
+             even if a review is also live",
+        );
+    }
+
+    /// A non-conflict revision (no `merge-conflict:` `created_via` marker)
+    /// gets none of the bypass above — it keeps serializing behind a live
+    /// `pr_review` sibling exactly as before this fix. Only merge-conflict
+    /// revisions are urgent enough, and safe enough (see the module docs on
+    /// `ExecutionCoordinator::resolve_chain_hold`), to bypass a review.
+    #[tokio::test]
+    async fn schedule_execution_still_defers_non_conflict_revision_behind_live_review_sibling() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            // No `created_via` marker — an ordinary/operator-filed revision.
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_no_bypass', product_id, 'revision', 'Address feedback', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        let _root_review_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_no_bypass")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&revision_exec.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&revision_exec, &worker_id).await;
+        assert!(
+            result.is_err(),
+            "a non-conflict revision must still defer behind a live pr_review sibling: {result:?}",
+        );
+        let after_defer = db.get_execution(&revision_exec.id).unwrap();
+        assert_eq!(
+            after_defer.status,
+            ExecutionStatus::Ready,
+            "deferred revision must remain ready, got {:?}",
+            after_defer.status,
+        );
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased while serialized behind a live review sibling",
+        );
+    }
+
+    /// The auto-dispatcher's pre-claim chain check must record a
+    /// `dispatch_wait_reason` that distinguishes a review-held chain hold
+    /// from a writer-held one — the trace line chore_18c0da77bef326b0_840
+    /// asked for, so an operator (or the kanban card) can tell "waiting on
+    /// a read-only review" from "waiting on another writer" without
+    /// cross-referencing `engine-trace.jsonl` by hand.
+    #[tokio::test]
+    async fn drain_records_review_held_wait_reason_distinct_from_writer_held() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/9001";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_wait_reason', product_id, 'revision', 'Address feedback', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        let _root_review_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_wait_reason")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        let mut wait_reason = None;
+        for _ in 0..200 {
+            wait_reason = db.get_execution(&revision_exec.id).unwrap().dispatch_wait_reason;
+            if wait_reason.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            wait_reason.as_deref(),
+            Some("chain_serialized_review_held"),
+            "a revision deferred behind a live pr_review sibling must record the review-held \
+             reason, not the generic writer-held `chain_serialized`",
         );
     }
 
