@@ -13,7 +13,7 @@ struct CommentTextEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView()
+        let textView = SubmitOnReturnTextView()
         textView.delegate = context.coordinator
         textView.isRichText = false
         textView.allowsUndo = true
@@ -57,6 +57,20 @@ struct CommentTextEditor: NSViewRepresentable {
             } else {
                 textView.selectedRanges = sel
             }
+        }
+    }
+
+    /// NSTextView's default key bindings map both plain Return and Shift+Return to
+    /// `insertNewline:`, so the delegate's `doCommandBy:` can't tell them apart.
+    /// Intercept Shift+Return here and route it to `insertNewlineIgnoringFieldEditor:`
+    /// (a literal newline) before AppKit's key binding manager collapses it.
+    final class SubmitOnReturnTextView: NSTextView {
+        override func keyDown(with event: NSEvent) {
+            if event.keyCode == 36, event.modifierFlags.contains(.shift) {
+                insertNewlineIgnoringFieldEditor(nil)
+                return
+            }
+            super.keyDown(with: event)
         }
     }
 
