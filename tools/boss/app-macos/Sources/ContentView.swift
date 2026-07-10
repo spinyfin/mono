@@ -4596,7 +4596,7 @@ private struct WorkEditSheet: View {
                 TextField("Goal", text: $goal)
             case .task, .chore:
                 Picker("Status", selection: $status) {
-                    ForEach(["todo", "active", "blocked", "in_review", "done"], id: \.self) { status in
+                    ForEach(["todo", "active", "blocked", "in_review", "done", "archived"], id: \.self) { status in
                         Text(status.replacingOccurrences(of: "_", with: " ").capitalized).tag(status)
                     }
                 }

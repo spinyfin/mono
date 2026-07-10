@@ -899,6 +899,72 @@ fn get_work_tree_includes_external_ref_on_chores() {
     assert_eq!(ext.web_url, "https://github.com/spinyfin/mono/issues/561");
 }
 
+/// Manually archiving a chore (`boss task update --status archived`) must
+/// pull it off the kanban board — `get_work_tree` is the query behind the
+/// board — while leaving it fully queryable via `list_chores`, since
+/// archive is distinct from (soft-)delete.
+#[test]
+fn archived_chore_leaves_work_tree_but_stays_listable() {
+    let (db, product_id, chore_id) = setup_product_and_chore();
+
+    db.update_task(
+        &chore_id,
+        WorkItemPatch {
+            status: Some("archived".to_owned()),
+            ..Default::default()
+        },
+        "human",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    assert!(
+        !tree.chores.iter().any(|c| c.id == chore_id),
+        "archived chore must not appear on the kanban board"
+    );
+
+    let chores = db.list_chores(&product_id, None, false).unwrap();
+    let archived = chores
+        .iter()
+        .find(|c| c.id == chore_id)
+        .expect("archived chore must remain listable (distinct from delete)");
+    assert_eq!(archived.status.as_str(), "archived");
+    assert!(archived.deleted_at.is_none(), "archive must not tombstone the row");
+}
+
+/// Unarchiving a manually-archived chore back to backlog must succeed —
+/// only auto-archived *revisions* refuse this move (see
+/// `refuse_manual_move_off_archived_moot_revision`).
+#[test]
+fn unarchive_chore_back_to_backlog_succeeds() {
+    let (db, _product_id, chore_id) = setup_product_and_chore();
+
+    db.update_task(
+        &chore_id,
+        WorkItemPatch {
+            status: Some("archived".to_owned()),
+            ..Default::default()
+        },
+        "human",
+    )
+    .unwrap();
+
+    let restored = db
+        .update_task(
+            &chore_id,
+            WorkItemPatch {
+                status: Some("todo".to_owned()),
+                ..Default::default()
+            },
+            "human",
+        )
+        .unwrap();
+    let WorkItem::Chore(restored) = restored else {
+        panic!("expected chore");
+    };
+    assert_eq!(restored.status.as_str(), "todo");
+}
+
 /// derive_external_ref_web_url derives correct GitHub URLs and returns
 /// empty string for unknown trackers.
 #[test]
