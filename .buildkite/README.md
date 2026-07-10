@@ -11,8 +11,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
   pipeline.yml          # Buildkite reads this; declares steps, queue tags, depends_on only
   steps/
     bootstrap.sh        # Prime the agent: rust toolchain, bazelisk, pnpm, cache restore
-    bazel-build.sh      # bazel build //... (dependency-graph compile guard)
-    bazel-test.sh       # bazel test //... (canonical rust + integration tests)
+    bazel-build-test.sh # bazel build //... then bazel test //... (one agent, reuses build outputs)
     checks.sh           # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
   README.md             # this file
 ```
@@ -20,13 +19,14 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 ## Pipeline shape
 
 ```
-bootstrap (queue=linux-amd64)┬──► bazel-build ──┐
-                             ├──► checks      ──┼──► (wait) ──► bazel-test ──► green
+┬──► bazel-build-test (build then test, one agent) ──┐
+├──► mac-app-build                                   ├──► boss-release (main only)
+└──► checks                                          ┘
 ```
 
-- `bootstrap` runs first; all other steps depend on it.
-- `bazel-build` and `checks` run in parallel after bootstrap.
-- `bazel-test` runs only after all static checks pass (the `wait` step).
+- `bazel-build-test`, `mac-app-build`, and `checks` all run in parallel with no barrier between them.
+- `bazel-build-test` runs `bazel build` then `bazel test` back to back on the same agent, so the test phase reuses the build phase's local bazel outputs instead of re-analyzing/rebuilding on a different `bazel-any` host.
+- `boss-release` (main branch only) explicitly `depends_on` all three so a release only happens once bazel, checks, and the mac app build have all gone green.
 
 ## Step details
 
@@ -39,13 +39,9 @@ Ensures the agent has the required toolchain:
 - pnpm: installs if not present, pins to the version in `package.json#packageManager`.
 - Restores the agent-local bazel disk cache (uses `~/.cache/bazelcache` from `.bazelrc`).
 
-### `bazel-build.sh`
+### `bazel-build-test.sh`
 
-Runs `bazel build //...`. Catches build-graph rot (visibility violations, missing deps, broken generated files) that cargo cannot see.
-
-### `bazel-test.sh`
-
-Runs `bazel test //...`. This is the canonical rust test step. With P1 landed (`tools/boss/engine/BUILD.bazel:86` — `rust_test(name = "engine_lib_test", crate = ":engine_lib")`), this covers the engine lib tests that the 2026-05-12 drift incident exposed, in addition to the integration test targets.
+Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The build phase catches build-graph rot (visibility violations, missing deps, broken generated files) that cargo cannot see; the test phase is the canonical rust test step and, with P1 landed (`tools/boss/engine/BUILD.bazel:86` — `rust_test(name = "engine_lib_test", crate = ":engine_lib")`), covers the engine lib tests that the 2026-05-12 drift incident exposed, in addition to the integration test targets. Each phase logs under its own collapsible `---` group (`[bazel-build]` / `[bazel-test]`) so a build breakage vs. a test failure stays distinguishable in the log even though they're one Buildkite step. The step still emits two GitHub commit statuses, `buildkite/mono/bazel-build` and `buildkite/mono/bazel-test`, so branch protection needs no changes — see `REQUIRED_CHECKS.md`.
 
 ### `checks.sh`
 
@@ -72,4 +68,4 @@ Required checks are managed via branch protection rules. The check names buildki
 
 ## Status
 
-The pipeline is canonical — `bazel-build` and `bazel-test` are the source of truth. `bazel-build.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`).
+The pipeline is canonical — `bazel-build-test` is the source of truth for bazel build+test. `bazel-build-test.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`).

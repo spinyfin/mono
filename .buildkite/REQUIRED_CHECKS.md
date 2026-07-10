@@ -15,16 +15,18 @@ These checks are currently **required** (block merge if red):
 | Check name                     | Step key in pipeline.yml |
 | ------------------------------ | ------------------------ |
 | `buildkite/mono/bootstrap`     | `bootstrap`              |
-| `buildkite/mono/bazel-build`   | `bazel-build`            |
+| `buildkite/mono/bazel-build`   | `bazel-build-test`       |
 | `buildkite/mono/mac-app-build` | `mac-app-build`          |
 | `buildkite/mono/checks`        | `checks`                 |
-| `buildkite/mono/bazel-test`    | `bazel-test`             |
+| `buildkite/mono/bazel-test`    | `bazel-build-test`       |
 
 ## How contexts are emitted
 
-Each gating step in `pipeline.yml` carries an explicit `notify: github_commit_status: { context: "buildkite/mono/<step-key>" }` block. This pins the GitHub check context name to the step's `key:` field, decoupling it from the step `label:` (which may include emoji and can be changed freely without affecting the gate).
+Each gating step in `pipeline.yml` carries one or more explicit `notify: github_commit_status: { context: "buildkite/mono/<name>" }` blocks. Usually `<name>` matches the step's `key:` field 1:1, decoupling the context from the step `label:` (which may include emoji and can be changed freely without affecting the gate).
 
-The resulting context names are `buildkite/mono/<step-key>` — e.g. `buildkite/mono/bootstrap`.
+The exception is `bazel-build-test`: it runs the former `bazel-build` and `bazel-test` steps back to back in a single step (so the test phase reuses the build phase's local bazel outputs instead of rebuilding on a second agent), but still carries two `notify` entries so it keeps emitting both the `buildkite/mono/bazel-build` and `buildkite/mono/bazel-test` contexts. Both statuses reflect the combined step's overall pass/fail — build vs. test failure attribution lives in the step's log groups (`--- [bazel-build] building` / `--- [bazel-test] testing`), not in separate GitHub checks. Branch protection and the Boss engine's CI gate (which reads GitHub's status-check-rollup, not step keys) need no changes as a result.
+
+Otherwise the resulting context names are `buildkite/mono/<step-key>` — e.g. `buildkite/mono/bootstrap`.
 
 ## Rename contract
 
