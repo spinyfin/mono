@@ -6533,15 +6533,7 @@ mod tests {
         // Create the chore with autostart=false so `rescan_active_dispatch`
         // never re-queues it after the PrReview execution fails. Only the
         // PrReview execution we inject below reaches the dispatcher.
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Reviewed chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Reviewed chore");
 
         // Simulate the post-implementation state: the chore is `active`
         // (auto-advanced by `start_execution_run` when the implementation
@@ -6717,15 +6709,7 @@ mod tests {
         let product = create_test_product(&db);
         // autostart=false so the reconcile sweep never enqueues a second
         // execution in parallel — only the one we inject reaches the dispatcher.
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Impl chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Impl chore");
         let impl_exec = db
             .create_execution(
                 CreateExecutionInput::builder()
@@ -7321,15 +7305,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
         db.request_execution(
             RequestExecutionInput::builder()
@@ -7430,15 +7406,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Resume me")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Resume me");
         db.reconcile_product_executions(&product.id).unwrap();
         // autostart=false means reconcile won't auto-create an execution;
         // request one explicitly to seed the dead-predecessor record.
@@ -7518,15 +7486,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Resume me")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Resume me");
         db.reconcile_product_executions(&product.id).unwrap();
         let resume = db
             .request_execution(
@@ -7578,15 +7538,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
         db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
             .unwrap();
@@ -7697,15 +7649,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Cleanup")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Cleanup");
         db.reconcile_product_executions(&product.id).unwrap();
         db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
             .unwrap();
@@ -8759,15 +8703,7 @@ mod tests {
         let product = create_test_product(&db);
 
         // Ghost A: dragged to Doing but no execution exists at all.
-        let ghost_a = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Ghost A")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let ghost_a = create_test_chore_manual(&db, product.id.clone(), "Ghost A");
         db.update_work_item(
             &ghost_a.id,
             crate::work::WorkItemPatch {
@@ -8780,15 +8716,7 @@ mod tests {
         // Ghost B: dragged to Doing, has a `ready` execution but no
         // run yet — the "RequestExecution raced an exhausted pool"
         // shape from the bug report.
-        let ghost_b = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Ghost B")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let ghost_b = create_test_chore_manual(&db, product.id.clone(), "Ghost B");
         db.update_work_item(
             &ghost_b.id,
             crate::work::WorkItemPatch {
@@ -8807,15 +8735,7 @@ mod tests {
         // Real worker: started a run before the engine restarted,
         // mimicking a crashed-mid-flight chore. heal must NOT touch
         // this — `reconcile_active_dispatch` redispatches it.
-        let real = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Real worker")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let real = create_test_chore_manual(&db, product.id.clone(), "Real worker");
         let real_exec = db
             .create_execution(
                 CreateExecutionInput::builder()
@@ -8957,15 +8877,7 @@ mod tests {
         let busy = create_test_chore(&db, product.id.clone(), "Already running");
         // A second chore that will sit in `ready` because the
         // configured pool size is 1 and `busy` claimed it.
-        let queued = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Skip the queue")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let queued = create_test_chore_manual(&db, product.id.clone(), "Skip the queue");
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -9124,15 +9036,7 @@ mod tests {
         let warm = create_test_chore(&db, product.id.clone(), "Warm-up");
         db.reconcile_product_executions(&product.id).unwrap();
 
-        let parked = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Parked")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parked = create_test_chore_manual(&db, product.id.clone(), "Parked");
         db.update_work_item(
             &parked.id,
             crate::work::WorkItemPatch {
@@ -9916,15 +9820,7 @@ mod tests {
     /// `schedule_execution` picks it up for the reviewer positioning path.
     fn make_pr_review_fixture(db: &WorkDb, pr_url: Option<&str>) -> (String, String) {
         let product = create_test_product_named(db, "TestProduct");
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Test chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(db, product.id.clone(), "Test chore");
         if let Some(url) = pr_url {
             db.update_work_item(
                 &chore.id,
@@ -10458,15 +10354,7 @@ mod tests {
 
         // dependent: the gated chore. Created with autostart=false so no
         // execution is created automatically.
-        let dep = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Gated chore (should not dispatch)")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let dep = create_test_chore_manual(&db, product.id.clone(), "Gated chore (should not dispatch)");
 
         // Wire the blocks edge: dep requires prereq to be done.
         db.add_dependency(AddDependencyInput {
@@ -11002,15 +10890,7 @@ mod tests {
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Redundant-spawn chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Redundant-spawn chore");
 
         // Simulate the race: a first execution is already live (running).
         let _live_exec = db
@@ -11105,15 +10985,7 @@ mod tests {
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
         let product = create_test_product(&db);
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Zombie-blocked chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Zombie-blocked chore");
 
         // The "live" blocker: a running execution with a real run on the local
         // host, but whose workspace directory no longer exists on disk — a
@@ -11557,15 +11429,7 @@ mod tests {
         let prereq = create_test_chore(&db, product.id.clone(), "Prereq (still active)");
 
         // dependent: the gated chore.
-        let dep = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Gated chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let dep = create_test_chore_manual(&db, product.id.clone(), "Gated chore");
 
         // Wire the blocks edge: dep requires prereq to be done first.
         db.add_dependency(AddDependencyInput {
@@ -11672,15 +11536,7 @@ mod tests {
             })
             .unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
-        let parent = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Parent chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
         {
             let conn = db.connect().unwrap();
             conn.execute(

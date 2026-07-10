@@ -22,15 +22,7 @@ use super::*;
 fn seed_product_and_chore(label: &str) -> (WorkDb, String, String) {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let product = create_test_product_with_repo(&db, label, Some("git@example.invalid:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(format!("Chore {label}"))
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), format!("Chore {label}"));
     (db, product.id, chore.id)
 }
 
@@ -106,24 +98,8 @@ fn list_filters_by_product_and_work_item() {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let p1 = create_test_product_with_repo(&db, "list-p1", Some("git@example.invalid:foo/one.git"));
     let p2 = create_test_product_with_repo(&db, "list-p2", Some("git@example.invalid:foo/two.git"));
-    let c1 = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(p1.id.clone())
-                .name("c1")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
-    let c2 = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(p2.id.clone())
-                .name("c2")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let c1 = create_test_chore_manual(&db, p1.id.clone(), "c1");
+    let c2 = create_test_chore_manual(&db, p2.id.clone(), "c2");
     let a1 = insert_attempt(&db, &p1.id, &c1.id, "p1-sha");
     let a2 = insert_attempt(&db, &p2.id, &c2.id, "p2-sha");
 
@@ -233,15 +209,7 @@ fn latest_returns_most_recent_regardless_of_status() {
     assert_eq!(after.status, "succeeded");
 
     // A different work item's attempts are not returned.
-    let other = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.clone())
-                .name("other")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let other = create_test_chore_manual(&db, product.clone(), "other");
     assert!(
         db.latest_conflict_resolution_for_work_item(&other.id)
             .unwrap()

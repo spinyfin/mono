@@ -243,15 +243,7 @@ fn set_task_repo(db: &WorkDb, task_id: &str, value: Option<&str>) {
 
 fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String) {
     let product = create_test_product_with_repo(db, &format!("Prod-{label}"), Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(format!("Chore-{label}"))
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(db, product.id.clone(), format!("Chore-{label}"));
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -295,15 +287,7 @@ fn make_revision_product(db: &WorkDb, label: &str) -> String {
 
 /// Helper: create a chore (non-revision root) and return its id.
 fn make_chore_root(db: &WorkDb, product_id: &str, label: &str) -> String {
-    db.create_chore(
-        CreateChoreInput::builder()
-            .product_id(product_id)
-            .name(format!("Root chore {label}"))
-            .autostart(false)
-            .build(),
-    )
-    .unwrap()
-    .id
+    create_test_chore_manual(db, product_id, format!("Root chore {label}")).id
 }
 
 /// Helper: directly INSERT a revision task row (kind = 'revision') with
@@ -326,16 +310,7 @@ fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> S
 
 /// Helper: create a chore and set its pr_url (to simulate "in review").
 fn make_in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id)
-                .name("Chore for revision tests")
-                .autostart(false)
-                // inherits from product
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(db, product_id, "Chore for revision tests");
     let conn = db.connect().unwrap();
     conn.execute(
         "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",

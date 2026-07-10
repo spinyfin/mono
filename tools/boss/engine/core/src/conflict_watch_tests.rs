@@ -7,19 +7,11 @@ use tokio::sync::Mutex;
 use super::*;
 use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 use crate::test_support::*;
-use crate::work::{CreateChoreInput, WorkDb, WorkItem, WorkItemPatch};
+use crate::work::{WorkDb, WorkItem, WorkItemPatch};
 
 fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
     let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(name)
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(db, product.id.clone(), name);
     db.update_work_item(
         &chore.id,
         WorkItemPatch {

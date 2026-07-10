@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::automation_schedule::next_occurrence_after_str;
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, WorkDb};
+    use crate::work::WorkDb;
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED, AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT,
         AutomationPatch, AutomationTrigger, CreateAutomationInput,
@@ -504,16 +504,7 @@ mod tests {
 
     /// An open task counted against the automation's cap.
     fn create_open_task_for_automation(db: &WorkDb, product_id: &str, automation_id: &str) {
-        let task_id = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name("produced")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap()
-            .id;
+        let task_id = create_test_chore_manual(db, product_id, "produced").id;
         db.stamp_task_source_automation_for_test(&task_id, automation_id, "todo")
             .unwrap();
     }

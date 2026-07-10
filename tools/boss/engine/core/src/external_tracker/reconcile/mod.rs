@@ -1692,15 +1692,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Already bound, label missing")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Already bound, label missing");
         db.set_external_ref(&chore.id, "spy", "spy#54", &json!({ "issue_number": 54 }))
             .expect("set_external_ref");
 
@@ -1730,15 +1722,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Already labeled")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Already labeled");
         db.set_external_ref(&chore.id, "spy", "spy#55", &json!({ "issue_number": 55 }))
             .expect("set_external_ref");
 
@@ -1783,15 +1767,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         // Seed a Boss chore bound to upstream#3.
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Open chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Open chore");
         db.set_external_ref(&chore.id, "spy", "spy#3", &json!({ "issue_number": 3 }))
             .expect("set_external_ref");
 
@@ -1818,15 +1794,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Chore without PR")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Chore without PR");
         db.set_external_ref(&chore.id, "spy", "spy#4", &json!({ "issue_number": 4 }))
             .expect("set_external_ref");
 
@@ -1862,15 +1830,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Chore with merged PR")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Chore with merged PR");
         db.set_external_ref(&chore.id, "spy", "spy#5", &json!({ "issue_number": 5 }))
             .expect("set_external_ref");
 
@@ -1902,15 +1862,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Chore that will be unbound")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Chore that will be unbound");
         db.set_external_ref(&chore.id, "spy", "spy#6", &json!({ "issue_number": 6 }))
             .expect("set_external_ref");
 
@@ -1941,15 +1893,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Chore for retry test")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Chore for retry test");
         db.set_external_ref(&chore.id, "spy", "spy#7", &json!({ "issue_number": 7 }))
             .expect("set_external_ref");
 
@@ -2028,15 +1972,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         // Seed a chore with external ref bound.
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Rebind test chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Rebind test chore");
         db.set_external_ref(&chore.id, "spy", "spy#9", &json!({ "issue_number": 9 }))
             .expect("set_external_ref");
 
@@ -2073,15 +2009,7 @@ mod tests {
 
     // Helper: create a chore that is already in `done` status.
     fn seed_done_chore(db: &WorkDb, product_id: &str, canonical_id: &str, issue_num: u64) -> boss_protocol::Task {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name(format!("Done chore {canonical_id}"))
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(db, product_id, format!("Done chore {canonical_id}"));
         db.set_external_ref(&chore.id, "spy", canonical_id, &json!({ "issue_number": issue_num }))
             .expect("set_external_ref");
         db.reconciler_close_work_item(&chore.id).expect("close work item");
@@ -2446,15 +2374,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Chore to be unbound")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Chore to be unbound");
         db.set_external_ref(&chore.id, "spy", "spy#20", &json!({ "issue_number": 20 }))
             .expect("set_external_ref");
 
@@ -2490,15 +2410,7 @@ mod tests {
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Chore with permission-denied close")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Chore with permission-denied close");
         db.set_external_ref(&chore.id, "spy", "spy#21", &json!({ "issue_number": 21 }))
             .expect("set_external_ref");
 
@@ -2596,15 +2508,7 @@ mod tests {
     // ── Behavior 6: set project status to "In progress" ──────────────────────
 
     fn seed_active_chore(db: &WorkDb, product_id: &str, canonical_id: &str, issue_num: u64) -> boss_protocol::Task {
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name(format!("Active chore {canonical_id}"))
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(db, product_id, format!("Active chore {canonical_id}"));
         db.set_external_ref(&chore.id, "spy", canonical_id, &json!({ "issue_number": issue_num }))
             .expect("set_external_ref");
         // Simulate the task being dragged to Doing (active) via direct SQL,
@@ -2684,15 +2588,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         // todo task
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Todo chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .expect("create chore");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Todo chore");
         db.set_external_ref(&chore.id, "spy", "spy#32", &json!({ "issue_number": 32 }))
             .expect("set_external_ref");
         // Leave as todo (default).
