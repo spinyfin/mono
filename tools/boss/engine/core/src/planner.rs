@@ -311,8 +311,35 @@ fn planner_output_from_response(response: &MessagesResponse) -> Result<PlannerOu
     let input = response
         .tool_use_input(TOOL_NAME)
         .ok_or_else(|| format!("model did not call the {TOOL_NAME} tool"))?;
-    serde_json::from_value::<PlannerOutput>(input.clone())
-        .map_err(|err| format!("tool input did not match the PlannerOutput schema: {err}"))
+    let mut output = serde_json::from_value::<PlannerOutput>(input.clone())
+        .map_err(|err| format!("tool input did not match the PlannerOutput schema: {err}"))?;
+    normalize_output_text(&mut output);
+    Ok(output)
+}
+
+/// Undo over-escaping the model occasionally introduces in free-text fields
+/// (observed as literal `\"` and `\n` sequences surviving the JSON decode —
+/// the model wrote `\\"` / `\\n` inside its tool-call JSON, one escape level
+/// too many). Applied once here, right after deserialisation, so every
+/// downstream consumer (the `planner_runs` audit row, the Materializer, the
+/// app UI) sees clean text instead of each display site having to band-aid
+/// around it.
+fn normalize_output_text(output: &mut PlannerOutput) {
+    output.notes = unescape_over_escaped(&output.notes);
+    for line in &mut output.effort_audit {
+        *line = unescape_over_escaped(line);
+    }
+    for task in &mut output.tasks {
+        task.name = unescape_over_escaped(&task.name);
+        task.description = unescape_over_escaped(&task.description);
+    }
+}
+
+/// Replace literal `\"` and `\n` (backslash followed by a literal character,
+/// as opposed to an actual quote/newline) with the character they were
+/// meant to represent.
+fn unescape_over_escaped(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\\"", "\"")
 }
 
 /// Clip a string to `max` bytes on a char boundary, appending an ellipsis if
@@ -634,6 +661,49 @@ mod tests {
         assert_eq!(out.confidence, Confidence::High);
         assert!(out.breakdown_found);
         assert_eq!(out.effort_audit.len(), 2);
+    }
+
+    #[test]
+    fn normalizes_over_escaped_notes_and_effort_audit() {
+        // Guards against a model that over-escapes its JSON tool-call
+        // arguments (writes `\\"` / `\\n` where a single JSON escape level
+        // was meant), which otherwise survives the JSON decode as literal
+        // backslash-quote and backslash-n sequences.
+        let response = response_from(json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [{
+                        "handle": "h",
+                        "name": "Over-escaped \\\"name\\\"",
+                        "description": "First paragraph.\\n\\nSecond paragraph with a \\\"quote\\\".",
+                        "kind": "project_task",
+                        "effort": "small",
+                        "ordinal": 0
+                    }],
+                    "edges": [],
+                    "confidence": "high",
+                    "breakdown_found": true,
+                    "notes": "the doc's \\\"Proposed implementation task breakdown\\\" section\\n\\nmore prose",
+                    "effort_audit": ["[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\""]
+                }
+            }]
+        }));
+        let out = planner_output_from_response(&response).expect("valid tool_use response parses");
+        assert_eq!(
+            out.notes,
+            "the doc's \"Proposed implementation task breakdown\" section\n\nmore prose"
+        );
+        assert_eq!(
+            out.effort_audit[0],
+            "[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
+        );
+        assert_eq!(out.tasks[0].name, "Over-escaped \"name\"");
+        assert_eq!(
+            out.tasks[0].description,
+            "First paragraph.\n\nSecond paragraph with a \"quote\"."
+        );
     }
 
     #[test]
