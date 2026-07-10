@@ -22,21 +22,57 @@
 //!       - `ESRCH` → process does not exist → proceed.
 //!       - `0` (alive) or `EPERM` (alive, not ours) → skip.
 //!       - Other errors → conservative skip with a warning.
-//! 3. For dead PIDs:
+//!    3. Corroborate a `Dead` verdict against recent in-execution hook
+//!       activity (see below). If the worker is demonstrably alive, the
+//!       tracked pid was the wrong identity — skip, do not reap.
+//! 3. For dead PIDs with no corroborating activity:
 //!    1. Mark the execution `orphaned` in the DB.
 //!    2. Append an `[engine-reconcile]` audit line to the task description.
 //!    3. Release the worker pool slot so the orphan sweep can redispatch.
 //!    4. Emit a `dead_pid_reconcile` dispatch event.
 //!    5. Kick the coordinator.
 //!
-//! ## False-positive guard
+//! ## False-positive guards
 //!
 //! The [`DEAD_PID_GRACE_SECS`] (30 s) guard skips executions whose
 //! `started_at` is too recent. A worker with no `started_at` yet
-//! (pane hasn't begun) is also skipped. Slow-but-running workers
-//! (e.g., multi-minute bazel runs) keep their PID alive, so
-//! `kill(pid, 0)` is robust against them — only `ESRCH` ("no such
-//! process") triggers a reap.
+//! (pane hasn't begun) is also skipped.
+//!
+//! ### Liveness corroboration (the T2450 false-reap fix)
+//!
+//! The registered `shell_pid` is the pty *foreground* pid captured once
+//! at surface-init (`ghostty_surface_foreground_pid`). That identity is
+//! not stable for the worker's lifetime: a wrapper/login shell can exit
+//! or `exec` while the real `claude` process lives on under a different
+//! pid, and macOS aggressively reuses pids (the T2450 pid, 98601, appears
+//! in the dispatch log of several *older*, long-dead executions). So a
+//! bare `kill(pid, 0) == ESRCH` is *not* proof the worker is dead — it
+//! can equally mean "the transient process we happened to snapshot has
+//! exited while the worker keeps running". Trusting it alone reaped a
+//! live worker mid-tool-call in T2450: the run kept emitting transcript
+//! events for a full minute after the engine logged its pid "not found".
+//!
+//! The engine holds a fresher, identity-independent liveness signal:
+//! [`boss_protocol::LiveWorkerState::last_event_at`], stamped on every
+//! hook event ([`crate::live_worker_state::LiveWorkerStateRegistry::apply_event`]).
+//! A worker that is actively producing transcript events cannot be dead,
+//! whatever an unrelated pid probe says. So on the *periodic speculative*
+//! sweep ([`DeadPidSweepMode::PeriodicSpeculative`]) a `Dead` verdict is
+//! corroborated before it is trusted: if the slot emitted a hook within
+//! [`DEAD_PID_CORROBORATION_SECS`], *or* has a tool in flight, and that
+//! activity is attributed to *this* execution (event at/after the
+//! execution's own `started_at`, guarding against a recycled slot's
+//! prior-run timestamp — cf. [`crate::stale_worker_sweep`]), the worker
+//! is presumed alive and the reap is skipped. A genuinely dead worker
+//! goes quiet, so its `last_event_at` ages out of the window and a later
+//! pass reaps it — no false reap, at worst a bounded delay on a true one.
+//!
+//! The app-reattach reconcile ([`DeadPidSweepMode::AppReattach`]) does
+//! *not* corroborate: it is a one-shot finalize against a *known-dead*
+//! app, so the pid probe is authoritative and there is no second pass to
+//! temporally disambiguate a just-before-death event from a survivor that
+//! keeps emitting. Genuinely-live survivors there are already spared by
+//! the `kill(pid, 0)`-alive check.
 //!
 //! ## Cadence
 //!
@@ -60,13 +96,68 @@ use boss_protocol::{LiveWorkerState, WorkExecution, WorkerActivity};
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::work::WorkDb;
 
 /// Grace period after `started_at` (epoch seconds) during which we
 /// skip PID probing. Guards against racing a fresh dispatch whose pane
 /// is still spinning up and may not have fully exec'd its shell yet.
 pub const DEAD_PID_GRACE_SECS: i64 = 30;
+
+/// A `kill(pid, 0) == ESRCH` verdict on the periodic sweep is only
+/// trusted if the worker has *also* gone quiet for at least this long.
+/// A hook event newer than this window (or a tool in flight) proves the
+/// worker's process tree is alive regardless of what the tracked pid —
+/// a possibly-transient or reused snapshot — reports, so the reap is
+/// skipped (the T2450 false-reap fix). 120 s is comfortably above the
+/// ~10-30 s hook cadence a working worker shows, so a live worker is
+/// never in danger, yet an order of magnitude below the
+/// [`crate::stale_worker_sweep`] 30-min threshold, so a genuinely dead
+/// worker still ages out of the window and gets reaped on a later pass.
+/// This is a *corroboration* window, not a longer reap timer: it only
+/// ever *prevents* reaping a demonstrably-live worker (a forbidden
+/// band-aid would be lengthening the reap interval, which still kills
+/// live workers — this does the opposite).
+pub const DEAD_PID_CORROBORATION_SECS: i64 = 120;
+
+/// Which entry point is driving a [`run_one_pass`] sweep. The two paths
+/// legitimately differ in whether a `Dead` pid verdict is corroborated
+/// against recent in-execution event activity before reaping, and whether
+/// each reap files a durable pane-death attention item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeadPidSweepMode {
+    /// The periodic backstop ([`spawn_loop`]). The registered shell pid
+    /// is a *speculative* liveness signal that can vanish (wrapper shell
+    /// exit/`exec`, macOS pid reuse) while the worker's process tree
+    /// lives on, so a `Dead` verdict is corroborated against recent
+    /// in-execution hook activity before reaping (T2450). Reaps here are
+    /// routine crash/OOM/kill-9 recoveries, one at a time, already
+    /// surfaced via the `dead_pid_reconcile` dispatch event — no
+    /// attention item.
+    PeriodicSpeculative,
+    /// The app-reattach reconcile ([`reconcile_orphans_on_reattach`]).
+    /// The prior app is known-dead, so the pid probe is authoritative and
+    /// the `Dead` verdict is trusted as-is (a single-shot pass cannot
+    /// temporally disambiguate a just-before-death event from a survivor
+    /// that keeps emitting; live survivors are already spared by the
+    /// `kill(pid, 0)`-alive check). A single relaunch can reap many panes
+    /// at once, so each reap files a durable pane-death attention item.
+    AppReattach,
+}
+
+impl DeadPidSweepMode {
+    /// Whether a `Dead` pid verdict is corroborated against recent
+    /// in-execution event activity before reaping.
+    fn corroborate_liveness(self) -> bool {
+        matches!(self, DeadPidSweepMode::PeriodicSpeculative)
+    }
+
+    /// Whether each reap also files a [`PANE_DEATH_ATTENTION_KIND`]
+    /// attention item on the work item.
+    fn file_pane_death_attention(self) -> bool {
+        matches!(self, DeadPidSweepMode::AppReattach)
+    }
+}
 
 /// `work_attention_items.kind` filed when a pane is reaped specifically
 /// via [`reconcile_orphans_on_reattach`] (an app relaunch killed it),
@@ -86,6 +177,11 @@ pub struct DeadPidSweepOutcome {
     pub alive_skipped: usize,
     pub unknown_pid_skipped: usize,
     pub grace_skipped: usize,
+    /// Slots whose pid probed `Dead` but whose recent in-execution hook
+    /// activity (or in-flight tool) contradicted the probe — the tracked
+    /// pid was the wrong identity and the (live) worker was spared. This
+    /// is the T2450 false-reap that would otherwise have fired.
+    pub live_corroborated_skipped: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for DeadPidSweepOutcome {
@@ -97,6 +193,7 @@ impl crate::sweep_loop::SweepOutcome for DeadPidSweepOutcome {
         tracing::info!(
             reaped = self.reaped,
             alive_skipped = self.alive_skipped,
+            live_corroborated_skipped = self.live_corroborated_skipped,
             grace_skipped = self.grace_skipped,
             "dead-pid sweep: pass complete",
         );
@@ -124,7 +221,7 @@ pub fn spawn_loop(
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
-                false,
+                DeadPidSweepMode::PeriodicSpeculative,
             )
             .await
         }
@@ -180,7 +277,7 @@ pub async fn reconcile_orphans_on_reattach(
         live_states.as_ref(),
         coordinator,
         dispatch_events.as_ref(),
-        true,
+        DeadPidSweepMode::AppReattach,
     )
     .await;
     tracing::info!(
@@ -201,20 +298,19 @@ pub async fn reconcile_orphans_on_reattach(
 /// requires `Arc<ExecutionCoordinator>` — the kick path spawns a
 /// tokio task that holds a reference.
 ///
-/// `file_pane_death_attention` gates whether each reap also files a
-/// [`PANE_DEATH_ATTENTION_KIND`] attention item on the work item. The
-/// periodic [`spawn_loop`] pass (crash/OOM/kill-9 reaps, one execution
-/// at a time) passes `false` — it already has the `dead_pid_reconcile`
-/// dispatch event and firing an attention on every crash would be
-/// noisy. [`reconcile_orphans_on_reattach`] (an app relaunch, which can
-/// reap many panes in one pass) passes `true`.
+/// `mode` selects the two behaviors that legitimately differ between the
+/// periodic backstop and the app-reattach reconcile — whether a `Dead`
+/// pid verdict is corroborated against recent in-execution event activity
+/// before reaping, and whether each reap files a durable pane-death
+/// attention item. See [`DeadPidSweepMode`].
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
-    file_pane_death_attention: bool,
+    mode: DeadPidSweepMode,
 ) -> DeadPidSweepOutcome {
+    let file_pane_death_attention = mode.file_pane_death_attention();
     let mut outcome = DeadPidSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
@@ -258,7 +354,7 @@ pub async fn run_one_pass(
         // within DEAD_PID_GRACE_SECS or not yet recorded. A missing
         // `started_at` means the pane hasn't fully exec'd yet.
         let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
-        match started_epoch {
+        let started_epoch = match started_epoch {
             None => {
                 outcome.grace_skipped += 1;
                 continue;
@@ -267,8 +363,8 @@ pub async fn run_one_pass(
                 outcome.grace_skipped += 1;
                 continue;
             }
-            _ => {}
-        }
+            Some(t) => t,
+        };
 
         // Probe PID liveness via kill(pid, 0).
         match probe_pid(state.shell_pid) {
@@ -291,9 +387,43 @@ pub async fn run_one_pass(
             }
         }
 
+        // Corroborate the `Dead` verdict before trusting it (periodic
+        // speculative sweep only). The tracked shell pid is a fragile
+        // identity — a wrapper shell that exited/exec'd, or a reused pid —
+        // so `ESRCH` does not by itself prove the worker is dead. If the
+        // worker emitted a hook within DEAD_PID_CORROBORATION_SECS or has
+        // a tool in flight (attributed to THIS execution), it is
+        // demonstrably alive and the reap is skipped. See module docs;
+        // this is the T2450 false-reap fix.
+        if mode.corroborate_liveness()
+            && let Some(activity) = corroborating_liveness(&state, started_epoch, now_epoch_secs)
+        {
+            tracing::warn!(
+                execution_id,
+                pid = state.shell_pid,
+                slot_id = state.slot_id,
+                probe = "kill(pid,0)",
+                probe_result = "ESRCH",
+                corroborating_activity = %activity,
+                "dead-pid sweep: pid probed dead but worker is demonstrably alive for this \
+                 execution; the tracked shell pid was a transient/reused identity — NOT reaping \
+                 (T2450 false-reap guard)",
+            );
+            outcome.live_corroborated_skipped += 1;
+            continue;
+        }
+
+        // No corroborating activity: the worker is presumed genuinely
+        // dead. Capture what the probe and live-state actually observed so
+        // the reap is explainable from the run's record and the dispatch
+        // tail (the operator's "a transcript must never just stop with no
+        // reason" ask).
+        let observation = LivenessProbeObservation::from_dead_probe(&state, now_epoch_secs);
         let reason = format!(
-            "dead-pid-reconcile: shell PID {} not found; process presumed dead",
-            state.shell_pid
+            "dead-pid-reconcile: shell PID {} not found (kill(pid,0)=ESRCH); {}; \
+             no live-event corroboration within {DEAD_PID_CORROBORATION_SECS}s — process presumed dead",
+            state.shell_pid,
+            observation.activity_summary(),
         );
         let reaped = reap_dead_execution(
             work_db,
@@ -305,6 +435,7 @@ pub async fn run_one_pass(
                 reason: &reason,
                 now_epoch_secs,
                 file_pane_death_attention,
+                probe_observation: Some(&observation),
             },
         )
         .await;
@@ -314,6 +445,49 @@ pub async fn run_one_pass(
     }
 
     outcome
+}
+
+/// Corroborate a `Dead` pid verdict against the slot's recent
+/// in-execution activity. Returns `Some(reason)` when the worker is
+/// demonstrably alive — meaning the reap must be skipped, with `reason`
+/// naming the contradicting signal for the log — and `None` when nothing
+/// contradicts the dead probe.
+///
+/// Only activity attributable to *this* execution counts: a recycled slot
+/// can carry a *prior* run's `last_event_at` (the slot/exec identity class
+/// investigated for [`crate::stale_worker_sweep`]), and a timestamp
+/// predating this execution's own `started_at` cannot be one of its
+/// events. Gating on `>= started_at` means a genuinely dead worker with a
+/// stale prior-run timestamp is still reaped, while a live worker with
+/// flowing events is spared.
+fn corroborating_liveness(state: &LiveWorkerState, started_epoch: i64, now_epoch_secs: i64) -> Option<String> {
+    let started_iso = iso8601_utc(started_epoch);
+    // A hook whose timestamp predates this execution's start belongs to a
+    // prior run on a recycled slot — not evidence of *this* worker's life.
+    let in_execution_event = state.last_event_at.as_deref().filter(|e| *e >= started_iso.as_str());
+
+    // A tool in flight (an unbalanced PreToolUse) means the worker is
+    // legitimately busy — most importantly a long foreground `bazel build`
+    // that emits no hook for many minutes. Genuine death mid-tool closes
+    // the pane and is caught by the app's authoritative pane-death report
+    // (`reap_reported_pane_death`), not this speculative probe, so sparing
+    // here cannot strand a truly-dead worker.
+    if let Some(tool) = state.current_tool.as_deref()
+        && let Some(event) = in_execution_event
+    {
+        return Some(format!("tool `{tool}` in flight (last hook {event})"));
+    }
+
+    // A hook within the corroboration window proves the process tree is
+    // alive whatever the pid probe says.
+    let recent_cutoff = iso8601_utc(now_epoch_secs - DEAD_PID_CORROBORATION_SECS);
+    if let Some(event) = in_execution_event
+        && event >= recent_cutoff.as_str()
+    {
+        return Some(format!("hook event at {event} within {DEAD_PID_CORROBORATION_SECS}s"));
+    }
+
+    None
 }
 
 /// Immediately reap the execution behind `run_id` after the app reports
@@ -386,9 +560,74 @@ pub async fn reap_reported_pane_death(
             reason: &reason,
             now_epoch_secs,
             file_pane_death_attention: false,
+            probe_observation: None,
         },
     )
     .await
+}
+
+/// What the liveness probe and live-state observed at the moment a
+/// periodic-sweep reap was decided. Recorded on the reap's `tracing` log
+/// and `dead_pid_reconcile` dispatch-event details so a future death is
+/// explainable from the run's record — the operator's explicit ask that a
+/// reaped run's transcript never "just stops" with no indication of why.
+/// Only produced on the speculative periodic path; the app-reported
+/// pane-death reap has no probe to describe.
+struct LivenessProbeObservation {
+    /// The liveness probe performed, e.g. `"kill(pid,0)"`.
+    probe: &'static str,
+    /// The probe's raw result, e.g. `"ESRCH"`.
+    result: &'static str,
+    /// The slot's last hook timestamp (ISO-8601), if any.
+    last_event_at: Option<String>,
+    /// Age of `last_event_at` in seconds at reap time, if parseable.
+    last_event_age_secs: Option<i64>,
+    /// Tool in flight at reap time (unbalanced `PreToolUse`), if any.
+    current_tool: Option<String>,
+}
+
+impl LivenessProbeObservation {
+    /// Build the observation for a `kill(pid,0)==ESRCH` verdict from the
+    /// slot's live state.
+    fn from_dead_probe(state: &LiveWorkerState, now_epoch_secs: i64) -> Self {
+        let last_event_age_secs = state
+            .last_event_at
+            .as_deref()
+            .and_then(crate::iso8601::parse_iso8601_to_epoch)
+            .map(|e| now_epoch_secs - e);
+        Self {
+            probe: "kill(pid,0)",
+            result: "ESRCH",
+            last_event_at: state.last_event_at.clone(),
+            last_event_age_secs,
+            current_tool: state.current_tool.clone(),
+        }
+    }
+
+    /// One-line human summary of the live-state activity at reap time,
+    /// folded into the orphan `reason` recorded on the run record.
+    fn activity_summary(&self) -> String {
+        let event = match (&self.last_event_at, self.last_event_age_secs) {
+            (Some(at), Some(age)) => format!("last hook {at} ({age}s ago)"),
+            (Some(at), None) => format!("last hook {at}"),
+            (None, _) => "no hook event ever observed".to_owned(),
+        };
+        match &self.current_tool {
+            Some(tool) => format!("{event}, tool `{tool}` in flight"),
+            None => format!("{event}, no tool in flight"),
+        }
+    }
+
+    /// The observation as JSON fields for the dispatch-event details.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "probe": self.probe,
+            "probe_result": self.result,
+            "last_event_at": self.last_event_at,
+            "last_event_age_secs": self.last_event_age_secs,
+            "current_tool": self.current_tool,
+        })
+    }
 }
 
 /// Per-reap parameters that don't identify *what* is being reaped (that's
@@ -399,6 +638,10 @@ struct ReapOptions<'a> {
     reason: &'a str,
     now_epoch_secs: i64,
     file_pane_death_attention: bool,
+    /// What the liveness probe observed, when the reap came from the
+    /// speculative periodic sweep. `None` for the app-reported pane-death
+    /// reap, which has no speculative probe to describe.
+    probe_observation: Option<&'a LivenessProbeObservation>,
 }
 
 /// Shared reap effects for a single dead worker: mark the execution
@@ -424,6 +667,7 @@ async fn reap_dead_execution(
         reason,
         now_epoch_secs,
         file_pane_death_attention,
+        probe_observation,
     } = options;
     let execution_id = &state.run_id;
 
@@ -432,6 +676,11 @@ async fn reap_dead_execution(
         work_item_id = %execution.work_item_id,
         pid = state.shell_pid,
         slot_id = state.slot_id,
+        probe = probe_observation.map(|o| o.probe),
+        probe_result = probe_observation.map(|o| o.result),
+        last_event_at = probe_observation.and_then(|o| o.last_event_at.as_deref()),
+        last_event_age_secs = probe_observation.and_then(|o| o.last_event_age_secs),
+        current_tool = probe_observation.and_then(|o| o.current_tool.as_deref()),
         reason,
         "dead-pid reconcile: reaping execution and releasing slot",
     );
@@ -481,18 +730,28 @@ async fn reap_dead_execution(
     let worker_id = worker_id_for_slot(state.slot_id);
     coordinator.release_worker_and_kick(&worker_id, None).await;
 
-    // Structured event for bossctl dispatch tail.
+    // Structured event for bossctl dispatch tail. Fold in what the
+    // liveness probe observed (probe type, result, and the live-state
+    // activity snapshot) so an operator can see exactly why the engine
+    // concluded the worker was dead — not just that it did.
+    let mut details = serde_json::json!({
+        "dead_pid": state.shell_pid,
+        "slot_id": state.slot_id,
+        "recovery_patch": recovery_patch
+            .as_deref()
+            .map(|p| p.display().to_string()),
+    });
+    if let Some(observation) = probe_observation
+        && let Some(obj) = details.as_object_mut()
+        && let serde_json::Value::Object(probe) = observation.to_json()
+    {
+        obj.extend(probe);
+    }
     dispatch_events
         .emit(
             DispatchEvent::new(Stage::DeadPidReconcile, Outcome::Ok, execution_id)
                 .with_work_item(&execution.work_item_id)
-                .with_details(serde_json::json!({
-                    "dead_pid": state.shell_pid,
-                    "slot_id": state.slot_id,
-                    "recovery_patch": recovery_patch
-                        .as_deref()
-                        .map(|p| p.display().to_string()),
-                })),
+                .with_details(details),
         )
         .await;
 
@@ -625,6 +884,53 @@ mod tests {
         pid
     }
 
+    /// Drive a slot to `Working` with NO tool in flight (a balanced
+    /// PreToolUse/PostToolUse pair). Stamps `last_event_at` to "now".
+    fn drive_working_idle(live_states: &LiveWorkerStateRegistry, slot_id: u8) {
+        use boss_protocol::WorkerEvent;
+        live_states.apply_event(
+            slot_id,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            slot_id,
+            &WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+    }
+
+    /// Drive a slot to `Working` WITH a tool in flight (a PreToolUse with
+    /// no balancing PostToolUse) — models a long foreground `bazel build`.
+    /// Stamps `last_event_at` to "now".
+    fn drive_tool_in_flight(live_states: &LiveWorkerStateRegistry, slot_id: u8) {
+        use boss_protocol::WorkerEvent;
+        live_states.apply_event(
+            slot_id,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+    }
+
+    /// The parsed `started_at` epoch for an execution (panics if unset).
+    fn started_epoch_of(db: &WorkDb, execution_id: &str) -> i64 {
+        db.get_execution(execution_id)
+            .unwrap()
+            .started_at
+            .and_then(|s| s.parse::<i64>().ok())
+            .expect("started_at set")
+    }
+
     // ─── tests ───────────────────────────────────────────────────────────────
 
     /// A slot backed by the live test process PID is never reaped, even
@@ -650,7 +956,14 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
 
         assert_eq!(outcome.reaped, 0, "live PID must not be reaped");
         assert_eq!(outcome.alive_skipped, 1);
@@ -687,7 +1000,14 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
 
         assert_eq!(outcome.reaped, 0, "zero PID must be skipped");
         assert_eq!(outcome.unknown_pid_skipped, 1);
@@ -725,7 +1045,14 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
 
         assert_eq!(outcome.reaped, 0, "grace period must prevent reaping fresh executions");
         assert_eq!(outcome.grace_skipped, 1);
@@ -756,7 +1083,14 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
 
         assert_eq!(outcome.reaped, 0, "missing started_at must be treated as too fresh");
         assert_eq!(outcome.grace_skipped, 1);
@@ -787,7 +1121,14 @@ mod tests {
         coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
 
         assert_eq!(
             outcome.reaped, 0,
@@ -823,7 +1164,14 @@ mod tests {
         );
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref(), false).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
 
         assert_eq!(outcome.reaped, 1, "dead-PID execution must be reaped");
         assert_eq!(outcome.alive_skipped, 0);
@@ -1185,5 +1533,259 @@ mod tests {
 
         assert!(!reaped);
         assert!(sink.events().await.is_empty());
+    }
+
+    // ─── liveness corroboration (the T2450 false-reap fix) ────────────────────
+
+    /// The T2450 reproduction: the registered shell pid is *dead* (a
+    /// wrapper/login shell that exited or exec'd), but the worker's real
+    /// `claude` process is alive and actively emitting hook events. The
+    /// periodic speculative sweep must NOT reap it — the recent
+    /// in-execution activity corroborates that the worker lives despite the
+    /// dead pid. This is exactly the run that kept producing transcript
+    /// events for a full minute after the engine logged its pid "not found".
+    #[tokio::test]
+    async fn dead_pid_with_recent_event_is_not_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        // Dead pid = the transient wrapper shell that exited.
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        // Recent hook events = the real worker process, alive and working.
+        drive_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 0,
+            "a live worker with a dead tracked pid must NOT be reaped"
+        );
+        assert_eq!(outcome.live_corroborated_skipped, 1);
+
+        // Execution untouched, slot still claimed, no reap event.
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Ready,
+            "execution must be untouched when live-event activity contradicts the dead probe",
+        );
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the live worker's slot must remain claimed",
+        );
+        assert!(
+            sink.events().await.is_empty(),
+            "no reap event may be emitted for a live worker"
+        );
+    }
+
+    /// A dead tracked pid with a *tool in flight* (a long foreground
+    /// `bazel build` that emits no hook for minutes) is spared even when
+    /// the last hook predates the corroboration window — a tool in flight
+    /// is itself proof the worker is busy, and a genuine death mid-tool is
+    /// caught by the app's authoritative pane-death report, not this probe.
+    #[tokio::test]
+    async fn dead_pid_with_tool_in_flight_is_not_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let started = started_epoch_of(&db, &execution_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        drive_tool_in_flight(&live_states, 1);
+        // Backdate the PreToolUse well past the corroboration window, but
+        // still after this execution's start (so it is correctly
+        // attributed). Only the in-flight tool spares it here.
+        live_states.set_last_event_at_for_test(1, iso8601_utc(started + 10));
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 0,
+            "a tool in flight must never be reaped by the dead-pid sweep"
+        );
+        assert_eq!(outcome.live_corroborated_skipped, 1);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// A genuinely dead worker — dead pid, an in-execution hook that has
+    /// aged out of the corroboration window, and no tool in flight — is
+    /// still reaped. Proves the corroboration guard narrows the reap to
+    /// live workers rather than disabling it.
+    #[tokio::test]
+    async fn dead_pid_with_stale_event_and_no_tool_is_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let started = started_epoch_of(&db, &execution_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        drive_working_idle(&live_states, 1); // Working, no tool in flight
+        // Last hook is attributed to this execution (after started) but far
+        // older than DEAD_PID_CORROBORATION_SECS — no live corroboration.
+        live_states.set_last_event_at_for_test(1, iso8601_utc(started + 5));
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 1, "a genuinely quiet dead worker must still be reaped");
+        assert_eq!(outcome.live_corroborated_skipped, 0);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+
+        // The reap event carries what the liveness probe observed (probe
+        // type, result, and the live-state activity snapshot) so a future
+        // death is explainable from the dispatch tail — the operator's ask
+        // that a reaped run never "just stops" with no indication of why.
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "dead_pid_reconcile");
+        let details = &events[0].details;
+        assert_eq!(details.get("probe").and_then(|v| v.as_str()), Some("kill(pid,0)"));
+        assert_eq!(details.get("probe_result").and_then(|v| v.as_str()), Some("ESRCH"));
+        assert!(
+            details.get("last_event_at").is_some(),
+            "the probe observation's live-state snapshot must be recorded; got: {details}",
+        );
+    }
+
+    /// A recycled slot carrying a *prior* run's last-event timestamp (an
+    /// event predating this execution's `started_at`) must not corroborate
+    /// liveness — the current worker is genuinely dead and must be reaped.
+    /// Guards against the attribution artifact from [`crate::stale_worker_sweep`]
+    /// leaking into the opposite (never-reap) failure here.
+    #[tokio::test]
+    async fn dead_pid_with_prestart_event_is_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let started = started_epoch_of(&db, &execution_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        // Tool "in flight" AND a recent-looking timestamp — but the
+        // timestamp belongs to a PRIOR run (before this execution started),
+        // so neither corroboration branch may fire.
+        drive_tool_in_flight(&live_states, 1);
+        live_states.set_last_event_at_for_test(1, iso8601_utc(started - 3_600));
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 1,
+            "a prior-run timestamp on a recycled slot must not spare a genuinely dead worker",
+        );
+        assert_eq!(outcome.live_corroborated_skipped, 0);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+    }
+
+    /// Gating: the app-reattach reconcile does NOT corroborate. A dead pid
+    /// with recent in-execution events is still reaped there, because the
+    /// prior app is known-dead and the reattach pass is one-shot with no
+    /// way to temporally disambiguate a just-before-death event from a
+    /// survivor. (The periodic sweep, which re-runs, is where corroboration
+    /// belongs — see `dead_pid_with_recent_event_is_not_reaped`.)
+    #[tokio::test]
+    async fn reattach_reconcile_reaps_dead_pid_despite_recent_event() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        drive_working_idle(&live_states, 1); // recent in-execution events
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = reconcile_orphans_on_reattach(
+            db.clone(),
+            live_states.clone(),
+            coordinator.clone(),
+            sink.clone() as Arc<dyn DispatchEventSink>,
+            1111,
+            2222,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 1,
+            "reattach must reap a dead pid even with recent events (no corroboration on reattach)",
+        );
+        assert_eq!(outcome.live_corroborated_skipped, 0);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "dead_pid_reconcile");
     }
 }
