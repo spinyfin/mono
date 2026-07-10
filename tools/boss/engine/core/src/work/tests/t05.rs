@@ -1939,6 +1939,72 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Attempts-used accounting: `get_ci_attempts_used` reports 0 for a
+/// fresh row, `increment_ci_attempts_used` accumulates one bump per
+/// call (and the running total surfaces in the budget snapshot's
+/// `used` field), and `reset_ci_attempts_used` zeroes it back out.
+/// Both writers guard on `deleted_at IS NULL`, so neither touches a
+/// soft-deleted row — the read path (which has no such guard) proves
+/// the last live value survives unchanged.
+#[test]
+fn ci_attempts_used_increment_and_reset_accounting() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "attempts-accounting");
+    let pr = "https://github.com/spinyfin/mono/pull/903";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    // Default: a fresh row reports zero attempts used.
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+
+    // Each increment bumps the running total by exactly one.
+    db.increment_ci_attempts_used(&chore).unwrap();
+    db.increment_ci_attempts_used(&chore).unwrap();
+    db.increment_ci_attempts_used(&chore).unwrap();
+    assert_eq!(
+        db.get_ci_attempts_used(&chore).unwrap(),
+        3,
+        "three increments accumulate to a running total of 3",
+    );
+    // The same counter surfaces through the budget snapshot.
+    assert_eq!(
+        db.ci_budget_snapshot(&chore).unwrap().unwrap().used,
+        3,
+        "the snapshot's `used` field reflects the accumulated counter",
+    );
+
+    // reset zeroes the counter back out...
+    db.reset_ci_attempts_used(&chore).unwrap();
+    assert_eq!(
+        db.get_ci_attempts_used(&chore).unwrap(),
+        0,
+        "reset returns the running total to zero",
+    );
+    // ...and is idempotent on an already-zero counter.
+    db.reset_ci_attempts_used(&chore).unwrap();
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+
+    // Both writers guard on `deleted_at IS NULL`. Bump once, soft-delete
+    // the row, then confirm a further increment / reset are no-ops: the
+    // read path (no deleted_at guard) still sees the last live value.
+    db.increment_ci_attempts_used(&chore).unwrap();
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+            params![chore, now_string()],
+        )
+        .unwrap();
+    }
+    db.increment_ci_attempts_used(&chore).unwrap();
+    db.reset_ci_attempts_used(&chore).unwrap();
+    assert_eq!(
+        db.get_ci_attempts_used(&chore).unwrap(),
+        1,
+        "increment/reset are no-ops on a soft-deleted row",
+    );
+}
+
 /// Regression: rows with `effort_level = ''` (empty string, produced by
 /// older write paths when clearing the field) should be converted to NULL
 /// by the `migrate_tasks_empty_effort_to_null` migration so canonical
