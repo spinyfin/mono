@@ -7,9 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use boss_protocol::{
-    ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus, WorkerActivity,
-};
+use boss_protocol::{ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -982,7 +980,7 @@ pub(crate) fn occupying_live_worker(
 ) -> Option<String> {
     live.iter()
         .filter(|s| s.run_id != self_execution_id)
-        .filter(|s| !matches!(s.activity, WorkerActivity::Terminated | WorkerActivity::Errored))
+        .filter(|s| !s.activity.is_terminal())
         .filter(|s| s.shell_pid > 0 && pid_alive(s.shell_pid))
         .find(|s| workspace_id_of_execution(&s.run_id).as_deref() == Some(leased_workspace_id))
         .map(|s| s.run_id.clone())

@@ -60,6 +60,15 @@ pub enum WorkerActivity {
 }
 
 impl WorkerActivity {
+    /// True iff the activity indicates the worker is no longer attached
+    /// to its slot — `Terminated` because it exited, `Errored` because
+    /// the events socket gave up on it. The remaining activity values
+    /// (`Spawning`, `Working`, `WaitingForInput`, `Idle`) all describe
+    /// a live, slot-holding worker.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, WorkerActivity::Terminated | WorkerActivity::Errored)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             WorkerActivity::Spawning => "spawning",

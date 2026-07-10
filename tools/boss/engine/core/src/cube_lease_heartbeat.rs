@@ -143,7 +143,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use boss_protocol::{ExecutionKind, WorkExecution, WorkerActivity};
+use boss_protocol::{ExecutionKind, WorkExecution};
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
@@ -394,7 +394,7 @@ async fn run_one_pass_impl(
 
         // Terminal activity → the completion / teardown path owns lease
         // release; there is nothing to keep alive.
-        if is_terminal_activity(state.activity) {
+        if state.activity.is_terminal() {
             outcome.terminal_skipped += 1;
             registered_run_ids.insert(state.run_id.clone());
             breaker.forget(&state.run_id);
@@ -911,10 +911,6 @@ pub async fn reheartbeat_live_runs(
         }
     }
     heartbeated
-}
-
-fn is_terminal_activity(activity: WorkerActivity) -> bool {
-    matches!(activity, WorkerActivity::Terminated | WorkerActivity::Errored)
 }
 
 #[cfg(test)]
