@@ -109,6 +109,14 @@ enum EngineEvent {
     case projectsList(productId: String, projects: [WorkProject])
     case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency])
     case workItemCreated(item: WorkItemPayload)
+    /// Batch counterpart of `workItemCreated`, pushed on a product's work
+    /// topic by background jobs that create many rows at once with no
+    /// originating session to reply to directly (e.g. the auto-populate
+    /// Populator staging a design's task breakdown — design
+    /// auto-populate-project-tasks-on-design-pr-merge.md §"Surfacing").
+    /// Unlike `workItemCreated`, applying this must not steal the
+    /// operator's current selection/filters — it's a passive data refresh.
+    case workItemsCreated(items: [WorkItemPayload])
     case workItemUpdated(item: WorkItemPayload)
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
@@ -1719,6 +1727,12 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.workItemCreated(item: item))
+            case "work_items_created":
+                let rawItems = payload["items"] as? [[String: Any]] ?? []
+                let items = rawItems.compactMap(parseWorkItem)
+                if !items.isEmpty {
+                    emit(.workItemsCreated(items: items))
+                }
             case "work_item_updated":
                 guard let itemPayload = payload["item"] as? [String: Any],
                       let item = parseWorkItem(itemPayload)
