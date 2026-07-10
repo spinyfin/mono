@@ -48,10 +48,15 @@ impl WorkDb {
 
     /// Insert a `conflict_resolutions` row with `status='pending'`
     /// alongside a `tasks.blocked_attempt_id` pointer to the new
-    /// attempt id. `(work_item_id, base_sha_at_trigger)` is the
-    /// idempotency key — a second probe for the same `(item, sha)`
+    /// attempt id. `(work_item_id, base_sha_at_trigger, head_sha_before)`
+    /// is the idempotency key — a second probe for the same triple
     /// finds the row already pending and returns `Ok(None)` (caller
     /// reads the existing row via [`Self::active_conflict_resolution_for_work_item`]).
+    /// `head_sha_before` is included because `base_sha_at_trigger` mirrors
+    /// GitHub's PR `baseRefOid`, which is fixed at PR-open time and does
+    /// not track `main` moving under an in-review PR — keying on it alone
+    /// would make every re-arm past a stale `succeeded` attempt collide
+    /// forever (T2396 / PR #1874).
     ///
     /// Phase 3 of the merge-conflict design (Q4). The caller is
     /// `conflict_watch::on_conflict_detected` after the parent
@@ -354,9 +359,10 @@ impl WorkDb {
 
     /// Abandon a stale `conflict_resolutions` row for supersede when the base
     /// SHA has NOT changed. Nullifies `base_sha_at_trigger` to free the
-    /// `UNIQUE (work_item_id, base_sha_at_trigger)` slot so the INSERT in
-    /// `on_conflict_detected` can create a fresh row with the current base SHA
-    /// and the churn guard can count this supersede toward the rolling window.
+    /// `UNIQUE (work_item_id, base_sha_at_trigger, head_sha_before)` slot so
+    /// the INSERT in `on_conflict_detected` can create a fresh row with the
+    /// current base SHA and the churn guard can count this supersede toward
+    /// the rolling window.
     ///
     /// SQLite treats NULL as distinct from every other value (including other
     /// NULLs) in UNIQUE constraints, so clearing the column releases the slot

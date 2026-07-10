@@ -429,8 +429,14 @@ impl WorkDb {
         // kanban card can show the real defer reason (chain_serialized,
         // pool_exhausted) instead of a generic "Waiting for a slot".
         migrate_work_executions_dispatch_wait(&conn)?;
+        // Widen the conflict_resolutions idempotency key so the
+        // stale-base re-arm path in conflict_watch can dispatch a fresh
+        // attempt once a `succeeded` row's resolution has gone stale,
+        // instead of colliding with that row's UNIQUE slot forever
+        // (T2396 / PR #1874).
+        migrate_conflict_resolutions_widen_unique_key(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '23')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '24')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

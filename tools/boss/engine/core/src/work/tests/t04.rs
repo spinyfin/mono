@@ -605,7 +605,7 @@ fn fresh_init_includes_external_tracker_schema() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
     let _ = std::fs::remove_file(path);
 }
 
@@ -699,7 +699,7 @@ fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
     let _ = std::fs::remove_file(path);
 }
 
@@ -970,7 +970,12 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
                  work_item_id TEXT NOT NULL, pr_url TEXT NOT NULL,
                  pr_number INTEGER NOT NULL, head_branch TEXT NOT NULL,
                  base_branch TEXT NOT NULL,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL);
+                 base_sha_at_trigger TEXT, head_sha_before TEXT, head_sha_after TEXT,
+                 status TEXT NOT NULL, failure_reason TEXT,
+                 cube_lease_id TEXT, cube_workspace_id TEXT, worker_id TEXT,
+                 conflict_diagnosis TEXT,
+                 created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                 UNIQUE (work_item_id, base_sha_at_trigger));
              INSERT INTO products(id, name, slug, status, created_at, updated_at)
              VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
              INSERT INTO tasks(id, product_id, project_id, kind, name, status,
@@ -1083,7 +1088,7 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
 
     // After migration we can also write a fresh `blocked` row
     // and re-backfill is still a no-op (the existing rows

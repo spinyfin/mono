@@ -1821,3 +1821,86 @@ pub(crate) fn migrate_tasks_dispatch_failure_columns(conn: &Connection) -> Resul
     }
     Ok(())
 }
+
+/// Widen the `conflict_resolutions` idempotency key from
+/// `(work_item_id, base_sha_at_trigger)` to `(work_item_id,
+/// base_sha_at_trigger, head_sha_before)`.
+///
+/// `base_sha_at_trigger` mirrors GitHub's PR `baseRefOid`, which is fixed
+/// at PR-open time and does not track `main` advancing under an in-review
+/// PR (confirmed live on T2396 / PR #1874: `baseRefOid` stayed put while
+/// `main` moved twice). `conflict_watch`'s stale-base re-arm path relies on
+/// the key changing so it can dispatch a fresh attempt once a `succeeded`
+/// row's resolution has gone stale; keyed on `base_sha_at_trigger` alone,
+/// every re-arm collides with that same succeeded row's UNIQUE slot
+/// forever, so `Ok(None)` comes back, no attempt is created, and the
+/// parent sits blocked with no fix vehicle in flight indefinitely.
+/// `head_sha_before` — the PR branch head observed at trigger time — does
+/// advance each time a resolution attempt actually pushes a fix commit, so
+/// folding it into the key lets a re-arm past a stale success create a new
+/// row while still deduping true repeat probes (same base, same head —
+/// nothing has actually changed since the last attempt).
+///
+/// SQLite can't alter a UNIQUE constraint in place, so the table is
+/// rebuilt — same pattern as `migrate_work_attention_items_work_item_id`.
+/// Idempotent: guarded by inspecting the live `CREATE TABLE` DDL for the
+/// widened constraint text rather than a column-presence check (no new
+/// column is added here, so `table_has_column` can't tell old from new).
+pub(crate) fn migrate_conflict_resolutions_widen_unique_key(conn: &Connection) -> Result<()> {
+    let already_widened: bool = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conflict_resolutions'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|sql| sql.contains("base_sha_at_trigger, head_sha_before"))
+        .unwrap_or(false);
+    if already_widened {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE conflict_resolutions_v2 (
+             id                  TEXT PRIMARY KEY,
+             product_id          TEXT NOT NULL,
+             work_item_id        TEXT NOT NULL,
+             pr_url              TEXT NOT NULL,
+             pr_number           INTEGER NOT NULL,
+             head_branch         TEXT NOT NULL,
+             base_branch         TEXT NOT NULL,
+             base_sha_at_trigger TEXT,
+             head_sha_before     TEXT,
+             head_sha_after      TEXT,
+             status              TEXT NOT NULL,
+             failure_reason      TEXT,
+             cube_lease_id       TEXT,
+             cube_workspace_id   TEXT,
+             worker_id           TEXT,
+             conflict_diagnosis  TEXT,
+             created_at          TEXT NOT NULL,
+             started_at          TEXT,
+             finished_at         TEXT,
+             revision_task_id    TEXT,
+             UNIQUE (work_item_id, base_sha_at_trigger, head_sha_before)
+         );
+         INSERT INTO conflict_resolutions_v2
+             (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+              base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
+              cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
+              created_at, started_at, finished_at, revision_task_id)
+         SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
+                cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
+                created_at, started_at, finished_at, revision_task_id
+           FROM conflict_resolutions;
+         DROP TABLE conflict_resolutions;
+         ALTER TABLE conflict_resolutions_v2 RENAME TO conflict_resolutions;
+         CREATE INDEX IF NOT EXISTS conflict_resolutions_status_idx
+             ON conflict_resolutions(status);
+         CREATE INDEX IF NOT EXISTS conflict_resolutions_work_item_idx
+             ON conflict_resolutions(work_item_id);
+         CREATE INDEX IF NOT EXISTS conflict_resolutions_product_idx
+             ON conflict_resolutions(product_id);",
+    )?;
+    Ok(())
+}

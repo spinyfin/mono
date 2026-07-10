@@ -412,6 +412,110 @@ async fn cycle_conflict_resolve_conflict() {
     );
 }
 
+/// Regression test for T2396 / PR #1874: the stale-base re-arm path
+/// must not permanently no-op when a succeeded crz's resolution has
+/// gone stale (PR still CONFLICTING) but the PR's `baseRefOid` — fixed
+/// at PR-open time — hasn't moved. GitHub never advances `baseRefOid`
+/// as `main` moves under an in-review PR, so keying the re-arm insert
+/// on `base_sha_at_trigger` alone collided with the succeeded row's
+/// UNIQUE slot forever. `head_sha_before` DOES vary — a real resolution
+/// attempt pushes a fix commit — so folding it into the key lets this
+/// re-arm create a fresh row and spawn a second revision.
+#[tokio::test]
+async fn rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/16";
+    let (product, chore) = make_in_review(&db, "C-rearm-stale-base", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    // First conflict: head is "head-before-resolution". Revision spawns,
+    // parent stays in_review.
+    assert!(
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe_with_head(
+                pr,
+                PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+                "head-before-resolution"
+            ),
+        )
+        .await
+    );
+    let first_attempt = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("first attempt must exist");
+
+    // The revision resolves the conflict — the worker pushes a fix commit,
+    // so the head moves. The PR briefly reports clean, retiring the attempt
+    // to `succeeded` (parent was in_review the whole time, so it stays there).
+    assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await);
+    let succeeded = db.get_conflict_resolution(&first_attempt.id).unwrap().unwrap();
+    assert_eq!(succeeded.status, "succeeded");
+
+    // Simulate the parent having been left `blocked: merge_conflict` by an
+    // earlier sweep (the direct-flip UNIQUE-collision path in
+    // `cycle_conflict_resolve_conflict` demonstrates how this happens).
+    // This routes the next detection through the re-arm branch rather
+    // than the primary WHERE-guard flip.
+    db.update_work_item(
+        &chore,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some("merge_conflict".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    // `main` moves further before any new push happens: the PR is
+    // CONFLICTING again, GitHub's baseRefOid is UNCHANGED (still
+    // "abc123" — it never tracks `main`), but the head now reflects
+    // the fix commit the resolved attempt pushed.
+    let second = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(
+            pr,
+            PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+            "head-after-resolution",
+        ),
+    )
+    .await;
+    assert!(second, "re-arm must report a state change (revision spawned)");
+
+    // A second, distinct attempt row must exist with a fresh revision.
+    let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "re-arm must create a second attempt row, got {attempts:?}"
+    );
+    let second_attempt = attempts
+        .iter()
+        .find(|a| a.id != first_attempt.id)
+        .expect("a second, distinct attempt row must exist");
+    assert_eq!(second_attempt.status, "pending");
+    assert!(
+        second_attempt.revision_task_id.is_some(),
+        "re-arm must spawn a fresh revision, got {second_attempt:?}",
+    );
+    assert_eq!(second_attempt.base_sha_at_trigger.as_deref(), Some("abc123"));
+    assert_eq!(second_attempt.head_sha_before.as_deref(), Some("head-after-resolution"));
+
+    // Parent must be unblocked back to in_review — the fresh revision is
+    // now the fix vehicle in flight.
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
+}
+
 #[tokio::test]
 async fn detection_skipped_when_human_moved_row_off_in_review() {
     let dir = tempdir().unwrap();

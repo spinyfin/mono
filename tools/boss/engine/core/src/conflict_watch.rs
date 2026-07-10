@@ -472,13 +472,19 @@ pub async fn on_conflict_detected(
                     };
                     match latest_status.as_str() {
                         "succeeded" => {
-                            // Previous worker succeeded against an obsolete base.
-                            // Fall through to dispatch against the current base SHA.
+                            // Previous worker succeeded but the PR is CONFLICTING
+                            // again (main moved further). Fall through to the
+                            // insert path, which creates a fresh row keyed on
+                            // (base, head) — see the UNIQUE-key note above the
+                            // insert call. If insert_conflict_resolution collides
+                            // (head hasn't actually moved since the succeeded
+                            // attempt), that path logs why no fresh attempt landed.
                             tracing::info!(
                                 work_item_id = %candidate.work_item_id,
                                 pr_url = %candidate.pr_url,
                                 base_ref_oid = ?probe.base_ref_oid,
-                                "conflict_watch: stale-base re-arm: succeeded crz but PR still CONFLICTING; dispatching fresh attempt",
+                                head_ref_oid = ?probe.head_ref_oid,
+                                "conflict_watch: stale-base re-arm: succeeded crz but PR still CONFLICTING; attempting fresh dispatch",
                             );
                         }
                         "pending" => {
@@ -534,12 +540,18 @@ pub async fn on_conflict_detected(
     supersede_stale_ci_remediation(work_db, candidate);
 
     // Insert the `conflict_resolutions` attempt row. The UNIQUE key is
-    // `(work_item_id, base_sha_at_trigger)`, so a second sweep for the
-    // same base sha returns `Ok(None)` — idempotent and safe to call on
-    // every conflict-detected event. In the re-arm path the base SHA is
-    // the *current* main SHA (different from the stale crz's
-    // base_sha_at_trigger), so a new row is inserted. The churn guard
-    // pre-abandons the 4th attempt inside a rolling 1h window.
+    // `(work_item_id, base_sha_at_trigger, head_sha_before)`, so a second
+    // sweep for the same base+head returns `Ok(None)` — idempotent and
+    // safe to call on every conflict-detected event. NOTE:
+    // `base_sha_at_trigger` mirrors GitHub's PR `baseRefOid`, which is
+    // fixed at PR-open time and does NOT track `main` advancing under an
+    // in-review PR — it is not "the current main SHA," and re-arms can't
+    // rely on it changing. `head_sha_before` is what actually varies
+    // across re-arms: a genuine resolution attempt pushes a new commit,
+    // so a re-arm past a stale `succeeded` row sees a different head and
+    // gets a fresh key here, while a true repeat probe (nothing has
+    // changed since the last attempt) still collides and dedupes. The
+    // churn guard pre-abandons the 4th attempt inside a rolling 1h window.
     let attempt = match work_db.insert_conflict_resolution(ConflictResolutionInsertInput {
         product_id: candidate.product_id.clone(),
         work_item_id: candidate.work_item_id.clone(),
@@ -552,8 +564,26 @@ pub async fn on_conflict_detected(
     }) {
         Ok(Some(a)) => Some(a),
         Ok(None) => {
-            // UNIQUE collision — a row for this base sha already exists.
-            // Fall back to a lookup so the started-event still fires.
+            // UNIQUE collision — a row for this (base, head) key already
+            // exists. This used to be silent, which made the preceding
+            // "dispatching fresh attempt" log actively misleading (it
+            // logged intent to dispatch, then this no-op quietly ate it).
+            // Log the colliding row so the fall-through is diagnosable,
+            // then fall back to a lookup so the started-event still fires
+            // if that row happens to be active.
+            let colliding = work_db
+                .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
+                .ok()
+                .flatten();
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                base_sha_at_trigger = ?probe.base_ref_oid,
+                head_sha_before = ?probe.head_ref_oid,
+                colliding_attempt_id = ?colliding.as_ref().map(|c| c.id.as_str()),
+                colliding_status = ?colliding.as_ref().map(|c| c.status.as_str()),
+                "conflict_watch: insert_conflict_resolution UNIQUE collision; no fresh attempt created for this key",
+            );
             work_db
                 .active_conflict_resolution_for_work_item(&candidate.work_item_id)
                 .unwrap_or(None)
