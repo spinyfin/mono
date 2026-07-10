@@ -92,7 +92,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{LiveWorkerState, WorkExecution, WorkerActivity};
+use boss_protocol::{LiveWorkerState, WorkExecution};
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -325,7 +325,7 @@ pub async fn run_one_pass(
         }
 
         // Skip terminal slots — the completion path handles these.
-        if is_terminal_activity(state.activity) {
+        if state.activity.is_terminal() {
             continue;
         }
 
@@ -526,7 +526,7 @@ pub async fn reap_reported_pane_death(
         return false;
     };
 
-    if is_terminal_activity(state.activity) {
+    if state.activity.is_terminal() {
         // Already finalized via the normal completion path; nothing to do.
         return false;
     }
@@ -814,10 +814,6 @@ pub(crate) fn probe_pid(pid: i32) -> PidStatus {
         Some(libc::EPERM) => PidStatus::PermissionDenied,
         _ => PidStatus::Unknown(err),
     }
-}
-
-fn is_terminal_activity(activity: WorkerActivity) -> bool {
-    matches!(activity, WorkerActivity::Terminated | WorkerActivity::Errored)
 }
 
 #[cfg(test)]

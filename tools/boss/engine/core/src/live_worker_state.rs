@@ -137,7 +137,7 @@ impl LiveWorkerStateRegistry {
         guard
             .by_slot
             .values()
-            .find(|state| !is_terminal_activity(state.activity) && state.work_item_id.as_deref() == Some(work_item_id))
+            .find(|state| !state.activity.is_terminal() && state.work_item_id.as_deref() == Some(work_item_id))
             .map(|state| state.run_id.clone())
     }
 
@@ -156,7 +156,7 @@ impl LiveWorkerStateRegistry {
         guard
             .by_slot
             .values()
-            .any(|state| state.run_id == run_id && !is_terminal_activity(state.activity))
+            .any(|state| state.run_id == run_id && !state.activity.is_terminal())
     }
 
     /// Apply a hook event to the state for `slot_id`. Returns `true`
@@ -427,15 +427,6 @@ impl LiveWorkerStateRegistry {
             state.last_event_at = Some(last_event_at.into());
         }
     }
-}
-
-/// True iff `activity` indicates the worker is no longer attached
-/// to its slot — `Terminated` because it exited, `Errored` because
-/// the events socket gave up on it. The remaining activity values
-/// (`Spawning`, `Working`, `WaitingForInput`, `Idle`) all describe
-/// a live, slot-holding worker.
-fn is_terminal_activity(activity: WorkerActivity) -> bool {
-    matches!(activity, WorkerActivity::Terminated | WorkerActivity::Errored)
 }
 
 fn current_iso8601() -> String {
