@@ -1233,7 +1233,7 @@ fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1399,7 +1399,7 @@ fn migration_adds_created_via_with_unknown_default() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1443,7 +1443,7 @@ fn fresh_init_includes_tasks_repo_remote_url() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
 
     let _ = std::fs::remove_file(path);
 }
@@ -1529,7 +1529,7 @@ fn migration_from_v4_adds_tasks_repo_remote_url() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "23");
+    assert_eq!(version, "24");
 
     let _ = std::fs::remove_file(path);
 }
