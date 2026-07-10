@@ -5,9 +5,6 @@
 //!
 //! See `tools/boss/docs/buildkite-release-setup.md` for provisioning steps.
 
-use std::sync::OnceLock;
-use std::time::Duration;
-
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -30,17 +27,6 @@ struct CreateBuildBody<'a> {
     message: &'a str,
 }
 
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
 /// Trigger a new build on `flunge/mono` and return the resulting `BuildResponse`.
 pub async fn trigger_release_build(api_base: &str, token: &str) -> Result<BuildResponse> {
     let url = format!(
@@ -53,7 +39,7 @@ pub async fn trigger_release_build(api_base: &str, token: &str) -> Result<BuildR
         message: "Manual release via boss release",
     };
 
-    let client = http_client();
+    let client = boss_github::http_client();
     let resp = client
         .post(&url)
         .bearer_auth(token)

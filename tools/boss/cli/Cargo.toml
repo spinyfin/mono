@@ -15,7 +15,6 @@ clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
 git-utils = { path = "../../../lib/rust/git_utils" }
 reqwest = { workspace = true, features = ["json"] }
-rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

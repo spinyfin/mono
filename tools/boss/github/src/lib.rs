@@ -154,8 +154,9 @@ fn current_unix_time() -> Result<u64> {
 
 /// Process-wide reqwest client. Matches the engine's pane_summary
 /// pattern: install the rustls default provider once, then share a
-/// pooled client across calls.
-fn http_client() -> &'static reqwest::Client {
+/// pooled client across calls. Shared with other Boss crates (e.g.
+/// `boss`'s buildkite_release) so the OnceLock/rustls setup lives once.
+pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
