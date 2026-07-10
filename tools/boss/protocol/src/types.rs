@@ -5218,4 +5218,205 @@ mod tests {
         );
         assert_eq!(EXECUTION_KIND_PR_REVIEW, ExecutionKind::PrReview.as_str());
     }
+
+    /// Every `ExecutionStatus` variant. The exhaustive match below is the
+    /// tripwire: adding a variant to the enum without adding it here is a
+    /// compile error, which forces the classification tests to reckon with
+    /// the new state instead of silently ignoring it.
+    fn all_execution_statuses() -> Vec<ExecutionStatus> {
+        use ExecutionStatus::*;
+        let all = vec![
+            Queued,
+            Ready,
+            WaitingDependency,
+            Running,
+            WaitingHuman,
+            WaitingReview,
+            WaitingMerge,
+            Completed,
+            Failed,
+            Abandoned,
+            Cancelled,
+            Orphaned,
+        ];
+        for status in &all {
+            match status {
+                Queued | Ready | WaitingDependency | Running | WaitingHuman | WaitingReview | WaitingMerge
+                | Completed | Failed | Abandoned | Cancelled | Orphaned => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn execution_status_is_terminal_marks_only_closed_states() {
+        use ExecutionStatus::*;
+        for status in [Completed, Failed, Abandoned, Cancelled, Orphaned] {
+            assert!(status.is_terminal(), "{status} should be terminal");
+        }
+        for status in [
+            Queued,
+            Ready,
+            WaitingDependency,
+            Running,
+            WaitingHuman,
+            WaitingReview,
+            WaitingMerge,
+        ] {
+            assert!(!status.is_terminal(), "{status} should not be terminal");
+        }
+    }
+
+    #[test]
+    fn execution_status_is_live_marks_only_active_states() {
+        use ExecutionStatus::*;
+        for status in [Running, WaitingHuman] {
+            assert!(status.is_live(), "{status} should be live");
+        }
+        for status in [
+            Queued,
+            Ready,
+            WaitingDependency,
+            WaitingReview,
+            WaitingMerge,
+            Completed,
+            Failed,
+            Abandoned,
+            Cancelled,
+            Orphaned,
+        ] {
+            assert!(!status.is_live(), "{status} should not be live");
+        }
+    }
+
+    #[test]
+    fn execution_status_can_reconcile_marks_only_pre_dispatch_states() {
+        use ExecutionStatus::*;
+        for status in [Queued, Ready, WaitingDependency] {
+            assert!(status.can_reconcile(), "{status} should be reconcilable");
+        }
+        for status in [
+            Running,
+            WaitingHuman,
+            WaitingReview,
+            WaitingMerge,
+            Completed,
+            Failed,
+            Abandoned,
+            Cancelled,
+            Orphaned,
+        ] {
+            assert!(!status.can_reconcile(), "{status} should not be reconcilable");
+        }
+    }
+
+    #[test]
+    fn execution_status_classifications_are_mutually_exclusive() {
+        for status in all_execution_statuses() {
+            let count = [status.is_terminal(), status.is_live(), status.can_reconcile()]
+                .into_iter()
+                .filter(|&b| b)
+                .count();
+            assert!(
+                count <= 1,
+                "{status} is in more than one classification (terminal/live/reconcile)"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_status_waiting_review_and_merge_are_unclassified() {
+        // WaitingReview/WaitingMerge are intentionally in none of the three
+        // buckets: the work is done from the engine's dispatch perspective but
+        // not yet closed, and nothing to reconcile. Pin that gap so a future
+        // reclassification is a deliberate, test-visible change.
+        for status in [ExecutionStatus::WaitingReview, ExecutionStatus::WaitingMerge] {
+            assert!(!status.is_terminal(), "{status} should not be terminal");
+            assert!(!status.is_live(), "{status} should not be live");
+            assert!(!status.can_reconcile(), "{status} should not be reconcilable");
+        }
+    }
+
+    /// Every `TaskStatus` variant, with the same compile-time tripwire as
+    /// [`all_execution_statuses`].
+    fn all_task_statuses() -> Vec<TaskStatus> {
+        use TaskStatus::*;
+        let all = vec![Todo, Active, Blocked, InReview, Done, Archived, Cancelled];
+        for status in &all {
+            match status {
+                Todo | Active | Blocked | InReview | Done | Archived | Cancelled => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn task_status_is_terminal_marks_only_closed_states() {
+        use TaskStatus::*;
+        for status in [Done, Archived, Cancelled] {
+            assert!(status.is_terminal(), "{status} should be terminal");
+        }
+        for status in [Todo, Active, Blocked, InReview] {
+            assert!(!status.is_terminal(), "{status} should not be terminal");
+        }
+    }
+
+    #[test]
+    fn task_status_is_live_marks_only_in_progress_states() {
+        use TaskStatus::*;
+        for status in [Active, InReview] {
+            assert!(status.is_live(), "{status} should be live");
+        }
+        for status in [Todo, Blocked, Done, Archived, Cancelled] {
+            assert!(!status.is_live(), "{status} should not be live");
+        }
+    }
+
+    #[test]
+    fn task_status_classifications_are_mutually_exclusive() {
+        for status in all_task_statuses() {
+            assert!(
+                !(status.is_terminal() && status.is_live()),
+                "{status} is both terminal and live"
+            );
+        }
+    }
+
+    #[test]
+    fn task_status_display_label_renames_board_columns() {
+        assert_eq!(TaskStatus::Todo.display_label(), "backlog");
+        assert_eq!(TaskStatus::Active.display_label(), "doing");
+        assert_eq!(TaskStatus::InReview.display_label(), "review");
+    }
+
+    #[test]
+    fn task_status_display_label_matches_as_str_for_unrenamed_states() {
+        for status in [
+            TaskStatus::Blocked,
+            TaskStatus::Done,
+            TaskStatus::Archived,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(
+                status.display_label(),
+                status.as_str(),
+                "{status} board label should match its stored name"
+            );
+        }
+    }
+
+    #[test]
+    fn task_status_display_label_diverges_only_for_renamed_states() {
+        // The renamed trio must differ from `as_str`; everything else must
+        // agree. This catches both a missing rename and an accidental one.
+        use TaskStatus::*;
+        for status in all_task_statuses() {
+            let renamed = matches!(status, Todo | Active | InReview);
+            assert_eq!(
+                status.display_label() != status.as_str(),
+                renamed,
+                "{status} rename divergence did not match expectation"
+            );
+        }
+    }
 }
