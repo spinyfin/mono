@@ -338,6 +338,7 @@ fn override_npm_binding(name: &str, requirement: &BinaryRequirement, npm: &toml:
 /// `pub(crate)` so tests can call it directly (gated e2e, parity).
 pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) -> Result<PathBuf> {
     let build_output = Command::new("bazel")
+        .args(super::ci_bazel_startup_flags())
         .arg("build")
         .arg("--color=no")
         .arg("--curses=no")
@@ -359,6 +360,7 @@ pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) ->
     }
 
     let cquery_output = Command::new("bazel")
+        .args(super::ci_bazel_startup_flags())
         .arg("cquery")
         .arg("--color=no")
         .arg("--curses=no")

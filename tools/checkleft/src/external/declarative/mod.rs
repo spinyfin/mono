@@ -904,3 +904,19 @@ fn non_empty(field: &str, value: String) -> Result<String> {
     }
     Ok(trimmed.to_owned())
 }
+
+/// Bazel startup options (e.g. `--bazelrc=...`, `--max_idle_secs=...`) that CI sets
+/// via `CI_BAZEL_STARTUP_FLAGS` (see `.buildkite/steps/ci-env.sh`) and every CI
+/// bazel invocation must reuse verbatim. Bazel spins up a brand-new server -- and
+/// lets the old one linger for its full idle TTL -- whenever startup options
+/// differ from the currently running server for the same output_base, so a
+/// resolver or invocation that constructs its own ad hoc startup flags (or none at
+/// all) silently doubles the workspace's daemon count. Outside CI the env var is
+/// unset and bazel just uses its ambient defaults, matching a developer's own
+/// `bazel` invocations.
+pub(super) fn ci_bazel_startup_flags() -> Vec<String> {
+    std::env::var("CI_BAZEL_STARTUP_FLAGS")
+        .ok()
+        .map(|val| val.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}

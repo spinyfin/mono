@@ -13,7 +13,12 @@ build:ci --curses=no
 build:ci --show_progress_rate_limit=5.0
 build:ci --announce_rc
 
-startup:ci --max_idle_secs=7200
+# max_idle_secs is a bazel STARTUP option, so a `startup:ci` line here would
+# only take effect if something passed `--config=ci` as a startup flag (i.e.
+# before the subcommand) -- nothing does; `--config=ci-<os>` is always passed
+# as a build/test flag after the subcommand, which only reaches `build:ci`/
+# `test:ci` lines. Per-pipeline idle TTL is set directly on the command line
+# instead -- see CI_BAZEL_STARTUP_FLAGS in .buildkite/steps/ci-env.sh.
 
 # Linux cache configuration
 build:ci-linux --config=ci

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::app::RepobinError;
 
 fn extra_bazel_startup_flags() -> Vec<String> {
-    match std::env::var("REPOBIN_BAZEL_STARTUP_FLAGS") {
+    match std::env::var("CI_BAZEL_STARTUP_FLAGS") {
         Ok(val) if !val.trim().is_empty() => shell_words::split(&val).unwrap_or_default(),
         _ => vec![],
     }
