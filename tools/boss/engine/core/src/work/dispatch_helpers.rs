@@ -1265,11 +1265,8 @@ pub(crate) fn request_pr_review_in_tx(
         );
     }
 
-    if let Some(latest) = query_latest_execution_for_work_item(conn, work_item_id)?
-        && latest.kind == ExecutionKind::PrReview
-        && !latest.status.is_terminal()
-    {
-        return Ok(latest);
+    if let Some(existing) = existing_nonterminal_pr_review_execution(conn, work_item_id)? {
+        return Ok(existing);
     }
 
     insert_execution(
@@ -1280,6 +1277,33 @@ pub(crate) fn request_pr_review_in_tx(
             .status(ExecutionStatus::Ready)
             .build(),
     )
+}
+
+/// Returns the work item's latest execution when it is a non-terminal
+/// `pr_review` (`ready` / `waiting_dependency` / `running` / etc.) — the
+/// shared idempotency check for every path that enqueues an automated
+/// review, so a caller never inserts a second `pr_review` execution on top
+/// of one that is already enqueued or in flight for the same item.
+///
+/// Used by [`request_pr_review_in_tx`] (operator/recovery re-review) and by
+/// [`WorkDb::create_pr_review_execution_dedup`] (the automatic
+/// reviewer-enqueue path in `finalize_pr_transition`). The latter closes
+/// T366: two independent PR-completion triggers (the Stop-hook path and the
+/// merge-poller's `pr_recheck` sweep) could each observe the producing
+/// execution as not-yet-terminal and independently enqueue a `pr_review`
+/// execution for the same unchanged head sha, minting two findings
+/// revisions from two redundant reviews. Callers MUST run this check and
+/// the subsequent insert inside the same `Immediate` transaction — sqlite
+/// then serialises concurrent callers on the write lock, closing the
+/// check-then-insert race instead of merely narrowing it.
+pub(crate) fn existing_nonterminal_pr_review_execution(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    match query_latest_execution_for_work_item(conn, work_item_id)? {
+        Some(latest) if latest.kind == ExecutionKind::PrReview && !latest.status.is_terminal() => Ok(Some(latest)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1930,6 +1954,67 @@ mod tests {
         assert_eq!(
             first.id, second.id,
             "a second trigger while a pr_review is already queued must reuse the same execution"
+        );
+    }
+
+    // ── create_pr_review_execution_dedup (T366 regression) ──────────────────
+    //
+    // Reproduces the T366 incident: two independent PR-completion triggers
+    // (the Stop-hook path and the merge-poller's `pr_recheck` sweep) each
+    // observed the producing execution as not-yet-terminal and independently
+    // enqueued a `pr_review` execution for the same unchanged head sha,
+    // minting two near-identical findings revisions from a single push.
+
+    #[test]
+    fn create_pr_review_execution_dedup_creates_fresh_ready_execution() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/100", "active");
+
+        let (execution, is_new) = db
+            .create_pr_review_execution_dedup(&work_item_id, "https://github.com/test/repo")
+            .unwrap();
+
+        assert!(is_new, "first call must create a fresh execution");
+        assert_eq!(execution.kind, ExecutionKind::PrReview);
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+        assert_eq!(execution.work_item_id, work_item_id);
+    }
+
+    #[test]
+    fn create_pr_review_execution_dedup_reuses_existing_nonterminal_pr_review() {
+        // Two triggers for the SAME unchanged head, back to back — the exact
+        // shape of the T366 race (Stop hook + pr_recheck sweep both racing
+        // past the enqueue check before either recorded its completion).
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/101", "active");
+
+        let (first, first_is_new) = db
+            .create_pr_review_execution_dedup(&work_item_id, "https://github.com/test/repo")
+            .unwrap();
+        let (second, second_is_new) = db
+            .create_pr_review_execution_dedup(&work_item_id, "https://github.com/test/repo")
+            .unwrap();
+
+        assert!(first_is_new, "first call must create a fresh execution");
+        assert!(
+            !second_is_new,
+            "second call for the same unchanged head must reuse, not duplicate"
+        );
+        assert_eq!(
+            first.id, second.id,
+            "both calls must resolve to the SAME pr_review execution row"
+        );
+
+        let reviews: Vec<_> = db
+            .list_ready_executions()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == work_item_id)
+            .collect();
+        assert_eq!(
+            reviews.len(),
+            1,
+            "exactly one pr_review execution must exist for the work item after two triggers; got {reviews:?}",
         );
     }
 
