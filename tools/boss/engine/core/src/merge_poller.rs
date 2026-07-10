@@ -336,6 +336,55 @@ pub enum OpenPrCiStatus {
     InFlight,
 }
 
+/// Adaptive-polling urgency tier for a single PR (doc `github-event-
+/// detection-webhooks-vs-polling-2026-07-08.md` §9 item 3: "adaptive
+/// per-PR poll intervals driven by task status, replacing the single
+/// 60s global tick"). Derived straight from a PR's own last-observed
+/// lifecycle signals — no extra GitHub round trip needed, since
+/// [`reconcile_one`] already probed the PR to detect merges, conflicts,
+/// and CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollTier {
+    /// Something is actively moving — CI still running, the PR is
+    /// merge-queued, or mergeability is conflicting/still being
+    /// recomputed. Check back soon.
+    Hot,
+    /// Steady state: CI has reached a terminal result and the PR merges
+    /// cleanly. Nothing GitHub-side is expected to change without a
+    /// human action (approving, pushing a fix), so back off.
+    Cold,
+}
+
+impl PollTier {
+    /// How long to wait before reconciling this PR again.
+    pub fn interval(self) -> Duration {
+        match self {
+            PollTier::Hot => Duration::from_secs(15),
+            PollTier::Cold => Duration::from_secs(180),
+        }
+    }
+}
+
+/// Classify a probed PR's [`PollTier`] from its lifecycle state.
+fn poll_tier_for_probe(probe: &PrLifecycleProbe) -> PollTier {
+    match &probe.state {
+        PrLifecycleState::Open(open) => {
+            if probe.in_merge_queue
+                || open.mergeability != OpenPrMergeability::Clean
+                || matches!(open.ci, OpenPrCiStatus::InFlight)
+            {
+                PollTier::Hot
+            } else {
+                PollTier::Cold
+            }
+        }
+        // Terminal states: the PR will drop out of every candidate list
+        // on the next full sweep regardless of tier, so `Cold` is a
+        // harmless placeholder rather than a real steady-state claim.
+        PrLifecycleState::Merged | PrLifecycleState::ClosedUnmerged => PollTier::Cold,
+    }
+}
+
 /// One required check that failed at probe time. Captured pre-spawn so
 /// the `ci_remediations.failed_checks` JSON is faithful to what the
 /// engine saw and the worker prompt embeds the same data.
@@ -1975,6 +2024,123 @@ pub async fn run_one_pass(
     outcome
 }
 
+/// Reconcile exactly one PR instead of sweeping every candidate (doc
+/// `github-event-detection-webhooks-vs-polling-2026-07-08.md` §9 item 3).
+/// This is the targeted entry point [`PrPollSchedule`]'s per-PR adaptive
+/// timer and [`PrReconcilerTargetedKick`] both drive: rather than waking
+/// the whole reconciler because one PR needs attention, reconcile just
+/// that PR.
+///
+/// Scopes every per-PR candidate list [`run_one_pass`] considers —
+/// [`WorkDb::list_chores_pending_merge_check`],
+/// [`WorkDb::list_chores_blocked_on_merge_conflict`],
+/// [`WorkDb::list_chores_blocked_on_ci_failure`], and
+/// [`WorkDb::list_chores_stranded_blocked_remediation`] — down to rows
+/// matching `pr_url`, probes just that PR, and runs the same detection
+/// paths [`sweep_one`] does, plus the merge-queue-rebounce and stalled-
+/// reviewer checks. Deliberately NOT scoped here: the *execution*-keyed
+/// candidate lists (`pending_pr_recheck`, `late_pr_candidates`,
+/// `stranded_ci_attempts`) — a task with no `pr_url` yet by definition
+/// can't be addressed by a `pr_url`-keyed entry point. Those stay on the
+/// periodic full sweep, which remains the correctness backstop.
+///
+/// Returns the sweep outcome alongside the [`PollTier`] observed for
+/// `pr_url` so the caller can reschedule its next adaptive poll. The
+/// tier is `None` when `pr_url` is no longer a live candidate (merged,
+/// closed, or otherwise dropped out of every list) — callers should stop
+/// tracking it until the next full sweep re-discovers it.
+pub async fn reconcile_one(
+    work_db: &WorkDb,
+    probe: &dyn MergeProbe,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
+    completion_handler: Option<&WorkerCompletionHandler>,
+    pr_url: &str,
+) -> (SweepOutcome, Option<PollTier>) {
+    let mut outcome = SweepOutcome::default();
+
+    let in_review = candidates_for_pr_url(work_db.list_chores_pending_merge_check(), pr_url);
+    let blocked_conflict = candidates_for_pr_url(work_db.list_chores_blocked_on_merge_conflict(), pr_url);
+    let blocked_ci = candidates_for_pr_url(work_db.list_chores_blocked_on_ci_failure(), pr_url);
+    let stranded_blocked = candidates_for_pr_url(work_db.list_chores_stranded_blocked_remediation(), pr_url);
+
+    if in_review.is_empty() && blocked_conflict.is_empty() && blocked_ci.is_empty() && stranded_blocked.is_empty() {
+        tracing::debug!(
+            pr_url,
+            "merge poller: reconcile_one found no live candidate for this PR; skipping until next full sweep",
+        );
+        return (outcome, None);
+    }
+
+    let probe_urls = vec![pr_url.to_owned()];
+    let probe_results = probe.probe_batch(&probe_urls).await;
+
+    let mut seen = std::collections::HashSet::new();
+    for candidate in in_review.iter().chain(blocked_conflict.iter()).chain(blocked_ci.iter()) {
+        if !seen.insert(candidate.work_item_id.clone()) {
+            continue;
+        }
+        sweep_one(
+            work_db,
+            &probe_results,
+            publisher,
+            cube_client,
+            completion_handler,
+            candidate,
+            &mut outcome,
+        )
+        .await;
+    }
+    for candidate in &stranded_blocked {
+        sweep_stranded_blocked_remediation(work_db, &probe_results, publisher, candidate, &mut outcome).await;
+    }
+    let mut rebounce_seen = std::collections::HashSet::new();
+    for candidate in in_review.iter().chain(blocked_ci.iter()) {
+        if !rebounce_seen.insert(candidate.work_item_id.clone()) {
+            continue;
+        }
+        check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
+    }
+
+    let reviewer_stale_secs: u64 = 10 * 60;
+    match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
+        Ok(stalled) => {
+            for (task_id, product_id, stalled_pr_url) in stalled.iter().filter(|(_, _, u)| u == pr_url) {
+                sweep_stalled_reviewer(
+                    work_db,
+                    publisher,
+                    task_id,
+                    product_id,
+                    stalled_pr_url,
+                    &GhPrStateChecker,
+                    &mut outcome,
+                )
+                .await;
+            }
+        }
+        Err(err) => tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks"),
+    }
+
+    let tier = probe_results
+        .get(pr_url)
+        .and_then(|r| r.as_ref().ok())
+        .map(poll_tier_for_probe);
+    (outcome, tier)
+}
+
+/// Filter a candidate-list query result down to rows matching `pr_url`,
+/// logging (not propagating) a query failure — [`reconcile_one`] is
+/// best-effort per list, matching [`run_one_pass`]'s own error handling.
+fn candidates_for_pr_url(result: Result<Vec<PendingMergeCheck>>, pr_url: &str) -> Vec<PendingMergeCheck> {
+    match result {
+        Ok(items) => items.into_iter().filter(|c| c.pr_url == pr_url).collect(),
+        Err(err) => {
+            tracing::warn!(?err, pr_url, "merge poller: reconcile_one candidate list query failed");
+            Vec::new()
+        }
+    }
+}
+
 /// Stop every in-flight `revision_implementation` execution belonging to
 /// revisions of `chain_root_id` now that the parent PR has merged.
 ///
@@ -3257,12 +3423,9 @@ async fn sweep_stalled_reviewer(
 /// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9 items 3–4)
 /// need to reconcile exactly one PR instead of triggering a full sweep.
 ///
-/// This type only adds the *entry point*: firing it still runs the same
-/// full [`run_one_pass`] sweep as the broad kick (idempotent reconciliation
-/// makes that safe — see the doc's §7 design properties), it just also
-/// records and logs which PR(s) asked for the pass. Scoping the sweep
-/// itself down to a single PR is left to the `reconcile_one(pr_url)` work
-/// in the sibling adaptive-intervals follow-up.
+/// Firing it reconciles exactly the named PR(s) via [`reconcile_one`] —
+/// not a full [`run_one_pass`] sweep — subject to the same quiesce window
+/// as the broad kick.
 #[derive(Clone, Default)]
 pub struct PrReconcilerTargetedKick {
     notify: Arc<Notify>,
@@ -3293,21 +3456,141 @@ impl PrReconcilerTargetedKick {
     }
 }
 
+/// A "no PR is due" placeholder wait — long enough to never race the
+/// periodic full-sweep interval or a kick, short enough to stay well
+/// under `tokio::time::sleep`'s max duration.
+const NO_PR_DUE_WAIT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// In-memory next-poll-time tracker driving the per-PR adaptive interval
+/// (doc `github-event-detection-webhooks-vs-polling-2026-07-08.md` §9
+/// item 3), replacing the single global tick with a per-PR schedule:
+/// hot PRs (CI running, merge-queued) get reconciled on a short cadence
+/// while cold ones (steady-state, awaiting a human) back off.
+///
+/// Purely in-memory and best-effort — it is reseeded from the DB's own
+/// candidate lists after every periodic full sweep (see [`spawn_loop`]),
+/// which remains the correctness backstop, so a dropped, evicted, or
+/// (after a restart) forgotten entry only means the PR is picked up on
+/// the next full sweep — never lost.
+#[derive(Default)]
+struct PrPollSchedule {
+    next_poll_at: HashMap<String, Instant>,
+}
+
+impl PrPollSchedule {
+    /// Earliest scheduled poll across every tracked PR, if any.
+    fn next_due(&self) -> Option<Instant> {
+        self.next_poll_at.values().min().copied()
+    }
+
+    /// Remove and return every PR whose scheduled poll has arrived.
+    fn drain_due(&mut self, now: Instant) -> Vec<String> {
+        let due: Vec<String> = self
+            .next_poll_at
+            .iter()
+            .filter(|&(_, &at)| at <= now)
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in &due {
+            self.next_poll_at.remove(url);
+        }
+        due
+    }
+
+    /// Record the tier observed for `pr_url`, scheduling its next poll.
+    /// `None` (the PR dropped out of every candidate list) stops tracking
+    /// it until a full sweep rediscovers it.
+    fn reschedule(&mut self, pr_url: &str, tier: Option<PollTier>, now: Instant) {
+        match tier {
+            Some(tier) => {
+                self.next_poll_at.insert(pr_url.to_owned(), now + tier.interval());
+            }
+            None => {
+                self.next_poll_at.remove(pr_url);
+            }
+        }
+    }
+
+    /// Seed a default (hot) entry for every PR in `pr_urls` that isn't
+    /// already tracked — called after a full sweep so newly-discovered
+    /// PRs get an adaptive slot immediately instead of waiting for
+    /// another full-sweep interval. Existing entries are left alone: a
+    /// fresh default must not clobber a tier already learned from a real
+    /// probe via [`reconcile_one`].
+    fn seed_defaults(&mut self, pr_urls: impl IntoIterator<Item = String>, now: Instant) {
+        for url in pr_urls {
+            self.next_poll_at
+                .entry(url)
+                .or_insert_with(|| now + PollTier::Hot.interval());
+        }
+    }
+}
+
+/// Distinct PR urls across every per-PR candidate list [`run_one_pass`]
+/// considers — a cheap, GitHub-call-free local DB read used only to seed
+/// [`PrPollSchedule`] after a full sweep.
+fn current_pr_candidate_urls(work_db: &WorkDb) -> Vec<String> {
+    let mut urls = std::collections::HashSet::new();
+    let lists = [
+        work_db.list_chores_pending_merge_check(),
+        work_db.list_chores_blocked_on_merge_conflict(),
+        work_db.list_chores_blocked_on_ci_failure(),
+        work_db.list_chores_stranded_blocked_remediation(),
+    ];
+    for list in lists {
+        match list {
+            Ok(items) => urls.extend(items.into_iter().map(|c| c.pr_url)),
+            Err(err) => tracing::warn!(
+                ?err,
+                "merge poller: failed to list candidates while seeding poll schedule"
+            ),
+        }
+    }
+    urls.into_iter().collect()
+}
+
+/// Increment every per-sweep metric from `outcome`. Shared by the
+/// periodic full sweep and the targeted [`reconcile_one`] paths in
+/// [`spawn_loop`] so adaptive/targeted transitions are counted exactly
+/// like full-sweep ones.
+fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
+    MERGED.inc_by(metrics, outcome.merged as u64);
+    CONFLICT_FLAGGED.inc_by(metrics, outcome.conflict_flagged as u64);
+    CONFLICT_CLEARED.inc_by(metrics, outcome.conflict_cleared as u64);
+    PR_RECHECK_RECOVERED.inc_by(metrics, outcome.pr_recheck_recovered as u64);
+    PR_RECHECK_UNRESOLVED.inc_by(metrics, outcome.pr_recheck_unresolved as u64);
+    MERGE_QUEUE_REBOUNCED.inc_by(metrics, outcome.merge_queue_rebounced as u64);
+    LATE_PR_RECOVERED.inc_by(metrics, outcome.late_pr_recovered as u64);
+    REVISION_INVALIDATED.inc_by(metrics, outcome.revision_invalidated as u64);
+    WORKER_STOPPED_ON_REVIEW.inc_by(metrics, outcome.worker_stopped_on_review as u64);
+    COMMENTS_REOPENED.inc_by(metrics, outcome.comments_reopened as u64);
+}
+
 /// merged or developed a conflict while the engine was offline gets
 /// reconciled on boot. The sweep runs inside the spawned task so
-/// engine startup isn't blocked on `gh`; subsequent passes are
-/// gated behind `interval`.
+/// engine startup isn't blocked on `gh`; subsequent full sweeps are
+/// gated behind `interval`, which remains the correctness backstop
+/// (doc `github-event-detection-webhooks-vs-polling-2026-07-08.md` §8):
+/// it re-discovers any PR the adaptive/targeted paths below missed.
+///
+/// Between full sweeps, an in-memory [`PrPollSchedule`] drives a
+/// per-PR adaptive timer (doc §9 item 3) that calls [`reconcile_one`]
+/// on just the PR that's due, instead of every PR sharing the single
+/// `interval` tick — hot PRs (CI running, merge-queued) get reconciled
+/// on a short cadence, cold ones back off. The schedule is reseeded
+/// with a default entry for every newly-discovered PR after each full
+/// sweep.
 ///
 /// `kick` is a shared [`Notify`] the caller can fire (via
-/// [`Notify::notify_one`]) to request an immediate out-of-band pass.
-/// Kicks received within the 15 s quiesce window after the most
-/// recent pass are silently dropped — the periodic tick will pick up
-/// the change soon enough and rapid window-toggle events don't result
-/// in repeated GitHub API calls.
+/// [`Notify::notify_one`]) to request an immediate out-of-band full
+/// sweep. Kicks received within the 15 s quiesce window after the most
+/// recent full sweep are silently dropped — the periodic tick will pick
+/// up the change soon enough and rapid window-toggle events don't
+/// result in repeated GitHub API calls.
 ///
 /// `targeted_kick` is the [`PrReconcilerTargetedKick`] companion — same
-/// quiesce behavior, but callers name the PR that prompted the request so
-/// it shows up in the sweep log.
+/// quiesce window, but it reconciles just the named PR(s) via
+/// [`reconcile_one`] rather than triggering a full sweep.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
@@ -3325,6 +3608,7 @@ pub fn spawn_loop(
     let (kick, targeted_kick) = kicks;
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
+        let mut schedule = PrPollSchedule::default();
         loop {
             let outcome = run_one_pass(
                 work_db.as_ref(),
@@ -3335,16 +3619,7 @@ pub fn spawn_loop(
             )
             .await;
             let last_run_at = Instant::now();
-            MERGED.inc_by(&metrics, outcome.merged as u64);
-            CONFLICT_FLAGGED.inc_by(&metrics, outcome.conflict_flagged as u64);
-            CONFLICT_CLEARED.inc_by(&metrics, outcome.conflict_cleared as u64);
-            PR_RECHECK_RECOVERED.inc_by(&metrics, outcome.pr_recheck_recovered as u64);
-            PR_RECHECK_UNRESOLVED.inc_by(&metrics, outcome.pr_recheck_unresolved as u64);
-            MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
-            LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
-            REVISION_INVALIDATED.inc_by(&metrics, outcome.revision_invalidated as u64);
-            WORKER_STOPPED_ON_REVIEW.inc_by(&metrics, outcome.worker_stopped_on_review as u64);
-            COMMENTS_REOPENED.inc_by(&metrics, outcome.comments_reopened as u64);
+            record_sweep_metrics(&metrics, &outcome);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -3363,16 +3638,62 @@ pub fn spawn_loop(
                 );
             }
 
-            // Wait for either the periodic interval or an activation kick.
-            // Kicks received within the quiesce window are silently absorbed
-            // — the inner loop keeps listening so the first kick that arrives
-            // after the window has elapsed will trigger a pass immediately.
+            // Seed a default adaptive slot for every PR this full sweep
+            // just considered. Existing entries (already scheduled by a
+            // prior `reconcile_one` call below) are left alone — a fresh
+            // default must not clobber a tier already learned from a
+            // real probe.
+            schedule.seed_defaults(current_pr_candidate_urls(work_db.as_ref()), last_run_at);
+
+            // Wait for the periodic full-sweep interval, an activation
+            // kick, a targeted kick, or the next PR's adaptive poll time —
+            // whichever comes first. Kicks received within the quiesce
+            // window are silently absorbed — the inner loop keeps
+            // listening so the first kick that arrives after the window
+            // has elapsed triggers a pass immediately. The adaptive-timer
+            // and targeted-kick arms never `break 'wait`: reconciling one
+            // PR is not a full sweep, so neither resets `last_run_at` or
+            // the full-sweep quiesce clock — they just reschedule that PR
+            // and keep waiting.
             'wait: loop {
-                let elapsed = last_run_at.elapsed();
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_run_at);
                 let remaining_interval = interval.saturating_sub(elapsed);
+                let pr_wait = schedule
+                    .next_due()
+                    .map(|at| at.saturating_duration_since(now))
+                    .unwrap_or(NO_PR_DUE_WAIT);
                 tokio::select! {
                     _ = tokio::time::sleep(remaining_interval) => {
                         break 'wait;
+                    }
+                    _ = tokio::time::sleep(pr_wait) => {
+                        for pr_url in schedule.drain_due(Instant::now()) {
+                            let (outcome, tier) = reconcile_one(
+                                work_db.as_ref(),
+                                probe.as_ref(),
+                                publisher.as_ref(),
+                                Some(cube_client.as_ref()),
+                                Some(completion_handler.as_ref()),
+                                &pr_url,
+                            )
+                            .await;
+                            record_sweep_metrics(&metrics, &outcome);
+                            if outcome.total_transitions() > 0 {
+                                tracing::info!(
+                                    pr_url,
+                                    merged = outcome.merged,
+                                    conflict_flagged = outcome.conflict_flagged,
+                                    conflict_cleared = outcome.conflict_cleared,
+                                    ci_flagged = outcome.ci_flagged,
+                                    ci_cleared = outcome.ci_cleared,
+                                    merge_queue_rebounced = outcome.merge_queue_rebounced,
+                                    "merge poller: adaptive per-PR reconcile transitions",
+                                );
+                            }
+                            schedule.reschedule(&pr_url, tier, Instant::now());
+                        }
+                        // continue listening in this same wait loop
                     }
                     _ = kick.notified() => {
                         let since_last = last_run_at.elapsed();
@@ -3393,21 +3714,46 @@ pub fn spawn_loop(
                     _ = targeted_kick.notified() => {
                         let pr_urls = targeted_kick.drain_pending();
                         let since_last = last_run_at.elapsed();
-                        if since_last >= quiesce_window {
+                        if since_last < quiesce_window {
                             tracing::debug!(
                                 ?pr_urls,
                                 since_last_ms = since_last.as_millis(),
-                                "merge poller: targeted kick → immediate sweep",
+                                quiesce_ms = quiesce_window.as_millis(),
+                                "merge poller: targeted kick within quiesce window, absorbing",
                             );
-                            break 'wait;
+                        } else {
+                            tracing::debug!(
+                                ?pr_urls,
+                                since_last_ms = since_last.as_millis(),
+                                "merge poller: targeted kick → reconciling named PR(s)",
+                            );
+                            for pr_url in pr_urls {
+                                let (outcome, tier) = reconcile_one(
+                                    work_db.as_ref(),
+                                    probe.as_ref(),
+                                    publisher.as_ref(),
+                                    Some(cube_client.as_ref()),
+                                    Some(completion_handler.as_ref()),
+                                    &pr_url,
+                                )
+                                .await;
+                                record_sweep_metrics(&metrics, &outcome);
+                                if outcome.total_transitions() > 0 {
+                                    tracing::info!(
+                                        pr_url,
+                                        merged = outcome.merged,
+                                        conflict_flagged = outcome.conflict_flagged,
+                                        conflict_cleared = outcome.conflict_cleared,
+                                        ci_flagged = outcome.ci_flagged,
+                                        ci_cleared = outcome.ci_cleared,
+                                        merge_queue_rebounced = outcome.merge_queue_rebounced,
+                                        "merge poller: targeted-kick reconcile transitions",
+                                    );
+                                }
+                                schedule.reschedule(&pr_url, tier, Instant::now());
+                            }
                         }
-                        tracing::debug!(
-                            ?pr_urls,
-                            since_last_ms = since_last.as_millis(),
-                            quiesce_ms = quiesce_window.as_millis(),
-                            "merge poller: targeted kick within quiesce window, absorbing",
-                        );
-                        // continue listening; periodic sleep arm will eventually fire
+                        // continue listening; targeted reconcile is not a full sweep
                     }
                 }
             }
@@ -3978,6 +4324,162 @@ mod tests {
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.total_transitions(), 0);
         assert!(publisher.lifecycle_reasons().await.is_empty());
+    }
+
+    /// Adaptive-per-PR-timer follow-up (doc §9 item 3): `reconcile_one`
+    /// must scope the sweep to exactly the named PR, leaving every other
+    /// in-review candidate untouched even though it's probed as merged too.
+    #[tokio::test]
+    async fn reconcile_one_scopes_to_named_pr_only() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr1 = "https://github.com/foo/bar/pull/301";
+        let pr2 = "https://github.com/foo/bar/pull/302";
+        let (_p1, chore1) = make_chore_in_review(&db, "C301", pr1);
+        let (_p2, chore2) = make_chore_in_review(&db, "C302", pr2);
+
+        let probe = StubProbe::new();
+        probe.set(pr1, PrLifecycleState::Merged);
+        probe.set(pr2, PrLifecycleState::Merged);
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let (outcome, tier) = reconcile_one(&db, probe.as_ref(), publisher.as_ref(), None, None, pr1).await;
+        assert_eq!(outcome.merged, 1);
+        // Merged is a terminal state; the placeholder tier is `Cold` (see
+        // `poll_tier_for_probe`) but the important assertion is that a
+        // tier is returned at all — the PR was a live candidate.
+        assert_eq!(tier, Some(PollTier::Cold));
+
+        match db.get_work_item(&chore1).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // The other in-review PR must be untouched even though the stub
+        // probe would also report it merged.
+        match db.get_work_item(&chore2).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    /// A PR that isn't a live candidate on any of `reconcile_one`'s four
+    /// scoped lists (merged/closed/never known to this DB) must be a
+    /// pure no-op — no probe call, no tier, so the caller stops tracking
+    /// it until the next full sweep rediscovers it.
+    #[tokio::test]
+    async fn reconcile_one_returns_no_tier_for_unknown_pr() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let (outcome, tier) = reconcile_one(
+            &db,
+            probe.as_ref(),
+            publisher.as_ref(),
+            None,
+            None,
+            "https://github.com/foo/bar/pull/999",
+        )
+        .await;
+        assert_eq!(outcome.total_transitions(), 0);
+        assert_eq!(tier, None);
+    }
+
+    /// [`poll_tier_for_probe`] classification (doc §9 item 3): CI in
+    /// flight, a merge-queued PR, and an unresolved/conflicting
+    /// mergeability all count as "actively changing" (`Hot`); a clean,
+    /// mergeable, non-queued PR is steady-state (`Cold`).
+    #[test]
+    fn poll_tier_classifies_open_pr_signals() {
+        let base = |state: PrLifecycleState, in_merge_queue: bool| PrLifecycleProbe {
+            url: "https://github.com/foo/bar/pull/1".to_owned(),
+            state,
+            base_ref_oid: None,
+            head_ref_oid: None,
+            head_ref_name: None,
+            base_ref_name: None,
+            labels: Vec::new(),
+            review: PrReviewState::Unknown,
+            in_merge_queue,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
+        };
+
+        assert_eq!(
+            poll_tier_for_probe(&base(PrLifecycleState::Open(OpenPrStatus::clean()), false)),
+            PollTier::Cold
+        );
+        assert_eq!(
+            poll_tier_for_probe(&base(PrLifecycleState::Open(OpenPrStatus::clean()), true)),
+            PollTier::Hot,
+            "merge-queued PRs must poll fast",
+        );
+        assert_eq!(
+            poll_tier_for_probe(&base(
+                PrLifecycleState::Open(OpenPrStatus {
+                    mergeability: OpenPrMergeability::Clean,
+                    ci: OpenPrCiStatus::InFlight,
+                }),
+                false
+            )),
+            PollTier::Hot,
+            "in-flight CI must poll fast",
+        );
+        assert_eq!(
+            poll_tier_for_probe(&base(PrLifecycleState::Open(OpenPrStatus::conflict_only()), false)),
+            PollTier::Hot,
+            "conflicting mergeability must poll fast",
+        );
+        assert_eq!(
+            poll_tier_for_probe(&base(
+                PrLifecycleState::Open(OpenPrStatus::unknown_mergeability()),
+                false
+            )),
+            PollTier::Hot,
+            "unresolved mergeability must poll fast",
+        );
+        assert_eq!(
+            poll_tier_for_probe(&base(PrLifecycleState::Merged, false)),
+            PollTier::Cold
+        );
+        assert_eq!(
+            poll_tier_for_probe(&base(PrLifecycleState::ClosedUnmerged, false)),
+            PollTier::Cold
+        );
+    }
+
+    /// [`PrPollSchedule`]: `seed_defaults` must not clobber an entry
+    /// already scheduled by a real probe outcome, `drain_due` must
+    /// return exactly (and only) the entries due by the given instant,
+    /// and rescheduling with `None` must stop tracking a PR entirely.
+    #[test]
+    fn pr_poll_schedule_seed_drain_and_reschedule() {
+        let mut schedule = PrPollSchedule::default();
+        let now = Instant::now();
+
+        // A real probe already scheduled pr1 as Cold (long interval).
+        schedule.reschedule("pr1", Some(PollTier::Cold), now);
+        // Seeding defaults must not override that — pr1 stays Cold-scheduled,
+        // far in the future — while pr2 (never seen) gets a fresh Hot slot.
+        schedule.seed_defaults(["pr1".to_owned(), "pr2".to_owned()], now);
+
+        // Only pr2's Hot (15 s) slot should be due at now + 20s; pr1's Cold
+        // (180 s) slot is not.
+        let due = schedule.drain_due(now + Duration::from_secs(20));
+        assert_eq!(due, vec!["pr2".to_owned()]);
+
+        // pr1 is still tracked (its Cold slot hasn't arrived yet).
+        assert!(schedule.next_due().is_some());
+        let due_later = schedule.drain_due(now + Duration::from_secs(200));
+        assert_eq!(due_later, vec!["pr1".to_owned()]);
+        assert!(schedule.next_due().is_none());
+
+        // Rescheduling with `None` stops tracking immediately.
+        schedule.reschedule("pr3", Some(PollTier::Hot), now);
+        assert!(schedule.next_due().is_some());
+        schedule.reschedule("pr3", None, now);
+        assert!(schedule.next_due().is_none());
     }
 
     #[tokio::test]
