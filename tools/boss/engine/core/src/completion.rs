@@ -1352,6 +1352,17 @@ impl WorkerCompletionHandler {
         // logged and swallowed, never block completion.
         self.detect_and_file_worker_signals(&execution).await;
 
+        // Deferred-scope detection (T222/PR #765, recovered as Flunge T254):
+        // a worker that deliberately narrowed its task's scope and declared
+        // it via a `[deferred-scope]` marker gets that recorded durably —
+        // both on the work item's own description and as a coordinator-
+        // visible attention item — so the deferral is a tracked decision
+        // rather than a prose sentence that dies with the transcript. Unlike
+        // the escalation/blocker pair above, this never suppresses the
+        // "produce a PR" nudge: the worker already produced its (narrower)
+        // deliverable.
+        self.detect_and_record_deferred_scope(&execution).await;
+
         // Resume-bounce SHA-delta gate: when the chore already has a
         // PR bound to it (`task.pr_url` populated by an earlier run's
         // on-Stop machinery), use that URL as the authoritative
@@ -4426,6 +4437,118 @@ manual review."
                     execution_id = %execution.id,
                     ?err,
                     "worker escalation: failed to file attention item; signal will not block nudges",
+                );
+            }
+        }
+    }
+
+    /// Scan `execution`'s Stop-boundary transcript for `[deferred-scope]`
+    /// markers and durably record each one found. See
+    /// [`crate::deferred_scope`] for the marker contract and the incident
+    /// this exists to fix. Best-effort: recording failures are logged and
+    /// swallowed, never block completion.
+    async fn detect_and_record_deferred_scope(&self, execution: &crate::work::WorkExecution) {
+        let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
+            return;
+        };
+        for item in crate::deferred_scope::detect_deferred_scope_items(&text) {
+            self.record_deferred_scope_item(execution, &item).await;
+        }
+    }
+
+    /// Durably record one [`crate::deferred_scope::DeferredScopeItem`],
+    /// unless an attention item already exists for this execution carrying
+    /// the exact same marker line (content-keyed dedup, mirroring
+    /// [`Self::file_worker_signal_attention`] — keeps this idempotent across
+    /// the many Stops a single execution's cumulative transcript survives).
+    ///
+    /// Recording has two durable halves: an `[engine-reconcile]`-style audit
+    /// line appended to the work item's own description (survives even if
+    /// the transcript is later pruned) and a `work_attention_items` row that
+    /// surfaces to the coordinator, exactly as effort-escalation/blocked
+    /// signals do. The attention item's body explicitly frames the decision
+    /// left for a human: create a followup task for the deferred item, or
+    /// consciously accept the deferral.
+    async fn record_deferred_scope_item(
+        &self,
+        execution: &crate::work::WorkExecution,
+        item: &crate::deferred_scope::DeferredScopeItem,
+    ) {
+        let kind = crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND;
+        let already_seen = self
+            .work_db
+            .list_attention_items(&execution.id)
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|i| i.kind == kind && i.body_markdown.contains(&item.marker_line))
+            })
+            .unwrap_or(false);
+        if already_seen {
+            return;
+        }
+
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let audit_line = crate::deferred_scope::render_audit_line(epoch, item);
+        if let Err(err) =
+            crate::reconcile_audit::append_description_line(&self.work_db, &execution.work_item_id, &audit_line)
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "deferred-scope: failed to append audit line to description (non-fatal)",
+            );
+        }
+
+        let mut body = format!(
+            "Worker deferred part of this task's scope on its Stop boundary.\n\n\
+             - execution: `{execution_id}`\n\
+             - work item: `{work_item_id}`\n\n\
+             Marker (verbatim):\n\n```\n{marker_line}\n```",
+            execution_id = execution.id,
+            work_item_id = execution.work_item_id,
+            marker_line = item.marker_line,
+        );
+        if let Some(warning) = item.parse_warning.as_deref() {
+            body.push_str(&format!(
+                "\n\n**Parse warning:** {warning} — the marker is malformed; read it by hand to \
+                 recover the deferred summary/reason."
+            ));
+        }
+        body.push_str(
+            "\n\nThis is NOT yet tracked work — the worker has no ability to file a task itself. \
+             Decide whether to create a followup task for the deferred item, or consciously accept \
+             the deferral (e.g. it is genuinely out of scope for this task). Either way, resolving \
+             this item records that a human made that call, rather than the remainder silently \
+             vanishing.",
+        );
+
+        match self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: kind.to_owned(),
+            status: None,
+            title: "Worker deferred scope".to_owned(),
+            body_markdown: body,
+            resolved_at: None,
+        }) {
+            Ok(item) => {
+                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                    let product_id = work_item_product_id(&work_item);
+                    self.publisher
+                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
+                        .await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "deferred-scope: failed to file attention item (non-fatal)",
                 );
             }
         }
@@ -9679,6 +9802,158 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             1,
             "exactly one worker_blocked attention item must be filed; got {items:?}",
         );
+    }
+
+    // -----------------------------------------------------------
+    // Deferred-scope declaration (Flunge T254, root-caused to T222/PR #765):
+    // a worker that emits a `[deferred-scope]` marker must get a durable
+    // audit line on the work item's description AND a coordinator-visible
+    // attention item — but, unlike escalation/blocker markers, must NOT
+    // suppress the "produce a PR" nudge: the worker already produced its
+    // (narrower) deliverable.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn well_formed_deferred_scope_records_audit_line_and_attention_item() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "Wired T8 and T9 as asked.\n\n\
+             [deferred-scope] summary=\"T11 wiring\" reason=\"needs new data plumbing, not just wiring\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+        handler.on_stop(&execution_id).await;
+
+        // Recorded on the work item's own description, grep-able even if the
+        // transcript is later pruned.
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert!(
+                    t.description.contains("[deferred-scope]"),
+                    "description must carry a [deferred-scope] audit line; got: {}",
+                    t.description,
+                );
+                assert!(
+                    t.description.contains("T11 wiring"),
+                    "audit line must carry the deferred summary; got: {}",
+                    t.description,
+                );
+                assert_eq!(
+                    t.description.matches("[deferred-scope]").count(),
+                    1,
+                    "the audit line must carry the tag exactly once; got: {}",
+                    t.description,
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .expect("a deferred_scope attention item must be filed");
+        assert_eq!(item.status, "open");
+        assert!(
+            item.body_markdown.contains("T11 wiring"),
+            "attention body must carry the marker verbatim; got: {}",
+            item.body_markdown,
+        );
+        assert!(
+            !item.body_markdown.contains("Parse warning"),
+            "a well-formed marker must not carry a parse warning; got: {}",
+            item.body_markdown,
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_deferred_scope_is_still_recorded_with_a_parse_warning() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(&db, workspace.path(), &execution_id, "[deferred-scope]\n");
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+        handler.on_stop(&execution_id).await;
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .expect("malformed marker must still be recorded");
+        assert!(
+            item.body_markdown.contains("Parse warning"),
+            "a malformed marker must be flagged with a parse warning; got: {}",
+            item.body_markdown,
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_scope_does_not_suppress_the_produce_a_pr_nudge() {
+        // Unlike [effort-escalation]/[blocked], a [deferred-scope] marker is
+        // a completeness record, not a stop-the-world signal — the worker
+        // already produced its narrower deliverable, so the normal
+        // produce-a-PR nudge must still fire.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[deferred-scope] summary=\"T11 wiring\" reason=\"needs new data plumbing\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            !matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "a deferred-scope marker alone must not suppress the nudge; got {outcome:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_stops_do_not_duplicate_the_deferred_scope_record() {
+        // The marker line never disappears from the cumulative transcript
+        // once emitted, so repeated Stops must not re-append the audit line
+        // or re-file the attention item.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[deferred-scope] summary=\"T11 wiring\" reason=\"needs new data plumbing\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+        handler.on_stop(&execution_id).await;
+        handler.on_stop(&execution_id).await;
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+                .count(),
+            1,
+            "the same marker must only ever file one attention item; got {items:?}",
+        );
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(
+                t.description.matches("[deferred-scope]").count(),
+                1,
+                "the same marker must only ever append one audit line; got: {}",
+                t.description,
+            ),
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     #[tokio::test]
