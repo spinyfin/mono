@@ -128,6 +128,15 @@ pub struct StartedWorker {
     pub slot_id: u8,
     pub shell_pid: i32,
     pub written_files: WrittenFiles,
+    /// `true` when the `SpawnWorkerPane` RPC never acked within the
+    /// spawn window and the worker was registered *provisionally*: the
+    /// app may or may not have hosted the pane, so the slot is tracked
+    /// with `shell_pid = 0` and the spawn-ack sweep is left to confirm
+    /// liveness (a hook/pid arrives) or reap it (total silence past the
+    /// grace window). Callers use this only to log/annotate — the
+    /// tracked-vs-failure decision has already been made here. See the
+    /// ack-timeout branch in [`start_worker`].
+    pub ack_timed_out: bool,
 }
 
 #[derive(Debug, Error)]
@@ -313,7 +322,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     }
 
     let claimed_slot = input.slot_id;
-    let response = spawner
+    let send_outcome = spawner
         .send_to_app_request(
             EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
                 run_id: input.run_id.clone(),
@@ -326,26 +335,63 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             }),
             Duration::from_secs(spawn_timeout.as_secs()),
         )
-        .await?;
+        .await;
 
-    let SpawnWorkerPaneResult { slot_id, shell_pid } = match response {
-        EngineToAppResponse::SpawnWorkerPane { result } => match result {
-            Ok(value) => value,
+    // Resolve the spawn outcome into `(slot_id, shell_pid, ack_timed_out)`.
+    //
+    // The subtle case is an **ack timeout** (`SendToAppError::Timeout`):
+    // the request WAS delivered to the app, but no reply arrived within
+    // the window. This is *ambiguous* — the app may already have hosted
+    // the pane (the T267 incident: post-sleep the app's RPC queue drained
+    // slowly, the ack timed out, yet the `claude` process had started and
+    // kept working). Treating that as a spawn failure releases the cube
+    // lease out from under a live pane and re-dispatches a duplicate
+    // worker onto the same work item. Instead we register the slot
+    // PROVISIONALLY (shell_pid 0) so the pane's hook events correlate back
+    // to this run and the spawn-ack sweep can reconcile: a hook or a
+    // reported pid confirms liveness; total silence past the grace window
+    // reaps it exactly as it does for a never-hooked `pane_spawned/ok`.
+    //
+    // Every other error means the pane definitively did NOT spawn — the
+    // request was never delivered (`NotRegistered`/`SessionWedged`), the
+    // app answered with an explicit error (`AppError`), or the transport
+    // returned the wrong shape — so those stay hard failures.
+    let (slot_id, shell_pid, ack_timed_out) = match send_outcome {
+        Ok(EngineToAppResponse::SpawnWorkerPane { result }) => match result {
+            Ok(SpawnWorkerPaneResult { slot_id, shell_pid }) => (slot_id, shell_pid, false),
             Err(err) => return Err(StartWorkerError::AppError(err)),
         },
-        EngineToAppResponse::ReleaseWorkerPane { .. }
-        | EngineToAppResponse::SendToPane { .. }
-        | EngineToAppResponse::FocusWorkerPane { .. }
-        | EngineToAppResponse::InterruptWorkerPane { .. }
-        | EngineToAppResponse::RevealWorkItem { .. } => {
+        Ok(
+            EngineToAppResponse::ReleaseWorkerPane { .. }
+            | EngineToAppResponse::SendToPane { .. }
+            | EngineToAppResponse::FocusWorkerPane { .. }
+            | EngineToAppResponse::InterruptWorkerPane { .. }
+            | EngineToAppResponse::RevealWorkItem { .. },
+        ) => {
             return Err(StartWorkerError::ResponseKindMismatch);
         }
+        Err(crate::app::SendToAppError::Timeout) => {
+            tracing::warn!(
+                run_id = %input.run_id,
+                slot_id = claimed_slot,
+                timeout_secs = spawn_timeout.as_secs(),
+                "spawn_flow: SpawnWorkerPane ack timed out — outcome is UNKNOWN (the app may have \
+                 hosted the pane anyway, e.g. a slow post-sleep RPC drain). Registering the slot \
+                 provisionally with shell_pid 0 and leaving the spawn-ack sweep to confirm liveness \
+                 (a hook/pid arrives) or reap on total silence. NOT failing the execution or \
+                 releasing the workspace lease, which would strand a live pane and duplicate dispatch.",
+            );
+            (claimed_slot, 0, true)
+        }
+        Err(err) => return Err(StartWorkerError::Send(err)),
     };
 
     // The engine dictates the slot; the app's response slot is just a
     // confirmation echo. A mismatch means the app picked a different
     // slot than we asked for, which would re-introduce the dual
-    // allocator the engine-owns-slots refactor exists to remove.
+    // allocator the engine-owns-slots refactor exists to remove. On an
+    // ack timeout there is no echo, so `slot_id` is the engine-claimed
+    // slot by construction and this holds trivially.
     debug_assert_eq!(
         slot_id, claimed_slot,
         "app honored a different slot ({slot_id}) than the engine claimed ({claimed_slot})"
@@ -391,6 +437,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         slot_id,
         shell_pid,
         written_files: written,
+        ack_timed_out,
     })
 }
 
@@ -815,5 +862,74 @@ mod tests {
         assert!(!keys.contains(&"RANDOM_KEY"));
         // Allowlisted key still made it through.
         assert!(keys.contains(&"BOSS_TASK_ID"));
+    }
+
+    /// T267 regression: a `SpawnWorkerPane` ack timeout must NOT surface
+    /// as a spawn failure. The app may have hosted the pane anyway (the
+    /// incident: a slow post-sleep RPC drain made the ack time out while
+    /// the `claude` process had already started). `start_worker` returns
+    /// `Ok` with `ack_timed_out` set, `shell_pid = 0`, and the
+    /// engine-claimed slot — and it registers the run→slot mapping so the
+    /// (possibly-live) pane's hook events correlate back to this run and
+    /// the spawn-ack sweep can confirm liveness or reap. Because it is
+    /// `Ok`, the coordinator never takes the failure path that releases
+    /// the lease and duplicate-dispatches the work item.
+    #[tokio::test]
+    async fn ack_timeout_registers_provisional_worker_instead_of_failing() {
+        let workspace = TempDir::new().unwrap();
+        let registry = WorkerRegistry::new();
+        let spawner = StubSpawner {
+            registry: registry.clone(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Err(SendToAppError::Timeout),
+        };
+
+        let started = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .expect("ack timeout must be a provisional success, not an error");
+
+        assert!(started.ack_timed_out, "ack timeout must be flagged as provisional");
+        assert_eq!(started.shell_pid, 0, "a provisional spawn has no reported shell pid");
+        assert_eq!(
+            started.slot_id, 3,
+            "a provisional spawn tracks the engine-claimed slot (no app echo on timeout)",
+        );
+        // The run→slot mapping is the correlation key: without it,
+        // dispatch_live_worker_state would drop every hook the live pane
+        // emits, and the spawn-ack sweep would never see the slot.
+        assert_eq!(
+            registry.slot_for_run("run-test"),
+            Some(3),
+            "provisional spawn must register the run→slot mapping so hooks correlate",
+        );
+    }
+
+    /// Only an ambiguous ack *timeout* is treated as provisional. A
+    /// `NotRegistered` send error means the request was never delivered
+    /// (no app session) — the pane definitively did not spawn — so it
+    /// stays a hard failure and registers nothing. The coordinator's
+    /// failure path (release lease + mark failed) is correct for this
+    /// case.
+    #[tokio::test]
+    async fn not_registered_send_error_stays_a_hard_failure() {
+        let workspace = TempDir::new().unwrap();
+        let registry = WorkerRegistry::new();
+        let spawner = StubSpawner {
+            registry: registry.clone(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Err(SendToAppError::NotRegistered),
+        };
+
+        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
+        assert!(
+            matches!(result, Err(StartWorkerError::Send(SendToAppError::NotRegistered))),
+            "a never-delivered spawn must remain a hard failure; got {result:?}",
+        );
+        assert!(
+            registry.slot_for_run("run-test").is_none(),
+            "a hard-failure spawn must not register a run→slot mapping",
+        );
     }
 }

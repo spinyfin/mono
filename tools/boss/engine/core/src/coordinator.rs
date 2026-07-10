@@ -5238,6 +5238,15 @@ mod tests {
         /// `RunWaitState::CancelledDuringSpawn`. The coordinator must
         /// then release the deferred lease and skip completion recording.
         cancelled_during_spawn: bool,
+        /// When `true`, simulate the T267 provisional spawn: the real
+        /// `PaneSpawnRunner` converts a `SpawnWorkerPane` ack timeout into
+        /// a provisional (unverified) spawn — the pane may be live, so the
+        /// run is tracked in `waiting_human` with its slot retained and the
+        /// lease is NOT released. The fake returns that same outcome so the
+        /// coordinator-side contract (no release, no duplicate dispatch,
+        /// still tracked) can be asserted. The Timeout→provisional
+        /// conversion itself is unit-tested in `spawn_flow`.
+        ack_timed_out: bool,
         /// Handle used by the `cancelled_during_spawn` path to cancel the
         /// row before returning. `None` for the default fake.
         work_db: Option<Arc<WorkDb>>,
@@ -5252,6 +5261,7 @@ mod tests {
                 slot_id: None,
                 spawn_config: None,
                 cancelled_during_spawn: false,
+                ack_timed_out: false,
                 work_db: None,
             }
         }
@@ -5295,6 +5305,22 @@ mod tests {
                     result_summary: Some("cancelled during spawn".to_owned()),
                     attention: None,
                     slot_id: None,
+                    spawn_config: None,
+                });
+            }
+
+            if self.ack_timed_out {
+                // Mirror the real PaneSpawnRunner after a SpawnWorkerPane
+                // ack timeout: a PROVISIONAL spawn. The pane may be live,
+                // so the run is tracked in `waiting_human` with its slot
+                // retained (slot_id = Some ⇒ the coordinator defers the
+                // pool-slot release and does NOT release the workspace
+                // lease). No attention item — this is not a failure.
+                return Ok(RunOutcome {
+                    wait_state: RunWaitState::WaitingHuman,
+                    result_summary: Some("provisional spawn: SpawnWorkerPane ack timed out".to_owned()),
+                    attention: None,
+                    slot_id: Some(1),
                     spawn_config: None,
                 });
             }
@@ -6254,6 +6280,85 @@ mod tests {
                 "stage `{expected}` missing from dispatch timeline; got {stages:?}",
             );
         }
+    }
+
+    /// T267 regression (outcome 3): a slow `SpawnWorkerPane` ack that
+    /// nonetheless spawned the pane must NOT be treated as a spawn
+    /// failure. The real `PaneSpawnRunner` now converts the ack timeout
+    /// into a PROVISIONAL spawn (waiting_human + slot retained); the fake
+    /// returns that same outcome. The coordinator must then:
+    ///   - keep the execution TRACKED in `waiting_human` (non-terminal),
+    ///   - NOT release the cube workspace lease (a live pane may occupy it),
+    ///   - NOT mark the run failed or emit a `pane_spawned: error` event,
+    ///   - NOT leave a duplicate execution behind (the incident's second
+    ///     worker came from the failed+demoted work item being re-dispatched).
+    ///
+    /// The Timeout→provisional conversion itself is unit-tested in
+    /// `spawn_flow`; this pins the coordinator-side contract.
+    #[tokio::test]
+    async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            ack_timed_out: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+
+        // Tracked, not failed — the pane may be live and doing work.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+        // The lease is retained on the tracked row (a provisional pane may
+        // be occupying the workspace) — clearing it would let the workspace
+        // be re-leased out from under a live worker.
+        assert_eq!(
+            execution.cube_lease_id.as_deref(),
+            Some("lease-1"),
+            "the tracked provisional execution must keep its cube lease",
+        );
+
+        // No release-while-occupied: the coordinator must not hand the
+        // workspace back to cube for a provisional spawn.
+        let releases = cube.release_calls.lock().await.clone();
+        assert!(
+            !releases.iter().any(|id| id == "lease-1"),
+            "cube lease must NOT be released for a provisional (ack-timeout) spawn; releases: {releases:?}",
+        );
+
+        // No duplicate dispatch: exactly one execution exists for the
+        // chore. In the incident, the failed+demoted work item spawned a
+        // second worker; keeping the run tracked (is_live) makes the
+        // orphan-active sweep skip it, so no duplicate is created.
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "a provisional spawn must not leave a duplicate execution behind; got {executions:#?}",
+        );
+
+        // The dispatch stream records a normal `pane_spawned: ok`, never a
+        // `pane_spawned: error` — this was not a failure.
+        let events = recording.events_for(&execution_id).await;
+        assert!(
+            events.iter().any(|e| e.stage == "pane_spawned" && e.outcome == "ok"),
+            "expected a pane_spawned:ok event for the provisional spawn; got {events:#?}",
+        );
+        assert!(
+            !events.iter().any(|e| e.stage == "pane_spawned" && e.outcome == "error"),
+            "a provisional spawn must NOT emit a pane_spawned:error event; got {events:#?}",
+        );
     }
 
     /// When a pane-spawn fails for an `automation_triage` execution, the

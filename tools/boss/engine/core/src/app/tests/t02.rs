@@ -2253,3 +2253,123 @@ fn duplicate_or_work_error_maps_other_error_to_work_error() {
         other => panic!("expected WorkError, got {other:?}"),
     }
 }
+
+/// T267 outcome 2: a hook event that arrives for an execution the engine
+/// already considers TERMINAL is the "a run we believe is dead is
+/// demonstrably alive" contradiction (its worker is still emitting
+/// hooks). `dispatch_live_worker_state` must surface it loudly — bumping
+/// the `hook_events.for_terminal_execution` counter (and logging an
+/// `[engine-reconcile]` line) — instead of silently dropping it as an
+/// ordinary slotless hook.
+#[tokio::test]
+async fn hook_for_terminal_execution_is_counted_not_silently_dropped() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+
+    let server_state = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = server_state
+        .work_db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    // Drive the execution to a terminal state, mirroring the engine
+    // having reaped or failed it. No slot is registered for the run, so a
+    // subsequent hook lands in the slotless drop path.
+    server_state
+        .work_db
+        .mark_execution_orphaned(&execution.id, "reaped for test")
+        .unwrap();
+
+    let baseline = server_state
+        .dispatcher_stats
+        .snapshot()
+        .hook_events_for_terminal_execution;
+
+    // The (supposedly-dead) worker is still emitting hooks.
+    let late_hook = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(execution.id.clone()),
+        transcript_path: None,
+        event: WorkerEvent::PostToolUse {
+            session_id: "sess-late".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+    };
+    dispatch_live_worker_state(&server_state, &late_hook).await;
+
+    let after = server_state
+        .dispatcher_stats
+        .snapshot()
+        .hook_events_for_terminal_execution;
+    assert_eq!(
+        after,
+        baseline + 1,
+        "a hook for a terminal execution must bump the reconcile counter, not be silently dropped",
+    );
+}
+
+/// The counterpart guard: a slotless hook for a NON-terminal execution
+/// (the ordinary race where a hook beats `register_run_slot`) must NOT be
+/// counted as a terminal-execution reconcile — it is a benign drop.
+#[tokio::test]
+async fn hook_for_live_execution_without_slot_is_not_counted_as_reconcile() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+
+    let server_state = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
+    let chore = server_state
+        .work_db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    // A fresh (non-terminal) execution, with no slot registered.
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    let baseline = server_state
+        .dispatcher_stats
+        .snapshot()
+        .hook_events_for_terminal_execution;
+
+    let early_hook = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(execution.id.clone()),
+        transcript_path: None,
+        event: WorkerEvent::PostToolUse {
+            session_id: "sess-early".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+    };
+    dispatch_live_worker_state(&server_state, &early_hook).await;
+
+    let after = server_state
+        .dispatcher_stats
+        .snapshot()
+        .hook_events_for_terminal_execution;
+    assert_eq!(
+        after, baseline,
+        "a slotless hook for a live (non-terminal) execution must not be counted as a terminal reconcile",
+    );
+}

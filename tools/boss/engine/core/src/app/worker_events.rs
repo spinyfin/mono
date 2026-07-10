@@ -156,11 +156,20 @@ pub(super) async fn dispatch_live_worker_state(
             match register_remote_worker_slot(server_state, run_id).await {
                 Some(slot_id) => slot_id,
                 None => {
-                    tracing::warn!(
-                        run_id,
-                        kind = event_kind,
-                        "live_status: dropping hook fan-out — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run, or a non-remote run); transcript_path already persisted",
-                    );
+                    // No slot, and not a live remote worker. Before we
+                    // drop the event, check whether it belongs to an
+                    // execution the engine already believes is terminal —
+                    // the T267-class contradiction where a run we think is
+                    // dead is demonstrably alive (its worker is still
+                    // emitting hooks). If so, make it LOUD and countable
+                    // instead of swallowing it silently.
+                    if !note_hook_for_terminal_execution(server_state, run_id, event_kind) {
+                        tracing::warn!(
+                            run_id,
+                            kind = event_kind,
+                            "live_status: dropping hook fan-out — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run, or a non-remote run); transcript_path already persisted",
+                        );
+                    }
                     return;
                 }
             }
@@ -366,6 +375,51 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         server_state.broadcast_live_worker_states().await;
     }
     Some(slot_id)
+}
+
+/// When a hook event arrives for a run with no live slot mapping,
+/// determine whether the engine already considers that execution
+/// terminal. A terminal execution that is *still emitting worker hook
+/// events* is the T267-class contradiction: the engine believed the run
+/// dead — because an ack-timeout was once mis-handled as a spawn failure,
+/// or a sweep reaped it — yet its worker is demonstrably alive. Emit a
+/// loud `[engine-reconcile]` diagnostic and bump the
+/// `dispatcher.hook_events.for_terminal_execution` counter so the
+/// mismatch is observable rather than silently swallowed (the "engine has
+/// fresher liveness signals but doesn't consult them" failure class).
+///
+/// Returns `true` when it logged a terminal-execution hook, so the caller
+/// skips the ordinary "dropping hook" warning (this is the more specific,
+/// louder signal). Returns `false` for a healthy not-yet-terminal run
+/// whose hook merely raced ahead of `register_run_slot`, or for a run id
+/// with no matching execution row (a non-worker token) — those fall
+/// through to the ordinary drop path.
+///
+/// This deliberately does NOT resurrect the row: reconciliation of the
+/// actual liveness state belongs to the sweeps (`spawn_ack_sweep`,
+/// `dead_pid_sweep`, the lease heartbeat). The job here is to stop the
+/// contradiction from being silent.
+fn note_hook_for_terminal_execution(server_state: &Arc<ServerState>, run_id: &str, event_kind: &str) -> bool {
+    let execution = match server_state.work_db.get_execution(run_id) {
+        Ok(execution) => execution,
+        Err(_) => return false,
+    };
+    if !execution.status.is_terminal() {
+        return false;
+    }
+    server_state.dispatcher_stats.inc_hook_events_for_terminal_execution();
+    tracing::warn!(
+        run_id,
+        kind = event_kind,
+        status = %execution.status,
+        work_item_id = %execution.work_item_id,
+        "[engine-reconcile] live hook event arrived for a TERMINAL execution — the engine believes \
+         this run is dead but its worker is still emitting hooks. This is the ack-timeout / \
+         stale-reap contradiction (a run that should have stayed tracked was terminalized). Not \
+         resurrecting the row here; surfacing the live-liveness signal so the reconcilers and \
+         operators can act instead of silently dropping it.",
+    );
+    true
 }
 
 /// The work item's explicit model override, if it carries one (only
