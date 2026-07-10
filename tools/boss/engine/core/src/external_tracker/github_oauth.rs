@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
@@ -916,10 +916,7 @@ fn merge_org_state(acc: OrgAuthState, next: OrgAuthState) -> OrgAuthState {
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::epoch_time::now_epoch_secs()
 }
 
 // ── KeychainTokenStore ────────────────────────────────────────────────────────

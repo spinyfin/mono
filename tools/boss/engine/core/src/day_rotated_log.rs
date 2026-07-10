@@ -8,7 +8,6 @@
 //! directory.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -136,10 +135,7 @@ pub fn prune_old_files(dir: &Path, file_prefix: &str, keep_days: u64) {
 }
 
 pub fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    crate::epoch_time::now_epoch_ms()
 }
 
 /// UTC `YYYY-MM-DD` for an epoch-millis instant.

@@ -39,7 +39,7 @@
 //! raise a second one on every skip.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use boss_protocol::RequestExecutionInput;
 
@@ -117,10 +117,7 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
     let churn_cutoff = now_epoch_secs - DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS;
 
     // Snapshot of claimed execution ids across every pool, same shape
@@ -205,6 +202,8 @@ pub async fn run_one_pass(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::TempDir;
 

@@ -1458,10 +1458,7 @@ impl WorkDb {
     /// rate-limit the next retry until the user explicitly overrides.
     pub fn count_recent_ci_remediations(&self, work_item_id: &str, window_secs: i64) -> Result<i64> {
         let conn = self.connect()?;
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now_secs = crate::epoch_time::now_epoch_secs();
         let cutoff = now_secs.saturating_sub(window_secs);
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM ci_remediations

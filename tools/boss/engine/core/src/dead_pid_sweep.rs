@@ -54,7 +54,7 @@
 //! rather than a speculative one.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use boss_protocol::{LiveWorkerState, WorkExecution, WorkerActivity};
 
@@ -218,10 +218,7 @@ pub async fn run_one_pass(
     let mut outcome = DeadPidSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
-    let now_epoch_secs: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - DEAD_PID_GRACE_SECS;
 
     for state in snapshot {
@@ -377,10 +374,7 @@ pub async fn reap_reported_pane_death(
         return false;
     }
 
-    let now_epoch_secs: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
     let reason = format!("worker-pane-died: {detail}");
     reap_dead_execution(
         work_db,

@@ -134,10 +134,7 @@ impl LiveStatusDebugStore {
 }
 
 fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::epoch_time::now_epoch_secs()
 }
 
 // Phase-4 counter handles for DispatcherStats. Registered via

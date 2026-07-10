@@ -682,10 +682,7 @@ impl WorkDb {
         let Some((run_id, automation_id)) = row else {
             return Ok(false);
         };
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now_epoch = crate::epoch_time::now_epoch_secs();
         tx.execute(
             "UPDATE automation_runs
                 SET outcome = ?2,

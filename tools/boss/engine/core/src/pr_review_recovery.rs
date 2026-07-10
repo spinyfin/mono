@@ -38,7 +38,7 @@
 //!    pass.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use boss_protocol::CreateAttentionItemInput;
 
@@ -126,10 +126,7 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
     let churn_cutoff = now_epoch_secs - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
 
     for candidate in candidates {
@@ -260,6 +257,7 @@ fn file_dead_review_attention(work_db: &WorkDb, work_item_id: &str, dead_executi
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use boss_protocol::{ExecutionKind, RequestExecutionInput};
     use tempfile::TempDir;

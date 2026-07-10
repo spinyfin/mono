@@ -41,7 +41,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -244,10 +243,7 @@ pub fn record_event<T: Serialize>(event: &str, payload: &T) {
 }
 
 fn epoch_now_s() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::epoch_time::now_epoch_secs()
 }
 
 fn parent_pid() -> Option<u32> {

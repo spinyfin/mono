@@ -327,10 +327,7 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
         let coord = server_state.execution_coordinator.clone();
         let dispatcher =
             crate::automation_triage::EngineTriageDispatcher::new(work_db.clone(), Arc::new(move || coord.kick()));
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now_epoch = crate::epoch_time::now_epoch_secs();
         match dispatcher.fire(&automation) {
             crate::automation_scheduler::TriageDispatch::Dispatched { execution_id } => {
                 if let Err(err) = work_db.record_automation_run_and_advance(

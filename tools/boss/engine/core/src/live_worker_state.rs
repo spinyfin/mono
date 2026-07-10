@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 use boss_protocol::{LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
 
@@ -82,7 +81,7 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
-        guard.spawned_at.insert(slot_id, current_epoch_secs());
+        guard.spawned_at.insert(slot_id, crate::epoch_time::now_epoch_secs());
     }
 
     /// Drop the entry for `slot_id`. Called when the engine releases
@@ -439,19 +438,8 @@ fn is_terminal_activity(activity: WorkerActivity) -> bool {
     matches!(activity, WorkerActivity::Terminated | WorkerActivity::Errored)
 }
 
-fn current_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 fn current_iso8601() -> String {
-    let now = SystemTime::now();
-    let secs = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let secs = crate::epoch_time::now_epoch_secs();
     crate::iso8601::format_epoch_iso8601(secs)
 }
 

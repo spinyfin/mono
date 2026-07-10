@@ -28,7 +28,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -481,10 +480,7 @@ pub struct DispatchEvent {
 
 impl DispatchEvent {
     pub fn new(stage: Stage, outcome: Outcome, execution_id: impl Into<String>) -> Self {
-        let ts_epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let ts_epoch_ms = crate::epoch_time::now_epoch_ms();
         Self {
             ts_epoch_ms,
             stage: stage.as_str().to_owned(),

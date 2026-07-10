@@ -27,7 +27,7 @@
 use std::io::Read;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -203,10 +203,7 @@ fn compute_binary_fingerprint() -> Option<String> {
 pub fn process_started_at() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let secs = crate::epoch_time::now_epoch_secs();
         crate::iso8601::format_epoch_iso8601(secs)
     })
     .as_str()

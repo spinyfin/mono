@@ -38,7 +38,6 @@
 //! don't reap.").
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use boss_protocol::WorkExecution;
 #[cfg(test)]
@@ -260,10 +259,7 @@ pub async fn confirm_execution_dead(
 /// epoch directly to [`probe_in_flight_runs`] so they don't depend on
 /// the system clock.
 pub fn current_epoch_s() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::epoch_time::now_epoch_secs()
 }
 
 #[cfg(test)]
