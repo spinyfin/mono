@@ -698,6 +698,26 @@ mod tests {
 
     // ─── helpers ──────────────────────────────────────────────────────
 
+    /// Build the default [`RecoveryContext`] most tests use from the
+    /// per-test `db`/`live`/`coordinator`/`sink`. This is a macro rather
+    /// than a fn because the context borrows temporaries — a
+    /// `&RecoveryPolicy::default()` and a `&NoopWorkerNudger` — that must
+    /// outlive the returned struct; a fn would drop them at the return.
+    /// Tests that intentionally use a non-default policy or a real nudger
+    /// construct [`RecoveryContext`] explicitly instead.
+    macro_rules! default_cx {
+        ($db:expr, $live:expr, $coordinator:expr, $sink:expr) => {
+            RecoveryContext {
+                work_db: $db.as_ref(),
+                live_states: &$live,
+                coordinator: $coordinator.clone(),
+                dispatch_events: $sink.as_ref(),
+                policy: &RecoveryPolicy::default(),
+                nudger: &NoopWorkerNudger,
+            }
+        };
+    }
+
     /// Create a `running` execution with a backdated `started_at` (past
     /// the grace window) and a run whose transcript is `transcript_path`.
     fn create_running_execution(
@@ -856,14 +876,7 @@ mod tests {
         nudged.insert(exec_id.clone());
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut nudged, now()).await;
 
         // Second pass: nudge already tried, error still present → orphan+respawn.
@@ -911,14 +924,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.resumed, 1, "noop nudger falls through to orphan+respawn");
@@ -963,14 +969,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.escalated, 1, "permanent error should escalate");
@@ -1016,14 +1015,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.escalated, 1, "at cap, must escalate not resume");
@@ -1096,14 +1088,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(
@@ -1135,14 +1120,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.escalated, 1, "at cap, must escalate not resume");
@@ -1180,14 +1158,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.resumed, 0);
@@ -1224,14 +1195,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(
@@ -1282,14 +1246,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.resumed, 0);
@@ -1320,14 +1277,7 @@ mod tests {
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(
@@ -1374,14 +1324,7 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 2);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome.resumed, 0);
@@ -1422,14 +1365,7 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 2);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let cx = RecoveryContext {
-            work_db: db.as_ref(),
-            live_states: &live,
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            policy: &RecoveryPolicy::default(),
-            nudger: &NoopWorkerNudger,
-        };
+        let cx = default_cx!(db, live, coordinator, sink);
         let outcome = run_one_pass(&cx, &mut HashSet::new(), now()).await;
 
         assert_eq!(outcome, TransientRecoveryOutcome::default());
