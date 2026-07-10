@@ -23,6 +23,18 @@ extension ChatViewModel {
         engine.sendListPlannerRuns(projectId: projectID)
     }
 
+    /// Refresh every known project's planner-run audit trail for a product.
+    /// Called on `workInvalidated` for the product's work topic so a
+    /// planner run created after [[PlannerRunAffordance]]'s first appearance
+    /// (e.g. a design-PR-triggered auto-populate landing while the board is
+    /// already open) surfaces its icon within seconds instead of only after
+    /// the view remounts.
+    func refreshPlannerRuns(forProductID productID: String) {
+        for project in projectsByProductID[productID] ?? [] {
+            refreshPlannerRuns(projectID: project.id)
+        }
+    }
+
     /// Release a project's staged auto-populate batch: flips `autostart =
     /// true` on every task from its live `staged` planner run so the
     /// dispatcher picks them up on its next pass.

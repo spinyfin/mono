@@ -1999,11 +1999,13 @@ final class ChatViewModel: ObservableObject {
                 engine.sendGetWorkTree(productId: selectedProductID, flow: .invalidationRefetch)
                 engine.sendListAttentionItemsForWorkItem(workItemID: selectedProductID)
                 engine.sendListAttentionGroups(productId: selectedProductID)
+                refreshPlannerRuns(forProductID: selectedProductID)
             } else if let productId,
                       productId == currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productId, flow: .invalidationRefetch)
                 engine.sendListAttentionItemsForWorkItem(workItemID: productId)
                 engine.sendListAttentionGroups(productId: productId)
+                refreshPlannerRuns(forProductID: productId)
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
@@ -2110,6 +2112,8 @@ final class ChatViewModel: ObservableObject {
             )
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
+        case .workItemsCreated(let items):
+            handleCreatedWorkItemsBatch(items)
         case .workItemUpdated(let item):
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
@@ -2780,6 +2784,39 @@ final class ChatViewModel: ObservableObject {
             engine.sendGetWorkTree(productId: task.productID, flow: .itemRefetch)
         }
         refreshWorkSubscriptions()
+    }
+
+    /// Passive counterpart of `handleCreatedWorkItem` for a background batch
+    /// push (e.g. the auto-populate Populator staging a project's task
+    /// breakdown while the operator is looking at something else). Unlike
+    /// the single-item path, this must never hijack the operator's current
+    /// selection/filters — it only refreshes the affected product's board
+    /// and, for any touched projects, their planner-run audit trail so a
+    /// [[PlannerRunAffordance]] icon that hasn't appeared yet surfaces
+    /// without a view remount.
+    private func handleCreatedWorkItemsBatch(_ items: [WorkItemPayload]) {
+        var productIDs: Set<String> = []
+        var projectIDs: Set<String> = []
+        for item in items {
+            switch item {
+            case .product(let product):
+                productIDs.insert(product.id)
+            case .project(let project):
+                productIDs.insert(project.productID)
+                projectIDs.insert(project.id)
+            case .task(let task), .chore(let task):
+                productIDs.insert(task.productID)
+                if let projectID = task.projectID {
+                    projectIDs.insert(projectID)
+                }
+            }
+        }
+        for productID in productIDs where productID == currentSelectedProductID {
+            engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
+        }
+        for projectID in projectIDs {
+            refreshPlannerRuns(projectID: projectID)
+        }
     }
 
     private func handleUpdatedWorkItem(_ item: WorkItemPayload) {
