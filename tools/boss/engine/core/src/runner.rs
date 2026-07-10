@@ -563,8 +563,29 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .unwrap_or("none"),
             claude_effort = spawn_config.claude_effort.unwrap_or("default"),
             model = %spawn_config.model,
+            ack_timed_out = started.ack_timed_out,
             "pane spawned for execution",
         );
+
+        // Provisional spawn: the `SpawnWorkerPane` ack timed out, so the
+        // app may or may not have hosted the pane. We deliberately do NOT
+        // treat this as a failure (which would release the lease under a
+        // possibly-live pane and duplicate-dispatch the work item — the
+        // T267 incident). The execution stays tracked in `waiting_human`
+        // with the slot registered; the spawn-ack sweep confirms liveness
+        // (a hook/pid arrives) or reaps on total silence past the grace
+        // window. Surface it loudly so the provisional state is visible in
+        // the engine log and the run's result summary.
+        if started.ack_timed_out {
+            tracing::warn!(
+                worker_id,
+                execution_id = %execution.id,
+                slot_id = started.slot_id,
+                "spawn ack timed out; worker registered provisionally (shell_pid 0). \
+                 Deferring to the spawn-ack sweep to confirm liveness or reap — the \
+                 execution stays tracked and the workspace lease is retained.",
+            );
+        }
 
         // Mid-spawn cancel reconciliation (T981). A cancel / force-stop
         // can land while we were awaiting the `SpawnWorkerPane`
@@ -625,12 +646,23 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             RunWaitState::WaitingHuman
         };
-        Ok(RunOutcome {
-            wait_state,
-            result_summary: Some(format!(
+        let result_summary = if started.ack_timed_out {
+            format!(
+                "Spawned worker pane in slot {} PROVISIONALLY — the SpawnWorkerPane ack timed out, \
+                 so the pane's liveness is unconfirmed (shell pid {}). The slot is registered and \
+                 the spawn-ack sweep will confirm it via the first hook event or reap it on total \
+                 silence. Hook events from this run will surface on the engine events socket.",
+                started.slot_id, started.shell_pid,
+            )
+        } else {
+            format!(
                 "Spawned worker pane in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
                 started.slot_id, started.shell_pid,
-            )),
+            )
+        };
+        Ok(RunOutcome {
+            wait_state,
+            result_summary: Some(result_summary),
             attention: None,
             slot_id: Some(started.slot_id),
             spawn_config: Some(spawn_config),

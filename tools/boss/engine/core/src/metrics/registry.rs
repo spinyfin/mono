@@ -646,6 +646,12 @@ mod tests {
             names.iter().any(|n| n == "dispatcher.hook_events.total"),
             "expected dispatcher.hook_events.total to be registered; got {names:?}",
         );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "dispatcher.hook_events.for_terminal_execution"),
+            "expected dispatcher.hook_events.for_terminal_execution to be registered; got {names:?}",
+        );
         // Phase 5: merge_poller counters.
         for expected in [
             "merge_poller.merged",
@@ -688,8 +694,8 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            44,
-            "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 10 merge_poller + 18 external_tracker counters"
+            45,
+            "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + 18 external_tracker counters"
         );
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

@@ -185,6 +185,12 @@ crate::register_counter!(
     "dispatcher.transcript_path_persist.from_cache",
     "Persist calls that resolved transcript_path from the in-memory cache."
 );
+crate::register_counter!(
+    DISPATCHER_HOOK_EVENTS_FOR_TERMINAL_EXECUTION,
+    "dispatcher.hook_events.for_terminal_execution",
+    "Hook events that arrived for an execution the engine already considers terminal \
+     (a run believed dead is demonstrably alive) — each triggers a loud reconcile log."
+);
 
 /// Register every DispatcherStats counter handle with `registry`.
 /// Called once from `metrics::init_all` at engine startup so duplicate-name
@@ -199,6 +205,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_ROW_MISSING);
     registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_ERR);
     registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE);
+    registry.register_counter(&DISPATCHER_HOOK_EVENTS_FOR_TERMINAL_EXECUTION);
 }
 
 /// Engine-wide counters for the hook-event dispatcher. One instance
@@ -263,6 +270,9 @@ impl DispatcherStats {
     pub fn inc_persist_from_cache(&self) {
         DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE.inc(&self.metrics);
     }
+    pub fn inc_hook_events_for_terminal_execution(&self) {
+        DISPATCHER_HOOK_EVENTS_FOR_TERMINAL_EXECUTION.inc(&self.metrics);
+    }
 
     pub fn record_last_hook(&self, run_id: &str, kind: &str) {
         let mut guard = self.last_hook.lock().expect("last_hook mutex poisoned");
@@ -318,6 +328,10 @@ impl DispatcherStats {
                 .metrics
                 .counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE.name())
                 .unwrap_or(0),
+            hook_events_for_terminal_execution: self
+                .metrics
+                .counter_value(DISPATCHER_HOOK_EVENTS_FOR_TERMINAL_EXECUTION.name())
+                .unwrap_or(0),
             last_hook: self.last_hook(),
         }
     }
@@ -334,6 +348,7 @@ pub struct DispatcherStatsSnapshot {
     pub transcript_path_persist_row_missing: u64,
     pub transcript_path_persist_err: u64,
     pub transcript_path_persist_from_cache: u64,
+    pub hook_events_for_terminal_execution: u64,
     pub last_hook: Option<LastHookSnapshot>,
 }
 
