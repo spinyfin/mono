@@ -1775,6 +1775,13 @@ pub struct SweepOutcome {
     /// that was addressing them — or a revision in its chain — had its PR
     /// closed without merging in this sweep.
     pub comments_reopened: usize,
+    /// Number of `in_review` chores/project_tasks retired to `done`
+    /// because their bound PR was closed **without** merging
+    /// (`chore-lifecycle-pr-closed-unmerged.md`) — the on-close
+    /// counterpart to `merged` above. Kept as a separate counter (rather
+    /// than folded into `merged`) so operators can tell "shipped" from
+    /// "abandoned" retires apart in the sweep summary log.
+    pub closed_unmerged: usize,
 }
 
 impl SweepOutcome {
@@ -1792,6 +1799,7 @@ impl SweepOutcome {
             + self.worker_stopped_on_review
             + self.stranded_blocked_recanonicalized
             + self.comments_reopened
+            + self.closed_unmerged
     }
 }
 
@@ -2615,18 +2623,14 @@ async fn sweep_one(
             }
         }
         PrLifecycleState::ClosedUnmerged => {
-            // The task-status transition itself is out-of-scope here —
-            // `chore-lifecycle-pr-closed-unmerged.md` owns that (unimplemented;
-            // no `abandoned` status exists yet). The current sweep leaves the
-            // chore where it was, matching the prior poller's behaviour for a
-            // PR that has vanished.
-            //
-            // Comment reconciliation is a narrower, comment-only signal that
-            // doesn't need that lifecycle work to land first (comment-intent-
-            // classification design §"Reconciliation" / §Risks — the "reopen
-            // on abandon" half of task 2c): a comment whose `[Revise]` batch
-            // never shipped because this PR closed unmerged should not sit at
-            // `in_revision` forever, so reopen it onto the `[Revise]` banner.
+            // Comment reconciliation is a narrower, comment-only signal
+            // (comment-intent-classification design §"Reconciliation" /
+            // §Risks — the "reopen on abandon" half of task 2c): a comment
+            // whose `[Revise]` batch never shipped because this PR closed
+            // unmerged should not sit at `in_revision` forever, so reopen it
+            // onto the `[Revise]` banner. Runs before the status retire
+            // below so the reopen always observes the pre-retire comment
+            // state, independent of whether the retire itself fires.
             match work_db.reopen_comments_for_closed_unmerged_pr(&candidate.work_item_id) {
                 Ok(reopened) if reopened > 0 => {
                     outcome.comments_reopened += reopened;
@@ -2648,11 +2652,14 @@ async fn sweep_one(
                     );
                 }
             }
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "merge poller: PR closed without merge; leaving row in place",
-            );
+            // `chore-lifecycle-pr-closed-unmerged.md`: PR closure without a
+            // merge is a definitive human signal that this attempt is over.
+            // Retire the row to `done` (the parallel path to `mark_merged`
+            // above) — no redo execution is spawned; a human moves the row
+            // back to `todo`/`active` manually if the work should be redone.
+            if mark_closed_unmerged(work_db, publisher, candidate).await {
+                outcome.closed_unmerged += 1;
+            }
         }
     }
     // For every open (or just-probed) PR, persist the CI + review poll
@@ -3283,6 +3290,48 @@ async fn mark_merged(
             },
         );
     }
+    true
+}
+
+/// On-close counterpart to [`mark_merged`]: retire a chore whose bound PR
+/// was closed **without** merging. Parallel structure, deliberately much
+/// thinner — a closed-unmerged PR has no base ref to auto-populate a doc
+/// pointer from and no dependent Populator enqueue, since nothing shipped.
+///
+/// `chore-lifecycle-pr-closed-unmerged.md` — PR closure is a definitive
+/// human signal that this attempt is over; the engine must NOT spawn a redo
+/// execution here (that would contradict the human's decision to close
+/// without merging). If the work should be redone, a human moves the row
+/// back to `todo`/`active` manually.
+async fn mark_closed_unmerged(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+) -> bool {
+    let updated = match work_db.mark_chore_pr_closed_unmerged(&candidate.work_item_id, &candidate.pr_url) {
+        Ok(Some(task)) => task,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "merge poller: failed to mark work item closed-unmerged",
+            );
+            return false;
+        }
+    };
+    publisher
+        .publish_work_item_changed(&candidate.product_id, &updated.id, "pr_closed_unmerged")
+        .await;
+    publisher.kick_scheduler();
+    tracing::info!(
+        work_item_id = %updated.id,
+        kind = %updated.kind,
+        pr_url = %candidate.pr_url,
+        "merge poller: PR closed without merge; work item retired to done \
+         (closed-unmerged — not a merge)",
+    );
     true
 }
 
@@ -4154,9 +4203,11 @@ mod tests {
     /// Comment-intent-classification design §"Reconciliation" (task 2c):
     /// a comment addressed by this chore's `[Revise]` batch must reopen
     /// when the chore's PR closes without merging — the minimal
-    /// comment-only hook ahead of the full
-    /// `chore-lifecycle-pr-closed-unmerged` lifecycle (which is
-    /// unimplemented; the chore's own status is left untouched).
+    /// comment-only hook that predates the full
+    /// `chore-lifecycle-pr-closed-unmerged` retire path. The reopen must
+    /// survive that retire firing in the same sweep: the chore's own
+    /// status transitions to `done` below, but the comment stays reopened
+    /// rather than being immediately re-resolved by the retire.
     #[tokio::test]
     async fn closed_unmerged_pr_reopens_addressed_comments() {
         let dir = tempdir().unwrap();
@@ -4195,15 +4246,17 @@ mod tests {
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.comments_reopened, 1);
         assert_eq!(outcome.merged, 0);
+        assert_eq!(outcome.closed_unmerged, 1);
 
         let reloaded = db.get_comment(&comment.id).unwrap().unwrap();
         assert_eq!(reloaded.status, "active");
         assert!(reloaded.revise_task_id.is_none());
 
-        // The chore's own lifecycle transition is out of scope for this
-        // hook — `chore-lifecycle-pr-closed-unmerged.md` owns that.
+        // The chore itself is retired to `done` — a closed-unmerged PR is a
+        // definitive human signal that this attempt is over
+        // (`chore-lifecycle-pr-closed-unmerged.md`).
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
             other => panic!("expected chore, got {other:?}"),
         }
 
@@ -4214,6 +4267,48 @@ mod tests {
                 .any(|(p, w, r)| p == &product_id && w == &chore_id && r == "comments_reopened_on_pr_closed_unmerged"),
             "expected comments_reopened_on_pr_closed_unmerged event, got {events:?}",
         );
+    }
+
+    /// `chore-lifecycle-pr-closed-unmerged.md`: a chore bound to a PR that
+    /// gets closed without merging must retire to `done` on the next
+    /// merge-poller tick — the on-close counterpart to
+    /// `merged_pr_is_promoted_and_publishes_invalidation` above. No redo
+    /// execution is spawned; PR closure is a definitive human signal.
+    #[tokio::test]
+    async fn closed_unmerged_pr_retires_chore_to_done() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/5";
+        let (product_id, chore_id) = make_chore_in_review(&db, "C5", pr);
+
+        let probe = StubProbe::new();
+        probe.set(pr, PrLifecycleState::ClosedUnmerged);
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(outcome.closed_unmerged, 1);
+        assert_eq!(outcome.merged, 0, "closed-unmerged must not count as a merge");
+
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::Done);
+                assert_eq!(t.pr_url.as_deref(), Some(pr));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        let events = publisher.events.lock().await.clone();
+        assert!(
+            events
+                .iter()
+                .any(|(p, w, r)| p == &product_id && w == &chore_id && r == "pr_closed_unmerged"),
+            "expected pr_closed_unmerged work-item event, got {events:?}",
+        );
+
+        // Idempotency: a second pass over the same (now-done) row must not
+        // double-count or error, mirroring the merge path's idempotency.
+        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(outcome2.closed_unmerged, 0);
     }
 
     #[tokio::test]

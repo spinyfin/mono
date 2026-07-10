@@ -682,6 +682,64 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// Move the chore or project_task identified by `work_item_id`
+    /// from `in_review` to `done` because its bound PR was **closed
+    /// without merging** — the on-close counterpart to
+    /// [`Self::mark_chore_pr_merged`] (`chore-lifecycle-pr-closed-unmerged.md`).
+    /// Returns the updated task if a transition happened; `Ok(None)` if the
+    /// row was already past `in_review` (idempotent for late-arriving close
+    /// events, and safe if a concurrent sweep already retired it).
+    ///
+    /// `done` is the only terminal status the current enum offers — there is
+    /// no `abandoned`/`cancelled` state to distinguish "shipped" from
+    /// "closed unmerged" at the status level (open question, out of scope
+    /// here). Callers are expected to pre-filter on `kind` and `status =
+    /// in_review` the same way [`Self::list_chores_pending_merge_check`]
+    /// does for the merge path; this function itself only refuses rows
+    /// already past `in_review`.
+    ///
+    /// Mirrors `mark_chore_pr_merged`'s terminal-transition side effects
+    /// (dependent cascade, revision flip/block) since the row's resulting
+    /// status is identical — but deliberately does **not** call
+    /// `comments::reconcile_comments_for_task` with `Resolved`: the
+    /// close-unmerged comment story is "reopen anything still `in_revision`"
+    /// ([`Self::reopen_comments_for_closed_unmerged_pr`], called separately
+    /// by the merge poller), which this function must not immediately
+    /// undo by re-resolving those same comments.
+    pub fn mark_chore_pr_closed_unmerged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let Some(task) = query_task(&tx, work_item_id)? else {
+            return Ok(None);
+        };
+        if task.deleted_at.is_some() {
+            return Ok(None);
+        }
+        if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
+            return Ok(None);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE tasks
+             SET status             = 'done',
+                 updated_at         = ?3,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, ?3)
+             WHERE id = ?1
+               AND pr_url = ?2",
+            params![task.id, pr_url, now],
+        )?;
+        cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
+        block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
+        let updated =
+            query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// Reopen every `in_revision` comment addressed by `work_item_id`'s PR
     /// closing without merging — the "reopen on abandon" half of
     /// comment-intent-classification design §"Reconciliation" (task 2c).
