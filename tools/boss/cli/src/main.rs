@@ -1970,6 +1970,14 @@ struct TaskListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     include_deleted: bool,
 
+    /// Include archived tasks in the listing. `archived` rows are hidden
+    /// from the default view (and from the kanban board) the same way
+    /// tombstoned rows are, but — unlike delete — they are never
+    /// resurrected; this flag is the only way to see them again short of
+    /// `--status archived`.
+    #[arg(long = "include-archived")]
+    include_archived: bool,
+
     /// Filter by resolved repo. Accepts a full URL or a short
     /// name (basename of the URL minus `.git`). Resolution falls
     /// back to the parent product's `repo_remote_url` when the
@@ -2268,6 +2276,10 @@ struct ChoreListArgs {
     /// `boss task list --help`.
     #[arg(long = "deleted", alias = "include-deleted")]
     include_deleted: bool,
+
+    /// Include archived chores in the listing. See `boss task list --help`.
+    #[arg(long = "include-archived")]
+    include_archived: bool,
 
     /// Filter by resolved repo. See `boss task list --help`.
     #[arg(long = "repo")]
@@ -2637,6 +2649,7 @@ enum TaskStatusArg {
     #[value(alias = "in-review", alias = "in_review")]
     Review,
     Done,
+    Archived,
 }
 
 /// `boss task|chore move --to`. Same board-name-primary,
@@ -2652,6 +2665,7 @@ enum MoveTarget {
     Review,
     Done,
     Blocked,
+    Archived,
 }
 
 impl ProductStatus {
@@ -2707,6 +2721,7 @@ impl TaskStatusArg {
             Self::Blocked => "blocked",
             Self::Review => "in_review",
             Self::Done => "done",
+            Self::Archived => "archived",
         }
     }
 }
@@ -2721,6 +2736,7 @@ impl MoveTarget {
             Self::Review => "in_review",
             Self::Done => "done",
             Self::Blocked => "blocked",
+            Self::Archived => "archived",
         }
     }
 }
@@ -2937,9 +2953,10 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         status_semantics: vec![
-            "Task and chore status uses the board (kanban) names: backlog, doing, review, done, blocked. These are the canonical values shown in --status help and emitted in --json.",
+            "Task and chore status uses the board (kanban) names: backlog, doing, review, done, blocked, archived. These are the canonical values shown in --status help and emitted in --json.",
             "The legacy stored names are accepted as aliases on input: todo->backlog, active->doing, in_review (or in-review)->review. They remain how rows are stored, so --json/human output always shows the board name regardless of how a row was set.",
-            "boss task|chore update --status and --status list filters accept either vocabulary; boss task|chore move --to backlog|doing|review|done|blocked (legacy names also accepted).",
+            "boss task|chore update --status and --status list filters accept either vocabulary; boss task|chore move --to backlog|doing|review|done|blocked|archived (legacy names also accepted).",
+            "archived is a terminal status for leaf work items (tasks/chores), distinct from delete: `boss task|chore update --status archived` (or `move --to archived`) marks a row as no longer relevant while keeping it queryable — it is NOT soft-deleted (deleted_at stays NULL) and leaves the kanban board the same way an archived project does. It can be reached from any non-terminal status, and moving it back to backlog (`--status backlog` / `--to backlog`) un-archives it. Archived rows are hidden from `boss task|chore list` by default; pass `--include-archived` or filter `--status archived` explicitly to see them.",
             "Product move/delete: --to active|paused|archived. delete is a soft archive (sets status=archived).",
             "Project move/delete: --to planned|active|blocked|done|archived. delete is a soft archive (sets status=archived).",
             "Task/chore delete is a soft delete (sets deleted_at). Recover an accidentally deleted leaf work item with `boss task restore <id>` (alias `undelete`); it clears deleted_at and is idempotent. Find tombstoned rows to restore with `boss task list --deleted` / `boss chore list --deleted`.",
@@ -3722,6 +3739,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     match_term: args.match_term.as_deref(),
                     ids: &args.id,
                     limit: args.limit,
+                    include_archived: args.include_archived,
                 },
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
@@ -3829,6 +3847,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     match_term: args.match_term.as_deref(),
                     ids: &args.id,
                     limit: args.limit,
+                    include_archived: args.include_archived,
                 },
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
@@ -6702,6 +6721,7 @@ async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: Rev
             match_term: args.match_term.as_deref(),
             ids: &args.id,
             limit: args.limit,
+            include_archived: false,
         },
         None,
         product.repo_remote_url.as_deref(),
@@ -8351,6 +8371,11 @@ struct TaskListCriteria<'a> {
     match_term: Option<&'a str>,
     ids: &'a [String],
     limit: Option<usize>,
+    /// When `false`, `archived` rows are hidden unless `statuses`
+    /// explicitly asks for them — mirrors the deleted/restore contract
+    /// (hidden by default, visible on request) rather than the
+    /// show-everything default other statuses get.
+    include_archived: bool,
 }
 
 fn apply_task_list_filters(
@@ -8363,9 +8388,13 @@ fn apply_task_list_filters(
     let allowed_priorities: Vec<&str> = criteria.priorities.iter().map(|p| p.as_str()).collect();
     let id_set: std::collections::HashSet<&str> = criteria.ids.iter().map(String::as_str).collect();
     let lc_term = criteria.match_term.map(str::to_lowercase);
+    let show_archived = criteria.include_archived || allowed_statuses.contains(&"archived");
     items
         .into_iter()
         .filter(|task| {
+            if !show_archived && task.status.as_str() == "archived" {
+                return false;
+            }
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
                 return false;
             }
@@ -9463,11 +9492,12 @@ mod tests {
     use super::{
         AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem, ChoreCommand, Cli,
         Commands, DependCommand, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand,
-        ProductStatus, ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand, TaskStatusArg,
-        classify_bind_pr, classify_lint_finding, compile_schedule, decide_open_design_action,
-        ensure_explicit_product_matches, expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
-        is_typed_work_item_id, lint_summary_line, parse_attention_group_selector, parse_automation_selector,
-        pick_by_index, split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
+        ProductStatus, ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand, TaskListCriteria,
+        TaskStatusArg, apply_task_list_filters, classify_bind_pr, classify_lint_finding, compile_schedule,
+        decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
+        format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
+        parse_attention_group_selector, parse_automation_selector, pick_by_index, split_shake_report, status_vocab,
+        validate_github_pr_url, with_display_status,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -9481,6 +9511,7 @@ mod tests {
         assert_eq!(MoveTarget::Review.as_status(), "in_review");
         assert_eq!(MoveTarget::Done.as_status(), "done");
         assert_eq!(MoveTarget::Blocked.as_status(), "blocked");
+        assert_eq!(MoveTarget::Archived.as_status(), "archived");
     }
 
     #[test]
@@ -9492,6 +9523,83 @@ mod tests {
         assert_eq!(TaskStatusArg::Review.as_str(), "in_review");
         assert_eq!(TaskStatusArg::Done.as_str(), "done");
         assert_eq!(TaskStatusArg::Blocked.as_str(), "blocked");
+        assert_eq!(TaskStatusArg::Archived.as_str(), "archived");
+    }
+
+    #[test]
+    fn archived_tasks_hidden_from_list_by_default_but_shown_on_request() {
+        let archived = Task::builder()
+            .id("task_archived")
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Archived)
+            .created_at("")
+            .updated_at("")
+            .build();
+        let live = Task::builder()
+            .id("task_live")
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .build();
+
+        // Default view: archived is hidden, live rows still show.
+        let visible = apply_task_list_filters(
+            vec![archived.clone(), live.clone()],
+            TaskListCriteria {
+                statuses: &[],
+                priorities: &[],
+                match_term: None,
+                ids: &[],
+                limit: None,
+                include_archived: false,
+            },
+            None,
+            None,
+        );
+        assert_eq!(visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["task_live"]);
+
+        // `--include-archived` surfaces it alongside everything else.
+        let visible = apply_task_list_filters(
+            vec![archived.clone(), live.clone()],
+            TaskListCriteria {
+                statuses: &[],
+                priorities: &[],
+                match_term: None,
+                ids: &[],
+                limit: None,
+                include_archived: true,
+            },
+            None,
+            None,
+        );
+        assert_eq!(visible.len(), 2);
+
+        // An explicit `--status archived` filter also surfaces it, without
+        // needing `--include-archived` too.
+        let visible = apply_task_list_filters(
+            vec![archived, live],
+            TaskListCriteria {
+                statuses: &[TaskStatusArg::Archived],
+                priorities: &[],
+                match_term: None,
+                ids: &[],
+                limit: None,
+                include_archived: false,
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["task_archived"]
+        );
     }
 
     #[test]
