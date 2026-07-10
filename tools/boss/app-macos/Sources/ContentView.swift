@@ -3134,31 +3134,11 @@ private struct PlannerRunRow: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let notes = run.notes, !notes.isEmpty {
                     section(title: "Rationale") {
-                        Text(notes)
-                            .font(.callout)
-                            .fixedSize(horizontal: false, vertical: true)
+                        PlannerRunRationaleText(text: notes)
                     }
                 }
-                let auditLines = run.effortAuditLines
-                if !auditLines.isEmpty {
-                    section(title: "Effort classification") {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(auditLines, id: \.self) { line in
-                                Text(line).font(.caption.monospaced())
-                            }
-                        }
-                    }
-                }
-                if let rawOutput = run.rawOutput, !rawOutput.isEmpty {
-                    section(title: "Raw model output") {
-                        ScrollView {
-                            Text(rawOutput)
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxHeight: 200)
-                    }
+                if hasDebugInfo {
+                    debugInfoDisclosure
                 }
                 if run.isStaged || run.isApplied {
                     actions
@@ -3204,6 +3184,48 @@ private struct PlannerRunRow: View {
         }
     }
 
+    /// `true` when this run has machine-audit metadata (effort-classification
+    /// lines, verbatim model output) worth keeping around for a rare
+    /// diagnostic look — but not worth showing an operator by default.
+    private var hasDebugInfo: Bool {
+        !run.effortAuditLines.isEmpty || !(run.rawOutput ?? "").isEmpty
+    }
+
+    /// Machine-audit metadata, collapsed behind its own disclosure so it
+    /// never shows by default alongside the operator-facing rationale.
+    /// Always rendered in a monospace block, never inline with prose.
+    @ViewBuilder
+    private var debugInfoDisclosure: some View {
+        DisclosureGroup("Debug info") {
+            VStack(alignment: .leading, spacing: 10) {
+                let auditLines = run.effortAuditLines
+                if !auditLines.isEmpty {
+                    section(title: "Effort classification") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(auditLines, id: \.self) { line in
+                                Text(line).font(.caption.monospaced())
+                            }
+                        }
+                    }
+                }
+                if let rawOutput = run.rawOutput, !rawOutput.isEmpty {
+                    section(title: "Raw model output") {
+                        ScrollView {
+                            Text(rawOutput)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 200)
+                    }
+                }
+            }
+            .padding(.top, 6)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+    }
+
     @ViewBuilder
     private var actions: some View {
         HStack(spacing: 8) {
@@ -3219,6 +3241,32 @@ private struct PlannerRunRow: View {
             PlannerUndoButton(model: model, project: project, run: run, isBusy: isBusy)
             if isBusy {
                 ProgressView().controlSize(.small)
+            }
+        }
+    }
+}
+
+/// Renders a Planner run's free-text rationale as legible prose: blank-line
+/// separated paragraphs get real spacing and line height instead of being
+/// dumped into a single dense `Text`.
+private struct PlannerRunRationaleText: View {
+    let text: String
+
+    private var paragraphs: [String] {
+        text
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, paragraph in
+                Text(paragraph)
+                    .font(.callout)
+                    .lineSpacing(4)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
