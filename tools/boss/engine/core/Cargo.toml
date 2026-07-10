@@ -50,3 +50,9 @@ core-foundation-sys = "0.8"
 boss-client = { path = "../../client" }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# test-util enables tokio's virtual-time controls (time::pause / advance,
+# #[tokio::test(start_paused = true)]) used by the sweep_loop tests to
+# drive the periodic loop deterministically without real sleeps. It is
+# deliberately excluded from tokio's "full" feature set, so it must be
+# opted into here for the test build.
+tokio = { workspace = true, features = ["test-util"] }
