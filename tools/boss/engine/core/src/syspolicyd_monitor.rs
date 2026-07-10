@@ -49,7 +49,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// CPU% at or above which `syspolicyd` is considered "saturated". The
 /// wedge pins it at ~100%; 90% leaves headroom for sampling jitter while
@@ -196,13 +196,6 @@ async fn sample_via_ps() -> Option<SyspolicydSample> {
     parse_syspolicyd_sample(&stdout)
 }
 
-fn now_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 /// Spawn a tokio task that samples `syspolicyd` forever at `interval`,
 /// updating `health`. Logs once on each transition into the wedged state
 /// (not every tick) so the engine log carries the signature without
@@ -213,7 +206,7 @@ pub fn spawn_loop(health: Arc<SyspolicydHealth>, interval: Duration) -> tokio::t
         loop {
             match sample_via_ps().await {
                 Some(sample) => {
-                    let status = health.record_sample(sample, now_epoch_secs());
+                    let status = health.record_sample(sample, crate::epoch_time::now_epoch_secs());
                     if status.wedged && !was_wedged {
                         tracing::error!(
                             pid = status.pid,

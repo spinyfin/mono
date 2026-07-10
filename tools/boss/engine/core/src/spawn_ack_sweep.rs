@@ -60,7 +60,7 @@
 //! pattern as [`crate::dead_pid_sweep`] / [`crate::stale_worker_sweep`]).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use boss_protocol::{WorkExecution, WorkerActivity};
 
@@ -178,10 +178,7 @@ pub async fn run_one_pass(
     let mut outcome = SpawnAckSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
-    let now_epoch_secs: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - grace_secs;
     let ctx = SpawnReapCtx {
         work_db,

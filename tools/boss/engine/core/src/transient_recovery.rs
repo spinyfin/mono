@@ -106,7 +106,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -646,10 +646,7 @@ fn clip(s: &str, max_bytes: usize) -> String {
 }
 
 pub fn current_epoch_s() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::epoch_time::now_epoch_secs()
 }
 
 #[cfg(test)]

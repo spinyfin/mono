@@ -22,7 +22,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -517,10 +517,7 @@ pub async fn run_stage_stalled_pass(
     thresholds: &StageThresholds,
     sink: &dyn DispatchEventSink,
 ) -> Result<usize> {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let now_ms = crate::epoch_time::now_epoch_ms();
     let stalls = pending_stalls(root, now_ms, thresholds)?;
     let count = stalls.len();
     for stall in stalls {

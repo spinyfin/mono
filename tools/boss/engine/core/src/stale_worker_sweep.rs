@@ -56,7 +56,7 @@
 //! pattern as [`crate::dead_pid_sweep`] / [`crate::orphan_sweep`]).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use boss_protocol::WorkerActivity;
 
@@ -182,10 +182,7 @@ pub async fn run_one_pass(
     let mut outcome = StaleWorkerSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
-    let now_epoch_secs: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - STALE_GRACE_SECS;
     // Build the staleness cutoff as a fixed-width ISO-8601 string so we
     // can compare `last_event_at < stale_cutoff` lexicographically — the

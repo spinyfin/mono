@@ -405,10 +405,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             );
             return;
         }
-        let now_epoch_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_epoch_s = crate::epoch_time::now_epoch_secs() as u64;
         coordinator.set_dispatch_paused(paused, now_epoch_s);
         // Persist the new state to the metadata table so it survives a restart.
         let db_result = if paused {

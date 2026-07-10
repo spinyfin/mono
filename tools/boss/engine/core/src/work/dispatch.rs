@@ -322,10 +322,7 @@ impl WorkDb {
     /// pre-spawn side of the reconciliation story.
     pub fn list_dispatch_failed_recovery_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let now_secs: i64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now_secs: i64 = crate::epoch_time::now_epoch_secs();
         let cutoff = now_secs - min_age_secs;
         let mut stmt = conn.prepare(
             "SELECT id FROM tasks
@@ -644,10 +641,7 @@ impl WorkDb {
     /// the correct `pr_review` execution kind.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let now_secs: i64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now_secs: i64 = crate::epoch_time::now_epoch_secs();
         let cutoff = now_secs - min_age_secs;
         // The recovery-escalation exclusion: once the transient-recovery
         // sweep has raised an open attention item because a worker's API

@@ -75,7 +75,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -176,10 +176,7 @@ pub async fn run_one_pass(
 ) -> PoolClaimSweepOutcome {
     let mut outcome = PoolClaimSweepOutcome::default();
 
-    let now_epoch_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_epoch_secs = crate::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - LEAK_GRACE_SECS;
 
     // Executions that currently have a live worker pane. `run_id` on a

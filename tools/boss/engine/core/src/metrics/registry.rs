@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static descriptor for a counter, produced by [`register_counter!`].
 ///
@@ -501,10 +500,7 @@ fn validate_name(name: &str) {
 }
 
 pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::epoch_time::now_epoch_ms() as i64
 }
 
 #[cfg(test)]

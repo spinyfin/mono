@@ -41,7 +41,7 @@
 //! wake catches up) and is correct across all cron frequencies.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -173,7 +173,7 @@ pub fn spawn_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let now = now_epoch();
+            let now = crate::epoch_time::now_epoch_secs();
             let pass = run_one_pass(work_db.as_ref(), now, dispatcher.as_ref()).await;
             if pass.evaluated > 0 {
                 tracing::info!(
@@ -217,13 +217,6 @@ pub(crate) fn next_sleep_secs(work_db: &WorkDb, now: i64) -> u64 {
             }
         }
     }
-}
-
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 /// Run a single scheduler pass against `now_epoch` (UTC seconds). Pure of

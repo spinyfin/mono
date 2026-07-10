@@ -32,8 +32,6 @@
 //! covering the same PR (it cleared the conflict moments ago and
 //! hasn't retired yet). `on_ci_failure_detected` defers in that case.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 #[cfg(test)]
 use boss_protocol::TaskKind;
 use boss_protocol::{
@@ -1098,10 +1096,7 @@ pub async fn on_ci_in_flight(
             return "none";
         }
     };
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now_secs = crate::epoch_time::now_epoch_secs();
     let elapsed = now_secs.saturating_sub(observation.first_observed_at_secs());
     let target_bucket = if elapsed >= NEVER_STARTS_ALERT_THRESHOLD_SECS {
         "alert"

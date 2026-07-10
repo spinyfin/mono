@@ -471,10 +471,7 @@ impl WorkDb {
         lookback_secs: u64,
     ) -> Result<Vec<LatePrCandidate>> {
         let conn = self.connect()?;
-        let cutoff = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
+        let cutoff = (crate::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(lookback_secs)
             .to_string();
         let mut stmt = conn.prepare(&format!(
@@ -518,10 +515,7 @@ impl WorkDb {
     /// Returns `(task_id, product_id, pr_url)` triples.
     pub fn list_tasks_with_stalled_reviewer(&self, stale_secs: u64) -> Result<Vec<(String, String, String)>> {
         let conn = self.connect()?;
-        let cutoff = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
+        let cutoff = (crate::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(stale_secs)
             .to_string();
         // Tasks in `active` with a `pr_url` that have a `pr_review` execution

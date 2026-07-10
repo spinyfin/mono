@@ -1513,10 +1513,7 @@ impl ExecutionCoordinator {
                 return Vec::new();
             }
         };
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_secs = crate::epoch_time::now_epoch_secs() as u64;
         let cutoff_ms = min_age_ms;
         ready
             .into_iter()

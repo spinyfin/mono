@@ -905,12 +905,7 @@ impl WorkDb {
 
         let outcome = if new_count <= max_retries {
             let delay = retry_delays[(new_count - 1) as usize];
-            let dispatch_not_before = (SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                + delay.as_secs())
-            .to_string();
+            let dispatch_not_before = (crate::epoch_time::now_epoch_secs() as u64 + delay.as_secs()).to_string();
             tx.execute(
                 "UPDATE work_executions
                  SET pre_start_failure_count = ?2,

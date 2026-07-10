@@ -1133,10 +1133,7 @@ pub async fn serve(
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
+                let now = crate::epoch_time::now_epoch_secs();
                 let changed =
                     live_worker_states.mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
                 if !changed.is_empty() {
