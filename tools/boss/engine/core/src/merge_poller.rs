@@ -7678,6 +7678,110 @@ mod tests {
         }
     }
 
+    /// T2381/PR#1861 end-to-end regression: a merge-queue rebounce whose fix
+    /// revision settles must not strand the parent invisibly in
+    /// `blocked: ci_failure`. Once its fix revision is spawned, the parent
+    /// must be back in `list_chores_pending_merge_check`'s `in_review`
+    /// bucket, so a later sweep that finds the PR CONFLICTING (green CI,
+    /// stale rebase base) routes straight to `conflict_watch` through the
+    /// normal `sweep_one` dispatch — exactly like any other open PR — instead
+    /// of being orphaned in ci_watch's bucket forever.
+    #[tokio::test]
+    async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1861";
+        let (product_id, chore) = make_chore_in_review(&db, "C-t2381-sweep", pr);
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Step 1: simulate the merge-queue rebounce detection (in production
+        // this comes from `check_merge_queue_rebounce`'s `gh` timeline probe;
+        // called directly here, as ci_watch's own tests do, to seed the DB
+        // state without a `gh` round-trip).
+        let rebounce_candidate = crate::work::PendingMergeCheck {
+            work_item_id: chore.clone(),
+            product_id: product_id.clone(),
+            pr_url: pr.to_owned(),
+        };
+        let flipped = ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &rebounce_candidate,
+            Some("feature-branch"),
+            None,
+            "synthetic-merge-sha",
+            &[],
+        )
+        .await;
+        assert!(flipped, "rebounce must be detected");
+
+        // The fix revision spawns immediately, so the parent returns to
+        // `in_review` (in_review model) rather than sitting in `blocked:
+        // ci_failure` — this is the fix: it must land back in the sweep's
+        // normal `in_review` probe pool.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "revision spawn must unblock the parent");
+                assert!(t.blocked_reason.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let in_review_bucket = db.list_chores_pending_merge_check().unwrap();
+        assert!(
+            in_review_bucket.iter().any(|c| c.work_item_id == chore),
+            "parent must be visible in the in_review probe pool, not orphaned in ci_watch's bucket",
+        );
+
+        // Step 2: the revision force-pushed a rebase; the next sweep's probe
+        // reports the PR's own CI as fully green but CONFLICTING against a
+        // now-stale base (T2381's exact observed state).
+        let probe = StubProbe::new();
+        probe.states.lock().unwrap().insert(
+            pr.into(),
+            Ok(PrLifecycleProbe {
+                url: pr.into(),
+                state: PrLifecycleState::Open(OpenPrStatus {
+                    mergeability: OpenPrMergeability::Conflict,
+                    ci: OpenPrCiStatus::Clean,
+                }),
+                base_ref_oid: Some("main-sha-2".into()),
+                head_ref_oid: Some("rebased-head-sha".into()),
+                head_ref_name: Some("feature-branch".into()),
+                base_ref_name: Some("main".into()),
+                labels: Vec::new(),
+                review: PrReviewState::Unknown,
+                in_merge_queue: false,
+                raw_mergeable: "CONFLICTING".into(),
+                raw_merge_state_status: "DIRTY".into(),
+            }),
+        );
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(
+            outcome.conflict_flagged, 1,
+            "conflict_watch must fire via the normal in_review sweep dispatch",
+        );
+
+        // The stale merge_queue_rebounce ci_remediations attempt must not be
+        // left active (it would otherwise strand a phantom "ci failing"
+        // badge forever), and a conflict-resolution attempt must now exist.
+        assert!(
+            db.active_ci_remediation_for_work_item(&chore).unwrap().is_none(),
+            "stale ci_remediations attempt must be superseded",
+        );
+        let crz = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+        assert_eq!(crz.len(), 1, "a conflict-resolution attempt must be spawned");
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_ne!(
+                    t.blocked_reason.as_deref(),
+                    Some("ci_failure"),
+                    "row must no longer be stuck on the foreign ci_failure reason",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
     /// Acceptance test: a kick that arrives after the quiesce window
     /// has elapsed triggers an immediate pass (breaks out of the wait).
     #[tokio::test]

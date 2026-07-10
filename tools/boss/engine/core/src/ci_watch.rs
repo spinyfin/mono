@@ -513,11 +513,30 @@ pub async fn on_ci_failure_detected(
     let task_transitioned = match task_result {
         Ok(Some(_)) => true,
         Ok(None) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: WHERE guard missed; row already blocked or manually moved",
-            );
+            // ci_failure is the lowest-priority blocked reason (design §Q2:
+            // dependency > review_feedback > merge_conflict >
+            // ci_failure_exhausted > ci_failure) and conflict pre-empts CI
+            // (§Q1), so ci_watch never takes a row over from another
+            // watcher's bucket — but make the skip visible (T2381/PR#1861:
+            // this class of cross-watcher orphaning previously left no
+            // trace at all) instead of a bare "manually moved" guess.
+            match work_db.task_blocked_reason(&candidate.work_item_id) {
+                Ok(Some(reason)) if reason != "ci_failure" && reason != "ci_failure_exhausted" => {
+                    tracing::info!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        owning_reason = %reason,
+                        "ci_watch: row parked in another watcher's bucket; not taking over",
+                    );
+                }
+                _ => {
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        "ci_watch: WHERE guard missed; row already blocked or manually moved",
+                    );
+                }
+            }
             false
         }
         Err(err) => {
@@ -1010,8 +1029,23 @@ pub async fn on_merge_queue_rebounce_detected(
     // by the first, and that attempt must still get its own revision rather than
     // strand. The PR is known-open (it was in the merge queue), so a static
     // checker is correct here and avoids a redundant `gh pr view` round-trip.
-    if attempt.status == "pending" && attempt.revision_task_id.is_none() {
-        maybe_spawn_ci_revision(
+    //
+    // T2381/PR#1861 fix: unlike `on_ci_failure_detected`, this path used to leave
+    // the upfront `blocked: ci_failure` flip in place even after a fix revision
+    // spawned successfully — the parent never returned to `in_review`, so it sat
+    // in `list_chores_blocked_on_ci_failure`'s bucket forever instead of the
+    // normal `in_review` probe pool. Once the revision force-pushed a rebase that
+    // GitHub reported as CONFLICTING against a moving base, that stuck parent was
+    // invisible to `conflict_watch` (its WHERE guard only flips `in_review` rows)
+    // and the row orphaned in the wrong watcher's bucket. Mirror the #1007
+    // parent-state model here too: clear the flip back to `in_review` and record
+    // the in-flight signal on a successful spawn, so the parent re-enters the
+    // normal `in_review` probe pool — where a subsequent CONFLICTING probe is
+    // routed straight to `conflict_watch` like any other open PR.
+    let mut task_unblocked_for_revision = false;
+    if attempt.status == "pending"
+        && attempt.revision_task_id.is_none()
+        && maybe_spawn_ci_revision(
             work_db,
             publisher,
             &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
@@ -1019,10 +1053,17 @@ pub async fn on_merge_queue_rebounce_detected(
             &[], // no per-check failures for rebounce; directive uses failure_kind
             &attempt,
         )
-        .await;
+        .await
+    {
+        task_unblocked_for_revision =
+            blocking_signal::unblock_for_revision(work_db, SignalKind::CiFailure, candidate, &attempt.id);
     }
 
-    if task_transitioned {
+    let task_changed = task_transitioned || task_unblocked_for_revision;
+    if task_changed {
+        // Keyed off the attempt (mirrors on_ci_failure_detected's budget
+        // comment): a fresh `fix` attempt progressed even when the upfront
+        // flip was immediately undone by a successful revision spawn.
         if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
@@ -1030,8 +1071,13 @@ pub async fn on_merge_queue_rebounce_detected(
                 "ci_watch: failed to increment ci_attempts_used (rebounce)",
             );
         }
+        let change_reason = if task_unblocked_for_revision {
+            "ci_revision_in_flight"
+        } else {
+            "blocked_ci_failure"
+        };
         publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "blocked_ci_failure")
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, change_reason)
             .await;
         publisher
             .publish_frontend_event_on_product(
@@ -1050,6 +1096,8 @@ pub async fn on_merge_queue_rebounce_detected(
             pr_url = %candidate.pr_url,
             before_commit_sha,
             head_sha_at_trigger = before_commit_sha,
+            task_transitioned,
+            task_unblocked_for_revision,
             "ci_watch: merge-queue rebounce detected; parent flipped to blocked: ci_failure",
         );
         true

@@ -1283,9 +1283,21 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
     .await;
     assert!(flipped, "rebounce detection must flip chore to ci_failure");
 
+    // T2381/PR#1861 fix: in the in_review model (mirrors on_ci_failure_detected
+    // and on_conflict_detected) a spawned revision immediately unblocks the
+    // parent back to `in_review`; `blocked: ci_failure` is transient. Before
+    // this fix the parent stayed `blocked: ci_failure` forever, invisible to
+    // conflict_watch's `status='in_review'` WHERE guard.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
+    assert!(
+        db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .any(|s| s.reason == "ci_failure"),
+        "in-flight ci_failure signal must stay armed while the revision runs",
+    );
 
     // Phase 5 cutover: no bespoke ci_remediation execution — the fix
     // delivers via an engine-triggered revision instead.
@@ -1361,10 +1373,19 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
          head-branch CI; the PR's own CI is always green in this case"
     );
 
-    // Chore must still be blocked after the clean probe.
+    // Parent stays in_review (in_review model) with the ci_failure signal
+    // still armed — the clean head-branch probe must not clear it.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
+    assert!(
+        db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .any(|s| s.reason == "ci_failure"),
+        "ci_failure in-flight signal must remain armed — the PR's own CI is always \
+         green for a rebounce",
+    );
 }
 
 /// Defect #3 (the un-block side fighting the block): an InFlight head-branch
@@ -1413,9 +1434,18 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
         "InFlight head-branch CI must not supersede a merge_queue_rebounce block",
     );
 
+    // Parent stays in_review (in_review model) with the ci_failure signal
+    // still armed — the InFlight probe must not supersede it.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
+    assert!(
+        db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .any(|s| s.reason == "ci_failure"),
+        "ci_failure in-flight signal must remain armed",
+    );
     let attempt = db
         .active_ci_remediation_for_work_item(&chore)
         .unwrap()
@@ -1451,14 +1481,19 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
         on_ci_in_flight_supersedes_failure(&db, pub_.as_ref(), &cand, &[], Some("pr-head")).await;
         on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await;
 
-        // Invariant on every cycle after the first bounce: still blocked.
+        // Invariant on every cycle after the first bounce: parent stays
+        // in_review (in_review model) with the ci_failure signal still armed
+        // — neither opposing un-block path may clear it.
         let (status, reason) = chore_state(&db, &chore);
-        assert_eq!(
-            status,
-            TaskStatus::Blocked,
-            "must stay blocked on cycle {cycle} (no flap)"
+        assert_eq!(status, TaskStatus::InReview, "cycle {cycle}");
+        assert!(reason.is_none(), "cycle {cycle}");
+        assert!(
+            db.active_blocked_signals(&chore)
+                .unwrap()
+                .iter()
+                .any(|s| s.reason == "ci_failure"),
+            "ci_failure in-flight signal must stay armed on cycle {cycle} (no flap)",
         );
-        assert_eq!(reason.as_deref(), Some("ci_failure"), "cycle {cycle}");
     }
     assert_eq!(
         bounce_count, 1,
@@ -1503,9 +1538,11 @@ async fn rebounce_detection_idempotent_on_same_sha() {
     assert!(first, "first detection must flip the chore");
     assert!(!second, "second probe for same SHA must be a no-op");
 
+    // In the in_review model the spawned revision immediately unblocks the
+    // parent back to `in_review`.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
 
     // Phase 5 cutover: exactly one revision, no ci_remediation executions.
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1622,9 +1659,11 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     )
     .await;
     assert!(first, "first rebounce must flip chore to ci_failure");
+    // In the in_review model the spawned revision immediately unblocks the
+    // parent back to `in_review`.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
     {
         // Phase 5 cutover: no bespoke ci_remediation execution; a revision is
         // spawned instead.
@@ -1754,9 +1793,11 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
             .unwrap();
         assert_eq!(r, 2, "sha2 must have its own revision; total revisions must be 2");
     }
+    // In the in_review model sha2's spawned revision immediately unblocks
+    // the parent back to `in_review`.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
 
     // Sanity: no stranded ci_remediation attempts — sha2 has revision_task_id.
     let stranded = db.list_stranded_ci_remediation_attempts().unwrap();
