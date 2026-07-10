@@ -259,3 +259,60 @@ pub(crate) fn comments_runs(json: bool, state_root: Option<PathBuf>, comment_id:
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--task <id>` alone is shorthand for a `work_item`-kind thread:
+    /// the id is returned verbatim and the kind is forced to `work_item`.
+    #[test]
+    fn task_shorthand_maps_to_work_item_kind() {
+        let (kind, id) = resolve_comments_artifact(Some("task-42".to_owned()), None, "pr_doc".to_owned())
+            .expect("--task alone should resolve");
+        assert_eq!(kind, "work_item");
+        assert_eq!(id, "task-42");
+    }
+
+    /// The `--task` shorthand ignores whatever `--artifact-kind` carries
+    /// (it defaults to `pr_doc`): a work-item comment thread is always
+    /// keyed by `work_item`, never by the passed-through kind.
+    #[test]
+    fn task_shorthand_ignores_artifact_kind() {
+        let (kind, id) = resolve_comments_artifact(Some("task-7".to_owned()), None, "some_other_kind".to_owned())
+            .expect("--task alone should resolve");
+        assert_eq!(kind, "work_item", "--task must force work_item kind");
+        assert_eq!(id, "task-7");
+    }
+
+    /// `--artifact <id>` alone pairs the raw id with the supplied
+    /// `--artifact-kind` unchanged.
+    #[test]
+    fn artifact_uses_supplied_kind() {
+        let (kind, id) =
+            resolve_comments_artifact(None, Some("pr_doc:repo:branch:path".to_owned()), "pr_doc".to_owned())
+                .expect("--artifact alone should resolve");
+        assert_eq!(kind, "pr_doc");
+        assert_eq!(id, "pr_doc:repo:branch:path");
+    }
+
+    /// Passing both `--task` and `--artifact` is rejected with guidance
+    /// to pass only one.
+    #[test]
+    fn both_task_and_artifact_errors() {
+        let err = resolve_comments_artifact(Some("task-1".to_owned()), Some("art-1".to_owned()), "pr_doc".to_owned())
+            .expect_err("passing both should error");
+        assert_eq!(format!("{err:#}"), "pass only one of --task or --artifact",);
+    }
+
+    /// Passing neither `--task` nor `--artifact` is rejected with guidance
+    /// to pass one of them.
+    #[test]
+    fn neither_task_nor_artifact_errors() {
+        let err = resolve_comments_artifact(None, None, "pr_doc".to_owned()).expect_err("passing neither should error");
+        assert_eq!(
+            format!("{err:#}"),
+            "pass --task <id> or --artifact <id> (with --artifact-kind)",
+        );
+    }
+}
