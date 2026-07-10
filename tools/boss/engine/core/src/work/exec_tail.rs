@@ -610,3 +610,7 @@ impl WorkDb {
         Ok(n > 0)
     }
 }
+
+#[cfg(test)]
+#[path = "exec_tail_tests.rs"]
+mod tests;
