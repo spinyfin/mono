@@ -4,14 +4,37 @@ OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
 
-BAZEL_STARTUP_FLAGS=""
+# Per-pipeline bazel daemon idle TTL. Low-immediacy pipelines (checkleft-release,
+# integrity) run on a cron/manual cadence where a cold start doesn't matter;
+# give them a short TTL so their daemon frees its memory ~15min after the last
+# invocation instead of lingering for bazel's multi-hour default. The hot `mono`
+# PR pipeline keeps a long TTL so back-to-back PR builds stay warm.
+case "${BUILDKITE_PIPELINE_SLUG:-}" in
+  mono-checkleft-release | mono-integrity)
+    BAZEL_MAX_IDLE_SECS=900
+    ;;
+  *)
+    BAZEL_MAX_IDLE_SECS=7200
+    ;;
+esac
+
+BAZEL_STARTUP_FLAGS="--max_idle_secs=${BAZEL_MAX_IDLE_SECS}"
 
 STARTUP_RC=".ci.${OS_TYPE}.startup.bazelrc"
 if [[ -f "$STARTUP_RC" ]]; then
-  BAZEL_STARTUP_FLAGS="--bazelrc=$STARTUP_RC"
+  BAZEL_STARTUP_FLAGS="$BAZEL_STARTUP_FLAGS --bazelrc=$STARTUP_RC"
 fi
 
-export REPOBIN_BAZEL_STARTUP_FLAGS="$BAZEL_STARTUP_FLAGS"
+# CI_BAZEL_STARTUP_FLAGS is the single source of truth for bazel startup
+# options in CI. Bazel spins up a brand-new server (and lets the old one
+# linger for its full idle TTL) whenever startup options differ from the
+# currently running server for the same output_base — so every CI code path
+# that shells out to bazel (this script's `bazel()` wrapper below, repobin,
+# and checkleft's own `bazel build`/`query` calls for buildifier resolution
+# and bazel_aspect invocations) MUST read startup flags from here rather than
+# constructing their own, or the workspace ends up running two daemons at
+# once (roughly doubling its memory footprint) instead of one.
+export CI_BAZEL_STARTUP_FLAGS="$BAZEL_STARTUP_FLAGS"
 
 # On macOS, detect Xcode version changes and expunge the stale Bazel output
 # base. The apple_cc_configure module extension caches Xcode paths in the

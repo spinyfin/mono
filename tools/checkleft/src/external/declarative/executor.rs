@@ -506,6 +506,11 @@ fn run_bazel_aspect_invocation(
     effective_severity: Option<Severity>,
 ) -> Result<Vec<Finding>> {
     let bazel = PathBuf::from("bazel");
+    // CI's startup flags (--bazelrc, --max_idle_secs, ...) MUST prefix every
+    // invocation below -- omitting them (or drifting from the wrapper `bazel()`
+    // that CI scripts use) makes bazel spin up a second server for this same
+    // workspace. See `ci_bazel_startup_flags` for why.
+    let startup_flags = super::ci_bazel_startup_flags();
 
     // 1. Map changed files to the targets that own them. `same_pkg_direct_rdeps`
     //    resolves each source file to the rule(s) listing it in srcs. Files that
@@ -517,12 +522,13 @@ fn run_bazel_aspect_invocation(
         .collect::<Vec<_>>()
         .join(" ");
     let query = format!("same_pkg_direct_rdeps(set({set}))");
-    let query_args = vec![
+    let mut query_args = startup_flags.clone();
+    query_args.extend([
         "query".to_owned(),
         "--keep_going".to_owned(),
         "--output=label".to_owned(),
         query,
-    ];
+    ]);
     let query_output = spawn(repo_root, &bazel, &query_args, &invocation.id)?;
     if !matches!(query_output.exit_code, Some(0) | Some(3)) {
         bail!(
@@ -570,12 +576,13 @@ fn run_bazel_aspect_invocation(
             .join(" ");
         let kinds = aspect.test_rdeps_kinds.join("|");
         let test_query = format!("kind(\"{kinds}\", same_pkg_direct_rdeps(set({targets_set})))");
-        let test_query_args = vec![
+        let mut test_query_args = startup_flags.clone();
+        test_query_args.extend([
             "query".to_owned(),
             "--keep_going".to_owned(),
             "--output=label".to_owned(),
             test_query,
-        ];
+        ]);
         let test_query_output = spawn(repo_root, &bazel, &test_query_args, &invocation.id)?;
         if matches!(test_query_output.exit_code, Some(0) | Some(3)) {
             for line in String::from_utf8_lossy(&test_query_output.stdout).lines() {
@@ -615,7 +622,8 @@ fn run_bazel_aspect_invocation(
         .iter()
         .filter_map(|f| expand_build_flag(f, effective_severity))
         .collect();
-    let mut build_args: Vec<String> = vec!["build".to_owned()];
+    let mut build_args: Vec<String> = startup_flags;
+    build_args.push("build".to_owned());
     build_args.extend(aspect_flags.iter().cloned());
     build_args.extend(expanded_build_flags.iter().cloned());
     build_args.extend(targets.iter().cloned());
