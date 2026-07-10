@@ -41,7 +41,7 @@ Ensures the agent has the required toolchain:
 
 ### `bazel-build-test.sh`
 
-Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The build phase catches build-graph rot (visibility violations, missing deps, broken generated files) that cargo cannot see; the test phase is the canonical rust test step and, with P1 landed (`tools/boss/engine/BUILD.bazel:86` — `rust_test(name = "engine_lib_test", crate = ":engine_lib")`), covers the engine lib tests that the 2026-05-12 drift incident exposed, in addition to the integration test targets. Each phase logs under its own collapsible `---` group (`[bazel-build]` / `[bazel-test]`) so a build breakage vs. a test failure stays distinguishable in the log even though they're one Buildkite step. The step still emits two GitHub commit statuses, `buildkite/mono/bazel-build` and `buildkite/mono/bazel-test`, so branch protection needs no changes — see `REQUIRED_CHECKS.md`.
+Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The build phase catches build-graph rot (visibility violations, missing deps, broken generated files) that cargo cannot see; the test phase is the canonical rust test step and, with P1 landed (`tools/boss/engine/BUILD.bazel:86` — `rust_test(name = "engine_lib_test", crate = ":engine_lib")`), covers the engine lib tests that the 2026-05-12 drift incident exposed, in addition to the integration test targets. Each phase logs under its own collapsible `---` group (`[bazel-build]` / `[bazel-test]`) so a build breakage vs. a test failure stays distinguishable in the log even though they're one Buildkite step. The step emits a single GitHub commit status, `buildkite/mono/bazel-build-test` — see `REQUIRED_CHECKS.md`.
 
 ### `checks.sh`
 
@@ -64,7 +64,7 @@ The CI config is in `.bazelrc.ci`.
 
 ## Required checks (branch protection)
 
-Required checks are managed via branch protection rules. The check names buildkite reports are `buildkite/mono/<step-key>`, e.g. `buildkite/mono/bazel-build`. Treat these as a public contract — renaming a step key in `pipeline.yml` requires updating branch protection in lockstep.
+Required checks are managed via branch protection rules. The check names buildkite reports are `buildkite/mono/<step-key>`, e.g. `buildkite/mono/bazel-build-test`. Treat these as a public contract — renaming a step key in `pipeline.yml` requires updating branch protection in lockstep.
 
 ## Status
 

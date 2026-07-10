@@ -16,9 +16,7 @@ steps:
       queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
       - github_commit_status:
-          context: "buildkite/mono/bazel-build"
-      - github_commit_status:
-          context: "buildkite/mono/bazel-test"
+          context: "buildkite/mono/bazel-build-test"
 
   - label: ":apple: mac-app-build"
     key: "mac-app-build"
