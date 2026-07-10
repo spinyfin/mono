@@ -1553,10 +1553,18 @@ struct SidebarProductPicker: View {
 /// reason string for any value this hasn't been taught yet, so a new
 /// engine-side defer reason still renders something useful instead of a
 /// blank card.
+///
+/// The `chain_serialized`/`chain_serialized_review_held` defer reasons are
+/// no longer matched here as fixed codes: the engine (`coordinator.rs`'s
+/// `chain_serialized_wait_reason`) now persists a fully-formed, operator-
+/// facing sentence naming the concrete blocking task and PR (e.g. "blocked
+/// by T2468 'Fix failing CI' on mono#1901 (revisions on the same PR run one
+/// at a time)") directly into `dispatch_wait_reason`, so it falls through
+/// to the `default` case below unchanged (T2469 incident: the old fixed
+/// "blocked behind a live PR sibling" copy named neither the blocking task
+/// nor the PR, and used engine-internal "sibling" vocabulary).
 private func dispatchWaitReasonLabel(_ reason: String) -> String {
     switch reason {
-    case "chain_serialized":
-        return "Waiting — blocked behind a live PR sibling"
     case "pool_exhausted":
         return "Waiting — worker pool full"
     case "pending_first_attempt":

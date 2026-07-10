@@ -164,6 +164,16 @@ pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall"
 /// incident so a human is alerted well before that point going forward.
 pub const CHAIN_SERIALIZED_STALL_THRESHOLD_SECS: i64 = 900;
 
+/// Short `repo#N` reference for a canonical GitHub PR URL, for embedding in
+/// operator-facing text (e.g. the `chain_serialized` wait reason). `None`
+/// for anything that isn't a parseable GitHub PR URL.
+fn pr_short_reference(pr_url: &str) -> Option<String> {
+    let repo_path = boss_github::pr_url::repo_from_pr_url(pr_url)?;
+    let number = boss_github::pr_url::pr_number_from_url(pr_url)?;
+    let repo_name = repo_path.rsplit('/').next().unwrap_or(repo_path);
+    Some(format!("{repo_name}#{number}"))
+}
+
 /// Outcome of [`ExecutionCoordinator::resolve_chain_hold`] for one execution.
 enum ChainHold {
     /// No other chain member is live; dispatch may proceed normally.
@@ -173,8 +183,15 @@ enum ChainHold {
     /// `true` when the blocking sibling is a `pr_review` execution — a
     /// review-vs-something-else hold, as opposed to a writer-vs-writer
     /// hold — purely for trace/UI labeling; the caller still treats both
-    /// as equally blocking.
-    Blocked { sibling: WorkExecution, review_held: bool },
+    /// as equally blocking. `queue_len` is the total count of live chain
+    /// siblings found (including `sibling` itself) — used to tell an
+    /// operator "N queued ahead" rather than naming only the one
+    /// currently live.
+    Blocked {
+        sibling: WorkExecution,
+        review_held: bool,
+        queue_len: usize,
+    },
     /// A live `pr_review` sibling was found but bypassed: `execution` is a
     /// merge-conflict-fix revision, and reviews are read-only so cannot
     /// race the shared jj backing store the guard protects (see
@@ -1791,6 +1808,7 @@ impl ExecutionCoordinator {
         let Some(first_sibling) = siblings.first().cloned() else {
             return Ok(ChainHold::Clear);
         };
+        let queue_len = siblings.len();
         let all_review_siblings = siblings.iter().all(|s| s.kind == ExecutionKind::PrReview);
         let is_conflict_revision = matches!(
             self.work_db.classify_work_item_for_dispatch(&execution.work_item_id),
@@ -1812,8 +1830,55 @@ impl ExecutionCoordinator {
             Ok(ChainHold::Blocked {
                 sibling,
                 review_held: all_review_siblings,
+                queue_len,
             })
         }
+    }
+
+    /// Build the operator-facing string persisted into
+    /// `dispatch_wait_reason` (and rendered verbatim on the kanban card)
+    /// for a `ChainHold::Blocked` outcome. Names the concrete blocking
+    /// task and PR instead of the opaque engine-internal "sibling"
+    /// vocabulary — see the T2469 incident (mono#1901) where the card read
+    /// "Waiting — blocked behind a live PR sibling" with no way to tell
+    /// what a "sibling" was, which task was blocking, or which PR was
+    /// involved. When more than one sibling is queued, names the count and
+    /// the currently-live one.
+    fn chain_serialized_wait_reason(&self, sibling: &WorkExecution, review_held: bool, queue_len: usize) -> String {
+        let sibling_task = self
+            .resolve_execution_work_item(sibling)
+            .ok()
+            .and_then(|item| match item {
+                WorkItem::Task(task) | WorkItem::Chore(task) => Some(task),
+                _ => None,
+            });
+        let sibling_label = sibling_task
+            .as_ref()
+            .map(|task| format!("{} '{}'", task.short_label(), task.name))
+            .unwrap_or_else(|| sibling.work_item_id.clone());
+        // The chain-root task's `pr_url` (set once the PR exists) is the
+        // reliable source — a root `chore_implementation`/`task_implementation`
+        // execution never carries its own `pr_url` (the PR doesn't exist yet
+        // when it was dispatched), only revision executions do. Fall back to
+        // the execution's own `pr_url` for the revision-sibling case.
+        let pr_ref = sibling_task
+            .as_ref()
+            .and_then(|task| task.pr_url.as_deref())
+            .or(sibling.pr_url.as_deref())
+            .and_then(pr_short_reference)
+            .map(|r| format!(" on {r}"))
+            .unwrap_or_default();
+        let queue_prefix = if queue_len > 1 {
+            format!("{queue_len} revisions queued; currently running: ")
+        } else {
+            String::new()
+        };
+        let cause = if review_held {
+            "an automated PR review runs at a time"
+        } else {
+            "revisions on the same PR run one at a time"
+        };
+        format!("blocked by {queue_prefix}{sibling_label}{pr_ref} ({cause})")
     }
 
     /// After `execution` has sat `ready` and chain-serialized for at least
@@ -2012,8 +2077,12 @@ impl ExecutionCoordinator {
             // behind a read-only review (see `resolve_chain_hold`'s docs for
             // the T270/T258 priority-inversion incident this closes).
             match self.resolve_chain_hold(&execution).await {
-                Ok(ChainHold::Blocked { sibling, review_held }) => {
-                    let reason = if review_held {
+                Ok(ChainHold::Blocked {
+                    sibling,
+                    review_held,
+                    queue_len,
+                }) => {
+                    let event_reason = if review_held {
                         "chain_serialized_review_held"
                     } else {
                         "chain_serialized"
@@ -2025,21 +2094,30 @@ impl ExecutionCoordinator {
                         live_sibling_work_item_id = %sibling.work_item_id,
                         pool = pool_label,
                         review_held,
-                        "spawn_attempt status=ready -> deferred reason={reason}"
+                        "spawn_attempt status=ready -> deferred reason={event_reason}"
                     );
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
                                 .with_work_item(&execution.work_item_id)
                                 .with_details(serde_json::json!({
-                                    "reason": reason,
+                                    "reason": event_reason,
                                     "review_held": review_held,
                                     "live_sibling_execution_id": sibling.id,
                                     "live_sibling_work_item_id": sibling.work_item_id,
                                 })),
                         )
                         .await;
-                    if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, reason) {
+                    // Operator-facing wait reason: names the concrete blocking
+                    // task/PR instead of the opaque "PR sibling" wording (T2469
+                    // incident — the card read "blocked behind a live PR
+                    // sibling" with no way to tell what a sibling was or which
+                    // task/PR was involved). `dispatch_events`/tracing above
+                    // keep the terse `event_reason` code for stats grouping;
+                    // this is the string persisted into `dispatch_wait_reason`
+                    // and rendered verbatim on the kanban card.
+                    let wait_reason = self.chain_serialized_wait_reason(&sibling, review_held, queue_len);
+                    if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, &wait_reason) {
                         tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
                     }
                     self.surface_chain_serialized_stall_if_overdue(&execution, &sibling);
@@ -2578,7 +2656,9 @@ impl ExecutionCoordinator {
         // here (which would otherwise wedge it in a defer loop instead of
         // ever actually dispatching).
         match self.resolve_chain_hold(execution).await {
-            Ok(ChainHold::Blocked { sibling, review_held }) => {
+            Ok(ChainHold::Blocked {
+                sibling, review_held, ..
+            }) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -3162,7 +3242,9 @@ impl ExecutionCoordinator {
         // assertion would defeat the bypass right before the irreversible
         // spawn step.
         match self.resolve_chain_hold(execution).await {
-            Ok(ChainHold::Blocked { sibling, review_held }) => {
+            Ok(ChainHold::Blocked {
+                sibling, review_held, ..
+            }) => {
                 tracing::error!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -10984,12 +11066,123 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(
-            wait_reason.as_deref(),
-            Some("chain_serialized_review_held"),
+        let wait_reason = wait_reason.expect("dispatch_wait_reason must be set");
+        assert!(
+            wait_reason.contains("an automated PR review runs at a time"),
             "a revision deferred behind a live pr_review sibling must record the review-held \
-             reason, not the generic writer-held `chain_serialized`",
+             reason, not the generic writer-held wording; got {wait_reason:?}",
         );
+        assert!(
+            !wait_reason.contains("revisions on the same PR run one at a time"),
+            "must not use the writer-held phrasing for a review-held wait; got {wait_reason:?}",
+        );
+        assert!(
+            !wait_reason.to_lowercase().contains("sibling"),
+            "operator-facing wait reason must not use engine-internal \"sibling\" vocabulary; \
+             got {wait_reason:?}",
+        );
+    }
+
+    /// The `chain_serialized` (writer-held, not review-held) wait reason
+    /// persisted into `dispatch_wait_reason` must name the concrete
+    /// blocking task (`T<short_id>` + name) and PR — not the opaque
+    /// "PR sibling" wording the T2469 incident (mono#1901) reported, which
+    /// gave an operator no way to tell what a "sibling" was, which task
+    /// was blocking, or which PR was involved.
+    #[tokio::test]
+    async fn drain_records_writer_held_wait_reason_names_blocking_task_and_pr() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1901";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_writer_held', product_id, 'revision', 'Fix failing CI', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Live writer execution on the chain root (blocks the revision below).
+        let root_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        let root_short_label = match db.get_work_item(&root_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.short_label(),
+            _ => panic!("expected a task/chore work item"),
+        };
+
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_writer_held")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        let mut wait_reason = None;
+        for _ in 0..200 {
+            wait_reason = db.get_execution(&revision_exec.id).unwrap().dispatch_wait_reason;
+            if wait_reason.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let wait_reason = wait_reason.expect("dispatch_wait_reason must be set");
+        assert!(
+            wait_reason.contains(&root_short_label),
+            "wait reason must name the blocking sibling's T-id; got {wait_reason:?}",
+        );
+        assert!(
+            wait_reason.contains("Test chore"),
+            "wait reason must name the blocking sibling's task title; got {wait_reason:?}",
+        );
+        assert!(
+            wait_reason.contains("mono#1901"),
+            "wait reason must name the blocking PR; got {wait_reason:?}",
+        );
+        assert!(
+            wait_reason.contains("revisions on the same PR run one at a time"),
+            "writer-held wait must not use the review-held phrasing; got {wait_reason:?}",
+        );
+        assert!(
+            !wait_reason.to_lowercase().contains("sibling"),
+            "operator-facing wait reason must not use engine-internal \"sibling\" vocabulary; \
+             got {wait_reason:?}",
+        );
+        assert!(root_exec.id != revision_exec.id, "sanity: distinct executions");
     }
 
     /// Redundant-spawn guard emits `host_selected:error` with `reason=redundant_spawn`
