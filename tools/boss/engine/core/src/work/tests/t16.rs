@@ -1121,3 +1121,239 @@ fn rearm_blocked_ci_failure_signal_false_on_wrong_state() {
     assert!(!db.rearm_blocked_ci_failure_signal(&wrong_reason).unwrap());
     assert!(active_signal_reasons(&db, &wrong_reason).is_empty());
 }
+
+// ── retarget_blocked_ci_failure_to_merge_conflict ───────────────────────
+//
+// Coverage for `WorkDb::retarget_blocked_ci_failure_to_merge_conflict` — the
+// foreign-bucket takeover (T2381/PR#1861) that re-buckets a chore currently
+// `blocked: ci_failure` / `ci_failure_exhausted` into `blocked:
+// merge_conflict`, clearing the CI-family signals and arming a
+// merge_conflict signal. Unlike its siblings this path overwrites *another*
+// watcher's scalar reason, so the tests pin the observable parent state
+// (returned Task + `active_blocked_signals`), not raw SQL internals.
+
+/// Attempt id stamped onto `tasks.blocked_attempt_id` by the seed helper so
+/// the retarget's NULL-out of that column is observable.
+const RETARGET_ATTEMPT_ID: &str = "cir_retarget_seed";
+
+/// Stand up a product-with-repo + a chore driven through the public flips
+/// into `blocked: ci_failure` (or `ci_failure_exhausted` when `exhausted`),
+/// against `pr_url`, with `blocked_attempt_id` stamped and the CI signal(s)
+/// armed. Mirrors the arrangement `ci_watch` produces in production. Returns
+/// the db and the chore id.
+fn seed_blocked_ci(label: &str, pr_url: &str, exhausted: bool) -> (WorkDb, String) {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product = create_test_product_with_repo(&db, label, Some("git@example.invalid:foo/bar.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), format!("Chore {label}"));
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            pr_url: Some(pr_url.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    // in_review → blocked: ci_failure, stamping blocked_attempt_id and arming
+    // the ci_failure signal.
+    db.mark_chore_blocked_ci_failure(&chore.id, pr_url, Some(RETARGET_ATTEMPT_ID))
+        .unwrap()
+        .expect("in_review row flips to blocked: ci_failure");
+    if exhausted {
+        // ci_failure → ci_failure_exhausted (keeps blocked_attempt_id, arms the
+        // exhausted signal alongside the still-active ci_failure one).
+        db.mark_chore_blocked_ci_failure_exhausted(&chore.id, pr_url)
+            .unwrap()
+            .expect("ci_failure row flips to ci_failure_exhausted");
+    }
+    (db, chore.id)
+}
+
+/// Happy path from `ci_failure`: the parent is re-bucketed to `blocked:
+/// merge_conflict`, `blocked_attempt_id` is NULLed, `last_status_actor`
+/// becomes `engine`, and the returned Task reflects all of it.
+#[test]
+fn retarget_flips_ci_failure_to_merge_conflict() {
+    let pr_url = pr(1);
+    let (db, chore_id) = seed_blocked_ci("retarget-cf", &pr_url, false);
+
+    // Precondition: blocked on ci_failure, attempt-id stamped, signal armed.
+    let (status, reason, attempt_id) = parent_state(&db, &chore_id);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(attempt_id.as_deref(), Some(RETARGET_ATTEMPT_ID));
+    assert_eq!(active_signal_reasons(&db, &chore_id), vec!["ci_failure"]);
+
+    let updated = db
+        .retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
+        .unwrap()
+        .expect("a blocked: ci_failure row on the matching pr_url must be retargeted");
+
+    // The returned Task reflects the flip.
+    assert_eq!(updated.status, TaskStatus::Blocked);
+    assert_eq!(updated.blocked_reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(updated.blocked_attempt_id, None, "blocked_attempt_id is cleared");
+    assert_eq!(updated.last_status_actor, "engine");
+
+    // …and so does the persisted row and the signal set.
+    let (status, reason, attempt_id) = parent_state(&db, &chore_id);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(attempt_id, None);
+    assert_eq!(
+        active_signal_reasons(&db, &chore_id),
+        vec!["merge_conflict"],
+        "the ci_failure signal is cleared and a merge_conflict signal is armed",
+    );
+}
+
+/// Same takeover from the budget-exhausted bucket: a `ci_failure_exhausted`
+/// parent is retargeted just like a `ci_failure` one.
+#[test]
+fn retarget_flips_ci_failure_exhausted_to_merge_conflict() {
+    let pr_url = pr(2);
+    let (db, chore_id) = seed_blocked_ci("retarget-exhausted", &pr_url, true);
+
+    // Precondition: blocked on ci_failure_exhausted with the exhausted signal
+    // armed (the earlier ci_failure signal is still active too).
+    let (_, reason, attempt_id) = parent_state(&db, &chore_id);
+    assert_eq!(reason.as_deref(), Some("ci_failure_exhausted"));
+    assert_eq!(attempt_id.as_deref(), Some(RETARGET_ATTEMPT_ID));
+    assert!(
+        active_signal_reasons(&db, &chore_id).contains(&"ci_failure_exhausted".to_owned()),
+        "the exhausted signal must be armed before the retarget",
+    );
+
+    let updated = db
+        .retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
+        .unwrap()
+        .expect("a blocked: ci_failure_exhausted row must also be retargeted");
+    assert_eq!(updated.status, TaskStatus::Blocked);
+    assert_eq!(updated.blocked_reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(updated.blocked_attempt_id, None);
+    assert_eq!(updated.last_status_actor, "engine");
+
+    let (status, reason, attempt_id) = parent_state(&db, &chore_id);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(attempt_id, None);
+    assert_eq!(active_signal_reasons(&db, &chore_id), vec!["merge_conflict"]);
+}
+
+/// The signal-clearing contract: every active CI-family signal
+/// (`ci_failure`, `ci_failure_exhausted`, `ci_flaky_retriggered`) is stamped
+/// `cleared_at`, and afterwards the only active signal is `merge_conflict`.
+#[test]
+fn retarget_clears_all_ci_signals_and_arms_merge_conflict() {
+    let pr_url = pr(3);
+    let (db, chore_id) = seed_blocked_ci("retarget-signals", &pr_url, true);
+    // Plant the third CI-family signal the takeover must also clear.
+    insert_signal(&db, &chore_id, "ci_flaky_retriggered", "500", None);
+
+    // Precondition: all three CI-family signals are active.
+    let before = active_signal_reasons(&db, &chore_id);
+    for reason in ["ci_failure", "ci_failure_exhausted", "ci_flaky_retriggered"] {
+        assert!(
+            before.contains(&reason.to_owned()),
+            "{reason} must be armed before the retarget",
+        );
+    }
+
+    db.retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
+        .unwrap()
+        .expect("retarget must land");
+
+    // Every CI-family signal is now cleared; only merge_conflict is active.
+    for reason in ["ci_failure", "ci_failure_exhausted", "ci_flaky_retriggered"] {
+        assert!(
+            signal_cleared_at(&db, &chore_id, reason).is_some(),
+            "the {reason} signal must be stamped cleared_at",
+        );
+    }
+    assert_eq!(active_signal_reasons(&db, &chore_id), vec!["merge_conflict"]);
+    assert!(
+        signal_cleared_at(&db, &chore_id, "merge_conflict").is_none(),
+        "the merge_conflict signal must be armed after the retarget",
+    );
+}
+
+/// A `pr_url` mismatch is a guarded no-op: the PR was re-pointed under the
+/// engine, so the row is not ours to retarget. `Ok(None)`, and the parent
+/// plus its armed signal are untouched.
+#[test]
+fn retarget_noop_on_pr_url_mismatch() {
+    let pr_url = pr(4);
+    let (db, chore_id) = seed_blocked_ci("retarget-pr-miss", &pr_url, false);
+
+    assert!(
+        db.retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr(999))
+            .unwrap()
+            .is_none(),
+        "a mismatched pr_url must not retarget the row",
+    );
+    let (status, reason, attempt_id) = parent_state(&db, &chore_id);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    assert_eq!(attempt_id.as_deref(), Some(RETARGET_ATTEMPT_ID));
+    assert_eq!(active_signal_reasons(&db, &chore_id), vec!["ci_failure"]);
+}
+
+/// A parent that is not in `status='blocked'` (e.g. a human moved it back to
+/// `in_review`) is a no-op even on the right pr_url and a CI reason.
+#[test]
+fn retarget_noop_when_not_blocked() {
+    let pr_url = pr(5);
+    let (db, chore_id) = seed_blocked_ci("retarget-not-blocked", &pr_url, false);
+    // Move the parent out of `blocked` while keeping its reason / pr_url.
+    set_blocking_state(&db, &chore_id, "in_review", Some("ci_failure"), Some(&pr_url), "100");
+
+    assert!(
+        db.retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
+            .unwrap()
+            .is_none(),
+        "a non-blocked parent must not be retargeted",
+    );
+    let (status, reason, _) = parent_state(&db, &chore_id);
+    assert_eq!(status, "in_review");
+    assert_eq!(reason.as_deref(), Some("ci_failure"));
+}
+
+/// A parent blocked on a *non-CI* reason (e.g. already `merge_conflict`) is
+/// a no-op — the WHERE guard only claims `ci_failure` / `ci_failure_exhausted`
+/// rows, so a concurrent clear/human move is respected.
+#[test]
+fn retarget_noop_on_non_ci_blocked_reason() {
+    let pr_url = pr(6);
+    let (db, chore_id) = seed_blocked_ci("retarget-non-ci", &pr_url, false);
+    set_blocking_state(&db, &chore_id, "blocked", Some("merge_conflict"), Some(&pr_url), "100");
+
+    assert!(
+        db.retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
+            .unwrap()
+            .is_none(),
+        "a non-CI blocked reason must not be retargeted",
+    );
+    let (status, reason, _) = parent_state(&db, &chore_id);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+/// A soft-deleted row (stamped `deleted_at`) is invisible to the takeover —
+/// the `deleted_at IS NULL` guard makes it a no-op.
+#[test]
+fn retarget_noop_on_soft_deleted_row() {
+    let pr_url = pr(7);
+    let (db, chore_id) = seed_blocked_ci("retarget-deleted", &pr_url, false);
+    soft_delete(&db, &chore_id);
+
+    assert!(
+        db.retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
+            .unwrap()
+            .is_none(),
+        "a soft-deleted row must not be retargeted",
+    );
+    // The reason is untouched behind the soft-delete.
+    let (status, reason, _) = parent_state(&db, &chore_id);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("ci_failure"));
+}
