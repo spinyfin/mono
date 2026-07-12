@@ -140,3 +140,91 @@ fn truncate_command(cmd: &str) -> String {
         .unwrap_or(0);
     format!("{}…", &cmd[..truncated])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trailing marker `truncate_command` appends when it cuts a command.
+    const ELLIPSIS: char = '…';
+
+    #[test]
+    fn short_command_returned_verbatim() {
+        let cmd = "gh pr view 42";
+        let out = truncate_command(cmd);
+        assert_eq!(out, cmd);
+        assert!(!out.ends_with(ELLIPSIS));
+    }
+
+    #[test]
+    fn command_exactly_at_limit_is_not_truncated() {
+        let cmd = "a".repeat(COMMAND_MAX_BYTES);
+        assert_eq!(cmd.len(), COMMAND_MAX_BYTES);
+        let out = truncate_command(&cmd);
+        // Exactly at the limit is the boundary case for `<=`: it must be
+        // returned unchanged, with no ellipsis.
+        assert_eq!(out, cmd);
+        assert!(!out.ends_with(ELLIPSIS));
+    }
+
+    #[test]
+    fn long_ascii_command_is_truncated_with_ellipsis() {
+        let cmd = "a".repeat(COMMAND_MAX_BYTES + 500);
+        let out = truncate_command(&cmd);
+        // A too-long command gets an ellipsis appended...
+        assert!(out.ends_with(ELLIPSIS));
+        assert_ne!(out, cmd);
+        // ...and the body preceding it is a prefix of the original input.
+        let body = out.strip_suffix(ELLIPSIS).unwrap();
+        assert!(cmd.starts_with(body));
+        // The stored byte length stays bounded: at most the cap plus the
+        // 3-byte ellipsis (it never blows past the intended size).
+        assert!(out.len() <= COMMAND_MAX_BYTES + ELLIPSIS.len_utf8());
+    }
+
+    #[test]
+    fn truncation_in_middle_of_multibyte_char_stays_valid_utf8() {
+        // Pack ASCII up to just before the cut point, then multibyte chars,
+        // so the naive byte cut at `COMMAND_MAX_BYTES - 1` would land in the
+        // middle of an emoji. The boundary logic must back off to a whole
+        // char instead of slicing mid-codepoint (which would panic).
+        let mut cmd = "a".repeat(COMMAND_MAX_BYTES - 2);
+        // Each 😀 is 4 bytes; append enough to push well past the limit.
+        for _ in 0..10 {
+            cmd.push('😀');
+        }
+        assert!(cmd.len() > COMMAND_MAX_BYTES);
+
+        // Must not panic on the mid-codepoint slice.
+        let out = truncate_command(&cmd);
+
+        // The result is a valid Rust String, so it is valid UTF-8 by
+        // construction; assert the observable behavior instead: it ends with
+        // the ellipsis and its body is a whole-char prefix of the input.
+        assert!(out.ends_with(ELLIPSIS));
+        let body = out.strip_suffix(ELLIPSIS).unwrap();
+        assert!(cmd.starts_with(body));
+        // No partial emoji leaked through: every char in the body is intact.
+        assert!(body.chars().all(|c| c == 'a' || c == '😀'));
+    }
+
+    #[test]
+    fn truncation_with_accented_chars_near_limit_does_not_panic() {
+        // Two-byte chars (é = 2 bytes) straddling the cut point exercise the
+        // same boundary logic with a different codepoint width. Placing the
+        // first é at byte 4094 means the naive cut at COMMAND_MAX_BYTES - 1
+        // (byte 4095) lands inside it.
+        let mut cmd = "a".repeat(COMMAND_MAX_BYTES - 2);
+        for _ in 0..10 {
+            cmd.push('é');
+        }
+        assert!(cmd.len() > COMMAND_MAX_BYTES);
+
+        let out = truncate_command(&cmd);
+
+        assert!(out.ends_with(ELLIPSIS));
+        let body = out.strip_suffix(ELLIPSIS).unwrap();
+        assert!(cmd.starts_with(body));
+        assert!(out.len() <= COMMAND_MAX_BYTES + ELLIPSIS.len_utf8());
+    }
+}
