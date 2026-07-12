@@ -936,8 +936,7 @@ impl ServerState {
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-        let staged_revision_pushes =
-            Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
+        let staged_revision_pushes = Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
 
         // Resolve the Boss state root early — both the feature-flags
         // store (loaded below, before the completion handler is

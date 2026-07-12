@@ -996,10 +996,7 @@ impl WorkerCompletionHandler {
     /// Wire an externally-owned [`StagedRevisionPushCache`] into this handler.
     /// Called by `app.rs` so the PostToolUse dispatcher and on_stop_inner share
     /// the same cache instance.
-    pub fn with_staged_revision_pushes(
-        mut self,
-        cache: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
-    ) -> Self {
+    pub fn with_staged_revision_pushes(mut self, cache: Arc<crate::pr_url_capture::StagedRevisionPushCache>) -> Self {
         self.staged_revision_pushes = cache;
         self
     }
@@ -1188,10 +1185,7 @@ impl WorkerCompletionHandler {
         // decide whether to require explicit push evidence (already_stop_seen=true
         // means this is a multi-turn stop where a parent push could have moved
         // the head without the revision contributing).
-        let already_stop_seen = self
-            .work_db
-            .execution_stop_seen(execution_id)
-            .unwrap_or(false);
+        let already_stop_seen = self.work_db.execution_stop_seen(execution_id).unwrap_or(false);
 
         // Stamp the stop_seen marker so the merge poller's SHA-delta gate
         // knows at least one Stop boundary has been observed for this
@@ -1446,10 +1440,7 @@ impl WorkerCompletionHandler {
                     if is_revision_contribution {
                         // Stamp the head we're about to finalize on; recheck_for_pr
                         // uses this for T848 recovery if finalization fails transiently.
-                        if let Err(err) = self
-                            .work_db
-                            .set_revision_stop_contributed_head(execution_id, &head_now)
-                        {
+                        if let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, &head_now) {
                             tracing::warn!(
                                 execution_id,
                                 ?err,
@@ -1477,10 +1468,7 @@ impl WorkerCompletionHandler {
                          (already_stop_seen=true, no push evidence) — parent push assumed; \
                          absorbing baseline",
                     );
-                    if let Err(err) = self
-                        .work_db
-                        .set_execution_pr_head_before(execution_id, &head_now)
-                    {
+                    if let Err(err) = self.work_db.set_execution_pr_head_before(execution_id, &head_now) {
                         tracing::warn!(
                             execution_id,
                             ?err,
@@ -1500,11 +1488,7 @@ impl WorkerCompletionHandler {
                         return outcome;
                     }
                     if let Some(outcome) = self
-                        .try_finalize_metadata_only_fix_on_stop(
-                            execution_id,
-                            &execution,
-                            &_pr_url_for_nudge,
-                        )
+                        .try_finalize_metadata_only_fix_on_stop(execution_id, &execution, &_pr_url_for_nudge)
                         .await
                     {
                         return outcome;
@@ -2076,10 +2060,7 @@ must not be asked to open one",
                      revision_stop_contributed_head (parent push or no prior on_stop Contributed); \
                      absorbing baseline",
                 );
-                if let Err(err) = self
-                    .work_db
-                    .set_execution_pr_head_before(execution_id, &head_now)
-                {
+                if let Err(err) = self.work_db.set_execution_pr_head_before(execution_id, &head_now) {
                     tracing::warn!(
                         execution_id,
                         ?err,
@@ -5741,7 +5722,10 @@ manual review."
                 head_now = %head_now,
                 "sha-delta gate: bound PR head moved — contribution verified"
             );
-            ShaDeltaGateOutcome::Contributed { pr_url: bound_pr_url, head_now }
+            ShaDeltaGateOutcome::Contributed {
+                pr_url: bound_pr_url,
+                head_now,
+            }
         }
     }
 }
@@ -11147,11 +11131,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // match the current head so it knows the head movement was the
         // revision's own contribution, not a concurrent parent push.
         db.set_execution_stop_seen(&execution_id).unwrap();
-        db.set_revision_stop_contributed_head(
-            &execution_id,
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )
-        .unwrap();
+        db.set_revision_stop_contributed_head(&execution_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
         // Cold-path detector returns None — correct for revisions which
         // have no branch of their own.
         let detector = StubPrDetector::ok(None);
@@ -14849,11 +14830,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // on_stop_inner having confirmed the revision's own push ("bbbb")
         // and attempted finalization (which failed transiently).
         db.set_execution_stop_seen(&execution_id).unwrap();
-        db.set_revision_stop_contributed_head(
-            &execution_id,
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )
-        .unwrap();
+        db.set_revision_stop_contributed_head(&execution_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());

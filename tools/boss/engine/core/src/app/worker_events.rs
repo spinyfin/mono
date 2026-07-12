@@ -299,10 +299,7 @@ pub(super) async fn dispatch_live_worker_state(
                     if crate::pr_url_capture::is_revision_push_command(tool_input) {
                         let execution_id = run_id;
                         match server_state.work_db.get_execution(execution_id) {
-                            Ok(execution)
-                                if execution.kind
-                                    == crate::work::ExecutionKind::RevisionImplementation =>
-                            {
+                            Ok(execution) if execution.kind == crate::work::ExecutionKind::RevisionImplementation => {
                                 server_state.staged_revision_pushes.record(execution_id);
                                 tracing::info!(
                                     execution_id,

@@ -310,9 +310,7 @@ pub(crate) fn migrate_work_executions_stop_seen(conn: &Connection) -> Result<()>
 /// seen a `Contributed` outcome for this execution, which tells `recheck_for_pr`
 /// the head movement was from a *different* worker (e.g. the parent chore's
 /// still-active worker pushing to the shared PR branch).
-pub(crate) fn migrate_work_executions_revision_stop_contributed_head(
-    conn: &Connection,
-) -> Result<()> {
+pub(crate) fn migrate_work_executions_revision_stop_contributed_head(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "revision_stop_contributed_head")? {
         conn.execute(
             "ALTER TABLE work_executions \

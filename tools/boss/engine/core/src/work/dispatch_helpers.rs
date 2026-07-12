@@ -784,10 +784,7 @@ pub(crate) fn reconcile_revision_execution(
                 )?;
             }
         }
-        Some(existing)
-            if existing.kind == ExecutionKind::RevisionImplementation
-                && existing.status.is_live() =>
-        {
+        Some(existing) if existing.kind == ExecutionKind::RevisionImplementation && existing.status.is_live() => {
             // A live execution (running or waiting_human) is already in
             // progress — do not spawn a duplicate worker. Without this arm
             // the `_ =>` branch fires for every reconcile tick while the

@@ -776,11 +776,7 @@ impl WorkDb {
     /// `recheck_for_pr` as the T848 recovery gate: it only finalizes when the
     /// current head matches this stamped value — not on any arbitrary head
     /// movement from a concurrently-active parent worker.
-    pub fn set_revision_stop_contributed_head(
-        &self,
-        execution_id: &str,
-        sha: &str,
-    ) -> Result<()> {
+    pub fn set_revision_stop_contributed_head(&self, execution_id: &str, sha: &str) -> Result<()> {
         if sha.is_empty() {
             bail!("set_revision_stop_contributed_head: sha must be non-empty");
         }
@@ -795,10 +791,7 @@ impl WorkDb {
     /// Return the `revision_stop_contributed_head` value for `execution_id`,
     /// or `None` if it has never been set (on_stop_inner has not yet observed
     /// a `Contributed` outcome for this execution).
-    pub fn get_revision_stop_contributed_head(
-        &self,
-        execution_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn get_revision_stop_contributed_head(&self, execution_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         let head: Option<String> = conn
             .query_row(
