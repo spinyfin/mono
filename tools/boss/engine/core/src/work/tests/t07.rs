@@ -408,15 +408,7 @@ fn count_open_tasks_counts_only_open_statuses() {
 
     // Create a task and stamp source_automation_id directly (bypassing the
     // not-yet-built create_task --automation flow for this unit test).
-    let task = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore from automation")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let task = create_test_chore_manual(&db, product.id.clone(), "chore from automation");
 
     // Stamp the source_automation_id.
     let conn = db.connect().unwrap();
@@ -464,15 +456,7 @@ fn count_open_tasks_counts_active_as_open() {
         })
         .unwrap();
 
-    let task = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("active chore from automation")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let task = create_test_chore_manual(&db, product.id.clone(), "active chore from automation");
 
     let conn = db.connect().unwrap();
     conn.execute(

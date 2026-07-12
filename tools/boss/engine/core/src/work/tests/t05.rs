@@ -331,17 +331,7 @@ fn concurrent_writes_do_not_return_database_locked() {
     // matching the real-world reconcile pattern where a script
     // binds N PRs to N different chores in parallel.
     let chore_ids: Vec<String> = (0..WORKERS)
-        .map(|i| {
-            db.create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(format!("Concurrent chore {i}"))
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap()
-            .id
-        })
+        .map(|i| create_test_chore_manual(&db, product.id.clone(), format!("Concurrent chore {i}")).id)
         .collect();
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
@@ -514,15 +504,7 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
     );
 
     // Implementation-kind tasks on the same product are unaffected.
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Implementation chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Implementation chore");
     let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
     assert_eq!(
         resolved.as_deref(),
@@ -697,15 +679,7 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
     // Create a chore, then flip its kind to `investigation` directly
     // (bypassing the create invariant) so the resolver sees an
     // investigation row on a single-repo product.
-    let investigation = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Investigation")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let investigation = create_test_chore_manual(&db, product.id.clone(), "Investigation");
     let conn = db.connect().unwrap();
     conn.execute(
         "UPDATE tasks SET kind = 'investigation' WHERE id = ?1",
@@ -721,15 +695,7 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
     );
 
     // Implementation-kind tasks on the same product are unaffected.
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Implementation chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Implementation chore");
     let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
     assert_eq!(
         resolved.as_deref(),
@@ -1243,14 +1209,7 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
         let db = db.clone();
         let product_id = product.id.clone();
         handles.push(std::thread::spawn(move || {
-            db.create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product_id)
-                    .name(format!("c{i}"))
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap()
+            create_test_chore_manual(&db, product_id, format!("c{i}"))
         }));
     }
     for h in handles {
@@ -1301,16 +1260,7 @@ fn allocator_per_product_sequences_are_independent() {
     let boss = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let flunge = create_test_product_with_repo(&db, "Flunge", Some("git@example.com:flunge.git"));
 
-    let mk_chore = |product_id: &str, name: &str| {
-        db.create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id)
-                .name(name)
-                .autostart(false)
-                .build(),
-        )
-        .unwrap()
-    };
+    let mk_chore = |product_id: &str, name: &str| create_test_chore_manual(&db, product_id, name);
 
     let b1 = mk_chore(&boss.id, "b1");
     let f1 = mk_chore(&flunge.id, "f1");
@@ -1432,15 +1382,7 @@ fn unique_short_id_index_rejects_manual_duplicate() {
     let path = temp_db_path("short-id-index-conflict");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c1")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "c1");
     let existing_short: i64 = {
         let conn = db.connect().unwrap();
         conn.query_row("SELECT short_id FROM tasks WHERE id = ?1", [&chore.id], |row| {
@@ -1534,27 +1476,11 @@ fn create_chore_protocol_struct_carries_short_id() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
 
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("wire-test")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "wire-test");
     assert_eq!(chore.short_id, Some(1), "first chore in product gets short_id 1");
 
     // A second chore in the same product gets the next number.
-    let chore2 = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("wire-test-2")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore2 = create_test_chore_manual(&db, product.id.clone(), "wire-test-2");
     assert_eq!(chore2.short_id, Some(2));
 
     // `list_chores` also surfaces the field (exercises the SELECT path).
@@ -1599,14 +1525,7 @@ fn work_tree_tasks_carry_short_id() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
 
-    db.create_chore(
-        CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("c1")
-            .autostart(false)
-            .build(),
-    )
-    .unwrap();
+    create_test_chore_manual(&db, product.id.clone(), "c1");
 
     let tree = db.get_work_tree(&product.id).unwrap();
     let chore = &tree.chores[0];
@@ -1625,15 +1544,7 @@ fn noop_status_patch_preserves_last_status_actor_for_task() {
     let path = temp_db_path("noop-status-actor-task");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("C")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
 
     // Simulate the engine having set the status by writing directly.
     {
@@ -1732,15 +1643,7 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
     let path = temp_db_path("real-status-actor-task");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("C")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
 
     {
         let conn = db.connect().unwrap();
@@ -1786,24 +1689,8 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
     let path = disk_db_path("list-ci-remediations-filters");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore_a = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-a")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
-    let chore_b = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-b")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore_a = create_test_chore_manual(&db, product.id.clone(), "chore-a");
+    let chore_b = create_test_chore_manual(&db, product.id.clone(), "chore-b");
     // Two rows for chore_a with different attempt_kinds + statuses.
     let r1 = db
         .insert_ci_remediation(CiRemediationInsertInput {
@@ -1902,15 +1789,7 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
     let path = disk_db_path("ci-budget-snapshot");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-budget")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-budget");
 
     // Defaults: no per-PR override, product default = 3, used = 0.
     let snap = db.ci_budget_snapshot(&chore.id).unwrap().unwrap();

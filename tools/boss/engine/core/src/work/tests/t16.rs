@@ -576,15 +576,7 @@ fn seed_blocked_merge_conflict_with_attempt(
 ) -> (WorkDb, String, ConflictResolution) {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
     let product = create_test_product_with_repo(&db, label, Some("git@example.invalid:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(format!("Chore {label}"))
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), format!("Chore {label}"));
     db.update_work_item(
         &chore.id,
         WorkItemPatch {

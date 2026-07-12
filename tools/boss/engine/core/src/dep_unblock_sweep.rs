@@ -205,15 +205,7 @@ mod tests {
     }
 
     fn create_chore_no_autostart(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id)
-                .name(name)
-                .autostart(false)
-                .build(),
-        )
-        .unwrap()
-        .id
+        create_test_chore_manual(db, product_id, name).id
     }
 
     /// Safety-net path: prereq goes to `done` via a path that bypasses the

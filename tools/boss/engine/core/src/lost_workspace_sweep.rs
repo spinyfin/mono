@@ -267,7 +267,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::dispatch_events::NoopDispatchEventSink;
-    use crate::work::{AutomationFireRecord, CreateChoreInput, WorkDb};
+    use crate::work::{AutomationFireRecord, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
         AutomationTrigger, CreateAutomationInput, ExecutionStatus, FinishExecutionRunInput,
@@ -381,16 +381,7 @@ mod tests {
         seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
 
         // The triage worker created a task before its pane died.
-        let task_id = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.as_str())
-                    .name("produced by triage")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap()
-            .id;
+        let task_id = create_test_chore_manual(&db, product.as_str(), "produced by triage").id;
         db.stamp_task_source_automation_for_test(&task_id, &automation, "todo")
             .unwrap();
 

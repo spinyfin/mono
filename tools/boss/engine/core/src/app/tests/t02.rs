@@ -14,20 +14,11 @@ use crate::test_support::*;
 #[tokio::test]
 async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -98,20 +89,11 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
 async fn dispatch_assigns_virtual_slot_to_remote_worker() {
     use crate::protocol::WorkerEvent;
     use crate::worker_registry::REMOTE_SLOT_BASE;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput, WorkerActivity};
+    use boss_protocol::{RequestExecutionInput, WorkerActivity};
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("remote chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "remote chore");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -184,20 +166,11 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
 #[tokio::test]
 async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("remote chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "remote chore");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -264,20 +237,11 @@ async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
 #[tokio::test]
 async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -370,20 +334,11 @@ async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
 #[tokio::test]
 async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -448,20 +403,11 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
 #[tokio::test]
 async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
     use crate::protocol::{SessionStartSource, WorkerEvent};
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -583,7 +529,7 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
     use crate::live_status_loop::{LiveStatusBroadcaster, TranscriptPathResolver};
     use crate::protocol::WorkerEvent;
     use async_trait::async_trait;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
     use std::path::PathBuf;
 
     // The slot loop spawns and lives for the duration of the
@@ -605,16 +551,7 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -721,20 +658,11 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
 #[tokio::test]
 async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -826,20 +754,11 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
 async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
     use crate::live_status_loop::TranscriptPathResolver;
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -921,20 +840,11 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
 /// WorkError to the caller).
 #[tokio::test]
 async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() {
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -988,20 +898,11 @@ async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() 
 #[tokio::test]
 async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
+    use boss_protocol::RequestExecutionInput;
 
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -1834,16 +1735,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
 /// Helper: create a product + chore + execution (in `ready` status).
 fn make_execution_for_test(server_state: &Arc<ServerState>) -> boss_protocol::WorkExecution {
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let chore = server_state
-        .work_db
-        .create_chore(
-            boss_protocol::CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -2035,16 +1927,7 @@ async fn execution_transcript_live_flag() {
 fn executions_list_returns_empty_for_task_with_no_executions() {
     let server_state = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
-    let task = server_state
-        .work_db
-        .create_chore(
-            boss_protocol::CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let task = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let executions = server_state.work_db.list_executions(Some(&task.id)).unwrap();
     assert!(
         executions.is_empty(),

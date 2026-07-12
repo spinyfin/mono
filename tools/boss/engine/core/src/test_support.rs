@@ -112,6 +112,28 @@ pub fn create_test_chore(db: &WorkDb, product_id: impl Into<String>, name: impl 
         .unwrap()
 }
 
+/// Like [`create_test_chore`], but creates the chore with `autostart`
+/// disabled (`.autostart(false)`).
+///
+/// This is the manual-start counterpart the completion, runner,
+/// coordinator, merge-poller, `work`, and app test modules hand-roll
+/// dozens of times as
+/// `create_chore(CreateChoreInput::builder().product_id(..).name(..).autostart(false).build())`.
+/// Centralising it means a new field on [`CreateChoreInput`] touches one
+/// site instead of ~120. As with [`create_test_chore`], args take
+/// `impl Into<String>` so existing call sites lift their expressions
+/// (`product.id.clone()`, `"Parent chore"`, `format!(...)`) verbatim.
+pub fn create_test_chore_manual(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
+    db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product_id)
+            .name(name)
+            .autostart(false)
+            .build(),
+    )
+    .unwrap()
+}
+
 /// Create a `ready` [`ExecutionKind::ChoreImplementation`] execution for
 /// `work_item_id` and return it.
 ///

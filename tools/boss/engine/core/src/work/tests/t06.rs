@@ -10,15 +10,7 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
     let path = disk_db_path("ci-retry-resets");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-retry")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-retry");
     let pr_url = "https://github.com/foo/bar/pull/200".to_owned();
     db.update_work_item(
         &chore.id,
@@ -93,15 +85,7 @@ fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
     let path = disk_db_path("list-engine-attempts");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-attempts")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-attempts");
     let pr_url = "https://github.com/foo/bar/pull/300".to_owned();
     db.update_work_item(
         &chore.id,
@@ -186,15 +170,7 @@ fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
     let path = temp_db_path("unblock-clears-blocked-fields");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("C")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
 
     // Simulate the engine having set blocked fields directly.
     {

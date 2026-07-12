@@ -57,15 +57,7 @@ fn mark_chore_pr_merged_surfaces_moot_revision_archival() {
 fn request_execution_refuses_archived_work_item() {
     let db = WorkDb::open(temp_db_path("request-execution-refuses-archived")).unwrap();
     let product_id = make_revision_product(&db, "req-exec-archived");
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("archived chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product_id.clone(), "archived chore");
 
     db.update_work_item(
         &chore.id,
@@ -193,16 +185,7 @@ fn dependency_unblock_of_moot_revision_does_not_strand_ready_execution() {
     let parent_id = make_done_chore(&db, &product_id, pr_url);
     let rev_id = insert_revision_row(&db, &product_id, &parent_id);
 
-    let prereq_id = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("prereq")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap()
-        .id;
+    let prereq_id = create_test_chore_manual(&db, product_id.clone(), "prereq").id;
 
     db.add_dependency(AddDependencyInput {
         dependent: rev_id.clone(),
@@ -245,15 +228,7 @@ fn dependency_unblock_of_moot_revision_does_not_strand_ready_execution() {
 fn abandon_stranded_executions_on_closed_work_items_sweep() {
     let db = WorkDb::open(temp_db_path("abandon-stranded-sweep")).unwrap();
     let product_id = make_revision_product(&db, "stranded-sweep");
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("stranded")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product_id.clone(), "stranded");
 
     // Force-create a `ready` execution the way a pre-fix race would have,
     // then archive the work item out from under it directly at the SQL

@@ -431,24 +431,8 @@ fn work_tree_includes_product_scoped_dependency_edges() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Prereq")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
-    let dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Dependent")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let prereq = create_test_chore_manual(&db, product.id.clone(), "Prereq");
+    let dependent = create_test_chore_manual(&db, product.id.clone(), "Dependent");
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
         prerequisite: prereq.id.clone(),
@@ -459,24 +443,8 @@ fn work_tree_includes_product_scoped_dependency_edges() {
     // A second product with its own edge — must NOT leak into the
     // first product's tree.
     let other_product = create_test_product_with_repo(&db, "Other", Some("git@github.com:spinyfin/other.git"));
-    let other_prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(other_product.id.clone())
-                .name("Other Prereq")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
-    let other_dependent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(other_product.id.clone())
-                .name("Other Dependent")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let other_prereq = create_test_chore_manual(&db, other_product.id.clone(), "Other Prereq");
+    let other_dependent = create_test_chore_manual(&db, other_product.id.clone(), "Other Dependent");
     db.add_dependency(AddDependencyInput {
         dependent: other_dependent.id.clone(),
         prerequisite: other_prereq.id.clone(),
@@ -1416,15 +1384,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Has PR under review")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Has PR under review");
 
     // Simulate the P992 `PendingReview` hold: the implementation finished and
     // opened a PR, but the card is held in Doing (`active`) with the PR stamped
@@ -1524,15 +1484,7 @@ fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Review in progress")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Review in progress");
 
     {
         let conn = db.connect().unwrap();
@@ -1806,15 +1758,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
 /// execution id. The run lands in `work_runs` with status `active`.
 fn start_run_on_host_for_test(db: &WorkDb, host_id: &str) -> String {
     let product = create_test_product_named(db, "p");
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("c")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(db, product.id.clone(), "c");
     let execution = db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();

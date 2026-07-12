@@ -190,7 +190,7 @@ mod tests {
     use boss_protocol::{ExecutionKind, ExecutionStatus};
 
     use crate::dispatch_events::{RecordingDispatchEventSink, Stage};
-    use crate::test_support::{create_test_product_with_repo, open_db};
+    use crate::test_support::{create_test_chore_manual, create_test_product_with_repo, open_db};
     use crate::work::AutomationFireRecord;
     use boss_protocol::{AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AutomationTrigger, CreateAutomationInput};
 
@@ -249,15 +249,7 @@ mod tests {
         let exec = db.create_automation_triage_execution(&automation, TEST_REPO).unwrap();
         seed_dispatch_run(&db, &automation, &exec.id);
 
-        let task = db
-            .create_chore(
-                crate::work::CreateChoreInput::builder()
-                    .product_id(product.as_str())
-                    .name("produced by triage")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let task = create_test_chore_manual(&db, product.as_str(), "produced by triage");
         db.stamp_task_source_automation_for_test(&task.id, &automation, "todo")
             .unwrap();
 

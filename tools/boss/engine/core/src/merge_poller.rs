@@ -3826,9 +3826,8 @@ mod tests {
     use crate::coordinator::{CubeClient, CubeRepoSummary, CubeWorkspaceStatus};
     use crate::test_support::*;
     use crate::work::{
-        AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateChoreInput, CreateCommentInput,
-        CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, FinishExecutionRunInput, WorkDb,
-        WorkItem, WorkItemPatch,
+        AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateCommentInput, CreateExecutionInput,
+        CreateProjectInput, CreateTaskInput, ExecutionStatus, FinishExecutionRunInput, WorkDb, WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -3978,15 +3977,7 @@ mod tests {
 
     fn make_chore_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
         let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(name)
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(db, product.id.clone(), name);
         // Move chore directly to in_review with a pr_url, mirroring
         // the post-completion state.
         db.update_work_item(
@@ -4014,15 +4005,7 @@ mod tests {
         review_status: &str,
     ) -> (String, String) {
         let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("https://github.com/foo/bar"));
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(name)
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(db, product.id.clone(), name);
         db.update_work_item(
             &chore.id,
             WorkItemPatch {
@@ -5059,15 +5042,7 @@ mod tests {
 
         // Add an unsatisfied gating prerequisite, then model the strand
         // (blocked with a NULL reason) co-occurring with the live dependency.
-        let prereq = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.clone())
-                    .name("Prereq")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let prereq = create_test_chore_manual(&db, product.clone(), "Prereq");
         db.add_dependency(AddDependencyInput {
             dependent: chore.clone(),
             prerequisite: prereq.id.clone(),
@@ -8078,15 +8053,7 @@ mod tests {
 
     fn make_abandoned_chore_with_workspace(db: &WorkDb, name: &str) -> (String, String, String) {
         let product = create_test_product_with_repo(db, &format!("Prod-{name}"), Some("git@github.com:foo/bar.git"));
-        let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name(name)
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(db, product.id.clone(), name);
         let exec = db
             .create_execution(
                 CreateExecutionInput::builder()

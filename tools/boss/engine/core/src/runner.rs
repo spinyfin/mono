@@ -5641,15 +5641,7 @@ mod pane_spawn_tests {
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
-        let chore = work_db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Some chore being reviewed")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let chore = create_test_chore_manual(&work_db, product.id.clone(), "Some chore being reviewed");
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("feature-flags.toml"),

@@ -10434,15 +10434,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-revision-chain-root-test");
-        let parent = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Parent chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
         {
             let conn = db.connect().unwrap();
             conn.execute(
@@ -10554,15 +10546,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-revision-no-pr-test");
         // Parent chore with NO pr_url (never opened a PR).
-        let parent = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Parent chore no PR")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore no PR");
         // Manually set parent to in_review WITHOUT a pr_url so the
         // revision gate passes (bypassed via direct SQL) but the chain
         // root has no PR to resolve.
@@ -10895,15 +10879,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-revision-test");
         // Parent chore: in_review with a bound pr_url.
-        let parent = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Parent chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
         {
             let conn = db.connect().unwrap();
             conn.execute(
@@ -11719,15 +11695,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-conflict-rev-test");
         // Parent chore: blocked:merge_conflict with a bound pr_url.
-        let parent = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Parent chore")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
         {
             let conn = db.connect().unwrap();
             conn.execute(
@@ -12263,15 +12231,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-ci-rev-test");
-        let parent = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product.id.clone())
-                    .name("Fix failing CI: Pull Request Description")
-                    .autostart(false)
-                    .build(),
-            )
-            .unwrap();
+        let parent = create_test_chore_manual(&db, product.id.clone(), "Fix failing CI: Pull Request Description");
         db.update_work_item(
             &parent.id,
             crate::work::WorkItemPatch {

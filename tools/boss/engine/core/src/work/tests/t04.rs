@@ -119,15 +119,7 @@ fn conflict_resolution_round_trip() {
     let path = temp_db_path("conflict-resolution-rt");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@example.invalid:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("C")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
     // Flip the chore into `blocked: merge_conflict` so the
     // insert path's UPDATE-tasks side stamps blocked_attempt_id.
     db.update_work_item(
@@ -524,15 +516,7 @@ fn record_and_list_effort_escalations_round_trip() {
     let path = temp_db_path("effort-escalations-rt");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Rename helper")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Rename helper");
     let chore_id = chore.id.clone();
     let recorded = db
         .record_effort_escalation(
@@ -1292,15 +1276,7 @@ fn manual_override_writes_ci_failure_suppression() {
     let path = disk_db_path("ci-manual-override");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-manual")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-manual");
     let pr_url = "https://github.com/foo/bar/pull/77".to_owned();
     db.update_work_item(
         &chore.id,
@@ -1364,15 +1340,7 @@ fn manual_override_from_exhausted_writes_suppression() {
     let path = disk_db_path("ci-manual-override-exh");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-exh")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-exh");
     let pr_url = "https://github.com/foo/bar/pull/78".to_owned();
     db.update_work_item(
         &chore.id,
@@ -1422,15 +1390,7 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
     let path = disk_db_path("ci-churn");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-churn")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-churn");
 
     // 0 attempts → not rate-limited.
     assert!(!db.is_ci_retry_rate_limited(&chore.id, false).unwrap());
@@ -1518,15 +1478,7 @@ fn manual_move_unrelated_to_ci_does_not_write_suppression() {
     let path = disk_db_path("ci-manual-override-noop");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("chore-noop")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "chore-noop");
     let pr_url = "https://github.com/foo/bar/pull/79".to_owned();
     // to_do → in_review → to_do with no CI involvement. None of
     // these transitions should reach the suppression code path

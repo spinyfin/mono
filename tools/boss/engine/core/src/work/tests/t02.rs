@@ -387,15 +387,7 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
     let path = temp_db_path("req-ci-remediation-bossctl");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("CI blocked chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "CI blocked chore");
     let pr_url = "https://github.com/spinyfin/mono/pull/686".to_owned();
     // Move to in_review so mark_chore_blocked_ci_failure accepts.
     db.update_work_item(
@@ -935,15 +927,7 @@ fn reconcile_skips_no_autostart_chore_until_status_changes() {
     let path = temp_db_path("no-autostart");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Parked")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Parked");
     assert!(!chore.autostart, "create_chore must persist autostart=false");
 
     // First reconcile right after create — must not create a
@@ -1035,15 +1019,7 @@ fn no_autostart_direct_to_in_review_suppresses_dispatch() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     // Step 1: create with --no-autostart (autostart=false)
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Design doc T708")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Design doc T708");
     assert!(!chore.autostart);
 
     // Reconcile right after create — no execution (autostart=false + todo).
@@ -1515,15 +1491,7 @@ fn rescan_skips_no_autostart_active_chore() {
     let path = temp_db_path("rescan-no-autostart");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Parked")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Parked");
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1712,15 +1680,7 @@ fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
 /// other t02 reconcile tests use.
 fn make_chore_execution_962(db: &WorkDb, label: &str) -> String {
     let product = create_test_product_named(db, &format!("Prod-{label}"));
-    let chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(format!("Chore-{label}"))
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let chore = create_test_chore_manual(db, product.id.clone(), format!("Chore-{label}"));
     db.create_execution(
         CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())

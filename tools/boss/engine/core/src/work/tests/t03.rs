@@ -820,15 +820,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
     let product_id = create_test_product(&db).id;
 
     // Parent chore — will transition to in_review.
-    let parent = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id.clone())
-                .name("Parent chore")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let parent = create_test_chore_manual(&db, product_id.clone(), "Parent chore");
 
     // Revision task — should unblock on parent reaching `in_review`.
     // Insert directly to bypass the PR-state gate on `create_revision`.
@@ -1347,15 +1339,7 @@ fn create_via_round_trip_per_source() {
         .unwrap();
     assert_eq!(cli_chore.created_via, boss_protocol::CREATED_VIA_CLI);
 
-    let unknown_chore = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("no source")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let unknown_chore = create_test_chore_manual(&db, product.id.clone(), "no source");
     assert_eq!(unknown_chore.created_via, CREATED_VIA_UNKNOWN);
 
     let project = db
@@ -1976,15 +1960,7 @@ fn create_time_depends_on_gates_dispatch_atomically() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     // Prerequisite — left in `todo` (unsatisfied).
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Prereq: version-pin mechanism")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let prereq = create_test_chore_manual(&db, product.id.clone(), "Prereq: version-pin mechanism");
 
     // Dependent declared WITH the gate at create time.
     let dependent = db
@@ -2063,15 +2039,7 @@ fn blocking_a_running_dependent_cancels_its_execution() {
     let path = temp_db_path("block-running-dependent");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
-    let prereq = db
-        .create_chore(
-            CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Prereq")
-                .autostart(false)
-                .build(),
-        )
-        .unwrap();
+    let prereq = create_test_chore_manual(&db, product.id.clone(), "Prereq");
     let dependent = create_test_chore(&db, product.id.clone(), "Already running dependent");
 
     // Drive the dependent into the Doing column with a live worker.
