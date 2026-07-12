@@ -72,6 +72,54 @@ impl WorkDb {
         Ok(execution)
     }
 
+    /// Idempotently enqueue a `pr_review` execution for `work_item_id`, from
+    /// the automatic reviewer-enqueue path in `finalize_pr_transition`.
+    ///
+    /// Unlike [`Self::request_pr_review`], this does not probe GitHub or
+    /// refuse when another execution is live for the item — the caller (mid
+    /// PR-completion finalisation, already holding a freshly-detected open
+    /// PR) is itself the producing execution's completion, so a fresh
+    /// live-execution check would spuriously trip on that very execution.
+    /// It exists solely to make "does a non-terminal `pr_review` execution
+    /// already exist for this item" and "insert one" atomic (T366): two
+    /// independent PR-completion triggers (the Stop-hook path and the
+    /// merge-poller's `pr_recheck` sweep) can each reach the reviewer-
+    /// enqueue check around the same moment, before either has recorded its
+    /// completion — without this atomicity both would insert a `pr_review`
+    /// execution for the same unchanged head sha, producing two independent
+    /// reviews and two duplicate findings revisions from a single push.
+    ///
+    /// The `Immediate` transaction acquires sqlite's write lock at `BEGIN`,
+    /// so a concurrent caller blocks (up to the configured `busy_timeout`)
+    /// until this one commits, instead of racing the same check-then-insert.
+    ///
+    /// Returns `(execution, is_new)`; `is_new = false` means an existing
+    /// live/non-terminal `pr_review` execution was reused rather than a
+    /// duplicate being created.
+    pub fn create_pr_review_execution_dedup(
+        &self,
+        work_item_id: &str,
+        repo_remote_url: &str,
+    ) -> Result<(WorkExecution, bool)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = existing_nonterminal_pr_review_execution(&tx, work_item_id)? {
+            tx.commit()?;
+            return Ok((existing, false));
+        }
+        let execution = insert_execution(
+            &tx,
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id.to_owned())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url(repo_remote_url.to_owned())
+                .build(),
+        )?;
+        tx.commit()?;
+        Ok((execution, true))
+    }
+
     /// Repo-resolution precheck that does not create or mutate any
     /// `work_executions` row. The kanban drag-to-Doing path calls this
     /// before flipping `tasks.status = 'active'` so a deterministic

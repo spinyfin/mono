@@ -62,8 +62,8 @@ use crate::merge_poller::{
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck,
-    THREAD_ENTRY_KIND_ANSWER, WorkDb, WorkItem, WorkerPrCompletionTarget,
+    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, PendingMergeCheck, THREAD_ENTRY_KIND_ANSWER, WorkDb,
+    WorkItem, WorkerPrCompletionTarget,
 };
 #[cfg(test)]
 use crate::work::{FinishExecutionRunInput, TaskStatus};
@@ -2668,7 +2668,50 @@ must not be asked to open one",
         // to zero on every fresh revision task row — see
         // `WorkDb::review_cycle_root_id`.
         let cycle_root_id = self.work_db.review_cycle_root_id(producing_task_id);
-        if let Err(err) = self
+
+        // T366: dedup at the revision-minting end too. If a prior COMPLETED
+        // review pass already recorded this exact head sha as reviewed
+        // (`last_reviewed_sha`), this pass is a redundant duplicate review of
+        // unchanged code — e.g. two independent `pr_review` executions raced
+        // past the enqueue-side guard (`WorkDb::create_pr_review_execution_dedup`)
+        // before it existed, or a stale duplicate execution survived from
+        // before this fix landed. Minting a second findings revision from it
+        // would re-litigate content the first pass's revision already covers.
+        // Read the state BEFORE `increment_task_review_cycle` overwrites it
+        // with this pass's own (matching) sha — the "before_commit_sha ==
+        // head_sha" signature pattern used elsewhere for re-fire guards
+        // (see ci_watch's rebounce idempotency key).
+        let duplicate_head_review = match self.work_db.get_task_review_cycle_state(&cycle_root_id) {
+            Ok((_, prior_sha)) => {
+                head_sha_for_cycle.as_deref().is_some_and(|sha| !sha.is_empty())
+                    && prior_sha.as_deref() == head_sha_for_cycle.as_deref()
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    producing_task_id,
+                    cycle_root_id,
+                    ?err,
+                    "pr_review finalize: could not read prior review_cycle state; \
+                     assuming not a duplicate head review",
+                );
+                false
+            }
+        };
+        let revision_warranted = revision_warranted && !duplicate_head_review;
+
+        if duplicate_head_review {
+            tracing::warn!(
+                execution_id = %execution.id,
+                producing_task_id,
+                cycle_root_id,
+                head_sha = ?head_sha_for_cycle,
+                trigger,
+                "pr_review finalize: this pass reviewed a head sha a prior completed pass \
+                 already recorded as reviewed; skipping review_cycle increment and findings \
+                 revision to avoid minting a duplicate (T366 duplicate-review guard)",
+            );
+        } else if let Err(err) = self
             .work_db
             .increment_task_review_cycle(&cycle_root_id, head_sha_for_cycle.as_deref())
         {
@@ -3226,15 +3269,17 @@ must not be asked to open one",
                             });
                             false
                         } else {
-                            match self.work_db.create_execution(
-                                CreateExecutionInput::builder()
-                                    .work_item_id(producing.work_item_id.clone())
-                                    .kind(ExecutionKind::PrReview)
-                                    .status(ExecutionStatus::Ready)
-                                    .repo_remote_url(producing.repo_remote_url.clone())
-                                    .build(),
-                            ) {
-                                Ok(review_exec) => {
+                            // T366: dedup-and-insert atomically, closing the race where
+                            // two independent completion triggers (the Stop-hook path
+                            // and the merge-poller's `pr_recheck` sweep) each observe
+                            // the producing execution as not-yet-terminal around the
+                            // same moment and would otherwise both enqueue a `pr_review`
+                            // execution for the same unchanged head sha.
+                            match self
+                                .work_db
+                                .create_pr_review_execution_dedup(&producing.work_item_id, &producing.repo_remote_url)
+                            {
+                                Ok((review_exec, true)) => {
                                     tracing::info!(
                                         execution_id,
                                         review_execution_id = %review_exec.id,
@@ -3245,6 +3290,18 @@ must not be asked to open one",
                                          holding producing task for reviewer pass",
                                     );
                                     self.publisher.kick_scheduler();
+                                    true
+                                }
+                                Ok((review_exec, false)) => {
+                                    tracing::info!(
+                                        execution_id,
+                                        review_execution_id = %review_exec.id,
+                                        pr_url = %pr_url,
+                                        producing_kind = %producing.kind,
+                                        trigger,
+                                        "pr_review execution already enqueued/in-flight for this \
+                                         item; reusing instead of dispatching a duplicate review",
+                                    );
                                     true
                                 }
                                 Err(err) => {
@@ -13454,6 +13511,116 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "low-severity regression finding must still fire the severity gate \
              and create a revision (T793 check); got {outcome:?}",
         );
+    }
+
+    /// T366 regression: two independent `pr_review` executions completing for
+    /// the SAME producing task with the SAME reviewed head sha — the exact
+    /// shape of the incident, where the enqueue-side race minted two review
+    /// executions for one unchanged push before the dedup guard existed —
+    /// must mint exactly ONE findings revision. The second pass recognizes
+    /// (via `last_reviewed_sha`) that this head was already recorded as
+    /// reviewed by a prior completed pass and skips minting a duplicate.
+    #[tokio::test]
+    async fn duplicate_pr_review_passes_on_same_head_mint_only_one_revision() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json_a = high_finding_review_result_json(pr_url);
+        let (db, product_id, chore_id, pr_review_exec_a, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), Some(&json_a));
+
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_pr_state_checker(open_pr_checker());
+
+        let outcome_a = handler.on_stop(&pr_review_exec_a).await;
+        assert!(
+            matches!(outcome_a, StopOutcome::ReviewPassRevisionCreated { .. }),
+            "first pass with a high finding must create a revision; got {outcome_a:?}",
+        );
+
+        // A second, INDEPENDENT pr_review execution for the SAME chore,
+        // reviewing the SAME head sha ("sha_reviewed_abc123") — two reviewer
+        // workers spawned for one unchanged push, each producing its own
+        // (differently worded) ReviewResult, exactly like the T366 incident.
+        let json_b = serde_json::json!({
+            "pr_url": pr_url,
+            "head_sha": "sha_reviewed_abc123",
+            "summary": "Same critical correctness issue, independently reviewed.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "correctness",
+                    "file": "src/pr.rs",
+                    "location": "fn ensure_pr, ~L120",
+                    "title": "Duplicate PR case not handled (reworded)",
+                    "detail": "A second independent review of the same commit, worded slightly differently.",
+                    "confidence": "medium"
+                }
+            ],
+            "regression_check": {"performed": true, "suspected_deletions": []}
+        })
+        .to_string();
+        let pr_review_exec_b = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let (pr_review_exec_b, run_b) = db
+            .start_execution_run(
+                &pr_review_exec_b.id,
+                "review-worker-2",
+                "mono",
+                "lease-review-2",
+                "mono-agent-review-002",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                FinishExecutionRunInput::builder()
+                    .execution_id(&pr_review_exec_b.id)
+                    .run_id(&run_b.id)
+                    .execution_status(ExecutionStatus::Running)
+                    .run_status("completed")
+                    .result_summary("reviewer spawned")
+                    .build(),
+            )
+            .unwrap();
+        let transcript_path = workspace
+            .path()
+            .join(format!("transcript-{}.jsonl", pr_review_exec_b.id));
+        std::fs::write(&transcript_path, make_review_transcript_jsonl(&json_b).as_bytes()).unwrap();
+        db.set_run_transcript_path_if_unset(&pr_review_exec_b.id, transcript_path.to_str().unwrap())
+            .unwrap();
+
+        let outcome_b = handler.on_stop(&pr_review_exec_b.id).await;
+        assert!(
+            matches!(outcome_b, StopOutcome::ReviewPassCompleted { .. }),
+            "second pass reviewing the SAME already-reviewed head must NOT mint another \
+             revision; got {outcome_b:?}",
+        );
+
+        let revisions = db.list_revisions(&product_id, None, false, Some(&chore_id)).unwrap();
+        assert_eq!(
+            revisions.len(),
+            1,
+            "exactly one revision must be minted from two duplicate review passes on the \
+             same head; got {revisions:?}",
+        );
+
+        // The redundant pass must not consume a second review_cycle slot.
+        let (review_cycle, last_sha) = db.get_task_review_cycle_state(&chore_id).unwrap();
+        assert_eq!(
+            review_cycle, 1,
+            "the duplicate pass must not double-increment review_cycle"
+        );
+        assert_eq!(last_sha.as_deref(), Some("sha_reviewed_abc123"));
     }
 
     /// When no ReviewResult is readable (no artifact AND no parseable
