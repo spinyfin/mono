@@ -5131,6 +5131,34 @@ mod pane_spawn_tests {
         )
     }
 
+    /// Build the standard worker-spawn test scaffolding from a workspace
+    /// tempdir: a `CapturingSpawner`, a `Weak<dyn WorkerSpawner>` the
+    /// runner can upgrade, a default `RuntimeConfig` pointed at the
+    /// workspace, and an open `WorkDb` over `state.db`. Call sites that
+    /// need bespoke `WorkConfig` options (e.g. custom pool sizes) build
+    /// these inline instead.
+    fn spawn_test_env(
+        workspace: &TempDir,
+    ) -> (
+        Arc<CapturingSpawner>,
+        Weak<dyn crate::spawn_flow::WorkerSpawner>,
+        Arc<crate::config::RuntimeConfig>,
+        Arc<WorkDb>,
+    ) {
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        (spawner, weak, cfg, work_db)
+    }
+
     /// Build a runner already bound to a `CapturingSpawner` and drive a
     /// run_execution against `workspace`. Returns the spawner so tests
     /// can inspect the captured request.
@@ -5140,21 +5168,7 @@ mod pane_spawn_tests {
     /// filesystem layout / env vars. Pass `None` for tests that don't
     /// inspect the hook command.
     async fn run_once(workspace: &TempDir, boss_event_path: Option<&Path>) -> Result<Arc<CapturingSpawner>> {
-        // We need a Weak<dyn WorkerSpawner> the runner can upgrade.
-        // Box-leak the Arc so it lives for the test's duration; the
-        // tempdir guards the workspace lifetime.
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (spawner, weak, cfg, work_db) = spawn_test_env(workspace);
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("feature-flags.toml"),
         ));
@@ -5285,17 +5299,7 @@ mod pane_spawn_tests {
         chore_input: CreateChoreInput,
         product_default_model: Option<&str>,
     ) -> Result<(Arc<CapturingSpawner>, Task)> {
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (spawner, weak, cfg, work_db) = spawn_test_env(workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         if let Some(model) = product_default_model {
@@ -5564,17 +5568,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn run_outcome_carries_resolved_spawn_config() {
         let workspace = TempDir::new().unwrap();
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let chore = work_db
@@ -5628,17 +5622,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn pr_review_execution_yields_reviewer_pane_alive() {
         let workspace = TempDir::new().unwrap();
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let chore = create_test_chore_manual(&work_db, product.id.clone(), "Some chore being reviewed");
@@ -5858,17 +5842,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn run_execution_reaps_and_signals_when_cancelled_mid_spawn() {
         let workspace = TempDir::new().unwrap();
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let chore = create_test_chore(&work_db, product.id.clone(), "Sort struct definitions");
@@ -5928,17 +5902,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn spawn_prompt_for_project_scoped_task_includes_parent_project_context() {
         let workspace = TempDir::new().unwrap();
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
         // Stand up a real product → project → task chain so the
         // runner's `get_project` lookup hits a row with the
@@ -6012,17 +5976,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn spawn_prompt_for_auto_design_task_states_design_only_directive() {
         let workspace = TempDir::new().unwrap();
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let project = work_db
@@ -6133,17 +6087,7 @@ mod pane_spawn_tests {
         use crate::work::SetProjectDesignDocInput;
 
         let workspace = TempDir::new().unwrap();
-        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
-        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
-            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder()
-                .cwd(workspace.path().to_path_buf())
-                .db_path(workspace.path().join("state.db"))
-                .build(),
-            None,
-        ));
-        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let project = work_db
