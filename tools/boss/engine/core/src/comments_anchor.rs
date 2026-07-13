@@ -430,4 +430,160 @@ mod tests {
         assert_eq!(cfg.score_threshold, 0.8);
         assert_eq!(cfg.second_best_threshold, 0.7);
     }
+
+    #[test]
+    fn context_too_short_is_orphan() {
+        // A single-char context (<2 chars, unbigrammable) that has no *unique*
+        // verbatim hit — the char occurs twice — falls straight through the
+        // exact phase and is rejected before fuzzy scoring can run.
+        let a = anchor("e", "", "");
+        assert_eq!(
+            resolve_anchor("wheel", &a, &CommentFuzzyConfig::default()),
+            AnchorResolution::Orphan(OrphanReason::ContextTooShort),
+        );
+    }
+
+    #[test]
+    fn no_confident_match_reports_zero_exact_hits_and_low_score() {
+        // The quote is simply gone: 0 verbatim hits, a fuzzy winner well below
+        // threshold, and a runner-up that can never exceed the winner.
+        let a = anchor("nonexistent quoted span of some length", "", "");
+        let cfg = CommentFuzzyConfig::default();
+        match resolve_anchor("totally unrelated document body prose", &a, &cfg) {
+            AnchorResolution::Orphan(OrphanReason::NoConfidentMatch {
+                exact_hits,
+                best_score,
+                second_best_score,
+            }) => {
+                assert_eq!(exact_hits, 0, "quote is absent, not duplicated");
+                assert!(
+                    best_score < cfg.score_threshold,
+                    "best {best_score} must miss threshold"
+                );
+                assert!(
+                    second_best_score <= best_score,
+                    "runner-up {second_best_score} can't beat winner {best_score}",
+                );
+            }
+            other => panic!("expected orphan/no-confident-match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_confident_match_reports_ambiguous_verbatim_duplicates() {
+        // The exact quote appears verbatim *twice*: the exact phase rejects it
+        // as non-unique (exact_hits > 1), then the fuzzy phase finds both
+        // windows scoring a perfect 1.0 — the winner cleared the threshold but
+        // lost to a too-close runner-up, so it's ambiguous, not absent.
+        let quote = "the primary widget configuration panel";
+        let doc = format!("{quote}. --- unrelated filler sits between the two regions --- {quote}.");
+        let a = anchor(quote, "", "");
+        let cfg = CommentFuzzyConfig::default();
+        match resolve_anchor(&doc, &a, &cfg) {
+            AnchorResolution::Orphan(OrphanReason::NoConfidentMatch {
+                exact_hits,
+                best_score,
+                second_best_score,
+            }) => {
+                assert_eq!(exact_hits, 2, "the verbatim quote occurs twice");
+                assert!(
+                    best_score >= cfg.score_threshold,
+                    "winner {best_score} cleared threshold"
+                );
+                assert!(
+                    second_best_score >= cfg.second_best_threshold,
+                    "runner-up {second_best_score} too close → ambiguous",
+                );
+            }
+            other => panic!("expected orphan/no-confident-match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_unit_env_clamps_and_honors_in_range() {
+        // Out-of-range, non-numeric, and empty values all reject to None (so
+        // `from_env` falls back to its default); an in-`[0,1]` value is kept.
+        let key = "BOSS_COMMENT_FUZZY_SCORE";
+        let cases: [(&str, Option<f64>); 5] = [
+            ("1.5", None),          // above 1.0
+            ("-0.2", None),         // below 0.0
+            ("not-a-number", None), // unparseable
+            ("", None),             // empty string
+            ("0.55", Some(0.55)),   // honored override
+        ];
+        for (raw, expected) in cases {
+            unsafe { std::env::set_var(key, raw) };
+            assert_eq!(read_unit_env(key), expected, "raw value {raw:?}");
+        }
+
+        // An in-range override flows through `from_env`, while the untouched
+        // second key stays at its default.
+        unsafe { std::env::set_var(key, "0.55") };
+        unsafe { std::env::remove_var("BOSS_COMMENT_FUZZY_SECOND_BEST") };
+        let cfg = CommentFuzzyConfig::from_env();
+        assert_eq!(cfg.score_threshold, 0.55, "in-range override honored");
+        assert_eq!(cfg.second_best_threshold, DEFAULT_FUZZY_SECOND_BEST_THRESHOLD);
+
+        // An out-of-range override falls back to the default in `from_env`.
+        unsafe { std::env::set_var(key, "2.0") };
+        let cfg = CommentFuzzyConfig::from_env();
+        assert_eq!(
+            cfg.score_threshold, DEFAULT_FUZZY_SCORE_THRESHOLD,
+            "out-of-range clamps to default"
+        );
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn fuzzy_span_is_clamped_within_haystack() {
+        // The plain text is the anchor context with its final char shaved off,
+        // so the whole (short) haystack scores as the fuzzy window and the
+        // `exact` span, projected from the window, would overrun the haystack.
+        // The resolver must clamp start+length inside the text — no OOB span.
+        let prefix = "The engine re-resolves each stored anchor ";
+        let exact = "against the fresh plain text projection";
+        let a = anchor(exact, prefix, "");
+        let context = format!("{prefix}{exact}");
+        let clen = context.chars().count();
+        let haystack: String = context.chars().take(clen - 1).collect();
+
+        match resolve_anchor(&haystack, &a, &CommentFuzzyConfig::default()) {
+            AnchorResolution::Fuzzy { start, length, score } => {
+                let hlen = haystack.chars().count();
+                assert!(score >= 0.8, "near-identical text should clear threshold, got {score}");
+                assert!(start + length <= hlen, "span {start}+{length} overruns haystack {hlen}");
+                assert!(
+                    length < exact.chars().count(),
+                    "length {length} should be clamped below the full exact len",
+                );
+            }
+            other => panic!("expected fuzzy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_resolved_with_maps_each_variant() {
+        let cases: [(AnchorResolution, &str); 3] = [
+            (
+                AnchorResolution::Exact { start: 0, length: 3 },
+                boss_protocol::RESOLVED_WITH_EXACT,
+            ),
+            (
+                AnchorResolution::Fuzzy {
+                    start: 1,
+                    length: 2,
+                    score: 0.95,
+                },
+                boss_protocol::RESOLVED_WITH_FUZZY,
+            ),
+            (
+                AnchorResolution::Orphan(OrphanReason::EmptyExact),
+                boss_protocol::RESOLVED_WITH_ORPHAN,
+            ),
+        ];
+        for (res, expected) in cases {
+            assert_eq!(res.last_resolved_with(), expected, "{res:?}");
+        }
+    }
 }
