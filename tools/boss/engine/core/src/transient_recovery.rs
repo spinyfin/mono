@@ -632,17 +632,12 @@ async fn read_transcript_tail(path: &str, max_bytes: u64) -> Vec<Value> {
     .collect()
 }
 
+/// Trim `s`, collapse embedded newlines to spaces, then clip to `max_bytes`
+/// on a char boundary. The one-line normalization is specific to error
+/// snippets; the byte-bounded clip is shared.
 fn clip(s: &str, max_bytes: usize) -> String {
     let one_line = s.trim().replace('\n', " ");
-    if one_line.len() <= max_bytes {
-        one_line
-    } else {
-        let mut end = max_bytes;
-        while !one_line.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &one_line[..end])
-    }
+    crate::string_clip::clip_to_bytes(&one_line, max_bytes)
 }
 
 pub fn current_epoch_s() -> i64 {

@@ -457,7 +457,7 @@ fn outcome_from_error(err: ClaudeError) -> PlannerOutcome {
     match err {
         ClaudeError::Api { status, body } => PlannerOutcome::ApiError {
             status,
-            snippet: clip(&body, 200),
+            snippet: crate::string_clip::clip_to_bytes(&body, 200),
         },
         ClaudeError::Transport(msg) | ClaudeError::Decode(msg) => PlannerOutcome::Transport(msg),
     }
@@ -536,20 +536,6 @@ fn normalize_output_text(output: &mut PlannerOutput) {
 /// meant to represent.
 fn unescape_over_escaped(s: &str) -> String {
     s.replace("\\n", "\n").replace("\\\"", "\"")
-}
-
-/// Clip a string to `max` bytes on a char boundary, appending an ellipsis if
-/// truncated. Used to bound the error snippet stored in [`PlannerOutcome`].
-fn clip(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        if out.len() + c.len_utf8() > max {
-            out.push('…');
-            return out;
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// The Planner's system prompt. Encodes the coordinator policy a human would
