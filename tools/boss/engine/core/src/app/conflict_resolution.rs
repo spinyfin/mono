@@ -59,6 +59,29 @@ pub(super) async fn handle_get_conflict_resolution(ctx: Dispatch, req: FrontendR
     }
 }
 
+pub(super) async fn handle_get_conflict_hotspots(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetConflictHotspots { product_id, top } = req else {
+        unreachable!()
+    };
+    {
+        // Read-only aggregation surface for `boss engine conflicts
+        // hotspots` (Layer 0 / T5). No auth gate, same reasoning as
+        // `list_conflict_resolutions`: diagnostic-only, and the
+        // caller can already read the SQLite file directly.
+        let top_n = top.unwrap_or(20) as usize;
+        match work_db.conflict_hotspots(&product_id, top_n) {
+            Ok(report) => send_response(&sink, &request_id, FrontendEvent::ConflictHotspots { report }),
+            Err(err) => send_work_error(&sink, &request_id, &err),
+        }
+    }
+}
+
 pub(super) async fn handle_retry_conflict_resolution(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -242,6 +265,7 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
 
 pub(super) async fn handle_record_producer_side_conflict(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -276,6 +300,13 @@ pub(super) async fn handle_record_producer_side_conflict(ctx: Dispatch, req: Fro
                     product_id = %attempt.product_id,
                     "record_producer_side_conflict: telemetry row recorded",
                 );
+                if let Some(class) = attempt.conflict_class.as_deref() {
+                    crate::merge_poller::record_conflict_class_counter(
+                        &server_state.metrics,
+                        &attempt.product_id,
+                        class,
+                    );
+                }
                 send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt });
             }
             Err(err) => {

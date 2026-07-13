@@ -4886,18 +4886,25 @@ impl ExecutionCoordinator {
             }
         };
 
-        if let Err(err) = self.work_db.set_conflict_resolution_diagnosis(&attempt.id, &json) {
-            tracing::warn!(
-                attempt_id = %attempt.id,
-                ?err,
-                "collect_conflict_diagnosis: failed to persist diagnosis; continuing without it",
-            );
-        } else {
-            tracing::debug!(
-                attempt_id = %attempt.id,
-                conflicted_files = diagnosis.files.len(),
-                "collect_conflict_diagnosis: diagnosis persisted",
-            );
+        match self.work_db.set_conflict_resolution_diagnosis(&attempt.id, &json) {
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "collect_conflict_diagnosis: failed to persist diagnosis; continuing without it",
+                );
+            }
+            Ok(updated) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    conflicted_files = diagnosis.files.len(),
+                    "collect_conflict_diagnosis: diagnosis persisted",
+                );
+                let counted = updated.and_then(|row| row.conflict_class.clone().map(|class| (row.product_id, class)));
+                if let Some((product_id, class)) = counted {
+                    crate::merge_poller::record_conflict_class_counter(&self.metrics, &product_id, &class);
+                }
+            }
         }
     }
 

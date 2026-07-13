@@ -7,13 +7,13 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
     AddDependencyInput, Attention, AttentionGroup, AttentionMerge, Automation, AutomationPatch, AutomationRun,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentWithThread, CommentsBannerState, ConflictResolution,
-    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction,
-    EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product,
-    Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
-    ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
+    ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
+    CreateCommentInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
+    EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    PrWorkItemMatch, Product, Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
     SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
     WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
@@ -629,6 +629,17 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] when the id is unknown.
     GetCiRemediation {
         attempt_id: String,
+    },
+
+    /// Read-only: aggregate `conflict_diagnosis` for one product into a
+    /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
+    /// per-file frequency, per-file-pair co-conflict frequency, per-class
+    /// counts. `top` caps each ranked list. Replies with
+    /// [`FrontendEvent::ConflictHotspots`].
+    GetConflictHotspots {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top: Option<u32>,
     },
 
     /// Read-only: fetch a single attempt row by id. Returns
@@ -2278,6 +2289,10 @@ pub enum FrontendEvent {
     /// filtered set of rows, ordered freshest-first.
     ConflictResolutionsList {
         attempts: Vec<ConflictResolution>,
+    },
+    /// Response to [`FrontendRequest::GetConflictHotspots`].
+    ConflictHotspots {
+        report: ConflictHotspotReport,
     },
     /// Response to [`FrontendRequest::GetConflictResolution`]: a single
     /// row by id.
