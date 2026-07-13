@@ -1088,6 +1088,35 @@ pub struct ConflictResolution {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
+
+    /// Which detection path produced this row: `"review_watch"` (the
+    /// original `conflict_watch` in-review detection) or
+    /// `"producer_rebase"` (a normal worker's own `cube workspace
+    /// rebase` hitting `REBASED_WITH_CONFLICTS` mid-task, previously
+    /// invisible to telemetry). Defaults to `"review_watch"` so
+    /// pre-existing rows are attributed correctly.
+    #[serde(default = "default_review_watch_event_source")]
+    #[builder(default = default_review_watch_event_source())]
+    pub event_source: String,
+
+    /// Per-event classification derived from the conflicted file
+    /// paths (`boss_conflict_diagnosis::classify_conflict_class`):
+    /// `lockfile` / `build_file` / `registry` / `migration` / `test` /
+    /// `semantic` / `mixed` / `unknown`. `None` for rows written
+    /// before this column existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_class: Option<String>,
+
+    /// Which escalation-ladder rung resolved this conflict (0-3). The
+    /// ladder (rungs 0-2) doesn't exist yet — until it ships, every
+    /// resolution goes through today's only path, the full worker
+    /// (rung 3). `None` for non-terminal or pre-migration rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by_rung: Option<i64>,
+}
+
+fn default_review_watch_event_source() -> String {
+    "review_watch".to_owned()
 }
 
 /// Input for creating a new attention (question or followup member).
@@ -4386,6 +4415,9 @@ mod tests {
             started_at: Some("1747000010".into()),
             finished_at: Some("1747000100".into()),
             revision_task_id: None,
+            event_source: "review_watch".into(),
+            conflict_class: Some("semantic".into()),
+            resolved_by_rung: Some(3),
         };
         let raw = serde_json::to_value(&attempt).unwrap();
         let back: ConflictResolution = serde_json::from_value(raw).unwrap();
@@ -4415,6 +4447,9 @@ mod tests {
             started_at: None,
             finished_at: None,
             revision_task_id: None,
+            event_source: "review_watch".into(),
+            conflict_class: None,
+            resolved_by_rung: None,
         };
         let encoded = serde_json::to_value(&attempt).unwrap();
         let obj = encoded.as_object().unwrap();
@@ -4429,6 +4464,8 @@ mod tests {
             "conflict_diagnosis",
             "started_at",
             "finished_at",
+            "conflict_class",
+            "resolved_by_rung",
         ] {
             assert!(!obj.contains_key(absent), "expected {absent} omitted on encode",);
         }

@@ -347,3 +347,192 @@ fn auto_pr_maintenance_reflects_explicit_toggle() {
         "re-enabling the flag must read as true"
     );
 }
+
+// ── record_producer_side_conflict (Layer 0 / T1 telemetry) ─────────────
+
+/// Create an execution row for `work_item_id`, optionally with a
+/// `pr_url` already bound, so `record_producer_side_conflict` has an
+/// execution to resolve `product_id`/`work_item_id`/PR context from.
+fn seed_execution(db: &WorkDb, work_item_id: &str, pr_url: Option<&str>) -> boss_protocol::WorkExecution {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .kind(ExecutionKind::TaskImplementation)
+            .status(ExecutionStatus::Running)
+            .cube_lease_id("lease_1")
+            .cube_workspace_id("ws_1")
+            .cube_repo_id("cube_repo_mono")
+            .workspace_path("/tmp/mono-agent-001")
+            .maybe_pr_url(pr_url)
+            .build(),
+    )
+    .unwrap()
+}
+
+/// The common case: a normal worker's own `cube workspace rebase` hits
+/// `REBASED_WITH_CONFLICTS` before it has ever opened a PR. The row
+/// must still be recorded — attributable to the right product/work
+/// item — with the empty-string/`0` PR sentinel, already terminal, and
+/// stamped with the telemetry fields the design calls for.
+#[test]
+fn record_producer_side_conflict_before_pr_exists_uses_sentinel_pr() {
+    let (db, product, chore) = seed_product_and_chore("producer-no-pr");
+    let execution = seed_execution(&db, &chore, None);
+
+    let attempt = db
+        .record_producer_side_conflict(
+            ProducerConflictInsertInput::builder()
+                .execution_id(execution.id.clone())
+                .head_branch("boss/exec_producer_1")
+                .base_branch("main")
+                .conflicted_files(vec!["Cargo.lock".to_owned()])
+                .build(),
+        )
+        .unwrap();
+
+    assert_eq!(attempt.product_id, product);
+    assert_eq!(attempt.work_item_id, chore);
+    assert_eq!(
+        attempt.pr_url, "",
+        "no PR yet must fall back to the empty-string sentinel"
+    );
+    assert_eq!(attempt.pr_number, 0, "no PR yet must fall back to the 0 sentinel");
+    assert_eq!(attempt.head_branch, "boss/exec_producer_1");
+    assert_eq!(attempt.base_branch, "main");
+    assert_eq!(
+        attempt.status, "succeeded",
+        "the worker already resolved it before calling this"
+    );
+    assert_eq!(attempt.event_source, "producer_rebase");
+    assert_eq!(attempt.conflict_class.as_deref(), Some("lockfile"));
+    assert_eq!(
+        attempt.resolved_by_rung,
+        Some(3),
+        "no ladder yet — today's only path is the full worker"
+    );
+    assert!(attempt.conflict_diagnosis.is_some());
+    assert_eq!(attempt.cube_lease_id.as_deref(), Some("lease_1"));
+    assert_eq!(attempt.cube_workspace_id.as_deref(), Some("ws_1"));
+
+    // The row is visible through the same listing surface as
+    // conflict_watch-detected rows, tagged by its source.
+    let listed = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, attempt.id);
+}
+
+/// When the execution already carries a `pr_url` (the worker pushed and
+/// opened a PR before hitting this conflict), the row uses that PR and
+/// derives the numeric `pr_number` from it instead of the sentinel.
+#[test]
+fn record_producer_side_conflict_after_pr_exists_uses_real_pr() {
+    let (db, _product, chore) = seed_product_and_chore("producer-with-pr");
+    let execution = seed_execution(&db, &chore, Some("https://github.com/foo/bar/pull/321"));
+
+    let attempt = db
+        .record_producer_side_conflict(
+            ProducerConflictInsertInput::builder()
+                .execution_id(execution.id.clone())
+                .head_branch("boss/exec_producer_2")
+                .base_branch("main")
+                .conflicted_files(vec!["src/completion.rs".to_owned()])
+                .build(),
+        )
+        .unwrap();
+
+    assert_eq!(attempt.pr_url, "https://github.com/foo/bar/pull/321");
+    assert_eq!(attempt.pr_number, 321);
+    assert_eq!(attempt.conflict_class.as_deref(), Some("semantic"));
+}
+
+/// Multiple conflicted files spanning more than one class classify as
+/// `"mixed"`; an empty conflicted-files list (shouldn't happen from a
+/// real `REBASED_WITH_CONFLICTS`, but the method must not panic)
+/// classifies as `"unknown"`.
+#[test]
+fn record_producer_side_conflict_classifies_mixed_and_empty_file_lists() {
+    let (db, _product, chore) = seed_product_and_chore("producer-classify");
+    let execution = seed_execution(&db, &chore, None);
+
+    let mixed = db
+        .record_producer_side_conflict(
+            ProducerConflictInsertInput::builder()
+                .execution_id(execution.id.clone())
+                .head_branch("boss/exec_producer_3")
+                .base_branch("main")
+                .conflicted_files(vec!["Cargo.lock".to_owned(), "src/completion.rs".to_owned()])
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(mixed.conflict_class.as_deref(), Some("mixed"));
+
+    let empty = db
+        .record_producer_side_conflict(
+            ProducerConflictInsertInput::builder()
+                .execution_id(execution.id.clone())
+                .head_branch("boss/exec_producer_4")
+                .base_branch("main")
+                .conflicted_files(vec![])
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(empty.conflict_class.as_deref(), Some("unknown"));
+}
+
+// ── conflict_class / resolved_by_rung stamping on the review_watch path ─
+
+/// `set_conflict_resolution_diagnosis` derives `conflict_class` from
+/// the diagnosis's conflicted-file paths in the same write, and leaves
+/// it untouched when the diagnosis JSON is an unparseable blob.
+#[test]
+fn set_diagnosis_derives_conflict_class() {
+    let (db, product, chore) = seed_product_and_chore("diagnosis-class");
+    let attempt = insert_attempt(&db, &product, &chore, "sha-diag");
+
+    let diagnosis = crate::conflict_diagnosis::ConflictDiagnosis {
+        schema_version: 1,
+        base_sha: "aaa".into(),
+        head_sha: "bbb".into(),
+        files: vec![crate::conflict_diagnosis::ConflictedFile {
+            path: "MODULE.bazel.lock".into(),
+            marker_count: None,
+            shape: "content".into(),
+        }],
+        error: None,
+    };
+    let updated = db
+        .set_conflict_resolution_diagnosis(&attempt.id, &serde_json::to_string(&diagnosis).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.conflict_class.as_deref(), Some("lockfile"));
+
+    // An unparseable diagnosis blob still stores verbatim but must not
+    // clobber the already-derived class.
+    let updated2 = db
+        .set_conflict_resolution_diagnosis(&attempt.id, "not json")
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated2.conflict_diagnosis.as_deref(), Some("not json"));
+    assert_eq!(
+        updated2.conflict_class.as_deref(),
+        Some("lockfile"),
+        "an unparseable diagnosis must not erase a previously-derived class"
+    );
+}
+
+/// `mark_conflict_resolution_succeeded` stamps `resolved_by_rung = 3`
+/// (today's only path — the full worker) the first time an attempt
+/// terminates successfully, and does not clobber an explicitly-set
+/// value on a second call.
+#[test]
+fn mark_succeeded_stamps_full_worker_rung() {
+    let (db, product, chore) = seed_product_and_chore("succeeded-rung");
+    let attempt = insert_attempt(&db, &product, &chore, "sha-rung");
+    assert_eq!(attempt.resolved_by_rung, None);
+
+    let succeeded = db
+        .mark_conflict_resolution_succeeded(&attempt.id, Some("head-after"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(succeeded.resolved_by_rung, Some(3));
+}

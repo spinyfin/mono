@@ -239,3 +239,48 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
         }
     }
 }
+
+pub(super) async fn handle_record_producer_side_conflict(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::RecordProducerSideConflict {
+        execution_id,
+        head_branch,
+        base_branch,
+        conflicted_files,
+    } = req
+    else {
+        unreachable!()
+    };
+    {
+        // Worker-facing telemetry surface (Layer 0 / T1). Same
+        // `User`-tier reasoning as `mark_conflict_resolution_failed`:
+        // the only state change is a fresh, self-contained
+        // `conflict_resolutions` row — a worker forging bogus content
+        // has nothing else to clobber.
+        let input = ProducerConflictInsertInput::builder()
+            .execution_id(execution_id)
+            .head_branch(head_branch)
+            .base_branch(base_branch)
+            .conflicted_files(conflicted_files)
+            .build();
+        match work_db.record_producer_side_conflict(input) {
+            Ok(attempt) => {
+                tracing::info!(
+                    attempt_id = %attempt.id,
+                    work_item_id = %attempt.work_item_id,
+                    product_id = %attempt.product_id,
+                    "record_producer_side_conflict: telemetry row recorded",
+                );
+                send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt });
+            }
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+            }
+        }
+    }
+}

@@ -1920,3 +1920,35 @@ pub(crate) fn migrate_conflict_resolutions_widen_unique_key(conn: &Connection) -
     )?;
     Ok(())
 }
+
+/// Add the Layer 0 telemetry columns to `conflict_resolutions`
+/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
+/// T1): `event_source` distinguishes the existing in-review
+/// `conflict_watch` path (`'review_watch'`, the default so every
+/// pre-existing row is attributed correctly) from the new producer-side
+/// path (`'producer_rebase'`) where a normal worker's own `cube
+/// workspace rebase` reports `REBASED_WITH_CONFLICTS` mid-task —
+/// previously invisible to telemetry entirely. `conflict_class` is a
+/// per-event classification derived from the conflicted file paths
+/// (see `boss_conflict_diagnosis::classify_conflict_class`).
+/// `resolved_by_rung` records which rung of the (future) escalation
+/// ladder resolved the conflict; until the ladder ships (T4+), every
+/// resolution is via today's only path — the full worker, rung 3.
+pub(crate) fn migrate_conflict_resolutions_telemetry_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "conflict_resolutions", "event_source")? {
+        conn.execute(
+            "ALTER TABLE conflict_resolutions ADD COLUMN event_source TEXT NOT NULL DEFAULT 'review_watch'",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "conflict_resolutions", "conflict_class")? {
+        conn.execute("ALTER TABLE conflict_resolutions ADD COLUMN conflict_class TEXT", [])?;
+    }
+    if !table_has_column(conn, "conflict_resolutions", "resolved_by_rung")? {
+        conn.execute(
+            "ALTER TABLE conflict_resolutions ADD COLUMN resolved_by_rung INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}

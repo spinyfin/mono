@@ -4095,6 +4095,9 @@ mod compose_prompt_tests {
             started_at: None,
             finished_at: None,
             revision_task_id: Some("task-rev-1".into()),
+            event_source: "review_watch".into(),
+            conflict_class: None,
+            resolved_by_rung: None,
         }
     }
 

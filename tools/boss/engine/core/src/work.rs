@@ -315,6 +315,7 @@ pub use execution_retention::{
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
+pub use mappers::ProducerConflictInsertInput;
 pub use metrics_types::MetricsCounterRow;
 pub use metrics_types::MetricsGaugeRow;
 pub use output_types::HostBoundExecution;
