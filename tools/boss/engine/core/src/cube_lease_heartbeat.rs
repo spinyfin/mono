@@ -929,7 +929,7 @@ mod tests {
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::run_reconcile::{RunReconcileReport, RunReconcileVerdict};
     use crate::test_support::*;
-    use crate::work::{CreateChoreInput, WorkDb};
+    use crate::work::WorkDb;
 
     // ─── cube stub ────────────────────────────────────────────────────────────
 
@@ -1011,13 +1011,7 @@ mod tests {
     }
 
     fn create_chore(db: &WorkDb, product_id: &str) -> String {
-        create_named_chore(db, product_id, "test chore")
-    }
-
-    fn create_named_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
-            .unwrap()
-            .id
+        create_test_chore(db, product_id, "test chore").id
     }
 
     /// Create a `ready` execution for `work_item_id`.
@@ -1611,10 +1605,10 @@ mod tests {
         let product_id = create_product(&db);
 
         // Two live executions: one with the hung lease, one normal.
-        let wi_slow = create_named_chore(&db, &product_id, "slow chore");
+        let wi_slow = create_test_chore(&db, &product_id, "slow chore").id;
         let exec_slow = running_execution_with_lease(&db, &wi_slow, "lease-slow");
 
-        let wi_fast = create_named_chore(&db, &product_id, "fast chore");
+        let wi_fast = create_test_chore(&db, &product_id, "fast chore").id;
         let exec_fast = running_execution_with_lease(&db, &wi_fast, "lease-fast");
 
         let live_states = LiveWorkerStateRegistry::new();

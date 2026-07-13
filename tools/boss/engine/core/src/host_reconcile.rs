@@ -273,8 +273,8 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
     use crate::runner::{ExecutionRunner, RunOutcome};
-    use crate::test_support::{create_test_product_with_repo, open_db};
-    use crate::work::{CreateChoreInput, WorkDb};
+    use crate::test_support::{create_test_chore, create_test_product_with_repo, open_db};
+    use crate::work::WorkDb;
 
     /// No-op execution runner: the real re-route tests only need
     /// `orphan_sweep::run_one_pass` to produce a fresh `ready` execution;
@@ -328,12 +328,6 @@ mod tests {
 
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
-    }
-
-    fn create_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
-            .unwrap()
-            .id
     }
 
     fn ready_execution(db: &WorkDb, work_item_id: &str) -> String {
@@ -439,16 +433,16 @@ mod tests {
         add_remote_host(&db, "zakalwe");
 
         // In-flight on the soon-to-be-disabled host.
-        let doomed_wi = create_chore(&db, &product, "doomed");
+        let doomed_wi = create_test_chore(&db, &product, "doomed").id;
         let doomed = running_execution_on_host(&db, &doomed_wi, "lease-doomed", "anaplian");
         // In-flight on a host that stays enabled — must be untouched.
-        let healthy_wi = create_chore(&db, &product, "healthy-remote");
+        let healthy_wi = create_test_chore(&db, &product, "healthy-remote").id;
         let healthy = running_execution_on_host(&db, &healthy_wi, "lease-healthy", "zakalwe");
         // In-flight locally — never selected by this query.
-        let local_wi = create_chore(&db, &product, "local");
+        let local_wi = create_test_chore(&db, &product, "local").id;
         running_execution_on_host(&db, &local_wi, "lease-local", "local");
         // Terminal on the disabled host — already settled, must be excluded.
-        let done_wi = create_chore(&db, &product, "already-done");
+        let done_wi = create_test_chore(&db, &product, "already-done").id;
         let done = running_execution_on_host(&db, &done_wi, "lease-done", "anaplian");
         db.mark_execution_orphaned(&done, "pre-existing terminal").unwrap();
 
@@ -473,7 +467,7 @@ mod tests {
         let (_dir, db) = open_db();
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
-        let wi = create_chore(&db, &product, "orphan-of-removed-host");
+        let wi = create_test_chore(&db, &product, "orphan-of-removed-host").id;
         let exec = running_execution_on_host(&db, &wi, "lease-x", "anaplian");
 
         // Remove the host row entirely (operator `hosts remove`).
@@ -491,9 +485,9 @@ mod tests {
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
 
-        let on_disabled = running_execution_on_host(&db, &create_chore(&db, &product, "a"), "l1", "anaplian");
-        let on_local = running_execution_on_host(&db, &create_chore(&db, &product, "b"), "l2", "local");
-        let no_run = ready_execution(&db, &create_chore(&db, &product, "c"));
+        let on_disabled = running_execution_on_host(&db, &create_test_chore(&db, &product, "a").id, "l1", "anaplian");
+        let on_local = running_execution_on_host(&db, &create_test_chore(&db, &product, "b").id, "l2", "local");
+        let no_run = ready_execution(&db, &create_test_chore(&db, &product, "c").id);
 
         // Enabled host → not offline.
         assert!(!db.execution_bound_host_offline(&on_disabled).unwrap());
@@ -517,9 +511,9 @@ mod tests {
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
 
-        let inflight_wi = create_chore(&db, &product, "in-flight");
+        let inflight_wi = create_test_chore(&db, &product, "in-flight").id;
         let inflight = running_execution_on_host(&db, &inflight_wi, "lease-inflight", "anaplian");
-        let hb_wi = create_chore(&db, &product, "heartbeat-failing");
+        let hb_wi = create_test_chore(&db, &product, "heartbeat-failing").id;
         let hb = running_execution_on_host(&db, &hb_wi, "lease-hb", "anaplian");
 
         db.set_host_enabled("anaplian", false).unwrap();
@@ -551,7 +545,7 @@ mod tests {
         let (_dir, db) = open_db();
         let product = create_product(&db);
         add_remote_host(&db, "zakalwe");
-        let wi = create_chore(&db, &product, "healthy");
+        let wi = create_test_chore(&db, &product, "healthy").id;
         let exec = running_execution_on_host(&db, &wi, "lease-ok", "zakalwe");
 
         let cube = FakeCube::default();
@@ -570,7 +564,7 @@ mod tests {
         let (_dir, db) = open_db();
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
-        let wi = create_chore(&db, &product, "unreachable");
+        let wi = create_test_chore(&db, &product, "unreachable").id;
         let exec = running_execution_on_host(&db, &wi, "lease-gone", "anaplian");
         db.set_host_enabled("anaplian", false).unwrap();
 
@@ -599,7 +593,7 @@ mod tests {
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
 
-        let wi = create_chore(&db, &product, "t2213-review");
+        let wi = create_test_chore(&db, &product, "t2213-review").id;
         let stuck = running_execution_on_host(&db, &wi, "lease-stuck", "anaplian");
         // start_execution_run flipped the task to `active` (Doing column).
         assert!(db.get_execution(&stuck).unwrap().status == ExecutionStatus::Running);
@@ -673,7 +667,7 @@ mod tests {
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
 
-        let wi = create_chore(&db, &product, "t2213-e2e-reroute");
+        let wi = create_test_chore(&db, &product, "t2213-e2e-reroute").id;
         let stuck = running_execution_on_host(&db, &wi, "lease-stuck-e2e", "anaplian");
         assert_eq!(db.get_execution(&stuck).unwrap().status, ExecutionStatus::Running);
 
@@ -736,7 +730,7 @@ mod tests {
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
 
-        let wi = create_chore(&db, &product, "t2213-already-churning");
+        let wi = create_test_chore(&db, &product, "t2213-already-churning").id;
         let stuck = running_execution_on_host(&db, &wi, "lease-churn", "anaplian");
 
         let old_epoch = std::time::SystemTime::now()
@@ -796,7 +790,7 @@ mod tests {
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
 
-        let wi = create_chore(&db, &product, "t2213-socket-write");
+        let wi = create_test_chore(&db, &product, "t2213-socket-write").id;
         let reviewer = running_pr_review_on_host(&db, &wi, "lease-review", "anaplian");
         // The task is in the PendingReview hold: active + pr_url.
         assert_eq!(task_status(&db, &wi), "active");
