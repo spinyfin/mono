@@ -3783,6 +3783,18 @@ pub enum WorkItem {
     Chore(Task),
 }
 
+impl WorkItem {
+    /// The primary id of any `WorkItem` variant, for callers that just need a
+    /// string to compare/print regardless of kind.
+    pub fn primary_id(&self) -> &str {
+        match self {
+            WorkItem::Product(p) => &p.id,
+            WorkItem::Project(p) => &p.id,
+            WorkItem::Task(t) | WorkItem::Chore(t) => &t.id,
+        }
+    }
+}
+
 /// One row of the `work_item_dependencies` table — an edge from a
 /// dependent to a prerequisite. `relation` is `"blocks"` for v1; the
 /// column exists so future relation types (`"relates-to"`,
