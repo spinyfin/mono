@@ -43,7 +43,8 @@ pub enum ValidationResult {
     /// Maps to `PLANNER_OUTCOME_REJECTED_CYCLE` (re-uses the "bad graph" bucket).
     RejectedDuplicateHandle { handle: String },
 
-    /// An edge references a handle not present in the `tasks` list.
+    /// An edge (or `merge_order_hints` entry) references a handle not present
+    /// in the `tasks` list.
     /// Maps to `PLANNER_OUTCOME_REJECTED_CYCLE` (re-uses the "bad graph" bucket).
     RejectedUnknownHandle { handle: String },
 
@@ -128,6 +129,22 @@ pub fn validate(output: &PlannerOutput, max_tasks: usize) -> ValidationResult {
     // 6. Acyclicity — the edge set must form a DAG.
     if let Some(cycle) = detect_cycle(&known, &output.edges) {
         return ValidationResult::RejectedCycle { cycle };
+    }
+
+    // 6b. Handle integrity for the soft file-overlap hints. These never gate
+    // dispatch (they are not edges), so they are not subject to the cycle
+    // check — only the same handle-existence check edges get.
+    for hint in &output.merge_order_hints {
+        if !known.contains(hint.task_a.as_str()) {
+            return ValidationResult::RejectedUnknownHandle {
+                handle: hint.task_a.clone(),
+            };
+        }
+        if !known.contains(hint.task_b.as_str()) {
+            return ValidationResult::RejectedUnknownHandle {
+                handle: hint.task_b.clone(),
+            };
+        }
     }
 
     // 7. All checks passed.
@@ -536,10 +553,19 @@ mod tests {
         PlannerOutput {
             tasks,
             edges,
+            merge_order_hints: vec![],
             confidence,
             breakdown_found,
             notes: String::new(),
             effort_audit: vec![],
+        }
+    }
+
+    fn merge_hint(task_a: &str, task_b: &str) -> boss_protocol::ProposedMergeOrderHint {
+        boss_protocol::ProposedMergeOrderHint {
+            task_a: task_a.to_owned(),
+            task_b: task_b.to_owned(),
+            reason: "both touch the shared config module".to_owned(),
         }
     }
 
@@ -624,6 +650,50 @@ mod tests {
                 handle: "ghost".to_owned()
             }
         );
+    }
+
+    // ---- merge_order_hints: soft, non-gating ------------------------------
+
+    #[test]
+    fn merge_order_hint_with_known_handles_is_valid() {
+        let mut out = output_with(vec![task("a"), task("b")], vec![], Confidence::High, true);
+        out.merge_order_hints = vec![merge_hint("a", "b")];
+        assert_eq!(validate(&out, 30), ValidationResult::Valid { low_confidence: false });
+    }
+
+    #[test]
+    fn rejected_when_merge_order_hint_task_a_unknown() {
+        let mut out = output_with(vec![task("a")], vec![], Confidence::High, true);
+        out.merge_order_hints = vec![merge_hint("ghost", "a")];
+        assert_eq!(
+            validate(&out, 30),
+            ValidationResult::RejectedUnknownHandle {
+                handle: "ghost".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejected_when_merge_order_hint_task_b_unknown() {
+        let mut out = output_with(vec![task("a")], vec![], Confidence::High, true);
+        out.merge_order_hints = vec![merge_hint("a", "ghost")];
+        assert_eq!(
+            validate(&out, 30),
+            ValidationResult::RejectedUnknownHandle {
+                handle: "ghost".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn merge_order_hint_never_gates_dispatch_even_with_no_edges() {
+        // Two tasks with a merge_order_hints entry and NO edges between them
+        // must still validate as parallel-startable — the hint alone must
+        // never behave like a dependency edge.
+        let mut out = output_with(vec![task("a"), task("b")], vec![], Confidence::High, true);
+        out.merge_order_hints = vec![merge_hint("a", "b")];
+        let result = validate(&out, 30);
+        assert_eq!(result, ValidationResult::Valid { low_confidence: false });
     }
 
     // ---- RejectedCycle -----------------------------------------------------

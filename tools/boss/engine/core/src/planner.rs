@@ -529,6 +529,9 @@ fn normalize_output_text(output: &mut PlannerOutput) {
         task.name = unescape_over_escaped(&task.name);
         task.description = unescape_over_escaped(&task.description);
     }
+    for hint in &mut output.merge_order_hints {
+        hint.reason = unescape_over_escaped(&hint.reason);
+    }
 }
 
 /// Replace literal `\"` and `\n` (backslash followed by a literal character,
@@ -687,15 +690,29 @@ config / module. Parallelising edit-overlapping siblings schedules a \
 forward-port conflict, and each such conflict is a chance for the later \
 resolution to silently drop the earlier one's work. So: when — and only when \
 — two otherwise-parallel tasks are **clearly and substantially** likely to \
-co-edit the same file(s), add a `blocks` edge so they land in a defined order \
-and note in the dependent task's `description` that it must **forward-port the \
-sibling's changes preservingly** (integrate, never delete). Do NOT over-index \
-on this — a little incidental overlap is not enough; if you serialise every \
-pair that shares a file, every project becomes linear. Parallel throughput \
-stays the default; sequence only on clear, substantial overlap.\n\
+co-edit the same file(s), add an entry to `merge_order_hints` naming the pair \
+and the file(s)/surface you expect them to co-edit. Do NOT over-index on \
+this — a little incidental overlap is not enough; if you flag every pair that \
+shares a file, the hint stops being useful. Emit a hint only on clear, \
+substantial overlap.\n\
+\n\
+**A `merge_order_hints` entry is NOT a dependency edge and must never gate \
+dispatch.** Both tasks stay independently startable — the hint only lets a \
+later merge-time step order the two PRs and require the later one to \
+forward-port the sibling's changes preservingly (integrate, never delete). \
+Never use a `blocks` edge for file overlap alone; `edges` is reserved for \
+true functional prerequisites (design's \"Parallel throughput stays the \
+default\").\n\
 \n\
 Each edge is { \"dependent\": <handle that waits>, \"prerequisite\": <handle \
 that must land first> }. Both endpoints must be handles you emitted.\n\
+\n\
+Each `merge_order_hints` entry is { \"task_a\": <handle>, \"task_b\": <handle>, \
+\"reason\": <which file(s)/surface they co-edit> }. Both handles must be \
+handles you emitted, and must be two DIFFERENT tasks with no `edges` \
+relationship between them (if one already depends on the other via an edge, \
+their landing order is already fixed — do not also emit a hint for that \
+pair).\n\
 \n\
 ## ordinal\n\
 \n\
@@ -849,12 +866,16 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("maximise safe parallelism"));
         assert!(SYSTEM_PROMPT.contains("breakdown_found"));
         assert!(SYSTEM_PROMPT.contains("DAG"));
-        // P5-lite (incident-002): the planner must weigh file overlap, but
-        // only serialise on clear/substantial overlap so throughput stays the
-        // default.
+        // P5-lite (incident-002, reconciled with T2253): the planner must
+        // weigh file overlap, but only emit a soft merge_order_hints entry —
+        // never a `blocks` edge — on clear/substantial overlap, so throughput
+        // stays the default and dispatch is never gated by file overlap
+        // alone.
         assert!(SYSTEM_PROMPT.contains("file** overlap"));
+        assert!(SYSTEM_PROMPT.contains("merge_order_hints"));
         assert!(SYSTEM_PROMPT.contains("forward-port the sibling's changes preservingly"));
-        assert!(SYSTEM_PROMPT.contains("Parallel throughput stays the default"));
+        assert!(SYSTEM_PROMPT.contains("is NOT a dependency edge and must never gate"));
+        assert!(SYSTEM_PROMPT.contains("Never use a `blocks` edge for file overlap alone"));
     }
 
     /// The decomposition gate's prompt half (design brief deliverable 1): the

@@ -516,6 +516,7 @@ mod tests {
         PlannerOutput {
             tasks,
             edges,
+            merge_order_hints: vec![],
             confidence: Confidence::High,
             breakdown_found: true,
             notes: String::new(),

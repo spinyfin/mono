@@ -148,6 +148,7 @@ fn output_from(tasks: &[T], edges: &[E], breakdown_found: bool, confidence: Conf
     PlannerOutput {
         tasks: proposed_tasks,
         edges: proposed_edges,
+        merge_order_hints: vec![],
         confidence,
         breakdown_found,
         notes: "Ground-truth fixture transcribed from the merged design doc.".to_owned(),
