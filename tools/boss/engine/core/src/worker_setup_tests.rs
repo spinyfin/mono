@@ -722,7 +722,7 @@ fn shell_escape_single_quote_uses_outer_close_inner_open_pattern() {
     // Ensure paths containing single-quotes can't break out of the
     // quoting envelope. Standard POSIX trick: ' is closed, then
     // \' is appended literally, then ' reopens the quote.
-    let escaped = shell_escape("a'b");
+    let escaped = shell_quote("a'b");
     assert_eq!(escaped, r#"'a'\''b'"#);
 }
 
@@ -1646,7 +1646,7 @@ fn settings_json_adds_deterministic_path_guard_hook() {
     // worker-settings dir.
     let script = path_guard_script_path();
     assert!(
-        cmd.contains(&shell_escape(&script.display().to_string())),
+        cmd.contains(&shell_quote(&script.display().to_string())),
         "guard must invoke the absolute gate-script path: {cmd}",
     );
 }
@@ -1765,7 +1765,7 @@ fn standard_worker_gets_checkleft_push_guard() {
     assert!(cmd.contains("python3"), "guard must run via python3: {cmd}");
     let script = checkleft_push_guard_script_path();
     assert!(
-        cmd.contains(&shell_escape(&script.display().to_string())),
+        cmd.contains(&shell_quote(&script.display().to_string())),
         "guard must invoke the absolute push-guard script path: {cmd}",
     );
     // The guard is Bash-matched (it inspects the command string).

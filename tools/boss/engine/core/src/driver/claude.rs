@@ -13,6 +13,7 @@ use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
     ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
 };
+use crate::ssh_transport::shell_quote;
 
 // ---------------------------------------------------------------------------
 // Claude model / effort menu (design §1.4 / §Mix-and-match)
@@ -239,20 +240,6 @@ pub(crate) const REVISION_PR_GUARD_COMMAND: &str = concat!(
     "\""
 );
 
-/// Single-quote a shell argument, escaping internal quotes, matching the
-/// POSIX `sh` that spawns Claude's hook commands.
-///
-/// Deliberately a small local copy of `worker_setup::shell_escape`: building
-/// the worker invocation and hook commands is the driver's job, and keeping
-/// this here avoids a back-edge from the driver into `worker_setup` during the
-/// incremental capability extraction. Both consolidate into a shared util once
-/// `worker_setup`'s remaining command-building (path guard, settings healing)
-/// also moves behind the driver.
-fn shell_escape(value: &str) -> String {
-    let escaped = value.replace('\'', r#"'\''"#);
-    format!("'{escaped}'")
-}
-
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// [`render_claude_md`][crate::worker_setup::render_claude_md].
@@ -385,11 +372,11 @@ impl AgentDriver for ClaudeDriver {
         // propagates env.
         let command = format!(
             "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-            socket = shell_escape(&config.events_socket_path.display().to_string()),
-            lease = shell_escape(&config.lease_id),
-            run_id = shell_escape(&config.run_id),
-            workspace = shell_escape(&config.workspace_path.display().to_string()),
-            shim = shell_escape(&config.forwarder_binary.display().to_string()),
+            socket = shell_quote(&config.events_socket_path.display().to_string()),
+            lease = shell_quote(&config.lease_id),
+            run_id = shell_quote(&config.run_id),
+            workspace = shell_quote(&config.workspace_path.display().to_string()),
+            shim = shell_quote(&config.forwarder_binary.display().to_string()),
         );
 
         // Every hook event fires this same forwarder hook (matcher `*`). The
@@ -427,8 +414,8 @@ impl AgentDriver for ClaudeDriver {
         if let (Some(data_dir), Some(guard_script)) = (&config.data_dir, &config.path_guard_script) {
             let guard_command = format!(
                 "BOSS_DATA_DIR={dir} python3 {script}",
-                dir = shell_escape(&data_dir.display().to_string()),
-                script = shell_escape(&guard_script.display().to_string()),
+                dir = shell_quote(&data_dir.display().to_string()),
+                script = shell_quote(&guard_script.display().to_string()),
             );
             hooks.push(serde_json::json!({
                 "matcher": "*",
@@ -462,7 +449,7 @@ impl AgentDriver for ClaudeDriver {
         {
             let guard_command = format!(
                 "python3 {script}",
-                script = shell_escape(&checkleft_script.display().to_string()),
+                script = shell_quote(&checkleft_script.display().to_string()),
             );
             hooks.push(serde_json::json!({
                 "matcher": "Bash",

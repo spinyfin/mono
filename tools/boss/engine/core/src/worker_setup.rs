@@ -63,6 +63,7 @@ use serde_json;
 use boss_protocol::ExecutionKind;
 
 use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig, ToolUseInterceptionConfig};
+use crate::ssh_transport::shell_quote;
 
 // Re-export guard command constants so the test module (which uses `use
 // super::*;`) can run the Python scripts end-to-end and verify their behaviour.
@@ -813,13 +814,6 @@ fn publish_deny_rules() -> Vec<String> {
         "Bash(cube pr)".to_owned(),
         "Bash(cube pr:*)".to_owned(),
     ]
-}
-
-/// Single-quote a shell argument, escaping internal quotes. Matches the
-/// quoting claude's hook-spawning shell expects (POSIX `sh`).
-fn shell_escape(value: &str) -> String {
-    let escaped = value.replace('\'', r#"'\''"#);
-    format!("'{escaped}'")
 }
 
 /// Single-pattern gitignore body. `*` matches every entry in
@@ -1622,7 +1616,7 @@ pub(crate) fn heal_hook_command(command: &str, new_boss_event_path: &Path) -> St
         return command.to_owned();
     };
     let close_pos = after + close_offset;
-    let new_escaped = shell_escape(&new_boss_event_path.display().to_string());
+    let new_escaped = shell_quote(&new_boss_event_path.display().to_string());
     format!("{}{}{}", &command[..open_pos], new_escaped, &command[close_pos + 1..])
 }
 

@@ -52,6 +52,7 @@ use serde_json::{Value, json};
 use boss_editorial::{CompiledRules, EditorialDecision, Finding, FindingKind};
 
 use crate::gh_invocation::{self, GhNoun};
+use crate::ssh_transport::shell_quote;
 
 /// A third deny of the same invocation within one execution flips to
 /// allow (R3). Calls 1 and 2 are denied; the 3rd is allowed with an
@@ -720,22 +721,6 @@ fn dequote(raw: &str) -> String {
     // adjacent quoted/unquoted runs, which is exactly the shell behaviour
     // for `--body="a"'b'`.
     tokenize(raw).into_iter().map(|t| t.value).collect::<Vec<_>>().join("")
-}
-
-/// Single-quote `s` for safe re-insertion into a shell command, escaping
-/// embedded single quotes as `'\''`. Deterministic and total.
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 // ---------------------------------------------------------------------------
