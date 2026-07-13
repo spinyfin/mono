@@ -369,6 +369,18 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         // caller. Discard it here. Completion probes are never urgent.
         let _ = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
     }
+
+    fn clear_pending_probes(&self, run_id: &str) {
+        let Some(weak) = self.server.get() else {
+            tracing::warn!(run_id, "probe queuer called before server state was bound");
+            return;
+        };
+        let Some(server) = weak.upgrade() else {
+            tracing::debug!(run_id, "probe queuer: server state already dropped");
+            return;
+        };
+        server.clear_pending_probes(run_id);
+    }
 }
 
 /// One queued probe that has not yet been dispatched into the worker.
@@ -1712,6 +1724,20 @@ impl ServerState {
             guard.remove(run_id);
         }
         probe
+    }
+
+    /// Drop every not-yet-delivered probe queued for `run_id`. Used by
+    /// the completion handler to discard a stale nudge (e.g. one
+    /// requeued for retry after a failed `SendToPane`) once a Stop
+    /// reveals the worker reported `[blocked]`/`[effort-escalation]` —
+    /// otherwise `dispatch_probe_on_stop` would pop and deliver it
+    /// regardless of that Stop's own (suppressed) completion outcome.
+    /// Leaves any already-injected in-flight probe untouched.
+    fn clear_pending_probes(&self, run_id: &str) {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .remove(run_id);
     }
 
     /// Note that `probe_id` was just dispatched into the worker's
