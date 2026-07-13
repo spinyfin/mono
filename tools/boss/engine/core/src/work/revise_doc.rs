@@ -982,4 +982,100 @@ mod tests {
         // The ordinary comment's own request is still present.
         assert!(task.description.contains("beta"));
     }
+
+    // --- T2265: a manually-reclassified answered question re-enters the
+    // revise pool with its full thread ---
+
+    #[test]
+    fn revise_picks_up_a_manually_reclassified_answered_question_with_its_thread() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // A comment auto-classified `question`, answered by the answer
+        // agent, then manually reclassified to `larger_change` by the user
+        // via the sidebar intent badge — the exact repro from T2265's
+        // design doc (PR spinyfin/mono#1791): the answer agent has already
+        // finished (status = 'answered'), so there is no bucket-2 bridge in
+        // play here, just a direct manual override.
+        let c1 = make_comment(&db, &artifact_id, "widget config");
+        db.set_comment_intent(&c1.id, "question", 0.9).unwrap();
+        db.transition_comment_to_answering(&c1.id).unwrap();
+        let run = db
+            .create_answer_agent_run(&c1.id, "pr_doc", &artifact_id, "v0", 0)
+            .unwrap();
+        db.complete_answer_agent_run(&run.id, "replied", Some("It lives in config.rs."), None)
+            .unwrap();
+        db.create_comment_thread_entry(
+            &c1.id,
+            THREAD_ENTRY_KIND_ANSWER,
+            "engine",
+            "It lives in config.rs.",
+            None,
+            Some(&run.id),
+        )
+        .unwrap();
+        let answered = db.transition_comment_to_answered(&c1.id).unwrap();
+        assert_eq!(answered.status, "answered");
+
+        // The user reclassifies to `larger_change` — before the fix, this
+        // left the comment stuck at status='answered', invisible to
+        // `[Revise]`.
+        let overridden = db.override_comment_intent(&c1.id, "larger_change").unwrap();
+        assert_eq!(overridden.status, "active");
+
+        // An ordinary larger_change comment alongside it, to mirror the
+        // repro's "four other larger_change comments" batch.
+        let c2 = make_comment(&db, &artifact_id, "beta");
+        db.set_comment_intent(&c2.id, "larger_change", 0.9).unwrap();
+
+        // The banner must count the reclassified comment before dispatch.
+        let banner = db.comments_banner_state("pr_doc", &artifact_id).unwrap();
+        assert_eq!(banner.unresolved_count, 2);
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created {
+            task_id,
+            addressed_comment_ids,
+            ..
+        } = outcome
+        else {
+            panic!("expected Created, got {outcome:?}");
+        };
+
+        // Both comments — including the reclassified one — are claimed into
+        // this batch.
+        assert_eq!(addressed_comment_ids.len(), 2);
+        assert!(addressed_comment_ids.contains(&c1.id));
+        assert!(addressed_comment_ids.contains(&c2.id));
+        let reloaded1 = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded1.status, "in_revision");
+        assert_eq!(reloaded1.revise_task_id.as_deref(), Some(task_id.as_str()));
+
+        // The revision prompt carries the full thread: the original user
+        // comment and the answer-agent's reply.
+        let task = match db.get_work_item(&task_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert!(task.description.contains("please change widget config"));
+        assert!(task.description.contains("It lives in config.rs."));
+    }
 }
