@@ -1728,6 +1728,25 @@ async fn chore_update_notify_sends_message_to_live_worker() {
         )
         .await;
 
+    // `send_input_to_worker` (the chore-update path) verifies the pane
+    // write against a follow-up `UserPromptSubmit` hook rather than
+    // trusting the app's ack alone — this is the fix for the incident
+    // where an identical chore-update notice silently vanished. Fire
+    // the confirming hook the way the worker's CLI would.
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(resolved_run.clone()),
+            transcript_path: None,
+            event: crate::protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "claude-sess-1".into(),
+                prompt: msg.clone(),
+            },
+        },
+    )
+    .await;
+
     send.await.expect("send task").expect("send ok");
 }
 

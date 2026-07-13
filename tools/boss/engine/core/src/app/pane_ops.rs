@@ -115,18 +115,57 @@ impl ServerState {
     /// into that worker pane as if the user had typed it. Returns the
     /// resolved slot on success so `bossctl agents send` can echo back
     /// which pane was targeted (useful when the agent reference was a
-    /// crew name). Mirrors [`focus_worker_pane`] in shape; the only
-    /// behavioural difference is the engine→app request kind.
+    /// crew name). Mirrors [`focus_worker_pane`] in shape, but this
+    /// call can land at any point in the worker's turn — including
+    /// mid-tool-call — so unlike a plain `SendToPane` it verifies the
+    /// write actually became a queued prompt (see
+    /// `inject_pane_text_verified`). This is the chore-update
+    /// auto-notice path implicated in the probe-6 incident.
+    ///
+    /// The corrected understanding of that incident (2026-07-13) is
+    /// that an unconfirmed write is *not* proof of loss — the text may
+    /// still have reached the worker through a channel this engine
+    /// can't yet observe. So on
+    /// [`PaneInjectOutcome::Unconfirmed`] this does **not** fall back
+    /// to `queue_probe`: doing so risks delivering the same notice to
+    /// the worker a second time at its next `Stop` boundary, which is
+    /// exactly the duplicate-delivery outcome the corrected spec warns
+    /// against. Instead it returns success (the write did reach the
+    /// pane) and leaves the unconfirmed state observable via the
+    /// probe/lifecycle machinery rather than silently retrying.
     pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
         };
-        let request = EngineToAppRequest::SendToPane(SendToPaneInput { slot_id, text });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(SendInputError::App(err)),
-            Ok(other) => Err(SendInputError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(SendInputError::Send(err)),
+        let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(self, run_id).await;
+        match self
+            .inject_pane_text_verified(
+                run_id,
+                slot_id,
+                text.clone(),
+                transcript_path.as_deref(),
+                offset_bytes,
+                Duration::from_secs(6),
+            )
+            .await
+        {
+            PaneInjectOutcome::Confirmed => Ok(slot_id),
+            PaneInjectOutcome::Unconfirmed => {
+                tracing::warn!(
+                    run_id,
+                    slot_id,
+                    "send_input_to_worker: pane write unconfirmed (no UserPromptSubmit or transcript match \
+                     observed within the window); NOT re-queuing as a probe, since the corrected probe-6 \
+                     understanding is that the text likely still reached the worker and redelivery would risk \
+                     duplicating it",
+                );
+                Ok(slot_id)
+            }
+            PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(msg)) => {
+                Err(SendInputError::ResponseKindMismatch(msg))
+            }
         }
     }
 

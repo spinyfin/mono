@@ -1033,25 +1033,20 @@ pub enum FrontendRequest {
     },
 
     /// Worker → engine, *validated* terminal signal: "there is no CI
-    /// to fix — the PR's required checks are already green." The CLI
-    /// surface is `boss engine ci mark-noop --attempt-id <cir_…>
-    /// [--observed-sha <sha>] [--reason <r>]`. Unlike the other
-    /// `Mark*` verbs, the engine does NOT take the worker's word for
-    /// it: it independently re-probes LIVE CI for the PR's CURRENT
-    /// head SHA (the same `gh pr view … statusCheckRollup` source the
-    /// merge-poller uses) and only honors the claim when every
-    /// required check is verified passing on that exact SHA. On a
-    /// verified-green probe it retires the attempt and unblocks the
-    /// parent ([`FrontendEvent::CiRemediationNoopValidated`]); on a
-    /// red/pending probe (or a SHA that moved) it rejects and keeps
-    /// the row actionable ([`FrontendEvent::CiRemediationNoopRejected`]),
-    /// so a worker cannot escape a real failure.
+    /// to fix — the PR's required checks are already green." CLI:
+    /// `boss engine ci mark-noop --attempt-id <cir_…> [--observed-sha
+    /// <sha>] [--reason <r>]`. Unlike other `Mark*` verbs, the engine
+    /// does NOT take the worker's word: it re-probes LIVE CI for the
+    /// PR's CURRENT head SHA (the merge-poller's `gh pr view …
+    /// statusCheckRollup` source) and only honors the claim when
+    /// every required check is verified passing on that exact SHA.
+    /// Verified-green retires the attempt and unblocks the parent
+    /// ([`FrontendEvent::CiRemediationNoopValidated`]); red/pending
+    /// (or a moved SHA) rejects and keeps the row actionable
+    /// ([`FrontendEvent::CiRemediationNoopRejected`]).
     ///
-    /// `observed_sha` is the head SHA the worker saw when it decided
-    /// CI was green; it is advisory. The verdict is always re-derived
-    /// from the live head SHA, so a claim about a stale commit is
-    /// re-validated against the new head, never honored blindly.
-    /// `reason` is a free-form note (defaults to `already_green`).
+    /// `observed_sha` is advisory only — the verdict always re-derives
+    /// from the live head SHA. `reason` is free-form (default `already_green`).
     MarkCiRemediationNoop {
         attempt_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2006,6 +2001,14 @@ pub enum FrontendEvent {
         probe_id: String,
         text: String,
     },
+    /// Push: an urgent probe write could not be confirmed delivered.
+    /// NOT proof of loss — left `Unconfirmed` (not auto-re-queued, to
+    /// avoid duplicate delivery); the observer decides on redelivery.
+    ProbeDeliveryEscalated {
+        run_id: String,
+        probe_id: String,
+        reason: String,
+    },
     /// Engine acknowledges a stop request — the pane release has
     /// been kicked off and (if applicable) the cube workspace lease
     /// released. The reply does not wait for the libghostty pane to
@@ -2959,42 +2962,4 @@ mod feature_flags_wire_tests;
 mod topic_and_envelope_tests;
 
 #[cfg(test)]
-mod sorted_request_variants_test {
-    /// Asserts that `FrontendRequest` variants are in alphabetical order.
-    ///
-    /// This test fails when a variant is inserted out of order. If you are
-    /// adding a new variant, insert it in the correct alphabetical position
-    /// in the enum — do NOT append it to the end.  Keeping variants sorted
-    /// spreads concurrent additions across the file and cuts merge conflicts.
-    #[test]
-    fn frontend_request_variants_are_alphabetically_sorted() {
-        let src = include_str!("wire.rs");
-        let variants: Vec<&str> = src
-            .lines()
-            .skip_while(|l| !l.contains("pub enum FrontendRequest {"))
-            .skip(1)
-            .take_while(|l| *l != "}")
-            .filter_map(|l| {
-                let t = l.trim();
-                if t.chars().next().is_some_and(|c| c.is_uppercase()) {
-                    // Extract just the variant name (up to the first
-                    // non-alphanumeric character: space, `{`, or `,`).
-                    t.split_once(|c: char| !c.is_alphanumeric())
-                        .map(|(name, _)| name)
-                        .or(Some(t))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut expected = variants.clone();
-        expected.sort_by_key(|s| s.to_ascii_lowercase());
-
-        assert_eq!(
-            variants, expected,
-            "FrontendRequest variants are not in alphabetical order. \
-             Insert new variants in sorted position (do not append to the end)."
-        );
-    }
-}
+mod sorted_request_variants_test;

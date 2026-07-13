@@ -1374,8 +1374,10 @@ async fn send_input_to_worker_unknown_run_returns_unknown_run() {
 async fn send_input_to_worker_round_trips_to_app() {
     // End-to-end smoke: engine resolves run_id → slot via the
     // worker registry, sends a SendToPane EngineRequest carrying
-    // the text payload to the registered app session, and
-    // surfaces the slot id once the app replies success.
+    // the text payload to the registered app session, waits for a
+    // `UserPromptSubmit` hook confirming the CLI actually enqueued
+    // it (not just that the app accepted the pty write), and
+    // surfaces the slot id once both land.
     let server_state = test_server_state();
     server_state.worker_registry.register_run_slot("run-send", 7);
 
@@ -1410,8 +1412,93 @@ async fn send_input_to_worker_round_trips_to_app() {
         )
         .await;
 
+    // Confirm delivery the way the worker's CLI would: fire the
+    // `UserPromptSubmit` hook that lands once it actually enqueues
+    // the injected text as the next prompt. Without this the pane
+    // write is never verified and `send_input_to_worker` falls back
+    // to the probe queue instead of returning promptly — see
+    // `send_input_to_worker_falls_back_to_probe_when_unverified`.
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some("run-send".to_owned()),
+            transcript_path: None,
+            event: crate::protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "claude-sess-1".into(),
+                prompt: "/help\n".into(),
+            },
+        },
+    )
+    .await;
+
     let slot = send.await.expect("send task").expect("send ok");
     assert_eq!(slot, 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
+    // Regression test, corrected understanding (2026-07-13): the
+    // chore-update auto-notice (routed through `send_input_to_worker`)
+    // originally looked like it silently vanished — `SendToPane`
+    // returned Ok, no WARN was logged, no `UserPromptSubmit` followed.
+    // The incident record was later corrected: the worker had in fact
+    // acted on the updated text, so the write was delivered but
+    // unverifiable, not lost. Falling back to `queue_probe` (the
+    // original fix) would hand the worker the same notice a second
+    // time at its next Stop boundary. This locks in the corrected
+    // behavior: an unconfirmed write returns Ok (the pane write did
+    // succeed) without being queued again.
+    let server_state = test_server_state();
+    server_state.worker_registry.register_run_slot("run-unverified", 3);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker("run-unverified", "[chore-update] spec changed".into())
+            .await
+    });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id,
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+
+    // The app accepts the pty write (this is exactly what happened in
+    // production) — but no `UserPromptSubmit` hook ever follows,
+    // simulating the worker being mid-turn when the write landed.
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::SendToPane {
+                result: Ok(crate::protocol::SendToPaneResult {}),
+            },
+        )
+        .await;
+
+    // Drive virtual time past the verification window so the send
+    // task's wait for a `UserPromptSubmit` confirmation times out
+    // deterministically, instead of the test blocking on real time.
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    let slot = send
+        .await
+        .expect("send task")
+        .expect("unconfirmed delivery must still return Ok — the pane write itself succeeded");
+    assert_eq!(slot, 3);
+
+    assert!(
+        server_state.pop_pending_probe("run-unverified").is_none(),
+        "unconfirmed pane write must not be re-queued as a probe — that would duplicate delivery \
+         if the worker really did consume the original write",
+    );
 }
 
 #[tokio::test]
@@ -2039,6 +2126,215 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         drain.is_err(),
         "duplicate Stop must not produce a second ProbeReplied for the same probe id",
     );
+}
+
+/// Happy path for the verified urgent-probe delivery: `SendToPane`
+/// succeeds and the worker's CLI confirms it by firing a
+/// `UserPromptSubmit` hook carrying the injected `[coordinator-nudge]`
+/// text, all within the verification window. The probe must be
+/// consumed (not left requeued) exactly as before this fix.
+#[tokio::test]
+async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit() {
+    use crate::protocol::WorkerEvent;
+
+    let server_state = test_server_state();
+    let run_id = "run-urgent-confirmed";
+    server_state.worker_registry.register_run_slot(run_id, 5);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane must be enqueued for urgent probe");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+
+    let post_tool_use = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(run_id.to_owned()),
+        transcript_path: None,
+        event: WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+    };
+    let dispatch = tokio::spawn({
+        let server_state = server_state.clone();
+        async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
+    });
+
+    app_responder.await.expect("app responder task");
+
+    // Confirm delivery the way the worker's CLI would: the marked
+    // "[coordinator-nudge] ..." text arrives as a UserPromptSubmit.
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run_id.to_owned()),
+            transcript_path: None,
+            event: WorkerEvent::UserPromptSubmit {
+                session_id: "claude-sess-1".into(),
+                prompt: "[coordinator-nudge] what now?".into(),
+            },
+        },
+    )
+    .await;
+
+    dispatch.await.expect("dispatch task");
+
+    assert!(
+        server_state.pop_pending_probe(run_id).is_none(),
+        "confirmed urgent probe must be consumed, not left queued",
+    );
+}
+
+/// Regression test for the probe-6 incident, corrected understanding
+/// (2026-07-13): an urgent probe's pane write lands while the worker
+/// is mid-turn, `SendToPane` reports success, but neither a
+/// `UserPromptSubmit` hook nor a transcript scan confirms it within
+/// the verification window. The original fix treated that as proof of
+/// loss and auto-redelivered the text at the next Stop boundary — but
+/// the corrected incident record shows the text likely *was* consumed
+/// (the worker acted on it), so auto-redelivery would have handed the
+/// worker a duplicate instruction. This asserts the corrected
+/// behavior: the probe is NOT re-queued, its lifecycle state is
+/// recorded as `Unconfirmed` (queryable rather than assumed), it is
+/// still tracked in-flight so a reply that does arrive is captured,
+/// and a `ProbeDeliveryEscalated` push tells observers delivery is
+/// unverified without implying a duplicate was sent.
+#[tokio::test(start_paused = true)]
+async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_redelivery() {
+    use crate::protocol::WorkerEvent;
+
+    let server_state = test_server_state();
+    let run_id = "run-urgent-midturn";
+    server_state.worker_registry.register_run_slot(run_id, 6);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+
+    // Observe the probe topic so we can assert the visibility push
+    // lands alongside the escalation.
+    let watch_session_id = "session-probe-watch".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .await;
+
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane must be enqueued for urgent probe");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+
+    let post_tool_use = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(run_id.to_owned()),
+        transcript_path: None,
+        event: WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+    };
+    let dispatch = tokio::spawn({
+        let server_state = server_state.clone();
+        async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
+    });
+
+    app_responder.await.expect("app responder task");
+
+    // Simulate the incident: the worker is mid-turn and never fires a
+    // UserPromptSubmit for the injected text. Drive virtual time past
+    // the verification window so the dispatch task's wait times out
+    // deterministically instead of the test blocking on real time.
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    dispatch.await.expect("dispatch task");
+
+    // The probe must NOT be re-queued — that would duplicate delivery
+    // in exactly the scenario the corrected incident record
+    // establishes actually happened.
+    assert!(
+        server_state.pop_pending_probe(run_id).is_none(),
+        "unconfirmed urgent probe must not be auto-redelivered",
+    );
+    // Its lifecycle must be observably Unconfirmed rather than silently
+    // assumed either way.
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeLifecycleState::Unconfirmed),
+        "unconfirmed delivery must be recorded, not left unknown",
+    );
+    // Still tracked as in-flight so a reply that does arrive (because
+    // the text really was consumed) is captured rather than dropped.
+    assert!(
+        server_state.take_in_flight_probe(run_id).is_some(),
+        "unconfirmed probe must still be tracked in-flight for reply capture",
+    );
+
+    let envelope = watch_sink
+        .next()
+        .await
+        .expect("ProbeDeliveryEscalated should be published on the probe topic");
+    match envelope.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            ..
+        } => {
+            assert_eq!(emitted_run, run_id);
+            assert_eq!(emitted_probe, probe_id);
+        }
+        other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
+    }
 }
 
 /// Regression: `dispatch_probe_if_idle` must deliver a probe
