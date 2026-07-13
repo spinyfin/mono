@@ -149,6 +149,9 @@ struct ContentView: View {
             model.paneInterruptHandler = { [workspace = workersWorkspace] slotId in
                 workspace.interruptWorkerPane(slotId: slotId)
             }
+            model.paneListHostedHandler = { [workspace = workersWorkspace] in
+                workspace.listHostedPanes()
+            }
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.

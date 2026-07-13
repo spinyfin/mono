@@ -196,3 +196,81 @@ pub(super) async fn handle_list_worker_live_states(ctx: Dispatch, req: FrontendR
         send_response(&sink, &request_id, FrontendEvent::WorkerLiveStatesList { states });
     }
 }
+
+pub(super) async fn handle_retire_pane(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        peer_pid,
+        ..
+    } = ctx;
+    let FrontendRequest::RetirePane { slot_id } = req else {
+        unreachable!()
+    };
+    {
+        // Break-glass admin action, same tier as `reap`: it must not be
+        // reachable from inside a worker pane subtree — a worker
+        // should never be able to retire a sibling's slot.
+        if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+            tracing::warn!(
+                peer_pid = ?peer_pid,
+                slot_id,
+                "retire_pane rejected: caller not in Boss subtree",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: "retire_pane requires Boss authority".to_owned(),
+                },
+            );
+            return;
+        }
+        match server_state.retire_pane(slot_id).await {
+            Ok(()) => {
+                tracing::info!(slot_id, "retire_pane: pane retired");
+                send_response(&sink, &request_id, FrontendEvent::PaneRetired { slot_id });
+            }
+            Err(err) => {
+                tracing::warn!(?err, slot_id, "retire_pane failed");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("retire_pane: {err}"),
+                    },
+                );
+            }
+        }
+    }
+}
+
+pub(super) async fn handle_list_husk_panes(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListHuskPanes = req else {
+        unreachable!()
+    };
+    {
+        match server_state.list_husk_panes().await {
+            Ok(panes) => {
+                send_response(&sink, &request_id, FrontendEvent::HuskPanesList { panes });
+            }
+            Err(err) => {
+                tracing::warn!(?err, "list_husk_panes failed");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("list_husk_panes: {err}"),
+                    },
+                );
+            }
+        }
+    }
+}

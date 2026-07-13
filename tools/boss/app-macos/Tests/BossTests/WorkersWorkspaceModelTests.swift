@@ -206,10 +206,15 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         let model = WorkersWorkspaceModel()
         _ = model.spawnWorkerPane(makeRequest(slot: 3, runId: "run-first"))
         let result = model.spawnWorkerPane(makeRequest(slot: 3, runId: "run-second"))
-        guard case .failure(.slotBusy) = result else {
+        guard case .failure(.slotBusy(let occupyingRunId)) = result else {
             XCTFail("expected .slotBusy when engine asks for an occupied slot, got \(result)")
             return
         }
+        XCTAssertEqual(
+            occupyingRunId,
+            "run-first",
+            "slotBusy should report the run already hosted in the slot"
+        )
     }
 
     func testSpawnRejectsOutOfRangeSlot() {

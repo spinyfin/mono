@@ -94,6 +94,37 @@ pub struct ReleaseWorkerPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseWorkerPaneResult {}
 
+/// Engine asks the app to report every slot it currently hosts a
+/// session in, regardless of whether the engine has a live-tracked
+/// run for that slot. Powers `bossctl agents list --all`: the engine
+/// diffs this report against its own `LiveWorkerStateRegistry`
+/// snapshot to surface "husk" panes — slots the app still occupies
+/// (and therefore rejects re-dispatch to with `SlotBusy`) that the
+/// engine has already forgotten about (crash, terminal-fail path bug,
+/// spawn-ack timeout). No input fields — the app reports on whatever
+/// it currently has.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListHostedPanesInput {}
+
+/// One slot the app reports as currently hosting a session. Carries
+/// only what the app itself knows — it has no opinion on whether the
+/// engine still considers the run live.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostedPaneEntry {
+    pub slot_id: u8,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
+}
+
+/// App's reply to [`EngineToAppRequest::ListHostedPanes`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListHostedPanesResult {
+    pub panes: Vec<HostedPaneEntry>,
+}
+
 /// Engine asks the app to write text into a worker pane's pty as if
 /// it were typed by the user. Used for probe-injection on `Stop`
 /// boundaries and for `bossctl agents send`.
@@ -159,6 +190,7 @@ pub enum EngineToAppRequest {
     FocusWorkerPane(FocusWorkerPaneInput),
     InterruptWorkerPane(InterruptWorkerPaneInput),
     RevealWorkItem(RevealWorkItemInput),
+    ListHostedPanes(ListHostedPanesInput),
 }
 
 /// App's reply, paired with the `request_id` from the originating
@@ -189,6 +221,9 @@ pub enum EngineToAppResponse {
     RevealWorkItem {
         result: Result<RevealWorkItemResult, EngineToAppError>,
     },
+    ListHostedPanes {
+        result: Result<ListHostedPanesResult, EngineToAppError>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,8 +242,15 @@ pub enum EngineToAppError {
     /// `SpawnWorkerPane` requested a slot the app considers already
     /// in use (a session is hosted there). Surfaces engine↔app
     /// disagreement instead of silently re-allocating; the engine
-    /// must reconcile rather than retry blindly.
-    SlotBusy,
+    /// must reconcile rather than retry blindly. `occupying_run_id`
+    /// is the run id the app has stamped on the slot (`None` only for
+    /// apps predating this field) — the engine logs it in
+    /// `dispatch.jsonl` so a `SlotBusy` spawn failure identifies which
+    /// pane is squatting the slot without coordinator archaeology.
+    SlotBusy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        occupying_run_id: Option<String>,
+    },
     /// App lost its connection to the engine before responding. The
     /// engine synthesises this on the caller's side; the app never
     /// sends it on the wire.
@@ -284,10 +326,49 @@ mod tests {
     #[test]
     fn slot_busy_error_round_trips() {
         let original = EngineToAppResponse::SpawnWorkerPane {
-            result: Err(EngineToAppError::SlotBusy),
+            result: Err(EngineToAppError::SlotBusy { occupying_run_id: None }),
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("slot_busy"));
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn slot_busy_error_carries_occupying_run_id() {
+        let original = EngineToAppResponse::SpawnWorkerPane {
+            result: Err(EngineToAppError::SlotBusy {
+                occupying_run_id: Some("run-husk".into()),
+            }),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("run-husk"));
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn list_hosted_panes_round_trips() {
+        let original = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("list_hosted_panes"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn list_hosted_panes_response_round_trips() {
+        let original = EngineToAppResponse::ListHostedPanes {
+            result: Ok(ListHostedPanesResult {
+                panes: vec![HostedPaneEntry {
+                    slot_id: 4,
+                    run_id: "run-husk".into(),
+                    summary: Some("fixing the fencer scraper".into()),
+                    task_title: None,
+                }],
+            }),
+        };
+        let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }

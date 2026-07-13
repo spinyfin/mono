@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use boss_protocol::{ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus};
+use boss_protocol::{
+    EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus,
+};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -21,6 +23,7 @@ use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
+use crate::spawn_flow::StartWorkerError;
 use crate::work::{
     CreateAttentionItemInput, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome, WorkDb, WorkExecution,
     WorkItem, WorkRun,
@@ -916,6 +919,26 @@ pub fn worker_id_for_slot(slot_id: u8) -> String {
             REVIEW_WORKER_ID_PREFIX,
             slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE
         )
+    }
+}
+
+/// If `err` is (transitively) a `SlotBusy` app-error from the spawn
+/// flow, return the run id the app reported as occupying the slot
+/// (`None` for apps predating the field, `Some` otherwise). Used by
+/// [`ExecutionCoordinator::run_execution`]'s pane-spawn-failure branch
+/// to enrich the `dispatch.jsonl` entry with which pane caused the
+/// rejection.
+///
+/// `err` arrives `.with_context(...)`-wrapped by the spawn flow, so
+/// the concrete `StartWorkerError` is not the outermost type — this
+/// walks the anyhow source chain rather than downcasting `err`
+/// directly, which would only ever match the context wrapper.
+fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
+    match err.chain().find_map(|cause| cause.downcast_ref::<StartWorkerError>()) {
+        Some(StartWorkerError::AppError(EngineToAppError::SlotBusy { occupying_run_id })) => {
+            Some(occupying_run_id.clone())
+        }
+        _ => None,
     }
 }
 
@@ -4545,6 +4568,24 @@ impl ExecutionCoordinator {
                             released_workspace = released,
                             "execution run failed"
                         );
+                        let mut error_details = serde_json::json!({
+                            "run_id": run.id,
+                            "released_workspace": released,
+                        });
+                        // A `SlotBusy` spawn rejection means the engine and
+                        // the app disagree about slot occupancy — the
+                        // engine already knew which slot it requested
+                        // (`worker_id` above), but not which pane the app
+                        // reports as squatting it. Surface both explicitly
+                        // so `dispatch.jsonl` is self-diagnosing instead of
+                        // requiring a coordinator to cross-reference the
+                        // husk pane by hand.
+                        if let Some(occupying_run_id) = slot_busy_occupant(&err) {
+                            error_details["slot_busy"] = serde_json::json!({
+                                "slot_id": slot_id_from_worker_id(&worker_id),
+                                "occupying_run_id": occupying_run_id,
+                            });
+                        }
                         self.dispatch_events
                             .emit(
                                 DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
@@ -4553,10 +4594,7 @@ impl ExecutionCoordinator {
                                     .with_cube_lease(&lease.lease_id)
                                     .with_cube_workspace(&lease.workspace_id)
                                     .with_error(&err)
-                                    .with_details(serde_json::json!({
-                                        "run_id": run.id,
-                                        "released_workspace": released,
-                                    })),
+                                    .with_details(error_details),
                             )
                             .await;
                         // Clear the card out of `active`. The run is
@@ -5148,10 +5186,11 @@ mod tests {
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
         EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter, HostAdapterProvider,
         MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool,
-        occupying_live_worker, pick_worst_failing_check, pool_model_override_for_worker_id, slot_id_from_worker_id,
-        worker_id_for_slot,
+        occupying_live_worker, pick_worst_failing_check, pool_model_override_for_worker_id, slot_busy_occupant,
+        slot_id_from_worker_id, worker_id_for_slot,
     };
-    use boss_protocol::ExecutionStatus;
+    use crate::spawn_flow::StartWorkerError;
+    use boss_protocol::{EngineToAppError, ExecutionStatus};
 
     /// Lease-time occupancy guard (defect 3, regression test c). The
     /// pure decision: a workspace is "occupied" only by a tracked worker
@@ -8130,6 +8169,45 @@ mod tests {
                 "slot {slot} must produce an automation-pool worker_id, got {back:?}"
             );
         }
+    }
+
+    #[test]
+    fn slot_busy_occupant_walks_the_with_context_wrapped_chain() {
+        // The spawn flow always wraps `StartWorkerError` with
+        // `.with_context(...)` before it reaches the coordinator (see
+        // `runner.rs`'s `spawning worker pane for run {}` wrapper), so
+        // a naive `err.downcast_ref::<StartWorkerError>()` on the
+        // outermost error would never match. This pins the chain-walk
+        // that makes extraction work anyway.
+        let root = StartWorkerError::AppError(EngineToAppError::SlotBusy {
+            occupying_run_id: Some("run-husk".to_owned()),
+        });
+        let wrapped: anyhow::Error = anyhow::Error::new(root).context("spawning worker pane for run exec-1");
+        assert_eq!(slot_busy_occupant(&wrapped), Some(Some("run-husk".to_owned())));
+    }
+
+    #[test]
+    fn slot_busy_occupant_handles_missing_occupying_run_id() {
+        // Older apps predating the field send `SlotBusy` with no
+        // payload — must decode as `Some(None)` (the error IS
+        // SlotBusy, but the occupant is unknown), not `None`
+        // (not-a-SlotBusy-error at all).
+        let root = StartWorkerError::AppError(EngineToAppError::SlotBusy { occupying_run_id: None });
+        let wrapped: anyhow::Error = anyhow::Error::new(root).context("spawning worker pane for run exec-2");
+        assert_eq!(slot_busy_occupant(&wrapped), Some(None));
+    }
+
+    #[test]
+    fn slot_busy_occupant_is_none_for_other_start_worker_errors() {
+        let root = StartWorkerError::AppError(EngineToAppError::NoAvailableSlot);
+        let wrapped: anyhow::Error = anyhow::Error::new(root).context("spawning worker pane for run exec-3");
+        assert_eq!(slot_busy_occupant(&wrapped), None);
+    }
+
+    #[test]
+    fn slot_busy_occupant_is_none_for_unrelated_errors() {
+        let wrapped = anyhow::anyhow!("workspace lease failed");
+        assert_eq!(slot_busy_occupant(&wrapped), None);
     }
 
     #[test]

@@ -30,10 +30,11 @@ use crate::merge_poller::{CommandMergeProbe, MergeProbe, PrReconcilerTargetedKic
 use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
-    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, InterruptWorkerPaneInput,
-    OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
-    TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload,
-    comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, HostedPaneEntry,
+    InterruptWorkerPaneInput, ListHostedPanesInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
+    RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic,
+    work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -64,6 +65,7 @@ pub(crate) mod handler_helpers;
 mod hosts;
 mod live_status;
 mod metrics;
+mod pane_ops;
 mod panes;
 mod planner_ops;
 mod products;
@@ -85,6 +87,13 @@ use server::{
     constant_time_eq, is_descendant_of_any, reap_worker_process_tree, register_app_session_trust_ok,
     resolve_status_actor, signal_shell_pids,
 };
+
+// Re-import pane-op error types so the `tests` child module can access them via `use super::*`.
+// Only the test module references these by name; production code calls the
+// `ServerState` methods and matches on the returned error with `{err}`/`{err:?}`,
+// never the concrete type — so this import is dead outside `#[cfg(test)]`.
+#[cfg(test)]
+use pane_ops::{FocusPaneError, InterruptPaneError, RetirePaneError, SendInputError};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{
@@ -776,70 +785,6 @@ pub enum SendToAppError {
     ResponseKindMismatch(&'static str),
 }
 
-/// Surfaced by [`ServerState::focus_worker_pane`]. Distinguishes
-/// engine-side resolution failures (run id has no allocated slot)
-/// from transport/app failures so the `bossctl` handler can produce
-/// a precise error message.
-#[derive(Debug, thiserror::Error)]
-pub enum FocusPaneError {
-    #[error("no worker pane mapped for that run id")]
-    UnknownRun,
-    #[error("app reported error: {0:?}")]
-    App(EngineToAppError),
-    #[error(transparent)]
-    Send(#[from] SendToAppError),
-    #[error("app returned unexpected response: {0}")]
-    ResponseKindMismatch(String),
-}
-
-/// Surfaced by [`ServerState::send_input_to_worker`]. Same shape as
-/// [`FocusPaneError`]: separates "no slot mapping for that run id"
-/// from app-side / transport failures so `bossctl agents send` can
-/// produce a precise error message.
-#[derive(Debug, thiserror::Error)]
-pub enum SendInputError {
-    #[error("no worker pane mapped for that run id")]
-    UnknownRun,
-    #[error("app reported error: {0:?}")]
-    App(EngineToAppError),
-    #[error(transparent)]
-    Send(#[from] SendToAppError),
-    #[error("app returned unexpected response: {0}")]
-    ResponseKindMismatch(String),
-}
-
-/// Surfaced by [`ServerState::interrupt_worker_pane`]. Mirrors
-/// [`FocusPaneError`] — the same error tiers apply (resolution miss,
-/// app failure, transport, response shape).
-#[derive(Debug, thiserror::Error)]
-pub enum InterruptPaneError {
-    #[error("no worker pane mapped for that run id")]
-    UnknownRun,
-    #[error("app reported error: {0:?}")]
-    App(EngineToAppError),
-    #[error(transparent)]
-    Send(#[from] SendToAppError),
-    #[error("app returned unexpected response: {0}")]
-    ResponseKindMismatch(String),
-}
-
-/// Surfaced by [`ServerState::reveal_work_item`]. Separates
-/// id-resolution failures from app-side / transport failures so
-/// `bossctl reveal` can produce a precise error.
-#[derive(Debug, thiserror::Error)]
-pub enum RevealItemError {
-    #[error("no work item found for id: {0}")]
-    NotFound(String),
-    #[error("work item {0} is deleted")]
-    Deleted(String),
-    #[error("app reported error: {0:?}")]
-    App(EngineToAppError),
-    #[error(transparent)]
-    Send(#[from] SendToAppError),
-    #[error("app returned unexpected response: {0}")]
-    ResponseKindMismatch(String),
-}
-
 impl ServerState {
     fn new_arc_with_app_pid(
         cfg: Arc<RuntimeConfig>,
@@ -1512,95 +1457,6 @@ impl ServerState {
             .filter_map(|s| (s.shell_pid > 0).then_some(s.shell_pid as libc::pid_t))
             .collect();
         signal_shell_pids(&pids, kill_grace);
-    }
-
-    /// Resolve `run_id → slot_id` and ask the app to bring that
-    /// worker pane to the front. Returns the resolved slot on success
-    /// so callers (`bossctl agents focus`) can confirm in JSON output
-    /// which slot was raised.
-    pub async fn focus_worker_pane(&self, run_id: &str) -> Result<u8, FocusPaneError> {
-        let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
-            return Err(FocusPaneError::UnknownRun);
-        };
-        let request = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::FocusWorkerPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::FocusWorkerPane { result: Err(err) }) => Err(FocusPaneError::App(err)),
-            Ok(other) => Err(FocusPaneError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(FocusPaneError::Send(err)),
-        }
-    }
-
-    /// Resolve `run_id → slot_id` and ask the app to write `text`
-    /// into that worker pane as if the user had typed it. Returns the
-    /// resolved slot on success so `bossctl agents send` can echo back
-    /// which pane was targeted (useful when the agent reference was a
-    /// crew name). Mirrors [`focus_worker_pane`] in shape; the only
-    /// behavioural difference is the engine→app request kind.
-    pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
-        let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
-            return Err(SendInputError::UnknownRun);
-        };
-        let request = EngineToAppRequest::SendToPane(SendToPaneInput { slot_id, text });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(SendInputError::App(err)),
-            Ok(other) => Err(SendInputError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(SendInputError::Send(err)),
-        }
-    }
-
-    /// Resolve `run_id → slot_id` and ask the app to deliver an Esc
-    /// keystroke to that worker pane's pty — equivalent to the human
-    /// pressing Esc with the pane focused. The worker run stays
-    /// alive; only the in-flight turn is cancelled. Returns the
-    /// resolved slot on success so callers (`bossctl agents
-    /// interrupt`) can confirm in JSON output which slot received
-    /// the interrupt.
-    pub async fn interrupt_worker_pane(&self, run_id: &str) -> Result<u8, InterruptPaneError> {
-        let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
-            return Err(InterruptPaneError::UnknownRun);
-        };
-        let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => Err(InterruptPaneError::App(err)),
-            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(InterruptPaneError::Send(err)),
-        }
-    }
-
-    /// Resolve `id` (short-form `T607` or canonical) to a work item
-    /// and ask the app to scroll the kanban to that card and play a
-    /// short transient highlight. Returns the canonical id on success
-    /// so `bossctl reveal` can confirm what was highlighted.
-    pub async fn reveal_work_item(&self, id: &str) -> Result<String, RevealItemError> {
-        let item = self
-            .work_db
-            .get_work_item_resolving_short_id(id)
-            .map_err(|_| RevealItemError::NotFound(id.to_owned()))?
-            .ok_or_else(|| RevealItemError::NotFound(id.to_owned()))?;
-        let canonical_id = match &item {
-            crate::work::WorkItem::Task(t) | crate::work::WorkItem::Chore(t) => {
-                if t.deleted_at.is_some() {
-                    return Err(RevealItemError::Deleted(id.to_owned()));
-                }
-                t.id.clone()
-            }
-            crate::work::WorkItem::Project(p) => p.id.clone(),
-            crate::work::WorkItem::Product(p) => p.id.clone(),
-        };
-        let product_id = work_item_product_id(&item);
-        let request = EngineToAppRequest::RevealWorkItem(RevealWorkItemInput {
-            work_item_id: canonical_id.clone(),
-            product_id,
-        });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::RevealWorkItem { result: Ok(_) }) => Ok(canonical_id),
-            Ok(EngineToAppResponse::RevealWorkItem { result: Err(err) }) => Err(RevealItemError::App(err)),
-            Ok(other) => Err(RevealItemError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(RevealItemError::Send(err)),
-        }
     }
 
     /// Register `session_id` as the app session, atomically replacing any
@@ -2835,6 +2691,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListExecutions { .. } => executions::handle_list_executions(ctx, r).await,
             r @ FrontendRequest::ListFeatureFlags => engine_meta::handle_list_feature_flags(ctx, r).await,
             r @ FrontendRequest::ListHosts => hosts::handle_list_hosts(ctx, r).await,
+            r @ FrontendRequest::ListHuskPanes => panes::handle_list_husk_panes(ctx, r).await,
             r @ FrontendRequest::ListLiveStatusDisabledSlots => {
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }
@@ -2886,6 +2743,7 @@ async fn handle_frontend_connection(
                 projects::handle_resolve_project_design_doc(ctx, r).await
             }
             r @ FrontendRequest::RestoreWorkItem { .. } => work_items::handle_restore_work_item(ctx, r).await,
+            r @ FrontendRequest::RetirePane { .. } => panes::handle_retire_pane(ctx, r).await,
             r @ FrontendRequest::RetryCiRemediation { .. } => ci_remediation::handle_retry_ci_remediation(ctx, r).await,
             r @ FrontendRequest::RetryConflictResolution { .. } => {
                 conflict_resolution::handle_retry_conflict_resolution(ctx, r).await
