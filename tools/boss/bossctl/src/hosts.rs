@@ -6,12 +6,7 @@ use anyhow::{Context, Result};
 use boss_engine::host_registry::{Host, HostCapability};
 use boss_engine::work::WorkDb;
 
-use crate::resolve_db_path;
-
-fn open_hosts_db(state_root: Option<PathBuf>) -> Result<WorkDb> {
-    let db_path = resolve_db_path(state_root)?;
-    WorkDb::open(db_path).context("opening state.db for hosts")
-}
+use crate::open_state_db;
 
 pub(crate) async fn hosts_add(
     json: bool,
@@ -22,7 +17,7 @@ pub(crate) async fn hosts_add(
     tags: Vec<String>,
     skip_wrapper_push: bool,
 ) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     let host = db.add_host(&id, &ssh_target, pool_size, &tags)?;
 
     // Phase 3: eagerly push the wrapper unless suppressed. A push
@@ -160,7 +155,7 @@ async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> Eag
 }
 
 pub(crate) fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: bool) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     let mut hosts = db.list_hosts()?;
     if only_enabled {
         hosts.retain(|h| h.enabled);
@@ -186,7 +181,7 @@ pub(crate) fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: 
 }
 
 pub(crate) fn hosts_show(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     match db.get_host(&id)? {
         None => {
             if json {
@@ -208,7 +203,7 @@ pub(crate) fn hosts_show(json: bool, state_root: Option<PathBuf>, id: String) ->
 }
 
 pub(crate) fn hosts_tag_add(json: bool, state_root: Option<PathBuf>, id: String, tags: Vec<String>) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     for tag in &tags {
         db.add_user_host_capability(&id, tag)?;
     }
@@ -224,7 +219,7 @@ pub(crate) fn hosts_tag_add(json: bool, state_root: Option<PathBuf>, id: String,
 }
 
 pub(crate) fn hosts_tag_remove(json: bool, state_root: Option<PathBuf>, id: String, tags: Vec<String>) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     for tag in &tags {
         db.remove_user_host_capability(&id, tag)?;
     }
@@ -240,7 +235,7 @@ pub(crate) fn hosts_tag_remove(json: bool, state_root: Option<PathBuf>, id: Stri
 }
 
 pub(crate) fn hosts_set_enabled(json: bool, state_root: Option<PathBuf>, id: String, enabled: bool) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     db.set_host_enabled(&id, enabled)?;
     let host = db.get_host(&id)?.context("host disappeared after enable/disable")?;
     let caps = db.list_host_capabilities(&host.id)?;
@@ -254,7 +249,7 @@ pub(crate) fn hosts_set_enabled(json: bool, state_root: Option<PathBuf>, id: Str
 }
 
 pub(crate) fn hosts_remove(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
-    let db = open_hosts_db(state_root)?;
+    let db = open_state_db(state_root)?;
     db.remove_host(&id)?;
     if json {
         println!("{}", serde_json::json!({ "status": "removed", "id": id }));

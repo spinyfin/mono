@@ -1290,6 +1290,15 @@ pub(crate) fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
 }
 
+/// Resolve `state.db`'s path via [`resolve_db_path`] and open it. This bundles
+/// the `resolve_db_path` + [`WorkDb::open`] pair that every direct-DB command
+/// (`comments`, `work executions`, `executions prune`, `hosts`, …) repeats,
+/// attaching the standard `"opening state.db"` context on failure.
+pub(crate) fn open_state_db(state_root: Option<PathBuf>) -> Result<WorkDb> {
+    let db_path = resolve_db_path(state_root)?;
+    WorkDb::open(db_path).context("opening state.db")
+}
+
 /// `bossctl executions prune` — on-demand retention cleanup of terminal
 /// `work_executions` rows. Opens `state.db` directly via [`resolve_db_path`]
 /// (same resolution `metrics`/`hosts` use), so it is always scoped to this
@@ -1301,8 +1310,7 @@ fn executions_prune(
     keep_per_work_item: u32,
     dry_run: bool,
 ) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = open_state_db(state_root)?;
     let policy = boss_engine::work::ExecutionRetentionPolicy {
         max_age_secs: older_than_days.saturating_mul(24 * 60 * 60),
         keep_per_work_item,
@@ -1341,8 +1349,7 @@ fn executions_prune(
 /// directly via [`resolve_db_path`] (same resolution `metrics`/`hosts`
 /// use), so it works even when the engine is wedged.
 fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = open_state_db(state_root)?;
     let executions = db.list_executions(Some(work_item_id)).context("listing executions")?;
     let host_ids = db
         .execution_host_ids_for_item(work_item_id)
