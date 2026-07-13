@@ -844,6 +844,22 @@ pub async fn serve(
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );
 
+    // Runtime envelope watchdog: signals (does NOT interrupt) a live
+    // execution whose wall-clock has blown past the duration envelope its
+    // effort class implies — the safety net beneath the planner
+    // decomposition gate and the design-brief sizing contract for
+    // under-decomposed rows that slip past both. Files one operator-visible
+    // `envelope_overrun` attention item per execution and logs an
+    // `envelope-calibration` line for tuning. Per-effort thresholds are
+    // configurable via `BOSS_ENVELOPE_{TRIVIAL,SMALL,MEDIUM,LARGE}_SECS`.
+    // Runs every 60s and fires on boot.
+    let _envelope_watch_handle = crate::envelope_watch::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        crate::envelope_watch::EnvelopeThresholds::from_env(|k| std::env::var_os(k)),
+        Duration::from_secs(60),
+    );
+
     // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
     // that never reported a shell pid AND never received a single hook
     // event — proof no worker process ever came up at all, distinct from
