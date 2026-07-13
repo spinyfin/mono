@@ -166,6 +166,20 @@ pub async fn pr_merge_queue_entry(pr_url: &str) -> Option<MergeQueueEntry> {
         return None;
     }
     let body: Value = serde_json::from_slice(&out.stdout).ok()?;
+    parse_merge_queue_entry(&body)
+}
+
+/// Map a GraphQL response `body` into an optional [`MergeQueueEntry`].
+///
+/// A null (or absent) `data.repository.pullRequest.mergeQueueEntry` node yields
+/// `None` (the PR is not queued). A non-null node yields `Some`, degrading
+/// gracefully over a partial response: a missing `position` or `enqueuedAt`
+/// becomes a `None` sub-field rather than dropping the whole entry, and a
+/// missing/non-string `state` defaults to the empty string.
+///
+/// Kept as a pure `Value -> Option<MergeQueueEntry>` function so the mapping is
+/// testable without spawning the `gh` CLI.
+fn parse_merge_queue_entry(body: &Value) -> Option<MergeQueueEntry> {
     let node = &body["data"]["repository"]["pullRequest"]["mergeQueueEntry"];
     if node.is_null() {
         return None;
@@ -405,5 +419,87 @@ mod tests {
         let err = gh_status_error(&failed_output("\ncould not connect to host\n"));
         assert_eq!(err.http_status, Some(0));
         assert_eq!(err.message, "could not connect to host");
+    }
+
+    /// Wrap a `mergeQueueEntry` value in the GraphQL response envelope
+    /// (`data.repository.pullRequest.mergeQueueEntry`) that
+    /// [`parse_merge_queue_entry`] navigates.
+    fn graphql_body(merge_queue_entry: serde_json::Value) -> Value {
+        serde_json::json!({
+            "data": { "repository": { "pullRequest": { "mergeQueueEntry": merge_queue_entry } } }
+        })
+    }
+
+    #[test]
+    fn parses_fully_populated_queued_entry() {
+        let body = graphql_body(serde_json::json!({
+            "state": "QUEUED",
+            "position": 3,
+            "enqueuedAt": "2026-07-14T12:00:00Z",
+        }));
+        assert_eq!(
+            parse_merge_queue_entry(&body),
+            Some(MergeQueueEntry {
+                state: "QUEUED".to_owned(),
+                position: Some(3),
+                enqueued_at: Some("2026-07-14T12:00:00Z".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn null_merge_queue_entry_yields_none() {
+        // A PR that isn't in the queue reports a null node => not queued.
+        let body = graphql_body(serde_json::Value::Null);
+        assert_eq!(parse_merge_queue_entry(&body), None);
+    }
+
+    #[test]
+    fn partial_entry_retains_state_with_none_subfields() {
+        // A partial response (position/enqueuedAt absent) must degrade
+        // gracefully: keep the entry, leave the missing sub-fields None,
+        // rather than dropping the whole entry.
+        let body = graphql_body(serde_json::json!({ "state": "AWAITING_CHECKS" }));
+        assert_eq!(
+            parse_merge_queue_entry(&body),
+            Some(MergeQueueEntry {
+                state: "AWAITING_CHECKS".to_owned(),
+                position: None,
+                enqueued_at: None,
+            })
+        );
+    }
+
+    #[test]
+    fn partial_entry_missing_only_position_keeps_enqueued_at() {
+        // Missing sub-fields are independent: an absent position must not drop
+        // a present enqueuedAt.
+        let body = graphql_body(serde_json::json!({
+            "state": "MERGEABLE",
+            "enqueuedAt": "2026-07-14T09:30:00Z",
+        }));
+        assert_eq!(
+            parse_merge_queue_entry(&body),
+            Some(MergeQueueEntry {
+                state: "MERGEABLE".to_owned(),
+                position: None,
+                enqueued_at: Some("2026-07-14T09:30:00Z".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_state_defaults_to_empty_string() {
+        // A non-null entry with no `state` string keeps the entry and defaults
+        // `state` to "" per current behavior.
+        let body = graphql_body(serde_json::json!({ "position": 1 }));
+        assert_eq!(
+            parse_merge_queue_entry(&body),
+            Some(MergeQueueEntry {
+                state: String::new(),
+                position: Some(1),
+                enqueued_at: None,
+            })
+        );
     }
 }
