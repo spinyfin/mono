@@ -115,18 +115,41 @@ impl ServerState {
     /// into that worker pane as if the user had typed it. Returns the
     /// resolved slot on success so `bossctl agents send` can echo back
     /// which pane was targeted (useful when the agent reference was a
-    /// crew name). Mirrors [`focus_worker_pane`] in shape; the only
-    /// behavioural difference is the engine→app request kind.
+    /// crew name). Mirrors [`focus_worker_pane`] in shape, but this
+    /// call can land at any point in the worker's turn — including
+    /// mid-tool-call — so unlike a plain `SendToPane` it verifies the
+    /// write actually became a queued prompt (see
+    /// `inject_pane_text_verified`). This is the chore-update
+    /// auto-notice path that failed identically to the probe-6
+    /// incident in production: `SendToPane` returned Ok, no WARN was
+    /// logged, and the notice never reached the worker. On an
+    /// unverified write, fall back to `queue_probe` so the text still
+    /// lands reliably at the worker's next `Stop` boundary instead of
+    /// evaporating silently.
     pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
         };
-        let request = EngineToAppRequest::SendToPane(SendToPaneInput { slot_id, text });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(SendInputError::App(err)),
-            Ok(other) => Err(SendInputError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(SendInputError::Send(err)),
+        match self
+            .inject_pane_text_verified(run_id, slot_id, text.clone(), Duration::from_secs(6))
+            .await
+        {
+            PaneInjectOutcome::Confirmed => Ok(slot_id),
+            PaneInjectOutcome::Unverified => {
+                tracing::warn!(
+                    run_id,
+                    slot_id,
+                    "send_input_to_worker: pane write unverified (no UserPromptSubmit observed within \
+                     the window); falling back to Stop-boundary probe delivery instead of dropping the text",
+                );
+                let _ = self.queue_probe(run_id.to_owned(), text, false);
+                Ok(slot_id)
+            }
+            PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(msg)) => {
+                Err(SendInputError::ResponseKindMismatch(msg))
+            }
         }
     }
 

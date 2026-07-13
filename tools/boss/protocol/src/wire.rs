@@ -1033,25 +1033,20 @@ pub enum FrontendRequest {
     },
 
     /// Worker → engine, *validated* terminal signal: "there is no CI
-    /// to fix — the PR's required checks are already green." The CLI
-    /// surface is `boss engine ci mark-noop --attempt-id <cir_…>
-    /// [--observed-sha <sha>] [--reason <r>]`. Unlike the other
-    /// `Mark*` verbs, the engine does NOT take the worker's word for
-    /// it: it independently re-probes LIVE CI for the PR's CURRENT
-    /// head SHA (the same `gh pr view … statusCheckRollup` source the
-    /// merge-poller uses) and only honors the claim when every
-    /// required check is verified passing on that exact SHA. On a
-    /// verified-green probe it retires the attempt and unblocks the
-    /// parent ([`FrontendEvent::CiRemediationNoopValidated`]); on a
-    /// red/pending probe (or a SHA that moved) it rejects and keeps
-    /// the row actionable ([`FrontendEvent::CiRemediationNoopRejected`]),
-    /// so a worker cannot escape a real failure.
+    /// to fix — the PR's required checks are already green." CLI:
+    /// `boss engine ci mark-noop --attempt-id <cir_…> [--observed-sha
+    /// <sha>] [--reason <r>]`. Unlike other `Mark*` verbs, the engine
+    /// does NOT take the worker's word: it re-probes LIVE CI for the
+    /// PR's CURRENT head SHA (the merge-poller's `gh pr view …
+    /// statusCheckRollup` source) and only honors the claim when
+    /// every required check is verified passing on that exact SHA.
+    /// Verified-green retires the attempt and unblocks the parent
+    /// ([`FrontendEvent::CiRemediationNoopValidated`]); red/pending
+    /// (or a moved SHA) rejects and keeps the row actionable
+    /// ([`FrontendEvent::CiRemediationNoopRejected`]).
     ///
-    /// `observed_sha` is the head SHA the worker saw when it decided
-    /// CI was green; it is advisory. The verdict is always re-derived
-    /// from the live head SHA, so a claim about a stale commit is
-    /// re-validated against the new head, never honored blindly.
-    /// `reason` is a free-form note (defaults to `already_green`).
+    /// `observed_sha` is advisory only — the verdict always re-derives
+    /// from the live head SHA. `reason` is free-form (default `already_green`).
     MarkCiRemediationNoop {
         attempt_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2005,6 +2000,14 @@ pub enum FrontendEvent {
         run_id: String,
         probe_id: String,
         text: String,
+    },
+    /// Push: an urgent probe write was unconfirmed (no `UserPromptSubmit`
+    /// within the window) and got re-queued for the next `Stop` boundary.
+    /// Pushed on [`probe_topic`] for `run_id`.
+    ProbeDeliveryEscalated {
+        run_id: String,
+        probe_id: String,
+        reason: String,
     },
     /// Engine acknowledges a stop request — the pane release has
     /// been kicked off and (if applicable) the cube workspace lease

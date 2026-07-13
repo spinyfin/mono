@@ -65,6 +65,7 @@ pub(crate) mod handler_helpers;
 mod hosts;
 mod live_status;
 mod metrics;
+mod pane_delivery;
 mod pane_ops;
 mod panes;
 mod planner_ops;
@@ -100,6 +101,9 @@ use worker_events::{
     dispatch_completion_on_stop, dispatch_editorial_on_pretooluse, dispatch_live_worker_state, dispatch_probe_if_idle,
     dispatch_probe_on_stop, dispatch_probe_reply_on_stop, dispatch_urgent_probe_on_post_tool_use,
 };
+
+// Re-import verified pane-injection types so child modules can access them via `use super::*`.
+use pane_delivery::{PaneInjectOutcome, PaneSendFailure};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
@@ -552,6 +556,20 @@ struct ServerState {
     /// offset captured at dispatch time bounds the read, so we don't
     /// re-emit text that pre-dated the probe.
     in_flight_probes: StdMutex<HashMap<String, InFlightProbe>>,
+    /// One-shot waiters for the next `UserPromptSubmit` hook on a
+    /// run, keyed by `run_id`. `inject_pane_text_verified` registers
+    /// a waiter immediately before writing text into a pane so it
+    /// can confirm the worker's CLI actually enqueued the write as a
+    /// prompt, rather than trusting the pty write alone — the gap
+    /// that let an urgent probe (and a chore-update notice) silently
+    /// evaporate mid-turn in production while the engine logged
+    /// "injected". `dispatch_live_worker_state` resolves the waiter
+    /// for a run whenever a `UserPromptSubmit` hook arrives for it.
+    /// Registering overwrites (and drops) any waiter already present
+    /// for the run — callers only inject one unconfirmed write per
+    /// run at a time, matching the `in_flight_probes` invariant.
+    #[builder(default)]
+    delivery_waiters: StdMutex<HashMap<String, oneshot::Sender<String>>>,
     /// Monotonic counter used to mint probe ids (`probe-{n}`). Probe
     /// ids only need to be unique for the lifetime of one engine
     /// process — they correlate a `ProbeRun` request with its

@@ -1374,8 +1374,10 @@ async fn send_input_to_worker_unknown_run_returns_unknown_run() {
 async fn send_input_to_worker_round_trips_to_app() {
     // End-to-end smoke: engine resolves run_id → slot via the
     // worker registry, sends a SendToPane EngineRequest carrying
-    // the text payload to the registered app session, and
-    // surfaces the slot id once the app replies success.
+    // the text payload to the registered app session, waits for a
+    // `UserPromptSubmit` hook confirming the CLI actually enqueued
+    // it (not just that the app accepted the pty write), and
+    // surfaces the slot id once both land.
     let server_state = test_server_state();
     server_state.worker_registry.register_run_slot("run-send", 7);
 
@@ -1410,8 +1412,95 @@ async fn send_input_to_worker_round_trips_to_app() {
         )
         .await;
 
+    // Confirm delivery the way the worker's CLI would: fire the
+    // `UserPromptSubmit` hook that lands once it actually enqueues
+    // the injected text as the next prompt. Without this the pane
+    // write is never verified and `send_input_to_worker` falls back
+    // to the probe queue instead of returning promptly — see
+    // `send_input_to_worker_falls_back_to_probe_when_unverified`.
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some("run-send".to_owned()),
+            transcript_path: None,
+            event: crate::protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "claude-sess-1".into(),
+                prompt: "/help\n".into(),
+            },
+        },
+    )
+    .await;
+
     let slot = send.await.expect("send task").expect("send ok");
     assert_eq!(slot, 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_input_to_worker_falls_back_to_probe_when_unverified() {
+    // Regression test for the incident where the chore-update
+    // auto-notice (routed through `send_input_to_worker`) silently
+    // vanished: `SendToPane` returned Ok, no WARN was logged, and the
+    // worker never received the text — because it never became a
+    // queued prompt. This locks in the fix: when no `UserPromptSubmit`
+    // confirms the write within the verification window, the engine
+    // must not treat "bytes reached the pane" as delivery. It falls
+    // back to the same `pending_probes` queue `dispatch_probe_on_stop`
+    // drains reliably at the worker's next Stop boundary, instead of
+    // losing the text.
+    let server_state = test_server_state();
+    server_state.worker_registry.register_run_slot("run-unverified", 3);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker("run-unverified", "[chore-update] spec changed".into())
+            .await
+    });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id,
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+
+    // The app accepts the pty write (this is exactly what happened in
+    // production) — but no `UserPromptSubmit` hook ever follows,
+    // simulating the worker being mid-turn when the write landed.
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::SendToPane {
+                result: Ok(crate::protocol::SendToPaneResult {}),
+            },
+        )
+        .await;
+
+    // Drive virtual time past the verification window so the send
+    // task's wait for a `UserPromptSubmit` confirmation times out
+    // deterministically, instead of the test blocking on real time.
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    let slot = send
+        .await
+        .expect("send task")
+        .expect("unverified delivery must still return Ok via the probe fallback, not drop the text");
+    assert_eq!(slot, 3);
+
+    let queued = server_state
+        .pop_pending_probe("run-unverified")
+        .expect("unverified pane write must fall back to a queued probe instead of vanishing");
+    assert_eq!(queued.text, "[chore-update] spec changed");
+    assert!(
+        !queued.urgent,
+        "fallback delivery goes through the reliable Stop-boundary path, not another urgent write",
+    );
 }
 
 #[tokio::test]
@@ -2039,6 +2128,203 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         drain.is_err(),
         "duplicate Stop must not produce a second ProbeReplied for the same probe id",
     );
+}
+
+/// Happy path for the verified urgent-probe delivery: `SendToPane`
+/// succeeds and the worker's CLI confirms it by firing a
+/// `UserPromptSubmit` hook carrying the injected `[coordinator-nudge]`
+/// text, all within the verification window. The probe must be
+/// consumed (not left requeued) exactly as before this fix.
+#[tokio::test]
+async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit() {
+    use crate::protocol::WorkerEvent;
+
+    let server_state = test_server_state();
+    let run_id = "run-urgent-confirmed";
+    server_state.worker_registry.register_run_slot(run_id, 5);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane must be enqueued for urgent probe");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+
+    let post_tool_use = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(run_id.to_owned()),
+        transcript_path: None,
+        event: WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+    };
+    let dispatch = tokio::spawn({
+        let server_state = server_state.clone();
+        async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
+    });
+
+    app_responder.await.expect("app responder task");
+
+    // Confirm delivery the way the worker's CLI would: the marked
+    // "[coordinator-nudge] ..." text arrives as a UserPromptSubmit.
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run_id.to_owned()),
+            transcript_path: None,
+            event: WorkerEvent::UserPromptSubmit {
+                session_id: "claude-sess-1".into(),
+                prompt: "[coordinator-nudge] what now?".into(),
+            },
+        },
+    )
+    .await;
+
+    dispatch.await.expect("dispatch task");
+
+    assert!(
+        server_state.pop_pending_probe(run_id).is_none(),
+        "confirmed urgent probe must be consumed, not left queued",
+    );
+}
+
+/// Regression test for the probe-6 incident: an urgent probe's pane
+/// write lands while the worker is mid-turn, `SendToPane` reports
+/// success, but the CLI never enqueues it — no `UserPromptSubmit`
+/// hook ever follows. Before this fix the engine logged "injected"
+/// and moved on, and the text was gone forever (the worker ran on the
+/// stale spec for 20+ minutes). This asserts the failure is detected
+/// (not assumed delivered) and the probe is escalated to the reliable
+/// Stop-boundary path rather than silently dropped, with a
+/// `ProbeDeliveryEscalated` push so observers don't mistake the
+/// earlier "injected" log line for proof of delivery.
+#[tokio::test(start_paused = true)]
+async fn dispatch_urgent_probe_on_post_tool_use_escalates_when_unconfirmed() {
+    use crate::protocol::WorkerEvent;
+
+    let server_state = test_server_state();
+    let run_id = "run-urgent-midturn";
+    server_state.worker_registry.register_run_slot(run_id, 6);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+
+    // Observe the probe topic so we can assert the visibility push
+    // lands alongside the escalation.
+    let watch_session_id = "session-probe-watch".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .await;
+
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane must be enqueued for urgent probe");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+
+    let post_tool_use = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(run_id.to_owned()),
+        transcript_path: None,
+        event: WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+    };
+    let dispatch = tokio::spawn({
+        let server_state = server_state.clone();
+        async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
+    });
+
+    app_responder.await.expect("app responder task");
+
+    // Simulate the incident: the worker is mid-turn and never fires a
+    // UserPromptSubmit for the injected text. Drive virtual time past
+    // the verification window so the dispatch task's wait times out
+    // deterministically instead of the test blocking on real time.
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    dispatch.await.expect("dispatch task");
+
+    // The probe must not have been silently dropped or wrongly marked
+    // delivered — it must still be queryable, and downgraded to
+    // non-urgent so it goes through the reliable Stop-boundary path
+    // instead of racing the TUI again on a bare retry.
+    let requeued = server_state
+        .pop_pending_probe(run_id)
+        .expect("unverified urgent probe must be re-queued, not lost");
+    assert_eq!(requeued.probe_id, probe_id);
+    assert!(
+        !requeued.urgent,
+        "unverified urgent delivery must escalate to the reliable Stop-boundary path",
+    );
+
+    let envelope = watch_sink
+        .next()
+        .await
+        .expect("ProbeDeliveryEscalated should be published on the probe topic");
+    match envelope.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            ..
+        } => {
+            assert_eq!(emitted_run, run_id);
+            assert_eq!(emitted_probe, probe_id);
+        }
+        other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
+    }
 }
 
 /// Regression: `dispatch_probe_if_idle` must deliver a probe

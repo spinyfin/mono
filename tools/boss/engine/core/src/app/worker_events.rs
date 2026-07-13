@@ -47,6 +47,17 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     };
     server_state.dispatcher_stats.record_last_hook(run_id, event_kind);
+    // Resolve any outstanding pane-injection delivery waiter for this
+    // run. A `UserPromptSubmit` hook is the CLI's own confirmation
+    // that it enqueued *something* as the next prompt; when a probe
+    // or chore-update notice is mid-flight (see
+    // `ServerState::inject_pane_text_verified`), this is what turns
+    // "bytes reached the pty" into "the worker actually got it". A
+    // no-op when nothing is waiting, which is the ordinary case for
+    // the worker's own prompts.
+    if let crate::protocol::WorkerEvent::UserPromptSubmit { prompt, .. } = &incoming.event {
+        server_state.resolve_delivery_waiter(run_id, prompt);
+    }
     // Persist the transcript path the moment we see it on a hook
     // payload. `start_execution_run` inserts the work_runs row with
     // `transcript_path = NULL` (the engine has no way to know the
@@ -679,20 +690,41 @@ pub(super) async fn dispatch_probe_on_stop(
     }
 }
 
+/// How long an urgent probe's pane write waits for a `UserPromptSubmit`
+/// hook to confirm the CLI actually enqueued it, before treating the
+/// write as unverified and escalating to Stop-boundary delivery. This
+/// is the exact injection point implicated in the probe-6 incident:
+/// text written into the pane while the worker was mid-turn, which
+/// the CLI's TUI never enqueued as a pending prompt.
+const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// On the `PostToolUse` boundary, check whether the front probe in the
 /// per-run queue is urgent. If so, pop it and dispatch it immediately
 /// via `SendToPane`, prefixing the text with `[coordinator-nudge]` so
 /// the worker and human readers can identify coordinator-injected
 /// urgent text. The tool call has already completed at this point, so
-/// no in-flight Bash is cancelled. On failure the probe is pushed back
-/// to the front so the next `PostToolUse` retries with the same id.
+/// no in-flight Bash is cancelled.
+///
+/// The write is not trusted just because `SendToPane` returned Ok: it
+/// lands while the worker is actively mid-turn, which races the CLI's
+/// TUI input handling (the probe-6 incident — bytes reached the pty
+/// but the CLI never enqueued them as a prompt, and nothing ever
+/// re-delivered them). So this waits for a matching `UserPromptSubmit`
+/// hook before declaring success. On a transport/app-level failure the
+/// probe is pushed back to the front so the next `PostToolUse` retries
+/// with the same id. On an *unverified* write (the racy case) the
+/// probe is downgraded to non-urgent and re-queued so
+/// `dispatch_probe_on_stop` delivers it at the worker's next, reliably
+/// idle, Stop boundary instead — and a `ProbeDeliveryEscalated` push
+/// tells anyone watching the probe topic not to assume delivery from
+/// an "injected" log line alone.
 ///
 /// Non-urgent probes are ignored here; they wait for `dispatch_probe_on_stop`.
 pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::{EngineToAppRequest, SendToPaneInput, WorkerEvent};
+    use crate::protocol::WorkerEvent;
     let WorkerEvent::PostToolUse { .. } = incoming.event else {
         return;
     };
@@ -724,23 +756,48 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
     };
     let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
     let marked_text = format!("[coordinator-nudge] {}", probe.text);
-    let request = EngineToAppRequest::SendToPane(SendToPaneInput {
-        slot_id,
-        text: marked_text,
-    });
-    match server_state.send_to_app(request, Duration::from_secs(5)).await {
-        Ok(_) => {
+    match server_state
+        .inject_pane_text_verified(run_id, slot_id, marked_text, URGENT_PROBE_VERIFY_TIMEOUT)
+        .await
+    {
+        PaneInjectOutcome::Confirmed => {
             tracing::info!(
                 run_id,
                 slot_id,
                 probe_id = %probe.probe_id,
-                "urgent probe injected at tool boundary",
+                "urgent probe injected at tool boundary (delivery confirmed via UserPromptSubmit)",
             );
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
-        Err(err) => {
+        PaneInjectOutcome::Unverified => {
             tracing::warn!(
-                ?err,
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                timeout = ?URGENT_PROBE_VERIFY_TIMEOUT,
+                "urgent probe write reached the pane but no UserPromptSubmit hook confirmed delivery \
+                 within the verification window (the probe-6 silent-drop failure mode); escalating to \
+                 Stop-boundary delivery instead of trusting the pty write",
+            );
+            let probe_id = probe.probe_id.clone();
+            let mut fallback = probe;
+            fallback.urgent = false;
+            server_state.requeue_probe_front(run_id.to_owned(), fallback);
+            server_state
+                .topic_broker
+                .publish(
+                    &probe_topic(run_id),
+                    FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
+                        run_id: run_id.to_owned(),
+                        probe_id,
+                        reason: "no UserPromptSubmit observed after urgent pane injection".to_owned(),
+                    }),
+                )
+                .await;
+        }
+        PaneInjectOutcome::SendFailed(failure) => {
+            tracing::warn!(
+                ?failure,
                 run_id,
                 slot_id,
                 probe_id = %probe.probe_id,
