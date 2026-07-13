@@ -8,6 +8,20 @@
 //! marker. This module owns that logic so callers compose their own pre/post
 //! processing around it instead of each re-deriving the boundary walk.
 
+/// Return the largest UTF-8 char-boundary byte index `<= max` in `s`.
+///
+/// `max` may land inside a multi-byte codepoint; this walks back to the
+/// nearest boundary so a subsequent `&s[..idx]` never panics and no partial
+/// codepoint leaks through. `max` is clamped to `s.len()` first, so callers
+/// may pass a `max` past the end of the string.
+pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Clip `s` to at most `max` bytes on a UTF-8 char boundary, appending `…`
 /// when the string is truncated. A string already within budget is returned
 /// unchanged (no ellipsis).
@@ -25,10 +39,7 @@ pub fn clip_to_bytes_with_suffix(s: &str, max: usize, suffix: &str) -> String {
     // `max` may land inside a multi-byte codepoint; walk back to the nearest
     // char boundary so the slice below never panics and no partial codepoint
     // leaks through.
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = floor_char_boundary(s, max);
     let mut out = s[..end].to_owned();
     out.push_str(suffix);
     out

@@ -471,10 +471,7 @@ pub(crate) fn revision_name_from_description(description: &str) -> String {
             // Walk back to the largest char boundary <= 120 so slicing never
             // splits a multi-byte UTF-8 scalar (a naive `&trimmed[..120]` panics
             // when byte 120 lands mid-character).
-            let mut end = 120;
-            while !trimmed.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = crate::string_clip::floor_char_boundary(trimmed, 120);
             let cutoff = &trimmed[..end];
             match cutoff.rfind(' ') {
                 Some(pos) => format!("{}…", &cutoff[..pos]),
