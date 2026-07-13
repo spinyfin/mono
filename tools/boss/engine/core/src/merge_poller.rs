@@ -211,6 +211,7 @@ pub struct PrLifecycleProbe {
     /// Derived from `mergeQueueEntry` — non-null means in queue, null means
     /// not queued. Used to render the merging indicator on Review-lane cards
     /// (replaces the CI icon while the PR is merging).
+    #[builder(default)]
     pub in_merge_queue: bool,
     /// GitHub's raw `mergeQueueEntry.state` (e.g. `"AWAITING_CHECKS"`,
     /// `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`, `"UNMERGEABLE"`). `None` when
@@ -226,10 +227,12 @@ pub struct PrLifecycleProbe {
     /// Raw `mergeable` string from GitHub (e.g. `"MERGEABLE"`, `"CONFLICTING"`,
     /// `"UNKNOWN"`). Carried through so callers can log the exact GitHub signal
     /// that drove each transition decision without a second round trip.
+    #[builder(default)]
     pub raw_mergeable: String,
     /// Raw `mergeStateStatus` string from GitHub (e.g. `"CLEAN"`, `"DIRTY"`,
     /// `"BLOCKED"`, `"BEHIND"`, `"UNKNOWN"`). Paired with `raw_mergeable`
     /// for diagnosability on transition log lines.
+    #[builder(default)]
     pub raw_merge_state_status: String,
 }
 
@@ -582,22 +585,12 @@ impl MergeProbe for CommandMergeProbe {
                 || stderr_lower.contains("404")
                 || stderr_lower.contains("not found")
             {
-                return Ok(PrLifecycleProbe {
-                    url: pr_url.to_owned(),
-                    state: PrLifecycleState::ClosedUnmerged,
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                });
+                return Ok(PrLifecycleProbe::builder()
+                    .url(pr_url.to_owned())
+                    .state(PrLifecycleState::ClosedUnmerged)
+                    .labels(Vec::new())
+                    .review(PrReviewState::Unknown)
+                    .build());
             }
             return Err(anyhow!(
                 "`gh pr view {pr_url}` failed: {}",
@@ -770,22 +763,12 @@ impl CommandMergeProbe {
                 // we can't see it" fallback as `probe`'s 404 path.
                 out.insert(
                     url.clone(),
-                    Ok(PrLifecycleProbe {
-                        url: url.clone(),
-                        state: PrLifecycleState::ClosedUnmerged,
-                        base_ref_oid: None,
-                        head_ref_oid: None,
-                        head_ref_name: None,
-                        base_ref_name: None,
-                        labels: Vec::new(),
-                        review: PrReviewState::Unknown,
-                        in_merge_queue: false,
-                        merge_queue_entry_state: None,
-                        merge_queue_position: None,
-                        merge_queue_enqueued_at: None,
-                        raw_mergeable: String::new(),
-                        raw_merge_state_status: String::new(),
-                    }),
+                    Ok(PrLifecycleProbe::builder()
+                        .url(url.clone())
+                        .state(PrLifecycleState::ClosedUnmerged)
+                        .labels(Vec::new())
+                        .review(PrReviewState::Unknown)
+                        .build()),
                 );
                 continue;
             };
@@ -3913,22 +3896,13 @@ mod tests {
         fn set_with_base(&self, url: &str, state: PrLifecycleState, base_ref_oid: Option<&str>) {
             self.states.lock().unwrap().insert(
                 url.to_owned(),
-                Ok(PrLifecycleProbe {
-                    url: url.to_owned(),
-                    state,
-                    base_ref_oid: base_ref_oid.map(str::to_owned),
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                }),
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(state)
+                    .maybe_base_ref_oid(base_ref_oid.map(str::to_owned))
+                    .labels(Vec::new())
+                    .review(PrReviewState::Unknown)
+                    .build()),
             );
         }
 
@@ -3942,44 +3916,28 @@ mod tests {
         fn set_with_base_head(&self, url: &str, state: PrLifecycleState, base_ref_oid: &str, head_ref_oid: &str) {
             self.states.lock().unwrap().insert(
                 url.to_owned(),
-                Ok(PrLifecycleProbe {
-                    url: url.to_owned(),
-                    state,
-                    base_ref_oid: Some(base_ref_oid.to_owned()),
-                    head_ref_oid: Some(head_ref_oid.to_owned()),
-                    head_ref_name: Some("feature-branch".to_owned()),
-                    base_ref_name: Some("main".to_owned()),
-                    labels: Vec::new(),
-                    review: PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                }),
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(state)
+                    .base_ref_oid(base_ref_oid.to_owned())
+                    .head_ref_oid(head_ref_oid.to_owned())
+                    .head_ref_name("feature-branch")
+                    .base_ref_name("main")
+                    .labels(Vec::new())
+                    .review(PrReviewState::Unknown)
+                    .build()),
             );
         }
 
         fn set_with_labels(&self, url: &str, state: PrLifecycleState, labels: &[&str]) {
             self.states.lock().unwrap().insert(
                 url.to_owned(),
-                Ok(PrLifecycleProbe {
-                    url: url.to_owned(),
-                    state,
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: labels.iter().map(|s| (*s).to_owned()).collect(),
-                    review: PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                }),
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(state)
+                    .labels(labels.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                    .review(PrReviewState::Unknown)
+                    .build()),
             );
         }
 
@@ -3995,22 +3953,12 @@ mod tests {
             match map.get(pr_url) {
                 Some(Ok(state)) => Ok(state.clone()),
                 Some(Err(msg)) => Err(anyhow!(msg.clone())),
-                None => Ok(PrLifecycleProbe {
-                    url: pr_url.to_owned(),
-                    state: PrLifecycleState::Open(OpenPrStatus::clean()),
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                }),
+                None => Ok(PrLifecycleProbe::builder()
+                    .url(pr_url.to_owned())
+                    .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+                    .labels(Vec::new())
+                    .review(PrReviewState::Unknown)
+                    .build()),
             }
         }
     }
@@ -4814,47 +4762,33 @@ mod tests {
 
     /// Helper to build a probe with CI failures + a head sha.
     fn probe_ci_failing(pr: &str, head_sha: &str) -> PrLifecycleProbe {
-        PrLifecycleProbe {
-            url: pr.to_owned(),
-            state: PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![RequiredCheckFailure {
-                name: "ci/test".into(),
-                conclusion: "FAILURE".into(),
-                target_url: "".into(),
-                provider: CiProvider::Other,
-                provider_job_id: None,
-            }])),
-            base_ref_oid: Some("base-1".into()),
-            head_ref_oid: Some(head_sha.to_owned()),
-            head_ref_name: None,
-            base_ref_name: None,
-            labels: Vec::new(),
-            review: PrReviewState::Unknown,
-            in_merge_queue: false,
-            merge_queue_entry_state: None,
-            merge_queue_position: None,
-            merge_queue_enqueued_at: None,
-            raw_mergeable: String::new(),
-            raw_merge_state_status: String::new(),
-        }
+        PrLifecycleProbe::builder()
+            .url(pr.to_owned())
+            .state(PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![
+                RequiredCheckFailure {
+                    name: "ci/test".into(),
+                    conclusion: "FAILURE".into(),
+                    target_url: "".into(),
+                    provider: CiProvider::Other,
+                    provider_job_id: None,
+                },
+            ])))
+            .base_ref_oid("base-1")
+            .head_ref_oid(head_sha.to_owned())
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build()
     }
 
     fn probe_ci_clean(pr: &str, head_sha: &str) -> PrLifecycleProbe {
-        PrLifecycleProbe {
-            url: pr.to_owned(),
-            state: PrLifecycleState::Open(OpenPrStatus::clean()),
-            base_ref_oid: Some("base-1".into()),
-            head_ref_oid: Some(head_sha.to_owned()),
-            head_ref_name: None,
-            base_ref_name: None,
-            labels: Vec::new(),
-            review: PrReviewState::Unknown,
-            in_merge_queue: false,
-            merge_queue_entry_state: None,
-            merge_queue_position: None,
-            merge_queue_enqueued_at: None,
-            raw_mergeable: String::new(),
-            raw_merge_state_status: String::new(),
-        }
+        PrLifecycleProbe::builder()
+            .url(pr.to_owned())
+            .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+            .base_ref_oid("base-1")
+            .head_ref_oid(head_sha.to_owned())
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build()
     }
 
     /// Probe whose CI is non-terminal (`InFlight`) — the state a rollup
@@ -4862,25 +4796,17 @@ mod tests {
     /// including the "one leaf already failed but others are still running"
     /// case after the terminal-failure gate (see `classify_ci`).
     fn probe_ci_in_flight(pr: &str, head_sha: &str) -> PrLifecycleProbe {
-        PrLifecycleProbe {
-            url: pr.to_owned(),
-            state: PrLifecycleState::Open(OpenPrStatus {
+        PrLifecycleProbe::builder()
+            .url(pr.to_owned())
+            .state(PrLifecycleState::Open(OpenPrStatus {
                 mergeability: OpenPrMergeability::Clean,
                 ci: OpenPrCiStatus::InFlight,
-            }),
-            base_ref_oid: Some("base-1".into()),
-            head_ref_oid: Some(head_sha.to_owned()),
-            head_ref_name: None,
-            base_ref_name: None,
-            labels: Vec::new(),
-            review: PrReviewState::Unknown,
-            in_merge_queue: false,
-            merge_queue_entry_state: None,
-            merge_queue_position: None,
-            merge_queue_enqueued_at: None,
-            raw_mergeable: String::new(),
-            raw_merge_state_status: String::new(),
-        }
+            }))
+            .base_ref_oid("base-1")
+            .head_ref_oid(head_sha.to_owned())
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build()
     }
 
     /// Which blocking signal a stranded-recovery case exercises. The
@@ -7838,27 +7764,21 @@ mod tests {
         }];
 
         // Pass 1: Conflict + Failing.
-        let mut p1 = PrLifecycleProbe {
-            url: pr.into(),
-            state: PrLifecycleState::Open(OpenPrStatus {
+        let mut p1 = PrLifecycleProbe::builder()
+            .url(pr)
+            .state(PrLifecycleState::Open(OpenPrStatus {
                 mergeability: OpenPrMergeability::Conflict,
                 ci: OpenPrCiStatus::Failing {
                     failures: failures.clone(),
                 },
-            }),
-            base_ref_oid: Some("base-1".into()),
-            head_ref_oid: Some("head-1".into()),
-            head_ref_name: Some("feature".into()),
-            base_ref_name: Some("main".into()),
-            labels: Vec::new(),
-            review: PrReviewState::Unknown,
-            in_merge_queue: false,
-            merge_queue_entry_state: None,
-            merge_queue_position: None,
-            merge_queue_enqueued_at: None,
-            raw_mergeable: String::new(),
-            raw_merge_state_status: String::new(),
-        };
+            }))
+            .base_ref_oid("base-1")
+            .head_ref_oid("head-1")
+            .head_ref_name("feature")
+            .base_ref_name("main")
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build();
         probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
         let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(
@@ -8795,22 +8715,12 @@ mod tests {
         // pending/running in the remediations list.
         probe.states.lock().unwrap().insert(
             pr.to_owned(),
-            Ok(PrLifecycleProbe {
-                url: pr.to_owned(),
-                state: PrLifecycleState::Merged,
-                base_ref_oid: None,
-                head_ref_oid: None,
-                head_ref_name: None,
-                base_ref_name: None,
-                labels: vec![],
-                review: PrReviewState::Unknown,
-                in_merge_queue: false,
-                merge_queue_entry_state: None,
-                merge_queue_position: None,
-                merge_queue_enqueued_at: None,
-                raw_mergeable: String::new(),
-                raw_merge_state_status: String::new(),
-            }),
+            Ok(PrLifecycleProbe::builder()
+                .url(pr.to_owned())
+                .state(PrLifecycleState::Merged)
+                .labels(vec![])
+                .review(PrReviewState::Unknown)
+                .build()),
         );
         let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(out2.merged, 1, "merge must be detected");

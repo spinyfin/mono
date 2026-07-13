@@ -31,41 +31,25 @@ fn candidate(product_id: &str, work_item_id: &str, pr_url: &str) -> PendingMerge
 }
 
 fn probe(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
-    PrLifecycleProbe {
-        url: pr_url.to_owned(),
-        state: PrLifecycleState::Open(OpenPrStatus::clean()),
-        base_ref_oid: Some("base-1".into()),
-        head_ref_oid: Some(head_sha.to_owned()),
-        head_ref_name: None,
-        base_ref_name: None,
-        labels: Vec::new(),
-        review: crate::merge_poller::PrReviewState::Unknown,
-        in_merge_queue: false,
-        merge_queue_entry_state: None,
-        merge_queue_position: None,
-        merge_queue_enqueued_at: None,
-        raw_mergeable: String::new(),
-        raw_merge_state_status: String::new(),
-    }
+    PrLifecycleProbe::builder()
+        .url(pr_url.to_owned())
+        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .base_ref_oid("base-1")
+        .head_ref_oid(head_sha.to_owned())
+        .labels(Vec::new())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .build()
 }
 
 fn probe_with_labels(pr_url: &str, head_sha: &str, labels: &[&str]) -> PrLifecycleProbe {
-    PrLifecycleProbe {
-        url: pr_url.to_owned(),
-        state: PrLifecycleState::Open(OpenPrStatus::clean()),
-        base_ref_oid: Some("base-1".into()),
-        head_ref_oid: Some(head_sha.to_owned()),
-        head_ref_name: None,
-        base_ref_name: None,
-        labels: labels.iter().map(|s| (*s).to_owned()).collect(),
-        review: crate::merge_poller::PrReviewState::Unknown,
-        in_merge_queue: false,
-        merge_queue_entry_state: None,
-        merge_queue_position: None,
-        merge_queue_enqueued_at: None,
-        raw_mergeable: String::new(),
-        raw_merge_state_status: String::new(),
-    }
+    PrLifecycleProbe::builder()
+        .url(pr_url.to_owned())
+        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .base_ref_oid("base-1")
+        .head_ref_oid(head_sha.to_owned())
+        .labels(labels.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .build()
 }
 
 fn one_failure() -> Vec<RequiredCheckFailure> {

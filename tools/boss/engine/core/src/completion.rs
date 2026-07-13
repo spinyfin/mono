@@ -8989,22 +8989,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         #[async_trait]
         impl MergeProbe for NoOpProbe {
             async fn probe(&self, _: &str) -> anyhow::Result<PrLifecycleProbe> {
-                Ok(PrLifecycleProbe {
-                    url: String::new(),
-                    state: PrLifecycleState::Open(OpenPrStatus::clean()),
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: crate::merge_poller::PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                })
+                Ok(PrLifecycleProbe::builder()
+                    .url(String::new())
+                    .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .build())
             }
         }
         let probe = NoOpProbe;
@@ -9260,22 +9250,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         #[async_trait]
         impl MergeProbe for NoOpProbe {
             async fn probe(&self, _: &str) -> anyhow::Result<PrLifecycleProbe> {
-                Ok(PrLifecycleProbe {
-                    url: String::new(),
-                    state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()),
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: crate::merge_poller::PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                })
+                Ok(PrLifecycleProbe::builder()
+                    .url(String::new())
+                    .state(PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .build())
             }
         }
         let probe = NoOpProbe;
@@ -11295,22 +11275,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[async_trait]
     impl MergeProbe for FixedStateProbe {
         async fn probe(&self, _pr_url: &str) -> anyhow::Result<crate::merge_poller::PrLifecycleProbe> {
-            Ok(crate::merge_poller::PrLifecycleProbe {
-                url: String::new(),
-                state: self.0.clone(),
-                base_ref_oid: None,
-                head_ref_oid: None,
-                head_ref_name: None,
-                base_ref_name: None,
-                labels: Vec::new(),
-                review: crate::merge_poller::PrReviewState::Unknown,
-                in_merge_queue: false,
-                merge_queue_entry_state: None,
-                merge_queue_position: None,
-                merge_queue_enqueued_at: None,
-                raw_mergeable: String::new(),
-                raw_merge_state_status: String::new(),
-            })
+            Ok(crate::merge_poller::PrLifecycleProbe::builder()
+                .url(String::new())
+                .state(self.0.clone())
+                .labels(Vec::new())
+                .review(crate::merge_poller::PrReviewState::Unknown)
+                .build())
         }
     }
 
@@ -12017,22 +11987,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         #[async_trait]
         impl MergeProbe for CleanMergeProbe {
             async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
-                Ok(PrLifecycleProbe {
-                    url: url.to_owned(),
-                    state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()),
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: crate::merge_poller::PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                })
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .build())
             }
         }
 
@@ -12230,22 +12190,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         #[async_trait]
         impl MergeProbe for ConflictingMergeProbe {
             async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
-                Ok(PrLifecycleProbe {
-                    url: url.to_owned(),
-                    state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::conflict_only()),
-                    base_ref_oid: None,
-                    head_ref_oid: None,
-                    head_ref_name: None,
-                    base_ref_name: None,
-                    labels: Vec::new(),
-                    review: crate::merge_poller::PrReviewState::Unknown,
-                    in_merge_queue: false,
-                    merge_queue_entry_state: None,
-                    merge_queue_position: None,
-                    merge_queue_enqueued_at: None,
-                    raw_mergeable: String::new(),
-                    raw_merge_state_status: String::new(),
-                })
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(PrLifecycleState::Open(
+                        crate::merge_poller::OpenPrStatus::conflict_only(),
+                    ))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .build())
             }
         }
 
@@ -12539,25 +12491,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     /// Build a `PrLifecycleProbe` for an open PR with the given CI status.
     fn ci_probe(ci: crate::merge_poller::OpenPrCiStatus) -> PrLifecycleProbe {
-        PrLifecycleProbe {
-            url: String::new(),
-            state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus {
+        PrLifecycleProbe::builder()
+            .url(String::new())
+            .state(PrLifecycleState::Open(crate::merge_poller::OpenPrStatus {
                 mergeability: crate::merge_poller::OpenPrMergeability::Clean,
                 ci,
-            }),
-            base_ref_oid: None,
-            head_ref_oid: None,
-            head_ref_name: None,
-            base_ref_name: None,
-            labels: Vec::new(),
-            review: crate::merge_poller::PrReviewState::Unknown,
-            in_merge_queue: false,
-            merge_queue_entry_state: None,
-            merge_queue_position: None,
-            merge_queue_enqueued_at: None,
-            raw_mergeable: String::new(),
-            raw_merge_state_status: String::new(),
-        }
+            }))
+            .labels(Vec::new())
+            .review(crate::merge_poller::PrReviewState::Unknown)
+            .build()
     }
 
     fn failing_check(name: &str) -> crate::merge_poller::RequiredCheckFailure {
