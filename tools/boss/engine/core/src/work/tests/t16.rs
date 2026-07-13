@@ -1357,3 +1357,167 @@ fn retarget_noop_on_soft_deleted_row() {
     assert_eq!(status, "blocked");
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 }
+
+// ── record_merge_conflict_in_flight ─────────────────────────────────────
+//
+// Coverage for `WorkDb::record_merge_conflict_in_flight` — the conflict
+// analogue of `record_ci_failure_in_flight` (covered in the CI lifecycle
+// tests). It arms the `merge_conflict` signal WITHOUT moving the parent to
+// `status='blocked'` (the in_review-with-revision model), stamping the
+// attempt id, and is idempotent: a repeat call re-arms the same row rather
+// than inserting a duplicate.
+
+/// `record_merge_conflict_in_flight` upserts an active `merge_conflict`
+/// signal (carrying the attempt id) while the parent stays `in_review`, and
+/// a repeat call after a signal-only clear re-arms the same row rather than
+/// duplicating it.
+#[test]
+fn record_merge_conflict_in_flight_arms_signal_without_blocking() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "record-mc-inflight");
+    let pr_url = pr(1);
+    let chore = make_in_review_chore(&db, &product_id, &pr_url);
+
+    db.record_merge_conflict_in_flight(&chore, "crz_in_flight_1").unwrap();
+
+    // The parent is NOT flipped to blocked — only the side-table signal arms.
+    let (status, reason, _) = parent_state(&db, &chore);
+    assert_eq!(
+        status, "in_review",
+        "record_*_in_flight must leave the parent in_review, not flip it to blocked",
+    );
+    assert_eq!(reason, None);
+
+    let signals = db.active_blocked_signals(&chore).unwrap();
+    assert_eq!(signals.len(), 1, "exactly one active signal after the in-flight record");
+    assert_eq!(signals[0].reason, "merge_conflict");
+    assert_eq!(
+        signals[0].attempt_id.as_deref(),
+        Some("crz_in_flight_1"),
+        "the in-flight attempt id must be stamped on the armed signal",
+    );
+
+    // A signal-only clear deactivates it (the premature polymorphic-clear shape)...
+    assert!(db.clear_merge_conflict_signal_only(&chore).unwrap());
+    assert!(active_signal_reasons(&db, &chore).is_empty());
+
+    // ...and a repeat record re-arms the SAME row (cleared_at back to NULL),
+    // not a duplicate — the ON CONFLICT(work_item_id, reason) upsert.
+    db.record_merge_conflict_in_flight(&chore, "crz_in_flight_2").unwrap();
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["merge_conflict"]);
+    assert!(
+        signal_cleared_at(&db, &chore, "merge_conflict").is_none(),
+        "the re-record must re-arm the existing signal row",
+    );
+    let row_count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM task_blocked_signals
+              WHERE work_item_id = ?1 AND reason = 'merge_conflict'",
+            params![chore],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "record_*_in_flight must re-arm rather than insert a duplicate signal row",
+    );
+}
+
+// ── mark_chore_blocked_ci_failure_exhausted ─────────────────────────────
+//
+// Coverage for `WorkDb::mark_chore_blocked_ci_failure_exhausted` — the
+// budget-exhausted exit. Other tests use it only as a setup step; these pin
+// its own transitions: `in_review` → `ci_failure_exhausted` (first failure
+// with the budget already spent), `ci_failure` → `ci_failure_exhausted`, and
+// the WHERE-guard misses (already exhausted / wrong pr_url).
+
+/// From `in_review` the exhausted flip blocks the parent as
+/// `ci_failure_exhausted`, arms the matching signal, and returns the updated
+/// task; a second call is a guarded no-op (the row is no longer `in_review`
+/// nor `ci_failure`).
+#[test]
+fn mark_ci_failure_exhausted_from_in_review_then_idempotent() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "exhausted-in-review");
+    let pr_url = pr(1);
+    let chore = make_in_review_chore(&db, &product_id, &pr_url);
+
+    let updated = db
+        .mark_chore_blocked_ci_failure_exhausted(&chore, &pr_url)
+        .unwrap()
+        .expect("in_review row flips straight to blocked: ci_failure_exhausted");
+    assert_eq!(updated.status, TaskStatus::Blocked);
+    assert_eq!(updated.blocked_reason.as_deref(), Some("ci_failure_exhausted"));
+    assert_eq!(updated.last_status_actor, "engine");
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure_exhausted"]);
+
+    // Idempotent: already exhausted → the WHERE guard misses (blocked, but the
+    // reason is no longer ci_failure), so Ok(None) and nothing changes.
+    assert!(
+        db.mark_chore_blocked_ci_failure_exhausted(&chore, &pr_url)
+            .unwrap()
+            .is_none(),
+        "a second exhausted flip on an already-exhausted row is a no-op",
+    );
+    let (status, reason, _) = parent_state(&db, &chore);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("ci_failure_exhausted"));
+}
+
+/// From an active `blocked: ci_failure` the exhausted flip re-buckets the
+/// scalar reason to `ci_failure_exhausted` and arms the exhausted signal
+/// alongside the still-active `ci_failure` one (the multi-signal projection).
+#[test]
+fn mark_ci_failure_exhausted_from_ci_failure_arms_alongside() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "exhausted-from-ci");
+    let pr_url = pr(1);
+    let chore = make_in_review_chore(&db, &product_id, &pr_url);
+
+    // in_review → blocked: ci_failure (arms the ci_failure signal).
+    db.mark_chore_blocked_ci_failure(&chore, &pr_url, None)
+        .unwrap()
+        .expect("flip to blocked: ci_failure");
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure"]);
+
+    // ci_failure → exhausted: the scalar reason is re-bucketed and the
+    // exhausted signal is armed while the earlier ci_failure signal stays active.
+    let updated = db
+        .mark_chore_blocked_ci_failure_exhausted(&chore, &pr_url)
+        .unwrap()
+        .expect("ci_failure row flips to ci_failure_exhausted");
+    assert_eq!(updated.status, TaskStatus::Blocked);
+    assert_eq!(updated.blocked_reason.as_deref(), Some("ci_failure_exhausted"));
+
+    let mut reasons = active_signal_reasons(&db, &chore);
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec!["ci_failure".to_owned(), "ci_failure_exhausted".to_owned()],
+        "the exhausted signal is armed alongside the still-active ci_failure signal",
+    );
+}
+
+/// A `pr_url` mismatch is a guarded no-op even from a genuine `in_review`
+/// row — the PR was re-pointed under the engine, so the row is not ours to
+/// exhaust. `Ok(None)` and the parent (plus its empty signal set) is untouched.
+#[test]
+fn mark_ci_failure_exhausted_noop_on_pr_url_mismatch() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "exhausted-pr-miss");
+    let pr_url = pr(1);
+    let chore = make_in_review_chore(&db, &product_id, &pr_url);
+
+    assert!(
+        db.mark_chore_blocked_ci_failure_exhausted(&chore, &pr(999))
+            .unwrap()
+            .is_none(),
+        "a mismatched pr_url must not exhaust the row",
+    );
+    let (status, reason, _) = parent_state(&db, &chore);
+    assert_eq!(status, "in_review");
+    assert_eq!(reason, None);
+    assert!(active_signal_reasons(&db, &chore).is_empty());
+}
