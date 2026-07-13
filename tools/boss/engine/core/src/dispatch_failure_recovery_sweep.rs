@@ -205,20 +205,12 @@ mod tests {
 
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use tempfile::TempDir;
-
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb};
 
     // `NoopCube` and `NoopRunner` come from `crate::test_support::*`.
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     fn create_bounced_chore(db: &WorkDb, product_id: &str) -> String {
         let chore = db

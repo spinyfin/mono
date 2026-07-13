@@ -267,14 +267,13 @@ mod tests {
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use boss_protocol::{CreateExecutionInput, ExecutionStatus, RequestExecutionInput, WorkExecution};
-    use tempfile::TempDir;
 
     use super::*;
     use crate::coordinator::{CubeRepoSummary, ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
     use crate::runner::{ExecutionRunner, RunOutcome};
-    use crate::test_support::create_test_product_with_repo;
+    use crate::test_support::{create_test_product_with_repo, open_db};
     use crate::work::{CreateChoreInput, WorkDb};
 
     /// No-op execution runner: the real re-route tests only need
@@ -326,12 +325,6 @@ mod tests {
     } }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
