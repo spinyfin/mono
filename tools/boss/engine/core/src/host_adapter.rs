@@ -1066,4 +1066,132 @@ mod tests {
         // Guard has dropped: the on-disk file is unlinked.
         assert!(!path.exists(), "staging file should be removed once the guard drops",);
     }
+
+    // ── command_repr ─────────────────────────────────────────────────────────
+
+    /// Build an `SshHostAdapter` wired only enough to exercise
+    /// `command_repr`, which touches nothing but the transport. `host_id`
+    /// and `ssh_target` are kept distinct so tests can tell which field the
+    /// command line vs. the cwd label is drawn from. The `WorkDb`/`cfg` are
+    /// never read by `command_repr`; they exist only to satisfy the ctor.
+    fn ssh_adapter(host_id: &str, ssh_target: &str) -> SshHostAdapter {
+        let base = std::env::temp_dir();
+        let (_dir, db) = crate::test_support::open_db();
+        let work = crate::config::WorkConfig::builder()
+            .cwd(base.clone())
+            .db_path(base.join("unused-command-repr.db"))
+            .build();
+        let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
+        let transport = SshTransport::new(host_id, ssh_target, &base);
+        SshHostAdapter::new(transport, Arc::new(db), cfg, base.join("events.sock"))
+    }
+
+    #[test]
+    fn ssh_command_repr_quotes_each_arg_like_run_and_labels_remote_cwd() {
+        // host_id and ssh_target deliberately differ: the command line must
+        // use the ssh_target (what you'd actually type), while the cwd label
+        // carries the stable host id.
+        let adapter = ssh_adapter("zakalwe", "deploy@zakalwe.example");
+        let args = ["workspace", "lease", "--task", "fix a b*c", "it's mine"];
+        let (cmd, cwd) = adapter.command_repr(&args).expect("ssh adapter always returns a repr");
+
+        // `ssh <target> cube <args...>`, every token single-quoted exactly as
+        // `SshTransport::run` quotes its argv — spaces, the `*` glob, and the
+        // embedded apostrophe (escaped `'\''`) all survive, so pasting the
+        // string re-runs the identical remote argv.
+        assert_eq!(
+            cmd,
+            r#"ssh deploy@zakalwe.example 'cube' 'workspace' 'lease' '--task' 'fix a b*c' 'it'\''s mine'"#
+        );
+        // Tie the reproducibility guarantee to the very function `run` uses:
+        // the tricky arg is quoted byte-for-byte the way the transport would.
+        assert!(cmd.contains(&crate::ssh_transport::shell_quote("it's mine")));
+
+        // Second tuple element is the `(remote: <host_id>)` cwd label.
+        assert_eq!(cwd, "(remote: zakalwe)");
+    }
+
+    #[test]
+    fn ssh_command_repr_with_no_args_is_ssh_target_plus_quoted_cube() {
+        let adapter = ssh_adapter("h1", "h1.internal");
+        let (cmd, cwd) = adapter.command_repr(&[]).expect("ssh adapter always returns a repr");
+        assert_eq!(cmd, "ssh h1.internal 'cube'");
+        assert_eq!(cwd, "(remote: h1)");
+    }
+
+    /// A `CubeClient` double implementing only `command_repr`. It echoes the
+    /// args it was handed into the returned command string so a test can
+    /// confirm `LocalHostAdapter` forwards the args through and hands the
+    /// resulting pair back verbatim. `repr_some` toggles the Some/None result.
+    struct ReprCube {
+        repr_some: bool,
+    }
+
+    #[async_trait]
+    impl CubeClient for ReprCube {
+        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
+            unimplemented!()
+        }
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: &[&str],
+        ) -> Result<CubeWorkspaceLease> {
+            unimplemented!()
+        }
+        async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
+            unimplemented!()
+        }
+        async fn release_workspace(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
+            unimplemented!()
+        }
+        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            unimplemented!()
+        }
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+            unimplemented!()
+        }
+        fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
+            self.repr_some
+                .then(|| (format!("cube {}", args.join(" ")), "/leased/ws".to_owned()))
+        }
+    }
+
+    #[test]
+    fn local_command_repr_delegates_pair_from_cube_client_unchanged() {
+        let adapter = LocalHostAdapter::new(
+            Arc::new(ReprCube { repr_some: true }),
+            Arc::new(crate::test_support::NoopRunner),
+        );
+        // The forwarded args show up in the client's command, and the cwd is
+        // whatever the client produced — the pair is returned verbatim.
+        let got = adapter.command_repr(&["workspace", "status"]);
+        assert_eq!(got, Some(("cube workspace status".to_owned(), "/leased/ws".to_owned())));
+    }
+
+    #[test]
+    fn local_command_repr_passes_through_none() {
+        // A client that returns None (e.g. a test double) must surface None
+        // unchanged, not a synthesized value.
+        let adapter = LocalHostAdapter::new(
+            Arc::new(ReprCube { repr_some: false }),
+            Arc::new(crate::test_support::NoopRunner),
+        );
+        assert_eq!(adapter.command_repr(&["anything"]), None);
+    }
 }
