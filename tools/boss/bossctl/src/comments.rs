@@ -19,16 +19,20 @@ use super::open_state_db;
 pub(crate) enum CommentsAction {
     /// List comments on an artifact. `--task` is shorthand for the common
     /// case (a work-item-kind comment thread); pass `--artifact-kind` +
-    /// `--artifact` directly for a `pr_doc:<repo>:<branch>:<path>`
-    /// composite key. Excludes `resolved`/`dismissed` comments unless
-    /// `--include-resolved` — `orphaned` comments are always included.
+    /// `--artifact` directly for a
+    /// `pr_doc:<owner>/<repo>:<branch>:<path>` composite key (e.g.
+    /// `pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md` — an SSH or HTTPS
+    /// remote URL also works for `<owner>/<repo>`). Excludes
+    /// `resolved`/`dismissed` comments unless `--include-resolved` —
+    /// `orphaned` comments are always included.
     List {
         /// Work item (task/chore) id whose comments to list — shorthand
         /// for `--artifact-kind work_item --artifact <id>`.
         #[arg(long)]
         task: Option<String>,
-        /// Raw artifact id (e.g. a `pr_doc:<repo>:<branch>:<path>`
-        /// composite key). Pairs with `--artifact-kind`.
+        /// Raw artifact id (e.g. a `pr_doc:<owner>/<repo>:<branch>:<path>`
+        /// composite key — an SSH or HTTPS remote URL also works for
+        /// `<owner>/<repo>`). Pairs with `--artifact-kind`.
         #[arg(long)]
         artifact: Option<String>,
         /// Artifact kind for `--artifact` (`work_item` or `pr_doc`).
@@ -88,8 +92,18 @@ pub(crate) fn comments_list(
 ) -> Result<()> {
     let (kind, id) = resolve_comments_artifact(task, artifact, artifact_kind)?;
     let db = open_state_db(state_root)?;
+    // `pr_doc` artifact ids are stored with the repo component as the full
+    // git remote URL, but a human-supplied `--artifact` routinely spells it
+    // as an `owner/repo` slug (what `gh`, PR links, and chat all show) —
+    // resolve to the stored key so either spelling finds the same rows.
+    let resolved_id = if kind == "pr_doc" {
+        db.resolve_pr_doc_artifact_id(&id)
+            .context("resolving pr_doc artifact id")?
+    } else {
+        id.clone()
+    };
     let comments = db
-        .list_comments_with_thread(&kind, &id, include_resolved)
+        .list_comments_with_thread(&kind, &resolved_id, include_resolved)
         .context("listing comments")?;
 
     if json {
@@ -97,12 +111,19 @@ pub(crate) fn comments_list(
             "{}",
             serde_json::json!({
                 "artifact_kind": kind,
-                "artifact_id": id,
+                "artifact_id": resolved_id,
                 "comments": comments,
             })
         );
     } else if comments.is_empty() {
-        println!("no comments on {kind}:{id}");
+        println!("no comments on {kind}:{resolved_id}");
+        if kind == "pr_doc"
+            && let Some(hint) = db
+                .pr_doc_artifact_hint(&resolved_id)
+                .context("looking up pr_doc artifact hint")?
+        {
+            println!("  hint: a row exists with the same branch + path under a different repo spelling: {hint}");
+        }
     } else {
         for entry in &comments {
             print_comment_with_thread_short(entry);
