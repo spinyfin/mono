@@ -61,7 +61,7 @@ Cross-checking against raw churn over the last 500 `main` commits (independent s
 
 Three things fall out of this evidence and shape the whole design:
 
-- **The single most common conflict surface is lockfiles.** `MODULE.bazel.lock` and `Cargo.lock` are #1 and #2. Their correct resolution is _formulaic_: take both sides' manifest changes and regenerate. This is the operator's direction-5 example, and the data says it is the highest-value deterministic target by a wide margin — lockfiles + `BUILD.bazel` alone are ~8% of conflicted file-rows and need zero agent judgment.
+- **The single most common conflict surface is formulaic files, and in _this_ repo the top instances are lockfiles.** `MODULE.bazel.lock` and `Cargo.lock` are #1 and #2, and their correct resolution is _formulaic_: take both sides' manifest changes and regenerate. But the design conclusion is one level up from the instances: the engine must stay **agnostic to any particular repo's tooling choices**, so the deliverable is a _general deterministic-resolver feature_ — a registry of pluggable per-file-class resolvers — not engine logic hardcoded to two filenames. Lockfile resolvers are merely the first built-ins because the data says they are the highest-value targets by a wide margin (lockfiles + `BUILD.bazel` alone are ~8% of conflicted file-rows and need zero agent judgment). This is the operator's direction-5 example.
 - **A large fraction of the rest is append/registry-shaped** (`mod.rs`/`lib.rs` registries 57 rows, protocol types 18, migrations 16). This is the direction-1 refactoring target: append-only structures → keyed maps, hotspot files split, registries extracted. Precedent already exists in this repo — `protocol/src/types.rs` adopted `#[derive(bon::Builder)]` _specifically_ so additive-change PRs stop touching every construction site (see the builder-pattern convention in `CLAUDE.md`). That is exactly the class of refactor direction 1 should schedule automatically.
 - **Only ~40 rows are genuinely semantic** engine hot files that actually need an agent. Everything else is mechanical or structural. **Today all of it goes to a full worker.** That is the waste.
 
@@ -69,7 +69,7 @@ Three things fall out of this evidence and shape the whole design:
 
 ## Framing: three cost centers, one escalation ladder
 
-The design is organized around the three cost centers, but its centerpiece is a single idea for cost center #2: **a resolution escalation ladder.** Every detected conflict enters at the bottom rung and only climbs when the cheaper rung declines. Each rung is strictly cheaper than the one above it:
+The design is organized around the three cost centers, but its centerpiece is a single idea for cost center #2: **a resolution escalation ladder.** Every detected conflict enters at the bottom rung and climbs in exactly two situations: the cheaper rung **declines** (it cannot produce a resolution), or the cheaper rung's completed resolution is **rejected by post-resolution review** (the tripwire, the build gate, or an AI review agent judges it wrong — see "escalation on review rejection" under rung 3 below). Each rung is strictly cheaper than the one above it:
 
 ```
 Rung 0  Deterministic resolver        free, instant, no agent      ← direction 5
@@ -95,7 +95,7 @@ The other cost centers wrap around the ladder:
 ## Goals
 
 - **Measure the real conflict rate and surface.** Close the telemetry coverage gap so we know the true frequency, the per-file/per-file-pair hotspots, and the per-class breakdown (mechanical vs. semantic). Measurement is a deliverable, not an afterthought.
-- **Make the common conflict free.** Resolve formulaic conflict classes (lockfiles first) with a deterministic resolver — no agent, instant, zero token cost.
+- **Make the common conflict free.** Resolve formulaic conflict classes with a general, extensible deterministic-resolver feature — no agent, instant, zero token cost. The engine core stays agnostic to repo tooling; individual resolvers (lockfiles first, per the data) are pluggable built-ins today and a user-extension point later.
 - **Make the mechanical conflict agent-free.** Attempt an engine-direct structural rebase before ever spawning an agent, exactly as `auto_rebase` already does for stacked PRs; auto-retire when jj's structural merge resolves it.
 - **Make the semantic conflict cheap and fast.** When an agent is genuinely required, spawn a _small, focused, pre-staged_ resolver (cheap model, tight prompt, workspace already at the conflict) rather than a full worker that starts from a cold session.
 - **Reduce frequency without reducing parallelism.** Incrementally de-hotspot the repo via a standing automation, and sequence merges of likely-overlapping siblings with a _non-blocking_ mechanism that never gates dispatch.
@@ -126,7 +126,7 @@ A deliberate inventory, because most of the substrate is already shipped and the
 | **Per-file conflict diagnosis**                                                               | `boss_conflict_diagnosis` crate: `ConflictDiagnosis { files: Vec<ConflictedFile> }`, `ConflictedFile { path, marker_count, shape }` via `git merge-tree`; collected pre-spawn (`coordinator.rs:4229`) | The raw hotspot data already exists per event — we aggregate it, we don't collect it anew.                                             |
 | **Engine-direct mechanical rebase** (no worker)                                               | `auto_rebase` two-tier (`jj rebase`, ~5–15s, try-and-fall-back) + `cube workspace rebase` reporting `REBASED_CLEAN`/`REBASED_WITH_CONFLICTS` (`runner.rs:2311`)                                       | Rung 1, promoted onto the `conflict_watch` path.                                                                                       |
 | **Pre-leased spawn with pre-loaded conflict**                                                 | `auto_rebase` escalation hands the worker an already-dirty workspace                                                                                                                                  | Rung 2 pre-staging.                                                                                                                    |
-| **Counter metrics** (in-memory → `state.db`, 30s flush)                                       | `metrics/` framework; `CONFLICT_FLAGGED`/`CONFLICT_CLEARED` in `merge_poller.rs:106`                                                                                                                  | Per-class conflict-rate counters.                                                                                                      |
+| **Counter metrics** (in-memory → `state.db`, 30s flush)                                       | `metrics/` framework; `CONFLICT_FLAGGED`/`CONFLICT_CLEARED` in `merge_poller.rs:106`                                                                                                                  | Per-class conflict-rate counters, scopable per-product (Layer 0).                                                                      |
 | **Automations** (cron standing instruction → triage → files one task; dedicated 3-agent pool) | `Automation` (`types.rs:228`), `AutomationTrigger::Schedule{cron,tz}`, `create_automation` (`work/automations.rs:47`), `automation_scheduler.rs`                                                      | Direction 1's proactive refactoring chore is a _data insert_, not new infra.                                                           |
 | **Task effort/model knobs**                                                                   | `CreateChoreInput.effort_level`, `.model_override`, `.driver`, `.depends_on`                                                                                                                          | Rung 2's small/cheap agent profile; refactoring chore sizing.                                                                          |
 | **Dependency edges with a `relation` column**                                                 | `work_item_dependencies (dependent_id, prerequisite_id, relation DEFAULT 'blocks')`; **only `relation='blocks'` gates dispatch** (`dep_helpers.rs:191,203`)                                           | Direction 2's non-blocking `merge_order` relation slots in here.                                                                       |
@@ -184,16 +184,16 @@ The substrate mostly exists; the work is _coverage_ and _aggregation_.
 1. **Close the coverage gap.** Today only conflicts that reach `conflict_watch` (an in-review PR whose `main` moved) are recorded. Add recording for the two blind spots:
    - **Producer-side conflicts** — when a normal worker runs `cube workspace rebase` during its own task and gets `REBASED_WITH_CONFLICTS`, record a conflict event (files, shape) even though it never became an in-review bot comment. This is the bulk of the undercount.
    - **Per-rung outcomes** — every conflict event records which rung resolved it (0/1/2/3), how long, and whether it escalated. This is what tells us the ladder's payoff and where it leaks.
-2. **Aggregate into a hotspot report.** A query surface over `conflict_resolutions.conflict_diagnosis` producing: per-file conflict frequency, per-file-_pair_ co-conflict frequency (which two files conflict together — the signal for direction 2), and per-class counts (lockfile / build / registry / migration / semantic, classified off `ConflictedFile.path` + `shape`). Expose as `boss engine conflicts hotspots` (implementation detail; the point is a machine-readable report the automation and the operator both consume).
-3. **Counters.** Add per-class `register_counter!` counters next to the existing `CONFLICT_FLAGGED`/`CONFLICT_CLEARED`, incremented at resolution time, so conflict rate and the rung mix are visible over time without a query.
+2. **Aggregate into a hotspot report.** A query surface over `conflict_resolutions.conflict_diagnosis` producing: per-file conflict frequency, per-file-_pair_ co-conflict frequency (which two files conflict together — the signal for direction 2), and per-class counts (lockfile / build / registry / migration / semantic, classified off `ConflictedFile.path` + `shape`). Expose as `boss engine conflicts hotspots` (implementation detail; the point is a machine-readable report the automation and the operator both consume). The report is **scoped per-product** (a required `--product` filter or per-product sections, never a cross-product blend): hotspot data is only meaningful within one repo, and boss manages several.
+3. **Counters — must be scopable per-product.** Add per-class counters next to the existing `CONFLICT_FLAGGED`/`CONFLICT_CLEARED`, incremented at resolution time, so conflict rate and the rung mix are visible over time without a query. **Hard requirement: every metric or counter this design introduces must be scopable per-product** — a fleet-wide number that cannot be broken down by product hides which repo is hurting. The current counter framework is deliberately dimensionless (its design defers tags/dimensions as "a follow-up design"), so this requirement is satisfied one of two ways: (a) key the counters per-product (e.g. `conflict.<product>.<class>.resolved` as separate counters — product count is small and bounded, so cardinality stays sane), or (b) do the framework's anticipated follow-up and add a product dimension. Either is acceptable; what is not acceptable is shipping product-blind conflict metrics. The `conflict_resolutions` rows are already attributable to a product via their PR/task, so the query-backed report gets per-product scoping for free — this requirement bites only on the flat counters.
 
 **Why first:** the reported ~12% is a floor we know is wrong; the whole cost/benefit of every later layer depends on the true rate and the class mix. It is also cheap — the per-file data is already collected per event.
 
 ### Layer 1 — The resolution escalation ladder
 
-Restructure the `conflict_watch` resolution path from "detect → full worker" into "detect → rung 0 → rung 1 → rung 2 → rung 3," each rung gated on the previous declining. Concretely, the engine-side harness (a small state machine invoked from `conflict_watch::on_conflict_detected`, before `maybe_spawn_conflict_revision`) does:
+Restructure the `conflict_watch` resolution path from "detect → full worker" into "detect → rung 0 → rung 1 → rung 2 → rung 3," each rung gated on the previous declining — plus a direct escalation to rung 3 when a completed resolution is rejected by post-resolution review (see rung 3). Concretely, the engine-side harness (a small state machine invoked from `conflict_watch::on_conflict_detected`, before `maybe_spawn_conflict_revision`) does:
 
-**Rung 0 — Deterministic resolvers (direction 5).** A registry of resolvers, each implementing roughly:
+**Rung 0 — Deterministic resolvers (direction 5).** This rung is a **general, extensible engine feature, not a special case for any particular file.** The engine core knows nothing about lockfiles, bazel, cargo, or any other repo tooling choice; all format knowledge lives in individual resolvers behind a registry, each implementing roughly:
 
 ```
 trait DeterministicResolver {
@@ -203,11 +203,20 @@ trait DeterministicResolver {
 }
 ```
 
-Ship one resolver first — **lockfiles** — because the data says it is the single highest-value target:
+The registry is the extension seam: today boss ships a set of **built-in** resolvers for particular file types; in the future, users of boss can plug in their own (see the declarative-recipe mechanism below). Deterministic resolvers are intended to be the _mainstay_ of how this common conflict surface is handled — the design bet is that most conflicts by volume are formulaic, and formula beats agent on speed, cost, and reliability.
+
+The first built-in is **lockfiles**, because the data says it is the single highest-value target:
 
 - `Cargo.lock`: discard the conflicted file, run the lockfile-regeneration command against the merged `Cargo.toml` (`cargo generate-lockfile` / equivalent), so both sides' dependency edits are represented.
 - `MODULE.bazel.lock`: the bazel analogue (regenerate the lockfile from the merged `MODULE.bazel`).
-  The harness runs `cube workspace rebase`; for each `REBASED_WITH_CONFLICTS` file it asks the registry. **If, and only if, _every_ conflicted file is resolved by some resolver**, it commits, pushes, comments, and auto-retires — no agent, zero tokens. If any file is declined, it discards rung-0 partial work and climbs. Deterministic resolvers are structurally _preserving_ (they represent both sides), so they pass the T2253 tripwire by construction — but the tripwire still runs on the result (see composition below). Later resolvers (behind telemetry): reformat-only conflicts (`rustfmt` reflow), regenerable generated code, and pure-append registry unions where both sides only added distinct entries. **New resolvers are authored by agents** — direction 1's automation files "write a resolver for class X" tasks as telemetry surfaces new formulaic classes. That is the direction-1↔direction-5 loop the operator called out.
+  The harness runs `cube workspace rebase`; for each `REBASED_WITH_CONFLICTS` file it asks the registry. **If, and only if, _every_ conflicted file is resolved by some resolver**, it commits, pushes, comments, and auto-retires — no agent, zero tokens. If any file is declined, it discards rung-0 partial work and climbs. Deterministic resolvers are structurally _preserving_ (they represent both sides), so they pass the T2253 tripwire by construction — but the tripwire still runs on the result (see composition below). Later built-ins (behind telemetry): reformat-only conflicts (`rustfmt` reflow), regenerable generated code, and pure-append registry unions where both sides only added distinct entries. **New resolvers are authored by agents** — direction 1's automation files "write a resolver for class X" tasks as telemetry surfaces new formulaic classes. That is the direction-1↔direction-5 loop the operator called out.
+
+**Extension mechanism — declarative resolution recipes.** Beyond code resolvers compiled into boss, the natural extension point is a **declarative recipe**: a mapping from a file pattern to a resolution formula, e.g. "for `*.lock`: discard the conflicted file, run `<command>`, verify with `<command>`." Two candidate homes, not mutually exclusive:
+
+- **In the target repo** (e.g. a `.boss/conflict-recipes.toml`): the repo declares how its own generated/formulaic files regenerate. Best locality — the knowledge lives next to the tooling it describes, travels with the repo, and repo owners extend it without touching boss.
+- **In boss product config**: the operator declares recipes per product. Safer trust model — recipes execute commands in the workspace, and boss-side config means a PR to the target repo cannot alter what the engine will execute on the next conflict (a repo-side recipe file is attacker-adjacent input in a world of agent-authored PRs).
+
+The recommendation is to design the recipe format alongside T2's trait (a recipe is just a data-driven `DeterministicResolver` implementation — one generic "recipe resolver" interprets all recipes), ship boss-side product config first (trust-simple), and treat in-repo recipe files as a follow-up that must answer the trust question explicitly (e.g. only honor recipes already present on `main`, never from the PR branch). Recipes are deliberately **not** a v1 blocker — the built-in resolver set covers the measured hotspots — but the trait and telemetry are shaped so recipes drop in without rework (tracked as T13).
 
 **Rung 1 — Engine-direct structural rebase (directions 3 & 4).** This is `auto_rebase`'s existing engine-direct tier, promoted onto the `conflict_watch` path. Run `cube workspace rebase` engine-side (not via an agent). Because jj represents conflicts first-class and does a real 3-way structural merge, two things happen for free: (a) if GitHub's `CONFLICTING` was stale or the overlap was only apparent, it returns `REBASED_CLEAN` → done, no agent; (b) non-overlapping hunks in the "same file" auto-resolve, leaving only genuinely overlapping hunks — this is the operator's "auto-resolve trivially non-overlapping conflicts" for free. Whatever files remain conflicted after rung 1 are the residue that climbs to rung 2. (Rungs 0 and 1 interleave in practice: rung 0 runs against the post-rung-1 residue; the harness attempts the mechanical rebase, then hands the still-conflicted files to the resolver registry.)
 
@@ -217,7 +226,12 @@ Ship one resolver first — **lockfiles** — because the data says it is the si
 - **Small + cheap.** `effort_level = small`, a `model_override` to a fast model; a tight prompt that says "resolve _only_ these conflicted hunks; the diagnosis is inline; do not author new work; the preservation rule (T2253 P1) applies." Bounded scope, bounded model, bounded prompt.
 - It resolves the hunks and returns; it does not re-plan the PR.
 
-**Rung 3 — Full worker (unchanged fallback).** Reached only when rung 2 declines (large/architectural conflict, or a stop condition like `product_decision_required`). Identical to today's path except it inherits the pre-staged workspace and — once T2253 lands — the hardened preservation brief.
+**Rung 3 — Full worker (unchanged fallback).** Reached two ways:
+
+- **Decline** — rung 2 declines the conflict up front (large/architectural conflict, or a stop condition like `product_decision_required`).
+- **Escalation on review rejection** — a lower rung _completed_ a resolution, but post-resolution review rejected it: the T2253 deletion tripwire fired, the build gate failed, or an AI review agent examining the resolution judged it wrong. In that case the conflict escalates to rung 3 **with the review findings attached to the brief** — it does not retry the same rung, and it does not loop. This is the safety net for making rung 2 faster and simpler: we have prior incidents of resolution agents doing destructive things to make a conflict go away (incident-002's agent deleted merged functionality, and review blessed it), and a cheaper/faster rung-2 agent _raises_ that risk. Escalation-on-rejection bounds it — a bad cheap resolution costs one review round and then gets the full-strength path, never a merge.
+
+Rung 3 itself is identical to today's path except it inherits the pre-staged workspace, the review findings when escalated, and — once T2253 lands — the hardened preservation brief.
 
 **Escalation is telemetry-visible:** each rung records its outcome (Layer 0), so we can see, e.g., "62% of conflicts resolve at rung 0/1 with no agent" and target the rest.
 
@@ -260,6 +274,7 @@ This is the load-bearing constraint, stated explicitly because "faster/lighter r
 
 - **The gates run on the _result_, not the rung.** T2253's P2 both-parents deletion tripwire diffs the resolution against _both_ merge parents and halts on any net removal of merged functionality. That check is indifferent to whether rung 0, 1, 2, or 3 produced the diff. So every rung — including the free deterministic ones — routes its output through the _same_ tripwire and the _same_ build gate before auto-retiring. Speed changes _who resolves_; it does not change _what is verified_.
 - **Deterministic resolvers are preserving by construction**, so they should pass the tripwire cleanly — but we do **not** skip the tripwire for them (that would be a bypass). If a deterministic resolver ever produces a net deletion, that is a resolver bug the tripwire _should_ catch.
+- **A gate or review rejection escalates; it never retries the same rung.** When any rung's completed resolution is rejected — tripwire, build gate, or AI reviewer — the conflict climbs to rung 3 with the findings attached (see rung 3). The cheap rungs get exactly one shot; the safety net is escalation, not iteration on the cheap path.
 - **Rung 2's small agent inherits the preservation brief.** Once T2253's P1 preservation clause exists, the small-agent prompt includes it verbatim; the small agent is _more_ constrained than today's worker (bounded to the conflicted hunks), not less.
 - **Ordering dependency.** The safety-critical integration point (routing every rung through the tripwire, adding the preservation clause to the small-agent prompt) has an explicit external dependency on **T2253's P2/P1 landing**. It is called out as such in the task breakdown. Until T2253 lands, rungs 0/1 still run (they are preserving) but rung 2's prompt uses today's brief and the result still passes today's checks.
 
@@ -270,7 +285,7 @@ The in-review conflict design already defines a cross-flow precedence `rebase > 
 ### Phased rollout (summary)
 
 1. **Phase 1 (measurement):** Layer 0 — telemetry coverage + hotspot report + counters.
-2. **Phase 2 (the big win):** Layer 1 rungs 0 (lockfile resolver) and 1 (engine-direct rebase) on the `conflict_watch` path. This alone should take the ~8%+ mechanical fraction to zero-agent, instantly.
+2. **Phase 2 (the big win):** Layer 1 rungs 0 (resolver framework + built-in lockfile resolvers) and 1 (engine-direct rebase) on the `conflict_watch` path. This alone should take the ~8%+ mechanical fraction to zero-agent, instantly.
 3. **Phase 3:** Layer 1 rung 2 (pre-staged small agent) + the T2253 integration.
 4. **Phase 4:** Layer 2 (refactoring automation) — starts paying down structural frequency once the hotspot report exists.
 5. **Phase 5:** Layer 3 (conflict-aware scheduling), expander hint first, then the `merge_order` relation.
@@ -281,8 +296,9 @@ The in-review conflict design already defines a cross-flow precedence `rebase > 
 ## Risks / open questions
 
 - **Deterministic lockfile regeneration runs a build tool.** `cargo generate-lockfile` / the bazel lockfile update run a real command with a real dependency graph. Risks: it is slower than a text merge (still far faster and cheaper than an agent), it can _itself_ fail if the merged manifest is inconsistent (then rung 0 declines and we climb — safe), and it must run in the leased workspace with the right toolchain. Open question: do we auto-apply a regenerated lockfile with no agent/human in the loop, trusting the build gate to catch a bad regen, or gate the first N auto-regens behind a light review? (See attentions.)
+- **Declarative recipes execute commands.** A resolution recipe (rung 0's extension mechanism) is ultimately "run this command in the workspace when this file conflicts." Boss-side product config is the trust-simple home (only the operator writes it). An in-repo recipe file is more convenient but is attacker-adjacent input in a world of agent-authored PRs — a PR could rewrite the recipe the engine will execute. Open question: if/when we honor in-repo recipes, is "only read the recipe file as it exists on `main`, never from the PR branch" a sufficient trust boundary, or do recipes need operator approval on change? (See T13; boss-config-first sidesteps this for v1.)
 - **The `REBASED_CLEAN`-after-`CONFLICTING` case.** GitHub says `CONFLICTING` but jj rebases clean surprisingly often (different merge algorithms). Rung 1 turns those into instant no-agent retires — but we should confirm the frequency (telemetry will) so we size the win correctly.
-- **Rung 2 model choice.** Which fast model for the small resolution agent, and do we trust it on multi-file semantic conflicts or cap it to single-file? A too-cheap model that resolves badly just gets caught by the tripwire and re-escalates — annoying but safe. Open question in attentions.
+- **Rung 2 model choice.** Which fast model for the small resolution agent, and do we trust it on multi-file semantic conflicts or cap it to single-file? A too-cheap model that resolves badly gets caught by post-resolution review and escalates to rung 3 with the findings (escalation-on-rejection) — one wasted review round, but never a bad merge. Open question in attentions.
 - **Direction 2 overlap prediction is fuzzy.** The expander's file-overlap guess is a prompt-level heuristic; it will have false positives (unnecessary `merge_order` edges — harmless, they don't block) and false negatives (missed pairs — no worse than today). The `merge_order` edge is cheap enough that erring toward more edges is fine. The _stagger_ knob is the risky part (it does delay dispatch), which is why it defaults off and is hard-capped.
 - **Automation churn.** A refactoring automation that files too aggressively could itself generate conflicts (a hotspot-split PR is a big diff). `open_task_limit = 1` and a "don't re-target what recent chores addressed" instruction bound this; still, the automation's own PRs want priority/scheduling care so they land before they rot.
 - **Sequencing against T2253.** The safety integration (rung outputs → tripwire, preservation clause in the small-agent prompt) depends on T2253 landing. If this project moves faster than T2253, we ship rungs 0/1 (preserving, safe under today's checks) and hold rung 2's prompt hardening until P1 exists. Do reviewers want a hard gate on T2253 before _any_ ladder work, or is the rung-0/1-first sequencing acceptable? (See attentions.)
@@ -297,12 +313,12 @@ PR-sized tasks in dependency order. Dependencies reference task names; "none" me
 ### Depth 0 — may all run in parallel (no dependencies)
 
 **T1. Conflict telemetry: coverage + schema**
-Scope: Extend conflict recording so it captures the two blind spots — producer-side conflicts (a normal worker's `cube workspace rebase` returning `REBASED_WITH_CONFLICTS`) and a per-event `conflict_class` + `resolved_by_rung` field. Reuse the `conflict_resolutions` table / `ConflictDiagnosis` substrate; add columns, not a new table. No aggregation yet.
+Scope: Extend conflict recording so it captures the two blind spots — producer-side conflicts (a normal worker's `cube workspace rebase` returning `REBASED_WITH_CONFLICTS`) and a per-event `conflict_class` + `resolved_by_rung` field. Reuse the `conflict_resolutions` table / `ConflictDiagnosis` substrate; add columns, not a new table. Every record must be attributable to a product (via its PR/task) so all downstream aggregation and counters can scope per-product. No aggregation yet.
 Effort hint: `medium`.
 Dependencies: none.
 
-**T2. Deterministic resolver framework + lockfile resolver (rung 0)**
-Scope: Introduce the `DeterministicResolver` registry (trait, class enum, dispatch by `ConflictedFile`) as its own crate (per the crate-per-unit convention). Ship the lockfile resolver (`Cargo.lock` + `MODULE.bazel.lock` regenerate-from-merged-manifest). Unit-tested standalone against fixture conflicts; not yet wired into `conflict_watch` (that is T4).
+**T2. Deterministic resolver framework + built-in lockfile resolvers (rung 0)**
+Scope: Introduce the `DeterministicResolver` registry (trait, class enum, dispatch by `ConflictedFile`) as its own crate (per the crate-per-unit convention). The framework is the deliverable: engine core stays agnostic to repo tooling, all format knowledge lives in registered resolvers, and the registry is the future user-extension seam (T13's recipes become one generic resolver behind it). Ship the built-in lockfile resolvers (`Cargo.lock` + `MODULE.bazel.lock` regenerate-from-merged-manifest) as the first instances. Unit-tested standalone against fixture conflicts; not yet wired into `conflict_watch` (that is T4).
 Effort hint: `medium`.
 Dependencies: none.
 
@@ -314,12 +330,12 @@ Dependencies: none (coordinate with T2253's P5-lite so they are the same change)
 ### Depth 1
 
 **T4. Escalation-ladder harness: rungs 0 + 1 on the `conflict_watch` path**
-Scope: Insert the ladder state machine into `conflict_watch::on_conflict_detected` _before_ `maybe_spawn_conflict_revision`. Run engine-direct `cube workspace rebase` (rung 1); on `REBASED_CLEAN` auto-retire with no agent; feed residual conflicted files to the T2 resolver registry (rung 0); if all resolved, commit/push/comment/auto-retire; else fall through to the existing worker spawn. Reuse `auto_rebase`'s engine-direct tier and the conflict-diagnosis collector. Record rung outcomes via T1.
+Scope: Insert the ladder state machine into `conflict_watch::on_conflict_detected` _before_ `maybe_spawn_conflict_revision`. Run engine-direct `cube workspace rebase` (rung 1); on `REBASED_CLEAN` auto-retire with no agent; feed residual conflicted files to the T2 resolver registry (rung 0); if all resolved, commit/push/comment/auto-retire; else fall through to the existing worker spawn. The harness owns escalation-on-rejection: when a rung's completed resolution is rejected post-resolution (build gate now; tripwire/AI review once T9 lands), escalate to rung 3 with the findings attached — never retry the same rung. Reuse `auto_rebase`'s engine-direct tier and the conflict-diagnosis collector. Record rung outcomes via T1.
 Effort hint: `large`.
 Dependencies: T1, T2.
 
 **T5. Hotspot aggregation report + counters**
-Scope: Build the query surface over `conflict_resolutions.conflict_diagnosis` — per-file frequency, per-file-pair co-conflict frequency, per-class counts — exposed as `boss engine conflicts hotspots` (machine-readable). Add per-class `register_counter!` counters alongside `CONFLICT_FLAGGED`. Consumes the richer records from T1 (and, once T4 lands, the rung mix).
+Scope: Build the query surface over `conflict_resolutions.conflict_diagnosis` — per-file frequency, per-file-pair co-conflict frequency, per-class counts — exposed as `boss engine conflicts hotspots` (machine-readable, scoped per-product). Add per-class conflict counters alongside `CONFLICT_FLAGGED`; per the Layer 0 hard requirement they must be scopable per-product (per-product-keyed counters, or the counter framework's deferred dimension follow-up). Consumes the richer records from T1 (and, once T4 lands, the rung mix).
 Effort hint: `small`.
 Dependencies: T1.
 
@@ -347,7 +363,7 @@ Effort hint: `large`.
 Dependencies: T3, T1 (overlap/telemetry signal).
 
 **T9. T2253 safety integration for the ladder**
-Scope: Ensure every rung's output routes through T2253's P2 both-parents deletion tripwire and the build gate before auto-retiring, and add T2253's P1 preservation clause to the rung-2 small-agent prompt. Thin integration + tests asserting a deletion produced by _any_ rung is halted identically. Explicit **external dependency on T2253 (P1/P2) landing**; until then, rungs 0/1 run under today's checks and this task is blocked.
+Scope: Ensure every rung's output routes through T2253's P2 both-parents deletion tripwire and the build gate before auto-retiring, and add T2253's P1 preservation clause to the rung-2 small-agent prompt. Wire tripwire/AI-review rejections into T4's escalation-on-rejection path so a rejected resolution escalates to rung 3 with the review findings attached. Thin integration + tests asserting a deletion produced by _any_ rung is halted identically and escalates rather than retries. Explicit **external dependency on T2253 (P1/P2) landing**; until then, rungs 0/1 run under today's checks and this task is blocked.
 Effort hint: `medium`.
 Dependencies: T6; **external: T2253 (P1/P2)**.
 
@@ -365,10 +381,15 @@ Scope: When two in-flight branches are predicted to conflict, offer to convert t
 Effort hint: `large`.
 Dependencies: T10, `auto-rebase-stacked-prs` shipped.
 
-**T12. Additional deterministic resolvers (Layer 1 rung 0, ongoing)** — `future / not a v1 blocker`.
+**T12. Additional built-in deterministic resolvers (Layer 1 rung 0, ongoing)** — `future / not a v1 blocker`.
 Scope: As telemetry (T5) surfaces new formulaic classes, author resolvers for reformat-only conflicts, regenerable generated code, and pure-append registry unions. Each is a small task; these are the tasks the T7 automation files over time (the direction-1↔direction-5 loop).
 Effort hint: `small` (each).
 Dependencies: T5 (to identify the class), T2 (the framework).
+
+**T13. Declarative resolution recipes (rung 0 extension mechanism)** — `future / not a v1 blocker`.
+Scope: Design and implement the declarative recipe format (file-pattern → resolution formula) as one generic recipe-interpreting `DeterministicResolver` behind the T2 registry. Boss-side product config first; in-repo recipe files only after the trust question (recipes execute commands; agent-authored PRs could rewrite a repo-side file) is answered explicitly — e.g. only honoring recipes as they exist on `main`. This is what makes rung 0 user-extensible without a boss code change.
+Effort hint: `medium`.
+Dependencies: T2 (the framework), T4 (the harness that invokes it).
 
 ### Dependency graph at a glance
 
@@ -381,7 +402,7 @@ Depth 2:     T6               T7   |        (T6, T7 parallel)
               |                     |
 Depth 3:     T9*  ┌──────────────── T8      (T8, T9 parallel; T9 also needs T2253)
                   (T8 needs T3+T1)
-Future:   T10 (needs T4,T5) → T11 ;  T12 (needs T2,T5)
+Future:   T10 (needs T4,T5) → T11 ;  T12 (needs T2,T5) ;  T13 (needs T2,T4)
 ```
 
 `*` T9 additionally gated on external **T2253 (P1/P2)**.
