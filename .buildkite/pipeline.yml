@@ -15,16 +15,8 @@ steps:
     agents:
       queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
-      # Additive during the required-checks rename: this step also still posts the two
-      # legacy contexts branch protection currently requires, so this PR (and any other
-      # in-flight PR) keeps satisfying required_status_checks until an operator flips
-      # branch protection to the new context. See .buildkite/REQUIRED_CHECKS.md.
       - github_commit_status:
           context: "buildkite/mono/bazel-build-test"
-      - github_commit_status:
-          context: "buildkite/mono/bazel-build"
-      - github_commit_status:
-          context: "buildkite/mono/bazel-test"
 
   - label: ":apple: mac-app-build"
     key: "mac-app-build"

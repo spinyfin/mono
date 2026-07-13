@@ -12,14 +12,11 @@ Buildkite emits check names in the form `buildkite/mono/<step-key>`, where `<ste
 
 These checks are currently **required** by branch protection on `main` (block merge if red):
 
-| Check name                     | Step key in pipeline.yml |
-| ------------------------------ | ------------------------ |
-| `buildkite/mono/bazel-build`   | `bazel-build-test`       |
-| `buildkite/mono/bazel-test`    | `bazel-build-test`       |
-| `buildkite/mono/mac-app-build` | `mac-app-build`          |
-| `buildkite/mono/checks`        | `checks`                 |
-
-`bazel-build-test` is mid-rename: the step now _also_ emits `buildkite/mono/bazel-build-test`, but branch protection has not been flipped to require it yet (see "Rollout: rename in progress" below), so the two legacy contexts above are still the ones GitHub actually enforces today.
+| Check name                        | Step key in pipeline.yml |
+| --------------------------------- | ------------------------ |
+| `buildkite/mono/bazel-build-test` | `bazel-build-test`       |
+| `buildkite/mono/mac-app-build`    | `mac-app-build`          |
+| `buildkite/mono/checks`           | `checks`                 |
 
 ## How contexts are emitted
 
@@ -29,14 +26,14 @@ Each gating step in `pipeline.yml` carries one explicit `notify: github_commit_s
 
 The resulting context names are `buildkite/mono/<step-key>` — e.g. `buildkite/mono/checks`.
 
-## Rollout: rename in progress (`bazel-build` + `bazel-test` → `bazel-build-test`)
+## Rollout: rename complete (`bazel-build` + `bazel-test` → `bazel-build-test`)
 
-Since the build+test consolidation, `bazel-build-test` kept emitting the two legacy `buildkite/mono/bazel-build` / `buildkite/mono/bazel-test` contexts (via two `notify` entries), purely so branch protection didn't need to change in the same PR as the pipeline consolidation. That rename is now being completed using the **additive** pattern from the rename contract below, so no PR is ever stranded mid-flight:
+The rename from the legacy `bazel-build` / `bazel-test` contexts to the consolidated `bazel-build-test` context is complete:
 
-1. `bazel-build-test` emits **all three** contexts (`bazel-build`, `bazel-test`, and the new `bazel-build-test`) at once — this PR. Branch protection still requires only the two legacy contexts, so this PR (and any other open PR) keeps satisfying `required_status_checks` throughout.
-2. Confirm `buildkite/mono/bazel-build-test` posts as a real, resolving check on this PR's own build.
-3. An operator with admin on `spinyfin/mono` flips `required_status_checks` to require `buildkite/mono/bazel-build-test` instead of the two legacy contexts (exact command in the PR description). This can happen either before or after step 1 merges, since the step already emits all three contexts.
-4. A follow-up PR removes the two legacy `notify` entries from the `bazel-build-test` step, now that branch protection no longer requires them.
+1. `bazel-build-test` emitted all three contexts (`bazel-build`, `bazel-test`, and the new `bazel-build-test`) during the transition, so no in-flight PR was ever stranded against `required_status_checks`.
+2. `buildkite/mono/bazel-build-test` was confirmed posting as a real, resolving check on recent `main` commits.
+3. An operator with admin on `spinyfin/mono` flipped `required_status_checks` on 2026-07-13 to require `buildkite/mono/bazel-build-test`, `buildkite/mono/mac-app-build`, and `buildkite/mono/checks`; the two legacy contexts are no longer required.
+4. The `bazel-build-test` step's two legacy `notify` entries have been removed, since branch protection no longer requires them.
 
 ## Rename contract
 
