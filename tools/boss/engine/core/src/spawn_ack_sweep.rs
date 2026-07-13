@@ -830,6 +830,82 @@ mod tests {
         );
     }
 
+    /// Regression for the case where an *operator* pause is already active
+    /// (which exempts `pr_review` executions from dispatch) when the app
+    /// spawn path independently breaks. Before this fix, `record_failure`
+    /// events feeding `trip_spawn_capability_circuit` would see
+    /// `is_dispatch_paused() == true` and skip — never escalating the pause
+    /// to `Breaker` origin, so reviews kept dispatching into a known-dead
+    /// spawn path forever. The breaker must instead detect "paused but still
+    /// review-exempt" and escalate: flip the origin to `Breaker` so reviews
+    /// stop being exempt too.
+    #[tokio::test]
+    async fn breaker_escalates_operator_pause_to_clear_review_exemption() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let db = Arc::new(db);
+
+        let mut execution_ids = Vec::new();
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        for slot in 1u8..=3 {
+            let work_item_id = create_active_chore(&db, &product_id, &format!("chore {slot}"));
+            let execution_id = create_old_execution(&db, &work_item_id);
+            register_slot_zero_pid(&live_states, slot, &execution_id, &work_item_id);
+            execution_ids.push(execution_id);
+        }
+
+        let coordinator = make_coordinator(db.clone(), 3);
+        for execution_id in &execution_ids {
+            coordinator.worker_pool().claim_worker(execution_id, None).await;
+        }
+
+        // Operator pause is already active before the spawn path breaks —
+        // this is what exempts pr_review executions from the pause.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        coordinator.set_dispatch_paused(
+            true,
+            now.max(0) as u64,
+            crate::coordinator::DispatchPauseOrigin::Operator,
+        );
+        assert!(
+            coordinator.dispatch_pause_exempts_reviews(),
+            "precondition: operator pause exempts reviews"
+        );
+
+        let spawn_health = SpawnHealthTracker::with_config(3, 300);
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &spawn_health,
+            SPAWN_ACK_GRACE_SECS,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 3, "every silent spawn is reaped");
+        assert!(coordinator.is_dispatch_paused(), "dispatch remains paused");
+        assert!(
+            !coordinator.dispatch_pause_exempts_reviews(),
+            "breaker trip must escalate an operator pause to Breaker origin, clearing the \
+             review exemption so reviews stop dispatching into the dead spawn path",
+        );
+
+        let events = sink.events().await;
+        let unhealthy: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "spawn_capability_unhealthy")
+            .collect();
+        assert_eq!(
+            unhealthy.len(),
+            1,
+            "the breaker trip must still raise its loud signal despite the pre-existing pause",
+        );
+    }
+
     /// The fast-fail NACK path: `reap_never_started_spawn` with the `AppNack`
     /// cause (what `handle_report_worker_spawn_failed` calls) reaps the
     /// execution immediately, orphans it, releases the slot, and emits a

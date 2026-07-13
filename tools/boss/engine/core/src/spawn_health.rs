@@ -131,10 +131,18 @@ impl SpawnHealthTracker {
 /// Act on a tripped spawn-capability breaker: pause dispatch and raise the one
 /// loud signal.
 ///
-/// Idempotent via the global dispatch-pause flag — if dispatch is already
-/// paused (whether by an earlier trip or a human), this is a no-op, so
-/// repeated failures while the app is wedged never spam attention items. The
-/// pause is persisted through the same metadata keys the human toggle
+/// Idempotent only once dispatch is already paused with review-exemption OFF
+/// (i.e. a prior breaker trip, or a human pause that has already been
+/// escalated) — that is a no-op, so repeated failures while the app is
+/// wedged never spam attention items. But an *operator* pause exempts
+/// `pr_review` executions ([`ExecutionCoordinator::dispatch_pause_exempts_reviews`]),
+/// so if the app spawn path is also broken during an operator pause, reviews
+/// would otherwise keep dispatching into the dead path and keep tripping this
+/// function forever. In that case this still escalates: it re-pauses with
+/// [`DispatchPauseOrigin::Breaker`] (clearing the review exemption) and
+/// raises the attention item, rather than skipping as a duplicate.
+///
+/// The pause is persisted through the same metadata keys the human toggle
 /// (`handle_set_dispatch_paused`) uses, so an engine restart mid-outage does
 /// not resume churning.
 ///
@@ -151,10 +159,10 @@ pub async fn trip_spawn_capability_circuit(
     distinct_work_items: usize,
     now_epoch_secs: i64,
 ) {
-    if coordinator.is_dispatch_paused() {
+    if coordinator.is_dispatch_paused() && !coordinator.dispatch_pause_exempts_reviews() {
         tracing::debug!(
             tripping_execution_id,
-            "spawn-capability breaker: dispatch already paused; skipping duplicate trip",
+            "spawn-capability breaker: dispatch already paused (non-exempt); skipping duplicate trip",
         );
         return;
     }
