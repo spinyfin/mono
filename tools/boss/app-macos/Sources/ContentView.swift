@@ -2493,6 +2493,7 @@ struct WorkBoardCardView: View {
                 HStack(alignment: .center, spacing: 6) {
                     if mergeQueueState == "queued" {
                         PrMergingIndicator(detail: mergeQueueDetail)
+                            .layoutPriority(-1)
                     } else if let ciState = ciRequiredState {
                         PrCiIndicator(state: ciState, detail: ciRequiredDetail)
                     }
@@ -2501,6 +2502,7 @@ struct WorkBoardCardView: View {
                         font: .caption,
                         ambiguousRepoNames: ambiguousRepoNames
                     )
+                    .layoutPriority(1)
                     if task.hasInProgressRevision {
                         PrInRevisionIndicator()
                             .onHover { hovering in
@@ -5174,13 +5176,13 @@ private struct PrMergingIndicator: View {
             Text(chipText)
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
+                .truncationMode(.tail)
         }
         .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(backgroundColor)
         .clipShape(Capsule())
-        .fixedSize()
         .help(tooltipText)
         .accessibilityLabel("In merge queue — \(chipText)")
     }
