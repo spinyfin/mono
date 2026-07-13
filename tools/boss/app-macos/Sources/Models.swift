@@ -814,6 +814,11 @@ struct WorkTask: Identifiable, Hashable {
     /// GitHub's merge queue; `nil` when not queued or the repo has no merge
     /// queue. Replaces the CI indicator on Review-lane cards while merging.
     var mergeQueueState: String? = nil
+    /// JSON-encoded merge-queue sub-state: `{"position", "state",
+    /// "enqueued_at"}`. `nil` unless `mergeQueueState == "queued"`. Parsed by
+    /// `MergeQueueDetail.parse(json:)` for the Review card's merging
+    /// indicator ("queue position N, awaiting checks").
+    var mergeQueueDetail: String? = nil
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil

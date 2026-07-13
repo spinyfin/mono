@@ -41,6 +41,9 @@ fn probe(pr_url: &str, head_sha: &str) -> PrLifecycleProbe {
         labels: Vec::new(),
         review: crate::merge_poller::PrReviewState::Unknown,
         in_merge_queue: false,
+        merge_queue_entry_state: None,
+        merge_queue_position: None,
+        merge_queue_enqueued_at: None,
         raw_mergeable: String::new(),
         raw_merge_state_status: String::new(),
     }
@@ -57,6 +60,9 @@ fn probe_with_labels(pr_url: &str, head_sha: &str, labels: &[&str]) -> PrLifecyc
         labels: labels.iter().map(|s| (*s).to_owned()).collect(),
         review: crate::merge_poller::PrReviewState::Unknown,
         in_merge_queue: false,
+        merge_queue_entry_state: None,
+        merge_queue_position: None,
+        merge_queue_enqueued_at: None,
         raw_mergeable: String::new(),
         raw_merge_state_status: String::new(),
     }

@@ -203,13 +203,25 @@ fn poll_ts(db: &WorkDb, task_id: &str) -> Option<String> {
         .unwrap()
 }
 
+/// Build a [`PrPollStateInput`] with just `ci_required_state` /
+/// `review_required_state` set and every other field defaulted (`None`).
+/// Cuts the boilerplate for the majority of test call sites below that don't
+/// exercise the merge-queue dimension.
+fn ci_review_input<'a>(ci_required_state: &'a str, review_required_state: &'a str) -> PrPollStateInput<'a> {
+    PrPollStateInput {
+        ci_required_state,
+        review_required_state,
+        ..Default::default()
+    }
+}
+
 /// First probe after migration: the state moves from NULL → set, so `changed`
 /// is true, `prior_ci_state` is None, and the poll timestamp is stamped.
 #[test]
 fn poll_state_first_probe_reports_change_with_null_prior() {
     let (db, _p, chore_id) = setup_product_and_chore();
     let out = db
-        .update_task_pr_poll_state(&chore_id, "success", "approved", None, None, None)
+        .update_task_pr_poll_state(&chore_id, ci_review_input("success", "approved"))
         .unwrap();
     assert!(out.changed, "first probe (NULL → set) must count as changed");
     assert!(
@@ -228,8 +240,13 @@ fn poll_state_first_probe_reports_change_with_null_prior() {
 #[test]
 fn poll_state_unchanged_probe_still_stamps_timestamp() {
     let (db, _p, chore_id) = setup_product_and_chore();
-    db.update_task_pr_poll_state(&chore_id, "success", "approved", None, None, Some("mergeable"))
-        .unwrap();
+    let input = PrPollStateInput {
+        ci_required_state: "success",
+        review_required_state: "approved",
+        merge_queue_state: Some("mergeable"),
+        ..Default::default()
+    };
+    db.update_task_pr_poll_state(&chore_id, input).unwrap();
     // Clear the stamp so we can prove the *unchanged* probe re-stamps it.
     db.connect()
         .unwrap()
@@ -239,9 +256,7 @@ fn poll_state_unchanged_probe_still_stamps_timestamp() {
         )
         .unwrap();
 
-    let out = db
-        .update_task_pr_poll_state(&chore_id, "success", "approved", None, None, Some("mergeable"))
-        .unwrap();
+    let out = db.update_task_pr_poll_state(&chore_id, input).unwrap();
     assert!(!out.changed, "an identical probe must report changed = false");
     assert_eq!(
         out.prior_ci_state.as_deref(),
@@ -261,38 +276,124 @@ fn poll_state_unchanged_probe_still_stamps_timestamp() {
 fn poll_state_change_detection_across_dimensions() {
     let (db, _p, chore_id) = setup_product_and_chore();
     // Baseline.
-    db.update_task_pr_poll_state(&chore_id, "failure", "pending", None, None, None)
+    db.update_task_pr_poll_state(&chore_id, ci_review_input("failure", "pending"))
         .unwrap();
 
     // Only the review dimension moves.
     let out = db
-        .update_task_pr_poll_state(&chore_id, "failure", "approved", None, None, None)
+        .update_task_pr_poll_state(&chore_id, ci_review_input("failure", "approved"))
         .unwrap();
     assert!(out.changed, "a review-state change must count as changed");
     assert_eq!(out.prior_ci_state.as_deref(), Some("failure"));
 
     // Only the merge-queue dimension moves.
-    let out = db
-        .update_task_pr_poll_state(&chore_id, "failure", "approved", None, None, Some("queued"))
-        .unwrap();
+    let queued_failure = PrPollStateInput {
+        ci_required_state: "failure",
+        review_required_state: "approved",
+        merge_queue_state: Some("queued"),
+        ..Default::default()
+    };
+    let out = db.update_task_pr_poll_state(&chore_id, queued_failure).unwrap();
     assert!(out.changed, "a merge-queue-state change must count as changed");
 
     // Nothing moves → not changed.
-    let out = db
-        .update_task_pr_poll_state(&chore_id, "failure", "approved", None, None, Some("queued"))
-        .unwrap();
+    let out = db.update_task_pr_poll_state(&chore_id, queued_failure).unwrap();
     assert!(!out.changed, "an identical probe must not count as changed");
 
     // fail → success: prior_ci_state must still report the pre-update 'failure'
     // so the caller can clear a stale "ci failing" badge.
-    let out = db
-        .update_task_pr_poll_state(&chore_id, "success", "approved", None, None, Some("queued"))
-        .unwrap();
+    let queued_success = PrPollStateInput {
+        ci_required_state: "success",
+        review_required_state: "approved",
+        merge_queue_state: Some("queued"),
+        ..Default::default()
+    };
+    let out = db.update_task_pr_poll_state(&chore_id, queued_success).unwrap();
     assert!(out.changed, "a ci fail → success transition must count as changed");
     assert_eq!(
         out.prior_ci_state.as_deref(),
         Some("failure"),
         "prior_ci_state must expose the previous 'failure' for fail → success detection"
+    );
+}
+
+/// `merge_queue_detail` (the JSON sub-state blob: queue position, GitHub's
+/// raw entry state, enqueued-at) persists alongside `merge_queue_state` and
+/// independently drives `changed` — a position tick with no other dimension
+/// moving must still be observable so the Review card can refresh.
+#[test]
+fn poll_state_merge_queue_detail_persists_and_drives_change() {
+    let (db, _p, chore_id) = setup_product_and_chore();
+    let detail_v1 = r#"{"position":3,"state":"QUEUED","enqueued_at":"2026-07-10T11:54:54Z"}"#;
+    let out = db
+        .update_task_pr_poll_state(
+            &chore_id,
+            PrPollStateInput {
+                ci_required_state: "success",
+                review_required_state: "approved",
+                merge_queue_state: Some("queued"),
+                merge_queue_detail: Some(detail_v1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(out.changed, "first write of merge_queue_detail must count as changed");
+
+    let stored: Option<String> = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT merge_queue_detail FROM tasks WHERE id = ?1",
+            params![chore_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(detail_v1),
+        "merge_queue_detail must be persisted verbatim"
+    );
+
+    // Same merge_queue_state ("queued"), but the position ticked down — this
+    // alone must count as changed even though every other dimension is stable.
+    let detail_v2 = r#"{"position":1,"state":"AWAITING_CHECKS","enqueued_at":"2026-07-10T11:54:54Z"}"#;
+    let out = db
+        .update_task_pr_poll_state(
+            &chore_id,
+            PrPollStateInput {
+                ci_required_state: "success",
+                review_required_state: "approved",
+                merge_queue_state: Some("queued"),
+                merge_queue_detail: Some(detail_v2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        out.changed,
+        "a merge_queue_detail change alone (position/state) must count as changed"
+    );
+
+    // Dequeued: merge_queue_state clears and detail clears with it.
+    let out = db
+        .update_task_pr_poll_state(&chore_id, ci_review_input("success", "approved"))
+        .unwrap();
+    assert!(
+        out.changed,
+        "clearing merge_queue_state/detail on dequeue must count as changed"
+    );
+    let stored: Option<String> = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT merge_queue_detail FROM tasks WHERE id = ?1",
+            params![chore_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored, None,
+        "merge_queue_detail must clear when the PR leaves the queue"
     );
 }
 
@@ -310,7 +411,7 @@ fn poll_state_deleted_or_absent_row_is_noop() {
         )
         .unwrap();
     let out = db
-        .update_task_pr_poll_state(&chore_id, "success", "approved", None, None, None)
+        .update_task_pr_poll_state(&chore_id, ci_review_input("success", "approved"))
         .unwrap();
     assert!(!out.changed, "a soft-deleted row must not count as changed");
     assert!(
@@ -323,7 +424,7 @@ fn poll_state_deleted_or_absent_row_is_noop() {
     );
 
     let out = db
-        .update_task_pr_poll_state("chr_does_not_exist", "success", "approved", None, None, None)
+        .update_task_pr_poll_state("chr_does_not_exist", ci_review_input("success", "approved"))
         .unwrap();
     assert!(!out.changed, "an absent row must not count as changed");
     assert!(out.prior_ci_state.is_none(), "an absent row yields no prior ci state");

@@ -802,15 +802,7 @@ impl WorkDb {
     /// a stale "ci failing" badge away during the poll we already do. Per-task
     /// poll writes are serialised by the sweep loop, so the read-then-write is
     /// race-free in practice.
-    pub fn update_task_pr_poll_state(
-        &self,
-        work_item_id: &str,
-        ci_required_state: &str,
-        review_required_state: &str,
-        ci_required_detail: Option<&str>,
-        review_required_detail: Option<&str>,
-        merge_queue_state: Option<&str>,
-    ) -> Result<PrPollStateOutcome> {
+    pub fn update_task_pr_poll_state(&self, work_item_id: &str, input: PrPollStateInput) -> Result<PrPollStateOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -832,29 +824,33 @@ impl WorkDb {
             "UPDATE tasks SET pr_state_polled_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id, now],
         )?;
-        // Only write state columns (and count as changed) when CI, review, or
-        // merge-queue state differs from what's already stored.  COALESCE treats
-        // NULL as distinct from any non-empty string, so the first probe after
-        // migration always fires the event.
+        // Only write state columns (and count as changed) when CI, review,
+        // merge-queue state, or merge-queue detail (position/enqueued-at,
+        // which ticks every sweep while queued) differs from what's already
+        // stored. COALESCE treats NULL as distinct from any non-empty string,
+        // so the first probe after migration always fires the event.
         let changed = tx.execute(
             "UPDATE tasks
              SET ci_required_state      = ?2,
                  review_required_state  = ?3,
                  ci_required_detail     = ?4,
                  review_required_detail = ?5,
-                 merge_queue_state      = ?6
+                 merge_queue_state      = ?6,
+                 merge_queue_detail     = ?7
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
                     OR COALESCE(review_required_state, '') != ?3
-                    OR COALESCE(merge_queue_state, '') != COALESCE(?6, ''))",
+                    OR COALESCE(merge_queue_state, '') != COALESCE(?6, '')
+                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, ''))",
             params![
                 work_item_id,
-                ci_required_state,
-                review_required_state,
-                ci_required_detail,
-                review_required_detail,
-                merge_queue_state,
+                input.ci_required_state,
+                input.review_required_state,
+                input.ci_required_detail,
+                input.review_required_detail,
+                input.merge_queue_state,
+                input.merge_queue_detail,
             ],
         )?;
         tx.commit()?;
@@ -863,6 +859,20 @@ impl WorkDb {
             prior_ci_state,
         })
     }
+}
+
+/// Argument bundle for [`WorkDb::update_task_pr_poll_state`] — grouped to
+/// keep the method under clippy's `too_many_arguments` threshold rather than
+/// passing six positional `Option<&str>`/`&str` params.
+#[derive(Debug, Clone, Copy, Default, bon::Builder)]
+#[builder(on(String, into))]
+pub struct PrPollStateInput<'a> {
+    pub ci_required_state: &'a str,
+    pub review_required_state: &'a str,
+    pub ci_required_detail: Option<&'a str>,
+    pub review_required_detail: Option<&'a str>,
+    pub merge_queue_state: Option<&'a str>,
+    pub merge_queue_detail: Option<&'a str>,
 }
 
 /// Outcome of [`WorkDb::update_task_pr_poll_state`].

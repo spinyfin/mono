@@ -1761,6 +1761,7 @@ private struct WorkBoardCardItem: View {
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
                     mergeQueueState: column == .review ? task.mergeQueueState : nil,
+                    mergeQueueDetail: column == .review ? task.mergeQueueDetail : nil,
                     externalRefLink: externalRefLink,
                     ambiguousRepoNames: model.ambiguousVisibleRepoNames,
                     inReviewRevisions: inReviewRevisions,
@@ -2214,6 +2215,12 @@ struct WorkBoardCardView: View {
     /// is in GitHub's merge queue; `nil` otherwise. When set, replaces the
     /// CI indicator so the card clearly shows the PR is actively being shipped.
     var mergeQueueState: String? = nil
+    /// JSON-encoded merge-queue sub-state (`{"position", "state",
+    /// "enqueued_at"}`), mirrors `WorkTask.mergeQueueDetail`. `nil` unless
+    /// `mergeQueueState == "queued"`. Parsed by `PrMergingIndicator` to
+    /// render "queue position N, awaiting checks" with the relative
+    /// enqueued time.
+    var mergeQueueDetail: String? = nil
     /// Upstream-link affordance derived from `task.externalRef`. `nil`
     /// when the task has no external binding — the affordance is hidden
     /// entirely in that state. Bound refs show an accent-colored `↗ #N`
@@ -2482,7 +2489,7 @@ struct WorkBoardCardView: View {
             if let prURL = task.prURL, !prURL.isEmpty {
                 HStack(alignment: .center, spacing: 6) {
                     if mergeQueueState == "queued" {
-                        PrMergingIndicator()
+                        PrMergingIndicator(detail: mergeQueueDetail)
                     } else if let ciState = ciRequiredState {
                         PrCiIndicator(state: ciState, detail: ciRequiredDetail)
                     }
@@ -5066,18 +5073,102 @@ private struct PrCiIndicator: View {
     }
 }
 
+/// Parsed form of `WorkTask.mergeQueueDetail` — the JSON sub-state blob
+/// (`{"position", "state", "enqueued_at"}`) the merge poller writes while a
+/// PR sits in GitHub's merge queue. Kept free of SwiftUI so the parsing
+/// contract can be unit-tested without hosting a view (mirrors
+/// `AutomationTime`).
+struct MergeQueueDetail: Equatable {
+    /// 1-indexed queue position. `nil` when GitHub didn't report one.
+    var position: Int?
+    /// GitHub's raw `mergeQueueEntry.state` (e.g. `"AWAITING_CHECKS"`,
+    /// `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`, `"UNMERGEABLE"`). `nil` when
+    /// GitHub didn't report one.
+    var state: String?
+    /// RFC 3339 timestamp of when the PR entered the queue. `nil` when
+    /// GitHub didn't report one.
+    var enqueuedAt: String?
+
+    /// Parse the engine's JSON blob. Returns `nil` for `nil`/empty/
+    /// unparseable input so the caller can fall back to the plain
+    /// "merging" chip rather than propagate a parse error into the view.
+    static func parse(_ json: String?) -> MergeQueueDetail? {
+        guard let json, let data = json.data(using: .utf8) else { return nil }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return MergeQueueDetail(
+            position: (obj["position"] as? NSNumber)?.intValue,
+            state: obj["state"] as? String,
+            enqueuedAt: obj["enqueued_at"] as? String
+        )
+    }
+
+    /// Human-readable form of `state` for the card chip (e.g.
+    /// `"AWAITING_CHECKS"` → `"awaiting checks"`). Falls back to a
+    /// lowercased, underscore-stripped rendering of any unrecognised value
+    /// so a future GitHub enum addition still reads sensibly.
+    var displayState: String? {
+        guard let state, !state.isEmpty else { return nil }
+        switch state.uppercased() {
+        case "AWAITING_CHECKS": return "awaiting checks"
+        case "MERGEABLE": return "mergeable"
+        case "LOCKED": return "locked"
+        case "QUEUED": return "queued"
+        case "UNMERGEABLE": return "unmergeable"
+        default: return state.lowercased().replacingOccurrences(of: "_", with: " ")
+        }
+    }
+}
+
 /// Merge-queue indicator for Review-lane cards. Shown when the PR is
 /// currently in GitHub's merge queue — replaces the CI icon so the user
 /// can immediately distinguish cards that are actively being shipped from
-/// cards waiting for CI or human action.
+/// cards waiting for CI or human action. When `detail` carries queue
+/// position / sub-state / enqueued time, the chip and tooltip surface those
+/// instead of the bare "merging" label (T2467/mono#1904).
 private struct PrMergingIndicator: View {
+    var detail: String?
+
     @Environment(\.colorScheme) private var colorScheme
+
+    private var parsed: MergeQueueDetail? { MergeQueueDetail.parse(detail) }
+
+    private var chipText: String {
+        guard let parsed else { return "merging" }
+        let positionText = parsed.position.map { "#\($0)" }
+        switch (positionText, parsed.displayState) {
+        case let (.some(position), .some(state)):
+            return "merging — \(position), \(state)"
+        case let (.some(position), .none):
+            return "merging — \(position)"
+        case let (.none, .some(state)):
+            return "merging — \(state)"
+        case (.none, .none):
+            return "merging"
+        }
+    }
+
+    private var tooltipText: String {
+        guard let parsed else {
+            return "PR is in the merge queue and actively being shipped."
+        }
+        var parts = ["PR is in the merge queue and actively being shipped."]
+        if let position = parsed.position {
+            parts.append("Queue position \(position).")
+        }
+        if let displayState = parsed.displayState {
+            parts.append("Status: \(displayState).")
+        }
+        if let enqueuedAt = parsed.enqueuedAt {
+            parts.append("Enqueued \(AutomationTime.relative(enqueuedAt, now: Date())).")
+        }
+        return parts.joined(separator: " ")
+    }
 
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: "arrow.triangle.merge")
                 .font(.caption2.weight(.semibold))
-            Text("merging")
+            Text(chipText)
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
@@ -5087,8 +5178,8 @@ private struct PrMergingIndicator: View {
         .background(backgroundColor)
         .clipShape(Capsule())
         .fixedSize()
-        .help("PR is in the merge queue and actively being shipped.")
-        .accessibilityLabel("In merge queue — merging")
+        .help(tooltipText)
+        .accessibilityLabel("In merge queue — \(chipText)")
     }
 
     private var backgroundColor: Color {
