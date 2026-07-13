@@ -3196,6 +3196,18 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_state: Option<String>,
 
+    /// Structured sub-state for the merge-queue indicator, JSON-encoded as
+    /// `{"position": <i64>, "state": "<GitHub mergeQueueEntry.state>",
+    /// "enqueued_at": "<RFC3339>"}`. `Some` only while `merge_queue_state ==
+    /// Some("queued")`; cleared (`None`) the moment the probe no longer sees
+    /// a `mergeQueueEntry` for the PR (merged, or removed from the queue).
+    /// `state` is GitHub's raw enum value (`AWAITING_CHECKS`, `MERGEABLE`,
+    /// `LOCKED`, `QUEUED`, `UNMERGEABLE`) — the client maps it to display
+    /// text. `position` and `enqueued_at` are omitted from the JSON when
+    /// GitHub didn't report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_detail: Option<String>,
+
     /// Explicit model slug override. `None` → resolve via the design's
     /// Q3 precedence (effort default → product default → engine default).
     /// Stored verbatim — the engine does not validate the slug.

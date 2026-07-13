@@ -902,6 +902,22 @@ pub(crate) fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add `tasks.merge_queue_detail` — a JSON-encoded sub-state blob for the
+/// merge-queue indicator, mirroring the `ci_required_detail` /
+/// `review_required_detail` convention: `{"position": <i64>, "state":
+/// "<GitHub mergeQueueEntry.state>", "enqueued_at": "<RFC3339>"}`, `NULL`
+/// while `merge_queue_state` is not `"queued"`. Populated by the merge
+/// poller from `mergeQueueEntry.{state,position,enqueuedAt}` (T2467/mono#1904:
+/// the engine previously discarded everything but queue membership, so a
+/// queued PR read as a plain "In review" card with no indication it was
+/// mid-merge). Idempotent — guarded by `table_has_column`.
+pub(crate) fn migrate_tasks_merge_queue_detail_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "merge_queue_detail")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN merge_queue_detail TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Add the external-tracker binding columns to `products` and the
 /// per-work-item upstream-ref columns to `tasks`, plus the two partial
 /// indices that support efficient lookup and uniqueness enforcement.

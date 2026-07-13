@@ -284,7 +284,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
                     source_automation_id
                FROM tasks
               WHERE source_automation_id = ?1
@@ -353,7 +353,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
                     source_automation_id
                FROM tasks
               WHERE source_automation_id = ?1

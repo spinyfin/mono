@@ -8999,6 +8999,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 })
@@ -9267,6 +9270,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 })
@@ -11299,6 +11305,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 labels: Vec::new(),
                 review: crate::merge_poller::PrReviewState::Unknown,
                 in_merge_queue: false,
+                merge_queue_entry_state: None,
+                merge_queue_position: None,
+                merge_queue_enqueued_at: None,
                 raw_mergeable: String::new(),
                 raw_merge_state_status: String::new(),
             })
@@ -12018,6 +12027,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 })
@@ -12228,6 +12240,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 })
@@ -12537,6 +12552,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             labels: Vec::new(),
             review: crate::merge_poller::PrReviewState::Unknown,
             in_merge_queue: false,
+            merge_queue_entry_state: None,
+            merge_queue_position: None,
+            merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
         }

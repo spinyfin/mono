@@ -130,35 +130,58 @@ pub async fn run_gh(args: &[&str], display: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// Query GitHub's GraphQL API to determine whether `pr_url` is currently in
-/// its repository's merge queue. Returns `true` when the PR's `mergeQueueEntry`
-/// is non-null (the PR is queued), and `false` on any error — a non-canonical
+/// A PR's live `mergeQueueEntry` sub-state (GitHub's merge-queue membership
+/// record). `state` is GitHub's raw enum value (`AWAITING_CHECKS`,
+/// `MERGEABLE`, `LOCKED`, `QUEUED`, `UNMERGEABLE`); `position` and
+/// `enqueued_at` are `None` when GitHub didn't report them (rare — schema
+/// says both are non-null while queued, but degrade gracefully rather than
+/// drop the whole entry over a partial response).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeQueueEntry {
+    pub state: String,
+    pub position: Option<i64>,
+    /// RFC 3339 timestamp of when the PR entered the queue.
+    pub enqueued_at: Option<String>,
+}
+
+/// Query GitHub's GraphQL API for `pr_url`'s current merge-queue membership.
+/// Returns `Some(entry)` when the PR's `mergeQueueEntry` is non-null (the PR
+/// is queued), `None` when it isn't queued or on any error — a non-canonical
 /// URL, a spawn/HTTP failure, a non-zero `gh` exit, or unparseable JSON.
 ///
 /// This lives alongside [`gh_output`] because several engine call sites need
 /// the same probe. It deliberately uses the GraphQL API rather than a
 /// `gh pr view --json` field because `mergeQueueEntry` is not exposed as a
 /// `--json` field in all installed versions of the `gh` CLI; the GraphQL API
-/// is stable across versions. Degrades gracefully (returns `false`) so callers
+/// is stable across versions. Degrades gracefully (returns `None`) so callers
 /// can treat "not in queue" and "couldn't tell" identically.
-pub async fn pr_in_merge_queue(pr_url: &str) -> bool {
-    let Some((owner, repo, number)) = crate::pr_url::parse_pr_url_parts(pr_url) else {
-        return false;
-    };
+pub async fn pr_merge_queue_entry(pr_url: &str) -> Option<MergeQueueEntry> {
+    let (owner, repo, number) = crate::pr_url::parse_pr_url_parts(pr_url)?;
     let query = format!(
-        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
+        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state position enqueuedAt }} }} }} }}"#
     );
     let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
-    let Ok(out) = output else { return false };
+    let out = output.ok()?;
     if !out.status.success() {
-        return false;
+        return None;
     }
-    let body: Value = match serde_json::from_slice(&out.stdout) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    // data.repository.pullRequest.mergeQueueEntry — non-null → in queue.
-    !body["data"]["repository"]["pullRequest"]["mergeQueueEntry"].is_null()
+    let body: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let node = &body["data"]["repository"]["pullRequest"]["mergeQueueEntry"];
+    if node.is_null() {
+        return None;
+    }
+    Some(MergeQueueEntry {
+        state: node["state"].as_str().unwrap_or("").to_owned(),
+        position: node["position"].as_i64(),
+        enqueued_at: node["enqueuedAt"].as_str().map(str::to_owned),
+    })
+}
+
+/// Whether `pr_url` is currently in its repository's merge queue. Thin
+/// boolean wrapper over [`pr_merge_queue_entry`] for callers that only need
+/// membership, not the sub-state detail.
+pub async fn pr_in_merge_queue(pr_url: &str) -> bool {
+    pr_merge_queue_entry(pr_url).await.is_some()
 }
 
 // ── CommandGhRunner (production) ──────────────────────────────────────────────

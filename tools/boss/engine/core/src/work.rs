@@ -329,6 +329,7 @@ pub use output_types::WorkerPrCompletion;
 pub use output_types::WorkerPrCompletionTarget;
 pub use planner_runs::ClaimPlannerRunInput;
 pub use planner_runs::PlannerRunPatch;
+pub use pr_flow::PrPollStateInput;
 #[cfg(test)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;

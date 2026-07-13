@@ -101,7 +101,7 @@ pub(crate) fn query_project(conn: &Connection, id: &str) -> Result<Option<Projec
 
 pub(crate) fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -166,7 +166,7 @@ pub(crate) fn list_projects_for_product(conn: &Connection, product_id: &str) -> 
 
 pub(crate) fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, driver
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",

@@ -2547,6 +2547,7 @@ final class EngineClient: @unchecked Sendable {
             reviewRequiredDetail: payload["review_required_detail"] as? String,
             prStatePolledAt: payload["pr_state_polled_at"] as? String,
             mergeQueueState: payload["merge_queue_state"] as? String,
+            mergeQueueDetail: payload["merge_queue_detail"] as? String,
             externalRef: parseExternalRef(payload["external_ref"]),
             parentTaskId: payload["parent_task_id"] as? String,
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,

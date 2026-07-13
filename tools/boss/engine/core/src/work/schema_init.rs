@@ -451,6 +451,10 @@ impl WorkDb {
         // previously attempted to finalize on — not on any head movement from a
         // concurrently-active parent worker.
         migrate_work_executions_revision_stop_contributed_head(&conn)?;
+        // Merge-queue sub-state: tasks.merge_queue_detail JSON blob (queue
+        // position, GitHub's raw entry state, enqueued-at timestamp) for the
+        // Review card's merging indicator (T2467/mono#1904).
+        migrate_tasks_merge_queue_detail_column(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '24')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

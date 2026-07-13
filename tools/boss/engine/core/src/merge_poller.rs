@@ -55,8 +55,8 @@ use crate::gh_invocation::gh_output;
 use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;
-use crate::work::{GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrStateChecker, WorkDb};
-use boss_github::gh_runner::pr_in_merge_queue;
+use crate::work::{GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrPollStateInput, PrStateChecker, WorkDb};
+use boss_github::gh_runner::pr_merge_queue_entry;
 use boss_github::pr_url::{parse_pr_url_parts, pr_number_from_url, repo_from_pr_url};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
@@ -212,6 +212,17 @@ pub struct PrLifecycleProbe {
     /// not queued. Used to render the merging indicator on Review-lane cards
     /// (replaces the CI icon while the PR is merging).
     pub in_merge_queue: bool,
+    /// GitHub's raw `mergeQueueEntry.state` (e.g. `"AWAITING_CHECKS"`,
+    /// `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`, `"UNMERGEABLE"`). `None` when
+    /// `in_merge_queue` is `false` or GitHub omitted the field.
+    pub merge_queue_entry_state: Option<String>,
+    /// GitHub's raw `mergeQueueEntry.position` (1-indexed queue position).
+    /// `None` when `in_merge_queue` is `false` or GitHub omitted the field.
+    pub merge_queue_position: Option<i64>,
+    /// GitHub's raw `mergeQueueEntry.enqueuedAt` (RFC 3339 timestamp of when
+    /// the PR entered the queue). `None` when `in_merge_queue` is `false` or
+    /// GitHub omitted the field.
+    pub merge_queue_enqueued_at: Option<String>,
     /// Raw `mergeable` string from GitHub (e.g. `"MERGEABLE"`, `"CONFLICTING"`,
     /// `"UNKNOWN"`). Carried through so callers can log the exact GitHub signal
     /// that drove each transition decision without a second round trip.
@@ -581,6 +592,9 @@ impl MergeProbe for CommandMergeProbe {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 });
@@ -602,7 +616,11 @@ impl MergeProbe for CommandMergeProbe {
         // does not expose `mergeQueueEntry` in all installed `gh` versions.
         // `mergeQueueEntry` is not exposed as a `--json` field in all
         // installed `gh` versions, so this is a separate GraphQL probe.
-        probe.in_merge_queue = pr_in_merge_queue(pr_url).await;
+        let queue_entry = pr_merge_queue_entry(pr_url).await;
+        probe.in_merge_queue = queue_entry.is_some();
+        probe.merge_queue_entry_state = queue_entry.as_ref().map(|e| e.state.clone());
+        probe.merge_queue_position = queue_entry.as_ref().and_then(|e| e.position);
+        probe.merge_queue_enqueued_at = queue_entry.and_then(|e| e.enqueued_at);
         Ok(probe)
     }
 
@@ -623,7 +641,7 @@ const PR_PROBE_FIELDS: &str = concat!(
     "state mergedAt closedAt mergeable mergeStateStatus baseRefOid headRefOid headRefName baseRefName ",
     "labels(first: 100) { nodes { name } } ",
     "reviewDecision reviews(last: 100) { nodes { author { login } state } } ",
-    "mergeQueueEntry { state } ",
+    "mergeQueueEntry { state position enqueuedAt } ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ",
     "__typename ... on CheckRun { name status conclusion detailsUrl } ",
     "... on StatusContext { context state targetUrl } } } } } } }",
@@ -762,6 +780,9 @@ impl CommandMergeProbe {
                         labels: Vec::new(),
                         review: PrReviewState::Unknown,
                         in_merge_queue: false,
+                        merge_queue_entry_state: None,
+                        merge_queue_position: None,
+                        merge_queue_enqueued_at: None,
                         raw_mergeable: String::new(),
                         raw_merge_state_status: String::new(),
                     }),
@@ -1220,8 +1241,27 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         .unwrap_or_default();
     let review = classify_review(review_decision, &reviews, review_signal);
     // `mergeQueueEntry` is non-null when the PR is in GitHub's merge queue.
-    // Null, missing, or explicit JSON null → not in queue.
-    let in_merge_queue = root.get("mergeQueueEntry").map(|v| !v.is_null()).unwrap_or(false);
+    // Null, missing, or explicit JSON null → not in queue. When present, pull
+    // the sub-state fields (state / position / enqueuedAt) too — the batched
+    // GraphQL probe's `PR_PROBE_FIELDS` selection set requests them inline;
+    // the single-PR `gh pr view` probe path stamps them separately (see
+    // `CommandMergeProbe::probe`) since `mergeQueueEntry` isn't a `--json`
+    // field there.
+    let merge_queue_entry_node = root.get("mergeQueueEntry").filter(|v| !v.is_null());
+    let in_merge_queue = merge_queue_entry_node.is_some();
+    let merge_queue_entry_state = merge_queue_entry_node
+        .and_then(|v| v.get("state"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let merge_queue_position = merge_queue_entry_node
+        .and_then(|v| v.get("position"))
+        .and_then(|v| v.as_i64());
+    let merge_queue_enqueued_at = merge_queue_entry_node
+        .and_then(|v| v.get("enqueuedAt"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -1232,6 +1272,9 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         labels,
         review,
         in_merge_queue,
+        merge_queue_entry_state,
+        merge_queue_position,
+        merge_queue_enqueued_at,
         raw_mergeable: mergeable.to_owned(),
         raw_merge_state_status: merge_state_status.to_owned(),
     })
@@ -3116,6 +3159,30 @@ fn merge_queue_state_str(in_merge_queue: bool) -> Option<&'static str> {
     if in_merge_queue { Some("queued") } else { None }
 }
 
+/// Build the `merge_queue_detail` JSON blob (`{"position", "state",
+/// "enqueued_at"}`) from a probe's merge-queue sub-state fields. Returns
+/// `None` when the probe isn't queued, or when queued but GitHub reported no
+/// sub-state fields at all (nothing to show beyond the plain "merging" chip)
+/// — this keeps the column `NULL` rather than a `"{}"` the client would have
+/// to special-case.
+fn merge_queue_detail_json(probe: &PrLifecycleProbe) -> Option<String> {
+    if !probe.in_merge_queue {
+        return None;
+    }
+    if probe.merge_queue_entry_state.is_none()
+        && probe.merge_queue_position.is_none()
+        && probe.merge_queue_enqueued_at.is_none()
+    {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "position": probe.merge_queue_position,
+        "state": probe.merge_queue_entry_state,
+        "enqueued_at": probe.merge_queue_enqueued_at,
+    }))
+    .ok()
+}
+
 /// Persist CI + review + merge-queue poll state and emit a change event
 /// when any field flips value. Called from `sweep_one` for every open PR and
 /// from `completion.rs` after the on-transition initial CI fetch.
@@ -3134,14 +3201,18 @@ pub(crate) async fn update_pr_poll_state(
     let ci_detail = ci_detail_json(&open.ci);
     let review_detail = review_detail_json(probe.review.reviewers());
     let merge_queue_state = merge_queue_state_str(probe.in_merge_queue);
+    let merge_queue_detail = merge_queue_detail_json(probe);
 
     let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
-        ci_state,
-        review_state,
-        ci_detail.as_deref(),
-        review_detail.as_deref(),
-        merge_queue_state,
+        PrPollStateInput {
+            ci_required_state: ci_state,
+            review_required_state: review_state,
+            ci_required_detail: ci_detail.as_deref(),
+            review_required_detail: review_detail.as_deref(),
+            merge_queue_state,
+            merge_queue_detail: merge_queue_detail.as_deref(),
+        },
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -3852,6 +3923,9 @@ mod tests {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 }),
@@ -3878,6 +3952,9 @@ mod tests {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 }),
@@ -3897,6 +3974,9 @@ mod tests {
                     labels: labels.iter().map(|s| (*s).to_owned()).collect(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 }),
@@ -3925,6 +4005,9 @@ mod tests {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    merge_queue_entry_state: None,
+                    merge_queue_position: None,
+                    merge_queue_enqueued_at: None,
                     raw_mergeable: String::new(),
                     raw_merge_state_status: String::new(),
                 }),
@@ -4474,6 +4557,9 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue,
+            merge_queue_entry_state: None,
+            merge_queue_position: None,
+            merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
         };
@@ -4744,6 +4830,9 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            merge_queue_entry_state: None,
+            merge_queue_position: None,
+            merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
         }
@@ -4760,6 +4849,9 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            merge_queue_entry_state: None,
+            merge_queue_position: None,
+            merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
         }
@@ -4783,6 +4875,9 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            merge_queue_entry_state: None,
+            merge_queue_position: None,
+            merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
         }
@@ -6764,6 +6859,92 @@ mod tests {
         );
     }
 
+    /// `mergeQueueEntry.{state,position,enqueuedAt}` parse through onto the
+    /// probe's sub-state fields, and clear back to `None` when not queued —
+    /// this is what the Review card's merging indicator renders as
+    /// queue-position / relative enqueued time.
+    #[test]
+    fn parse_probe_surfaces_merge_queue_sub_state() {
+        let body_in_queue = {
+            let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+                "OPEN",
+                "",
+                "MERGEABLE",
+                "CLEAN",
+                ("", ""),
+                &[],
+                serde_json::json!([]),
+            ))
+            .unwrap();
+            doc["mergeQueueEntry"] = serde_json::json!({
+                "state": "AWAITING_CHECKS",
+                "position": 1,
+                "enqueuedAt": "2026-07-10T11:54:54Z",
+            });
+            doc.to_string()
+        };
+        let probe = parse_probe_json("https://example.test/pr/mqsub1", &body_in_queue, None).unwrap();
+        assert!(probe.in_merge_queue);
+        assert_eq!(probe.merge_queue_entry_state.as_deref(), Some("AWAITING_CHECKS"));
+        assert_eq!(probe.merge_queue_position, Some(1));
+        assert_eq!(probe.merge_queue_enqueued_at.as_deref(), Some("2026-07-10T11:54:54Z"));
+
+        let body_not_queued = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("", ""), &[], serde_json::json!([]));
+        let probe_not_queued = parse_probe_json("https://example.test/pr/mqsub2", &body_not_queued, None).unwrap();
+        assert!(!probe_not_queued.in_merge_queue);
+        assert_eq!(probe_not_queued.merge_queue_entry_state, None);
+        assert_eq!(probe_not_queued.merge_queue_position, None);
+        assert_eq!(probe_not_queued.merge_queue_enqueued_at, None);
+    }
+
+    /// T2467/mono#1904 note: while a PR sits in the merge queue,
+    /// `mergeStateStatus` commonly reads `UNKNOWN` (GitHub is mid-recompute
+    /// against the synthetic merge commit). `classify_state`'s conflict
+    /// predicate requires *both* `mergeable == CONFLICTING` and
+    /// `mergeStateStatus == DIRTY`, so an `UNKNOWN` `mergeStateStatus` can
+    /// never trip it regardless of `mergeable` — this pins that down for the
+    /// specific queued case (T1752's prior art covers the general
+    /// UNKNOWN-must-not-be-MERGEABLE rule; this covers the newer
+    /// UNKNOWN-must-not-be-CONFLICT-while-queued rule from the same design
+    /// note) so conflict_watch never misfires a `blocked: merge_conflict`
+    /// flip on a PR that is actually mid-merge-queue-check.
+    #[test]
+    fn parse_probe_queued_with_unknown_merge_state_status_never_classifies_conflict() {
+        for mergeable in ["MERGEABLE", "UNKNOWN"] {
+            let body = {
+                let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+                    "OPEN",
+                    "",
+                    mergeable,
+                    "UNKNOWN",
+                    ("base-1", "head-1"),
+                    &[],
+                    serde_json::json!([]),
+                ))
+                .unwrap();
+                doc["mergeQueueEntry"] = serde_json::json!({
+                    "state": "AWAITING_CHECKS",
+                    "position": 1,
+                    "enqueuedAt": "2026-07-10T11:54:54Z",
+                });
+                doc.to_string()
+            };
+            let probe = parse_probe_json("https://example.test/pr/mqconflict", &body, None).unwrap();
+            assert!(
+                probe.in_merge_queue,
+                "mergeable={mergeable}: queue entry must still parse"
+            );
+            let PrLifecycleState::Open(open) = &probe.state else {
+                panic!("mergeable={mergeable}: expected Open state");
+            };
+            assert_ne!(
+                open.mergeability,
+                OpenPrMergeability::Conflict,
+                "mergeable={mergeable}: a queued PR with mergeStateStatus=UNKNOWN must never classify as Conflict",
+            );
+        }
+    }
+
     /// Build a CheckRun rollup leaf with the given name + verdict shape.
     fn check_run(name: &str, status: &str, conclusion: &str) -> serde_json::Value {
         serde_json::json!({
@@ -7672,6 +7853,9 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            merge_queue_entry_state: None,
+            merge_queue_position: None,
+            merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
         };
@@ -7815,6 +7999,9 @@ mod tests {
                 labels: Vec::new(),
                 review: PrReviewState::Unknown,
                 in_merge_queue: false,
+                merge_queue_entry_state: None,
+                merge_queue_position: None,
+                merge_queue_enqueued_at: None,
                 raw_mergeable: "CONFLICTING".into(),
                 raw_merge_state_status: "DIRTY".into(),
             }),
@@ -8477,7 +8664,14 @@ mod tests {
         // head's failing rollup having been recorded, while the engine's block
         // has since been quiesced (no active signal, status still in_review).
         let seeded = db
-            .update_task_pr_poll_state(&chore, "fail", "unknown", None, None, None)
+            .update_task_pr_poll_state(
+                &chore,
+                PrPollStateInput {
+                    ci_required_state: "fail",
+                    review_required_state: "unknown",
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert!(seeded.changed, "seed write must register a state change");
         assert!(
@@ -8611,6 +8805,9 @@ mod tests {
                 labels: vec![],
                 review: PrReviewState::Unknown,
                 in_merge_queue: false,
+                merge_queue_entry_state: None,
+                merge_queue_position: None,
+                merge_queue_enqueued_at: None,
                 raw_mergeable: String::new(),
                 raw_merge_state_status: String::new(),
             }),
@@ -9059,6 +9256,58 @@ mod tests {
     fn merge_queue_state_str_maps_flag() {
         assert_eq!(merge_queue_state_str(true), Some("queued"));
         assert_eq!(merge_queue_state_str(false), None);
+    }
+
+    /// Test-only helper for building a minimal `Open(clean)` probe with the
+    /// merge-queue fields under test; every other field is a harmless default.
+    fn probe_with_queue_fields(
+        in_merge_queue: bool,
+        merge_queue_entry_state: Option<&str>,
+        merge_queue_position: Option<i64>,
+        merge_queue_enqueued_at: Option<&str>,
+    ) -> PrLifecycleProbe {
+        PrLifecycleProbe {
+            url: "https://github.com/foo/bar/pull/1".to_owned(),
+            state: PrLifecycleState::Open(OpenPrStatus::clean()),
+            base_ref_oid: None,
+            head_ref_oid: None,
+            head_ref_name: None,
+            base_ref_name: None,
+            labels: Vec::new(),
+            review: PrReviewState::Unknown,
+            in_merge_queue,
+            merge_queue_entry_state: merge_queue_entry_state.map(str::to_owned),
+            merge_queue_position,
+            merge_queue_enqueued_at: merge_queue_enqueued_at.map(str::to_owned),
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_queue_detail_json_builds_blob_when_queued_with_sub_state() {
+        let probe = probe_with_queue_fields(true, Some("AWAITING_CHECKS"), Some(1), Some("2026-07-10T11:54:54Z"));
+        let json = merge_queue_detail_json(&probe).expect("queued with sub-state → Some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({"position": 1, "state": "AWAITING_CHECKS", "enqueued_at": "2026-07-10T11:54:54Z"})
+        );
+    }
+
+    #[test]
+    fn merge_queue_detail_json_none_when_not_queued() {
+        let probe = probe_with_queue_fields(false, None, None, None);
+        assert_eq!(merge_queue_detail_json(&probe), None);
+    }
+
+    #[test]
+    fn merge_queue_detail_json_none_when_queued_but_no_sub_state_reported() {
+        // Degenerate case: GitHub reported a non-null mergeQueueEntry but none
+        // of the sub-fields (shouldn't happen per schema, but the parser
+        // degrades gracefully rather than emitting an empty "{}" blob).
+        let probe = probe_with_queue_fields(true, None, None, None);
+        assert_eq!(merge_queue_detail_json(&probe), None);
     }
 
     #[test]
