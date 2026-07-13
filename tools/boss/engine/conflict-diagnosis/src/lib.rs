@@ -32,6 +32,7 @@
 //! at probe time and choose the matching invocation.
 
 use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -116,6 +117,21 @@ async fn git_version() -> Option<(u32, u32, u32)> {
     parse_git_version(stdout.trim())
 }
 
+/// Spawn `git <args>` inside `workspace_path` with `GIT_DIR` pointed at
+/// `git_dir` and capture its output. Centralizes the spawn boilerplate
+/// shared by the `merge-tree` / `merge-base` probes; callers retain
+/// ownership of the exit-code interpretation, which differs per
+/// invocation (e.g. new-syntax `merge-tree` treats exit 1 as a conflict
+/// signal rather than a failure).
+async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::io::Result<Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(workspace_path)
+        .env("GIT_DIR", git_dir)
+        .output()
+        .await
+}
+
 /// Resolve the git directory for `workspace_path`.
 ///
 /// For jj-only cube workspaces (no top-level `.git`), the real git
@@ -193,19 +209,19 @@ async fn collect_new_syntax(
     base_sha: &str,
     head_sha: &str,
 ) -> std::io::Result<ConflictDiagnosis> {
-    let output = Command::new("git")
-        .args([
+    let output = run_git(
+        &[
             "merge-tree",
             "--write-tree",
             "--name-only",
             "--no-messages",
             base_sha,
             head_sha,
-        ])
-        .current_dir(workspace_path)
-        .env("GIT_DIR", git_dir)
-        .output()
-        .await?;
+        ],
+        workspace_path,
+        git_dir,
+    )
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -245,12 +261,7 @@ async fn collect_legacy(
     head_sha: &str,
 ) -> std::io::Result<ConflictDiagnosis> {
     // The legacy form requires the common ancestor tree as first argument.
-    let mb_output = Command::new("git")
-        .args(["merge-base", base_sha, head_sha])
-        .current_dir(workspace_path)
-        .env("GIT_DIR", git_dir)
-        .output()
-        .await?;
+    let mb_output = run_git(&["merge-base", base_sha, head_sha], workspace_path, git_dir).await?;
 
     if !mb_output.status.success() {
         let stderr = String::from_utf8_lossy(&mb_output.stderr).trim().to_owned();
@@ -263,12 +274,12 @@ async fn collect_legacy(
 
     let merge_base = String::from_utf8_lossy(&mb_output.stdout).trim().to_owned();
 
-    let output = Command::new("git")
-        .args(["merge-tree", &merge_base, base_sha, head_sha])
-        .current_dir(workspace_path)
-        .env("GIT_DIR", git_dir)
-        .output()
-        .await?;
+    let output = run_git(
+        &["merge-tree", &merge_base, base_sha, head_sha],
+        workspace_path,
+        git_dir,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
