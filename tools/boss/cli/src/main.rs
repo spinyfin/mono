@@ -3938,14 +3938,12 @@ async fn run_show_leaf(
     let with_primary_id = args.with_primary_id;
     let work_item = match parse_work_item_selector(&args.id) {
         WorkItemSelector::ShortId(n) => {
-            let product = resolve_product(client, args.product, ctx).await?;
-            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            let item = resolve_short_id_item(client, ctx, args.product, n).await?;
             check_task_kind_for_verb(&item, n, chore_only)?;
             item
         }
         WorkItemSelector::ProductShortId { product_slug, n } => {
-            let product = resolve_product(client, Some(product_slug), ctx).await?;
-            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            let item = resolve_short_id_item(client, ctx, Some(product_slug), n).await?;
             check_task_kind_for_verb(&item, n, chore_only)?;
             item
         }
@@ -7916,6 +7914,21 @@ async fn get_work_item_by_short_id_rpc(
     )
 }
 
+/// Resolve a short-id selector to its work item. `product` is the product
+/// source: the caller's `--product` flag for a bare `ShortId`, or
+/// `Some(product_slug)` for a cross-product `ProductShortId`. Shared by
+/// [`run_show_leaf`] and [`resolve_selector_to_primary_id`], which differ
+/// only in the per-site post-processing left at their call sites.
+async fn resolve_short_id_item(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    product: Option<String>,
+    short_id: i64,
+) -> Result<WorkItem, CliError> {
+    let product = resolve_product(client, product, ctx).await?;
+    get_work_item_by_short_id_rpc(client, &product.id, short_id).await
+}
+
 fn work_item_primary_id(item: &WorkItem) -> &str {
     match item {
         WorkItem::Product(p) => &p.id,
@@ -7975,13 +7988,11 @@ async fn resolve_selector_to_primary_id(
 ) -> Result<String, CliError> {
     match parse_work_item_selector(id) {
         WorkItemSelector::ShortId(n) => {
-            let product = resolve_product(client, product, ctx).await?;
-            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            let item = resolve_short_id_item(client, ctx, product, n).await?;
             Ok(work_item_primary_id(&item).to_owned())
         }
         WorkItemSelector::ProductShortId { product_slug, n } => {
-            let product = resolve_product(client, Some(product_slug), ctx).await?;
-            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            let item = resolve_short_id_item(client, ctx, Some(product_slug), n).await?;
             Ok(work_item_primary_id(&item).to_owned())
         }
         WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
