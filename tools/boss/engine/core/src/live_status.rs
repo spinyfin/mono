@@ -186,7 +186,7 @@ pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Val
             // Redact the body before logging so an error response
             // containing the key (some Anthropic 401 bodies echo
             // headers) can't leak into engine stderr.
-            let snippet = live_status_redact::redact_text(&clip_str(&body, 120));
+            let snippet = live_status_redact::redact_text(&crate::string_clip::clip_to_bytes(&body, 120));
             tracing::error!(
                 status,
                 snippet = %snippet,
@@ -203,18 +203,6 @@ pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Val
             SummarizerOutcome::Transport(msg)
         }
     }
-}
-
-fn clip_str(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        if out.len() + c.len_utf8() > max {
-            out.push('…');
-            return out;
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Apply [`live_status_redact`] to a transcript tail and assemble the
@@ -283,7 +271,10 @@ fn render_assistant(line: &Value) -> String {
                 "text" => {
                     if let Some(t) = obj.get("text").and_then(Value::as_str) {
                         let one_line = t.trim().replace('\n', " ");
-                        parts.push(format!("assistant: {}", clip(&one_line, 200)));
+                        parts.push(format!(
+                            "assistant: {}",
+                            crate::string_clip::clip_to_bytes(&one_line, 200)
+                        ));
                     }
                 }
                 "tool_use" => {
@@ -296,12 +287,12 @@ fn render_assistant(line: &Value) -> String {
                         obj.get("input")
                             .and_then(|i| i.get("command"))
                             .and_then(Value::as_str)
-                            .map(|c| clip(c, 80))
+                            .map(|c| crate::string_clip::clip_to_bytes(c, 80))
                     } else {
                         obj.get("input")
                             .and_then(|i| i.get("file_path"))
                             .and_then(Value::as_str)
-                            .map(|c| clip(c, 80))
+                            .map(|c| crate::string_clip::clip_to_bytes(c, 80))
                     };
                     if let Some(arg) = arg {
                         parts.push(format!("tool: {name}({arg})"));
@@ -312,31 +303,19 @@ fn render_assistant(line: &Value) -> String {
                 "thinking" => {
                     if let Some(t) = obj.get("thinking").and_then(Value::as_str) {
                         let one_line = t.trim().replace('\n', " ");
-                        parts.push(format!("thinking: {}", clip(&one_line, 200)));
+                        parts.push(format!(
+                            "thinking: {}",
+                            crate::string_clip::clip_to_bytes(&one_line, 200)
+                        ));
                     }
                 }
                 _ => {}
             }
         }
     } else if let Some(t) = message.get("text").and_then(Value::as_str) {
-        parts.push(format!("assistant: {}", clip(t, 200)));
+        parts.push(format!("assistant: {}", crate::string_clip::clip_to_bytes(t, 200)));
     }
     parts.join(" | ")
-}
-
-fn clip(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let mut out = String::new();
-    for c in s.chars() {
-        if out.len() + c.len_utf8() > max {
-            break;
-        }
-        out.push(c);
-    }
-    out.push('…');
-    out
 }
 
 /// Build the prompt for the model. The system message carries the
@@ -429,18 +408,7 @@ pub fn clean_summary(raw: &str) -> String {
     // Single-line shape. The UI renders this on a single line; any
     // model-injected newline becomes a space.
     let one_line = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.len() <= MAX_LIVE_STATUS_LEN {
-        return one_line;
-    }
-    let mut out = String::new();
-    for c in one_line.chars() {
-        if out.len() + c.len_utf8() > MAX_LIVE_STATUS_LEN {
-            break;
-        }
-        out.push(c);
-    }
-    out.push('…');
-    out
+    crate::string_clip::clip_to_bytes(&one_line, MAX_LIVE_STATUS_LEN)
 }
 
 #[cfg(test)]

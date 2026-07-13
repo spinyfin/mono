@@ -128,17 +128,7 @@ fn map_editorial_action(row: &Row<'_>) -> rusqlite::Result<boss_protocol::Editor
 }
 
 fn truncate_command(cmd: &str) -> String {
-    if cmd.len() <= COMMAND_MAX_BYTES {
-        return cmd.to_owned();
-    }
-    // Truncate at a UTF-8 boundary.
-    let truncated = cmd
-        .char_indices()
-        .take_while(|(i, _)| *i < COMMAND_MAX_BYTES - 1)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    format!("{}…", &cmd[..truncated])
+    crate::string_clip::clip_to_bytes(cmd, COMMAND_MAX_BYTES)
 }
 
 #[cfg(test)]
