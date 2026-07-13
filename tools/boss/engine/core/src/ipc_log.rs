@@ -115,7 +115,128 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{EngineToAppResponse, ReleaseWorkerPaneInput, ReleaseWorkerPaneResult};
+    use crate::protocol::{
+        EngineToAppResponse, FocusWorkerPaneInput, FocusWorkerPaneResult, InterruptWorkerPaneInput,
+        InterruptWorkerPaneResult, ListHostedPanesInput, ListHostedPanesResult, ReleaseWorkerPaneInput,
+        ReleaseWorkerPaneResult, RevealWorkItemInput, RevealWorkItemResult, SendToPaneInput, SendToPaneResult,
+        SpawnWorkerPaneInput, SpawnWorkerPaneResult,
+    };
+
+    /// Every `EngineToAppRequest` variant must emit its documented
+    /// snake_case `kind` discriminant. This is a wire contract downstream
+    /// log consumers depend on, so a silent rename of any arm should fail
+    /// here.
+    #[test]
+    fn request_kind_covers_every_variant() {
+        let cases: Vec<(EngineToAppRequest, &str)> = vec![
+            (
+                EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
+                    run_id: "run-1".into(),
+                    workspace_path: "/tmp/ws".into(),
+                    slot_id: 1,
+                    initial_input: "claude\n".into(),
+                    env: vec![],
+                    summary: None,
+                    task_title: None,
+                }),
+                "spawn_worker_pane",
+            ),
+            (
+                EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
+                    slot_id: 1,
+                    kill_grace_seconds: 0,
+                }),
+                "release_worker_pane",
+            ),
+            (
+                EngineToAppRequest::SendToPane(SendToPaneInput {
+                    slot_id: 1,
+                    text: "hi".into(),
+                }),
+                "send_to_pane",
+            ),
+            (
+                EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 1 }),
+                "focus_worker_pane",
+            ),
+            (
+                EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id: 1 }),
+                "interrupt_worker_pane",
+            ),
+            (
+                EngineToAppRequest::RevealWorkItem(RevealWorkItemInput {
+                    work_item_id: "task_1".into(),
+                    product_id: "prod_1".into(),
+                }),
+                "reveal_work_item",
+            ),
+            (
+                EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {}),
+                "list_hosted_panes",
+            ),
+        ];
+
+        for (req, expected_kind) in cases {
+            assert_eq!(request_kind(&req), expected_kind, "kind for {req:?}");
+        }
+    }
+
+    /// Every `EngineToAppResponse` variant must emit its documented
+    /// snake_case `kind` discriminant, mirroring the request side.
+    #[test]
+    fn response_kind_covers_every_variant() {
+        let cases: Vec<(EngineToAppResponse, &str)> = vec![
+            (
+                EngineToAppResponse::SpawnWorkerPane {
+                    result: Ok(SpawnWorkerPaneResult {
+                        slot_id: 1,
+                        shell_pid: 42,
+                    }),
+                },
+                "spawn_worker_pane",
+            ),
+            (
+                EngineToAppResponse::ReleaseWorkerPane {
+                    result: Ok(ReleaseWorkerPaneResult {}),
+                },
+                "release_worker_pane",
+            ),
+            (
+                EngineToAppResponse::SendToPane {
+                    result: Ok(SendToPaneResult {}),
+                },
+                "send_to_pane",
+            ),
+            (
+                EngineToAppResponse::FocusWorkerPane {
+                    result: Ok(FocusWorkerPaneResult {}),
+                },
+                "focus_worker_pane",
+            ),
+            (
+                EngineToAppResponse::InterruptWorkerPane {
+                    result: Ok(InterruptWorkerPaneResult {}),
+                },
+                "interrupt_worker_pane",
+            ),
+            (
+                EngineToAppResponse::RevealWorkItem {
+                    result: Ok(RevealWorkItemResult {}),
+                },
+                "reveal_work_item",
+            ),
+            (
+                EngineToAppResponse::ListHostedPanes {
+                    result: Ok(ListHostedPanesResult { panes: vec![] }),
+                },
+                "list_hosted_panes",
+            ),
+        ];
+
+        for (resp, expected_kind) in cases {
+            assert_eq!(response_kind(&resp), expected_kind, "kind for {resp:?}");
+        }
+    }
 
     #[tokio::test]
     async fn ipc_logger_writes_and_rotates() {
