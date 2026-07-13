@@ -1979,7 +1979,7 @@ impl ExecutionCoordinator {
     /// under-estimate, never a false alarm). Idempotent — repeated calls
     /// while the stall persists are a no-op after the first.
     fn surface_chain_serialized_stall_if_overdue(&self, execution: &WorkExecution, sibling: &WorkExecution) {
-        let Some(created_at) = execution.created_at.parse::<i64>().ok() else {
+        let Some(created_at) = execution.created_epoch() else {
             return;
         };
         let elapsed = crate::run_reconcile::current_epoch_s() - created_at;

@@ -232,7 +232,7 @@ pub async fn run_one_pass(
             // never race the happy path. A missing/unparseable
             // finished_at (data anomaly — every terminal path stamps it)
             // falls through as past-grace.
-            let finished_epoch = execution.finished_at.as_deref().and_then(|s| s.parse::<i64>().ok());
+            let finished_epoch = execution.finished_epoch();
             if matches!(finished_epoch, Some(t) if t > grace_cutoff) {
                 outcome.grace_skipped += 1;
                 continue;
