@@ -243,3 +243,122 @@ impl ServerState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Behavior tests for the transcript-confirmation fallback helpers.
+    //!
+    //! These assert observable outcomes of `normalize_ws` and
+    //! `transcript_shows_text` — the correctness-sensitive fallback path
+    //! `inject_pane_text_verified` relies on when no `UserPromptSubmit`
+    //! hook arrives to confirm injected text. They are deliberately
+    //! hermetic: every transcript is a tempfile written in-test, so no
+    //! real session transcripts are touched and results are deterministic.
+
+    use super::{normalize_ws, transcript_shows_text};
+    use std::io::Write;
+
+    /// Write `bytes` to a fresh tempfile and return `(handle, path)`. The
+    /// handle must be kept alive for the file to survive; the `String`
+    /// path is what `transcript_shows_text` takes.
+    fn transcript_with(bytes: &[u8]) -> (tempfile::NamedTempFile, String) {
+        let mut file = tempfile::NamedTempFile::new().expect("create tempfile");
+        file.write_all(bytes).expect("write transcript bytes");
+        file.flush().expect("flush transcript");
+        let path = file.path().to_str().expect("utf-8 tempfile path").to_owned();
+        (file, path)
+    }
+
+    #[test]
+    fn normalize_ws_collapses_whitespace_runs_to_single_spaces() {
+        assert_eq!(normalize_ws("chore   update\t\tnotice"), "chore update notice");
+    }
+
+    #[test]
+    fn normalize_ws_collapses_newlines_and_trims_ends() {
+        assert_eq!(
+            normalize_ws("  \n  first line\n\n  second line  \n"),
+            "first line second line"
+        );
+    }
+
+    #[test]
+    fn normalize_ws_empty_input_is_empty() {
+        assert_eq!(normalize_ws(""), "");
+    }
+
+    #[test]
+    fn normalize_ws_whitespace_only_input_is_empty() {
+        assert_eq!(normalize_ws("  \n\t  \r\n "), "");
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_false_when_file_missing() {
+        // A path that was never created — File::open fails, so the
+        // scan reports "not confirmed" rather than panicking.
+        let missing = tempfile::NamedTempFile::new().unwrap();
+        let path = missing.path().to_str().unwrap().to_owned();
+        drop(missing); // remove the file so the path no longer exists
+        assert!(!transcript_shows_text(&path, 0, "anything").await);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_false_when_length_at_or_below_offset() {
+        let body = b"prompt text recorded here";
+        let (_f, path) = transcript_with(body);
+        // offset exactly at EOF: nothing new to scan.
+        assert!(!transcript_shows_text(&path, body.len() as u64, "prompt").await);
+        // offset past EOF: same, guarded by the `<= offset_bytes` check.
+        assert!(!transcript_shows_text(&path, body.len() as u64 + 100, "prompt").await);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_only_scans_bytes_past_offset() {
+        // "SECRET" lives entirely before the offset; the injected text
+        // "injected message" lives after it. The scan must ignore the
+        // pre-offset region and only match content written since the
+        // injection snapshot was taken.
+        let prefix = b"SECRET before the offset ";
+        let suffix = b"injected message after the offset";
+        let mut body = Vec::new();
+        body.extend_from_slice(prefix);
+        body.extend_from_slice(suffix);
+        let (_f, path) = transcript_with(&body);
+
+        let offset = prefix.len() as u64;
+        // Pre-offset text is invisible to the scan.
+        assert!(!transcript_shows_text(&path, offset, "SECRET").await);
+        // Post-offset text is found.
+        assert!(transcript_shows_text(&path, offset, "injected message").await);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_matches_across_whitespace_reflow() {
+        // The transcript records the prompt on a single line with
+        // collapsed spacing; the needle we search with is the original
+        // multi-line chore-update text. Normalized comparison bridges
+        // the difference so reflow doesn't produce a false "unconfirmed".
+        let (_f, path) = transcript_with(b"...before... please update the spec now ...after...");
+        let needle = "please   update\nthe   spec\n\nnow";
+        assert!(transcript_shows_text(&path, 0, needle).await);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_false_for_empty_or_whitespace_needle() {
+        // A non-empty chunk must not be "confirmed" by an empty needle —
+        // normalized, both the empty string and a whitespace-only string
+        // reduce to "" and are rejected before the substring check.
+        let (_f, path) = transcript_with(b"a non-empty transcript chunk");
+        assert!(!transcript_shows_text(&path, 0, "").await);
+        assert!(!transcript_shows_text(&path, 0, "   \n\t ").await);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_false_on_invalid_utf8_chunk() {
+        // A partial/corrupt multibyte sequence in the new chunk makes
+        // String::from_utf8 fail; the scan reports "not confirmed"
+        // rather than erroring or matching arbitrarily.
+        let (_f, path) = transcript_with(&[0xff, 0xfe, 0x00, 0x9f]);
+        assert!(!transcript_shows_text(&path, 0, "anything").await);
+    }
+}
