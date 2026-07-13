@@ -87,6 +87,38 @@ struct FollowupEntry {
     rationale: Option<String>,
 }
 
+// ── Shared reconcile result handling ─────────────────────────────────────────
+
+/// Run [`WorkDb::reconcile_attentions`] and apply the result handling every
+/// structured/backstop producer shares: on a non-empty create set, emit an
+/// `info!` via `log_created` (passed the group and the newly created count);
+/// on error, emit a `warn!` via `log_err`. The two closures own the
+/// call-site-specific tracing field set and log message, so the distinct
+/// messages and `task_id`/`project_id` vs `work_item_id`/`execution_id`
+/// context are preserved. Returns the group + newly created members, or `None`
+/// when nothing was reconciled or the reconcile failed (failures are logged
+/// and swallowed so they never mask the surrounding transition).
+fn reconcile_and_log(
+    work_db: &WorkDb,
+    inputs: Vec<CreateAttentionInput>,
+    log_created: impl FnOnce(&AttentionGroup, usize),
+    log_err: impl FnOnce(&anyhow::Error),
+) -> Option<(AttentionGroup, Vec<Attention>)> {
+    match work_db.reconcile_attentions(inputs) {
+        Ok(Some((group, created))) => {
+            if !created.is_empty() {
+                log_created(&group, created.len());
+            }
+            Some((group, created))
+        }
+        Ok(None) => None,
+        Err(err) => {
+            log_err(&err);
+            None
+        }
+    }
+}
+
 // ── Questions: design-doc manifest ──────────────────────────────────────────
 
 /// Fired from `completion::finalize_pr_transition` for a `kind=design` task.
@@ -176,30 +208,27 @@ pub async fn reconcile_design_doc_questions(
         return None;
     }
 
-    match work_db.reconcile_attentions(inputs) {
-        Ok(Some((group, created))) => {
-            if !created.is_empty() {
-                tracing::info!(
-                    task_id,
-                    project_id,
-                    group_id = %group.id,
-                    new_members = created.len(),
-                    "attentions detector: upserted design-doc question group"
-                );
-            }
-            Some((group, created))
-        }
-        Ok(None) => None,
-        Err(err) => {
+    reconcile_and_log(
+        work_db,
+        inputs,
+        |group, new_members| {
+            tracing::info!(
+                task_id,
+                project_id,
+                group_id = %group.id,
+                new_members,
+                "attentions detector: upserted design-doc question group"
+            );
+        },
+        |err| {
             tracing::warn!(
                 task_id,
                 project_id,
                 ?err,
                 "attentions detector: failed to reconcile design-doc questions"
             );
-            None
-        }
-    }
+        },
+    )
 }
 
 /// Build a `question` [`CreateAttentionInput`] from a manifest entry, or
@@ -331,30 +360,27 @@ pub async fn reconcile_task_followups(
         return None;
     }
 
-    match work_db.reconcile_attentions(inputs) {
-        Ok(Some((group, created))) => {
-            if !created.is_empty() {
-                tracing::info!(
-                    work_item_id,
-                    execution_id,
-                    group_id = %group.id,
-                    new_members = created.len(),
-                    "attentions detector: upserted task followup group"
-                );
-            }
-            Some((group, created))
-        }
-        Ok(None) => None,
-        Err(err) => {
+    reconcile_and_log(
+        work_db,
+        inputs,
+        |group, new_members| {
+            tracing::info!(
+                work_item_id,
+                execution_id,
+                group_id = %group.id,
+                new_members,
+                "attentions detector: upserted task followup group"
+            );
+        },
+        |err| {
             tracing::warn!(
                 work_item_id,
                 execution_id,
                 ?err,
                 "attentions detector: failed to reconcile task followups"
             );
-            None
-        }
-    }
+        },
+    )
 }
 
 /// Build a `followup` [`CreateAttentionInput`], or `None` when the entry has
@@ -562,30 +588,27 @@ pub async fn extract_doc_questions_backstop(
         })
         .collect();
 
-    match work_db.reconcile_attentions(inputs) {
-        Ok(Some((group, created))) => {
-            if !created.is_empty() {
-                tracing::info!(
-                    task_id,
-                    project_id,
-                    group_id = %group.id,
-                    new_members = created.len(),
-                    "attentions backstop (questions): upserted extracted question group"
-                );
-            }
-            Some((group, created))
-        }
-        Ok(None) => None,
-        Err(err) => {
+    reconcile_and_log(
+        work_db,
+        inputs,
+        |group, new_members| {
+            tracing::info!(
+                task_id,
+                project_id,
+                group_id = %group.id,
+                new_members,
+                "attentions backstop (questions): upserted extracted question group"
+            );
+        },
+        |err| {
             tracing::warn!(
                 task_id,
                 project_id,
                 ?err,
                 "attentions backstop (questions): failed to reconcile extracted questions"
             );
-            None
-        }
-    }
+        },
+    )
 }
 
 /// Extract list items from the first "Risks / open questions" section of a
@@ -790,30 +813,27 @@ pub async fn extract_followups_backstop(
         return None;
     }
 
-    match work_db.reconcile_attentions(inputs) {
-        Ok(Some((group, created))) => {
-            if !created.is_empty() {
-                tracing::info!(
-                    work_item_id,
-                    execution_id,
-                    group_id = %group.id,
-                    new_members = created.len(),
-                    "attentions backstop (followups): upserted extracted followup group"
-                );
-            }
-            Some((group, created))
-        }
-        Ok(None) => None,
-        Err(err) => {
+    reconcile_and_log(
+        work_db,
+        inputs,
+        |group, new_members| {
+            tracing::info!(
+                work_item_id,
+                execution_id,
+                group_id = %group.id,
+                new_members,
+                "attentions backstop (followups): upserted extracted followup group"
+            );
+        },
+        |err| {
             tracing::warn!(
                 work_item_id,
                 execution_id,
                 ?err,
                 "attentions backstop (followups): failed to reconcile extracted followups"
             );
-            None
-        }
-    }
+        },
+    )
 }
 
 fn build_followups_supervisor_prompt(transcript_tail: &str) -> String {
