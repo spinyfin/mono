@@ -1,0 +1,13 @@
+[package]
+name = "boss-deterministic-resolvers"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+async-trait = { workspace = true }
+boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
