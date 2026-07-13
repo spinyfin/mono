@@ -353,4 +353,232 @@ mod tests {
         assert_eq!(Confidence::Low.as_str(), "low");
         assert_eq!(Confidence::High.to_string(), "high");
     }
+
+    // -----------------------------------------------------------------------
+    // Schema-as-contract tests
+    //
+    // These pin the *observable contract* of `planner_output_schema()` against
+    // the types it is meant to enforce, so the hand-maintained JSON Schema
+    // cannot silently drift from `PlannerOutput` / `ProposedTask` /
+    // `ProposedEdge` (or from the `Confidence` / `TaskKind` / `EffortLevel`
+    // enums) and cause runtime deserialization failures. They deliberately
+    // derive their expectations from serde and the enum types — not from the
+    // `json!` literal — so a change to either side that the other doesn't
+    // mirror trips a failure.
+    // -----------------------------------------------------------------------
+
+    /// The serde field names of a value, as actually emitted by `Serialize`.
+    fn serde_field_names<T: Serialize>(value: &T) -> Vec<String> {
+        let mut keys: Vec<String> = serde_json::to_value(value)
+            .expect("serialises")
+            .as_object()
+            .expect("value serialises to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Pull a JSON array of strings out of the schema at `pointer`.
+    fn string_array(schema: &Value, pointer: &str) -> Vec<String> {
+        schema
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("schema has no value at {pointer}"))
+            .as_array()
+            .unwrap_or_else(|| panic!("schema value at {pointer} is not an array"))
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("entry at {pointer} is not a string"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// A fully-populated sample used to derive the serde field names of every
+    /// output type (one task, one edge) without restating them by hand.
+    fn sample_output() -> PlannerOutput {
+        PlannerOutput {
+            tasks: vec![ProposedTask {
+                handle: "schema".into(),
+                name: "Add schema".into(),
+                description: "Add the schema types.".into(),
+                kind: TaskKind::ProjectTask,
+                effort: EffortLevel::Small,
+                ordinal: 1,
+            }],
+            edges: vec![ProposedEdge {
+                dependent: "impl".into(),
+                prerequisite: "schema".into(),
+            }],
+            confidence: Confidence::High,
+            breakdown_found: true,
+            notes: "Clear breakdown found.".into(),
+            effort_audit: vec!["[effort-classification] level=`small`".into()],
+        }
+    }
+
+    #[test]
+    fn schema_top_level_required_matches_planner_output_fields() {
+        let schema = planner_output_schema();
+        let required = sorted(string_array(&schema, "/required"));
+        let fields = serde_field_names(&sample_output());
+        assert_eq!(
+            required, fields,
+            "top-level `required` must list exactly PlannerOutput's serde fields"
+        );
+    }
+
+    #[test]
+    fn schema_task_items_required_matches_proposed_task_fields() {
+        let schema = planner_output_schema();
+        let sample = sample_output();
+        let required = sorted(string_array(&schema, "/properties/tasks/items/required"));
+        let fields = serde_field_names(&sample.tasks[0]);
+        assert_eq!(
+            required, fields,
+            "tasks[].items `required` must list exactly ProposedTask's serde fields"
+        );
+    }
+
+    #[test]
+    fn schema_edge_items_required_matches_proposed_edge_fields() {
+        let schema = planner_output_schema();
+        let sample = sample_output();
+        let required = sorted(string_array(&schema, "/properties/edges/items/required"));
+        let fields = serde_field_names(&sample.edges[0]);
+        assert_eq!(
+            required, fields,
+            "edges[].items `required` must list exactly ProposedEdge's serde fields"
+        );
+    }
+
+    #[test]
+    fn schema_confidence_enum_matches_confidence_variants() {
+        let schema = planner_output_schema();
+        let enum_vals = string_array(&schema, "/properties/confidence/enum");
+        let expected: Vec<String> = [Confidence::High, Confidence::Medium, Confidence::Low]
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        assert_eq!(
+            enum_vals, expected,
+            "confidence enum must equal the Confidence variants' as_str() values"
+        );
+        // Every listed value must round-trip through serde into a Confidence.
+        for v in &enum_vals {
+            let c: Confidence = serde_json::from_value(Value::String(v.clone()))
+                .unwrap_or_else(|_| panic!("{v} is not a valid Confidence"));
+            assert_eq!(c.as_str(), v);
+        }
+    }
+
+    #[test]
+    fn schema_kind_enum_is_the_planner_subset_of_task_kind() {
+        let schema = planner_output_schema();
+        let kinds = string_array(&schema, "/properties/tasks/items/properties/kind/enum");
+        assert_eq!(
+            kinds,
+            vec!["project_task".to_string(), "investigation".to_string()],
+            "kind enum must be the Planner's project_task/investigation subset"
+        );
+        // Each listed value is a genuine TaskKind, and matches the intended variant.
+        let parsed: Vec<TaskKind> = kinds
+            .iter()
+            .map(|v| {
+                serde_json::from_value(Value::String(v.clone()))
+                    .unwrap_or_else(|_| panic!("{v} is not a valid TaskKind"))
+            })
+            .collect();
+        assert_eq!(parsed, vec![TaskKind::ProjectTask, TaskKind::Investigation]);
+    }
+
+    #[test]
+    fn schema_effort_enum_matches_effort_level_minus_max() {
+        let schema = planner_output_schema();
+        let efforts = string_array(&schema, "/properties/tasks/items/properties/effort/enum");
+        assert_eq!(
+            efforts,
+            vec![
+                "trivial".to_string(),
+                "small".to_string(),
+                "medium".to_string(),
+                "large".to_string()
+            ],
+            "effort enum must be the non-max EffortLevel values"
+        );
+        let parsed: Vec<EffortLevel> = efforts
+            .iter()
+            .map(|v| {
+                serde_json::from_value(Value::String(v.clone()))
+                    .unwrap_or_else(|_| panic!("{v} is not a valid EffortLevel"))
+            })
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                EffortLevel::Trivial,
+                EffortLevel::Small,
+                EffortLevel::Medium,
+                EffortLevel::Large
+            ]
+        );
+        // `max` is a real EffortLevel but deliberately excluded (human-only).
+        assert!(
+            !efforts.contains(&"max".to_string()),
+            "effort enum must not offer the human-only `max`"
+        );
+        assert_eq!(EffortLevel::Max.as_str(), "max");
+    }
+
+    #[test]
+    fn schema_conformant_document_deserializes_into_planner_output() {
+        // A document that satisfies every `required` the schema lists, using
+        // legal enum values, must deserialize into PlannerOutput — proving the
+        // schema and the deserialization target agree.
+        let doc = json!({
+            "tasks": [{
+                "handle": "schema",
+                "name": "Add schema",
+                "description": "Add the schema types.",
+                "kind": "project_task",
+                "effort": "small",
+                "ordinal": 1
+            }],
+            "edges": [{ "dependent": "impl", "prerequisite": "schema" }],
+            "confidence": "high",
+            "breakdown_found": true,
+            "notes": "Clear breakdown.",
+            "effort_audit": ["[effort-classification] level=`small`"]
+        });
+        let output: PlannerOutput = serde_json::from_value(doc).expect("schema-conformant document deserializes");
+        assert_eq!(output.tasks[0].kind, TaskKind::ProjectTask);
+        assert_eq!(output.tasks[0].effort, EffortLevel::Small);
+        assert_eq!(output.edges[0].prerequisite, "schema");
+        assert_eq!(output.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn document_missing_a_required_field_fails_to_deserialize() {
+        // Same document minus `confidence` (a schema-required field) must not
+        // deserialize — pinning that the required list is load-bearing.
+        let doc = json!({
+            "tasks": [],
+            "edges": [],
+            "breakdown_found": false,
+            "notes": "",
+            "effort_audit": []
+        });
+        let result: Result<PlannerOutput, _> = serde_json::from_value(doc);
+        assert!(
+            result.is_err(),
+            "a document missing the required `confidence` field must not deserialize"
+        );
+    }
 }
