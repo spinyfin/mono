@@ -9022,6 +9022,12 @@ fn print_planner_proposal(proposal: &PlannerOutput) {
             println!("  {} depends on {}", edge.dependent, edge.prerequisite);
         }
     }
+    if !proposal.merge_order_hints.is_empty() {
+        println!("Merge-order hints (soft, do not gate dispatch):");
+        for hint in &proposal.merge_order_hints {
+            println!("  {} <-> {} ({})", hint.task_a, hint.task_b, hint.reason);
+        }
+    }
     println!("Confidence: {}", proposal.confidence);
     if !proposal.notes.is_empty() {
         println!("Notes: {}", proposal.notes);

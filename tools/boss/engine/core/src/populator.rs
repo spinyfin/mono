@@ -1159,6 +1159,7 @@ mod tests {
         PlannerOutput {
             tasks,
             edges,
+            merge_order_hints: vec![],
             confidence,
             breakdown_found,
             notes: "rationale".to_owned(),

@@ -139,6 +139,30 @@ pub struct ProposedEdge {
     pub prerequisite: String,
 }
 
+/// A soft file-overlap hint between two otherwise-parallel proposed tasks,
+/// expressed by handle.
+///
+/// This is deliberately NOT a [`ProposedEdge`]: it never gates dispatch — both
+/// `task_a` and `task_b` remain independently startable, exactly like the
+/// design's "merge_order is non-blocking by construction" (see the
+/// merge-conflict-reduction design, "Composition with T2253's P5-lite"). It
+/// exists only so a later merge-time consumer can order the two PRs and stamp
+/// the later one with a preservation obligation. The Planner emits this only
+/// when two tasks it has otherwise declared parallel are clearly and
+/// substantially likely to co-edit the same file(s) — never for incidental
+/// overlap.
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize)]
+#[builder(on(String, into))]
+pub struct ProposedMergeOrderHint {
+    /// Handle of one of the two overlapping tasks.
+    pub task_a: String,
+    /// Handle of the other overlapping task.
+    pub task_b: String,
+    /// Free-text rationale: which file(s)/surface the two tasks are expected
+    /// to co-edit.
+    pub reason: String,
+}
+
 /// The Planner's structured output — a validated, typed task-graph proposal.
 ///
 /// This is the shape the engine deserialises directly from the Anthropic
@@ -150,6 +174,13 @@ pub struct PlannerOutput {
     pub tasks: Vec<ProposedTask>,
     /// Dependency edges between tasks, referenced by handle.
     pub edges: Vec<ProposedEdge>,
+    /// Soft file-overlap hints between otherwise-parallel tasks, referenced
+    /// by handle. Never gates dispatch — see [`ProposedMergeOrderHint`].
+    /// `#[serde(default)]` so a proposal from before this field existed still
+    /// deserialises.
+    #[serde(default)]
+    #[builder(default)]
+    pub merge_order_hints: Vec<ProposedMergeOrderHint>,
     pub confidence: Confidence,
     /// `false` when the design doc contained no task-breakdown section at
     /// all — a clean no-op signal, distinct from "found a breakdown but it
@@ -197,6 +228,7 @@ pub fn planner_output_schema() -> Value {
         "required": [
             "tasks",
             "edges",
+            "merge_order_hints",
             "confidence",
             "breakdown_found",
             "notes",
@@ -260,6 +292,29 @@ pub fn planner_output_schema() -> Value {
                     }
                 }
             },
+            "merge_order_hints": {
+                "type": "array",
+                "description": "Soft file-overlap hints between otherwise-parallel tasks, by handle. Never gates dispatch — use a `blocks` edge for true prerequisites instead.",
+                "items": {
+                    "type": "object",
+                    "required": ["task_a", "task_b", "reason"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "task_a": {
+                            "type": "string",
+                            "description": "Handle of one of the two overlapping tasks."
+                        },
+                        "task_b": {
+                            "type": "string",
+                            "description": "Handle of the other overlapping task."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Which file(s)/surface the two tasks are expected to co-edit."
+                        }
+                    }
+                }
+            },
             "confidence": {
                 "type": "string",
                 "enum": ["high", "medium", "low"],
@@ -315,6 +370,7 @@ mod tests {
                 ordinal: 1,
             }],
             edges: vec![],
+            merge_order_hints: vec![],
             confidence: Confidence::High,
             breakdown_found: true,
             notes: "Clear breakdown found.".into(),
@@ -417,6 +473,11 @@ mod tests {
                 dependent: "impl".into(),
                 prerequisite: "schema".into(),
             }],
+            merge_order_hints: vec![ProposedMergeOrderHint {
+                task_a: "schema".into(),
+                task_b: "impl".into(),
+                reason: "both touch the shared config module".into(),
+            }],
             confidence: Confidence::High,
             breakdown_found: true,
             notes: "Clear breakdown found.".into(),
@@ -457,6 +518,35 @@ mod tests {
             required, fields,
             "edges[].items `required` must list exactly ProposedEdge's serde fields"
         );
+    }
+
+    #[test]
+    fn schema_merge_order_hint_items_required_matches_field_names() {
+        let schema = planner_output_schema();
+        let sample = sample_output();
+        let required = sorted(string_array(&schema, "/properties/merge_order_hints/items/required"));
+        let fields = serde_field_names(&sample.merge_order_hints[0]);
+        assert_eq!(
+            required, fields,
+            "merge_order_hints[].items `required` must list exactly ProposedMergeOrderHint's serde fields"
+        );
+    }
+
+    #[test]
+    fn merge_order_hints_defaults_to_empty_when_absent() {
+        // Older/hand-written documents without this field must still
+        // deserialise (`#[serde(default)]`), so a proposal predating this
+        // field is not rejected outright.
+        let doc = json!({
+            "tasks": [],
+            "edges": [],
+            "confidence": "high",
+            "breakdown_found": false,
+            "notes": "",
+            "effort_audit": []
+        });
+        let output: PlannerOutput = serde_json::from_value(doc).expect("missing merge_order_hints defaults to []");
+        assert!(output.merge_order_hints.is_empty());
     }
 
     #[test]
@@ -552,6 +642,7 @@ mod tests {
                 "ordinal": 1
             }],
             "edges": [{ "dependent": "impl", "prerequisite": "schema" }],
+            "merge_order_hints": [{ "task_a": "schema", "task_b": "impl", "reason": "shared config module" }],
             "confidence": "high",
             "breakdown_found": true,
             "notes": "Clear breakdown.",
@@ -561,6 +652,7 @@ mod tests {
         assert_eq!(output.tasks[0].kind, TaskKind::ProjectTask);
         assert_eq!(output.tasks[0].effort, EffortLevel::Small);
         assert_eq!(output.edges[0].prerequisite, "schema");
+        assert_eq!(output.merge_order_hints[0].task_a, "schema");
         assert_eq!(output.confidence, Confidence::High);
     }
 
