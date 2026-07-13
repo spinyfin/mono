@@ -780,6 +780,23 @@ pub trait ProbeQueuer: Send + Sync {
     /// `Stop` event for the run pops one and `SendToPane`'s it as if
     /// the human had typed it.
     fn queue_probe(&self, run_id: &str, text: &str);
+
+    /// Drop every not-yet-delivered probe queued for `run_id`.
+    ///
+    /// Exists for the escalation/blocker suppression path: a probe
+    /// minted on an earlier Stop (e.g. a `PROBE_NO_PR` nudge whose
+    /// `SendToPane` failed and was requeued for retry — see
+    /// `dispatch_probe_on_stop`) can still be sitting in the queue when
+    /// a *later* Stop reveals the worker is blocked. `dispatch_probe_on_stop`
+    /// pops whatever is queued for a run on every `Stop` regardless of
+    /// that Stop's own completion outcome, so a stale probe like that
+    /// would otherwise fire even though this Stop just suppressed the
+    /// nudge — the worker sees "You stopped without producing a PR"
+    /// injected into its pane on the very turn it reported `[blocked]`.
+    /// Called whenever `on_stop_inner` finds an unresolved worker
+    /// signal, so no queued nudge survives into a Stop where nudging is
+    /// suppressed.
+    fn clear_pending_probes(&self, run_id: &str);
 }
 
 /// `ProbeQueuer` that drops everything — used when the test harness
@@ -789,6 +806,7 @@ pub struct NoopProbeQueuer;
 
 impl ProbeQueuer for NoopProbeQueuer {
     fn queue_probe(&self, _run_id: &str, _text: &str) {}
+    fn clear_pending_probes(&self, _run_id: &str) {}
 }
 
 /// Orchestrates the on-Stop completion flow: detect PR, transition
@@ -1402,6 +1420,22 @@ impl WorkerCompletionHandler {
         // while the item is unresolved. Best-effort: filing failures are
         // logged and swallowed, never block completion.
         self.detect_and_file_worker_signals(&execution).await;
+
+        // Flunge T308 (exec_18c1c0a92f0bda38_570, 2026-07-13): a probe
+        // minted on an earlier Stop can still be sitting undelivered in
+        // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
+        // `SendToPane` failed and was requeued for retry on the next
+        // Stop). `dispatch_probe_on_stop` pops whatever is queued for a
+        // run on *every* Stop, independent of what this Stop's own
+        // completion decision was — so without this, a stale nudge could
+        // still fire on the very Stop where the worker just reported
+        // `[blocked]`/`[effort-escalation]`, even though `nudge_or_park`
+        // below correctly refuses to queue a *new* one. Drop any stale
+        // queued probe now, before the event loop's `dispatch_probe_on_stop`
+        // gets a chance to pop it.
+        if self.unresolved_worker_signal_reason(&execution).is_some() {
+            self.probe_queuer.clear_pending_probes(execution_id);
+        }
 
         // Deferred-scope detection (T222/PR #765, recovered as Flunge T254):
         // a worker that deliberately narrowed its task's scope and declared
@@ -6668,6 +6702,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingProbeQueuer {
         calls: std::sync::Mutex<Vec<(String, String)>>,
+        clear_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl ProbeQueuer for RecordingProbeQueuer {
@@ -6677,11 +6712,25 @@ mod tests {
                 .expect("RecordingProbeQueuer mutex poisoned")
                 .push((run_id.to_owned(), text.to_owned()));
         }
+
+        fn clear_pending_probes(&self, run_id: &str) {
+            self.clear_calls
+                .lock()
+                .expect("RecordingProbeQueuer mutex poisoned")
+                .push(run_id.to_owned());
+        }
     }
 
     impl RecordingProbeQueuer {
         fn snapshot(&self) -> Vec<(String, String)> {
             self.calls.lock().expect("RecordingProbeQueuer mutex poisoned").clone()
+        }
+
+        fn clear_snapshot(&self) -> Vec<String> {
+            self.clear_calls
+                .lock()
+                .expect("RecordingProbeQueuer mutex poisoned")
+                .clone()
         }
     }
 
@@ -10282,6 +10331,49 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 .count(),
             1,
             "exactly one worker_blocked attention item must be filed; got {items:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_marker_on_first_stop_clears_any_stale_queued_probe() {
+        // Flunge T308 (exec_18c1c0a92f0bda38_570, 2026-07-13): the
+        // completion handler correctly refuses to *queue a new*
+        // produce-a-PR nudge once `[blocked]` is detected (the case
+        // above), but `dispatch_probe_on_stop` in the real event loop
+        // pops and delivers whatever is already sitting in the run's
+        // pending-probe queue on every Stop, independent of this Stop's
+        // own completion outcome. A probe minted on an earlier Stop
+        // (e.g. queued, then requeued for retry after a failed
+        // `SendToPane`) would therefore still fire on the very Stop
+        // where the worker reports `[blocked]`. `on_stop` must clear any
+        // such stale probe via the `ProbeQueuer` the moment it finds an
+        // unresolved worker signal, on the FIRST Stop that carries the
+        // marker — not just refrain from adding a new one.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[blocked] reason=\"bazel E0583, survives clean --expunge; need explicit direction\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no new nudge should be queued on the blocked Stop"
+        );
+        assert_eq!(
+            probes.clear_snapshot(),
+            vec![execution_id.clone()],
+            "on_stop must clear any stale queued probe for this run so dispatch_probe_on_stop \
+             cannot deliver a nudge minted before the blocker was recognized",
         );
     }
 
