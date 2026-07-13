@@ -462,14 +462,8 @@ fn provider_for_url(url: &str) -> CiProvider {
 /// prompt then shows the raw URL and the worker shells out manually.
 fn parse_provider_job_id(provider: CiProvider, url: &str) -> Option<String> {
     match provider {
-        CiProvider::Buildkite => url.split_once('#').map(|(_, frag)| frag.to_owned()),
-        CiProvider::GithubActions => {
-            // …/actions/runs/<run-id>/job/<job-id>[?…]
-            let stripped = url.split('?').next().unwrap_or(url);
-            stripped
-                .rsplit_once("/job/")
-                .map(|(_, tail)| tail.trim_end_matches('/').to_owned())
-        }
+        CiProvider::Buildkite => crate::ci_log_reader::parse_buildkite_job_id(url),
+        CiProvider::GithubActions => crate::ci_log_reader::parse_gha_job_id(url),
         CiProvider::Other => None,
     }
 }
