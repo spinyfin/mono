@@ -296,14 +296,35 @@ impl WorkDb {
     /// apology thread entry stands in for the missing answer so the thread
     /// isn't left silently stuck). Guarded on `status = 'answering'`,
     /// mirroring the design's idempotency table.
+    ///
+    /// Reverse-edge case: [`Self::override_comment_intent`] has no status
+    /// guard, so a user can reclassify a comment away from `question` while
+    /// its answer-agent run is still in flight (still `answering`). When
+    /// that run finishes, landing on `answered` would strand the comment
+    /// off the `[Revise]` candidate pool exactly like the forward-direction
+    /// bug this module fixes — there's no question left to await a
+    /// follow-up on. So if `intent` is already `directive`/`larger_change`
+    /// by the time this fires, skip `answered` entirely and land on
+    /// `active`, folding the comment straight into the revise pool (the
+    /// answer-agent's reply is still available as thread context via
+    /// [`Self::latest_answer_agent_run_for_comment`]).
     pub fn transition_comment_to_answered(&self, comment_id: &str) -> Result<WorkComment> {
         let conn = self.connect()?;
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             SET status = CASE WHEN intent IN (?5, ?6) THEN ?7 ELSE ?2 END,
+                 status_actor = 'engine', updated_at = ?3
              WHERE id = ?1 AND status = ?4",
-            params![comment_id, COMMENT_STATUS_ANSWERED, now, COMMENT_STATUS_ANSWERING],
+            params![
+                comment_id,
+                COMMENT_STATUS_ANSWERED,
+                now,
+                COMMENT_STATUS_ANSWERING,
+                INTENT_DIRECTIVE,
+                INTENT_LARGER_CHANGE,
+                COMMENT_STATUS_ACTIVE,
+            ],
         )?;
         if n == 0 {
             bail!("comment {comment_id} not found, or not 'answering' (expected answering → answered)");
@@ -514,6 +535,24 @@ impl WorkDb {
     /// `intent_confidence` is cleared (`NULL`) — a manual override has no
     /// numeric confidence, and the override itself doubles as the
     /// classification, so no re-classification LLM call is triggered.
+    ///
+    /// Also has no status guard — it can fire from any comment status,
+    /// including mid-bucket-2 (`answered`/`awaiting_followup`). If the new
+    /// intent is revisable (`directive`/`larger_change`) and the comment is
+    /// currently sitting in one of those two statuses, this also resets
+    /// `status` back to `active` in the same write: those two statuses only
+    /// make sense for a `question` awaiting an answer/follow-up, and
+    /// leaving a revisable-intent comment stranded there would silently
+    /// exclude it from every `status = 'active'` consumer of comment intent
+    /// — `[Revise]`'s candidate query, its claim UPDATE, and the banner's
+    /// `unresolved_count` (comment-triggered-document-revisions.md
+    /// §"Reclassifying an answered question mid-flight"). The answer-agent's
+    /// prior reply is preserved as thread context regardless (it isn't
+    /// touched by this transition) — `compose_doc_comment_directive` pulls
+    /// it in via [`Self::latest_answer_agent_run_for_comment`] once the
+    /// comment is claimed into a revision. A comment still `answering` (a
+    /// run genuinely in flight right now) is intentionally left alone here;
+    /// see [`Self::transition_comment_to_answered`] for that reverse edge.
     pub fn override_comment_intent(&self, comment_id: &str, intent: &str) -> Result<WorkComment> {
         match intent {
             INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
@@ -524,9 +563,21 @@ impl WorkDb {
         let n = conn.execute(
             "UPDATE work_comments
              SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user',
-                 intent_classification_failed_at = NULL, intent_classification_error = NULL
+                 intent_classification_failed_at = NULL, intent_classification_error = NULL,
+                 status = CASE WHEN status IN (?4, ?5) AND ?2 IN (?6, ?7) THEN ?8 ELSE status END,
+                 status_actor = CASE WHEN status IN (?4, ?5) AND ?2 IN (?6, ?7) THEN 'user' ELSE status_actor END,
+                 updated_at = CASE WHEN status IN (?4, ?5) AND ?2 IN (?6, ?7) THEN ?3 ELSE updated_at END
              WHERE id = ?1",
-            params![comment_id, intent, now],
+            params![
+                comment_id,
+                intent,
+                now,
+                COMMENT_STATUS_ANSWERED,
+                COMMENT_STATUS_AWAITING_FOLLOWUP,
+                INTENT_DIRECTIVE,
+                INTENT_LARGER_CHANGE,
+                COMMENT_STATUS_ACTIVE,
+            ],
         )?;
         if n == 0 {
             bail!("unknown comment: {comment_id}");
@@ -1343,6 +1394,103 @@ mod tests {
     fn override_comment_intent_rejects_unknown_comment() {
         let db = mem_db();
         assert!(db.override_comment_intent("cmt_missing", "directive").is_err());
+    }
+
+    // --- Reclassified answered/awaiting_followup comments re-enter the
+    // revise pool (T2265: intent override never reset status) ---
+
+    #[test]
+    fn override_comment_intent_resets_answered_status_to_active_for_revisable_intent() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        assert_eq!(comment.status, "answered");
+
+        let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        assert_eq!(overridden.status, "active");
+        assert_eq!(overridden.status_actor.as_deref(), Some("user"));
+        assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
+        assert_eq!(overridden.intent_overridden_by.as_deref(), Some("user"));
+
+        let reloaded = db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+    }
+
+    #[test]
+    fn override_comment_intent_resets_awaiting_followup_status_to_active_for_revisable_intent() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+
+        let overridden = db.override_comment_intent(&comment.id, "directive").unwrap();
+        assert_eq!(overridden.status, "active");
+        assert_eq!(overridden.status_actor.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn override_comment_intent_leaves_answered_status_alone_when_new_intent_is_still_question() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+
+        // Re-affirming 'question' isn't a bucket-1&3 bridge — status must
+        // stay 'answered'.
+        let overridden = db.override_comment_intent(&comment.id, "question").unwrap();
+        assert_eq!(overridden.status, "answered");
+    }
+
+    #[test]
+    fn override_comment_intent_leaves_active_status_alone() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert_eq!(comment.status, "active");
+
+        // Already active — the CASE guard must be a no-op, not an error.
+        let overridden = db.override_comment_intent(&comment.id, "directive").unwrap();
+        assert_eq!(overridden.status, "active");
+    }
+
+    #[test]
+    fn override_comment_intent_does_not_touch_status_while_a_run_is_still_answering() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+
+        // A run is genuinely in flight right now — resetting to 'active'
+        // here would orphan it. See `transition_comment_to_answered` for
+        // how this reverse edge is handled once the run finishes.
+        let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        assert_eq!(overridden.status, "answering");
+        assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
+    }
+
+    #[test]
+    fn transition_to_answered_lands_on_active_when_intent_already_overridden_mid_flight() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+
+        // The user reclassifies away from 'question' while the answer-agent
+        // run is still in flight.
+        db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        assert_eq!(db.get_comment(&comment.id).unwrap().unwrap().status, "answering");
+
+        // The run finishes: rather than landing on 'answered' (stranding
+        // the comment off the revise pool exactly like the forward-direction
+        // bug), it must skip straight to 'active'.
+        let answered = db.transition_comment_to_answered(&comment.id).unwrap();
+        assert_eq!(answered.status, "active");
+        assert_eq!(answered.status_actor.as_deref(), Some("engine"));
+        assert_eq!(answered.intent.as_deref(), Some("larger_change"));
+    }
+
+    #[test]
+    fn transition_to_answered_lands_on_answered_when_intent_is_still_question() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+
+        // No override happened — the ordinary path is unaffected.
+        let answered = db.transition_comment_to_answered(&comment.id).unwrap();
+        assert_eq!(answered.status, "answered");
     }
 
     #[test]
