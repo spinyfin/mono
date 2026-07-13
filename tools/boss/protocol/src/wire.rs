@@ -2590,6 +2590,9 @@ pub enum FrontendEvent {
         /// Epoch seconds when dispatch was paused. `None` when `paused = false`.
         #[serde(skip_serializing_if = "Option::is_none")]
         paused_since_epoch_s: Option<u64>,
+        /// Whether the pause exempts `pr_review` executions (operator pause); `false` for a breaker pause.
+        #[serde(default)]
+        reviews_exempt: bool,
     },
     /// Response to [`FrontendRequest::SyncProductExternalTracker`].
     /// Emitted when the engine begins the on-demand reconcile pass

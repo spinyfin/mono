@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::coordinator::DispatchPauseOrigin;
 use crate::test_support::*;
 /// `dispatch_live_worker_state` must persist `transcript_path` on
 /// the matching `work_runs` row even when the in-memory
@@ -2040,8 +2041,8 @@ fn dispatch_paused_state_defaults_when_absent() {
     let db = open_temp_work_db();
     assert_eq!(
         load_dispatch_paused_state(&db),
-        (false, 0),
-        "with no metadata keys set, the state defaults to (not-paused, since 0)"
+        (false, 0, DispatchPauseOrigin::Breaker),
+        "with no metadata keys set, the state defaults to (not-paused, since 0, breaker origin)"
     );
 }
 
@@ -2051,10 +2052,11 @@ fn dispatch_paused_state_reads_paused_and_since() {
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "1700000000")
         .unwrap();
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, "operator").unwrap();
     assert_eq!(
         load_dispatch_paused_state(&db),
-        (true, 1_700_000_000),
-        "paused flag '1' with a numeric since must parse both components"
+        (true, 1_700_000_000, DispatchPauseOrigin::Operator),
+        "paused flag '1' with a numeric since and a persisted origin must parse all three components"
     );
 }
 
@@ -2065,7 +2067,7 @@ fn dispatch_paused_state_since_defaults_to_zero_when_missing_or_garbage() {
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
     assert_eq!(
         load_dispatch_paused_state(&db),
-        (true, 0),
+        (true, 0, DispatchPauseOrigin::Breaker),
         "missing since key must default the timestamp to 0 while preserving paused=true"
     );
     // Non-numeric since value is also treated as 0.
@@ -2073,7 +2075,7 @@ fn dispatch_paused_state_since_defaults_to_zero_when_missing_or_garbage() {
         .unwrap();
     assert_eq!(
         load_dispatch_paused_state(&db),
-        (true, 0),
+        (true, 0, DispatchPauseOrigin::Breaker),
         "non-numeric since value must fall back to 0"
     );
 }
@@ -2086,11 +2088,26 @@ fn dispatch_paused_state_non_one_flag_is_not_paused() {
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0").unwrap();
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "1700000000")
         .unwrap();
-    let (paused, since) = load_dispatch_paused_state(&db);
+    let (paused, since, _origin) = load_dispatch_paused_state(&db);
     assert!(!paused, "flag '0' must read as not paused");
     assert_eq!(
         since, 1_700_000_000,
         "the since component still parses independently of the flag"
+    );
+}
+
+#[test]
+fn dispatch_paused_state_missing_origin_defaults_to_breaker() {
+    let db = open_temp_work_db();
+    // A pause persisted before the origin key existed (or corrupted data)
+    // must NOT be restored as review-exempt — default conservatively to the
+    // non-exempt breaker origin.
+    db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
+    let (_, _, origin) = load_dispatch_paused_state(&db);
+    assert_eq!(
+        origin,
+        DispatchPauseOrigin::Breaker,
+        "a pause with no persisted origin must default to the non-exempt breaker origin"
     );
 }
 

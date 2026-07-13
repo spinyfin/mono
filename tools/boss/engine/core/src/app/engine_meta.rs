@@ -401,17 +401,24 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 FrontendEvent::DispatchStateResult {
                     paused,
                     paused_since_epoch_s,
+                    reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
                 },
             );
             return;
         }
         let now_epoch_s = crate::epoch_time::now_epoch_secs() as u64;
-        coordinator.set_dispatch_paused(paused, now_epoch_s);
+        // A human toggling `bossctl dispatch pause` / the app's pause switch
+        // is always an operator-originated pause, so PR-review executions —
+        // the lifecycle of a change already in flight, not new work — stay
+        // exempt from it. See `DispatchPauseOrigin`.
+        let origin = crate::coordinator::DispatchPauseOrigin::Operator;
+        coordinator.set_dispatch_paused(paused, now_epoch_s, origin);
         // Persist the new state to the metadata table so it survives a restart.
         let db_result = if paused {
             work_db
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_epoch_s.to_string()))
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, origin.as_metadata_str()))
         } else {
             work_db
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
@@ -426,7 +433,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             );
         }
         if paused {
-            tracing::info!("dispatch: globally paused — no new executions will be dispatched");
+            tracing::info!("dispatch: globally paused (operator) — PR-review executions remain exempt");
         } else {
             // Re-kick the scheduler so anything that queued while paused is
             // drained immediately without waiting for the next external event.
@@ -440,6 +447,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             FrontendEvent::DispatchStateResult {
                 paused,
                 paused_since_epoch_s,
+                reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
             },
         );
         // Broadcast the new health report to all connected app clients so
@@ -468,6 +476,7 @@ pub(super) async fn handle_get_dispatch_state(ctx: Dispatch, req: FrontendReques
             FrontendEvent::DispatchStateResult {
                 paused,
                 paused_since_epoch_s,
+                reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
             },
         );
     }

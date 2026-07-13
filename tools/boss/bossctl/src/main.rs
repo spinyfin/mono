@@ -1011,6 +1011,7 @@ async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: b
         FrontendEvent::DispatchStateResult {
             paused: new_paused,
             paused_since_epoch_s,
+            reviews_exempt,
         } => {
             if json {
                 println!(
@@ -1018,13 +1019,19 @@ async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: b
                     serde_json::json!({
                         "paused": new_paused,
                         "paused_since_epoch_s": paused_since_epoch_s,
+                        "reviews_exempt": reviews_exempt,
                     })
                 );
             } else if new_paused {
                 let since_str = paused_since_epoch_s
                     .map(|s| format!(" (since epoch {s})"))
                     .unwrap_or_default();
-                println!("dispatch paused{since_str}");
+                let exempt_str = if reviews_exempt {
+                    " — PR reviews are exempt and keep dispatching"
+                } else {
+                    " — PR reviews are held too (spawn-capability breaker)"
+                };
+                println!("dispatch paused{since_str}{exempt_str}");
             } else {
                 println!("dispatch resumed");
             }
@@ -1047,6 +1054,7 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
         FrontendEvent::DispatchStateResult {
             paused,
             paused_since_epoch_s,
+            reviews_exempt,
         } => {
             if json {
                 println!(
@@ -1054,6 +1062,7 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
                     serde_json::json!({
                         "paused": paused,
                         "paused_since_epoch_s": paused_since_epoch_s,
+                        "reviews_exempt": reviews_exempt,
                     })
                 );
             } else if paused {
@@ -1063,6 +1072,11 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
                 println!("state: paused");
                 if !since_str.is_empty() {
                     println!("{since_str}");
+                }
+                if reviews_exempt {
+                    println!("  reviews: exempt — PR-review executions keep dispatching");
+                } else {
+                    println!("  reviews: held — spawn-capability breaker pause");
                 }
             } else {
                 println!("state: running");

@@ -56,6 +56,13 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
 /// Metadata key storing the epoch-seconds timestamp at which dispatch was last
 /// paused. Zero (or absent) means not paused.
 pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoch_s";
+/// Metadata key storing the origin of the current pause — one of
+/// [`crate::coordinator::DispatchPauseOrigin::as_metadata_str`]'s values.
+/// Determines whether the pause exempts `pr_review` executions on restore;
+/// absent (a pause persisted before this key existed) defaults to the
+/// non-exempt `breaker` origin — see
+/// [`crate::coordinator::DispatchPauseOrigin::from_metadata_str`].
+pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
 
 /// Persist the disabled-slot snapshot to the metadata KV. Called
 /// from the toggle handler. Errors bubble up so the caller can log
@@ -98,14 +105,25 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     }
 
     if dispatch_paused {
+        let reviews_exempt = server_state.execution_coordinator.dispatch_pause_exempts_reviews();
+        let body = if reviews_exempt {
+            "The engine is not dispatching new executions from the main or automation pools. \
+             PR-review executions are exempt and keep dispatching — a review is the lifecycle \
+             of a change already in flight, not new work. Currently-running workers continue to \
+             completion. Run `bossctl dispatch resume` to restore normal dispatch."
+                .to_owned()
+        } else {
+            "The engine is not dispatching new executions from any source, including PR \
+             reviews — the spawn-capability circuit breaker tripped, so review dispatch is held \
+             too until the app's spawn path is confirmed healthy. Currently-running workers \
+             continue to completion. Run `bossctl dispatch resume` to restore normal dispatch."
+                .to_owned()
+        };
         issues.push(EngineHealthIssue {
             kind: "dispatch_paused".to_owned(),
             severity: "warning".to_owned(),
             title: "Dispatch is globally paused".to_owned(),
-            body: "The engine is not dispatching new executions from any source. \
-                   Currently-running workers continue to completion. Run \
-                   `bossctl dispatch resume` to restore normal dispatch."
-                .to_owned(),
+            body,
         });
     }
 
@@ -287,9 +305,10 @@ pub(super) fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
 }
 
 /// Read the persisted dispatch-pause state from the metadata KV. Returns
-/// `(paused, paused_since_epoch_s)`. On first boot or if absent/malformed
-/// defaults to `(false, 0)`.
-pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64) {
+/// `(paused, paused_since_epoch_s, origin)`. On first boot or if
+/// absent/malformed defaults to `(false, 0, DispatchPauseOrigin::Breaker)` —
+/// the origin is irrelevant when `paused` is `false`.
+pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64, crate::coordinator::DispatchPauseOrigin) {
     let paused = work_db
         .get_metadata(METADATA_KEY_DISPATCH_PAUSED)
         .ok()
@@ -302,7 +321,9 @@ pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64) {
         .flatten()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    (paused, since_epoch_s)
+    let origin_raw = work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN).ok().flatten();
+    let origin = crate::coordinator::DispatchPauseOrigin::from_metadata_str(origin_raw.as_deref());
+    (paused, since_epoch_s, origin)
 }
 
 /// Downcast `err` to `DuplicateTaskError` and return a structured

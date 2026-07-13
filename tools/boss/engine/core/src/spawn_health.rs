@@ -38,8 +38,10 @@ use std::sync::Mutex;
 
 use boss_protocol::CreateAttentionItemInput;
 
-use crate::app::handler_helpers::{METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE};
-use crate::coordinator::ExecutionCoordinator;
+use crate::app::handler_helpers::{
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+};
+use crate::coordinator::{DispatchPauseOrigin, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
 
@@ -129,12 +131,25 @@ impl SpawnHealthTracker {
 /// Act on a tripped spawn-capability breaker: pause dispatch and raise the one
 /// loud signal.
 ///
-/// Idempotent via the global dispatch-pause flag — if dispatch is already
-/// paused (whether by an earlier trip or a human), this is a no-op, so
-/// repeated failures while the app is wedged never spam attention items. The
-/// pause is persisted through the same metadata keys the human toggle
+/// Idempotent only once dispatch is already paused with review-exemption OFF
+/// (i.e. a prior breaker trip, or a human pause that has already been
+/// escalated) — that is a no-op, so repeated failures while the app is
+/// wedged never spam attention items. But an *operator* pause exempts
+/// `pr_review` executions ([`ExecutionCoordinator::dispatch_pause_exempts_reviews`]),
+/// so if the app spawn path is also broken during an operator pause, reviews
+/// would otherwise keep dispatching into the dead path and keep tripping this
+/// function forever. In that case this still escalates: it re-pauses with
+/// [`DispatchPauseOrigin::Breaker`] (clearing the review exemption) and
+/// raises the attention item, rather than skipping as a duplicate.
+///
+/// The pause is persisted through the same metadata keys the human toggle
 /// (`handle_set_dispatch_paused`) uses, so an engine restart mid-outage does
 /// not resume churning.
+///
+/// Pauses with [`DispatchPauseOrigin::Breaker`], which — unlike an operator
+/// pause — does NOT exempt `pr_review` executions: the app's spawn path
+/// itself is broken here, so dispatching a review would just burn another
+/// attempt against the same dead path.
 pub async fn trip_spawn_capability_circuit(
     work_db: &WorkDb,
     coordinator: &ExecutionCoordinator,
@@ -144,19 +159,25 @@ pub async fn trip_spawn_capability_circuit(
     distinct_work_items: usize,
     now_epoch_secs: i64,
 ) {
-    if coordinator.is_dispatch_paused() {
+    if coordinator.is_dispatch_paused() && !coordinator.dispatch_pause_exempts_reviews() {
         tracing::debug!(
             tripping_execution_id,
-            "spawn-capability breaker: dispatch already paused; skipping duplicate trip",
+            "spawn-capability breaker: dispatch already paused (non-exempt); skipping duplicate trip",
         );
         return;
     }
 
     let now_u64 = now_epoch_secs.max(0) as u64;
-    coordinator.set_dispatch_paused(true, now_u64);
+    coordinator.set_dispatch_paused(true, now_u64, DispatchPauseOrigin::Breaker);
     if let Err(err) = work_db
         .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
         .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_u64.to_string()))
+        .and_then(|()| {
+            work_db.set_metadata(
+                METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
+                DispatchPauseOrigin::Breaker.as_metadata_str(),
+            )
+        })
     {
         tracing::warn!(
             ?err,
