@@ -427,7 +427,6 @@ mod tests {
 
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
-    use tempfile::TempDir;
 
     use super::*;
     use crate::coordinator::ExecutionCoordinator;
@@ -478,12 +477,6 @@ mod tests {
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     /// Create a `ready` execution for `work_item_id` and stamp its
     /// `started_at` to 5 minutes ago so the grace-period guard passes.

@@ -269,7 +269,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use boss_protocol::{ExecutionKind, RequestExecutionInput};
-    use tempfile::TempDir;
 
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
@@ -277,12 +276,6 @@ mod tests {
     use crate::work::{CreateChoreInput, ExecutionStatus, FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
 
     // `NoopCube` and `NoopRunner` come from `crate::test_support::*`.
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     /// Create an active chore with a bound `pr_url` and a dead (orphaned)
     /// `pr_review` execution — the exact shape `list_dead_pr_review_candidates`

@@ -67,17 +67,9 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::TempDir;
-
     use super::*;
     use crate::test_support::*;
     use crate::work::CreateChoreInput;
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     #[tokio::test]
     async fn sweep_prunes_old_abandoned_backlog_on_first_pass() {
