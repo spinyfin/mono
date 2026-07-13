@@ -2570,9 +2570,24 @@ async fn sweep_one(
                     // `Open` arm with `mergeability = Conflict`, so the PR is
                     // known-open; feed that observation to the gate via a
                     // static checker rather than a redundant `gh pr view`.
+                    //
+                    // Escalation ladder (T4): hand `on_conflict_detected` a live
+                    // `CubeClient` for the rung-1 engine-direct rebase only when
+                    // the `conflict_ladder_mechanical_rebase` flag is enabled.
+                    // Off (or no completion handler) → `None` preserves the
+                    // worker-only path exactly.
+                    let rung1_cube = if completion_handler
+                        .map(|h| h.mechanical_rebase_enabled())
+                        .unwrap_or(false)
+                    {
+                        cube_client
+                    } else {
+                        None
+                    };
                     if conflict_watch::on_conflict_detected(
                         work_db,
                         publisher,
+                        rung1_cube,
                         &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
                         candidate,
                         &probe_result,
@@ -2861,7 +2876,10 @@ async fn reconcile_stranded(
     let checker = crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open);
     match kind {
         SignalKind::MergeConflict => {
-            if conflict_watch::on_conflict_detected(work_db, publisher, &checker, candidate, probe_result).await {
+            // Recovery re-arm path (not a fresh conflict): drive detection to
+            // re-spawn the worker revision. The mechanical rung is only for
+            // fresh conflicts, so pass `None` — no engine-direct rebase here.
+            if conflict_watch::on_conflict_detected(work_db, publisher, None, &checker, candidate, probe_result).await {
                 outcome.conflict_flagged += 1;
             }
         }

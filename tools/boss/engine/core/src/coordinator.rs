@@ -329,6 +329,28 @@ pub struct CubeChangeHandle {
     pub change_id: String,
 }
 
+/// Outcome of an engine-direct `cube workspace rebase` (rung 1 of the
+/// merge-conflict escalation ladder — see
+/// `docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+///
+/// Mirrors the two terminal states `cube workspace rebase` reports on its
+/// `--json` `payload`: `REBASED_CLEAN` (jj rebased with no conflicts and,
+/// unless `--no-push` was passed, advanced+pushed the boss bookmark) or
+/// `REBASED_WITH_CONFLICTS` (conflicts materialized in the working copy,
+/// nothing pushed). The `conflicted_files` list is best-effort informational
+/// (it comes from `jj resolve --list`, so entries may carry a trailing
+/// conflict-type descriptor after the path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseOutcome {
+    /// `true` for `REBASED_CLEAN`, `false` for `REBASED_WITH_CONFLICTS`.
+    pub clean: bool,
+    /// Whether the rebased branch was pushed to GitHub. Always `false` on
+    /// the conflict path; `true` on a clean rebase unless `--no-push`.
+    pub pushed: bool,
+    /// Files still conflicted after the structural rebase (empty when clean).
+    pub conflicted_files: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder, serde::Deserialize)]
 #[builder(on(String, into))]
 pub struct CubeWorkspaceStatus {
@@ -375,6 +397,21 @@ pub trait CubeClient: Send + Sync {
     /// child commit atop PR `pr`'s current head. Delegates to
     /// `cube workspace goto --workspace <path> --pr <n>`. Idempotent.
     async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
+    /// Run an engine-direct `cube workspace rebase --pr <pr>` inside the
+    /// leased workspace at `workspace_path`, rebasing the PR's boss branch
+    /// onto the repo's integration branch. On a clean rebase the command
+    /// advances and pushes the boss bookmark itself (rung 1 of the
+    /// merge-conflict escalation ladder — no agent, zero tokens). See
+    /// [`RebaseOutcome`].
+    ///
+    /// The default implementation errors so the many test doubles and the
+    /// host-adapter layers need no change; the harness treats any error as
+    /// "rung 1 unavailable" and falls through to the worker path. Only
+    /// [`CommandCubeClient`] provides a real implementation.
+    async fn rebase_workspace(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {
+        let _ = (workspace_path, pr);
+        Err(anyhow!("rebase_workspace is not supported by this CubeClient"))
+    }
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
@@ -415,12 +452,21 @@ impl CommandCubeClient {
     }
 
     async fn run_json(&self, args: &[&str]) -> Result<serde_json::Value> {
+        let cwd = self.cfg.work.cwd.clone();
+        self.run_json_in_dir(&cwd, args).await
+    }
+
+    /// Like [`Self::run_json`] but runs the cube subprocess with an explicit
+    /// working directory. Required for cwd-sensitive subcommands such as
+    /// `cube workspace rebase`, which resolves the target workspace from the
+    /// current directory rather than a `--workspace` flag.
+    async fn run_json_in_dir(&self, cwd: &Path, args: &[&str]) -> Result<serde_json::Value> {
         let agent = self.cfg.agent()?;
         let mut command = Command::new(&agent.cube.command);
         command
             .args(&agent.cube.args)
             .args(args)
-            .current_dir(&self.cfg.work.cwd)
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -526,6 +572,38 @@ impl CubeClient for CommandCubeClient {
             ])
             .await?;
         Ok(())
+    }
+
+    async fn rebase_workspace(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {
+        let pr_str = pr.to_string();
+        // `cube workspace rebase` resolves the workspace from the current
+        // directory (no `--workspace` flag), so it must run inside the leased
+        // workspace. Without `--no-push`, a clean rebase advances and pushes
+        // the boss bookmark itself. The `--json` output is the command's
+        // `payload` object (`{status, pushed, conflicted_files, ...}`).
+        let payload = self
+            .run_json_in_dir(workspace_path, &["--json", "workspace", "rebase", "--pr", &pr_str])
+            .await?;
+        let status = payload
+            .get("status")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cube workspace rebase returned no `status` field: {payload}"))?;
+        let clean = match status {
+            "clean" => true,
+            "conflicts" => false,
+            other => return Err(anyhow!("cube workspace rebase returned unexpected status `{other}`")),
+        };
+        let pushed = payload.get("pushed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let conflicted_files = payload
+            .get("conflicted_files")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        Ok(RebaseOutcome {
+            clean,
+            pushed,
+            conflicted_files,
+        })
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {

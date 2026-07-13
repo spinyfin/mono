@@ -31,6 +31,7 @@ use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, Fron
 use boss_protocol::{ExecutionKind, TaskKind};
 
 use crate::blocking_signal::{self, SignalKind};
+use crate::conflict_ladder;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 #[cfg(test)]
@@ -102,9 +103,18 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
 /// Returns `true` when the parent task status changed (in either
 /// direction) or a fresh attempt row was created; `false` for purely
 /// idempotent repeat probes and human-owned rows.
+///
+/// **Escalation ladder (T4):** when `cube_client` is `Some`, a fresh conflict
+/// first attempts the engine-direct mechanical rebase (rung 1) before spawning
+/// a worker — see [`crate::conflict_ladder`]. A clean rebase resolves and
+/// pushes the PR with no agent; the harness retires the attempt and this
+/// returns early. `None` (the default at call sites, and whenever the
+/// `conflict_ladder_mechanical_rebase` flag is off) preserves the pre-ladder
+/// worker-only path exactly.
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
     pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
@@ -619,6 +629,25 @@ pub async fn on_conflict_detected(
 
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
+            // Escalation ladder (T4): before spawning a full worker, try the
+            // engine-direct mechanical rungs. On a clean rebase (rung 1) the
+            // conflict is resolved and pushed with no agent; the harness
+            // retires this attempt and clears the parent back to Review, so we
+            // return without ever spawning a worker. `cube_client` is `Some`
+            // only when the mechanical-rebase flag is enabled (gated at the
+            // sweep call site); `None` preserves the pre-ladder worker path.
+            if let Some(cube) = cube_client
+                && conflict_ladder::try_mechanical_rungs(work_db, publisher, cube, candidate, a).await
+                    == conflict_ladder::LadderOutcome::Retired
+            {
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %a.id,
+                    "conflict_watch: conflict auto-resolved by engine-direct rebase (rung 1); no worker spawned",
+                );
+                return true;
+            }
             // Fresh attempt — try to spawn a revision.
             let spawned = maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a).await;
             if spawned {

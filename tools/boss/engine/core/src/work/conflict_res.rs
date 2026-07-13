@@ -334,6 +334,23 @@ impl WorkDb {
         attempt_id: &str,
         head_sha_after: Option<&str>,
     ) -> Result<Option<ConflictResolution>> {
+        self.mark_conflict_resolution_succeeded_at_rung(attempt_id, head_sha_after, RUNG_FULL_WORKER)
+    }
+
+    /// Auto-retire an attempt at a specific escalation-ladder rung (design's
+    /// rungs 0–3). Identical to [`Self::mark_conflict_resolution_succeeded`]
+    /// but records `resolved_by_rung = rung` for a resolution the engine
+    /// produced without the full-worker path — the rung-1 engine-direct
+    /// mechanical rebase (T4) passes `1`, deterministic resolvers (rung 0)
+    /// pass `0`. `resolved_by_rung` is `COALESCE`d so a rung already stamped
+    /// on the row (e.g. by the harness before the poller's retire) wins over
+    /// a later default.
+    pub fn mark_conflict_resolution_succeeded_at_rung(
+        &self,
+        attempt_id: &str,
+        head_sha_after: Option<&str>,
+        rung: i64,
+    ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -345,7 +362,7 @@ impl WorkDb {
                     resolved_by_rung = COALESCE(resolved_by_rung, ?4)
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
-            params![attempt_id, head_sha_after, now, RUNG_FULL_WORKER],
+            params![attempt_id, head_sha_after, now, rung],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }

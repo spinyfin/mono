@@ -172,6 +172,21 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: false,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: "conflict_ladder_mechanical_rebase",
+        description: "Run the rung-1 engine-direct mechanical rebase (`cube workspace rebase`) on the \
+             conflict_watch path before spawning a full-worker revision (design: \
+             merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, T4). When a probe \
+             reports an in-review PR CONFLICTING, the engine leases a workspace, positions it on the \
+             PR, and rebases onto main with no agent: on REBASED_CLEAN it auto-retires the conflict \
+             (zero tokens); on conflicts it records the diagnosis and falls through to the existing \
+             worker spawn. DEFAULT OFF — the path leases a workspace and pushes to the PR branch \
+             engine-side; enable per operator once validated in staging. Kill switch: set false to \
+             make conflict detection fall straight through to the worker path.",
+        category: "conflict",
+        default_enabled: false,
+        capability_id: None,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.

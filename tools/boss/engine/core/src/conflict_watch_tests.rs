@@ -5,6 +5,7 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 use super::*;
+use crate::coordinator::{CubeRepoHandle, CubeWorkspaceLease, RebaseOutcome};
 use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 use crate::test_support::*;
 use crate::work::{WorkDb, WorkItem, WorkItemPatch};
@@ -73,6 +74,117 @@ fn probe_with_labels(pr_url: &str, state: PrLifecycleState, labels: &[&str]) -> 
         .build()
 }
 
+/// A [`CubeClient`] double whose engine-direct rebase always reports a clean,
+/// pushed rebase — driving the rung-1 escalation-ladder path (T4).
+struct CleanRebaseCube;
+
+crate::stub_cube_client! { CleanRebaseCube {
+    async fn ensure_repo(&self, _origin: &str) -> anyhow::Result<CubeRepoHandle> {
+        Ok(CubeRepoHandle { repo_id: "repo-1".to_owned() })
+    }
+    async fn lease_workspace(
+        &self,
+        _repo_id: &str,
+        _task: &str,
+        _prefer: Option<&str>,
+        _allow_dirty: bool,
+        _exclude: &[&str],
+    ) -> anyhow::Result<CubeWorkspaceLease> {
+        Ok(CubeWorkspaceLease {
+            lease_id: "L1".to_owned(),
+            workspace_id: "W1".to_owned(),
+            workspace_path: std::path::PathBuf::from("/tmp/rung1-ws"),
+        })
+    }
+    async fn goto_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn rebase_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<RebaseOutcome> {
+        Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new() })
+    }
+    async fn release_workspace(&self, _lease_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+} }
+
+/// Escalation ladder (T4): when a live `CubeClient` is provided and the
+/// engine-direct rebase resolves cleanly, `on_conflict_detected` retires the
+/// conflict at rung 1 with no worker — the parent returns to Review, the
+/// attempt is `succeeded` with `resolved_by_rung = 1`, and no revision task is
+/// created.
+#[tokio::test]
+async fn conflict_auto_resolved_by_rung1_rebase_without_spawning_worker() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/77";
+    let (product, chore) = make_in_review(&db, "C-rung1", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = CleanRebaseCube;
+
+    let transitioned = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        Some(&cube),
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+
+    assert!(transitioned, "rung-1 resolution is a state change");
+    // Parent back in Review, unblocked.
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none(), "block should be cleared, got {reason:?}");
+    // No active attempt (it retired); latest attempt succeeded at rung 1 with
+    // no worker revision.
+    assert!(
+        db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none(),
+        "attempt should be terminal, not active"
+    );
+    let latest = db.latest_conflict_resolution_for_work_item(&chore).unwrap().unwrap();
+    assert_eq!(latest.status, "succeeded");
+    assert_eq!(latest.resolved_by_rung, Some(1));
+    assert!(
+        latest.revision_task_id.is_none(),
+        "no worker revision should have been created for a rung-1 resolution"
+    );
+}
+
+/// Without a `CubeClient` (rung 1 disabled / flag off), detection preserves the
+/// pre-ladder worker path exactly: a revision is spawned and the parent stays
+/// in Review with an in-flight attempt.
+#[tokio::test]
+async fn conflict_without_cube_client_spawns_worker_as_before() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/78";
+    let (product, chore) = make_in_review(&db, "C-noladder", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let transitioned = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+
+    assert!(transitioned);
+    // Worker path: a revision fix vehicle exists and the attempt is still live.
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("an active attempt with a spawned revision");
+    assert_eq!(active.status, "pending");
+    assert!(
+        active.revision_task_id.is_some(),
+        "the pre-ladder path must spawn a worker revision"
+    );
+}
+
 /// New-model acceptance: when a revision fix vehicle is successfully spawned,
 /// the parent stays in `in_review` (Review column). The blocked state is only
 /// reached when there is no tractable fix vehicle (churn cap, create_revision
@@ -88,6 +200,7 @@ async fn detection_keeps_parent_in_review_when_revision_spawns() {
     let transitioned = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -132,6 +245,7 @@ async fn detection_blocks_parent_when_revision_fails() {
     let transitioned = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &closed,
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -167,6 +281,7 @@ async fn detection_is_idempotent_on_repeated_probes() {
     let first = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -179,6 +294,7 @@ async fn detection_is_idempotent_on_repeated_probes() {
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -229,6 +345,7 @@ async fn resolution_retires_attempt_when_parent_was_in_review() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -279,6 +396,7 @@ async fn resolution_flips_blocked_parent_back_to_in_review() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &closed,
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -326,6 +444,7 @@ async fn resolution_is_idempotent_on_repeated_clean_probes() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -353,6 +472,7 @@ async fn cycle_conflict_resolve_conflict() {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            None,
             &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -375,6 +495,7 @@ async fn cycle_conflict_resolve_conflict() {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            None,
             &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -421,6 +542,7 @@ async fn rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            None,
             &open_checker(),
             &candidate(&product, &chore, pr),
             &probe_with_head(
@@ -465,6 +587,7 @@ async fn rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_head(
@@ -522,6 +645,7 @@ async fn detection_skipped_when_human_moved_row_off_in_review() {
     let transitioned = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -549,6 +673,7 @@ async fn resolution_skipped_when_human_moved_row_off_blocked() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &closed,
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -676,6 +801,7 @@ async fn retire_with_running_attempt_releases_lease_and_emits_typed_event() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -760,6 +886,7 @@ async fn retire_with_running_attempt_emits_resolved_when_parent_was_blocked() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &closed,
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -808,6 +935,7 @@ async fn typed_events_arrive_in_started_then_succeeded_order() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -903,6 +1031,7 @@ async fn rearm_reconciles_blocked_parent_when_revision_is_in_flight() {
     let reconciled = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -947,6 +1076,7 @@ async fn retire_is_idempotent_on_repeated_probes_with_active_attempt() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &closed,
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1011,6 +1141,7 @@ async fn retire_tolerates_lease_release_failure() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1057,6 +1188,7 @@ async fn detection_emits_started_event_reuses_existing_row_on_same_base_sha() {
     let first = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1075,6 +1207,7 @@ async fn detection_emits_started_event_reuses_existing_row_on_same_base_sha() {
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1117,6 +1250,7 @@ async fn detection_inserts_attempt_and_emits_started_event() {
     let transitioned = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1174,6 +1308,7 @@ async fn detection_defers_when_rebase_attempt_is_active() {
     let r = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1213,6 +1348,7 @@ async fn detection_skipped_when_product_opt_out_flag_disabled() {
     let r = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1239,6 +1375,7 @@ async fn detection_skipped_when_pr_has_opt_out_label() {
     let r = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_labels(
@@ -1268,6 +1405,7 @@ async fn opt_out_label_match_is_case_insensitive() {
     let r = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_labels(
@@ -1298,6 +1436,7 @@ async fn resolution_skipped_when_product_opt_out_flag_disabled() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1458,6 +1597,7 @@ async fn detection_spawns_revision_and_stamps_attempt() {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            None,
             &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1515,6 +1655,7 @@ async fn detection_idempotent_does_not_double_spawn_revision() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1533,6 +1674,7 @@ async fn detection_idempotent_does_not_double_spawn_revision() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1576,6 +1718,7 @@ async fn churn_abandoned_attempt_spawns_no_revision() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         // probe base is "abc123" — a fourth distinct sha in the window.
@@ -1647,6 +1790,7 @@ async fn stale_head_sha_supersedes_pending_crz() {
     let first = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
@@ -1670,6 +1814,7 @@ async fn stale_head_sha_supersedes_pending_crz() {
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-B"),
@@ -1730,6 +1875,7 @@ async fn terminal_revision_supersedes_pending_crz_even_without_head_move() {
     let first = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1760,6 +1906,7 @@ async fn terminal_revision_supersedes_pending_crz_even_without_head_move() {
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1826,6 +1973,7 @@ async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
     let first = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_head_and_base(
@@ -1856,6 +2004,7 @@ async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe_with_head_and_base(
@@ -1927,6 +2076,7 @@ async fn live_revision_same_head_sha_remains_no_op() {
     let first = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1938,6 +2088,7 @@ async fn live_revision_same_head_sha_remains_no_op() {
     let second = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -1970,6 +2121,7 @@ async fn create_revision_failure_abandons_attempt() {
     on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &closed,
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -2040,6 +2192,7 @@ async fn foreign_bucket_takeover_rebuckets_stuck_ci_failure_row_to_conflict() {
     let took_over = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
@@ -2103,6 +2256,7 @@ async fn foreign_bucket_takeover_declines_higher_priority_reason() {
     let took_over = on_conflict_detected(
         &db,
         pub_.as_ref(),
+        None,
         &open_checker(),
         &candidate(&product, &chore, pr),
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
