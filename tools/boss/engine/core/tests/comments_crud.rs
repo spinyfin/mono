@@ -4,61 +4,19 @@
 //! the harness in `work_crud.rs`. Design:
 //! `tools/boss/docs/designs/comments-in-markdown-viewer.md`.
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use boss_client::{BossClient, wait_for_socket};
-use boss_engine::app::serve;
-use boss_engine::config::{RuntimeConfig, WorkConfig};
+use boss_client::BossClient;
 use boss_protocol::{
     CommentAnchor, CommentWithThread, CreateCommentInput, FrontendEvent, FrontendRequest, ResolvedComment,
     TopicEventPayload, WorkComment, comment_topic,
 };
 
+mod common;
 mod watcher_support;
+use common::TestEngine;
 use watcher_support::subscribe_watcher;
-
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-struct TestEngine {
-    socket_path: PathBuf,
-    _temp: tempfile::TempDir,
-    join: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl TestEngine {
-    async fn spawn() -> Result<Self> {
-        let temp = tempfile::tempdir()?;
-        let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(PathBuf::from(":memory:"))
-            .build();
-        let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
-        let socket_for_serve = socket_path.clone();
-        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
-        if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
-        }
-        Ok(Self {
-            socket_path,
-            _temp: temp,
-            join,
-        })
-    }
-
-    fn socket_str(&self) -> &str {
-        self.socket_path.to_str().expect("socket path is utf-8")
-    }
-}
-
-impl Drop for TestEngine {
-    fn drop(&mut self) {
-        self.join.abort();
-    }
-}
 
 fn anchor(exact: &str, prefix: &str, suffix: &str) -> CommentAnchor {
     CommentAnchor {

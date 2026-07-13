@@ -20,75 +20,27 @@
 //!   BossOnly tier rejected the worker-pane case; the verb now uses
 //!   AppOrBoss, which accepts worker descendants too.
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use boss_client::{BossClient, wait_for_socket};
-use boss_engine::app::serve;
-use boss_engine::config::{RuntimeConfig, WorkConfig};
+use boss_client::BossClient;
 use boss_engine::work::WorkDb;
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest,
     RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
 };
 
-// linux-amd64 CI runners run ~6-7x slower than macOS dev boxes. Under
-// concurrent test load the first batch of tests blocks on the
-// binary_fingerprint OnceLock in build_info::init() — 5 s is too tight on
-// slow CI hardware. 30 s gives headroom for cold starts.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+mod common;
+use common::{TestEngine, TestEngineOptions};
 
-struct TestEngine {
-    socket_path: PathBuf,
-    db_path: PathBuf,
-    _temp: tempfile::TempDir,
-    join: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl TestEngine {
-    async fn spawn() -> Result<Self> {
-        let temp = tempfile::tempdir()?;
-        let socket_path = temp.path().join("engine.sock");
-        let db_path = temp.path().join("state.db");
-        let work_config = WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(db_path.clone())
-            .build();
-        let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
-
-        let socket_for_serve = socket_path.clone();
-        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
-
-        if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
-        }
-
-        Ok(Self {
-            socket_path,
-            db_path,
-            _temp: temp,
-            join,
-        })
-    }
-
-    fn socket_str(&self) -> &str {
-        self.socket_path.to_str().expect("socket path is utf-8")
-    }
-
-    fn state_root(&self) -> PathBuf {
-        self.db_path
-            .parent()
-            .expect("db path has parent in tempdir")
-            .to_path_buf()
-    }
-}
-
-impl Drop for TestEngine {
-    fn drop(&mut self) {
-        self.join.abort();
-    }
+/// Spawn an engine backed by an on-disk DB so `state_root()` and out-of-band
+/// `WorkDb::open(engine.db_path)` reopen a real SQLite file.
+async fn spawn_engine() -> Result<TestEngine> {
+    TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        ..Default::default()
+    })
+    .await
 }
 
 /// Returned by `seed_execution` so the test can verify both
@@ -177,7 +129,7 @@ async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Resul
 
 #[tokio::test]
 async fn work_cancel_marks_execution_cancelled() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution {
         work_item_id,
@@ -235,7 +187,7 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
 
 #[tokio::test]
 async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let response = client
@@ -257,7 +209,7 @@ async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
 
 #[tokio::test]
 async fn agents_transcript_returns_tail_lines() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
@@ -329,7 +281,7 @@ async fn agents_transcript_returns_tail_lines() -> Result<()> {
 
 #[tokio::test]
 async fn agents_transcript_errors_when_run_has_no_transcript_path() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
@@ -373,7 +325,7 @@ async fn agents_transcript_via_execution_id_returns_tail_lines() -> Result<()> {
     // `TailRunTranscript` with an exec_* id to confirm the engine's
     // `transcript_path_for_execution` fallback inside
     // `resolve_transcript_for_tail` is reachable.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
@@ -431,7 +383,7 @@ async fn get_run_via_execution_id_returns_run_record() -> Result<()> {
     // must return the run record for a completed execution. Before this
     // fix, `GetRun { id: exec_id }` returned "unknown run: exec_..."
     // because the handler only queried `work_runs.id` (run_* ns).
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
@@ -475,7 +427,7 @@ async fn workspace_summary_returns_pool_snapshot() -> Result<()> {
     // wired through the engine — what we're really guarding against
     // is the verb regressing back to the literal `not_implemented`
     // stub it used to return.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let response = client.send_request(&FrontendRequest::WorkspacePoolSummary).await?;
@@ -504,7 +456,7 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     // (treated as permissive), so any local caller must succeed
     // here; the worker-descendant case is locked in by the macOS
     // unit test `app_or_boss_admits_worker_descendant`.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
         .send_request(&FrontendRequest::StopRun {
@@ -534,7 +486,7 @@ async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     // The macOS unit test `app_or_boss_admits_worker_descendant`
     // locks in the worker-descendant admission; this test is the
     // wire-shape smoke that asserts probe is reachable at all.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
         .send_request(&FrontendRequest::ProbeRun {
@@ -562,7 +514,7 @@ async fn agents_send_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     // worker pane. Same auth class as `agents focus` / `probe` /
     // `agents stop` (AppOrBoss). With no run seeded, the verb should
     // pass auth and then fail the run-id lookup with a `WorkError`.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
         .send_request(&FrontendRequest::SendInputToWorker {
@@ -591,7 +543,7 @@ async fn probe_run_returns_unique_probe_ids() -> Result<()> {
     // that flow lives in the `dispatch_probe_reply_emits_…` unit
     // test). Two back-to-back probes for the same run must mint
     // distinct ids.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let first = client
         .send_request(&FrontendRequest::ProbeRun {
@@ -628,7 +580,7 @@ async fn urgent_probe_echoes_urgent_flag_in_queued_response() -> Result<()> {
     // response so the caller (`bossctl probe --urgent`) can confirm
     // the delivery semantics the engine accepted. A non-urgent probe
     // must echo `urgent: false` (backwards-compatible default).
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let urgent_resp = client
@@ -667,7 +619,7 @@ async fn agents_transcript_does_not_reject_local_caller_as_boss_only() -> Result
     // downgrade with `bossctl probe` and `bossctl agents stop`. This
     // smoke test guards against the verb regressing back to BossOnly
     // and silently locking the coordinator out of worker transcripts.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
         .send_request(&FrontendRequest::TailRunTranscript {
@@ -697,7 +649,7 @@ async fn agents_interrupt_does_not_reject_local_caller_as_boss_only() -> Result<
     // pane, the app shell, *and* from inside worker (slot) panes.
     // This smoke guards against the verb regressing to BossOnly and
     // silently locking the coordinator out of in-flight Esc.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
         .send_request(&FrontendRequest::InterruptWorkerPane {
@@ -727,7 +679,7 @@ async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
     //   - the engine returns `RunReaped` with status='orphaned',
     //   - cube workspace columns are preserved on the row,
     //   - a second reap on the now-terminal row errors cleanly.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
@@ -783,7 +735,7 @@ async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
 
 #[tokio::test]
 async fn agents_reap_unknown_run_returns_clear_error() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
         .send_request(&FrontendRequest::ReapRun {
@@ -819,7 +771,7 @@ async fn agents_reap_unknown_run_returns_clear_error() -> Result<()> {
 ///   non-terminal execution backing it.
 #[tokio::test]
 async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let product = match client
@@ -925,7 +877,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
 /// when there is no existing non-terminal execution.
 #[tokio::test]
 async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let product = match client
@@ -1012,7 +964,7 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
 /// after the human flipped the card.
 #[tokio::test]
 async fn kanban_drag_emits_status_transition_event() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let product = match client
@@ -1116,7 +1068,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
 /// naming the missing repo.
 #[tokio::test]
 async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let chore = seed_unresolvable_chore(&mut client).await?;
@@ -1193,7 +1145,7 @@ async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<
 /// successful and skipped paths.
 #[tokio::test]
 async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let chore = seed_unresolvable_chore(&mut client).await?;
@@ -1333,7 +1285,7 @@ async fn list_executions_for(client: &mut BossClient, work_item_id: &str) -> Res
 /// "already-terminal row" idempotency arm.
 #[tokio::test]
 async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
 
     // Seed a product → in_review chore → conflict_resolutions row by
     // talking to the engine's own WorkDb. We avoid the RPC surface
@@ -1445,7 +1397,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
 /// handler → response wire without reaching the live-CI probe.
 #[tokio::test]
 async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
 
     let work_db = WorkDb::open(engine.db_path.clone())?;
     let product = work_db.create_product(CreateProductInput {
@@ -1584,7 +1536,7 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
 /// then fetch one by id.
 #[tokio::test]
 async fn engine_conflicts_list_and_show_round_trip() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let (product, _chore, a, b) = seed_two_conflict_resolutions(&engine).await?;
 
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
@@ -1706,7 +1658,7 @@ async fn engine_conflicts_list_and_show_round_trip() -> Result<()> {
 /// reset; non-terminal rows are rejected.
 #[tokio::test]
 async fn engine_conflicts_retry_resets_terminal_rows() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let (_product, _chore, _a, b) = seed_two_conflict_resolutions(&engine).await?;
 
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
@@ -1767,7 +1719,7 @@ async fn engine_conflicts_retry_resets_terminal_rows() -> Result<()> {
 /// already-terminal arm rejects.
 #[tokio::test]
 async fn engine_conflicts_abandon_flips_attempt_status() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let (_product, _chore, a, _b) = seed_two_conflict_resolutions(&engine).await?;
 
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
@@ -1880,7 +1832,7 @@ async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()
     // terminal). The verb is read-only and proxies a view that any
     // local user can already get from `cube workspace list`, so it's
     // now User-tier. This smoke asserts no auth rejection fires.
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client.send_request(&FrontendRequest::WorkspacePoolSummary).await?;
     match response {
@@ -1910,7 +1862,7 @@ async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()
 /// rejected the bareword before even checking the work-item table.
 #[tokio::test]
 async fn request_execution_accepts_tnnn_friendly_id() -> Result<()> {
-    let engine = TestEngine::spawn().await?;
+    let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     // Seed a product + chore. The first chore in a fresh DB gets short_id=1
