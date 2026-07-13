@@ -1851,10 +1851,5 @@ fn print_live_status_slot_debug(slot: &LiveStatusSlotDebug) {
     println!();
 }
 
-// Re-import agent-resolution helpers so `tests` can access them via `use super::*`.
-// Only test code references these by name; production call sites go through
-// `agents::agents_*` / `agents::fetch_live_states`, never these two directly.
-#[cfg(test)]
-use agents::{live_candidates_summary, looks_like_name_or_slot, pick_unique, resolve_agent_ref};
 #[cfg(test)]
 mod tests;

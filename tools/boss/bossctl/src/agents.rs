@@ -1038,3 +1038,242 @@ fn print_live_state_short(state: &LiveWorkerState) {
     }
     println!();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boss_protocol::{Product, Project, ProjectStatus, Task, TaskKind, TaskStatus};
+
+    /// Build a live-worker fixture with a caller-chosen slot id, run id, and
+    /// crew name. Setting `name` explicitly (rather than deriving it from
+    /// `slot_id` the way production does) lets the resolver tests target each
+    /// match tier — and the ambiguous-slot / ambiguous-name paths —
+    /// independently of the roster's slot→name mapping.
+    fn worker(slot_id: u8, run_id: &str, name: &str) -> LiveWorkerState {
+        let mut state = LiveWorkerState::new_spawning(slot_id, run_id, "opus", 0, None);
+        state.name = name.to_owned();
+        state
+    }
+
+    fn task(id: &str, kind: TaskKind) -> Task {
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(kind)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    fn product(id: &str) -> Product {
+        Product::builder()
+            .id(id)
+            .name("n")
+            .slug("n")
+            .description("")
+            .status("active")
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    fn project(id: &str) -> Project {
+        Project::builder()
+            .id(id)
+            .product_id("prod_1")
+            .name("n")
+            .slug("n")
+            .description("")
+            .goal("")
+            .status(ProjectStatus::Planned)
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    // ---- resolve_agent_ref -------------------------------------------------
+
+    #[test]
+    fn resolves_by_exact_run_id() {
+        let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
+        let resolved = resolve_agent_ref("exec_def", &states).expect("run id should resolve");
+        assert_eq!(resolved.run_id, "exec_def");
+        assert_eq!(resolved.slot_id, 2);
+    }
+
+    #[test]
+    fn resolves_by_numeric_slot_id() {
+        let states = [worker(1, "exec_abc", "Riker"), worker(7, "exec_def", "Yar")];
+        let resolved = resolve_agent_ref("7", &states).expect("slot id should resolve");
+        assert_eq!(resolved.slot_id, 7);
+        assert_eq!(resolved.run_id, "exec_def");
+    }
+
+    #[test]
+    fn resolves_by_name_case_insensitive() {
+        let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
+        let resolved = resolve_agent_ref("dATa", &states).expect("crew name should resolve");
+        assert_eq!(resolved.slot_id, 2);
+        assert_eq!(resolved.run_id, "exec_def");
+    }
+
+    /// Slot 4's crew name is "La Forge" — the space is part of the name,
+    /// and the case-insensitive *exact* match honours it.
+    #[test]
+    fn resolves_multiword_name_with_space() {
+        let states = [worker(4, "exec_d", "La Forge")];
+        let resolved = resolve_agent_ref("la forge", &states).expect("multi-word name should resolve");
+        assert_eq!(resolved.slot_id, 4);
+    }
+
+    /// A numeric reference that matches one worker's run id and *also*
+    /// another worker's slot resolves to the run-id match — a defensive
+    /// case, since real run ids are never bare numbers, but it pins the
+    /// tier order (run id before slot).
+    #[test]
+    fn run_id_match_takes_precedence_over_slot() {
+        let states = [worker(2, "1", "Data"), worker(1, "exec_a", "Riker")];
+        let resolved = resolve_agent_ref("1", &states).expect("run id tier should win");
+        assert_eq!(resolved.run_id, "1");
+        assert_eq!(resolved.slot_id, 2, "run-id match must win over the slot match");
+    }
+
+    /// A reference that matches one worker's run id and *also* another
+    /// worker's name resolves to the run-id match — the run-id tier is
+    /// consulted first and short-circuits.
+    #[test]
+    fn run_id_match_takes_precedence_over_name() {
+        let states = [worker(1, "shared", "Riker"), worker(2, "exec_def", "shared")];
+        let resolved = resolve_agent_ref("shared", &states).expect("run id tier should win");
+        assert_eq!(resolved.slot_id, 1, "run-id match must win over the name match");
+        assert_eq!(resolved.run_id, "shared");
+    }
+
+    /// A numeric reference that matches one worker's slot and *also*
+    /// another worker's (numeric) name resolves to the slot match — the
+    /// slot tier is consulted before the name tier.
+    #[test]
+    fn slot_match_takes_precedence_over_name() {
+        let states = [worker(5, "exec_abc", "Data"), worker(2, "exec_def", "5")];
+        let resolved = resolve_agent_ref("5", &states).expect("slot tier should win");
+        assert_eq!(resolved.slot_id, 5, "slot match must win over the name match");
+        assert_eq!(resolved.run_id, "exec_abc");
+    }
+
+    #[test]
+    fn ambiguous_name_reports_all_candidates() {
+        let states = [worker(1, "exec_abc", "Data"), worker(2, "exec_def", "Data")];
+        let err = resolve_agent_ref("data", &states).expect_err("two workers share a name");
+        let msg = err.to_string();
+        assert!(msg.contains("matches multiple live workers"), "message was: {msg}");
+        assert!(msg.contains("slot 1 (Data) run exec_abc"), "message was: {msg}");
+        assert!(msg.contains("slot 2 (Data) run exec_def"), "message was: {msg}");
+    }
+
+    #[test]
+    fn ambiguous_slot_reports_all_candidates() {
+        let states = [worker(3, "exec_abc", "Worf"), worker(3, "exec_def", "Riker")];
+        let err = resolve_agent_ref("3", &states).expect_err("two workers share a slot");
+        let msg = err.to_string();
+        assert!(msg.contains("matches multiple live workers"), "message was: {msg}");
+        assert!(msg.contains("slot 3 (Worf) run exec_abc"), "message was: {msg}");
+        assert!(msg.contains("slot 3 (Riker) run exec_def"), "message was: {msg}");
+    }
+
+    #[test]
+    fn no_match_errors_with_live_candidates() {
+        let states = [worker(2, "exec_def", "Data"), worker(1, "exec_abc", "Riker")];
+        let err = resolve_agent_ref("nonesuch", &states).expect_err("no worker matches");
+        let msg = err.to_string();
+        assert!(msg.contains("no live worker matches `nonesuch`"), "message was: {msg}");
+        // The candidate summary is appended and sorted by slot id.
+        assert!(
+            msg.contains("Live: slot 1 (Riker), slot 2 (Data)"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_match_with_no_live_workers() {
+        let err = resolve_agent_ref("anything", &[]).expect_err("no workers at all");
+        let msg = err.to_string();
+        assert!(msg.contains("no live worker matches `anything`"), "message was: {msg}");
+        assert!(msg.contains("no live workers"), "message was: {msg}");
+    }
+
+    // ---- pick_unique -------------------------------------------------------
+
+    #[test]
+    fn pick_unique_returns_sole_match() {
+        let states = [worker(4, "exec_abc", "La Forge")];
+        let resolved = pick_unique("La Forge", vec![&states[0]], &states).expect("exactly one match");
+        assert_eq!(resolved.slot_id, 4);
+        assert_eq!(resolved.run_id, "exec_abc");
+    }
+
+    #[test]
+    fn pick_unique_bails_on_multiple_matches() {
+        let states = [worker(1, "exec_abc", "Riker"), worker(2, "exec_def", "Data")];
+        let err = pick_unique("x", vec![&states[0], &states[1]], &states).expect_err("two matches");
+        let msg = err.to_string();
+        assert!(msg.contains("`x` matches multiple live workers"), "message was: {msg}");
+        assert!(msg.contains("slot 1 (Riker) run exec_abc"), "message was: {msg}");
+        assert!(msg.contains("slot 2 (Data) run exec_def"), "message was: {msg}");
+    }
+
+    // ---- live_candidates_summary ------------------------------------------
+
+    #[test]
+    fn summary_reports_no_live_workers_when_empty() {
+        assert_eq!(live_candidates_summary(&[]), "no live workers");
+    }
+
+    #[test]
+    fn summary_lists_workers_sorted_by_slot_id() {
+        // Deliberately out of slot order on input to prove the sort.
+        let states = [worker(2, "exec_def", "Data"), worker(1, "exec_abc", "Riker")];
+        assert_eq!(live_candidates_summary(&states), "Live: slot 1 (Riker), slot 2 (Data)");
+    }
+
+    // ---- looks_like_name_or_slot ------------------------------------------
+
+    #[test]
+    fn numeric_slot_looks_like_name_or_slot() {
+        assert!(looks_like_name_or_slot("5"));
+        assert!(looks_like_name_or_slot("0"));
+    }
+
+    #[test]
+    fn roster_name_looks_like_name_or_slot_case_insensitive() {
+        assert!(looks_like_name_or_slot("Riker"));
+        assert!(looks_like_name_or_slot("riker"));
+        assert!(looks_like_name_or_slot("LA FORGE"));
+    }
+
+    #[test]
+    fn run_id_does_not_look_like_name_or_slot() {
+        assert!(!looks_like_name_or_slot("exec_18ad9f"));
+        // Not a roster name, and out of `u8` range so it isn't a slot either.
+        assert!(!looks_like_name_or_slot("300"));
+        assert!(!looks_like_name_or_slot("Picard"));
+    }
+
+    // ---- work_item_primary_id ---------------------------------------------
+
+    #[test]
+    fn primary_id_for_each_work_item_variant() {
+        assert_eq!(work_item_primary_id(&WorkItem::Product(product("prod_9"))), "prod_9");
+        assert_eq!(work_item_primary_id(&WorkItem::Project(project("proj_9"))), "proj_9");
+        assert_eq!(
+            work_item_primary_id(&WorkItem::Task(task("task_9", TaskKind::Task))),
+            "task_9"
+        );
+        assert_eq!(
+            work_item_primary_id(&WorkItem::Chore(task("chore_9", TaskKind::Chore))),
+            "chore_9"
+        );
+    }
+}
