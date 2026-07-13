@@ -659,6 +659,7 @@ pub(super) async fn dispatch_probe_on_stop(
     // assistant content the worker happened to flush while we were
     // still in this code path.
     let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
+    let probe_id = probe.probe_id.clone();
     let request = EngineToAppRequest::SendToPane(SendToPaneInput {
         slot_id,
         text: probe.text.clone(),
@@ -671,6 +672,12 @@ pub(super) async fn dispatch_probe_on_stop(
                 probe_id = %probe.probe_id,
                 "probe injected into pane",
             );
+            // The Stop boundary is the arrival point this delivery
+            // mechanism has always trusted (unlike the urgent
+            // mid-turn path), so a successful SendToPane here is
+            // treated as consumed rather than left pending
+            // confirmation.
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
@@ -685,6 +692,7 @@ pub(super) async fn dispatch_probe_on_stop(
             // the same probe id — callers waiting on the matching
             // `ProbeReplied` event must not see their id silently
             // reissued.
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -707,17 +715,24 @@ const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 ///
 /// The write is not trusted just because `SendToPane` returned Ok: it
 /// lands while the worker is actively mid-turn, which races the CLI's
-/// TUI input handling (the probe-6 incident — bytes reached the pty
-/// but the CLI never enqueued them as a prompt, and nothing ever
-/// re-delivered them). So this waits for a matching `UserPromptSubmit`
-/// hook before declaring success. On a transport/app-level failure the
-/// probe is pushed back to the front so the next `PostToolUse` retries
-/// with the same id. On an *unverified* write (the racy case) the
-/// probe is downgraded to non-urgent and re-queued so
-/// `dispatch_probe_on_stop` delivers it at the worker's next, reliably
-/// idle, Stop boundary instead — and a `ProbeDeliveryEscalated` push
-/// tells anyone watching the probe topic not to assume delivery from
-/// an "injected" log line alone.
+/// TUI input handling (the probe-6 incident). This waits for
+/// confirmation — a matching `UserPromptSubmit` hook, or a transcript
+/// scan — before declaring success. On a transport/app-level failure
+/// the probe is pushed back to the front so the next `PostToolUse`
+/// retries with the same id.
+///
+/// On an *unconfirmed* write, the corrected understanding of the
+/// probe-6 incident (2026-07-13) is that the text likely still reached
+/// the worker through a channel this engine can't yet observe — the
+/// defect was unverifiable delivery, not lost delivery. So this does
+/// **not** re-queue the probe for redelivery at the next `Stop`
+/// boundary: doing so would hand the worker the same instruction
+/// twice in exactly the scenario the incident actually hit. Instead it
+/// records the probe as `Unconfirmed` in the lifecycle table, still
+/// tracks it as in-flight (so a reply that does arrive is still
+/// captured), and pushes `ProbeDeliveryEscalated` so anyone watching
+/// the probe topic knows delivery is unverified and can choose to
+/// re-issue it deliberately.
 ///
 /// Non-urgent probes are ignored here; they wait for `dispatch_probe_on_stop`.
 pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
@@ -756,8 +771,17 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
     };
     let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
     let marked_text = format!("[coordinator-nudge] {}", probe.text);
+    let probe_id = probe.probe_id.clone();
+    server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Injected);
     match server_state
-        .inject_pane_text_verified(run_id, slot_id, marked_text, URGENT_PROBE_VERIFY_TIMEOUT)
+        .inject_pane_text_verified(
+            run_id,
+            slot_id,
+            marked_text,
+            transcript_path.as_deref(),
+            offset_bytes,
+            URGENT_PROBE_VERIFY_TIMEOUT,
+        )
         .await
     {
         PaneInjectOutcome::Confirmed => {
@@ -765,24 +789,28 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 run_id,
                 slot_id,
                 probe_id = %probe.probe_id,
-                "urgent probe injected at tool boundary (delivery confirmed via UserPromptSubmit)",
+                "urgent probe injected at tool boundary (delivery confirmed)",
             );
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
-        PaneInjectOutcome::Unverified => {
+        PaneInjectOutcome::Unconfirmed => {
             tracing::warn!(
                 run_id,
                 slot_id,
                 probe_id = %probe.probe_id,
                 timeout = ?URGENT_PROBE_VERIFY_TIMEOUT,
-                "urgent probe write reached the pane but no UserPromptSubmit hook confirmed delivery \
-                 within the verification window (the probe-6 silent-drop failure mode); escalating to \
-                 Stop-boundary delivery instead of trusting the pty write",
+                "urgent probe write reached the pane but delivery could not be confirmed within the \
+                 verification window; NOT auto-redelivering (the corrected probe-6 understanding is that \
+                 the text likely still reached the worker) — recording Unconfirmed and leaving \
+                 redelivery to whoever is watching the probe topic",
             );
-            let probe_id = probe.probe_id.clone();
-            let mut fallback = probe;
-            fallback.urgent = false;
-            server_state.requeue_probe_front(run_id.to_owned(), fallback);
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Unconfirmed);
+            // Still track as in-flight: the text may well have been
+            // consumed even though we couldn't confirm it, so a reply
+            // at the next Stop boundary should still be captured
+            // rather than silently dropped.
+            server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
             server_state
                 .topic_broker
                 .publish(
@@ -790,7 +818,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                     FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
                         run_id: run_id.to_owned(),
                         probe_id,
-                        reason: "no UserPromptSubmit observed after urgent pane injection".to_owned(),
+                        reason: "delivery unconfirmed after urgent pane injection (not re-delivered)".to_owned(),
                     }),
                 )
                 .await;
@@ -803,6 +831,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 probe_id = %probe.probe_id,
                 "urgent probe injection failed; pushing back onto queue",
             );
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -858,6 +887,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
         return;
     };
     let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
+    let probe_id = probe.probe_id.clone();
     let request = EngineToAppRequest::SendToPane(SendToPaneInput {
         slot_id,
         text: probe.text.clone(),
@@ -870,6 +900,10 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
                 probe_id = %probe.probe_id,
                 "probe injected into idle worker pane (immediate dispatch)",
             );
+            // Parked (Idle/WaitingForInput) is a reliable delivery
+            // boundary just like Stop, so a successful SendToPane
+            // here is treated as consumed.
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
@@ -880,6 +914,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
                 probe_id = %probe.probe_id,
                 "probe immediate-dispatch failed; pushing back onto queue",
             );
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -900,7 +935,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
 /// "Out of scope" section called out that `work_db.get_run(run_id)`
 /// was joining the wrong namespace). Fixed here alongside the
 /// `TranscriptPathResolver` impl.
-async fn transcript_offset_for_run(server_state: &Arc<ServerState>, run_id: &str) -> (Option<String>, u64) {
+pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id: &str) -> (Option<String>, u64) {
     let path = match server_state.work_db.transcript_path_for_execution(run_id) {
         Ok(path) => path,
         Err(err) => {
@@ -947,6 +982,23 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     let Some(in_flight) = server_state.take_in_flight_probe(run_id) else {
         return;
     };
+    // Guard against extracting a reply for a probe id whose lifecycle
+    // was never actually advanced past being queued (e.g. a stale
+    // in-flight entry surviving some other bug) — only a probe that
+    // was actually written into the pane (Injected/Consumed/
+    // Unconfirmed) can plausibly have produced a reply.
+    match server_state.probe_lifecycle_state(&in_flight.probe_id) {
+        Some(ProbeLifecycleState::Injected | ProbeLifecycleState::Consumed | ProbeLifecycleState::Unconfirmed) => {}
+        other => {
+            tracing::warn!(
+                run_id,
+                probe_id = %in_flight.probe_id,
+                ?other,
+                "probe reply skipped: lifecycle state was not a dispatched state",
+            );
+            return;
+        }
+    }
     let Some(transcript_path) = in_flight.transcript_path.as_deref() else {
         tracing::warn!(
             run_id,
@@ -977,6 +1029,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
             return;
         }
     };
+    server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeLifecycleState::Replied);
     let envelope = FrontendEventEnvelope::push(FrontendEvent::ProbeReplied {
         run_id: run_id.to_owned(),
         probe_id: in_flight.probe_id.clone(),

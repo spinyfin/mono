@@ -402,6 +402,47 @@ struct InFlightProbe {
     offset_bytes: u64,
 }
 
+/// One outstanding waiter for a `UserPromptSubmit` hook that would
+/// confirm a specific pane-injection attempt. See the
+/// `ServerState::delivery_waiters` field docs for why these are kept
+/// in a per-run `Vec` rather than a single slot.
+struct DeliveryWaiter {
+    token: u64,
+    /// The (normalized) text this waiter is trying to match against
+    /// an arriving `UserPromptSubmit` prompt.
+    match_text: String,
+    tx: oneshot::Sender<String>,
+}
+
+/// Observable lifecycle of one probe, keyed by `probe_id`. Queried by
+/// tests and by `dispatch_probe_reply_on_stop` (which asserts a probe
+/// was at least `Injected` before it will report a reply for it).
+///
+/// This is the corrected-spec replacement for treating "no
+/// `UserPromptSubmit` within the verification window" as a delivery
+/// failure: rather than silently re-delivering (which duplicates the
+/// probe if the CLI *did* enqueue it and the hook was merely slow or
+/// absent), the engine now records `Unconfirmed` and leaves the
+/// redelivery call to whoever is watching the probe topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeLifecycleState {
+    /// Minted and sitting in `pending_probes`, not yet written to the pane.
+    Queued,
+    /// `SendToPane` returned Ok but delivery has not yet been confirmed
+    /// or timed out.
+    Injected,
+    /// A `UserPromptSubmit` hook (or, failing that, a transcript scan)
+    /// confirmed the CLI actually enqueued the injected text.
+    Consumed,
+    /// The verification window elapsed with no confirming signal. The
+    /// write may still have landed — this state means "unproven", not
+    /// "lost" — so the engine does not automatically re-deliver.
+    Unconfirmed,
+    /// `dispatch_probe_reply_on_stop` extracted and published the
+    /// worker's reply.
+    Replied,
+}
+
 struct PidFileGuard {
     path: String,
     pid: u32,
@@ -556,20 +597,32 @@ struct ServerState {
     /// offset captured at dispatch time bounds the read, so we don't
     /// re-emit text that pre-dated the probe.
     in_flight_probes: StdMutex<HashMap<String, InFlightProbe>>,
-    /// One-shot waiters for the next `UserPromptSubmit` hook on a
-    /// run, keyed by `run_id`. `inject_pane_text_verified` registers
-    /// a waiter immediately before writing text into a pane so it
-    /// can confirm the worker's CLI actually enqueued the write as a
-    /// prompt, rather than trusting the pty write alone — the gap
-    /// that let an urgent probe (and a chore-update notice) silently
-    /// evaporate mid-turn in production while the engine logged
-    /// "injected". `dispatch_live_worker_state` resolves the waiter
-    /// for a run whenever a `UserPromptSubmit` hook arrives for it.
-    /// Registering overwrites (and drops) any waiter already present
-    /// for the run — callers only inject one unconfirmed write per
-    /// run at a time, matching the `in_flight_probes` invariant.
+    /// Lifecycle state per `probe_id`. Written at each transition
+    /// (queued / injected / consumed / unconfirmed / replied) and read
+    /// by `dispatch_probe_reply_on_stop` and by tests asserting the
+    /// corrected no-auto-redelivery behavior. See [`ProbeLifecycleState`].
     #[builder(default)]
-    delivery_waiters: StdMutex<HashMap<String, oneshot::Sender<String>>>,
+    probe_lifecycle: StdMutex<HashMap<String, ProbeLifecycleState>>,
+    /// One-shot waiters for the next `UserPromptSubmit` hook on a
+    /// run, keyed by `run_id`. Each run can have *multiple* waiters
+    /// registered concurrently (an urgent probe and a chore-update
+    /// notice can both be mid-flight within the same verification
+    /// window — they run from unrelated call sites with no shared
+    /// serialization), so entries are stored in a `Vec` alongside the
+    /// text each waiter is trying to confirm. `resolve_delivery_waiter`
+    /// resolves only the entry whose `match_text` is contained in the
+    /// arrived prompt (normalized for whitespace/reflow), so an
+    /// unrelated prompt from the worker can't steal a waiter that was
+    /// registered for different injected text, and a second concurrent
+    /// registration for the same run no longer drops the first.
+    #[builder(default)]
+    delivery_waiters: StdMutex<HashMap<String, Vec<DeliveryWaiter>>>,
+    /// Mint tokens for [`Self::delivery_waiters`] entries so
+    /// `take_delivery_waiter` can remove exactly the waiter a given
+    /// `inject_pane_text_verified` call registered, even when other
+    /// waiters for the same run are concurrently outstanding.
+    #[builder(default)]
+    next_delivery_token: AtomicU64,
     /// Monotonic counter used to mint probe ids (`probe-{n}`). Probe
     /// ids only need to be unique for the lifetime of one engine
     /// process — they correlate a `ProbeRun` request with its
@@ -1627,6 +1680,8 @@ impl ServerState {
         } else {
             queue.push_back(probe);
         }
+        drop(guard);
+        self.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
         probe_id
     }
 
@@ -1696,6 +1751,31 @@ impl ServerState {
             .lock()
             .expect("in_flight_probes mutex poisoned")
             .remove(run_id)
+    }
+
+    /// Record `probe_id`'s current lifecycle stage. Call sites drive
+    /// every transition explicitly (see [`ProbeLifecycleState`]) —
+    /// there's no automatic advancement based on other bookkeeping,
+    /// so a probe id with no entry has never been queued in this
+    /// process (or the engine restarted).
+    fn set_probe_lifecycle(&self, probe_id: &str, state: ProbeLifecycleState) {
+        self.probe_lifecycle
+            .lock()
+            .expect("probe_lifecycle mutex poisoned")
+            .insert(probe_id.to_owned(), state);
+    }
+
+    /// Query the current lifecycle stage for `probe_id`, if any is
+    /// tracked. Used by `dispatch_probe_reply_on_stop` to skip reply
+    /// extraction for a probe the engine never actually dispatched,
+    /// and by tests to assert the corrected no-auto-redelivery
+    /// behavior without depending on internal queue contents.
+    fn probe_lifecycle_state(&self, probe_id: &str) -> Option<ProbeLifecycleState> {
+        self.probe_lifecycle
+            .lock()
+            .expect("probe_lifecycle mutex poisoned")
+            .get(probe_id)
+            .copied()
     }
 
     /// Authorize a peer-pid against an RPC tier. Walks up the peer's

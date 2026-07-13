@@ -1437,17 +1437,18 @@ async fn send_input_to_worker_round_trips_to_app() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn send_input_to_worker_falls_back_to_probe_when_unverified() {
-    // Regression test for the incident where the chore-update
-    // auto-notice (routed through `send_input_to_worker`) silently
-    // vanished: `SendToPane` returned Ok, no WARN was logged, and the
-    // worker never received the text — because it never became a
-    // queued prompt. This locks in the fix: when no `UserPromptSubmit`
-    // confirms the write within the verification window, the engine
-    // must not treat "bytes reached the pane" as delivery. It falls
-    // back to the same `pending_probes` queue `dispatch_probe_on_stop`
-    // drains reliably at the worker's next Stop boundary, instead of
-    // losing the text.
+async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
+    // Regression test, corrected understanding (2026-07-13): the
+    // chore-update auto-notice (routed through `send_input_to_worker`)
+    // originally looked like it silently vanished — `SendToPane`
+    // returned Ok, no WARN was logged, no `UserPromptSubmit` followed.
+    // The incident record was later corrected: the worker had in fact
+    // acted on the updated text, so the write was delivered but
+    // unverifiable, not lost. Falling back to `queue_probe` (the
+    // original fix) would hand the worker the same notice a second
+    // time at its next Stop boundary. This locks in the corrected
+    // behavior: an unconfirmed write returns Ok (the pane write did
+    // succeed) without being queued again.
     let server_state = test_server_state();
     server_state.worker_registry.register_run_slot("run-unverified", 3);
 
@@ -1490,16 +1491,13 @@ async fn send_input_to_worker_falls_back_to_probe_when_unverified() {
     let slot = send
         .await
         .expect("send task")
-        .expect("unverified delivery must still return Ok via the probe fallback, not drop the text");
+        .expect("unconfirmed delivery must still return Ok — the pane write itself succeeded");
     assert_eq!(slot, 3);
 
-    let queued = server_state
-        .pop_pending_probe("run-unverified")
-        .expect("unverified pane write must fall back to a queued probe instead of vanishing");
-    assert_eq!(queued.text, "[chore-update] spec changed");
     assert!(
-        !queued.urgent,
-        "fallback delivery goes through the reliable Stop-boundary path, not another urgent write",
+        server_state.pop_pending_probe("run-unverified").is_none(),
+        "unconfirmed pane write must not be re-queued as a probe — that would duplicate delivery \
+         if the worker really did consume the original write",
     );
 }
 
@@ -2212,18 +2210,22 @@ async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit(
     );
 }
 
-/// Regression test for the probe-6 incident: an urgent probe's pane
-/// write lands while the worker is mid-turn, `SendToPane` reports
-/// success, but the CLI never enqueues it — no `UserPromptSubmit`
-/// hook ever follows. Before this fix the engine logged "injected"
-/// and moved on, and the text was gone forever (the worker ran on the
-/// stale spec for 20+ minutes). This asserts the failure is detected
-/// (not assumed delivered) and the probe is escalated to the reliable
-/// Stop-boundary path rather than silently dropped, with a
-/// `ProbeDeliveryEscalated` push so observers don't mistake the
-/// earlier "injected" log line for proof of delivery.
+/// Regression test for the probe-6 incident, corrected understanding
+/// (2026-07-13): an urgent probe's pane write lands while the worker
+/// is mid-turn, `SendToPane` reports success, but neither a
+/// `UserPromptSubmit` hook nor a transcript scan confirms it within
+/// the verification window. The original fix treated that as proof of
+/// loss and auto-redelivered the text at the next Stop boundary — but
+/// the corrected incident record shows the text likely *was* consumed
+/// (the worker acted on it), so auto-redelivery would have handed the
+/// worker a duplicate instruction. This asserts the corrected
+/// behavior: the probe is NOT re-queued, its lifecycle state is
+/// recorded as `Unconfirmed` (queryable rather than assumed), it is
+/// still tracked in-flight so a reply that does arrive is captured,
+/// and a `ProbeDeliveryEscalated` push tells observers delivery is
+/// unverified without implying a duplicate was sent.
 #[tokio::test(start_paused = true)]
-async fn dispatch_urgent_probe_on_post_tool_use_escalates_when_unconfirmed() {
+async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_redelivery() {
     use crate::protocol::WorkerEvent;
 
     let server_state = test_server_state();
@@ -2297,17 +2299,25 @@ async fn dispatch_urgent_probe_on_post_tool_use_escalates_when_unconfirmed() {
 
     dispatch.await.expect("dispatch task");
 
-    // The probe must not have been silently dropped or wrongly marked
-    // delivered — it must still be queryable, and downgraded to
-    // non-urgent so it goes through the reliable Stop-boundary path
-    // instead of racing the TUI again on a bare retry.
-    let requeued = server_state
-        .pop_pending_probe(run_id)
-        .expect("unverified urgent probe must be re-queued, not lost");
-    assert_eq!(requeued.probe_id, probe_id);
+    // The probe must NOT be re-queued — that would duplicate delivery
+    // in exactly the scenario the corrected incident record
+    // establishes actually happened.
     assert!(
-        !requeued.urgent,
-        "unverified urgent delivery must escalate to the reliable Stop-boundary path",
+        server_state.pop_pending_probe(run_id).is_none(),
+        "unconfirmed urgent probe must not be auto-redelivered",
+    );
+    // Its lifecycle must be observably Unconfirmed rather than silently
+    // assumed either way.
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeLifecycleState::Unconfirmed),
+        "unconfirmed delivery must be recorded, not left unknown",
+    );
+    // Still tracked as in-flight so a reply that does arrive (because
+    // the text really was consumed) is captured rather than dropped.
+    assert!(
+        server_state.take_in_flight_probe(run_id).is_some(),
+        "unconfirmed probe must still be tracked in-flight for reply capture",
     );
 
     let envelope = watch_sink

@@ -120,29 +120,45 @@ impl ServerState {
     /// mid-tool-call — so unlike a plain `SendToPane` it verifies the
     /// write actually became a queued prompt (see
     /// `inject_pane_text_verified`). This is the chore-update
-    /// auto-notice path that failed identically to the probe-6
-    /// incident in production: `SendToPane` returned Ok, no WARN was
-    /// logged, and the notice never reached the worker. On an
-    /// unverified write, fall back to `queue_probe` so the text still
-    /// lands reliably at the worker's next `Stop` boundary instead of
-    /// evaporating silently.
+    /// auto-notice path implicated in the probe-6 incident.
+    ///
+    /// The corrected understanding of that incident (2026-07-13) is
+    /// that an unconfirmed write is *not* proof of loss — the text may
+    /// still have reached the worker through a channel this engine
+    /// can't yet observe. So on
+    /// [`PaneInjectOutcome::Unconfirmed`] this does **not** fall back
+    /// to `queue_probe`: doing so risks delivering the same notice to
+    /// the worker a second time at its next `Stop` boundary, which is
+    /// exactly the duplicate-delivery outcome the corrected spec warns
+    /// against. Instead it returns success (the write did reach the
+    /// pane) and leaves the unconfirmed state observable via the
+    /// probe/lifecycle machinery rather than silently retrying.
     pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
         };
+        let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(self, run_id).await;
         match self
-            .inject_pane_text_verified(run_id, slot_id, text.clone(), Duration::from_secs(6))
+            .inject_pane_text_verified(
+                run_id,
+                slot_id,
+                text.clone(),
+                transcript_path.as_deref(),
+                offset_bytes,
+                Duration::from_secs(6),
+            )
             .await
         {
             PaneInjectOutcome::Confirmed => Ok(slot_id),
-            PaneInjectOutcome::Unverified => {
+            PaneInjectOutcome::Unconfirmed => {
                 tracing::warn!(
                     run_id,
                     slot_id,
-                    "send_input_to_worker: pane write unverified (no UserPromptSubmit observed within \
-                     the window); falling back to Stop-boundary probe delivery instead of dropping the text",
+                    "send_input_to_worker: pane write unconfirmed (no UserPromptSubmit or transcript match \
+                     observed within the window); NOT re-queuing as a probe, since the corrected probe-6 \
+                     understanding is that the text likely still reached the worker and redelivery would risk \
+                     duplicating it",
                 );
-                let _ = self.queue_probe(run_id.to_owned(), text, false);
                 Ok(slot_id)
             }
             PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
