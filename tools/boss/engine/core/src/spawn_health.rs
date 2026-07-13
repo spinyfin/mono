@@ -305,4 +305,97 @@ mod tests {
         assert_eq!(tracker.record_failure("wi-4", 1001), None);
         assert_eq!(tracker.record_failure("wi-5", 1001), Some(3));
     }
+
+    #[test]
+    fn keeps_firing_on_every_failure_once_tripped() {
+        // Documented level-triggered behavior: once distinct in-window failures
+        // are at/over the threshold, record_failure returns Some on *every*
+        // subsequent failure — for a brand-new distinct work item AND for a
+        // repeat of an already-counted one. The signal is deduped downstream by
+        // trip_spawn_capability_circuit's idempotency, not by record_failure
+        // firing only once.
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        assert_eq!(tracker.record_failure("wi-1", 1000), None);
+        assert_eq!(tracker.record_failure("wi-2", 1001), None);
+        assert_eq!(tracker.record_failure("wi-3", 1002), Some(3), "3rd distinct trips");
+        // A repeat of an already-counted item re-fires; distinct count is
+        // unchanged (still 3 distinct items in-window).
+        assert_eq!(
+            tracker.record_failure("wi-1", 1003),
+            Some(3),
+            "repeat of a counted item still re-fires, distinct count unchanged",
+        );
+        // A brand-new distinct item re-fires with the higher distinct count.
+        assert_eq!(
+            tracker.record_failure("wi-4", 1004),
+            Some(4),
+            "a new distinct item re-fires with the incremented distinct count",
+        );
+        // And a further repeat keeps firing at the current distinct count.
+        assert_eq!(
+            tracker.record_failure("wi-2", 1005),
+            Some(4),
+            "still level-triggered on subsequent repeats",
+        );
+    }
+
+    #[test]
+    fn with_config_clamps_zero_to_one() {
+        // threshold and window_secs are clamped with .max(1), so with_config(0, 0)
+        // behaves as threshold=1 / window=1: a single failure trips immediately.
+        let tracker = SpawnHealthTracker::with_config(0, 0);
+        assert_eq!(tracker.window_secs(), 1, "window clamped to 1");
+        assert_eq!(
+            tracker.record_failure("wi-1", 1000),
+            Some(1),
+            "clamped threshold=1 means a single failure trips",
+        );
+        // 2s later the 1s window has pruned the earlier failure, so a new item
+        // is again the only in-window entry — 1 distinct, which still trips.
+        assert_eq!(
+            tracker.record_failure("wi-2", 1002),
+            Some(1),
+            "1s window pruned the earlier failure; new item is the only one in-window",
+        );
+        // Same reasoning with a repeat of the original item after the window.
+        assert_eq!(
+            tracker.record_failure("wi-1", 1004),
+            Some(1),
+            "1s window means even a repeated item is the sole in-window entry",
+        );
+    }
+
+    #[test]
+    fn window_boundary_is_inclusive() {
+        // The prune predicate keeps entries where ts >= now - window_secs.
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        // Two failures exactly window_secs (300s) before the trip attempt at
+        // t=300 are retained (300 >= 300 - 300 == 0), so they count.
+        assert_eq!(tracker.record_failure("wi-1", 0), None);
+        assert_eq!(tracker.record_failure("wi-2", 0), None);
+        assert_eq!(
+            tracker.record_failure("wi-3", 300),
+            Some(3),
+            "entries exactly window_secs old are retained (ts >= now - window_secs)",
+        );
+
+        // A fresh tracker: entries window_secs+1 old are pruned. Two failures at
+        // t=0, then a trip attempt at t=301 — the two are 301s old (> 300 window)
+        // and pruned, leaving only the new one in-window (1 distinct, no trip).
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        assert_eq!(tracker.record_failure("wi-1", 0), None);
+        assert_eq!(tracker.record_failure("wi-2", 0), None);
+        assert_eq!(
+            tracker.record_failure("wi-3", 301),
+            None,
+            "entries window_secs+1 old are pruned (ts < now - window_secs)",
+        );
+    }
+
+    #[test]
+    fn window_secs_accessor_returns_configured_value() {
+        assert_eq!(SpawnHealthTracker::with_config(3, 300).window_secs(), 300);
+        // Reflects the clamped value when the configured window is below 1.
+        assert_eq!(SpawnHealthTracker::with_config(3, 0).window_secs(), 1);
+    }
 }
