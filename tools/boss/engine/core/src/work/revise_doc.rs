@@ -796,6 +796,128 @@ mod tests {
     }
 
     #[test]
+    fn resolves_comment_when_revision_lands_before_chain_root_merges() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, task_kind, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(task_kind, "revision");
+
+        // Drive the revision worker's own on-Stop PR-completion signal —
+        // its commit lands on the chain root's PR branch — independent of
+        // the chain root's PR ever merging.
+        let exec = db
+            .request_execution(RequestExecutionInput::builder().work_item_id(task_id.clone()).build())
+            .unwrap();
+        db.start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+        db.record_worker_pr_completion(&exec.id, &pr_url, None, WorkerPrCompletionTarget::InReview)
+            .unwrap()
+            .unwrap();
+
+        // The comment must already read resolved — the reviewer's re-read
+        // of the updated doc happens now, well before the chain root PR
+        // merges.
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "resolved");
+        assert_eq!(reloaded.revise_task_id.as_deref(), Some(task_id.as_str()));
+
+        let WorkItem::Task(revision_task) = db.get_work_item(&task_id).unwrap() else {
+            panic!("expected a task work item");
+        };
+        assert_eq!(revision_task.status, TaskStatus::InReview);
+
+        // The merge-time backstop must be a harmless no-op for a comment
+        // already resolved here — re-firing must not error or change it.
+        db.mark_chore_pr_merged(&design.id, &pr_url).unwrap();
+        let reloaded_again = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded_again.status, "resolved");
+    }
+
+    #[test]
+    fn reopens_comment_resolved_by_revision_landing_when_chain_root_pr_closes_unmerged() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+
+        let exec = db
+            .request_execution(RequestExecutionInput::builder().work_item_id(task_id.clone()).build())
+            .unwrap();
+        db.start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+        db.record_worker_pr_completion(&exec.id, &pr_url, None, WorkerPrCompletionTarget::InReview)
+            .unwrap()
+            .unwrap();
+
+        let resolved = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(
+            resolved.status, "resolved",
+            "the revision's commit landing must resolve it up front"
+        );
+
+        // The chain root's PR later closes unmerged: the commit that
+        // resolved the comment never made it to `main`, so the reopen
+        // sweep must find it via `revise_task_id` (the resolve arm never
+        // clears it) even though its status is `resolved`, not `in_revision`.
+        let reopened = db.reopen_comments_for_closed_unmerged_pr(&design.id).unwrap();
+        assert_eq!(reopened, 1);
+
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+        assert!(
+            reloaded.revise_task_id.is_none(),
+            "reopened comment must clear revise_task_id so a fresh [Revise] can re-claim it"
+        );
+    }
+
+    #[test]
     fn reopens_comment_when_chore_pr_closed_unmerged() {
         let db = mem_db();
         let (_design, artifact_id) = seed_design_owned_artifact(&db);

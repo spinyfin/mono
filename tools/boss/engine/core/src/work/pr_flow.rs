@@ -96,6 +96,20 @@ impl WorkDb {
             cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
         }
 
+        // Comment-intent-classification design §"Reconciliation": a
+        // revision's claimed comments are addressed the moment its commit
+        // is verified on the chain root's PR branch (this is that
+        // detection point), not when the chain root's PR eventually merges
+        // — the reviewer's re-read of the updated doc happens here, not at
+        // merge time. Guarded on `status = 'in_revision'` inside
+        // `reconcile_comments_for_task`, so this is a no-op on a re-fire
+        // (e.g. `target` already `InReview` and this call just re-affirms
+        // it). `flip_in_review_revisions_to_done`'s merge-time reconcile
+        // becomes a no-op backstop for rows already resolved here.
+        if new_status == TaskStatus::InReview && task.kind == TaskKind::Revision {
+            comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
+        }
+
         tx.execute(
             "UPDATE work_executions
              SET status = 'completed',
@@ -766,15 +780,28 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
+        // The direct/plain-chore vehicle's own comments only ever resolve on
+        // a genuine merge, so a late/duplicate close-unmerged sweep here
+        // must never undo that (`include_resolved: false`).
         let mut affected = comments::reconcile_comments_for_task(
             &tx,
             work_item_id,
-            comments::CommentReconcileOutcome::Reopened,
+            comments::CommentReconcileOutcome::Reopened {
+                include_resolved: false,
+            },
             &now,
         )?;
         for rev_id in collect_chain_revision_ids(&tx, work_item_id)? {
-            affected +=
-                comments::reconcile_comments_for_task(&tx, &rev_id, comments::CommentReconcileOutcome::Reopened, &now)?;
+            // A revision's comments may already be `resolved` (its commit
+            // landed and reached `in_review` before the chain root's PR
+            // itself resolved) — that resolve must be undone here too, since
+            // the commit that produced it never merged either.
+            affected += comments::reconcile_comments_for_task(
+                &tx,
+                &rev_id,
+                comments::CommentReconcileOutcome::Reopened { include_resolved: true },
+                &now,
+            )?;
         }
         tx.commit()?;
         Ok(affected)
