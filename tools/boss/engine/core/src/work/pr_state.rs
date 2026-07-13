@@ -35,12 +35,23 @@ impl PrStateChecker for GhPrStateChecker {
         let body = String::from_utf8_lossy(&output.stdout);
         let v: serde_json::Value =
             serde_json::from_str(&body).with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
-        let state = v["state"].as_str().unwrap_or("").to_ascii_uppercase();
-        match state.as_str() {
-            "MERGED" => Ok(PrOpenState::Merged),
-            "CLOSED" => Ok(PrOpenState::ClosedUnmerged),
-            _ => Ok(PrOpenState::Open),
-        }
+        Ok(map_gh_state(&v))
+    }
+}
+
+/// Pure mapping from the parsed `gh pr view --json state,mergedAt` JSON to a
+/// [`PrOpenState`]. Extracted from [`GhPrStateChecker::check`] so the mapping
+/// can be unit-tested without shelling out to `gh`.
+///
+/// `state` is upper-cased before matching, so `gh`'s canonical uppercase
+/// values (`MERGED`/`CLOSED`/`OPEN`) and any lowercase variants map alike;
+/// a missing or unrecognized state falls through to [`PrOpenState::Open`].
+fn map_gh_state(v: &serde_json::Value) -> PrOpenState {
+    let state = v["state"].as_str().unwrap_or("").to_ascii_uppercase();
+    match state.as_str() {
+        "MERGED" => PrOpenState::Merged,
+        "CLOSED" => PrOpenState::ClosedUnmerged,
+        _ => PrOpenState::Open,
     }
 }
 
@@ -128,5 +139,59 @@ impl RevisionGateError {
             short_id: task.short_id.unwrap_or(0),
             pr_number: parse_pr_number(pr_url).unwrap_or(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merged_state_maps_to_merged() {
+        assert_eq!(
+            map_gh_state(&json!({"state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z"})),
+            PrOpenState::Merged
+        );
+    }
+
+    #[test]
+    fn closed_state_maps_to_closed_unmerged() {
+        assert_eq!(
+            map_gh_state(&json!({"state": "CLOSED", "mergedAt": null})),
+            PrOpenState::ClosedUnmerged
+        );
+    }
+
+    #[test]
+    fn open_state_maps_to_open() {
+        assert_eq!(
+            map_gh_state(&json!({"state": "OPEN", "mergedAt": null})),
+            PrOpenState::Open
+        );
+    }
+
+    #[test]
+    fn lowercase_states_still_map_correctly() {
+        // check() upper-cases before matching, so lowercase inputs map like their canonical forms.
+        assert_eq!(map_gh_state(&json!({"state": "merged"})), PrOpenState::Merged);
+        assert_eq!(map_gh_state(&json!({"state": "closed"})), PrOpenState::ClosedUnmerged);
+        assert_eq!(map_gh_state(&json!({"state": "open"})), PrOpenState::Open);
+    }
+
+    #[test]
+    fn unrecognized_state_maps_to_open() {
+        assert_eq!(map_gh_state(&json!({"state": "SOMETHING_ELSE"})), PrOpenState::Open);
+    }
+
+    #[test]
+    fn missing_state_maps_to_open() {
+        assert_eq!(map_gh_state(&json!({"mergedAt": null})), PrOpenState::Open);
+    }
+
+    #[test]
+    fn non_string_state_maps_to_open() {
+        // A non-string `state` value can't be read as a str, so it falls through to Open.
+        assert_eq!(map_gh_state(&json!({"state": 42})), PrOpenState::Open);
     }
 }
