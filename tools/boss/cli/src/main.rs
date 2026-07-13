@@ -4156,7 +4156,7 @@ async fn run_restore_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskR
         WorkItem::Chore(t) => ("Chore", boss_protocol::short_id_label(t.short_id)),
         _ => ("Item", None),
     };
-    let friendly = friendly.unwrap_or_else(|| work_item_primary_id(&item).to_owned());
+    let friendly = friendly.unwrap_or_else(|| item.primary_id().to_owned());
     print_entity(ctx, &serde_json::json!({ "item": item }), || {
         if !ctx.quiet {
             println!("Restored {label} {friendly}");
@@ -6755,7 +6755,7 @@ async fn resolve_create_revision_parent(client: &mut BossClient, selector: &str)
         // straight to GetWorkItem; the engine resolves it without a product.
         WorkItemSelector::ShortId(_) => {
             let item = get_work_item(client, selector).await?;
-            Ok(work_item_primary_id(&item).to_owned())
+            Ok(item.primary_id().to_owned())
         }
         // Already a primary id or opaque slug — pass through unchanged.
         WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
@@ -6765,7 +6765,7 @@ async fn resolve_create_revision_parent(client: &mut BossClient, selector: &str)
             // via the standard resolution with an empty product context.
             // This will fail clearly if the product slug can't be resolved.
             let item = get_work_item(client, selector).await?;
-            Ok(work_item_primary_id(&item).to_owned())
+            Ok(item.primary_id().to_owned())
         }
     }
 }
@@ -7929,14 +7929,6 @@ async fn resolve_short_id_item(
     get_work_item_by_short_id_rpc(client, &product.id, short_id).await
 }
 
-fn work_item_primary_id(item: &WorkItem) -> &str {
-    match item {
-        WorkItem::Product(p) => &p.id,
-        WorkItem::Project(p) => &p.id,
-        WorkItem::Task(t) | WorkItem::Chore(t) => &t.id,
-    }
-}
-
 /// Resolve any selector form (friendly `T441`, `#42`, plain `42`,
 /// cross-product `boss/42`, or primary `task_…` id) to a primary engine
 /// id. If the selector is already a primary id or an opaque slug, it is
@@ -7989,11 +7981,11 @@ async fn resolve_selector_to_primary_id(
     match parse_work_item_selector(id) {
         WorkItemSelector::ShortId(n) => {
             let item = resolve_short_id_item(client, ctx, product, n).await?;
-            Ok(work_item_primary_id(&item).to_owned())
+            Ok(item.primary_id().to_owned())
         }
         WorkItemSelector::ProductShortId { product_slug, n } => {
             let item = resolve_short_id_item(client, ctx, Some(product_slug), n).await?;
-            Ok(work_item_primary_id(&item).to_owned())
+            Ok(item.primary_id().to_owned())
         }
         WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
     }

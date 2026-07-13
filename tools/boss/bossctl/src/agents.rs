@@ -90,16 +90,6 @@ pub(crate) fn looks_like_name_or_slot(reference: &str) -> bool {
     ROSTER.iter().any(|name| name.eq_ignore_ascii_case(reference))
 }
 
-/// The primary id of any `WorkItem` variant, for callers that just need a
-/// string to compare/print regardless of kind.
-pub(crate) fn work_item_primary_id(item: &WorkItem) -> &str {
-    match item {
-        WorkItem::Product(p) => p.id.as_str(),
-        WorkItem::Project(p) => p.id.as_str(),
-        WorkItem::Task(t) | WorkItem::Chore(t) => t.id.as_str(),
-    }
-}
-
 /// Resolve `reference` to a work item when it looks like one: a friendly
 /// short id (`T42`, `t42`, `P7`, `p7`) or a primary `task_…` / `proj_…` /
 /// `prod_…` id. Returns `Ok(None)` for anything else (run ids, slot
@@ -166,7 +156,7 @@ async fn resolve_tnnn_to_live_worker<'a>(
     let Some(item) = resolve_work_item_ref(client, selector).await? else {
         return Ok(None);
     };
-    let primary_id = work_item_primary_id(&item);
+    let primary_id = item.primary_id();
     Ok(states.iter().find(|s| s.work_item_id.as_deref() == Some(primary_id)))
 }
 
@@ -232,7 +222,7 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
     // to spawn one) no `work_runs` row either, so the `GetRun` fallback
     // below would just error with "no such run".
     if let Some(work_item) = resolve_work_item_ref(&mut client, &agent).await? {
-        let primary_id = work_item_primary_id(&work_item).to_owned();
+        let primary_id = work_item.primary_id().to_owned();
         if let Some(state) = states
             .iter()
             .find(|s| s.work_item_id.as_deref() == Some(primary_id.as_str()))
@@ -298,7 +288,7 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
 /// particular is exactly the "why is this active with no worker" signal
 /// the coordinator previously had to dig out of the engine trace.
 async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<()> {
-    let primary_id = work_item_primary_id(work_item).to_owned();
+    let primary_id = work_item.primary_id().to_owned();
 
     let runtime = match client
         .send_request(&FrontendRequest::GetTaskRuntime {
@@ -1261,18 +1251,15 @@ mod tests {
         assert!(!looks_like_name_or_slot("Picard"));
     }
 
-    // ---- work_item_primary_id ---------------------------------------------
+    // ---- WorkItem::primary_id ---------------------------------------------
 
     #[test]
     fn primary_id_for_each_work_item_variant() {
-        assert_eq!(work_item_primary_id(&WorkItem::Product(product("prod_9"))), "prod_9");
-        assert_eq!(work_item_primary_id(&WorkItem::Project(project("proj_9"))), "proj_9");
+        assert_eq!(WorkItem::Product(product("prod_9")).primary_id(), "prod_9");
+        assert_eq!(WorkItem::Project(project("proj_9")).primary_id(), "proj_9");
+        assert_eq!(WorkItem::Task(task("task_9", TaskKind::Task)).primary_id(), "task_9");
         assert_eq!(
-            work_item_primary_id(&WorkItem::Task(task("task_9", TaskKind::Task))),
-            "task_9"
-        );
-        assert_eq!(
-            work_item_primary_id(&WorkItem::Chore(task("chore_9", TaskKind::Chore))),
+            WorkItem::Chore(task("chore_9", TaskKind::Chore)).primary_id(),
             "chore_9"
         );
     }

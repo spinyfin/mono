@@ -24,7 +24,7 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
 // NOTE: unit tests for the `agents.rs` reference-resolution and
 // candidate-formatting helpers (`resolve_agent_ref`, `pick_unique`,
 // `live_candidates_summary`, `looks_like_name_or_slot`,
-// `work_item_primary_id`) now live co-located in that module's own
+// `WorkItem::primary_id`) now live co-located in that module's own
 // `#[cfg(test)] mod tests` — see `agents.rs`. This crate-level module
 // keeps the tests for the `logs.rs` dispatch-tail helpers and the
 // bossctl-boundary `LiveWorkerState` serialization guard.
