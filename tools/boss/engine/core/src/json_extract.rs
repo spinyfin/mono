@@ -86,6 +86,70 @@ pub(crate) fn find_first_balanced_object(s: &str) -> Option<&str> {
     None
 }
 
+/// Given a string starting with `[`, return the slice covering the balanced
+/// `[…]` array (handling nested arrays/objects and string literals). Returns
+/// `None` if the input doesn't start with `[` or the delimiters are
+/// unbalanced.
+///
+/// The array analogue of [`extract_balanced_object`]: both `[` and `{` deepen
+/// the nesting and both `]` and `}` close it, so an object nested inside the
+/// array is spanned correctly and its closing `}` cannot be mistaken for the
+/// array terminator.
+pub(crate) fn extract_balanced_array(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Scan `s` for the first balanced `[…]` array at any starting offset
+/// (string/escape-aware via [`extract_balanced_array`]). The input need not
+/// start with `[` — this walks forward to the first `[` that yields a balanced
+/// array. Fenced blocks are transparent: the fence markers sit outside the
+/// array.
+pub(crate) fn find_first_balanced_array(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'['
+            && let Some(arr) = extract_balanced_array(&s[i..])
+        {
+            return Some(arr);
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +247,57 @@ mod tests {
         // returned slice must stop there, dropping trailing prose.
         let s = r#"{"outer": {"a": "{{", "b": "}}"}} trailing"#;
         assert_eq!(extract_balanced_object(s), Some(r#"{"outer": {"a": "{{", "b": "}}"}}"#));
+    }
+
+    #[test]
+    fn extract_balanced_array_spans_nested_object() {
+        // An object nested in the array must not close the array early: its
+        // `}` decrements back to array depth, and the terminal `]` closes it.
+        let s = r#"[{"a": 1}, {"b": 2}]"#;
+        assert_eq!(extract_balanced_array(s), Some(s));
+    }
+
+    #[test]
+    fn extract_balanced_array_rejects_input_not_starting_with_bracket() {
+        assert_eq!(extract_balanced_array("not json"), None);
+    }
+
+    #[test]
+    fn extract_balanced_array_returns_none_on_missing_closing_bracket() {
+        assert_eq!(extract_balanced_array(r#"[1, 2"#), None);
+    }
+
+    #[test]
+    fn find_first_balanced_array_respects_strings() {
+        // A `]` inside a string literal must not terminate the array. (Moved
+        // from attentions_detector.rs when the scanner was consolidated here.)
+        let s = r#"prefix [{"k": "a]b"}] suffix"#;
+        assert_eq!(find_first_balanced_array(s), Some(r#"[{"k": "a]b"}]"#));
+    }
+
+    #[test]
+    fn find_first_balanced_array_skips_leading_prose_and_fence() {
+        // Fence markers sit outside the array and are transparent.
+        let s = "FOLLOWUPS:\n```json\n[{\"proposed_name\": \"X\"}]\n```\n";
+        assert_eq!(find_first_balanced_array(s), Some(r#"[{"proposed_name": "X"}]"#));
+    }
+
+    #[test]
+    fn find_first_balanced_array_returns_none_without_brackets() {
+        assert_eq!(find_first_balanced_array("no brackets here"), None);
+    }
+
+    #[test]
+    fn find_first_balanced_array_recovers_after_unbalanced_first_bracket() {
+        // The first `[` never closes (its inner `[1, 2]` balances back to depth
+        // 1, then the input ends), so extraction from that offset fails. The
+        // scan must keep walking and return the later balanced array.
+        let s = r#"[ oops [1, 2]"#;
+        assert_eq!(find_first_balanced_array(s), Some(r#"[1, 2]"#));
+    }
+
+    #[test]
+    fn find_first_balanced_array_returns_none_on_missing_closing_bracket() {
+        assert_eq!(find_first_balanced_array(r#"prefix [1, 2"#), None);
     }
 }

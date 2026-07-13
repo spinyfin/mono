@@ -452,58 +452,23 @@ fn extract_assistant_text(jsonl: &str) -> String {
 
 /// Parse the `FOLLOWUPS:` block out of assistant text: locate the last
 /// `FOLLOWUPS:` sentinel and the first balanced JSON array after it (fenced
-/// or not). Returns an empty `Vec` when no parseable block is present.
+/// or not, via the shared [`crate::json_extract::find_first_balanced_array`]).
+/// Returns an empty `Vec` when no parseable block is present.
 fn parse_followups_block(text: &str) -> Vec<FollowupEntry> {
     let Some(idx) = text.rfind("FOLLOWUPS:") else {
         return Vec::new();
     };
     let tail = &text[idx..];
-    let Some(array) = extract_balanced_array(tail) else {
+    let Some(array) = crate::json_extract::find_first_balanced_array(tail) else {
         return Vec::new();
     };
-    match serde_json::from_str::<Vec<FollowupEntry>>(&array) {
+    match serde_json::from_str::<Vec<FollowupEntry>>(array) {
         Ok(entries) => entries,
         Err(err) => {
             tracing::warn!(?err, "attentions detector: FOLLOWUPS block is not a valid JSON array");
             Vec::new()
         }
     }
-}
-
-/// Return the first balanced `[...]` JSON array in `s` (depth-counting,
-/// string- and escape-aware so brackets inside string literals are ignored).
-/// Handles fenced blocks transparently — the fence markers sit outside the
-/// array.
-fn extract_balanced_array(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'[')?;
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    for (offset, &b) in bytes[start..].iter().enumerate() {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(s[start..start + offset + 1].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 // ── Backstop: Questions extraction ───────────────────────────────────────────
@@ -977,13 +942,6 @@ mod tests {
     #[test]
     fn parse_followups_block_empty_without_sentinel() {
         assert!(parse_followups_block("no block here [1,2,3]").is_empty());
-    }
-
-    #[test]
-    fn extract_balanced_array_respects_strings() {
-        // A `]` inside a string literal must not terminate the array.
-        let s = r#"prefix [{"k": "a]b"}] suffix"#;
-        assert_eq!(extract_balanced_array(s).as_deref(), Some(r#"[{"k": "a]b"}]"#));
     }
 
     #[test]
