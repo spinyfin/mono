@@ -1,10 +1,33 @@
-//! Shared string/escape-aware balanced-JSON-object extraction, used by any
-//! call site that has to pull a `{...}` object out of an LLM reply that may
-//! be wrapped in prose or a markdown fence. Originally lived only in
+//! Shared, low-level helpers for cleaning up and extracting from an LLM's
+//! text reply.
+//!
+//! The bulk is string/escape-aware balanced-JSON-object extraction, used by
+//! any call site that has to pull a `{...}` object out of an LLM reply that
+//! may be wrapped in prose or a markdown fence. Originally lived only in
 //! `pr_review.rs`; lifted here so `comment_classifier.rs` (and any future
 //! caller) shares the same brace-narrowing pass instead of a second, weaker
 //! `find('{')`/`rfind('}')` implementation that mis-bounds on a `}` inside a
 //! string value or trailing prose.
+//!
+//! It also hosts [`strip_wrapping_quotes`], the tiny prelude both worker
+//! summarizers ([`crate::pane_summary`] and [`crate::live_status`]) run over
+//! a model reply before their post-processing diverges.
+
+/// Trim a model reply and strip any surrounding quote/backtick characters
+/// plus a trailing period, returning the inner slice.
+///
+/// Models routinely wrap a short phrase in quotes or backticks and tack on a
+/// period (`"fixing the scraper."`), none of which belongs in a UI label.
+/// Both [`crate::pane_summary::clean_summary`] and
+/// [`crate::live_status::clean_summary`] begin with this identical pass and
+/// then diverge (pane word-clamps and strips a leading `is `; live_status
+/// redacts), so the shared prelude lives here as one helper.
+pub(crate) fn strip_wrapping_quotes(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches(['"', '\'', '`'])
+        .trim_end_matches(['"', '\'', '`', '.'])
+        .trim()
+}
 
 /// Given a string starting with `{`, return the slice covering the balanced
 /// `{…}` object (handling nested braces and string literals). Returns `None`
@@ -66,6 +89,23 @@ pub(crate) fn find_first_balanced_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_wrapping_quotes_trims_quotes_backticks_and_trailing_period() {
+        // The exact byte-for-byte prelude both summarizers rely on:
+        // outer whitespace, wrapping quote/backtick, and a trailing period
+        // all come off; interior characters are untouched.
+        assert_eq!(
+            strip_wrapping_quotes("  \"fixing the scraper.\"  "),
+            "fixing the scraper"
+        );
+        assert_eq!(strip_wrapping_quotes("`running bazel build`"), "running bazel build");
+        assert_eq!(strip_wrapping_quotes("'reading the config'"), "reading the config");
+        // No wrapping to strip — returned unchanged after the trim.
+        assert_eq!(strip_wrapping_quotes("editing card layout"), "editing card layout");
+        // Empty / whitespace-only collapses to empty.
+        assert_eq!(strip_wrapping_quotes("   "), "");
+    }
 
     #[test]
     fn extract_balanced_object_handles_nested_braces_and_strings() {

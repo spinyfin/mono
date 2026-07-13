@@ -421,11 +421,7 @@ pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<Clau
 /// Returns an empty string on rejection so the caller can fall back
 /// to "keep prior".
 pub fn clean_summary(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let stripped = trimmed
-        .trim_start_matches(['"', '\'', '`'])
-        .trim_end_matches(['"', '\'', '`', '.'])
-        .trim();
+    let stripped = crate::json_extract::strip_wrapping_quotes(raw);
     let redacted = live_status_redact::redact_text(stripped);
     if live_status_redact::is_mostly_redacted(&redacted) {
         return String::new();
