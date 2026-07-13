@@ -97,6 +97,25 @@ struct MarkdownFindBar: View {
 final class MarkdownScrollController {
     weak var scrollView: NSScrollView?
 
+    /// Current scroll offset, in the clip view's own (flipped) coordinate
+    /// space. Used to snapshot the viewport position before a forced
+    /// `StructuredText` remount (see `parseVersion` in
+    /// `MarkdownViewerScrollContent`/`DesignRendererMarkdownContent`) so it
+    /// can be restored once the remount lands, instead of leaving AppKit's
+    /// default post-remount scroll offset (top-of-document) in place.
+    func currentOffset() -> CGPoint? {
+        scrollView?.contentView.bounds.origin
+    }
+
+    /// Restores a previously captured offset without animation — this runs
+    /// right after a remount, so an animated scroll would visibly fight the
+    /// content that's still settling into place.
+    func restoreOffset(_ origin: CGPoint) {
+        guard let scrollView else { return }
+        scrollView.contentView.bounds.origin = origin
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
     func scrollToFraction(_ fraction: Double) {
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let docHeight = documentView.frame.height

@@ -133,6 +133,12 @@ struct DesignRendererView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var source: String = ""
     @State private var loadError: String?
+    /// Stable across re-renders via `@State` (a plain stored `let`/`var`
+    /// would be reinitialized — losing the captured `NSScrollView` — every
+    /// time SwiftUI reconstructs this view struct). Handed to
+    /// `DesignRendererMarkdownContent` so it can preserve scroll position
+    /// across the forced `StructuredText` remount on comment changes.
+    @State private var scrollController = MarkdownScrollController()
 
     private var questionGroups: [AttentionGroup] {
         model.openQuestionGroupsForDocPath(content.filePath)
@@ -158,6 +164,7 @@ struct DesignRendererView: View {
                 .padding(.vertical, 20)
                 .frame(maxWidth: 720)
                 .frame(maxWidth: .infinity)
+                .background(MarkdownScrollViewCapture(controller: scrollController))
             }
             .textSelection(.enabled)
             .background(viewerBackground)
@@ -226,7 +233,8 @@ struct DesignRendererView: View {
         } else {
             DesignRendererMarkdownContent(
                 source: source,
-                baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent()
+                baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent(),
+                scrollController: scrollController
             )
         }
     }
@@ -274,6 +282,10 @@ struct DesignRendererView: View {
 private struct DesignRendererMarkdownContent: View {
     let source: String
     let baseURL: URL?
+    /// Captured/restores the enclosing `NSScrollView`'s offset around the
+    /// forced remount below, so highlight updates don't reset the reader's
+    /// scroll position back to the top of the document.
+    let scrollController: MarkdownScrollController
 
     @Environment(\.commentedAnchors) private var commentedAnchors
     @Environment(\.commentFlashAnchor) private var commentFlashAnchor
@@ -288,8 +300,22 @@ private struct DesignRendererMarkdownContent: View {
             .textual.textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .id(parseVersion)
-            .onChange(of: commentedAnchors) { _, _ in parseVersion &+= 1 }
-            .onChange(of: commentFlashAnchor) { _, _ in parseVersion &+= 1 }
+            .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
+            .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
+    }
+
+    /// See `MarkdownViewerScrollContent.bumpParseVersionPreservingScroll`
+    /// (DesignsView.swift) for why this capture/restore is needed: AppKit
+    /// resets an `NSScrollView`'s document offset to the top when SwiftUI
+    /// tears down and rebuilds its document view content, which is exactly
+    /// what happens here on every `.id()` change.
+    private func bumpParseVersionPreservingScroll() {
+        let offset = scrollController.currentOffset()
+        parseVersion &+= 1
+        guard let offset else { return }
+        DispatchQueue.main.async {
+            scrollController.restoreOffset(offset)
+        }
     }
 
     private var markdownParser: any MarkupParser {
