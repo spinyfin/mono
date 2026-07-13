@@ -68,6 +68,7 @@ use serde_json::{Value, json};
 use boss_protocol::{PlannerInput, PlannerOutput, planner_output_schema};
 
 use crate::claude_client::{self, CallConfig, ClaudeError, MessagesResponse, RetryPolicy};
+use crate::planner_validation::{OversizeFinding, detect_oversize_tasks};
 
 /// The model the Planner runs on. A direct API call needs a concrete model
 /// id (the `--model` family aliases used for worker dispatch are resolved by
@@ -108,15 +109,27 @@ pub const PLANNER_ATTEMPTS: u32 = 2;
 /// high-effort call can afford a real pause before hammering the API again.
 pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Total attempts across the outer schema-validation retry loop in
-/// [`Planner::plan`]. A model occasionally emits a tool call that violates
-/// [`planner_output_schema`] (observed: an array-typed field like
-/// `effort_audit` emitted as a single JSON-encoded string). That is model
-/// flakiness, not a transient transport error, so [`PLANNER_ATTEMPTS`]'s
-/// 429/5xx retry never sees it and a single miss used to fail the whole
-/// proposal. Bounded at 2 (one retry): the retry re-sends the request with the
-/// validation error appended to the prompt, so the model can see and correct
-/// exactly what it got wrong.
+/// Total attempts across the outer output-acceptance retry loop in
+/// [`Planner::plan`]. Two distinct rejection modes share this one bounded
+/// loop, each re-prompting with the rejection reason fed back to the model:
+///
+/// 1. **Schema-invalid output** — a model occasionally emits a tool call that
+///    violates [`planner_output_schema`] (observed: an array-typed field like
+///    `effort_audit` emitted as a single JSON-encoded string). That is model
+///    flakiness, not a transient transport error, so [`PLANNER_ATTEMPTS`]'s
+///    429/5xx retry never sees it and a single miss used to fail the whole
+///    proposal.
+/// 2. **Oversize tasks (the decomposition gate)** — a schema-valid proposal
+///    that packs a monolithic "project in disguise" task
+///    ([`detect_oversize_tasks`]). The retry asks the model to decompose it
+///    into dependency-ordered, single-subsystem, single-PR tasks.
+///
+/// Bounded at 2 (one retry): the retry re-sends the request with the
+/// rejection reason appended to the prompt, so the model can see and correct
+/// exactly what it got wrong. A schema failure that survives the budget fails
+/// the run ([`PlannerOutcome::InvalidOutput`]); an oversize proposal that
+/// survives it is accepted best-effort (the valid, operator-reviewed plan is
+/// not worth discarding over an imperfect split).
 pub const PLANNER_VALIDATION_ATTEMPTS: u32 = 2;
 
 /// Name of the forced tool whose `input_schema` is [`planner_output_schema`].
@@ -221,42 +234,86 @@ impl Planner {
     }
 }
 
+/// Why the previous attempt's output was rejected, carried into the next
+/// attempt's prompt so the model can see and fix exactly what was wrong. The
+/// two rejection modes share the one bounded acceptance loop
+/// ([`PLANNER_VALIDATION_ATTEMPTS`]).
+enum RetryFeedback {
+    /// The tool call failed [`planner_output_schema`] validation.
+    Schema(String),
+    /// The proposal was schema-valid but one or more tasks tripped the
+    /// decomposition gate ([`detect_oversize_tasks`]).
+    Oversize(Vec<OversizeFinding>),
+}
+
 /// Core of [`Planner::plan`] with the endpoint URL injected so tests can
 /// drive it against a mock server. Hands each attempt's request to the shared
 /// [`crate::claude_client`] pipeline (which owns 429/5xx/transport
-/// retry/backoff) and, on a schema-validation failure, rebuilds the request
-/// with the error fed back into the prompt and tries again — bounded by
-/// [`PLANNER_VALIDATION_ATTEMPTS`] — before failing safe.
+/// retry/backoff) and, on a rejection — a schema-validation failure OR an
+/// oversize proposal the decomposition gate catches — rebuilds the request
+/// with the reason fed back into the prompt and tries again, bounded by
+/// [`PLANNER_VALIDATION_ATTEMPTS`], before failing safe / accepting
+/// best-effort.
 async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> PlannerOutcome {
     let config = CallConfig::new(PLANNER_TIMEOUT)
         .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF))
         .with_endpoint(url);
 
-    let mut validation_error: Option<String> = None;
+    let mut feedback: Option<RetryFeedback> = None;
     for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
-        let body = match &validation_error {
+        let body = match &feedback {
             None => build_request_body(input),
-            Some(err) => build_retry_request_body(input, err),
+            Some(fb) => build_retry_request_body(input, fb),
         };
         match claude_client::send_messages_raw(api_key, &body, &config).await {
             Ok(response) => match planner_output_from_response(&response) {
-                Ok(output) => return PlannerOutcome::Success(output),
+                Ok(output) => {
+                    // Decomposition gate (design brief deliverable 1): reject a
+                    // schema-valid proposal that ships a monolithic
+                    // "project in disguise" task and re-prompt for a split,
+                    // bounded by the same retry budget. On the final attempt
+                    // accept the best-effort output rather than discard a valid
+                    // (if imperfectly-decomposed) plan — the staged tasks are
+                    // still operator-reviewed before dispatch, and the prompt's
+                    // sizing contract already pushed hard for the split.
+                    let findings = detect_oversize_tasks(&output);
+                    if findings.is_empty() {
+                        return PlannerOutcome::Success(output);
+                    }
+                    if attempt >= PLANNER_VALIDATION_ATTEMPTS {
+                        tracing::warn!(
+                            attempt,
+                            oversize = findings.len(),
+                            "planner: oversize task(s) remain after decomposition retries; accepting best-effort proposal",
+                        );
+                        return PlannerOutcome::Success(output);
+                    }
+                    tracing::warn!(
+                        attempt,
+                        oversize = findings.len(),
+                        "planner: proposal packs oversize task(s); re-prompting for decomposition",
+                    );
+                    feedback = Some(RetryFeedback::Oversize(findings));
+                }
                 Err(msg) => {
+                    if attempt >= PLANNER_VALIDATION_ATTEMPTS {
+                        return PlannerOutcome::InvalidOutput(msg);
+                    }
                     tracing::warn!(
                         attempt,
                         max_attempts = PLANNER_VALIDATION_ATTEMPTS,
                         err = %msg,
                         "planner: schema-invalid output; retrying with validation feedback",
                     );
-                    validation_error = Some(msg);
+                    feedback = Some(RetryFeedback::Schema(msg));
                 }
             },
             Err(err) => return outcome_from_error(err),
         }
     }
-    // Exhausted the validation-retry budget; `validation_error` is always
-    // `Some` here (the loop only continues past attempt 1 by setting it).
-    PlannerOutcome::InvalidOutput(validation_error.unwrap_or_else(|| "exhausted planner validation retries".to_owned()))
+    // Unreachable in practice: the final iteration returns in every branch
+    // (Ok → Success/best-effort, Err → InvalidOutput). Kept as a fail-safe.
+    PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned())
 }
 
 /// Assemble the Anthropic Messages request body. Public so tests and future
@@ -336,35 +393,60 @@ pub fn build_user_prompt(input: &PlannerInput) -> String {
 }
 
 /// Build the retry request body: identical to [`build_request_body`] except
-/// the single user turn also carries the previous attempt's schema-validation
-/// error, so the model can see and correct exactly what it got wrong instead
-/// of repeating the same mistake blind.
-fn build_retry_request_body(input: &PlannerInput, validation_error: &str) -> Value {
+/// the single user turn also carries the previous attempt's rejection reason,
+/// so the model can see and correct exactly what it got wrong instead of
+/// repeating the same mistake blind.
+fn build_retry_request_body(input: &PlannerInput, feedback: &RetryFeedback) -> Value {
     let mut body = build_request_body(input);
     if let Some(content) = body
         .get_mut("messages")
         .and_then(|messages| messages.get_mut(0))
         .and_then(|message| message.get_mut("content"))
     {
-        *content = Value::String(retry_user_prompt(input, validation_error));
+        *content = Value::String(retry_user_prompt(input, feedback));
     }
     body
 }
 
-/// The retry user turn: the normal prompt plus an explicit rejection notice
-/// naming the schema-validation error from the previous attempt.
-fn retry_user_prompt(input: &PlannerInput, validation_error: &str) -> String {
+/// The retry user turn: the normal prompt plus an explicit rejection notice.
+/// The notice differs by rejection mode — a schema-type error, or the
+/// decomposition gate's list of oversize tasks to split.
+fn retry_user_prompt(input: &PlannerInput, feedback: &RetryFeedback) -> String {
     let mut out = build_user_prompt(input);
-    out.push_str(&format!(
-        "\n--- YOUR PREVIOUS emit_task_graph CALL WAS REJECTED ---\n\
-         Schema validation error: {validation_error}\n\
-         Every field must have exactly the JSON type the schema declares — in \
-         particular, array fields (`tasks`, `edges`, `effort_audit`) must be \
-         emitted as a JSON array, never as a single JSON-encoded string \
-         containing one. Call `emit_task_graph` again with a schema-valid \
-         payload that fixes this.\n\
-         --- END REJECTION NOTICE ---\n"
-    ));
+    match feedback {
+        RetryFeedback::Schema(validation_error) => {
+            out.push_str(&format!(
+                "\n--- YOUR PREVIOUS emit_task_graph CALL WAS REJECTED ---\n\
+                 Schema validation error: {validation_error}\n\
+                 Every field must have exactly the JSON type the schema declares — in \
+                 particular, array fields (`tasks`, `edges`, `effort_audit`) must be \
+                 emitted as a JSON array, never as a single JSON-encoded string \
+                 containing one. Call `emit_task_graph` again with a schema-valid \
+                 payload that fixes this.\n\
+                 --- END REJECTION NOTICE ---\n"
+            ));
+        }
+        RetryFeedback::Oversize(findings) => {
+            let list = findings
+                .iter()
+                .map(|f| format!("- {}", f.describe()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push_str(&format!(
+                "\n--- YOUR PREVIOUS emit_task_graph CALL WAS REJECTED: OVERSIZE TASK(S) ---\n\
+                 One or more proposed tasks are too large for a single worker session / a \
+                 single reviewable PR. Decompose EACH of the following into dependency-ordered \
+                 tasks — single-subsystem, single-PR each — and wire the `edges` between them. \
+                 Lift any embedded fan-out (\"validate/sweep/migrate all N X\", an all-lists \
+                 reconciliation, a corpus-wide sweep) into its OWN dependent task. When a task \
+                 embeds unknown-format discovery, emit a separate `investigation` task before \
+                 the implementation task that consumes it:\n\
+                 {list}\n\
+                 Call `emit_task_graph` again with the decomposed graph.\n\
+                 --- END REJECTION NOTICE ---\n"
+            ));
+        }
+    }
     out
 }
 
@@ -506,6 +588,38 @@ Do NOT propose:\n\
 - Any task whose name duplicates one already in the project (the existing \
 names are listed in the user message).\n\
 - More than the task cap stated in the user message.\n\
+\n\
+## task sizing contract — one reviewable PR per task\n\
+\n\
+Every task you propose must be single-subsystem, single-PR, and completable \
+by one worker in roughly one session. Size each item down to that \
+granularity: when a doc's own breakdown item is bigger than that, SPLIT it \
+into several dependency-ordered tasks rather than transcribing it whole. A \
+single monolithic \"project in disguise\" task is exactly the failure mode \
+this guards against.\n\
+\n\
+- **Multi-subsystem scope is several tasks.** A task that spans multiple \
+subsystems (engine + cli + protocol + app + …) must be emitted as one task \
+per subsystem with dependency edges — never one task that touches them all.\n\
+- **Multi-phase scope is several tasks.** \"parse (i)… and (ii)… and emit… \
+and validate…\" is a chain of phases: emit each phase as its own task and \
+wire the `edges` between them. Never pack the phases into one task.\n\
+- **Embedded fan-out is its own dependent task.** \"validate/sweep/migrate \
+all N X\", an all-lists reconciliation, or a corpus-wide sweep is a separate \
+task that depends on the implementation it validates. Do not fold the sweep \
+into the implementer.\n\
+- **If a breakdown item needs a paragraph to describe, it is almost \
+certainly several tasks** — decompose it.\n\
+- **Unknown-format discovery becomes an INVESTIGATION task.** When an item \
+embeds format discovery / reverse-engineering (verbs like study, dump, \
+reverse-engineer, characterise, reconcile-against-source), emit a separate \
+`investigation` task for that discovery, sequenced (via an edge) BEFORE the \
+implementation task that consumes its findings. This is the T298 lesson: the \
+single biggest chunk of that run was format discovery, not implementation — \
+ideal investigation-task shape.\n\
+\n\
+A proposal that ships an oversize task will be rejected and you will be \
+re-prompted to decompose it, so split it up front.\n\
 \n\
 ## handles\n\
 \n\
@@ -755,6 +869,21 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("file** overlap"));
         assert!(SYSTEM_PROMPT.contains("forward-port the sibling's changes preservingly"));
         assert!(SYSTEM_PROMPT.contains("Parallel throughput stays the default"));
+    }
+
+    /// The decomposition gate's prompt half (design brief deliverable 1): the
+    /// sizing contract must instruct the model to split multi-subsystem /
+    /// multi-phase / fan-out scope and to emit investigation tasks for
+    /// embedded discovery, so breakdowns arrive pre-split.
+    #[test]
+    fn system_prompt_encodes_the_sizing_contract() {
+        assert!(SYSTEM_PROMPT.contains("task sizing contract"));
+        assert!(SYSTEM_PROMPT.contains("single-subsystem, single-PR"));
+        assert!(SYSTEM_PROMPT.contains("project in disguise"));
+        assert!(SYSTEM_PROMPT.contains("Multi-phase scope is several tasks"));
+        assert!(SYSTEM_PROMPT.contains("Embedded fan-out is its own dependent task"));
+        assert!(SYSTEM_PROMPT.contains("INVESTIGATION task"));
+        assert!(SYSTEM_PROMPT.contains("re-prompted to decompose"));
     }
 
     fn response_from(value: Value) -> MessagesResponse {
@@ -1145,6 +1274,163 @@ mod tests {
             other => panic!("expected ApiError, got {other:?}"),
         }
         assert_eq!(outcome.tag(), "api_error");
+    }
+
+    /// A schema-valid tool_use response whose single task is T298-shaped: a
+    /// paragraph of multi-table parsing across sections/slots, an emit step,
+    /// a projected_impact seed, and an all-lists validation sweep, with an
+    /// effort_audit line that literally calls it "a project in disguise". This
+    /// trips the decomposition gate ([`detect_oversize_tasks`]).
+    fn oversize_tool_use_response() -> Value {
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [{
+                        "handle": "national-rolling-points",
+                        "name": "Full national rolling-points PDF detail parse",
+                        "description": "Parse the multi-table PDF across sections and slots, emit the \
+                            event-type slot mapping, seed the projected_impact path, and validate every \
+                            fixture in the all-lists reconciliation sweep.\n\n\
+                            [effort-classification] level=`large` matched-rule=`rule 2` reasons=\"a project in disguise\"",
+                        "kind": "project_task",
+                        "effort": "large",
+                        "ordinal": 0
+                    }],
+                    "edges": [],
+                    "confidence": "high",
+                    "breakdown_found": true,
+                    "notes": "One big task.",
+                    "effort_audit": [
+                        "[effort-classification] level=`large` matched-rule=`rule 2` reasons=\"a project in disguise\""
+                    ]
+                }
+            }]
+        })
+    }
+
+    /// The decomposed answer a re-prompted model returns: an investigation
+    /// task, a parser task, and a validation-sweep task — each well-sized,
+    /// wired with dependency edges. Passes the gate cleanly.
+    fn decomposed_tool_use_response() -> Value {
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [{
+                        "handle": "format-investigation",
+                        "name": "Reverse-engineer the detail-table format",
+                        "description": "Document the closed vocabulary of the detail tables.",
+                        "kind": "investigation",
+                        "effort": "large",
+                        "ordinal": 0
+                    }, {
+                        "handle": "detail-parser",
+                        "name": "Implement the detail-table parser",
+                        "description": "Implement the parser against the documented format.",
+                        "kind": "project_task",
+                        "effort": "medium",
+                        "ordinal": 1
+                    }, {
+                        "handle": "fixture-sweep",
+                        "name": "Add the fixture reconciliation test",
+                        "description": "Add the reconciliation test over the committed fixtures.",
+                        "kind": "project_task",
+                        "effort": "small",
+                        "ordinal": 2
+                    }],
+                    "edges": [
+                        { "dependent": "detail-parser", "prerequisite": "format-investigation" },
+                        { "dependent": "fixture-sweep", "prerequisite": "detail-parser" }
+                    ],
+                    "confidence": "high",
+                    "breakdown_found": true,
+                    "notes": "Split into investigation, parser, and validation.",
+                    "effort_audit": [
+                        "[effort-classification] level=`large` matched-rule=`rule 1 (investigation)` reasons=\"format discovery\"",
+                        "[effort-classification] level=`medium` matched-rule=`rule 6` reasons=\"single-subsystem parser\"",
+                        "[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"one test\""
+                    ]
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn oversize_proposal_triggers_decomposition_reprompt() {
+        // The T298 case end to end: the first tool call ships one monolithic
+        // task; the gate rejects it and re-prompts; the model returns the
+        // decomposed graph, which is staged. The plan visible to the caller
+        // is the split (multiple dependency-ordered tasks), not the monolith.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_tool_use_response()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(decomposed_tool_use_response()))
+            .mount(&server)
+            .await;
+
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        match outcome {
+            PlannerOutcome::Success(out) => {
+                assert_eq!(out.tasks.len(), 3, "the decomposed plan must replace the monolith");
+                assert_eq!(out.edges.len(), 2, "decomposed tasks must be dependency-ordered");
+                assert!(
+                    out.tasks
+                        .iter()
+                        .any(|t| t.kind == boss_protocol::TaskKind::Investigation)
+                );
+            }
+            other => panic!("expected Success with the decomposed plan, got {other:?}"),
+        }
+
+        // Exactly one re-prompt, and it must feed the oversize rejection back
+        // to the model.
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2, "expected exactly one decomposition retry");
+        let retry_body: Value = requests[1].body_json().expect("retry body is JSON");
+        let retry_prompt = retry_body["messages"][0]["content"]
+            .as_str()
+            .expect("retry content is a string");
+        assert!(
+            retry_prompt.contains("REJECTED: OVERSIZE TASK(S)"),
+            "retry prompt must name the decomposition rejection: {retry_prompt}",
+        );
+        assert!(
+            retry_prompt.contains("national-rolling-points"),
+            "retry prompt must name the offending task handle: {retry_prompt}",
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_proposal_accepted_best_effort_after_exhausting_retries() {
+        // If the model keeps returning an oversize task, the run does NOT
+        // fail — the valid (if imperfectly-split) plan is staged best-effort
+        // for operator review, after exactly PLANNER_VALIDATION_ATTEMPTS calls.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_tool_use_response()))
+            .mount(&server)
+            .await;
+
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        assert!(
+            matches!(outcome, PlannerOutcome::Success(_)),
+            "an unsplittable oversize proposal is accepted best-effort, not failed: {outcome:?}",
+        );
+        assert_eq!(
+            server.received_requests().await.expect("requests recorded").len(),
+            PLANNER_VALIDATION_ATTEMPTS as usize,
+            "must stop after exactly PLANNER_VALIDATION_ATTEMPTS calls",
+        );
     }
 
     #[test]

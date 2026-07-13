@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use boss_protocol::{Confidence, PlannerOutput, ProposedEdge};
+use boss_protocol::{Confidence, PlannerOutput, ProposedEdge, ProposedTask};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -220,6 +220,281 @@ fn detect_cycle<'a>(handles: &HashSet<&'a str>, edges: &'a [ProposedEdge]) -> Op
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Oversize-task detection (the decomposition gate)
+// ---------------------------------------------------------------------------
+//
+// See the design brief "Systematic oversized-task detection": T298 ("Full
+// national rolling-points PDF detail parse") ran well over an hour in a
+// single worker session — a multi-table parse across sections/slots plus a
+// projected-impact seed path plus an all-lists validation sweep, shipped as
+// one task. The planner's own effort classification even called it "a
+// project in disguise" and shipped it anyway. Detection must trigger
+// **decomposition**, not just a bigger model.
+//
+// This is a *per-task* sizing check, distinct from the graph-level
+// [`validate`] above: it inspects each [`ProposedTask`]'s scope for signals
+// that the task packs more than one reviewable-PR-per-session unit of work.
+// The Planner ([`crate::planner`]) runs it on its own output and re-prompts
+// for a decomposed graph when it trips (bounded, feedback fed back to the
+// model), so oversize proposals are split before they are ever staged.
+// Like everything else in this module it is a pure, no-I/O function.
+
+/// A substantive scope description (excluding its trailing
+/// `[effort-classification]` audit line) longer than this many characters
+/// is almost always a project in disguise — the brief's "if a breakdown
+/// item needs a paragraph to describe, it is probably several tasks".
+pub const OVERSIZE_DESCRIPTION_CHARS: usize = 600;
+
+/// More than this many distinct *deliverable clauses* in one task's scope
+/// (enumerated sub-parts like `(i)…(ii)…(iii)`, or distinct
+/// deliverable-verbs such as parse/emit/validate/reconcile) means the task
+/// spans multiple phases that should be split with dependency edges.
+pub const OVERSIZE_DELIVERABLE_CLAUSES: usize = 2;
+
+/// A scope naming at least this many distinct engine subsystems / module
+/// surfaces is a multi-subsystem unit that should be decomposed. Two
+/// surfaces is merely `medium` per the effort heuristic; three or more is
+/// the oversize signal.
+pub const OVERSIZE_SUBSYSTEM_COUNT: usize = 3;
+
+/// One reason a [`ProposedTask`] tripped the decomposition gate. Each
+/// variant maps to one of the oversize signals the brief enumerates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OversizeSignal {
+    /// The scope or its classification reason uses project-in-disguise
+    /// language (the effort heuristic's own "a project in disguise").
+    ProjectInDisguise,
+    /// The substantive scope description exceeds [`OVERSIZE_DESCRIPTION_CHARS`].
+    LongDescription,
+    /// The scope enumerates more than [`OVERSIZE_DELIVERABLE_CLAUSES`]
+    /// distinct deliverable clauses (multi-phase scope).
+    MultipleDeliverables,
+    /// The scope names at least [`OVERSIZE_SUBSYSTEM_COUNT`] distinct
+    /// subsystems / module surfaces.
+    MultiSubsystem,
+    /// The scope embeds a fan-out ("validate/sweep/migrate all N X") that
+    /// should be its own dependent task.
+    FanOut,
+}
+
+impl OversizeSignal {
+    /// Short kebab-case label for logs and audit lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            OversizeSignal::ProjectInDisguise => "project-in-disguise",
+            OversizeSignal::LongDescription => "long-description",
+            OversizeSignal::MultipleDeliverables => "multiple-deliverables",
+            OversizeSignal::MultiSubsystem => "multi-subsystem",
+            OversizeSignal::FanOut => "embedded-fan-out",
+        }
+    }
+
+    /// One-line explanation of what the signal means and how to fix it —
+    /// fed back to the model in the decomposition re-prompt.
+    pub fn reason(self) -> &'static str {
+        match self {
+            OversizeSignal::ProjectInDisguise => {
+                "its own classification calls it a project in disguise — split it into dependency-ordered tasks"
+            }
+            OversizeSignal::LongDescription => {
+                "the scope needs a paragraph to describe — if a breakdown item needs a paragraph it is probably several tasks"
+            }
+            OversizeSignal::MultipleDeliverables => {
+                "it enumerates multiple deliverable clauses (parse … and emit … and validate …) — emit each phase as its own task with dependency edges"
+            }
+            OversizeSignal::MultiSubsystem => {
+                "it spans several subsystems — keep each task single-subsystem and single-PR"
+            }
+            OversizeSignal::FanOut => {
+                "it embeds a fan-out (validate/sweep/migrate all N X) — emit that sweep as its own dependent task"
+            }
+        }
+    }
+}
+
+/// One oversize task the decomposition gate rejected, with the signals it
+/// tripped. `handle`/`name` identify the task so the re-prompt can name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversizeFinding {
+    pub handle: String,
+    pub name: String,
+    pub signals: Vec<OversizeSignal>,
+}
+
+impl OversizeFinding {
+    /// Human-readable one-liner naming the task and its tripped signals —
+    /// used verbatim in the re-prompt and in logs.
+    pub fn describe(&self) -> String {
+        let reasons: Vec<&str> = self.signals.iter().map(|s| s.reason()).collect();
+        format!("`{}` ({}): {}", self.name, self.handle, reasons.join("; "))
+    }
+}
+
+/// Distinct engine subsystem / module tokens. Naming three or more of these
+/// in one task's scope is the multi-subsystem oversize signal. Matched as
+/// whole hyphen-aware words so `cli` does not match `client` and
+/// `app-macos` stays one token.
+const SUBSYSTEM_TOKENS: &[&str] = &[
+    "engine",
+    "protocol",
+    "cli",
+    "cube",
+    "bossctl",
+    "materializer",
+    "planner",
+    "populator",
+    "kanban",
+    "app-macos",
+    "macos",
+];
+
+/// Deliverable verbs whose co-occurrence signals a multi-phase task. A task
+/// doing three or more distinct ones of these is packing several
+/// deliverables. Deliberately excludes generic verbs (`add`, `build`,
+/// `wire`) that appear in well-sized single-PR tasks.
+const DELIVERABLE_VERBS: &[&str] = &[
+    "parse",
+    "emit",
+    "validate",
+    "reconcile",
+    "map",
+    "seed",
+    "migrate",
+    "sweep",
+    "instrument",
+    "backfill",
+    "ingest",
+    "attribute",
+    "extract",
+];
+
+/// Case-insensitive fan-out markers: an embedded "validate/sweep/migrate all
+/// N X" that should be lifted out as its own dependent task.
+const FAN_OUT_MARKERS: &[&str] = &[
+    "sweep",
+    "all lists",
+    "all-lists",
+    "across all",
+    "for each",
+    "each of the",
+    "for all",
+    "all of the",
+    "reconcile all",
+    "validate all",
+    "migrate all",
+    "fan-out",
+    "fan out",
+    "every fixture",
+    "all fixtures",
+    "-fixture sweep",
+];
+
+/// Project-in-disguise phrases, drawn from the effort heuristic's own
+/// language (rule 2: "Long scope is almost always a project in disguise").
+const PROJECT_IN_DISGUISE_MARKERS: &[&str] = &["project in disguise", "in disguise"];
+
+/// Scan a whole [`PlannerOutput`] and return one [`OversizeFinding`] per task
+/// that trips the decomposition gate (empty when every task is well-sized).
+///
+/// Pure and side-effect-free. The Planner calls this on its own structured
+/// output and, when it is non-empty, re-prompts the model to decompose the
+/// offending tasks into dependency-ordered, single-subsystem, single-PR
+/// units before the proposal is ever staged.
+pub fn detect_oversize_tasks(output: &PlannerOutput) -> Vec<OversizeFinding> {
+    output
+        .tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, task)| {
+            // The per-task classification line is appended to the
+            // description by the prompt contract, but the aligned
+            // `effort_audit` entry is the canonical copy; fold both into the
+            // haystack so project-in-disguise language is caught wherever it
+            // landed.
+            let audit = output.effort_audit.get(i).map(String::as_str).unwrap_or("");
+            detect_oversize_task(task, audit)
+        })
+        .collect()
+}
+
+/// Detect the oversize signals for a single proposed task. `audit` is the
+/// task's aligned `[effort-classification]` line (may be empty).
+fn detect_oversize_task(task: &ProposedTask, audit: &str) -> Option<OversizeFinding> {
+    let scope = scope_without_audit_line(&task.description);
+    let haystack = format!("{scope}\n{audit}").to_lowercase();
+
+    let mut signals = Vec::new();
+
+    if PROJECT_IN_DISGUISE_MARKERS.iter().any(|m| haystack.contains(m)) {
+        signals.push(OversizeSignal::ProjectInDisguise);
+    }
+    if scope.chars().count() > OVERSIZE_DESCRIPTION_CHARS {
+        signals.push(OversizeSignal::LongDescription);
+    }
+    if deliverable_clause_count(&scope) > OVERSIZE_DELIVERABLE_CLAUSES {
+        signals.push(OversizeSignal::MultipleDeliverables);
+    }
+    if distinct_subsystem_count(&haystack) >= OVERSIZE_SUBSYSTEM_COUNT {
+        signals.push(OversizeSignal::MultiSubsystem);
+    }
+    if FAN_OUT_MARKERS.iter().any(|m| haystack.contains(m)) {
+        signals.push(OversizeSignal::FanOut);
+    }
+
+    if signals.is_empty() {
+        return None;
+    }
+    Some(OversizeFinding {
+        handle: task.handle.clone(),
+        name: task.name.clone(),
+        signals,
+    })
+}
+
+/// Strip a trailing `[effort-classification] …` audit line (and any blank
+/// separator before it) from a task description so the length / clause
+/// checks measure the substantive scope, not the boilerplate audit line the
+/// prompt contract appends.
+fn scope_without_audit_line(description: &str) -> String {
+    match description.find("[effort-classification]") {
+        Some(idx) => description[..idx].trim_end().to_owned(),
+        None => description.trim_end().to_owned(),
+    }
+}
+
+/// Count the distinct deliverable clauses a scope describes. Takes the
+/// larger of two independent estimates: the count of enumerated sub-parts
+/// (`(i)`, `(ii)`, …) and the number of distinct [`DELIVERABLE_VERBS`] used.
+fn deliverable_clause_count(scope: &str) -> usize {
+    let lower = scope.to_lowercase();
+
+    let enumerators = ["(i)", "(ii)", "(iii)", "(iv)", "(v)", "(vi)"]
+        .iter()
+        .filter(|e| lower.contains(**e))
+        .count();
+
+    let words: HashSet<&str> = word_tokens(&lower).collect();
+    let distinct_verbs = DELIVERABLE_VERBS.iter().filter(|v| words.contains(**v)).count();
+
+    enumerators.max(distinct_verbs)
+}
+
+/// Count the distinct [`SUBSYSTEM_TOKENS`] named in `haystack` (already
+/// lowercased). Whole-word, hyphen-aware matching.
+fn distinct_subsystem_count(haystack: &str) -> usize {
+    let words: HashSet<&str> = word_tokens(haystack).collect();
+    SUBSYSTEM_TOKENS.iter().filter(|t| words.contains(**t)).count()
+}
+
+/// Split `text` into lowercase-friendly word tokens: maximal runs of
+/// ASCII-alphanumeric characters plus `-` (so `app-macos` stays one token).
+/// Everything else (whitespace, punctuation) is a separator.
+fn word_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|w| !w.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +737,188 @@ mod tests {
         assert_eq!(
             validate(&out, 2),
             ValidationResult::RejectedTooMany { count: 3, max: 2 }
+        );
+    }
+
+    // ---- Decomposition gate: detect_oversize_tasks -------------------------
+
+    /// Build a proposed task with an explicit description, so sizing tests
+    /// can craft the exact scope prose they need. Effort/kind are irrelevant
+    /// to the gate, which reads only the scope.
+    fn sized_task(handle: &str, description: &str) -> ProposedTask {
+        ProposedTask {
+            handle: handle.to_owned(),
+            name: format!("Task {handle}"),
+            description: description.to_owned(),
+            kind: TaskKind::ProjectTask,
+            effort: EffortLevel::Small,
+            ordinal: 0,
+        }
+    }
+
+    fn output_of(tasks: Vec<ProposedTask>) -> PlannerOutput {
+        output_with(tasks, vec![], Confidence::High, true)
+    }
+
+    #[test]
+    fn well_sized_tasks_produce_no_findings() {
+        // A schema task and a two-subsystem handler task — both the healthy
+        // single-PR shape. Neither trips any signal (two subsystems is
+        // `medium`, not oversize; short scope; one deliverable).
+        let out = output_of(vec![
+            sized_task("schema", "Add the contract types to boss-protocol."),
+            sized_task("handler", "Wire the engine RPC handler against the protocol types."),
+        ]);
+        assert!(
+            detect_oversize_tasks(&out).is_empty(),
+            "well-sized tasks must not trip the decomposition gate",
+        );
+    }
+
+    #[test]
+    fn project_in_disguise_language_trips() {
+        // The T298 tell: the effort classification's own reason. Here it
+        // rides in the aligned effort_audit entry, not the description, to
+        // prove both are scanned.
+        let mut out = output_of(vec![sized_task("t298", "Parse the detail tables.")]);
+        out.effort_audit = vec![
+            "[effort-classification] level=`large` matched-rule=`rule 2` reasons=\"a project in disguise\"".to_owned(),
+        ];
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].signals.contains(&OversizeSignal::ProjectInDisguise));
+    }
+
+    #[test]
+    fn long_paragraph_scope_trips_long_description() {
+        // A paragraph of scope (> OVERSIZE_DESCRIPTION_CHARS) is a project
+        // in disguise per the brief.
+        let long = "word ".repeat(OVERSIZE_DESCRIPTION_CHARS); // ~5x the threshold
+        let out = output_of(vec![sized_task("big", &long)]);
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].signals.contains(&OversizeSignal::LongDescription));
+    }
+
+    #[test]
+    fn multi_deliverable_clauses_trip() {
+        // Parse … and emit … and validate … and reconcile … — four distinct
+        // deliverable verbs, a multi-phase task.
+        let out = output_of(vec![sized_task(
+            "multi",
+            "Parse the tables, emit the slot mapping, validate the fixtures, and reconcile against source.",
+        )]);
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].signals.contains(&OversizeSignal::MultipleDeliverables));
+    }
+
+    #[test]
+    fn enumerated_subparts_trip_multi_deliverable() {
+        // Roman-enumerated sub-parts (i)…(ii)…(iii) count as clauses even
+        // without the deliverable verbs.
+        let out = output_of(vec![sized_task(
+            "phased",
+            "Do the work in phases: (i) the reader, (ii) the writer, and (iii) the checker.",
+        )]);
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].signals.contains(&OversizeSignal::MultipleDeliverables));
+    }
+
+    #[test]
+    fn three_subsystems_trip_multi_subsystem() {
+        // engine + cli + protocol = three surfaces → oversize. (Two would be
+        // merely `medium` and must NOT trip — covered below.)
+        let out = output_of(vec![sized_task(
+            "wide",
+            "Thread the flag through the engine, the cli, and the protocol crate.",
+        )]);
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].signals.contains(&OversizeSignal::MultiSubsystem));
+    }
+
+    #[test]
+    fn two_subsystems_do_not_trip_multi_subsystem() {
+        // engine + protocol is the common `medium` shape — never oversize on
+        // subsystem count alone.
+        let out = output_of(vec![sized_task(
+            "medium",
+            "Add the engine handler for the new protocol message.",
+        )]);
+        let findings = detect_oversize_tasks(&out);
+        assert!(
+            findings.is_empty(),
+            "two subsystems is medium, not oversize: {findings:?}",
+        );
+    }
+
+    #[test]
+    fn subsystem_tokens_match_whole_words_only() {
+        // `cli` must not match `client`; `map` (a deliverable verb) must not
+        // match `mapper`. A scope full of near-miss words stays well-sized.
+        let out = output_of(vec![sized_task(
+            "nearmiss",
+            "The client calls the mapper to render the applied template.",
+        )]);
+        assert!(
+            detect_oversize_tasks(&out).is_empty(),
+            "near-miss substrings must not trip whole-word signals",
+        );
+    }
+
+    #[test]
+    fn fan_out_marker_trips() {
+        // The all-lists sweep — embedded fan-out that should be its own task.
+        let out = output_of(vec![sized_task(
+            "sweep",
+            "Reconcile the parser against the all-lists corpus and run the fixture sweep.",
+        )]);
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].signals.contains(&OversizeSignal::FanOut));
+    }
+
+    #[test]
+    fn only_the_oversize_task_is_flagged_in_a_mixed_proposal() {
+        // A well-sized schema task alongside a T298-shaped monolith: exactly
+        // one finding, naming the offending handle.
+        let out = output_of(vec![
+            sized_task("schema", "Add the contract types."),
+            sized_task(
+                "t298",
+                "Parse the multi-table PDF across sections and slots, emit the event-type slot mapping, \
+                 seed the projected_impact path, and validate every fixture in the all-lists sweep.",
+            ),
+        ]);
+        let findings = detect_oversize_tasks(&out);
+        assert_eq!(findings.len(), 1, "only the oversize task should be flagged");
+        assert_eq!(findings[0].handle, "t298");
+        // Its description names the offending signals for the re-prompt.
+        let described = findings[0].describe();
+        assert!(
+            described.contains("t298"),
+            "describe() must name the handle: {described}"
+        );
+    }
+
+    #[test]
+    fn audit_line_is_excluded_from_the_length_check() {
+        // A short scope whose only length comes from the appended
+        // [effort-classification] line must NOT trip LongDescription — the
+        // audit boilerplate is stripped before measuring.
+        let padding = "x".repeat(OVERSIZE_DESCRIPTION_CHARS);
+        let desc = format!(
+            "Add the schema types.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"{padding}\""
+        );
+        let out = output_of(vec![sized_task("schema", &desc)]);
+        let findings = detect_oversize_tasks(&out);
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.signals.contains(&OversizeSignal::LongDescription)),
+            "the [effort-classification] line must be excluded from the scope-length check: {findings:?}",
         );
     }
 }

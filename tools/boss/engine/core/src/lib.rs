@@ -39,6 +39,7 @@ pub mod dispatch_reader;
 pub mod editorial_hook;
 pub mod effort;
 pub mod engine_control;
+pub mod envelope_watch;
 pub(crate) mod epoch_time;
 pub mod events_socket;
 pub mod execution_liveness;

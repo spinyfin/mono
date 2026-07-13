@@ -2004,6 +2004,12 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("    - a one-paragraph **scope** description.\n");
     out.push_str("    - an **effort hint**: one of `trivial | small | medium | large`.\n");
     out.push_str("    - **explicit dependencies** — which other entries in this list gate this one (use the task names; \"none\" if it can start immediately).\n");
+    out.push_str("  - **size each entry to one reviewable PR by one worker in one session.** This is the granularity scheduling materialises into tasks, so pre-split the work here — an oversize entry forces the scheduler to reject and re-plan it:\n");
+    out.push_str("    - keep each entry single-subsystem and single-PR. Scope that spans several subsystems (engine + cli + protocol + app + …) is several entries with dependency edges, not one.\n");
+    out.push_str("    - multi-phase scope (\"parse (i)… and (ii)… and emit… and validate…\") is several entries — list each phase separately with explicit dependencies, never one entry that does it all.\n");
+    out.push_str("    - sweeps and validation campaigns (\"validate/sweep/migrate all N X\", an all-lists reconciliation, a corpus-wide fixture sweep) are separate dependent entries, listed after the implementation they validate — do not fold them into the implementer.\n");
+    out.push_str("    - unknown-format discovery (study / dump / reverse-engineer / reconcile-against-source) is its own investigation entry, sequenced before the implementation that consumes its findings.\n");
+    out.push_str("    - if an entry needs a paragraph to describe, it is probably several tasks — split it.\n");
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
     out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same file (e.g. a compact-view task and a detail-view task that both edit the same component/container). If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
     out.push_str("  - include items that are deferred or explicitly out of scope, marked as `future / not a v1 blocker` rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected.\n");
@@ -6087,6 +6093,27 @@ mod pane_spawn_tests {
         assert!(
             prompt.contains("the deliverable is a PR URL"),
             "design prompt must keep the PR-URL acceptance criterion:\n{prompt}",
+        );
+
+        // Deliverable 2 — the breakdown sizing contract: the design worker
+        // must be told to pre-split its breakdown to one-PR-per-session
+        // granularity, so breakdowns arrive pre-decomposed and the planner
+        // gate rarely fires.
+        assert!(
+            prompt.contains("size each entry to one reviewable PR by one worker in one session"),
+            "design prompt must carry the one-PR-per-session sizing contract:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("single-subsystem and single-PR"),
+            "design prompt must require single-subsystem, single-PR entries:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("sweeps and validation campaigns"),
+            "design prompt must split sweeps/validation campaigns into separate dependent entries:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("unknown-format discovery"),
+            "design prompt must route unknown-format discovery to its own investigation entry:\n{prompt}",
         );
     }
 
