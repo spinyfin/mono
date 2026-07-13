@@ -16,7 +16,8 @@ use boss_protocol::{
     PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
     ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Table};
@@ -3963,6 +3964,7 @@ async fn run_show_leaf(
     .await?;
     let executions = list_executions_for_item(client, &item.id).await?;
     let runtime = get_task_runtime(client, &item.id).await?;
+    let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
     let task_json = task_json_with_runtime(&item, &runtime)?;
     print_entity(
         ctx,
@@ -3970,9 +3972,11 @@ async fn run_show_leaf(
             label: task_json,
             "dependencies": detail,
             "executions": executions,
+            "attention_items": attention_items,
         }),
         || {
             print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
+            print_attention_items_section(&attention_items);
             print_runtime_section(&runtime);
             print_dependency_section(&detail);
             print_executions_section(&executions);
@@ -7582,6 +7586,49 @@ async fn list_executions_for_item(client: &mut BossClient, work_item_id: &str) -
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("executions list", &other)),
+    }
+}
+
+/// Fetch the open + resolved operational attention items filed against a
+/// work item directly (`work_attention_items.work_item_id`) — e.g. the
+/// `churn_guard_parked` item an orphan-sweep or pr_review-recovery churn
+/// guard trip files when it stops auto-redispatching an `active` item with
+/// no live execution. Distinct from the `boss attention` noun, which covers
+/// the newer agent-authored question/followup store.
+async fn list_attention_items_for_work_item(
+    client: &mut BossClient,
+    work_item_id: &str,
+) -> Result<Vec<WorkAttentionItem>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
+            work_item_id: work_item_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionItemsForWorkItemList { items, .. } => Ok(items),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention items for work item", &other)),
+    }
+}
+
+/// Print the Attention section appended by `boss <kind> show` — the
+/// operator-visible surface for engine-raised operational alerts (see
+/// `list_attention_items_for_work_item`). Only open items are shown;
+/// resolved ones still ride along in the `--json` output but would just be
+/// noise here. Prints nothing when there are none, matching
+/// `print_dependency_section` / `print_executions_section`.
+fn print_attention_items_section(items: &[WorkAttentionItem]) {
+    let open: Vec<&WorkAttentionItem> = items.iter().filter(|item| item.status == "open").collect();
+    if open.is_empty() {
+        return;
+    }
+    println!();
+    println!("Attention ({}):", open.len());
+    for item in &open {
+        println!("  [{}] {} (since {})", item.kind, item.title, item.created_at);
     }
 }
 

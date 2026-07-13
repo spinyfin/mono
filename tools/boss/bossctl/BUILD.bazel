@@ -6,6 +6,7 @@ rust_binary(
     srcs = [
         "src/comments.rs",
         "src/dispatch_stats.rs",
+        "src/hosts.rs",
         "src/logs.rs",
         "src/main.rs",
         "src/review.rs",

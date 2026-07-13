@@ -819,6 +819,28 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Same candidate set as [`Self::count_recent_terminal_executions`]
+    /// but returns the execution ids themselves (most recent first) so a
+    /// churn-guard trip can point the operator at the specific failing
+    /// runs instead of just a count. See
+    /// [`Self::file_churn_guard_parked_attention`].
+    pub fn list_recent_terminal_execution_ids(&self, work_item_id: &str, since_epoch_secs: i64) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+              WHERE work_item_id = ?1
+                AND status IN ('orphaned', 'abandoned', 'failed')
+                AND CAST(created_at AS INTEGER) >= ?2
+              ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![work_item_id, since_epoch_secs], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         if let Some(work_item_id) = work_item_id {

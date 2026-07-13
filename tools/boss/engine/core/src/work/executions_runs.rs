@@ -1591,6 +1591,24 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Rewrite `created_at` on every terminal execution for a work item to
+    /// the given epoch. Lets a test simulate the churn guard's trailing
+    /// window draining (a real re-check would just wait for wall-clock time
+    /// to pass) by moving previously-recent terminal executions outside the
+    /// window deterministically.
+    #[cfg(test)]
+    pub fn backdate_terminal_executions_for_test(&self, work_item_id: &str, created_at_epoch: i64) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions
+                SET created_at = ?2
+              WHERE work_item_id = ?1
+                AND status IN ('orphaned', 'abandoned', 'failed')",
+            params![work_item_id, created_at_epoch.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Mark a task `done` without running `cascade_dependents_after_prereq_status_change`.
     /// Used in tests that need to simulate the engine being offline when a
     /// prereq transitions, so the sweeper can be exercised as the recovery path.

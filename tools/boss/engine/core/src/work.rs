@@ -43,6 +43,18 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
 /// go live; the 4th trips the guard.
 pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 
+/// `work_attention_items.kind` filed when [`crate::orphan_sweep`] or
+/// [`crate::pr_review_recovery`] trips the churn guard above and parks a
+/// work item instead of auto-redispatching it. Before this existed the
+/// trip was only a `tracing::warn!` in the engine trace — the work item
+/// stayed `active` with no live execution and nothing in `boss task show`,
+/// `bossctl agents status`, or the kanban card said why. Resolved
+/// automatically the next time [`WorkDb::request_execution_with_live_check`]
+/// is called for the work item (either the sweep succeeding once the
+/// trailing window drains, or an operator running `bossctl work start`,
+/// which bypasses the guard entirely since it only lives in the sweeps).
+pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
+
 /// Attention-item `kind` raised when the engine stops auto-resuming a
 /// worker because its Claude API error is non-retryable (permanent or
 /// unrecognised). See [`crate::transient_recovery`].
