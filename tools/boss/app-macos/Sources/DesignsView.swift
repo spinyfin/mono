@@ -564,8 +564,8 @@ private struct MarkdownViewerScrollContent: View {
                         // A monotonic counter is used instead of a hashValue-based key to avoid
                         // hash collisions and guarantee a new identity on every comment/search update.
                         .id(parseVersion)
-                        .onChange(of: commentedAnchors) { _, _ in parseVersion &+= 1 }
-                        .onChange(of: commentFlashAnchor) { _, _ in parseVersion &+= 1 }
+                        .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
+                        .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
                         .background(
                             GeometryReader { geo in
                                 Color.clear.preference(
@@ -629,6 +629,24 @@ private struct MarkdownViewerScrollContent: View {
             }
             .frame(width: 0, height: 0)
             .hidden()
+        }
+    }
+
+    /// Bumps `parseVersion` (forcing `StructuredText` to remount with a
+    /// fresh `HighlightingMarkdownParser`) while preserving the scroll
+    /// position across the remount. AppKit resets a `NSScrollView`'s
+    /// document offset to the top when its document view's content is torn
+    /// down and rebuilt, which is exactly what SwiftUI does under the hood
+    /// for an `.id()` change — so a comment add/remove/flash would
+    /// otherwise silently scroll the reader back to the top of the
+    /// document. The offset is captured before the remount and reapplied
+    /// on the next run loop turn, once the new content has been laid out.
+    private func bumpParseVersionPreservingScroll() {
+        let offset = scrollController.currentOffset()
+        parseVersion &+= 1
+        guard let offset else { return }
+        DispatchQueue.main.async {
+            scrollController.restoreOffset(offset)
         }
     }
 
