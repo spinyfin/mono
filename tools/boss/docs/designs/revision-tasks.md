@@ -133,7 +133,12 @@ boss task create-revision \
                                   # and rendered on the Review-lane affordance,
                                   # so keep it short.
     [--priority <p>]              # defaults to parent's priority
-    [--effort <level>]            # defaults to 'small' (Q7); escalatable
+    [--effort <level>]            # defaults to 'small' (Q7); 'large' when the
+                                  # chain root is design-family (design/
+                                  # investigation, transitively through a
+                                  # revision chain) — see the design-family
+                                  # Fable-tier dispatch floor policy addendum
+                                  # (2026-07-13); escalatable
     [--model <slug>]              # optional model override
     [--force-duplicate]           # same dedup-bypass flag as other creates
 ```
@@ -444,7 +449,8 @@ pub struct CreateRevisionInput {
     pub parent_task_id: String,          // resolved from --parent selector
     pub description: String,             // the ask; rendered on Review rollup
     pub priority: Option<String>,        // defaults to parent's
-    pub effort_level: Option<EffortLevel>, // defaults to 'small' (Q7)
+    pub effort_level: Option<EffortLevel>, // defaults to 'small' (Q7), or 'large'
+                                            // for a design-family chain root
     pub model_override: Option<String>,
     pub force_duplicate: bool,
     pub created_via: Option<String>,     // "operator" (A) or
