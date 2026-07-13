@@ -40,22 +40,16 @@ fn candidate(product_id: &str, work_item_id: &str, pr_url: &str) -> PendingMerge
 }
 
 fn probe(pr_url: &str, state: PrLifecycleState) -> PrLifecycleProbe {
-    PrLifecycleProbe {
-        url: pr_url.to_owned(),
-        state,
-        base_ref_oid: Some("abc123".into()),
-        head_ref_oid: Some("head456".into()),
-        head_ref_name: Some("feature".into()),
-        base_ref_name: Some("main".into()),
-        labels: Vec::new(),
-        review: crate::merge_poller::PrReviewState::Unknown,
-        in_merge_queue: false,
-        merge_queue_entry_state: None,
-        merge_queue_position: None,
-        merge_queue_enqueued_at: None,
-        raw_mergeable: String::new(),
-        raw_merge_state_status: String::new(),
-    }
+    PrLifecycleProbe::builder()
+        .url(pr_url.to_owned())
+        .state(state)
+        .base_ref_oid("abc123")
+        .head_ref_oid("head456")
+        .head_ref_name("feature")
+        .base_ref_name("main")
+        .labels(Vec::new())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .build()
 }
 
 /// A `PrStateChecker` that reports every PR as `Open`, so the
@@ -67,22 +61,16 @@ fn open_checker() -> crate::work::FakePrStateChecker {
 }
 
 fn probe_with_labels(pr_url: &str, state: PrLifecycleState, labels: &[&str]) -> PrLifecycleProbe {
-    PrLifecycleProbe {
-        url: pr_url.to_owned(),
-        state,
-        base_ref_oid: Some("abc123".into()),
-        head_ref_oid: Some("head456".into()),
-        head_ref_name: Some("feature".into()),
-        base_ref_name: Some("main".into()),
-        labels: labels.iter().map(|s| (*s).to_owned()).collect(),
-        review: crate::merge_poller::PrReviewState::Unknown,
-        in_merge_queue: false,
-        merge_queue_entry_state: None,
-        merge_queue_position: None,
-        merge_queue_enqueued_at: None,
-        raw_mergeable: String::new(),
-        raw_merge_state_status: String::new(),
-    }
+    PrLifecycleProbe::builder()
+        .url(pr_url.to_owned())
+        .state(state)
+        .base_ref_oid("abc123")
+        .head_ref_oid("head456")
+        .head_ref_name("feature")
+        .base_ref_name("main")
+        .labels(labels.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .build()
 }
 
 /// New-model acceptance: when a revision fix vehicle is successfully spawned,
