@@ -39,8 +39,8 @@ use crate::protocol::{
 use crate::repo_slug;
 use crate::work::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
-    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ReviseDocOutcome, SetRunTranscriptPathOutcome,
-    THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
+    SetRunTranscriptPathOutcome, THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -2855,6 +2855,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,
             r @ FrontendRequest::ReapRun { .. } => executions::handle_reap_run(ctx, r).await,
             r @ FrontendRequest::RecordEffortEscalation { .. } => effort::handle_record_effort_escalation(ctx, r).await,
+            r @ FrontendRequest::RecordProducerSideConflict { .. } => {
+                conflict_resolution::handle_record_producer_side_conflict(ctx, r).await
+            }
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
             r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
             r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,

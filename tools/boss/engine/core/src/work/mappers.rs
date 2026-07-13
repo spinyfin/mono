@@ -509,18 +509,29 @@ pub(crate) fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<Conflic
         started_at: row.get(17)?,
         finished_at: row.get(18)?,
         revision_task_id: row.get(19)?,
+        event_source: row.get(20)?,
+        conflict_class: row.get(21)?,
+        resolved_by_rung: row.get(22)?,
     })
 }
 
-pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<Option<ConflictResolution>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+/// Canonical `conflict_resolutions` column list, in the order every
+/// mapper/query in this module expects. Centralised so the growing
+/// telemetry tail (`event_source`, `conflict_class`, `resolved_by_rung`)
+/// only needs updating in one place.
+pub(crate) const CONFLICT_RESOLUTION_COLUMNS: &str =
+    "id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
                 base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
                 cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                created_at, started_at, finished_at, revision_task_id
+                created_at, started_at, finished_at, revision_task_id,
+                event_source, conflict_class, resolved_by_rung";
+
+pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<Option<ConflictResolution>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CONFLICT_RESOLUTION_COLUMNS}
          FROM conflict_resolutions
          WHERE id = ?1",
-    )?;
+    ))?;
     let row = stmt.query_row([id], map_conflict_resolution).optional()?;
     Ok(row)
 }
@@ -541,6 +552,24 @@ pub struct ConflictResolutionInsertInput {
     pub base_branch: String,
     pub base_sha_at_trigger: Option<String>,
     pub head_sha_before: Option<String>,
+}
+
+/// Pre-insert payload for [`WorkDb::record_producer_side_conflict`] —
+/// the Layer 0 telemetry surface for the producer-side blind spot
+/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
+/// T1). Supplied by a normal worker's `boss engine conflicts
+/// record-producer` call after its own `cube workspace rebase`
+/// reported `REBASED_WITH_CONFLICTS` and it resolved the conflict
+/// inline. `product_id` / `work_item_id` / any existing `pr_url` are
+/// resolved engine-side from `execution_id` — the worker doesn't need
+/// to know them.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ProducerConflictInsertInput {
+    pub execution_id: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub conflicted_files: Vec<String>,
 }
 
 /// Pre-insert payload for [`WorkDb::insert_ci_remediation`]. Mirrors

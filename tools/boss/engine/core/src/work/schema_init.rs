@@ -455,8 +455,16 @@ impl WorkDb {
         // position, GitHub's raw entry state, enqueued-at timestamp) for the
         // Review card's merging indicator (T2467/mono#1904).
         migrate_tasks_merge_queue_detail_column(&conn)?;
+        // Layer 0 conflict telemetry (T1 of
+        // merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md):
+        // conflict_resolutions.event_source / conflict_class /
+        // resolved_by_rung, so producer-side conflicts (a normal
+        // worker's own `cube workspace rebase` hitting
+        // `REBASED_WITH_CONFLICTS`) and per-rung outcomes are captured,
+        // not just in-review `conflict_watch` detections.
+        migrate_conflict_resolutions_telemetry_columns(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '24')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '25')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

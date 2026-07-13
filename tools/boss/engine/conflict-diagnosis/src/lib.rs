@@ -37,6 +37,9 @@ use std::process::Output;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+mod classify;
+pub use classify::classify_conflict_class;
+
 /// Structured pre-spawn conflict-diagnosis blob. Wire-encoded as JSON
 /// and stored in `conflict_resolutions.conflict_diagnosis`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

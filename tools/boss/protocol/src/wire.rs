@@ -1239,6 +1239,26 @@ pub enum FrontendRequest {
         rule_id: Option<String>,
     },
 
+    /// Worker-facing telemetry surface closing the producer-side
+    /// blind spot in `conflict_resolutions`
+    /// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
+    /// T1): a normal (non-conflict-resolution) worker's own `cube
+    /// workspace rebase` reported `REBASED_WITH_CONFLICTS` mid-task —
+    /// resolved inline and never surfaced to `conflict_watch`. The CLI
+    /// surface is `boss engine conflicts record-producer`. The engine
+    /// resolves `product_id` / `work_item_id` / any existing `pr_url`
+    /// from `execution_id`; the row is inserted already terminal
+    /// (`status = 'succeeded'`, `event_source = 'producer_rebase'`) —
+    /// by the time a worker calls this it has already resolved the
+    /// conflict, so there is no separate pending/running lifecycle to
+    /// track. Replies with [`FrontendEvent::ConflictResolution`].
+    RecordProducerSideConflict {
+        execution_id: String,
+        head_branch: String,
+        base_branch: String,
+        conflicted_files: Vec<String>,
+    },
+
     /// App self-identifies as the singleton app session. The engine
     /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
     /// engine's parent). After registration, `EngineRequest` events

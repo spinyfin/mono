@@ -1382,6 +1382,14 @@ enum EngineConflictsCommand {
     /// product decision required, architectural mismatch) and chooses
     /// not to push.
     MarkFailed(EngineConflictsMarkFailedArgs),
+    /// Record a producer-side conflict for telemetry: your own `cube
+    /// workspace rebase` reported `REBASED_WITH_CONFLICTS` mid-task
+    /// (not as part of a dedicated conflict-resolution revision) and
+    /// you resolved it inline. Call this AFTER resolving, so the
+    /// engine's telemetry sees conflicts that never reach the
+    /// in-review `conflict_watch` path. Best-effort — this never
+    /// blocks or reverts your actual work.
+    RecordProducer(EngineConflictsRecordProducerArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1443,6 +1451,31 @@ struct EngineConflictsMarkFailedArgs {
     /// stores it verbatim on the attempt row.
     #[arg(long)]
     reason: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsRecordProducerArgs {
+    /// Your own execution id (given to you at spawn time as
+    /// `execution id` in the task briefing). The engine resolves
+    /// `product_id` / `work_item_id` / any already-open PR from this.
+    #[arg(long = "execution-id")]
+    execution_id: String,
+
+    /// The `boss/exec_*` branch `cube workspace rebase` reported (its
+    /// `branch` field).
+    #[arg(long = "head-branch")]
+    head_branch: String,
+
+    /// The integration branch `cube workspace rebase` reported (its
+    /// `main_branch` field), e.g. `main`.
+    #[arg(long = "base-branch")]
+    base_branch: String,
+
+    /// Comma-separated conflicted file paths, e.g. from `jj resolve
+    /// --list` or the `conflicted_files` field `cube workspace
+    /// rebase` printed.
+    #[arg(long, value_delimiter = ',')]
+    files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -5995,6 +6028,36 @@ async fn run_engine_conflicts_command(command: EngineConflictsCommand, ctx: &Run
                     Err(CliError::application(message))
                 }
                 other => Err(unexpected_event("conflicts mark-failed", &other)),
+            }
+        }
+        EngineConflictsCommand::RecordProducer(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::RecordProducerSideConflict {
+                    execution_id: args.execution_id.clone(),
+                    head_branch: args.head_branch.clone(),
+                    base_branch: args.base_branch.clone(),
+                    conflicted_files: args.files.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictResolution { attempt } => {
+                    print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
+                        if !ctx.quiet {
+                            println!(
+                                "Producer-side conflict recorded ({}) for telemetry — {} file(s), class={}.",
+                                attempt.id,
+                                args.files.len(),
+                                attempt.conflict_class.as_deref().unwrap_or("unknown"),
+                            );
+                        }
+                    })
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts record-producer", &other)),
             }
         }
     }

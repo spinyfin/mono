@@ -1,5 +1,14 @@
 use super::*;
 
+/// The only escalation-ladder rung that exists today (design's rung 3,
+/// "Full worker — unchanged fallback"). Rungs 0-2 (deterministic
+/// resolvers, engine-direct mechanical rebase, the small pre-staged
+/// agent) are designed but not yet built (T2/T4/T6 of
+/// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`);
+/// until they ship, every conflict this engine records was resolved by
+/// a full worker doing the whole job by hand.
+const RUNG_FULL_WORKER: i64 = 3;
+
 impl WorkDb {
     /// Read the unified auto-maintenance opt-out flag for a product.
     /// Defaults to `true` when the column is unset or the product row
@@ -163,16 +172,13 @@ impl WorkDb {
     /// work item.
     pub fn latest_conflict_resolution_for_work_item(&self, work_item_id: &str) -> Result<Option<ConflictResolution>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
-                    base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
-                    cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                    created_at, started_at, finished_at, revision_task_id
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CONFLICT_RESOLUTION_COLUMNS}
              FROM conflict_resolutions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
-        )?;
+        ))?;
         let mut rows = stmt.query_map([work_item_id], map_conflict_resolution)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -186,17 +192,14 @@ impl WorkDb {
     /// embed the diagnosis from.
     pub fn active_conflict_resolution_for_work_item(&self, work_item_id: &str) -> Result<Option<ConflictResolution>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
-                    base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
-                    cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                    created_at, started_at, finished_at, revision_task_id
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CONFLICT_RESOLUTION_COLUMNS}
              FROM conflict_resolutions
              WHERE work_item_id = ?1
                AND status IN ('pending', 'running')
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
-        )?;
+        ))?;
         let mut rows = stmt.query_map([work_item_id], map_conflict_resolution)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -204,9 +207,15 @@ impl WorkDb {
         }
     }
 
-    /// Store the engine-collected diagnosis JSON on a pending attempt.
-    /// Idempotent — calling twice overwrites. Returns the updated row;
-    /// `Ok(None)` when the id is missing.
+    /// Store the engine-collected diagnosis JSON on a pending attempt,
+    /// and derive `conflict_class` (Layer 0 telemetry) from the
+    /// diagnosis's conflicted-file paths in the same update. A
+    /// diagnosis that fails to parse (the `error` path in
+    /// `ConflictDiagnosis`) leaves `conflict_class` untouched rather
+    /// than failing the whole write — the diagnosis JSON is still
+    /// useful even when it can't be classified. Idempotent — calling
+    /// twice overwrites. Returns the updated row; `Ok(None)` when the
+    /// id is missing.
     pub fn set_conflict_resolution_diagnosis(
         &self,
         attempt_id: &str,
@@ -214,11 +223,18 @@ impl WorkDb {
     ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let conflict_class = serde_json::from_str::<crate::conflict_diagnosis::ConflictDiagnosis>(diagnosis_json)
+            .ok()
+            .map(|diagnosis| {
+                let paths: Vec<String> = diagnosis.files.into_iter().map(|f| f.path).collect();
+                crate::conflict_diagnosis::classify_conflict_class(&paths).to_owned()
+            });
         let rows = tx.execute(
             "UPDATE conflict_resolutions
-                SET conflict_diagnosis = ?2
+                SET conflict_diagnosis = ?2,
+                    conflict_class     = COALESCE(?3, conflict_class)
               WHERE id = ?1",
-            params![attempt_id, diagnosis_json],
+            params![attempt_id, diagnosis_json, conflict_class],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -323,12 +339,13 @@ impl WorkDb {
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
-                SET status         = 'succeeded',
-                    head_sha_after = COALESCE(?2, head_sha_after),
-                    finished_at    = COALESCE(finished_at, ?3)
+                SET status           = 'succeeded',
+                    head_sha_after   = COALESCE(?2, head_sha_after),
+                    finished_at      = COALESCE(finished_at, ?3),
+                    resolved_by_rung = COALESCE(resolved_by_rung, ?4)
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
-            params![attempt_id, head_sha_after, now],
+            params![attempt_id, head_sha_after, now, RUNG_FULL_WORKER],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -407,13 +424,7 @@ impl WorkDb {
         limit: Option<u32>,
     ) -> Result<Vec<ConflictResolution>> {
         let conn = self.connect()?;
-        let mut sql = String::from(
-            "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
-                    base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
-                    cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                    created_at, started_at, finished_at, revision_task_id
-             FROM conflict_resolutions WHERE 1=1",
-        );
+        let mut sql = format!("SELECT {CONFLICT_RESOLUTION_COLUMNS} FROM conflict_resolutions WHERE 1=1");
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(pid) = product_id {
             sql.push_str(" AND product_id = ?");
@@ -519,5 +530,93 @@ impl WorkDb {
         )?;
         tx.commit()?;
         Ok(Some(reset))
+    }
+
+    /// Record a producer-side conflict event: a normal worker's own
+    /// `cube workspace rebase` reported `REBASED_WITH_CONFLICTS`
+    /// mid-task and it resolved the conflict inline, without ever
+    /// going through `conflict_watch` (Layer 0 / T1 of
+    /// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
+    /// — previously the largest source of telemetry undercount).
+    /// `product_id`, `work_item_id`, and any already-open PR are
+    /// resolved from `input.execution_id` so the calling worker only
+    /// needs to supply what it directly observed from `cube workspace
+    /// rebase`'s own output. The row is inserted already terminal
+    /// (`status = 'succeeded'`) — by the time a worker calls this it
+    /// has already resolved the conflict, so there is no separate
+    /// pending/running lifecycle to track. `pr_url`/`pr_number` fall
+    /// back to the empty-string/`0` sentinel when the task has not
+    /// opened a PR yet — exactly the blind spot named in the design's
+    /// evidence ("conflicts a producing worker resolves before
+    /// opening its PR").
+    pub fn record_producer_side_conflict(&self, input: ProducerConflictInsertInput) -> Result<ConflictResolution> {
+        let execution = self.get_execution(&input.execution_id)?;
+        let work_item = self.get_work_item(&execution.work_item_id)?;
+        let (product_id, existing_pr_url) = match work_item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => (t.product_id, t.pr_url),
+            other => bail!(
+                "execution {} work item {} is a {}, not a task/chore",
+                input.execution_id,
+                execution.work_item_id,
+                other.primary_id(),
+            ),
+        };
+        let pr_url = execution.pr_url.or(existing_pr_url).unwrap_or_default();
+        let pr_number = boss_github::pr_url::pr_number_from_url(&pr_url)
+            .map(|n| n as i64)
+            .unwrap_or(0);
+
+        let diagnosis = crate::conflict_diagnosis::ConflictDiagnosis {
+            schema_version: 1,
+            base_sha: "unknown".to_owned(),
+            head_sha: "unknown".to_owned(),
+            files: input
+                .conflicted_files
+                .iter()
+                .map(|path| crate::conflict_diagnosis::ConflictedFile {
+                    path: path.clone(),
+                    marker_count: None,
+                    shape: "content".to_owned(),
+                })
+                .collect(),
+            error: None,
+        };
+        let conflict_class = crate::conflict_diagnosis::classify_conflict_class(&input.conflicted_files);
+        let diagnosis_json =
+            serde_json::to_string(&diagnosis).context("failed to serialize producer-side conflict diagnosis")?;
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let id = next_id("crz");
+        let now = now_string();
+        tx.execute(
+            "INSERT INTO conflict_resolutions
+                (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                 status, cube_lease_id, cube_workspace_id, conflict_diagnosis,
+                 created_at, started_at, finished_at, event_source, conflict_class, resolved_by_rung)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'succeeded', ?8, ?9, ?10,
+                     ?11, ?12, ?13, 'producer_rebase', ?14, ?15)",
+            params![
+                id,
+                product_id,
+                execution.work_item_id,
+                pr_url,
+                pr_number,
+                input.head_branch,
+                input.base_branch,
+                execution.cube_lease_id,
+                execution.cube_workspace_id,
+                diagnosis_json,
+                now,
+                now,
+                now,
+                conflict_class,
+                RUNG_FULL_WORKER,
+            ],
+        )?;
+        let inserted = query_conflict_resolution(&tx, &id)?
+            .with_context(|| format!("unknown conflict_resolution after producer-side insert: {id}"))?;
+        tx.commit()?;
+        Ok(inserted)
     }
 }

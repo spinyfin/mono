@@ -382,6 +382,25 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha\n\
          ```\n\
          \n\
+         ## Merge-conflict telemetry\n\
+         \n\
+         If you ever run `cube workspace rebase` mid-task (e.g. to sync with\n\
+         `main` before pushing, or because a push was rejected) and it reports\n\
+         `REBASED_WITH_CONFLICTS`, resolve the conflicts as normal, then\n\
+         AFTER resolving run:\n\
+         \n\
+         ```sh\n\
+         boss engine conflicts record-producer --execution-id <your execution id> \\\n\
+           --head-branch <branch> --base-branch <main_branch> --files <comma-separated conflicted paths>\n\
+         ```\n\
+         \n\
+         using the `branch`, `main_branch`, and conflicted-file list `cube\n\
+         workspace rebase` printed (or `jj resolve --list` if you need it\n\
+         again). This is telemetry only — best-effort, never blocks or\n\
+         reverts your actual work — but it is the only way the engine learns\n\
+         about conflicts you resolve on your own, before they'd ever reach\n\
+         the reviewed in-PR conflict-resolution flow.\n\
+         \n\
          ## Reuse before you build\n\
          \n\
          Before implementing any cross-cutting capability (an API/HTTP client,\n\
