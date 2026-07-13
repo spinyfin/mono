@@ -2,10 +2,14 @@
 //!
 //! When a `kind=design` task's worker opens a PR, or that PR merges,
 //! the engine scans the PR's changed files for a single markdown file
-//! under any product's `docs/designs/` directory (e.g.
-//! `tools/boss/docs/designs/` or `tools/checkleft/docs/designs/`). If
-//! exactly one match is found, it becomes the project's design-doc pointer.
-//! Zero matches or multiple matches skip auto-population with a logged warning.
+//! under any product's `docs/designs/` OR `docs/design-docs/` directory
+//! (e.g. `tools/boss/docs/designs/`, `tools/checkleft/docs/designs/`, or
+//! flunge's `docs/design-docs/` — repos vary in which of the two directory
+//! names they use for the same convention, and both are treated as
+//! equivalent). If exactly one match is found, it becomes the project's
+//! design-doc pointer. Zero matches or multiple matches skip
+//! auto-population with a logged warning and an operator-visible
+//! `[doc-detector]` line appended to the task's description.
 //!
 //! Two entry points, called from their respective trigger modules:
 //!
@@ -44,8 +48,8 @@ pub(crate) struct PrScanResult {
 /// when the work item is `kind=design` with a `project_id`.
 ///
 /// Scans the PR's changed files for a design-doc markdown file under any
-/// product's `docs/designs/` directory. On a single match, populates (or updates)
-/// the project's design-doc pointer using the PR's **head** branch so
+/// product's `docs/designs/` or `docs/design-docs/` directory. On a single
+/// match, populates (or updates) the project's design-doc pointer using the PR's **head** branch so
 /// the in-app viewer can fetch the doc from the PR branch while the PR
 /// is still open. The `raw_content_url` builder percent-encodes `/` as
 /// `%2F` in `?ref=` so slashed branch names like `boss/exec_*` round-trip
@@ -62,6 +66,25 @@ pub async fn on_design_pr_detected(work_db: &WorkDb, task_id: &str, product_id: 
     };
     let Some(path) = scan.doc_path else {
         // doc_path could not be determined (zero or ambiguous matches in the PR).
+        // The underlying WARN is trace-only, so append an operator-visible
+        // note to the task's description (same mechanism as the
+        // `[engine-reconcile]` audit lines) — otherwise this class of miss
+        // is invisible outside engine logs.
+        if let Err(err) = crate::reconcile_audit::append_description_line(
+            work_db,
+            task_id,
+            "\n[doc-detector] no design-doc pointer auto-populated for this PR — zero or ambiguous \
+             docs/designs/*.md or docs/design-docs/*.md matches among the changed files. Add/rename \
+             the doc file and re-push, or set the pointer manually with `boss project set-design-doc`.",
+        ) {
+            tracing::warn!(
+                task_id,
+                project_id,
+                pr_url,
+                ?err,
+                "design detector: failed to append doc-detector miss note to task description"
+            );
+        }
         // Still update design_doc_branch to the PR head branch so the in-app
         // viewer fetches from the live PR branch while it is open — provided
         // the project already has a path set. set_project_design_doc with
@@ -337,18 +360,38 @@ pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool
 /// Per-task analogue of [`on_design_pr_detected`] for project-less
 /// docs-backed items (investigations). Fired on the `in_review`
 /// transition. Scans the PR's changed files for a single
-/// `docs/designs/*.md` or `docs/investigations/*.md` and populates the
-/// task's own `doc_*` columns (or, when already set, updates `doc_branch`
-/// to the PR **head** branch so the in-app viewer can fetch the doc while
-/// the PR is open).
+/// `docs/designs/*.md`, `docs/design-docs/*.md`, or
+/// `docs/investigations/*.md` and populates the task's own `doc_*`
+/// columns (or, when already set, updates `doc_branch` to the PR
+/// **head** branch so the in-app viewer can fetch the doc while the PR
+/// is open).
 pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str) {
     let scan = match scan_pr_for_task_doc(task_id, pr_url).await {
         Some(s) => s,
         None => return,
     };
     let Some(path) = scan.doc_path else {
-        // doc_path could not be determined. Still update doc_branch to the PR
-        // head so the viewer fetches from the live branch while the PR is open.
+        // doc_path could not be determined. The underlying WARN is
+        // trace-only, so append an operator-visible note to the task's
+        // description (same mechanism as the `[engine-reconcile]` audit
+        // lines).
+        if let Err(err) = crate::reconcile_audit::append_description_line(
+            work_db,
+            task_id,
+            "\n[doc-detector] no doc pointer auto-populated for this PR — zero or ambiguous \
+             docs/designs/*.md, docs/design-docs/*.md, or docs/investigations/*.md matches among \
+             the changed files. Add/rename the doc file and re-push.",
+        ) {
+            tracing::warn!(
+                task_id,
+                product_id,
+                pr_url,
+                ?err,
+                "doc detector: failed to append doc-detector miss note to task description"
+            );
+        }
+        // Still update doc_branch to the PR head so the viewer fetches from
+        // the live branch while the PR is open.
         if let Some(head_branch) = scan.head_ref_name {
             match work_db.set_task_doc_pointer(task_id, None, Some(&head_branch), None) {
                 Ok(_) => tracing::debug!(
@@ -555,7 +598,7 @@ pub(crate) async fn scan_pr_for_task_doc(task_id: &str, pr_url: &str) -> Option<
         Ok(root) => Some(parse_pr_scan_matching(
             &root,
             is_project_less_doc_path,
-            "docs/designs/*.md or docs/investigations/*.md",
+            "docs/designs/*.md, docs/design-docs/*.md, or docs/investigations/*.md",
         )),
         Err(err) => {
             tracing::warn!(task_id, pr_url, ?err, "doc detector: failed to scan PR files");
@@ -601,7 +644,7 @@ async fn fetch_pr_view_json(pr_url: &str) -> Result<serde_json::Value> {
 ///   [`is_design_doc_path`]). Zero or multiple matches yield `None`. A
 ///   missing or non-array `files` key is treated as zero matches.
 pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
-    parse_pr_scan_matching(root, is_design_doc_path, "docs/designs/*.md")
+    parse_pr_scan_matching(root, is_design_doc_path, "docs/designs/*.md or docs/design-docs/*.md")
 }
 
 /// Generic core of [`parse_pr_scan`]: extract the head/base ref names and
@@ -728,9 +771,13 @@ fn is_doc_path_under(path: &str, segment: &str) -> bool {
     !rest.contains('/') && (rest.ends_with(".md") || rest.ends_with(".markdown"))
 }
 
-/// Direct-child markdown under any `docs/designs/` directory.
+/// Direct-child markdown under any `docs/designs/` or `docs/design-docs/`
+/// directory. Repos vary in which of the two directory names they use for
+/// their design-doc convention — e.g. `tools/boss` and `tools/checkleft`
+/// use `docs/designs/`, while flunge uses `docs/design-docs/` — so both
+/// are treated as the same logical design-doc location.
 fn is_design_doc_path(path: &str) -> bool {
-    is_doc_path_under(path, "designs")
+    is_doc_path_under(path, "designs") || is_doc_path_under(path, "design-docs")
 }
 
 /// Direct-child markdown under any `docs/investigations/` directory —
@@ -769,11 +816,24 @@ mod tests {
         assert!(is_design_doc_path("docs/designs/top-level.md"));
     }
 
+    /// T285/P284 regression: flunge's repo convention is `docs/design-docs/`,
+    /// not `docs/designs/`. Both directory names must resolve to the same
+    /// logical design-doc location.
+    #[test]
+    fn design_doc_path_matches_design_docs_convention() {
+        assert!(is_design_doc_path(
+            "docs/design-docs/plan-recommendations-full-usefulness-pass.md"
+        ));
+        assert!(is_design_doc_path("tools/flunge/docs/design-docs/flunge-auth.md"));
+        assert!(is_design_doc_path("docs/design-docs/x.markdown"));
+    }
+
     #[test]
     fn design_doc_path_rejects_subdirectory() {
-        // Only direct children of designs/ are matched.
+        // Only direct children of designs/ (or design-docs/) are matched.
         assert!(!is_design_doc_path("tools/boss/docs/designs/sub/doc.md"));
         assert!(!is_design_doc_path("tools/checkleft/docs/designs/sub/doc.md"));
+        assert!(!is_design_doc_path("docs/design-docs/sub/doc.md"));
     }
 
     #[test]
@@ -790,6 +850,7 @@ mod tests {
         assert!(!is_design_doc_path("tools/boss/docs/designs/doc.txt"));
         assert!(!is_design_doc_path("tools/boss/docs/designs/doc.rs"));
         assert!(!is_design_doc_path("tools/checkleft/docs/designs/doc.txt"));
+        assert!(!is_design_doc_path("docs/design-docs/doc.txt"));
     }
 
     /// Build a `files` array value from a list of paths, shaped like
@@ -834,6 +895,36 @@ mod tests {
         });
         let scan = parse_pr_scan(&root);
         assert_eq!(scan.doc_path, None);
+    }
+
+    /// T285/P284 regression: the exact PR #794 changed-files shape — a
+    /// flunge design PR using the repo's `docs/design-docs/` convention
+    /// (not `docs/designs/`). Before this fix, `is_design_doc_path` never
+    /// matched any of these paths, so the pointer was silently never
+    /// populated no matter how the ADDED/MODIFIED disambiguation ran.
+    #[test]
+    fn parse_pr_scan_matches_flunge_design_docs_convention() {
+        let root = serde_json::json!({
+            "files": [
+                {
+                    "path": "docs/design-docs/plan-recommendations-full-usefulness-pass.md",
+                    "changeType": "ADDED",
+                },
+                {
+                    "path": "docs/design-docs/plan-recommendations-full-usefulness-pass.attentions.json",
+                    "changeType": "ADDED",
+                },
+                {"path": "docs/design-docs/index.md", "changeType": "MODIFIED"},
+            ],
+            "headRefName": "boss/exec_18c16af0ccd3c140_164",
+            "baseRefName": "main",
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(
+            scan.doc_path.as_deref(),
+            Some("docs/design-docs/plan-recommendations-full-usefulness-pass.md"),
+            "should pick the single ADDED .md under docs/design-docs/, not the MODIFIED index.md"
+        );
     }
 
     /// T1897 regression: a design PR that adds a new doc AND modifies an
@@ -997,9 +1088,23 @@ mod tests {
     #[test]
     fn project_less_matcher_accepts_designs_and_investigations() {
         assert!(is_project_less_doc_path("tools/boss/docs/designs/foo.md"));
+        assert!(is_project_less_doc_path("docs/design-docs/foo.md"));
         assert!(is_project_less_doc_path("docs/investigations/foo.md"));
         assert!(!is_project_less_doc_path("README.md"));
         assert!(!is_project_less_doc_path("docs/other/foo.md"));
+    }
+
+    /// If a repo happens to have matching files under both `docs/designs/`
+    /// and `docs/design-docs/` in the same PR, that is still two matches —
+    /// the OR'd matcher must not silently prefer one convention over the
+    /// other; it stays ambiguous (None) same as two same-convention matches.
+    #[test]
+    fn parse_pr_scan_cross_convention_match_is_ambiguous_none() {
+        let root = serde_json::json!({
+            "files": files_json(&["docs/designs/feature-a.md", "docs/design-docs/feature-b.md"]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
     }
 
     #[test]
