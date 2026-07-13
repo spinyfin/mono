@@ -423,7 +423,9 @@ async fn engine_health_report_flags_dispatch_paused() {
 
     // Pause dispatch through the same coordinator API the human toggle
     // and the spawn-health circuit breaker use.
-    state.execution_coordinator.set_dispatch_paused(true, 0);
+    state
+        .execution_coordinator
+        .set_dispatch_paused(true, 0, crate::coordinator::DispatchPauseOrigin::Operator);
 
     let report = build_engine_health_report(&state);
     assert!(

@@ -1032,6 +1032,46 @@ fn default_coordinator_metrics() -> Arc<Registry> {
     metrics
 }
 
+/// Why dispatch is currently paused. Determines whether `drain_ready_queue`
+/// exempts `pr_review` executions from the pause — see
+/// [`ExecutionCoordinator::dispatch_pause_exempts_reviews`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchPauseOrigin {
+    /// An operator toggled `bossctl dispatch pause` / the app's pause
+    /// switch. A review is the lifecycle of a change already in flight, not
+    /// new work, so reviews keep dispatching through an operator pause.
+    Operator,
+    /// The spawn-capability circuit breaker tripped (see
+    /// [`crate::spawn_health`]) because the app's worker-pane spawn path
+    /// itself is broken. Exempting reviews here would just burn spawn
+    /// attempts against the same dead path, so reviews are held like
+    /// everything else.
+    Breaker,
+}
+
+impl DispatchPauseOrigin {
+    /// Stable string persisted to `state.db` under
+    /// [`crate::app::handler_helpers::METADATA_KEY_DISPATCH_PAUSE_ORIGIN`].
+    pub fn as_metadata_str(self) -> &'static str {
+        match self {
+            DispatchPauseOrigin::Operator => "operator",
+            DispatchPauseOrigin::Breaker => "breaker",
+        }
+    }
+
+    /// Parse the persisted metadata value. Anything unrecognized (including
+    /// absent, e.g. a pause persisted before this field existed) defaults to
+    /// `Breaker` — the conservative choice that does NOT exempt reviews,
+    /// since restoring an unknown pause as review-exempt could resume
+    /// burning spawn attempts against a still-broken spawn path.
+    pub fn from_metadata_str(value: Option<&str>) -> Self {
+        match value {
+            Some("operator") => DispatchPauseOrigin::Operator,
+            _ => DispatchPauseOrigin::Breaker,
+        }
+    }
+}
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct ExecutionCoordinator {
@@ -1121,6 +1161,14 @@ pub struct ExecutionCoordinator {
     /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
     #[builder(default)]
     dispatch_paused_since_epoch_s: AtomicU64,
+    /// Whether the current pause exempts `pr_review` executions from
+    /// `drain_ready_queue`'s pause gate — `true` when the pause originated
+    /// from [`DispatchPauseOrigin::Operator`], `false` for
+    /// [`DispatchPauseOrigin::Breaker`]. Only meaningful while
+    /// `dispatch_paused` is `true`; set on every `set_dispatch_paused(true, …)`
+    /// call and otherwise left at its last value.
+    #[builder(default)]
+    dispatch_pause_exempts_reviews: AtomicBool,
     /// Live per-slot worker registry, used by the lease-time occupancy
     /// guard to refuse leasing a workspace that is still the cwd of a
     /// tracked, live worker process (defect 3 — belt-and-suspenders
@@ -1218,6 +1266,7 @@ impl ExecutionCoordinator {
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
             dispatch_paused: AtomicBool::new(false),
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
+            dispatch_pause_exempts_reviews: AtomicBool::new(false),
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
         }
@@ -1396,22 +1445,36 @@ impl ExecutionCoordinator {
     }
 
     /// Pause or resume global dispatch. When `paused = true` the scheduler
-    /// drain stops claiming worker slots for new executions; already-running
-    /// executions are unaffected. Pass `paused_since_epoch_s = 0` when
-    /// resuming (it is ignored).
+    /// drain stops claiming worker slots for new executions from the main and
+    /// automation pools; already-running executions are unaffected. `origin`
+    /// determines whether `pr_review` executions are exempt from the pause —
+    /// see [`DispatchPauseOrigin`] — and is ignored when resuming. Pass
+    /// `paused_since_epoch_s = 0` when resuming (it is ignored).
     ///
-    /// The caller is responsible for persisting the new state to `state.db`
+    /// The caller is responsible for persisting the new state (including
+    /// `origin`, via [`DispatchPauseOrigin::as_metadata_str`]) to `state.db`
     /// so it survives an engine restart — see the `handle_set_dispatch_paused`
     /// handler in `app/engine_meta.rs`.
-    pub fn set_dispatch_paused(&self, paused: bool, paused_since_epoch_s: u64) {
+    pub fn set_dispatch_paused(&self, paused: bool, paused_since_epoch_s: u64, origin: DispatchPauseOrigin) {
         self.dispatch_paused.store(paused, Ordering::Release);
         self.dispatch_paused_since_epoch_s
             .store(if paused { paused_since_epoch_s } else { 0 }, Ordering::Release);
+        if paused {
+            self.dispatch_pause_exempts_reviews
+                .store(origin == DispatchPauseOrigin::Operator, Ordering::Release);
+        }
     }
 
     /// `true` when dispatch is globally paused.
     pub fn is_dispatch_paused(&self) -> bool {
         self.dispatch_paused.load(Ordering::Acquire)
+    }
+
+    /// `true` when the current pause (if any) exempts `pr_review` executions
+    /// from `drain_ready_queue`'s pause gate. Meaningless when
+    /// [`Self::is_dispatch_paused`] is `false`.
+    pub fn dispatch_pause_exempts_reviews(&self) -> bool {
+        self.dispatch_pause_exempts_reviews.load(Ordering::Acquire)
     }
 
     /// The epoch-seconds timestamp at which dispatch was last paused, or
@@ -1969,13 +2032,15 @@ impl ExecutionCoordinator {
     /// for this pass; they remain `ready` and will be picked up on the
     /// next `kick()` triggered by `release_worker_and_kick`.
     async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
-        // Global pause gate: when dispatch is paused, skip the drain entirely.
-        // Ready executions remain in the queue and will be picked up on the
-        // first drain after dispatch is resumed.
-        if self.dispatch_paused.load(Ordering::Acquire) {
-            tracing::debug!("drain_ready_queue: dispatch is globally paused — skipping");
-            return DrainOutcome::QueueEmpty;
-        }
+        // Global pause gate. `pr_review` executions are the lifecycle of a
+        // change already in flight, not new work, so an operator-originated
+        // pause exempts them — they keep draining into the review pool while
+        // main/automation rows are held. A breaker-originated pause (the
+        // app's spawn path itself is broken — see `spawn_health.rs`) exempts
+        // nothing, since dispatching a review would just burn another spawn
+        // attempt against the same dead path.
+        let paused = self.dispatch_paused.load(Ordering::Acquire);
+        let reviews_exempt_from_pause = paused && self.dispatch_pause_exempts_reviews.load(Ordering::Acquire);
 
         let executions = match self.work_db.list_ready_executions() {
             Ok(e) => e,
@@ -1987,6 +2052,29 @@ impl ExecutionCoordinator {
 
         if executions.is_empty() {
             return DrainOutcome::QueueEmpty;
+        }
+
+        if paused {
+            let review_count = executions
+                .iter()
+                .filter(|e| self.execution_targets_review_pool(e))
+                .count();
+            let held_count = executions.len() - review_count;
+            if reviews_exempt_from_pause {
+                tracing::debug!(
+                    held_count,
+                    review_exempt_count = review_count,
+                    "drain_ready_queue: dispatch is globally paused — holding non-review rows, \
+                     draining review-pool exemptions",
+                );
+            } else {
+                tracing::debug!(
+                    held_count,
+                    review_exempt_count = 0,
+                    "drain_ready_queue: dispatch is globally paused — skipping (breaker pause, no exemptions)",
+                );
+                return DrainOutcome::QueueEmpty;
+            }
         }
 
         let mut main_pool_exhausted = false;
@@ -2033,6 +2121,15 @@ impl ExecutionCoordinator {
             } else {
                 "main"
             };
+
+            // Dispatch is paused and this row isn't exempt: leave it `ready`
+            // for the next drain after resume. Reached only when
+            // `reviews_exempt_from_pause` is true (a non-exempt pause already
+            // returned above), so this holds every non-review row while
+            // review rows fall through to normal dispatch below.
+            if paused && !is_review {
+                continue;
+            }
 
             // Skip executions for pools we already know are full.
             // They remain `ready` and will be retried on the next kick.
@@ -5184,10 +5281,10 @@ mod tests {
     use super::{
         AUTOMATION_WORKER_ID_PREFIX, CHAIN_SERIALIZED_STALL_ATTENTION_KIND, CHAIN_SERIALIZED_STALL_THRESHOLD_SECS,
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-        EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter, HostAdapterProvider,
-        MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool,
-        occupying_live_worker, pick_worst_failing_check, pool_model_override_for_worker_id, slot_busy_occupant,
-        slot_id_from_worker_id, worker_id_for_slot,
+        DispatchPauseOrigin, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter,
+        HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
+        REVIEW_WORKER_ID_PREFIX, WorkerPool, occupying_live_worker, pick_worst_failing_check,
+        pool_model_override_for_worker_id, slot_busy_occupant, slot_id_from_worker_id, worker_id_for_slot,
     };
     use crate::spawn_flow::StartWorkerError;
     use boss_protocol::{EngineToAppError, ExecutionStatus};
@@ -10321,6 +10418,189 @@ mod tests {
             cube.create_calls.lock().await.len(),
             1,
             "create_change must be called when pr_url is absent"
+        );
+    }
+
+    // ── Dispatch-pause review exemption tests ──────────────────────────────────
+
+    /// An operator-originated pause (`bossctl dispatch pause`, the human
+    /// toggle) must NOT hold `pr_review` executions: a review is the
+    /// lifecycle of a change already in flight, not new work, so it keeps
+    /// dispatching through `drain_ready_queue` while paused.
+    #[tokio::test]
+    async fn operator_pause_exempts_ready_pr_review_execution() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_review_pool(WorkerPool::new_review(1));
+        let coordinator = Arc::new(coord);
+
+        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            1,
+            "the review execution must dispatch despite the operator pause"
+        );
+    }
+
+    /// The same operator pause must still hold a main-pool (non-review)
+    /// execution — only review rows are exempt. It stays `ready` until an
+    /// explicit resume kicks the scheduler.
+    #[tokio::test]
+    async fn operator_pause_holds_main_pool_row_until_resume() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+        coordinator.kick();
+
+        // No positive event to wait on — the assertion is that nothing
+        // changes while paused.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            0,
+            "a main-pool row must be held, not dispatched, during an operator pause"
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Ready,
+            "the held execution must remain `ready` while paused"
+        );
+
+        // Resume mirrors `handle_set_dispatch_paused`: flip the flag, then
+        // kick so the held row drains immediately.
+        coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Operator);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
+    }
+
+    /// A breaker-originated pause (the spawn-capability circuit breaker —
+    /// see `spawn_health.rs`) must hold `pr_review` executions too: the
+    /// app's spawn path itself is broken, so exempting reviews would just
+    /// burn another spawn attempt against the same dead path.
+    #[tokio::test]
+    async fn breaker_pause_holds_pr_review_execution_too() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_review_pool(WorkerPool::new_review(1));
+        let coordinator = Arc::new(coord);
+
+        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Breaker);
+        coordinator.kick();
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            0,
+            "a breaker-tripped pause must hold review executions, not exempt them"
+        );
+        assert_eq!(
+            db.get_execution(&execution.id).unwrap().status,
+            ExecutionStatus::Ready,
+            "the held review execution must remain `ready` while breaker-paused"
+        );
+    }
+
+    /// Rows held by an operator pause must drain exactly once on resume,
+    /// even if the scheduler was kicked multiple times while paused (e.g.
+    /// by unrelated work being created) — no double-dispatch of the same
+    /// held row.
+    #[tokio::test]
+    async fn resume_kick_drains_held_row_exactly_once() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+        // Multiple kicks while paused must not cause multiple dispatches once resumed.
+        coordinator.kick();
+        coordinator.kick();
+        coordinator.kick();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            0,
+            "must stay held across repeated kicks"
+        );
+
+        coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Operator);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
+
+        // Give any (incorrect) duplicate dispatch a window to land before asserting.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            1,
+            "the held row must be dispatched exactly once after resume"
         );
     }
 
