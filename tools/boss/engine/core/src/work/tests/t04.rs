@@ -2140,3 +2140,95 @@ fn migration_adds_editorial_controls_columns() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// The `(kind, config_json)` split produced by `automation_trigger_to_db`
+/// reconstructs the identical `AutomationTrigger` through
+/// `automation_trigger_from_db`. This is the invariant the `automations`
+/// mapper and insert path both depend on.
+#[test]
+fn automation_trigger_to_db_from_db_round_trip() {
+    let trigger = boss_protocol::AutomationTrigger::Schedule {
+        cron: "0 14 * * 1-5".to_owned(),
+        timezone: "America/Los_Angeles".to_owned(),
+    };
+    let (kind, config_json) = automation_trigger_to_db(&trigger).unwrap();
+    let reconstructed = automation_trigger_from_db(&kind, &config_json).unwrap();
+    assert_eq!(reconstructed, trigger, "round-trip must preserve the trigger");
+}
+
+/// `automation_trigger_to_db` returns the snake_case discriminator
+/// (`"schedule"`) as the kind column and strips the `"kind"` field from
+/// the stored config body — the discriminator lives in its own column so
+/// it must not be duplicated in the JSON. The remaining variant fields
+/// survive in the body.
+#[test]
+fn automation_trigger_to_db_strips_kind_and_returns_discriminator() {
+    let trigger = boss_protocol::AutomationTrigger::Schedule {
+        cron: "*/5 * * * *".to_owned(),
+        timezone: "UTC".to_owned(),
+    };
+    let (kind, config_json) = automation_trigger_to_db(&trigger).unwrap();
+    assert_eq!(kind, "schedule", "kind column must be the snake_case discriminator");
+
+    let body: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+    assert!(
+        body.get("kind").is_none(),
+        "the discriminator must not be duplicated in the config body",
+    );
+    assert_eq!(body["cron"], "*/5 * * * *", "variant fields must remain in the body");
+    assert_eq!(body["timezone"], "UTC");
+}
+
+/// `automation_trigger_from_db` reconstructs the trigger by injecting the
+/// `kind` discriminator back into the stored body. A config body that
+/// already omits `kind` (the canonical stored shape) deserialises cleanly.
+#[test]
+fn automation_trigger_from_db_injects_kind_discriminator() {
+    // Canonical stored shape: the body has no "kind"; the discriminator
+    // is supplied separately from its own column.
+    let trigger = automation_trigger_from_db("schedule", r#"{"cron":"0 0 * * *","timezone":"Europe/London"}"#).unwrap();
+    assert_eq!(
+        trigger,
+        boss_protocol::AutomationTrigger::Schedule {
+            cron: "0 0 * * *".to_owned(),
+            timezone: "Europe/London".to_owned(),
+        },
+    );
+}
+
+/// `automation_trigger_from_db` surfaces an error when the config column
+/// is not parseable JSON — a corrupt `trigger_config` must fail the read
+/// loudly rather than silently producing a default trigger.
+#[test]
+fn automation_trigger_from_db_rejects_unparseable_json() {
+    let err = automation_trigger_from_db("schedule", "not json at all").unwrap_err();
+    assert!(
+        err.to_string().contains("failed to parse trigger_config JSON"),
+        "error must name the parse failure, got: {err}",
+    );
+}
+
+/// `automation_trigger_from_db` errors when the JSON parses but is not a
+/// JSON object (the body must be an object so the `kind` discriminator can
+/// be injected into it).
+#[test]
+fn automation_trigger_from_db_rejects_non_object_json() {
+    // A JSON array parses as valid JSON but not as the expected object map.
+    let err = automation_trigger_from_db("schedule", "[1, 2, 3]").unwrap_err();
+    assert!(
+        err.to_string().contains("failed to parse trigger_config JSON"),
+        "non-object config must fail the object parse, got: {err}",
+    );
+}
+
+/// `automation_trigger_from_db` errors when the discriminator does not
+/// name a known `AutomationTrigger` variant, even though the config body
+/// is well-formed JSON — the reconstructed-value deserialisation must fail.
+#[test]
+fn automation_trigger_from_db_rejects_unknown_kind() {
+    let err = automation_trigger_from_db("bogus_kind", r#"{"cron":"* * * * *","timezone":"UTC"}"#).unwrap_err();
+    assert!(
+        err.to_string().contains("failed to deserialise AutomationTrigger"),
+        "unknown discriminator must fail variant deserialisation, got: {err}",
+    );
+}
