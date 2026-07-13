@@ -302,6 +302,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-deterministic-resolvers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boss-conflict-diagnosis",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "boss-editorial"
 version = "0.1.0"
 dependencies = [

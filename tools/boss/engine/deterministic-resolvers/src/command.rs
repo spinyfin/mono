@@ -1,0 +1,114 @@
+//! Process-spawning seam. Resolvers depend on the [`CommandRunner`] trait
+//! rather than calling `tokio::process::Command` directly, so their
+//! decline/resolve logic can be unit-tested without spawning a real
+//! `cargo`/`bazel` process.
+
+use std::path::Path;
+
+use async_trait::async_trait;
+
+/// Minimal captured shape of a finished child process — just enough for a
+/// resolver to decide success/failure and report a reason.
+#[derive(Debug, Clone)]
+pub(crate) struct CommandOutput {
+    pub(crate) success: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stderr: String,
+}
+
+#[async_trait]
+pub(crate) trait CommandRunner: Send + Sync {
+    async fn run(&self, program: &str, args: &[&str], cwd: &Path) -> std::io::Result<CommandOutput>;
+}
+
+pub(crate) struct RealCommandRunner;
+
+#[async_trait]
+impl CommandRunner for RealCommandRunner {
+    async fn run(&self, program: &str, args: &[&str], cwd: &Path) -> std::io::Result<CommandOutput> {
+        let output = tokio::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await?;
+        Ok(CommandOutput {
+            success: output.status.success(),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FakeCommandRunner {
+    outcome: std::sync::Mutex<Option<std::io::Result<CommandOutput>>>,
+    /// File to (re)write in `cwd` when `run` succeeds, simulating a real
+    /// `cargo`/`bazel` invocation actually regenerating the lockfile.
+    writes_file: Option<(String, String)>,
+    pub(crate) calls: std::sync::Mutex<Vec<(String, Vec<String>, std::path::PathBuf)>>,
+}
+
+#[cfg(test)]
+impl FakeCommandRunner {
+    /// Succeeds without touching the filesystem — useful for exercising the
+    /// "command exits 0 but never wrote the lockfile" case.
+    pub(crate) fn success() -> Self {
+        Self::with_outcome(Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stderr: String::new(),
+        }))
+    }
+
+    /// Succeeds and writes `filename` (with `contents`) into `cwd`, the way
+    /// `cargo generate-lockfile`/`bazel mod deps` would in reality.
+    pub(crate) fn success_writing_file(filename: &str, contents: &str) -> Self {
+        let mut runner = Self::success();
+        runner.writes_file = Some((filename.to_owned(), contents.to_owned()));
+        runner
+    }
+
+    pub(crate) fn failure(stderr: &str) -> Self {
+        Self::with_outcome(Ok(CommandOutput {
+            success: false,
+            code: Some(1),
+            stderr: stderr.to_owned(),
+        }))
+    }
+
+    pub(crate) fn spawn_error() -> Self {
+        Self::with_outcome(Err(std::io::Error::other("program not found")))
+    }
+
+    fn with_outcome(outcome: std::io::Result<CommandOutput>) -> Self {
+        Self {
+            outcome: std::sync::Mutex::new(Some(outcome)),
+            writes_file: None,
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl CommandRunner for FakeCommandRunner {
+    async fn run(&self, program: &str, args: &[&str], cwd: &Path) -> std::io::Result<CommandOutput> {
+        self.calls.lock().unwrap().push((
+            program.to_owned(),
+            args.iter().map(|s| s.to_string()).collect(),
+            cwd.to_path_buf(),
+        ));
+        let outcome = self
+            .outcome
+            .lock()
+            .unwrap()
+            .take()
+            .expect("FakeCommandRunner outcome consumed more than once");
+        if let (Ok(output), Some((filename, contents))) = (&outcome, &self.writes_file)
+            && output.success
+        {
+            std::fs::write(cwd.join(filename), contents)?;
+        }
+        outcome
+    }
+}
