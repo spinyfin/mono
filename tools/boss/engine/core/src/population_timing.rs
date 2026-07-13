@@ -449,6 +449,111 @@ mod tests {
     }
 
     #[test]
+    fn queue_wait_records_one_segment_after_enqueue() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.mark_enqueued();
+        trace.record_queue_wait();
+
+        let queue_waits: Vec<_> = trace
+            .segments
+            .iter()
+            .filter(|s| s.segment == segment::QUEUE_WAIT)
+            .collect();
+        assert_eq!(queue_waits.len(), 1, "exactly one queue_wait segment");
+        assert_eq!(queue_waits[0].segment, "queue_wait");
+    }
+
+    #[test]
+    fn queue_wait_is_noop_without_mark_enqueued() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        // No mark_enqueued() call — the documented no-op contract.
+        trace.record_queue_wait();
+        assert!(
+            !trace.segments.iter().any(|s| s.segment == segment::QUEUE_WAIT),
+            "record_queue_wait must not push a segment when mark_enqueued was never called"
+        );
+        assert!(trace.segments.is_empty());
+    }
+
+    #[test]
+    fn disabled_trace_records_no_queue_wait() {
+        let mut trace = PopulationTrace::disabled();
+        trace.mark_enqueued();
+        trace.record_queue_wait();
+        assert!(!trace.is_enabled());
+        assert!(trace.segments.is_empty(), "disabled trace records nothing");
+    }
+
+    #[test]
+    fn queue_wait_fires_only_once_per_mark_enqueued() {
+        let mut trace = PopulationTrace::new("prod-1", "req-1", None, Instant::now());
+        trace.mark_enqueued();
+        trace.record_queue_wait();
+        // Second call without re-marking: enqueued_at was taken, so this is a no-op.
+        trace.record_queue_wait();
+
+        let count = trace
+            .segments
+            .iter()
+            .filter(|s| s.segment == segment::QUEUE_WAIT)
+            .count();
+        assert_eq!(count, 1, "queue_wait must record once per mark_enqueued");
+    }
+
+    #[tokio::test]
+    async fn flush_propagates_items_and_per_segment_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = PopulationTimingLog::new(dir.path());
+
+        let mut trace = PopulationTrace::new("prod-9", "req-9", Some(42), Instant::now());
+        trace.record_plain(segment::DECODE, 0.5);
+        trace.record_query(segment::DB_TASKS, 12.0, 1949);
+        trace.record_nplus1(segment::DB_TASK_RUNTIMES, 6000.0, 1949, 4200);
+        trace.record_serialize(80.0, 2_500_000);
+        trace.set_items(1949);
+        trace.flush(&log);
+
+        // Let the background writer task drain the channel to disk.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "one daily log file");
+        let content = std::fs::read_to_string(dir.path().join(&files[0])).unwrap();
+        let records: Vec<serde_json::Value> = content.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(records.len(), 4, "one emitted record per recorded segment");
+
+        // Trace-level correlation + items ride on every emitted record.
+        for rec in &records {
+            assert_eq!(rec["product_id"], "prod-9");
+            assert_eq!(rec["request_id"], "req-9");
+            assert_eq!(rec["fetch_seq"], 42);
+            assert_eq!(rec["items"], 1949, "trace-level items on every segment");
+        }
+
+        let by_segment = |name: &str| records.iter().find(|r| r["segment"] == name).unwrap();
+
+        // Plain segment carries neither rows nor payload bytes.
+        let decode = by_segment("decode");
+        assert!(decode.get("rows").is_none());
+        assert!(decode.get("payload_bytes").is_none());
+
+        // Single-query segment carries its row count.
+        assert_eq!(by_segment("db.tasks")["rows"], 1949);
+
+        // N+1 segment carries rows and the SQL statement fan-out.
+        let runtimes = by_segment("db.task_runtimes");
+        assert_eq!(runtimes["rows"], 1949);
+        assert_eq!(runtimes["db_queries"], 4200);
+
+        // Serialize segment carries the payload size.
+        assert_eq!(by_segment("serialize")["payload_bytes"], 2_500_000);
+    }
+
+    #[test]
     fn record_serializes_to_expected_json_shape() {
         let rec = EnginePopulationRecord {
             ts_epoch_ms: 1_778_716_800_000,
