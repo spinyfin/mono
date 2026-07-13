@@ -32,6 +32,21 @@ pub const DEFAULT_MAX_EMBED_DIFF_LINES: u64 = 500;
 /// the extra review cycles prove too slow or costly.
 pub const DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS: bool = true;
 
+/// Default value for [`WorkConfig::merge_order_stagger_secs`]. **Zero disables
+/// the stagger** (the conservative default the design specifies): the
+/// non-blocking `merge_order` merge-sequencing relation is always active, but
+/// the *optional* bounded dispatch stagger — delaying the "later" sibling of a
+/// high-overlap pair by a small window so their diffs interleave less — ships
+/// off. Operators opt in via `BOSS_MERGE_ORDER_STAGGER_SECS`. See the
+/// merge-conflict-reduction design, Layer 3 / direction 2.
+pub const DEFAULT_MERGE_ORDER_STAGGER_SECS: u64 = 0;
+
+/// **Hard cap** on [`WorkConfig::merge_order_stagger_secs`]. The stagger is a
+/// small offset (minutes), never "wait until the first sibling merges", so any
+/// configured value is clamped to this ceiling at load time. 600s (10 min)
+/// bounds the worst-case dispatch delay a misconfiguration can impose.
+pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -96,6 +111,16 @@ pub struct WorkConfig {
     /// revert.
     #[builder(default = DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS)]
     pub enable_revision_triggered_reviews: bool,
+    /// Bounded dispatch stagger for high-overlap `merge_order` sibling pairs
+    /// (seconds). When > 0, the "later" side of a `merge_order` pairing whose
+    /// "first" side is concurrently in flight has its *first* dispatch delayed
+    /// by this many seconds (one-shot), so the two workers' diffs interleave
+    /// less. **Never a block and never waits for a merge** — a small offset
+    /// only. Zero (the default) disables it. Configured via
+    /// `BOSS_MERGE_ORDER_STAGGER_SECS`; hard-capped at
+    /// [`MAX_MERGE_ORDER_STAGGER_SECS`]. Design: Layer 3 / direction 2.
+    #[builder(default = DEFAULT_MERGE_ORDER_STAGGER_SECS)]
+    pub merge_order_stagger_secs: u64,
 }
 
 impl WorkConfig {
@@ -127,6 +152,12 @@ impl WorkConfig {
             lookup_u64(&lookup, "BOSS_MAX_EMBED_DIFF_LINES")?.unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
         let enable_revision_triggered_reviews = lookup_bool(&lookup, "BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS")?
             .unwrap_or(DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS);
+        // Clamp to the hard cap at load time so no downstream consumer can ever
+        // see an out-of-bounds stagger window (defense in depth: the coordinator
+        // also treats 0 as "disabled").
+        let merge_order_stagger_secs = lookup_u64(&lookup, "BOSS_MERGE_ORDER_STAGGER_SECS")?
+            .unwrap_or(DEFAULT_MERGE_ORDER_STAGGER_SECS)
+            .min(MAX_MERGE_ORDER_STAGGER_SECS);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -137,6 +168,7 @@ impl WorkConfig {
             .min_review_changed_lines(min_review_changed_lines)
             .max_review_embed_diff_lines(max_review_embed_diff_lines)
             .enable_revision_triggered_reviews(enable_revision_triggered_reviews)
+            .merge_order_stagger_secs(merge_order_stagger_secs)
             .build())
     }
 }
@@ -319,8 +351,8 @@ fn default_db_path() -> Result<PathBuf> {
 mod tests {
     use super::{
         DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES,
-        DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-        WorkConfig,
+        DEFAULT_MERGE_ORDER_STAGGER_SECS, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
+        MAX_AUTOMATION_POOL_SIZE, MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
     };
     use std::ffi::OsString;
 
@@ -506,6 +538,39 @@ mod tests {
         })
         .expect("config loads");
         assert!(config.enable_revision_triggered_reviews);
+    }
+
+    #[test]
+    fn merge_order_stagger_secs_defaults_off_reads_env_and_clamps_to_cap() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        // Absent → defaults OFF (0).
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.merge_order_stagger_secs, DEFAULT_MERGE_ORDER_STAGGER_SECS);
+        assert_eq!(config.merge_order_stagger_secs, 0, "stagger defaults off");
+
+        // A modest value within the cap is honored verbatim.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_MERGE_ORDER_STAGGER_SECS" => Some(OsString::from("90")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.merge_order_stagger_secs, 90);
+
+        // An over-cap value is hard-clamped to the ceiling (never unbounded).
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_MERGE_ORDER_STAGGER_SECS" => Some(OsString::from("100000")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.merge_order_stagger_secs, MAX_MERGE_ORDER_STAGGER_SECS);
     }
 
     #[test]

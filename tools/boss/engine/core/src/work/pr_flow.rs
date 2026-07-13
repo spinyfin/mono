@@ -673,6 +673,14 @@ impl WorkDb {
             params![task.id, pr_url, now],
         )?;
         cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        // merge_order sequencing (direction 2): order the pair. Any in-flight
+        // merge_order sibling of this just-merged task is now the "later" side
+        // and owes a preserving forward-port when its base moves. This never
+        // gates dispatch — it only records the ordering for the log; the
+        // durable contract is the merge_order edge + this task's `done` status,
+        // which the forward-port brief and the both-parents deletion tripwire
+        // consume.
+        record_merge_order_on_merge(&tx, &task.id)?;
         // OQ7: when a chain root reaches `done`, flip any `in_review`
         // revisions on it to `done` as well.  A revision's deliverable
         // (the commit) rode the parent PR to its terminal state.

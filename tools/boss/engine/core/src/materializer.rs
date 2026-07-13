@@ -59,7 +59,7 @@ use boss_protocol::{
 use crate::work::{
     WorkDb, add_dependency_edge_in_tx, insert_investigation_in_tx, insert_task_in_tx, now_string, query_project,
 };
-use crate::work_dependencies::{RELATION_BLOCKS, query_edge};
+use crate::work_dependencies::{RELATION_BLOCKS, RELATION_MERGE_ORDER, insert_edge, query_edge};
 
 /// `created_via` stamp for tasks materialized from a planner proposal, so the
 /// row's provenance is distinguishable from `cli` / `mac_app` / `bossctl`
@@ -162,11 +162,61 @@ impl Materializer {
             }
         }
 
+        // Wire soft `merge_order` edges from the proposal's file-overlap hints.
+        // These are **non-blocking** (dispatch gating is `blocks`-only, see
+        // `dep_helpers::compute_gated_work_item_ids`) and pair two otherwise-
+        // parallel siblings so the later PR forward-ports preservingly at merge
+        // time (merge-conflict-reduction design, Layer 3 / direction 2). The
+        // pairing is undirected; we store a canonical direction
+        // (`task_a` = prerequisite/"first", `task_b` = dependent/"later") and
+        // dedup a hint whose pairing already exists in either direction.
+        let mut merge_order_edges_created = 0usize;
+        for hint in &output.merge_order_hints {
+            // Hints are **soft**: a malformed one (a handle that doesn't
+            // resolve — possible on the public `apply` entry point, which does
+            // not run the upstream hint-handle validation) must never abort a
+            // valid task graph. Skip it with a warning instead of failing the
+            // whole populate the way an unresolved `blocks` edge handle does.
+            let (Some(a_id), Some(b_id)) = (handle_to_id.get(&hint.task_a), handle_to_id.get(&hint.task_b)) else {
+                tracing::warn!(
+                    task_a = %hint.task_a,
+                    task_b = %hint.task_b,
+                    "materializer: skipping merge_order hint with an unresolved handle",
+                );
+                continue;
+            };
+            // A hint whose two handles deduped to the same existing task is a
+            // no-op — a task never sequences against itself.
+            if a_id == b_id {
+                continue;
+            }
+            // Dedup the undirected pairing: an existing edge either way
+            // satisfies it, so re-applying a proposal that lists the same pair
+            // (even with the handles swapped) stays a no-op.
+            let already = query_edge(&tx, b_id, a_id, RELATION_MERGE_ORDER)?.is_some()
+                || query_edge(&tx, a_id, b_id, RELATION_MERGE_ORDER)?.is_some();
+            if already {
+                continue;
+            }
+            // Non-blocking insert: bypass `add_dependency_edge_in_tx`, whose
+            // auto-block and `would_create_cycle` gate are `blocks`-specific. A
+            // merge_order edge must never block a dependent or be rejected by
+            // the blocks-graph cycle check.
+            insert_edge(&tx, b_id, a_id, RELATION_MERGE_ORDER, &now).with_context(|| {
+                format!(
+                    "materializer: wiring merge_order edge {} <-> {}",
+                    hint.task_a, hint.task_b
+                )
+            })?;
+            merge_order_edges_created += 1;
+        }
+
         tx.commit()?;
         Ok(ApplyResult {
             created,
             skipped,
             edges_created,
+            merge_order_edges_created,
         })
     }
 }
@@ -319,7 +369,7 @@ fn find_cycle(handles: &HashSet<&str>, edges: &[ProposedEdge]) -> Option<Vec<Str
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use boss_protocol::{Confidence, CreateTaskInput, EffortLevel, ProposedTask, TaskKind};
+    use boss_protocol::{Confidence, CreateTaskInput, EffortLevel, ProposedMergeOrderHint, ProposedTask, TaskKind};
 
     use crate::work::{ClaimPlannerRunInput, WorkDb};
 
@@ -376,14 +426,30 @@ mod tests {
     }
 
     fn output(tasks: Vec<ProposedTask>, edges: Vec<ProposedEdge>) -> PlannerOutput {
+        output_with_hints(tasks, edges, vec![])
+    }
+
+    fn output_with_hints(
+        tasks: Vec<ProposedTask>,
+        edges: Vec<ProposedEdge>,
+        merge_order_hints: Vec<ProposedMergeOrderHint>,
+    ) -> PlannerOutput {
         PlannerOutput {
             tasks,
             edges,
-            merge_order_hints: vec![],
+            merge_order_hints,
             confidence: Confidence::High,
             breakdown_found: true,
             notes: String::new(),
             effort_audit: vec![],
+        }
+    }
+
+    fn phint(task_a: &str, task_b: &str) -> ProposedMergeOrderHint {
+        ProposedMergeOrderHint {
+            task_a: task_a.to_owned(),
+            task_b: task_b.to_owned(),
+            reason: "shared component file".to_owned(),
         }
     }
 
@@ -690,6 +756,157 @@ mod tests {
                 &[]
             ),
             2
+        );
+    }
+
+    // ---- apply: merge_order hints → non-blocking edges --------------------
+
+    #[test]
+    fn materializes_merge_order_hint_as_non_blocking_edge() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        // Two parallel tasks (no blocks edge) flagged as file-overlapping.
+        let out = output_with_hints(
+            vec![
+                ptask("compact", "Compact view", TaskKind::ProjectTask),
+                ptask("detail", "Detail view", TaskKind::ProjectTask),
+            ],
+            vec![],
+            vec![phint("compact", "detail")],
+        );
+
+        let res = Materializer::apply(&db, &project_id, &run, &out).unwrap();
+        assert_eq!(res.created.len(), 2);
+        assert_eq!(res.edges_created, 0, "file overlap must NOT create a blocks edge");
+        assert_eq!(res.merge_order_edges_created, 1);
+
+        // Exactly one merge_order edge, zero blocks edges.
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM work_item_dependencies WHERE relation = 'merge_order'",
+                &[]
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM work_item_dependencies WHERE relation = 'blocks'",
+                &[]
+            ),
+            0
+        );
+
+        // Neither task is gated — a merge_order edge never blocks dispatch.
+        for id in &res.created {
+            assert_ne!(
+                task_scalar::<String>(&db, id, "status"),
+                "blocked",
+                "a merge_order sibling must never be blocked",
+            );
+        }
+    }
+
+    #[test]
+    fn re_apply_dedups_merge_order_edge_in_both_directions() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        let out = output_with_hints(
+            vec![
+                ptask("a", "Task A", TaskKind::ProjectTask),
+                ptask("b", "Task B", TaskKind::ProjectTask),
+            ],
+            vec![],
+            vec![phint("a", "b")],
+        );
+        let first = Materializer::apply(&db, &project_id, &run, &out).unwrap();
+        assert_eq!(first.merge_order_edges_created, 1);
+
+        // Re-apply the identical proposal: the pairing already exists.
+        let second = Materializer::apply(&db, &project_id, &run, &out).unwrap();
+        assert_eq!(second.merge_order_edges_created, 0, "same pairing must dedup");
+
+        // Re-apply with the handles swapped: the undirected pairing still
+        // exists, so no reverse-direction edge is created.
+        let swapped = output_with_hints(
+            vec![
+                ptask("a", "Task A", TaskKind::ProjectTask),
+                ptask("b", "Task B", TaskKind::ProjectTask),
+            ],
+            vec![],
+            vec![phint("b", "a")],
+        );
+        let third = Materializer::apply(&db, &project_id, &run, &swapped).unwrap();
+        assert_eq!(third.merge_order_edges_created, 0, "reverse pairing must dedup");
+
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM work_item_dependencies WHERE relation = 'merge_order'",
+                &[]
+            ),
+            1,
+            "exactly one merge_order edge total",
+        );
+    }
+
+    #[test]
+    fn merge_order_hint_with_unknown_handle_is_skipped_not_fatal() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        // A soft hint referencing a handle that isn't among the proposal's
+        // tasks must not abort the (otherwise valid) task graph.
+        let out = output_with_hints(
+            vec![ptask("a", "Task A", TaskKind::ProjectTask)],
+            vec![],
+            vec![phint("a", "ghost")],
+        );
+        let res = Materializer::apply(&db, &project_id, &run, &out).expect("soft hint must not fail apply");
+        assert_eq!(res.created.len(), 1, "the valid task is still created");
+        assert_eq!(res.merge_order_edges_created, 0, "the malformed hint is skipped");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM work_item_dependencies WHERE relation = 'merge_order'",
+                &[]
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_order_hint_collapsing_to_one_task_is_skipped() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        // Two handles with the same name dedup to one task id; a merge_order
+        // hint between them must not create a self-edge.
+        let out = output_with_hints(
+            vec![
+                ptask("a", "Same name", TaskKind::ProjectTask),
+                ptask("b", "Same name", TaskKind::ProjectTask),
+            ],
+            vec![],
+            vec![phint("a", "b")],
+        );
+        let res = Materializer::apply(&db, &project_id, &run, &out).unwrap();
+        assert_eq!(res.created.len(), 1, "both handles deduped to one task");
+        assert_eq!(res.merge_order_edges_created, 0, "no self-pairing");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM work_item_dependencies WHERE relation = 'merge_order'",
+                &[]
+            ),
+            0
         );
     }
 }

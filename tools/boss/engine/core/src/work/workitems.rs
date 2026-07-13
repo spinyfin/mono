@@ -915,6 +915,35 @@ impl WorkDb {
         deps::gating_prereqs_for(&conn, work_item_id)
     }
 
+    /// The `merge_order` siblings of `work_item_id` that have already merged
+    /// (`status = 'done'`), each with its PR url. Non-blocking: reads the
+    /// soft `merge_order` pairing graph, never the `blocks` gating graph.
+    ///
+    /// Used by the forward-port brief composer to stamp a sibling-specific
+    /// preservation clause: because the named siblings landed *first* and
+    /// overlap this item's files, their surfaces must be preserved by this
+    /// item's forward-port (the both-parents deletion tripwire then verifies
+    /// it). Returns an empty vec when the item has no merged overlap partner.
+    pub fn merge_order_merged_siblings(&self, work_item_id: &str) -> Result<Vec<deps::MergeOrderMergedSibling>> {
+        let conn = self.connect()?;
+        let mut out = Vec::new();
+        for sib in deps::merge_order_siblings(&conn, work_item_id)? {
+            // Only task rows can carry a merged PR.
+            if !sib.sibling_id.starts_with("task_") {
+                continue;
+            }
+            if let Some(task) = query_task(&conn, &sib.sibling_id)?
+                && task.status == TaskStatus::Done
+            {
+                out.push(deps::MergeOrderMergedSibling {
+                    task_id: task.id,
+                    pr_url: task.pr_url,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Declare a `relation` edge from `dependent` to `prerequisite`.
     /// Validates both endpoints resolve to live work items in the
     /// same product, refuses self-edges and cycles, and is
