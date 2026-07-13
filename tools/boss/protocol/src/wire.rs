@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
+use crate::engine_app::{EngineToAppRequest, EngineToAppResponse, HostedPaneEntry};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
 use crate::live_worker_state::LiveWorkerState;
@@ -938,6 +938,17 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::HostsList`].
     ListHosts,
 
+    /// Read-only query: which slots does the app currently host a
+    /// session in that the engine has NO live-tracked run for
+    /// ("husk" panes)? Powers `bossctl agents list --all`, which is
+    /// otherwise structurally blind to husks — `ListWorkerLiveStates`
+    /// only reflects the engine's own `LiveWorkerStateRegistry`, which
+    /// by definition has no entry for a husk. Replies with
+    /// [`FrontendEvent::HuskPanesList`]; an empty list (not an error)
+    /// when no app session is registered or the app reports nothing
+    /// the engine doesn't already track.
+    ListHuskPanes,
+
     /// Snapshot of which slots currently have the live-status
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
@@ -1348,6 +1359,28 @@ pub enum FrontendRequest {
     /// Replies with [`FrontendEvent::WorkItemRestored`] on success.
     RestoreWorkItem {
         id: String,
+    },
+
+    /// Boss-only break-glass RPC: instruct the app to tear down
+    /// whatever pane is hosted in `slot_id` and free the slot in the
+    /// app's own bookkeeping — WITHOUT resolving through a run id.
+    /// Exists for "husk" panes: a pane the app still hosts but the
+    /// engine has no live-tracked run for (crash, terminal-fail path
+    /// bug, spawn-ack timeout). Neither `StopRun` nor `ReapRun` can
+    /// reach this case — both key off a run id the engine no longer
+    /// has a slot mapping for, so `bossctl agents stop` fails with "no
+    /// live worker matches" before it ever reaches the engine. Used by
+    /// `bossctl agents retire-pane <slot>`.
+    ///
+    /// Refuses with `WorkError` when the engine's own
+    /// `LiveWorkerStateRegistry` still shows a live (non-terminal) run
+    /// in `slot_id` — that pane is not a husk, and retiring it would
+    /// tear down a pane the engine still considers active; the caller
+    /// must use `agents stop` (or `agents reap`) instead. Idempotent
+    /// otherwise: a slot the app doesn't recognise (already released,
+    /// never allocated) still replies `PaneRetired`.
+    RetirePane {
+        slot_id: u8,
     },
 
     /// User-facing reset for an `in_review` PR that has been blocked
@@ -2037,6 +2070,19 @@ pub enum FrontendEvent {
     RunReaped {
         run_id: String,
         execution: WorkExecution,
+    },
+    /// Engine acknowledges a [`FrontendRequest::RetirePane`] — the
+    /// husk pane in `slot_id` has been instructed to tear down (or the
+    /// app reported the slot as already unknown/idle) and any
+    /// lingering engine-side bookkeeping for the slot has been
+    /// cleared.
+    PaneRetired {
+        slot_id: u8,
+    },
+    /// Reply to [`FrontendRequest::ListHuskPanes`]. Empty when the app
+    /// has no panes the engine isn't already tracking as live.
+    HuskPanesList {
+        panes: Vec<HostedPaneEntry>,
     },
     /// Trailing transcript chunk for a run. `lines` are the raw JSONL
     /// lines the engine read off the recorded transcript path

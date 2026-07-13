@@ -96,6 +96,7 @@ fn request_kind(req: &EngineToAppRequest) -> &'static str {
         EngineToAppRequest::FocusWorkerPane(_) => "focus_worker_pane",
         EngineToAppRequest::InterruptWorkerPane(_) => "interrupt_worker_pane",
         EngineToAppRequest::RevealWorkItem(_) => "reveal_work_item",
+        EngineToAppRequest::ListHostedPanes(_) => "list_hosted_panes",
     }
 }
 
@@ -107,6 +108,7 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
         EngineToAppResponse::FocusWorkerPane { .. } => "focus_worker_pane",
         EngineToAppResponse::InterruptWorkerPane { .. } => "interrupt_worker_pane",
         EngineToAppResponse::RevealWorkItem { .. } => "reveal_work_item",
+        EngineToAppResponse::ListHostedPanes { .. } => "list_hosted_panes",
     }
 }
 

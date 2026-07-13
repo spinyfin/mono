@@ -366,7 +366,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             | EngineToAppResponse::SendToPane { .. }
             | EngineToAppResponse::FocusWorkerPane { .. }
             | EngineToAppResponse::InterruptWorkerPane { .. }
-            | EngineToAppResponse::RevealWorkItem { .. },
+            | EngineToAppResponse::RevealWorkItem { .. }
+            | EngineToAppResponse::ListHostedPanes { .. },
         ) => {
             return Err(StartWorkerError::ResponseKindMismatch);
         }
@@ -648,13 +649,18 @@ mod tests {
             spawn_calls: Arc::new(AtomicUsize::new(0)),
             last_request: std::sync::Mutex::new(None),
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
-                result: Err(EngineToAppError::SlotBusy),
+                result: Err(EngineToAppError::SlotBusy {
+                    occupying_run_id: Some("run-husk".into()),
+                }),
             }),
         };
 
         let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
         assert!(
-            matches!(result, Err(StartWorkerError::AppError(EngineToAppError::SlotBusy))),
+            matches!(
+                result,
+                Err(StartWorkerError::AppError(EngineToAppError::SlotBusy { .. }))
+            ),
             "expected SlotBusy app error, got {result:?}",
         );
         assert!(

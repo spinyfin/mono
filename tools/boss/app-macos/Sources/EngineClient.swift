@@ -30,8 +30,10 @@ enum EngineSpawnError: Sendable {
     /// session. Surfaces engine↔app disagreement explicitly instead
     /// of silently re-allocating to a different slot, which would
     /// re-introduce the dual-allocator bug the engine-owns-slots
-    /// refactor exists to fix.
-    case slotBusy
+    /// refactor exists to fix. `occupyingRunId` is whatever run the
+    /// slot is currently hosting, so the engine can log which pane
+    /// caused the rejection instead of just "SlotBusy".
+    case slotBusy(occupyingRunId: String?)
     case internalFailure(String)
 }
 
@@ -89,6 +91,16 @@ enum EngineRevealResult: Sendable {
     case failure(EngineRevealError)
 }
 
+/// One slot the app reports as currently hosting a session, in reply
+/// to `EngineRequestKind.listHostedPanes`. Mirrors the wire
+/// `HostedPaneEntry` shape.
+struct EngineHostedPaneEntry: Sendable {
+    let slotId: Int
+    let runId: String
+    let summary: String?
+    let taskTitle: String?
+}
+
 enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
@@ -96,6 +108,12 @@ enum EngineRequestKind: Sendable {
     case focusWorkerPane(slotId: Int)
     case interruptWorkerPane(slotId: Int)
     case revealWorkItem(workItemId: String, productId: String)
+    /// Read-only: engine asks which slots the app currently hosts a
+    /// session in, regardless of whether the engine has a live-tracked
+    /// run for them. Backs `bossctl agents list --all` — the engine
+    /// diffs the reply against its own live-worker registry to surface
+    /// "husk" panes.
+    case listHostedPanes
 }
 
 enum EngineEvent {
@@ -1372,173 +1390,6 @@ final class EngineClient: @unchecked Sendable {
         sendLine(payload)
     }
 
-    func sendSpawnWorkerPaneResponse(requestId: String, result: EngineSpawnResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success(let slotId, let shellPid):
-            resultPayload = [
-                "Ok": [
-                    "slot_id": slotId,
-                    "shell_pid": Int(shellPid),
-                ]
-            ]
-        case .failure(let error):
-            resultPayload = ["Err": engineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "spawn_worker_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    func sendReleaseWorkerPaneResponse(requestId: String, result: EngineReleaseResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success:
-            resultPayload = ["Ok": [String: Any]()]
-        case .failure(let error):
-            resultPayload = ["Err": releaseEngineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "release_worker_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    func sendSendToPaneResponse(requestId: String, result: EngineSendResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success:
-            resultPayload = ["Ok": [String: Any]()]
-        case .failure(let error):
-            resultPayload = ["Err": sendEngineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "send_to_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    func sendFocusWorkerPaneResponse(requestId: String, result: EngineFocusResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success:
-            resultPayload = ["Ok": [String: Any]()]
-        case .failure(let error):
-            resultPayload = ["Err": focusEngineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "focus_worker_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    func sendInterruptWorkerPaneResponse(requestId: String, result: EngineInterruptResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success:
-            resultPayload = ["Ok": [String: Any]()]
-        case .failure(let error):
-            resultPayload = ["Err": interruptEngineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "interrupt_worker_pane",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    func sendRevealWorkItemResponse(requestId: String, result: EngineRevealResult) {
-        let resultPayload: [String: Any]
-        switch result {
-        case .success:
-            resultPayload = ["Ok": [String: Any]()]
-        case .failure(let error):
-            resultPayload = ["Err": revealEngineToAppErrorPayload(error)]
-        }
-        sendLine([
-            "type": "engine_response",
-            "request_id": requestId,
-            "response": [
-                "kind": "reveal_work_item",
-                "result": resultPayload,
-            ],
-        ])
-    }
-
-    private func engineToAppErrorPayload(_ error: EngineSpawnError) -> [String: Any] {
-        switch error {
-        case .noAvailableSlot:
-            return ["kind": "no_available_slot"]
-        case .slotBusy:
-            return ["kind": "slot_busy"]
-        case .internalFailure(let message):
-            return ["kind": "internal", "message": message]
-        }
-    }
-
-    private func releaseEngineToAppErrorPayload(_ error: EngineReleaseError) -> [String: Any] {
-        switch error {
-        case .unknownSlot:
-            return ["kind": "unknown_slot"]
-        case .internalFailure(let message):
-            return ["kind": "internal", "message": message]
-        }
-    }
-
-    private func sendEngineToAppErrorPayload(_ error: EngineSendError) -> [String: Any] {
-        switch error {
-        case .unknownSlot:
-            return ["kind": "unknown_slot"]
-        case .internalFailure(let message):
-            return ["kind": "internal", "message": message]
-        }
-    }
-
-    private func focusEngineToAppErrorPayload(_ error: EngineFocusError) -> [String: Any] {
-        switch error {
-        case .unknownSlot:
-            return ["kind": "unknown_slot"]
-        case .internalFailure(let message):
-            return ["kind": "internal", "message": message]
-        }
-    }
-
-    private func interruptEngineToAppErrorPayload(_ error: EngineInterruptError) -> [String: Any] {
-        switch error {
-        case .unknownSlot:
-            return ["kind": "unknown_slot"]
-        case .internalFailure(let message):
-            return ["kind": "internal", "message": message]
-        }
-    }
-
-    private func revealEngineToAppErrorPayload(_ error: EngineRevealError) -> [String: Any] {
-        switch error {
-        case .internalFailure(let message):
-            return ["kind": "internal", "message": message]
-        }
-    }
-
     /// Test-only spy: invoked on every outbound payload before
     /// JSON-encoding. Tests inject a recorder to assert that the
     /// chore/task create flow puts `repo_remote_url` on the wire as
@@ -1548,7 +1399,10 @@ final class EngineClient: @unchecked Sendable {
     /// no behaviour change.
     var outboundRecorder: (([String: Any]) -> Void)?
 
-    private func sendLine(_ payload: [String: Any]) {
+    // Not `private`: called from the `EngineClient+PaneResponses.swift`
+    // extension, which needs file-scoped-`private` loosened to `internal`
+    // to reach it.
+    func sendLine(_ payload: [String: Any]) {
         outboundRecorder?(payload)
 
         // Log outbound engine_response messages so both sides of every
@@ -1847,6 +1701,8 @@ final class EngineClient: @unchecked Sendable {
                         requestId: requestId,
                         request: .revealWorkItem(workItemId: workItemId, productId: productId)
                     ))
+                case "list_hosted_panes":
+                    emit(.engineRequest(requestId: requestId, request: .listHostedPanes))
                 default:
                     emit(.error(message:"engine_request unknown kind: \(kind)"))
                 }

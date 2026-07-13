@@ -118,7 +118,7 @@ final class WorkersWorkspaceModel: ObservableObject {
             ))
         }
         guard targetSlots[index].session == nil else {
-            return .failure(.slotBusy)
+            return .failure(.slotBusy(occupyingRunId: targetSlots[index].runId))
         }
 
         let slotId: Int
@@ -290,6 +290,23 @@ final class WorkersWorkspaceModel: ObservableObject {
             }
         }
         return .success
+    }
+
+    /// Report every slot currently hosting a session, across all three
+    /// pools, regardless of whether the engine has a live-tracked run
+    /// for it. Answers `EngineRequestKind.listHostedPanes` — the
+    /// engine diffs this against its own live-worker registry to
+    /// surface "husk" panes for `bossctl agents list --all`.
+    func listHostedPanes() -> [EngineHostedPaneEntry] {
+        (slots + automationSlots + reviewSlots).compactMap { slot in
+            guard slot.session != nil, let runId = slot.runId else { return nil }
+            return EngineHostedPaneEntry(
+                slotId: slot.slotId,
+                runId: runId,
+                summary: slot.summary,
+                taskTitle: slot.taskTitle
+            )
+        }
     }
 
     /// Resolve the foreground pid of the pty hosting `session`, or

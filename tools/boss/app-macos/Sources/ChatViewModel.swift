@@ -1863,6 +1863,12 @@ final class ChatViewModel: ObservableObject {
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
+    /// Enumerates every slot the app currently hosts a session in,
+    /// regardless of whether the engine has a live-tracked run for it.
+    /// Backs `bossctl agents list --all`. `nil` build (Bazel without
+    /// GhosttyKit) replies with an empty list — there is no pane
+    /// allocator to enumerate.
+    var paneListHostedHandler: (() -> [EngineHostedPaneEntry])?
     /// Invoked when the engine pushes `engine_pool_config`: forwards pool sizes to
     /// `WorkersWorkspaceModel` and coordinator model to `BossPaneModel`.
     /// Parameters: workerSlots, automationSlots, reviewSlots, coordinatorModel.
@@ -1974,6 +1980,9 @@ final class ChatViewModel: ObservableObject {
                         result: .failure(.internalFailure(reason))
                     )
                 }
+            case .listHostedPanes:
+                let panes = paneListHostedHandler?() ?? []
+                engine.sendListHostedPanesResponse(requestId: requestId, panes: panes)
             }
         case .disconnected:
             isConnected = false
