@@ -1784,4 +1784,150 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
     }
+
+    // ─── corroborating_liveness (pure decision) ────────────────────────────────
+    //
+    // These exercise the safety-critical spare/reap decision directly, without
+    // driving a full sweep, so the assertions are on the observable return
+    // value: `None` reaps, `Some(reason)` spares with `reason` naming the
+    // contradicting signal. This is the T2450 regression guard — a bug here
+    // false-reaps a live worker mid-task.
+
+    /// Build a bare `LiveWorkerState` overriding only the two fields the
+    /// decision reads (`last_event_at`, `current_tool`); everything else is
+    /// the freshly-spawned default.
+    fn live_state(last_event_at: Option<String>, current_tool: Option<String>) -> LiveWorkerState {
+        let mut state = LiveWorkerState::new_spawning(1, "run", "claude-opus-4-7", 1234, None);
+        state.last_event_at = last_event_at;
+        state.current_tool = current_tool;
+        state
+    }
+
+    /// An idle worker with no in-execution event and no tool in flight is
+    /// not corroborated as alive — nothing contradicts the dead probe.
+    #[test]
+    fn corroboration_none_when_no_event_and_no_tool() {
+        let started = 1_000_000;
+        let now = started + 300;
+        assert_eq!(corroborating_liveness(&live_state(None, None), started, now), None);
+    }
+
+    /// A tool in flight with an in-execution event spares the worker even
+    /// when that event is old — models a long foreground `bazel build` that
+    /// emits no hook for many minutes. The reason names the tool.
+    #[test]
+    fn corroboration_spares_busy_worker_with_tool_in_flight() {
+        let started = 1_000_000;
+        // An hour into the run: the last hook is ancient, but a tool is still
+        // in flight, so the worker is legitimately busy, not dead.
+        let now = started + 3_600;
+        let event = iso8601_utc(started + 5);
+        let reason = corroborating_liveness(&live_state(Some(event), Some("Bash".to_owned())), started, now)
+            .expect("busy worker with a tool in flight must be spared");
+        assert!(
+            reason.contains("Bash"),
+            "reason should name the in-flight tool: {reason}"
+        );
+    }
+
+    /// A `last_event_at` predating this execution's `started_at` belongs to a
+    /// prior run on a recycled slot and must NOT count as liveness — even
+    /// though the event is within the wall-clock corroboration window.
+    #[test]
+    fn corroboration_ignores_event_predating_execution_start() {
+        let started = 1_000_000;
+        let now = started + 5;
+        // 10s before this execution began, but only 15s before `now`.
+        let event = iso8601_utc(started - 10);
+        assert_eq!(
+            corroborating_liveness(&live_state(Some(event), None), started, now),
+            None
+        );
+    }
+
+    /// A prior-run event cannot be rescued by a tool in flight either: the
+    /// tool branch also requires the event to belong to this execution.
+    #[test]
+    fn corroboration_ignores_prior_run_event_even_with_tool() {
+        let started = 1_000_000;
+        let now = started + 30;
+        let event = iso8601_utc(started - 1);
+        assert_eq!(
+            corroborating_liveness(&live_state(Some(event), Some("Bash".to_owned())), started, now),
+            None,
+        );
+    }
+
+    /// An in-execution hook within `DEAD_PID_CORROBORATION_SECS` of now
+    /// proves the process tree is alive whatever the pid probe says.
+    #[test]
+    fn corroboration_spares_worker_with_recent_in_execution_event() {
+        let started = 1_000_000;
+        let now = started + 300;
+        let event = iso8601_utc(now - 30); // 30s ago, well inside the window
+        let reason = corroborating_liveness(&live_state(Some(event), None), started, now)
+            .expect("a recent in-execution hook must spare the worker");
+        assert!(
+            reason.contains("hook event"),
+            "reason should describe the hook event: {reason}"
+        );
+    }
+
+    /// An in-execution event older than the corroboration window, with no
+    /// tool in flight, does not spare the worker — it is reaped.
+    #[test]
+    fn corroboration_reaps_when_event_older_than_window_and_no_tool() {
+        let started = 1_000_000;
+        let now = started + 600;
+        // After start, but 80s past the far edge of the window.
+        let event = iso8601_utc(now - (DEAD_PID_CORROBORATION_SECS + 80));
+        assert_eq!(
+            corroborating_liveness(&live_state(Some(event), None), started, now),
+            None
+        );
+    }
+
+    /// Boundary: an event exactly at the window edge (`now - CORROBORATION`)
+    /// is still inside the window and spares the worker.
+    #[test]
+    fn corroboration_spares_event_exactly_at_window_edge() {
+        let started = 1_000_000;
+        let now = started + 500;
+        let event = iso8601_utc(now - DEAD_PID_CORROBORATION_SECS);
+        assert!(
+            corroborating_liveness(&live_state(Some(event), None), started, now).is_some(),
+            "an event exactly at the window edge must spare the worker",
+        );
+    }
+
+    /// Boundary: an event one second beyond the window edge is outside the
+    /// window and, with no tool in flight, does not spare the worker.
+    #[test]
+    fn corroboration_reaps_event_one_second_past_window_edge() {
+        let started = 1_000_000;
+        let now = started + 500;
+        let event = iso8601_utc(now - DEAD_PID_CORROBORATION_SECS - 1);
+        assert_eq!(
+            corroborating_liveness(&live_state(Some(event), None), started, now),
+            None
+        );
+    }
+
+    // ─── DeadPidSweepMode predicates ───────────────────────────────────────────
+
+    /// Only the periodic speculative sweep corroborates a `Dead` verdict
+    /// before reaping; the app-reattach reconcile trusts the pid probe.
+    #[test]
+    fn corroborate_liveness_only_for_periodic_speculative() {
+        assert!(DeadPidSweepMode::PeriodicSpeculative.corroborate_liveness());
+        assert!(!DeadPidSweepMode::AppReattach.corroborate_liveness());
+    }
+
+    /// Only the app-reattach reconcile files a pane-death attention item on
+    /// each reap; the periodic sweep's reaps are routine and file none.
+    #[test]
+    fn file_pane_death_attention_only_for_app_reattach() {
+        assert!(DeadPidSweepMode::AppReattach.file_pane_death_attention());
+        assert!(!DeadPidSweepMode::PeriodicSpeculative.file_pane_death_attention());
+    }
 }
