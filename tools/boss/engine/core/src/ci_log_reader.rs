@@ -209,10 +209,7 @@ pub fn reader_for(provider: CiProvider) -> Box<dyn CiLogReader> {
 /// the build id is the path segment after `/builds/`. Returns `None`
 /// when the URL doesn't match the canonical shape.
 pub fn parse_buildkite_build_id(url: &str) -> Option<String> {
-    let after_builds = url.split_once("/builds/")?.1;
-    // Strip query/fragment and any trailing path segments.
-    let id = after_builds.split(['#', '?', '/']).next().unwrap_or(after_builds);
-    if id.is_empty() { None } else { Some(id.to_owned()) }
+    path_segment_after(url, "/builds/")
 }
 
 /// Extract the Buildkite pipeline slug from a `targetUrl`. Buildkite
@@ -246,8 +243,17 @@ pub fn parse_buildkite_job_id(url: &str) -> Option<String> {
 /// Extract the GitHub Actions run id from a `targetUrl`. Run id is
 /// the path segment after `/runs/`.
 pub fn parse_gha_run_id(url: &str) -> Option<String> {
-    let after_runs = url.split_once("/runs/")?.1;
-    let id = after_runs.split(['/', '?', '#']).next().unwrap_or(after_runs);
+    path_segment_after(url, "/runs/")
+}
+
+/// Extract the path segment immediately following `marker` in `url`,
+/// stopping at the next path separator, query, or fragment
+/// (`/`, `?`, `#`). Returns `None` when `marker` is absent or the
+/// segment is empty. Shared by [`parse_buildkite_build_id`] and
+/// [`parse_gha_run_id`], whose URL shapes differ only in the marker.
+fn path_segment_after(url: &str, marker: &str) -> Option<String> {
+    let after = url.split_once(marker)?.1;
+    let id = after.split(['/', '?', '#']).next().unwrap_or(after);
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
