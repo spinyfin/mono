@@ -92,7 +92,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
 
-        let runner = Arc::new(FakeCommandRunner::success());
+        let runner = Arc::new(FakeCommandRunner::success_writing_file("MODULE.bazel.lock", "{}\n"));
         let resolver = BazelModuleLockResolver::with_runner(runner.clone());
 
         let outcome = resolver.resolve(dir.path(), &file("MODULE.bazel.lock")).await;
@@ -105,6 +105,24 @@ mod tests {
             calls[0].1,
             vec!["mod".to_owned(), "deps".to_owned(), "--lockfile_mode=update".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn declines_when_bazel_succeeds_but_lockfile_not_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+
+        // Simulates `bazel mod deps --lockfile_mode=update` exiting 0
+        // without actually recreating a deleted MODULE.bazel.lock.
+        let runner = Arc::new(FakeCommandRunner::success());
+        let resolver = BazelModuleLockResolver::with_runner(runner);
+
+        let outcome = resolver.resolve(dir.path(), &file("MODULE.bazel.lock")).await;
+
+        match outcome {
+            ResolveOutcome::Declined { reason } => assert!(reason.contains("did not regenerate")),
+            other => panic!("expected Declined, got {other:?}"),
+        }
     }
 
     #[tokio::test]

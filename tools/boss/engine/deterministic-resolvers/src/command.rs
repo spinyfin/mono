@@ -42,17 +42,30 @@ impl CommandRunner for RealCommandRunner {
 #[cfg(test)]
 pub(crate) struct FakeCommandRunner {
     outcome: std::sync::Mutex<Option<std::io::Result<CommandOutput>>>,
+    /// File to (re)write in `cwd` when `run` succeeds, simulating a real
+    /// `cargo`/`bazel` invocation actually regenerating the lockfile.
+    writes_file: Option<(String, String)>,
     pub(crate) calls: std::sync::Mutex<Vec<(String, Vec<String>, std::path::PathBuf)>>,
 }
 
 #[cfg(test)]
 impl FakeCommandRunner {
+    /// Succeeds without touching the filesystem — useful for exercising the
+    /// "command exits 0 but never wrote the lockfile" case.
     pub(crate) fn success() -> Self {
         Self::with_outcome(Ok(CommandOutput {
             success: true,
             code: Some(0),
             stderr: String::new(),
         }))
+    }
+
+    /// Succeeds and writes `filename` (with `contents`) into `cwd`, the way
+    /// `cargo generate-lockfile`/`bazel mod deps` would in reality.
+    pub(crate) fn success_writing_file(filename: &str, contents: &str) -> Self {
+        let mut runner = Self::success();
+        runner.writes_file = Some((filename.to_owned(), contents.to_owned()));
+        runner
     }
 
     pub(crate) fn failure(stderr: &str) -> Self {
@@ -70,6 +83,7 @@ impl FakeCommandRunner {
     fn with_outcome(outcome: std::io::Result<CommandOutput>) -> Self {
         Self {
             outcome: std::sync::Mutex::new(Some(outcome)),
+            writes_file: None,
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -84,10 +98,17 @@ impl CommandRunner for FakeCommandRunner {
             args.iter().map(|s| s.to_string()).collect(),
             cwd.to_path_buf(),
         ));
-        self.outcome
+        let outcome = self
+            .outcome
             .lock()
             .unwrap()
             .take()
-            .expect("FakeCommandRunner outcome consumed more than once")
+            .expect("FakeCommandRunner outcome consumed more than once");
+        if let (Ok(output), Some((filename, contents))) = (&outcome, &self.writes_file)
+            && output.success
+        {
+            std::fs::write(cwd.join(filename), contents)?;
+        }
+        outcome
     }
 }

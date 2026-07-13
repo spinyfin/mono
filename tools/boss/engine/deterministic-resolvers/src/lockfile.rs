@@ -67,6 +67,16 @@ pub(crate) async fn regenerate_lockfile(
         };
     }
 
+    if !lock_path.is_file() {
+        return ResolveOutcome::Declined {
+            reason: format!(
+                "`{program} {}` succeeded but did not regenerate {}",
+                args.join(" "),
+                file.path
+            ),
+        };
+    }
+
     ResolveOutcome::Resolved {
         summary: format!("regenerated {} via `{program} {}`", file.path, args.join(" ")),
     }
@@ -111,7 +121,7 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         std::fs::write(dir.path().join("Cargo.lock"), "<<<<<<< ours\n").unwrap();
 
-        let runner = FakeCommandRunner::success();
+        let runner = FakeCommandRunner::success_writing_file("Cargo.lock", "regenerated\n");
         let outcome = regenerate_lockfile(
             &runner,
             dir.path(),
@@ -123,15 +133,44 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
-        assert!(
-            !dir.path().join("Cargo.lock").exists(),
-            "conflicted lockfile should be discarded"
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Cargo.lock")).unwrap(),
+            "regenerated\n",
+            "conflicted lockfile content should be discarded, replaced by the regenerated one"
         );
         let calls = runner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cargo");
         assert_eq!(calls[0].1, vec!["generate-lockfile".to_owned()]);
         assert_eq!(calls[0].2, dir.path());
+    }
+
+    #[tokio::test]
+    async fn declines_when_command_succeeds_but_lockfile_not_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "<<<<<<< ours\n").unwrap();
+
+        // Command exits 0 but (unrealistically) never rewrites the lockfile
+        // it was supposed to regenerate.
+        let runner = FakeCommandRunner::success();
+        let outcome = regenerate_lockfile(
+            &runner,
+            dir.path(),
+            &file("Cargo.lock"),
+            "Cargo.toml",
+            "cargo",
+            &["generate-lockfile"],
+        )
+        .await;
+
+        match outcome {
+            ResolveOutcome::Declined { reason } => {
+                assert!(reason.contains("did not regenerate"), "reason was: {reason}");
+                assert!(reason.contains("Cargo.lock"), "reason was: {reason}");
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -183,7 +222,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
 
-        let runner = FakeCommandRunner::success();
+        let runner = FakeCommandRunner::success_writing_file("Cargo.lock", "regenerated\n");
         let outcome = regenerate_lockfile(
             &runner,
             dir.path(),

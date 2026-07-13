@@ -88,7 +88,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
 
-        let runner = Arc::new(FakeCommandRunner::success());
+        let runner = Arc::new(FakeCommandRunner::success_writing_file("Cargo.lock", "[[package]]\n"));
         let resolver = CargoLockResolver::with_runner(runner.clone());
 
         let outcome = resolver.resolve(dir.path(), &file("Cargo.lock")).await;
@@ -98,6 +98,22 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cargo");
         assert_eq!(calls[0].1, vec!["generate-lockfile".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn declines_when_cargo_succeeds_but_lockfile_not_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let runner = Arc::new(FakeCommandRunner::success());
+        let resolver = CargoLockResolver::with_runner(runner);
+
+        let outcome = resolver.resolve(dir.path(), &file("Cargo.lock")).await;
+
+        match outcome {
+            ResolveOutcome::Declined { reason } => assert!(reason.contains("did not regenerate")),
+            other => panic!("expected Declined, got {other:?}"),
+        }
     }
 
     /// End-to-end against the real `cargo` binary: a zero-dependency
