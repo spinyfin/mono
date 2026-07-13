@@ -480,6 +480,11 @@ struct ServerState {
     /// [`WorkerCompletionHandler::with_staged_pr_urls`] so writes
     /// here and reads in `on_stop` see the same map.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// In-memory set of `revision_implementation` execution IDs that ran a
+    /// `jj git push` command since their last Stop boundary. Shared with the
+    /// completion handler so `on_stop_inner`'s SHA-delta gate can confirm
+    /// the revision was the one that moved the PR head.
+    staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
     /// Per-execution deny counter for the editorial PreToolUse loop guard
     /// (design R3). State is in-memory only; a restart resets it to zero,
     /// which is the safe direction (worst case a worker gets three fresh
@@ -931,6 +936,7 @@ impl ServerState {
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        let staged_revision_pushes = Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
 
         // Resolve the Boss state root early — both the feature-flags
         // store (loaded below, before the completion handler is
@@ -1050,6 +1056,7 @@ impl ServerState {
                 probe_queuer.clone(),
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_staged_revision_pushes(staged_revision_pushes.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion)
@@ -1152,6 +1159,7 @@ impl ServerState {
                 )))
                 .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
                 .staged_pr_urls(staged_pr_urls)
+                .staged_revision_pushes(staged_revision_pushes)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
                 .maybe_anthropic_api_key(anthropic_api_key)
                 .worker_pool_size(worker_pool_size)

@@ -282,6 +282,45 @@ pub(crate) fn migrate_timestamps_to_epoch(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `stop_seen`: boolean signal (INTEGER 0/1) stamped by `on_stop_inner` the
+/// first time a Stop event fires for an execution. The SHA-delta gate in
+/// `recheck_for_pr` uses this as a guard for `revision_implementation`
+/// executions: it only fires the gate after a Stop has been observed, ensuring
+/// that the gate acts as a recovery path (Stop fired but PR detection failed
+/// transiently) rather than a primary detector. Without this guard, a commit
+/// pushed to the parent PR by *another* worker between the snapshot time and
+/// the merge-poller check fires `Contributed`, transitioning the revision to
+/// `in_review` before the revision worker has done any work (T1503/T1496
+/// regression).
+pub(crate) fn migrate_work_executions_stop_seen(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "stop_seen")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN stop_seen INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// `revision_stop_contributed_head`: the PR head SHA that `on_stop_inner`'s
+/// SHA-delta `Contributed` arm observed when it last attempted to finalize a
+/// `revision_implementation` execution. Set just before the finalize attempt
+/// so that `recheck_for_pr` can complete the transition when the first attempt
+/// failed transiently (T848 recovery). `NULL` means `on_stop_inner` has never
+/// seen a `Contributed` outcome for this execution, which tells `recheck_for_pr`
+/// the head movement was from a *different* worker (e.g. the parent chore's
+/// still-active worker pushing to the shared PR branch).
+pub(crate) fn migrate_work_executions_revision_stop_contributed_head(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "revision_stop_contributed_head")? {
+        conn.execute(
+            "ALTER TABLE work_executions \
+             ADD COLUMN revision_stop_contributed_head TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
     table_has_column(conn, "work_executions", column)
 }

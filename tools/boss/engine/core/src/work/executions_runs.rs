@@ -723,6 +723,38 @@ impl WorkDb {
     /// callers may invoke once per execution start (or skip when no
     /// PR is bound). Empty `sha` is rejected — pass `None` semantics
     /// by simply not calling.
+    /// Stamp the "stop event was observed" marker for this execution.
+    /// Called by `on_stop_inner` the first time a Stop event fires.
+    /// The SHA-delta gate in `recheck_for_pr` checks this before running
+    /// for `revision_implementation` executions: the gate must only fire
+    /// *after* a Stop has been seen (as a recovery path for transient
+    /// failures), never while the revision worker is still running
+    /// between turns. Idempotent.
+    pub fn set_execution_stop_seen(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET stop_seen = 1 WHERE id = ?1",
+            params![execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return `true` if `on_stop_inner` has been called at least once for
+    /// this execution (i.e. the `stop_seen` flag is set). Returns `false`
+    /// for unknown execution IDs (treat as not seen, gate stays closed).
+    pub fn execution_stop_seen(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let seen: Option<i64> = conn
+            .query_row(
+                "SELECT stop_seen FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(seen.unwrap_or(0) != 0)
+    }
+
     pub fn set_execution_pr_head_before(&self, execution_id: &str, sha: &str) -> Result<()> {
         if sha.is_empty() {
             bail!("set_execution_pr_head_before: sha must be non-empty");
@@ -736,6 +768,40 @@ impl WorkDb {
             bail!("unknown execution: {execution_id}");
         }
         Ok(())
+    }
+
+    /// Stamp `revision_stop_contributed_head` to record that
+    /// `on_stop_inner`'s SHA-delta `Contributed` arm observed `sha` as the
+    /// current PR head for a `revision_implementation` execution. Used by
+    /// `recheck_for_pr` as the T848 recovery gate: it only finalizes when the
+    /// current head matches this stamped value — not on any arbitrary head
+    /// movement from a concurrently-active parent worker.
+    pub fn set_revision_stop_contributed_head(&self, execution_id: &str, sha: &str) -> Result<()> {
+        if sha.is_empty() {
+            bail!("set_revision_stop_contributed_head: sha must be non-empty");
+        }
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET revision_stop_contributed_head = ?2 WHERE id = ?1",
+            params![execution_id, sha],
+        )?;
+        Ok(())
+    }
+
+    /// Return the `revision_stop_contributed_head` value for `execution_id`,
+    /// or `None` if it has never been set (on_stop_inner has not yet observed
+    /// a `Contributed` outcome for this execution).
+    pub fn get_revision_stop_contributed_head(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let head: Option<String> = conn
+            .query_row(
+                "SELECT revision_stop_contributed_head FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(head)
     }
 
     /// Snapshot the bound PR's description/body captured at run start.
