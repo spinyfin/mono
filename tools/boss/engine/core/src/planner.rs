@@ -43,6 +43,16 @@
 //! failure ([`PlannerOutcome::InvalidOutput`]), never a parse-and-hope over
 //! free-form markdown.
 //!
+//! A healthy ~13-task proposal has nevertheless been observed to fail whole
+//! because one array-typed field (`effort_audit`) came back as a single
+//! JSON-encoded string rather than a JSON array — model flakiness on an
+//! otherwise-valid result, not a prompt or schema defect. Two mitigations, in
+//! order: (1) [`coerce_stringified_array_fields`] rewrites a known-array field
+//! back into an array, when the string itself parses as one, before schema
+//! validation runs; (2) if validation still fails, [`plan_with_url`] retries
+//! (bounded by [`PLANNER_VALIDATION_ATTEMPTS`]) with the validation error fed
+//! back into the prompt, rather than failing the whole run on one bad field.
+//!
 //! ## Bounded model / effort / timeout
 //!
 //! Planning quality matters and the call is infrequent (once per project),
@@ -85,14 +95,29 @@ pub const PLANNER_MAX_TOKENS: u32 = 16_384;
 /// caller indefinitely (design "bound … timeout").
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Total attempts per [`Planner::plan`] call: the design says "retry once,
+/// Total attempts per Anthropic round trip: the design says "retry once,
 /// then fail safe", i.e. two attempts. Only transient failures (429/5xx/
-/// overloaded/transport) are retried — see [`ClaudeError::is_retryable`].
+/// overloaded/transport) are retried at this layer — see
+/// [`ClaudeError::is_retryable`]. This is independent of
+/// [`PLANNER_VALIDATION_ATTEMPTS`], which bounds a *different* retry: a
+/// schema-invalid response is not a transport failure, so it is not retried
+/// here.
 pub const PLANNER_ATTEMPTS: u32 = 2;
 
 /// Backoff before the planning retry. A single retry of an infrequent,
 /// high-effort call can afford a real pause before hammering the API again.
 pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Total attempts across the outer schema-validation retry loop in
+/// [`Planner::plan`]. A model occasionally emits a tool call that violates
+/// [`planner_output_schema`] (observed: an array-typed field like
+/// `effort_audit` emitted as a single JSON-encoded string). That is model
+/// flakiness, not a transient transport error, so [`PLANNER_ATTEMPTS`]'s
+/// 429/5xx retry never sees it and a single miss used to fail the whole
+/// proposal. Bounded at 2 (one retry): the retry re-sends the request with the
+/// validation error appended to the prompt, so the model can see and correct
+/// exactly what it got wrong.
+pub const PLANNER_VALIDATION_ATTEMPTS: u32 = 2;
 
 /// Name of the forced tool whose `input_schema` is [`planner_output_schema`].
 /// The model must call exactly this tool; its `input` is the structured
@@ -197,20 +222,41 @@ impl Planner {
 }
 
 /// Core of [`Planner::plan`] with the endpoint URL injected so tests can
-/// drive it against a mock server. Builds the request once and hands it to the
-/// shared [`crate::claude_client`] pipeline, which owns retry/backoff.
+/// drive it against a mock server. Hands each attempt's request to the shared
+/// [`crate::claude_client`] pipeline (which owns 429/5xx/transport
+/// retry/backoff) and, on a schema-validation failure, rebuilds the request
+/// with the error fed back into the prompt and tries again — bounded by
+/// [`PLANNER_VALIDATION_ATTEMPTS`] — before failing safe.
 async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> PlannerOutcome {
-    let body = build_request_body(input);
     let config = CallConfig::new(PLANNER_TIMEOUT)
         .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF))
         .with_endpoint(url);
-    match claude_client::send_messages_raw(api_key, &body, &config).await {
-        Ok(response) => match planner_output_from_response(&response) {
-            Ok(output) => PlannerOutcome::Success(output),
-            Err(msg) => PlannerOutcome::InvalidOutput(msg),
-        },
-        Err(err) => outcome_from_error(err),
+
+    let mut validation_error: Option<String> = None;
+    for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
+        let body = match &validation_error {
+            None => build_request_body(input),
+            Some(err) => build_retry_request_body(input, err),
+        };
+        match claude_client::send_messages_raw(api_key, &body, &config).await {
+            Ok(response) => match planner_output_from_response(&response) {
+                Ok(output) => return PlannerOutcome::Success(output),
+                Err(msg) => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = PLANNER_VALIDATION_ATTEMPTS,
+                        err = %msg,
+                        "planner: schema-invalid output; retrying with validation feedback",
+                    );
+                    validation_error = Some(msg);
+                }
+            },
+            Err(err) => return outcome_from_error(err),
+        }
     }
+    // Exhausted the validation-retry budget; `validation_error` is always
+    // `Some` here (the loop only continues past attempt 1 by setting it).
+    PlannerOutcome::InvalidOutput(validation_error.unwrap_or_else(|| "exhausted planner validation retries".to_owned()))
 }
 
 /// Assemble the Anthropic Messages request body. Public so tests and future
@@ -289,6 +335,39 @@ pub fn build_user_prompt(input: &PlannerInput) -> String {
     out
 }
 
+/// Build the retry request body: identical to [`build_request_body`] except
+/// the single user turn also carries the previous attempt's schema-validation
+/// error, so the model can see and correct exactly what it got wrong instead
+/// of repeating the same mistake blind.
+fn build_retry_request_body(input: &PlannerInput, validation_error: &str) -> Value {
+    let mut body = build_request_body(input);
+    if let Some(content) = body
+        .get_mut("messages")
+        .and_then(|messages| messages.get_mut(0))
+        .and_then(|message| message.get_mut("content"))
+    {
+        *content = Value::String(retry_user_prompt(input, validation_error));
+    }
+    body
+}
+
+/// The retry user turn: the normal prompt plus an explicit rejection notice
+/// naming the schema-validation error from the previous attempt.
+fn retry_user_prompt(input: &PlannerInput, validation_error: &str) -> String {
+    let mut out = build_user_prompt(input);
+    out.push_str(&format!(
+        "\n--- YOUR PREVIOUS emit_task_graph CALL WAS REJECTED ---\n\
+         Schema validation error: {validation_error}\n\
+         Every field must have exactly the JSON type the schema declares — in \
+         particular, array fields (`tasks`, `edges`, `effort_audit`) must be \
+         emitted as a JSON array, never as a single JSON-encoded string \
+         containing one. Call `emit_task_graph` again with a schema-valid \
+         payload that fixes this.\n\
+         --- END REJECTION NOTICE ---\n"
+    ));
+    out
+}
+
 /// Map a shared [`ClaudeError`] into the matching [`PlannerOutcome`]. Transport
 /// and decode failures are both "we couldn't get usable bytes back", so they
 /// bucket together.
@@ -311,10 +390,45 @@ fn planner_output_from_response(response: &MessagesResponse) -> Result<PlannerOu
     let input = response
         .tool_use_input(TOOL_NAME)
         .ok_or_else(|| format!("model did not call the {TOOL_NAME} tool"))?;
-    let mut output = serde_json::from_value::<PlannerOutput>(input.clone())
+    let mut input = input.clone();
+    coerce_stringified_array_fields(&mut input);
+    let mut output = serde_json::from_value::<PlannerOutput>(input)
         .map_err(|err| format!("tool input did not match the PlannerOutput schema: {err}"))?;
     normalize_output_text(&mut output);
     Ok(output)
+}
+
+/// Top-level [`PlannerOutput`] fields the schema requires to be a JSON array.
+const ARRAY_TYPED_FIELDS: &[&str] = &["tasks", "edges", "effort_audit"];
+
+/// Undo a model slip observed in production (T-planner-string-array): an
+/// array-typed field emitted as a single JSON-encoded string instead of an
+/// actual JSON array — e.g. `"effort_audit": "[\"[effort-classification] …\"]"`
+/// rather than `"effort_audit": ["[effort-classification] …"]`. The model's
+/// *content* is fine; only the outer JSON type is wrong. When one of
+/// [`ARRAY_TYPED_FIELDS`] is a string that itself parses as a JSON array, this
+/// swaps it in place before schema validation, logging a warning so the slip
+/// stays visible rather than being silently masked. A string that fails to
+/// parse (or parses to something other than an array) is left untouched —
+/// serde still rejects it, and the retry loop in [`plan_with_url`] then feeds
+/// the resulting schema error back to the model.
+fn coerce_stringified_array_fields(input: &mut Value) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+    for field in ARRAY_TYPED_FIELDS {
+        let raw = match obj.get(*field) {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        if let Ok(parsed @ Value::Array(_)) = serde_json::from_str::<Value>(&raw) {
+            tracing::warn!(
+                field = *field,
+                "planner: coerced a stringified JSON array back into an array before schema validation",
+            );
+            obj.insert((*field).to_owned(), parsed);
+        }
+    }
 }
 
 /// Undo over-escaping the model occasionally introduces in free-text fields
@@ -664,6 +778,68 @@ mod tests {
     }
 
     #[test]
+    fn coerces_a_stringified_effort_audit_array_before_validation() {
+        // Reproduces the production failure: the model emitted `effort_audit`
+        // as a single JSON-encoded string (`"[\"[effort-classification] …\"]"`)
+        // instead of a JSON array, which used to fail the whole otherwise-valid
+        // proposal with a serde type-mismatch error.
+        let response = response_from(json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [{
+                        "handle": "h",
+                        "name": "Task",
+                        "description": "Do the thing.",
+                        "kind": "project_task",
+                        "effort": "small",
+                        "ordinal": 0
+                    }],
+                    "edges": [],
+                    "confidence": "high",
+                    "breakdown_found": true,
+                    "notes": "n",
+                    "effort_audit": "[\"[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\"\"]"
+                }
+            }]
+        }));
+        let out = planner_output_from_response(&response)
+            .expect("stringified-array effort_audit must be coerced and accepted");
+        assert_eq!(out.effort_audit.len(), 1);
+        assert_eq!(
+            out.effort_audit[0],
+            "[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
+        );
+    }
+
+    #[test]
+    fn does_not_coerce_a_non_json_string_field() {
+        // A field that is a string but does not itself parse as a JSON array
+        // (e.g. a genuine free-text mistake, not the known stringified-array
+        // slip) must still be rejected by schema validation rather than
+        // silently accepted.
+        let response = response_from(json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [],
+                    "edges": [],
+                    "confidence": "high",
+                    "breakdown_found": false,
+                    "notes": "n",
+                    "effort_audit": "not an array at all"
+                }
+            }]
+        }));
+        assert!(
+            planner_output_from_response(&response).is_err(),
+            "a non-JSON-array string must still fail validation",
+        );
+    }
+
+    #[test]
     fn normalizes_over_escaped_notes_and_effort_audit() {
         // Guards against a model that over-escapes its JSON tool-call
         // arguments (writes `\\"` / `\\n` where a single JSON escape level
@@ -810,6 +986,145 @@ mod tests {
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after one retry, got {outcome:?}",
+        );
+    }
+
+    /// A tool-use response body whose `input` is missing the required
+    /// `confidence` field — invalid in a way the stringified-array coercion
+    /// cannot fix, so it only succeeds via the validation-retry loop.
+    fn missing_confidence_tool_use_response() -> Value {
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [],
+                    "edges": [],
+                    "breakdown_found": false,
+                    "notes": "",
+                    "effort_audit": []
+                }
+            }]
+        })
+    }
+
+    /// A tool-use response body mirroring the production incident: an
+    /// otherwise well-formed proposal where `effort_audit` is a single
+    /// JSON-encoded string instead of a JSON array.
+    fn stringified_effort_audit_tool_use_response() -> Value {
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [{
+                        "handle": "h",
+                        "name": "Task",
+                        "description": "Do the thing.",
+                        "kind": "project_task",
+                        "effort": "small",
+                        "ordinal": 0
+                    }],
+                    "edges": [],
+                    "confidence": "high",
+                    "breakdown_found": true,
+                    "notes": "n",
+                    "effort_audit": "[\"[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\"\"]"
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn end_to_end_stringified_array_is_coerced_without_a_retry_round_trip() {
+        // Regression test for the production incident: the model's array
+        // field arrived as a JSON-encoded string. This must succeed off the
+        // *first* HTTP call via coercion — no second round trip needed. Only
+        // one response is mounted (`up_to_n_times(1)`); if the code
+        // mistakenly retried, the second call would get no matching mock.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(stringified_effort_audit_tool_use_response()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        match outcome {
+            PlannerOutcome::Success(out) => assert_eq!(out.effort_audit.len(), 1),
+            other => panic!("expected Success via coercion, got {other:?}"),
+        }
+        assert_eq!(
+            server.received_requests().await.expect("requests recorded").len(),
+            1,
+            "coercion must resolve the stringified array on the first call, with no retry round trip",
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_with_validation_feedback_after_uncoercible_invalid_output() {
+        // First attempt is schema-invalid in a way coercion cannot fix
+        // (missing required field); the second attempt is well-formed. The
+        // run must succeed via the validation-retry loop, and the retry
+        // request must carry the previous validation error back to the model.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(missing_confidence_tool_use_response()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tool_use_response()))
+            .mount(&server)
+            .await;
+
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        assert!(
+            matches!(outcome, PlannerOutcome::Success(_)),
+            "expected success after the validation retry, got {outcome:?}",
+        );
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2, "expected exactly one validation retry");
+        let retry_body: Value = requests[1].body_json().expect("retry body is JSON");
+        let retry_prompt = retry_body["messages"][0]["content"]
+            .as_str()
+            .expect("retry content is a string");
+        assert!(
+            retry_prompt.contains("YOUR PREVIOUS emit_task_graph CALL WAS REJECTED"),
+            "retry prompt must feed the validation failure back to the model",
+        );
+        assert!(
+            retry_prompt.contains("confidence"),
+            "retry prompt must mention the actual validation error",
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_after_exhausting_validation_retries() {
+        // Every attempt is schema-invalid; the run must fail safe (not hang
+        // or retry unboundedly) after exactly PLANNER_VALIDATION_ATTEMPTS
+        // calls.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(missing_confidence_tool_use_response()))
+            .mount(&server)
+            .await;
+
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        assert!(
+            matches!(outcome, PlannerOutcome::InvalidOutput(_)),
+            "expected InvalidOutput after exhausting retries, got {outcome:?}",
+        );
+        assert_eq!(outcome.tag(), "invalid_output");
+        assert_eq!(
+            server.received_requests().await.expect("requests recorded").len(),
+            PLANNER_VALIDATION_ATTEMPTS as usize,
+            "must stop after exactly PLANNER_VALIDATION_ATTEMPTS calls",
         );
     }
 
