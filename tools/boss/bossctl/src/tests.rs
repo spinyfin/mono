@@ -21,70 +21,13 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
     }
 }
 
-#[test]
-fn resolves_by_run_id() {
-    let states = vec![live(1, "exec_a"), live(2, "exec_b")];
-    let hit = resolve_agent_ref("exec_b", &states).unwrap();
-    assert_eq!(hit.slot_id, 2);
-}
-
-#[test]
-fn resolves_by_numeric_slot_id() {
-    let states = vec![live(1, "exec_a"), live(3, "exec_c")];
-    let hit = resolve_agent_ref("3", &states).unwrap();
-    assert_eq!(hit.run_id, "exec_c");
-}
-
-#[test]
-fn resolves_by_crew_name_case_insensitive() {
-    let states = vec![live(1, "exec_a"), live(2, "exec_b")];
-    // slot 1 = Riker, slot 2 = Data
-    let hit = resolve_agent_ref("riker", &states).unwrap();
-    assert_eq!(hit.slot_id, 1);
-    let hit = resolve_agent_ref("DATA", &states).unwrap();
-    assert_eq!(hit.slot_id, 2);
-}
-
-#[test]
-fn resolves_la_forge_with_space() {
-    // Slot 4 is "La Forge" — the space matters for exact match.
-    let states = vec![live(4, "exec_d")];
-    let hit = resolve_agent_ref("la forge", &states).unwrap();
-    assert_eq!(hit.slot_id, 4);
-}
-
-#[test]
-fn unknown_reference_lists_live_candidates() {
-    let states = vec![live(1, "exec_a"), live(2, "exec_b")];
-    let err = resolve_agent_ref("Wesley", &states).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("no live worker matches"), "msg: {msg}");
-    assert!(msg.contains("Riker"), "msg: {msg}");
-    assert!(msg.contains("Data"), "msg: {msg}");
-}
-
-#[test]
-fn unknown_with_no_live_workers_says_so() {
-    let states: Vec<LiveWorkerState> = vec![];
-    let err = resolve_agent_ref("Riker", &states).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("no live workers"), "msg: {msg}");
-}
-
-#[test]
-fn run_id_takes_precedence_over_slot_match() {
-    // If a run_id happens to be the literal "1", the run_id tier
-    // wins before slot_id is even consulted (a defensive case
-    // since real run ids are not numeric strings).
-    let mut s1 = live(2, "1");
-    // Force a different slot so a slot match would resolve to a
-    // different worker; run_id "1" should still win.
-    s1.slot_id = 2;
-    let states = vec![s1, live(1, "exec_a")];
-    let hit = resolve_agent_ref("1", &states).unwrap();
-    assert_eq!(hit.run_id, "1");
-    assert_eq!(hit.slot_id, 2);
-}
+// NOTE: unit tests for the `agents.rs` reference-resolution and
+// candidate-formatting helpers (`resolve_agent_ref`, `pick_unique`,
+// `live_candidates_summary`, `looks_like_name_or_slot`,
+// `work_item_primary_id`) now live co-located in that module's own
+// `#[cfg(test)] mod tests` — see `agents.rs`. This crate-level module
+// keeps the tests for the `logs.rs` dispatch-tail helpers and the
+// bossctl-boundary `LiveWorkerState` serialization guard.
 
 fn ev(ts: u128, stage: &str, outcome: &str, exec: &str) -> DispatchEvent {
     DispatchEvent {
@@ -168,15 +111,6 @@ fn build_diagnose_json_returns_empty_events_when_none() {
     let json = build_diagnose_json("exec-missing", &[], &[]);
     assert_eq!(json["execution_id"], "exec-missing");
     assert!(json["events"].as_array().unwrap().is_empty());
-}
-
-#[test]
-fn looks_like_name_or_slot_recognises_roster_and_numbers() {
-    assert!(looks_like_name_or_slot("Riker"));
-    assert!(looks_like_name_or_slot("riker"));
-    assert!(looks_like_name_or_slot("La Forge"));
-    assert!(looks_like_name_or_slot("3"));
-    assert!(!looks_like_name_or_slot("exec_18ad6336fedcb190_12"));
 }
 
 /// Re-assert PR #340's invariant at the *bossctl* boundary — the
@@ -263,49 +197,4 @@ fn format_age_ms_crosses_into_days_at_24h() {
 fn format_age_ms_reports_multiple_days() {
     // 3 days of age.
     assert_eq!(format_age_ms(1_000, 259_201_000), "(3d ago)");
-}
-
-#[test]
-fn live_candidates_summary_empty_says_no_live_workers() {
-    let states: Vec<LiveWorkerState> = vec![];
-    assert_eq!(live_candidates_summary(&states), "no live workers");
-}
-
-#[test]
-fn live_candidates_summary_sorts_entries_by_slot_id() {
-    // Provide slots out of order so the sort is observable in the
-    // output: slot 3 appears before slot 1 in the input, but the
-    // summary must list slot 1 first.
-    let states = vec![live(3, "exec_c"), live(1, "exec_a")];
-    let s1 = boss_protocol::name_for_slot(1);
-    let s3 = boss_protocol::name_for_slot(3);
-    assert_eq!(
-        live_candidates_summary(&states),
-        format!("Live: slot 1 ({s1}), slot 3 ({s3})"),
-    );
-}
-
-#[test]
-fn pick_unique_returns_the_sole_match() {
-    let states = vec![live(1, "exec_a")];
-    let matches = vec![&states[0]];
-    let hit = pick_unique("riker", matches, &states).unwrap();
-    assert_eq!(hit.slot_id, 1);
-    assert_eq!(hit.run_id, "exec_a");
-}
-
-#[test]
-fn pick_unique_errors_and_enumerates_all_ambiguous_matches() {
-    let states = vec![live(1, "exec_a"), live(2, "exec_b")];
-    let matches: Vec<&LiveWorkerState> = states.iter().collect();
-    let err = pick_unique("opus", matches, &states).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("matches multiple live workers"), "msg: {msg}");
-    // Every ambiguous match is enumerated with slot, name and run id.
-    let s1 = boss_protocol::name_for_slot(1);
-    let s2 = boss_protocol::name_for_slot(2);
-    assert!(msg.contains(&format!("slot 1 ({s1}) run exec_a")), "msg: {msg}");
-    assert!(msg.contains(&format!("slot 2 ({s2}) run exec_b")), "msg: {msg}");
-    // The live-candidates summary is appended to the error.
-    assert!(msg.contains("Live: "), "msg: {msg}");
 }
