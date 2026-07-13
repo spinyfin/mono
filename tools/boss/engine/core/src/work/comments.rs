@@ -896,7 +896,17 @@ pub(crate) fn query_revisable_comments(
 /// Comment-intent-classification design §"Reconciliation".
 pub(crate) enum CommentReconcileOutcome {
     Resolved,
-    Reopened,
+    /// `include_resolved`: also match comments already `resolved` (not just
+    /// `in_revision`) — for a revision whose commit landed and resolved its
+    /// comments ahead of the chain root's own terminal state (see the
+    /// module-level doc on this transition in `record_worker_pr_completion`),
+    /// a later close-unmerged event must still reopen them. `false` for the
+    /// plain-chore vehicle: its own comments only ever resolve on a genuine
+    /// merge, so a late/duplicate close-unmerged sweep for that same task
+    /// must never undo it (`reopen_is_noop_once_already_resolved`).
+    Reopened {
+        include_resolved: bool,
+    },
 }
 
 /// Reconcile every comment claimed by `task_id`'s `[Revise]` batch
@@ -904,13 +914,23 @@ pub(crate) enum CommentReconcileOutcome {
 /// reaches a terminal state. Design
 /// `comment-triggered-document-revisions.md` §"Reconciliation":
 ///
-/// - `Resolved` (the task's PR merged): the requested change rode that
-///   PR, so mark the comment `resolved`. `revise_task_id` is deliberately
-///   left in place — it is the provenance trail of which batch addressed
-///   the comment (see [`WorkComment::revise_task_id`]'s doc comment).
+/// - `Resolved` — for a revision, fired the moment its commit lands on the
+///   chain root's PR branch (the vehicle reaches `in_review`); for the
+///   plain-chore vehicle, fired when the chore's own PR merges. Either way
+///   the requested change rode a real commit, so mark the comment
+///   `resolved`. `revise_task_id` is deliberately left in place — it is the
+///   provenance trail of which batch addressed the comment (see
+///   [`WorkComment::revise_task_id`]'s doc comment).
 /// - `Reopened` (the task was abandoned / its PR closed unmerged): the
 ///   requested change never shipped, so put the comment back on the
-///   `[Revise]` banner — `status='active'`, `revise_task_id` cleared.
+///   `[Revise]` banner — `status='active'`, `revise_task_id` cleared. With
+///   `include_resolved: true`, also matches comments already `resolved` by
+///   a revision's commit landing: if the chain root's PR later closes
+///   unmerged, that commit never made it to `main` either, so a comment
+///   resolved-by-landing must reopen just like one still sitting
+///   `in_revision` — the `revise_task_id` provenance this outcome never
+///   clears on the resolve side is exactly what makes these rows findable
+///   here.
 ///
 /// Deliberately does **not** touch `last_resolved_with`: despite the
 /// design doc's SQL sketch proposing `last_resolved_with='revise:<task_id>'`,
@@ -921,9 +941,9 @@ pub(crate) enum CommentReconcileOutcome {
 /// `revise_task_id` already carries the "which batch resolved this"
 /// provenance the design SQL was reaching for.
 ///
-/// Both arms are guarded on `status = 'in_revision'`, so calling this on a
-/// task that never claimed any comments — or re-firing on an
-/// already-reconciled task — is a no-op. Returns the number of comment
+/// `Resolved` is always guarded on `status = 'in_revision'`. Either way,
+/// calling this on a task that never claimed any comments — or re-firing on
+/// an already-reconciled task — is a no-op. Returns the number of comment
 /// rows changed (tests / logging).
 pub(crate) fn reconcile_comments_for_task(
     conn: &Connection,
@@ -943,18 +963,26 @@ pub(crate) fn reconcile_comments_for_task(
             ),
             params![task_id, now],
         )?,
-        CommentReconcileOutcome::Reopened => conn.execute(
-            &format!(
-                "UPDATE work_comments
-                 SET status = '{COMMENT_STATUS_ACTIVE}',
-                     revise_task_id = NULL,
-                     status_actor = 'engine',
-                     updated_at = ?2,
-                     dismissed_at = NULL
-                 WHERE revise_task_id = ?1 AND status = '{COMMENT_STATUS_IN_REVISION}'"
-            ),
-            params![task_id, now],
-        )?,
+        CommentReconcileOutcome::Reopened { include_resolved } => {
+            let status_filter = if include_resolved {
+                format!("status IN ('{COMMENT_STATUS_IN_REVISION}', '{COMMENT_STATUS_RESOLVED}')")
+            } else {
+                format!("status = '{COMMENT_STATUS_IN_REVISION}'")
+            };
+            conn.execute(
+                &format!(
+                    "UPDATE work_comments
+                     SET status = '{COMMENT_STATUS_ACTIVE}',
+                         revise_task_id = NULL,
+                         status_actor = 'engine',
+                         updated_at = ?2,
+                         dismissed_at = NULL
+                     WHERE revise_task_id = ?1
+                       AND {status_filter}"
+                ),
+                params![task_id, now],
+            )?
+        }
     };
     Ok(affected)
 }
