@@ -196,13 +196,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::*;
-    use crate::work::{AddDependencyInput, CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-
-    fn create_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
-            .unwrap()
-            .id
-    }
+    use crate::work::{AddDependencyInput, ExecutionStatus, WorkDb, WorkItemPatch};
 
     fn create_chore_no_autostart(db: &WorkDb, product_id: &str, name: &str) -> String {
         create_test_chore_manual(db, product_id, name).id
@@ -216,8 +210,8 @@ mod tests {
     async fn sweep_unblocks_dependent_when_prereq_done_without_cascade() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         // Wire dependency — auto-blocks the dependent.
         db.add_dependency(AddDependencyInput {
@@ -268,8 +262,8 @@ mod tests {
     async fn sweep_unblocks_when_actor_is_human_but_blocked_reason_is_dependency() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
@@ -307,8 +301,8 @@ mod tests {
     async fn cascade_unblocks_via_update_work_item_despite_human_actor() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
@@ -348,8 +342,8 @@ mod tests {
     async fn sweep_leaves_dependent_blocked_when_prereq_still_active() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
@@ -378,7 +372,7 @@ mod tests {
     async fn sweep_ignores_human_blocked_items_without_dependency_reason() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let task_id = create_chore(&db, &product_id, "manually-blocked");
+        let task_id = create_test_chore(&db, &product_id, "manually-blocked").id;
 
         // Block manually via the public API — last_status_actor='human', blocked_reason=NULL.
         db.update_work_item(
@@ -406,8 +400,8 @@ mod tests {
     async fn sweep_reports_unblock_in_outcome() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
@@ -435,8 +429,8 @@ mod tests {
     async fn sweep_promotes_stuck_todo_waiting_dependency_execution() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
@@ -493,8 +487,8 @@ mod tests {
     async fn gate_clear_with_live_execution_does_not_create_new_ready() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let prereq_id = create_chore(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
@@ -550,7 +544,7 @@ mod tests {
         // (which only scans autostart=1 tasks). This isolates the assertion to
         // dep only.
         let prereq_id = create_chore_no_autostart(&db, &product_id, "prereq");
-        let dep_id = create_chore(&db, &product_id, "dependent");
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
 
         db.add_dependency(AddDependencyInput {
             dependent: dep_id.clone(),
