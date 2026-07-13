@@ -629,6 +629,68 @@ impl WorkDb {
         Ok(None)
     }
 
+    /// Resolve a user-supplied `pr_doc:<repo>:<branch>:<path>` artifact id
+    /// to its stored form, accepting any git remote spelling for the repo
+    /// component — an `owner/repo` slug, an SSH remote
+    /// (`git@github.com:owner/repo.git`), or an HTTPS remote
+    /// (`https://github.com/owner/repo`) — not just the exact string
+    /// persisted at comment-creation time (always the full git remote
+    /// URL; see [`crate::design_detector`]). Compares canonicalized forms
+    /// at lookup time rather than rewriting stored keys.
+    ///
+    /// Falls back to `artifact_id` unchanged when it isn't a `pr_doc` key,
+    /// or when no stored `pr_doc` row's `(branch, path)` and repo are
+    /// equivalent to the ones supplied — the caller's subsequent query then
+    /// legitimately returns zero rows.
+    pub fn resolve_pr_doc_artifact_id(&self, artifact_id: &str) -> Result<String> {
+        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+            return Ok(artifact_id.to_owned());
+        };
+        for candidate in self.distinct_pr_doc_artifact_ids()? {
+            let Some((cand_repo, cand_branch, cand_path)) = parse_pr_doc_artifact_id(&candidate) else {
+                continue;
+            };
+            if cand_branch == branch && cand_path == path && repo_component_matches(&cand_repo, &repo) {
+                return Ok(candidate);
+            }
+        }
+        Ok(artifact_id.to_owned())
+    }
+
+    /// Find a stored `pr_doc` artifact id sharing `artifact_id`'s
+    /// `(branch, path)` but spelled with a repo component
+    /// [`resolve_pr_doc_artifact_id`] didn't recognise as equivalent —
+    /// e.g. a genuinely different git host, or a spelling outside the
+    /// slug/SSH/HTTPS forms it understands. Used to surface a "did you
+    /// mean" hint instead of a bare zero-rows result. Returns `None` when
+    /// `artifact_id` isn't a `pr_doc` key or no such row exists.
+    pub fn pr_doc_artifact_hint(&self, artifact_id: &str) -> Result<Option<String>> {
+        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+            return Ok(None);
+        };
+        for candidate in self.distinct_pr_doc_artifact_ids()? {
+            let Some((cand_repo, cand_branch, cand_path)) = parse_pr_doc_artifact_id(&candidate) else {
+                continue;
+            };
+            if cand_branch == branch && cand_path == path && cand_repo != repo {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every distinct `artifact_id` stored under `artifact_kind = 'pr_doc'`
+    /// in `work_comments`. Backing query for [`Self::resolve_pr_doc_artifact_id`]
+    /// / [`Self::pr_doc_artifact_hint`]; the table is small enough (one row
+    /// per commented-on doc) that scanning it beats trying to express repo
+    /// equivalence in SQL.
+    fn distinct_pr_doc_artifact_ids(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT artifact_id FROM work_comments WHERE artifact_kind = 'pr_doc'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
+    }
+
     /// List `in_review` tasks whose doc-branch pointer is `NULL` and whose
     /// PR is still open (unmerged), so a startup sweep can backfill the
     /// branch without waiting for the next PR event.
@@ -804,6 +866,24 @@ pub(crate) fn parse_pr_doc_artifact_id(artifact_id: &str) -> Option<(String, Str
     Some((repo.to_owned(), branch.to_owned(), path.to_owned()))
 }
 
+/// Returns `true` when `a` and `b` name the same git repo, regardless of
+/// which of the three shapes each is spelled in: a bare `owner/repo` slug,
+/// an SSH remote (`git@github.com:owner/repo.git`), or an HTTPS remote
+/// (`https://github.com/owner/repo`). `pr_doc` artifact ids always store
+/// the full remote URL (see [`crate::design_detector`]), but a slug is what
+/// every other surface (`gh`, PR links, chat) shows a human, so lookups
+/// need to accept either.
+fn repo_component_matches(a: &str, b: &str) -> bool {
+    use git_utils::repo_slug::{is_owner_name_slug, origin_path_matches_slug, origin_urls_equivalent};
+
+    match (is_owner_name_slug(a), is_owner_name_slug(b)) {
+        (true, true) => a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/'),
+        (true, false) => origin_path_matches_slug(b, a),
+        (false, true) => origin_path_matches_slug(a, b),
+        (false, false) => origin_urls_equivalent(a, b),
+    }
+}
+
 /// Build a [`DocOwner`] for `task_id`, applying the scope guard: `None`
 /// unless the task exists, is not soft-deleted, and is `kind ∈ {Design,
 /// Investigation}`.
@@ -932,5 +1012,118 @@ mod tests {
         assert_eq!(parse_pr_doc_artifact_id("pr_doc:r:b"), None);
         assert_eq!(parse_pr_doc_artifact_id("pr_doc:"), None);
         assert_eq!(parse_pr_doc_artifact_id("pr_doc::b:p.md"), None);
+    }
+
+    // ── repo_component_matches ──────────────────────────────────────────────
+
+    #[test]
+    fn repo_component_matches_slug_against_ssh_and_https() {
+        assert!(repo_component_matches(
+            "spinyfin/mono",
+            "git@github.com:spinyfin/mono.git"
+        ));
+        assert!(repo_component_matches(
+            "git@github.com:spinyfin/mono.git",
+            "spinyfin/mono"
+        ));
+        assert!(repo_component_matches(
+            "spinyfin/mono",
+            "https://github.com/spinyfin/mono"
+        ));
+    }
+
+    #[test]
+    fn repo_component_matches_rejects_different_repos() {
+        assert!(!repo_component_matches(
+            "spinyfin/mono",
+            "git@github.com:other/repo.git"
+        ));
+        assert!(!repo_component_matches("spinyfin/mono", "spinyfin/other"));
+    }
+
+    #[test]
+    fn repo_component_matches_url_forms_ignoring_auth_prefix() {
+        assert!(repo_component_matches(
+            "git@github.com:spinyfin/mono.git",
+            "org-123@github.com:spinyfin/mono.git",
+        ));
+    }
+
+    // ── resolve_pr_doc_artifact_id / pr_doc_artifact_hint ───────────────────
+
+    fn mem_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn comment_input(artifact_id: &str) -> CreateCommentInput {
+        CreateCommentInput {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "a comment body".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 1,
+        }
+    }
+
+    #[test]
+    fn resolve_pr_doc_artifact_id_accepts_slug_for_ssh_stored_key() {
+        let db = mem_db();
+        let stored = "pr_doc:git@github.com:spinyfin/mono.git:boss/exec_x:docs/foo.md";
+        db.create_comment(comment_input(stored)).unwrap();
+
+        let resolved = db
+            .resolve_pr_doc_artifact_id("pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md")
+            .unwrap();
+        assert_eq!(resolved, stored);
+    }
+
+    #[test]
+    fn resolve_pr_doc_artifact_id_falls_back_when_no_row_matches() {
+        let db = mem_db();
+        let queried = "pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md";
+        assert_eq!(db.resolve_pr_doc_artifact_id(queried).unwrap(), queried);
+    }
+
+    #[test]
+    fn resolve_pr_doc_artifact_id_passes_non_pr_doc_ids_through() {
+        let db = mem_db();
+        assert_eq!(
+            db.resolve_pr_doc_artifact_id("work_item:task-1").unwrap(),
+            "work_item:task-1"
+        );
+    }
+
+    #[test]
+    fn pr_doc_artifact_hint_names_the_stored_key_on_a_repo_spelling_mismatch() {
+        let db = mem_db();
+        let stored = "pr_doc:git@github.com:spinyfin/mono.git:boss/exec_x:docs/foo.md";
+        db.create_comment(comment_input(stored)).unwrap();
+
+        // A repo spelling `resolve_pr_doc_artifact_id` can't canonicalize
+        // (not a github.com URL and not a slug) still gets a hint pointing
+        // at the row that shares branch + path.
+        let hint = db
+            .pr_doc_artifact_hint("pr_doc:ssh://git@example.com/spinyfin/mono:boss/exec_x:docs/foo.md")
+            .unwrap();
+        assert_eq!(hint.as_deref(), Some(stored));
+    }
+
+    #[test]
+    fn pr_doc_artifact_hint_is_none_when_nothing_shares_branch_and_path() {
+        let db = mem_db();
+        db.create_comment(comment_input(
+            "pr_doc:git@github.com:spinyfin/mono.git:main:docs/other.md",
+        ))
+        .unwrap();
+        let hint = db
+            .pr_doc_artifact_hint("pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md")
+            .unwrap();
+        assert_eq!(hint, None);
     }
 }
