@@ -10,11 +10,10 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use boss_engine::work::WorkDb;
 use boss_protocol::{AnswerAgentRun, CommentWithThread, WorkComment};
 use clap::Subcommand;
 
-use super::resolve_db_path;
+use super::open_state_db;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum CommentsAction {
@@ -88,8 +87,7 @@ pub(crate) fn comments_list(
     include_resolved: bool,
 ) -> Result<()> {
     let (kind, id) = resolve_comments_artifact(task, artifact, artifact_kind)?;
-    let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = open_state_db(state_root)?;
     let comments = db
         .list_comments_with_thread(&kind, &id, include_resolved)
         .context("listing comments")?;
@@ -140,8 +138,7 @@ fn print_comment_with_thread_short(entry: &CommentWithThread) {
 /// against it (folding in what `bossctl comments runs` shows standalone).
 /// Opens `state.db` directly via [`resolve_db_path`].
 pub(crate) fn comments_show(json: bool, state_root: Option<PathBuf>, comment_id: &str) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = open_state_db(state_root)?;
     let comment = db
         .get_comment(comment_id)
         .context("fetching comment")?
@@ -237,8 +234,7 @@ fn print_answer_agent_runs(runs: &[AnswerAgentRun]) {
 /// `bossctl comments runs` — every `answer_agent_runs` row for a comment,
 /// oldest first. Opens `state.db` directly via [`resolve_db_path`].
 pub(crate) fn comments_runs(json: bool, state_root: Option<PathBuf>, comment_id: &str) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let db = open_state_db(state_root)?;
     db.get_comment(comment_id)
         .context("fetching comment")?
         .ok_or_else(|| anyhow::anyhow!("unknown comment: {comment_id}"))?;
