@@ -19,6 +19,33 @@ impl WorkDb {
             .and_then(|t| t.pr_url)
             .filter(|u| !u.is_empty())
     }
+
+    /// True when `task` is "design-family" for the Fable-tier dispatch
+    /// floor (policy addendum, 2026-07-13): its own kind is `design` or
+    /// `investigation`, or — transitively — it is a `revision` whose chain
+    /// root (the first non-revision ancestor, see [`chain_root`]) has kind
+    /// `design` or `investigation`. Any other kind, or a `revision` with a
+    /// broken/missing parent link, is not design-family.
+    pub(crate) fn is_design_family(&self, task: &Task) -> Result<bool> {
+        if matches!(task.kind, TaskKind::Design | TaskKind::Investigation) {
+            return Ok(true);
+        }
+        if task.kind != TaskKind::Revision {
+            return Ok(false);
+        }
+        let conn = self.connect()?;
+        let root_id = chain_root(&conn, &task.id)?;
+        if root_id == task.id {
+            // chain_root didn't walk anywhere: broken/missing parent link.
+            return Ok(false);
+        }
+        let root_kind: Option<String> = conn
+            .query_row("SELECT kind FROM tasks WHERE id = ?1", params![root_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(matches!(root_kind.as_deref(), Some("design") | Some("investigation")))
+    }
 }
 
 /// Return the id of the most-recently-created non-done revision that is a
@@ -407,6 +434,22 @@ pub(crate) fn attach_ai_reviewing_flag(
     Ok(())
 }
 
+/// Default `effort_level` for a revision the caller didn't supply one for.
+///
+/// Design-family chain roots (`design`/`investigation`) default to `large`
+/// so the resolved `effort_level` is never a hand-set-looking sub-`large`
+/// value on a row nobody actually demoted — the Fable-tier dispatch floor
+/// (`resolve_spawn_config_with_family_floor`) only treats a sub-`large`
+/// level as an opt-out when it is hand-set, and this default must never be
+/// mistaken for one. Every other chain root keeps the original `small`
+/// default (revision-tasks.md §Q7).
+fn default_revision_effort_level(root_kind: &TaskKind) -> &'static str {
+    match root_kind {
+        TaskKind::Design | TaskKind::Investigation => "large",
+        _ => "small",
+    }
+}
+
 // ── revision name helpers ────────────────────────────────────────────────────
 
 /// Extract a short display name from a revision description.
@@ -460,10 +503,12 @@ pub(crate) fn insert_revision_in_tx(
         bail!("revision description must be non-empty");
     }
     let priority = normalize_priority(input.priority.as_deref())?;
-    let effort_level = input
-        .effort_level
-        .map(|l| l.as_str().to_owned())
-        .or_else(|| Some("small".to_owned())); // revision-tasks.md §Q7: default small
+    let effort_level = Some(
+        input
+            .effort_level
+            .map(|l| l.as_str().to_owned())
+            .unwrap_or_else(|| default_revision_effort_level(&root.kind).to_owned()),
+    );
     let model_override = normalize_model_override(input.model_override);
     let driver = normalize_model_override(input.driver);
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");

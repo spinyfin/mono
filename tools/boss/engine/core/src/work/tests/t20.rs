@@ -1522,3 +1522,214 @@ fn reconcile_does_not_create_duplicate_execution_for_running_revision() {
     );
     assert_eq!(task_status(&db, &revision_id), "active");
 }
+
+// Design-family Fable-tier dispatch floor (policy addendum, 2026-07-13):
+// `WorkDb::is_design_family` lineage-walking, and `create_revision`'s
+// default `effort_level` derivation for design-family chain roots. The
+// dispatch-floor precedence itself (model resolution, hand-set-vs-heuristic
+// opt-out) is covered by the `effort.rs` unit tests
+// (`resolve_spawn_config_with_family_floor`); these tests cover the two
+// pieces that need a real `WorkDb`: lineage discovery and revision-create
+// defaulting.
+
+/// Create a project (auto-creating its `kind=design` seed task), mark that
+/// design task "in review" with `pr_url`, and return the design task's id —
+/// a design-family revision-chain-root fixture.
+fn make_in_review_design_task(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+    let project = db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product_id)
+                .name("Design-family fixture project")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let design = db
+        .list_tasks(product_id, Some(&project.id), None, false)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.kind == TaskKind::Design)
+        .expect("project should have an auto-created design task");
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+        params![design.id, pr_url],
+    )
+    .unwrap();
+    design.id
+}
+
+/// Create an `investigation` task, mark it "in review" with `pr_url`, and
+/// return its id — the other design-family kind, product-scoped (no
+/// project needed).
+fn make_in_review_investigation(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+    let task = db
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product_id)
+                .name("Investigation fixture")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+        params![task.id, pr_url],
+    )
+    .unwrap();
+    task.id
+}
+
+// ── WorkDb::is_design_family ────────────────────────────────────────────────
+
+#[test]
+fn is_design_family_true_for_direct_design_and_investigation_tasks() {
+    let db = WorkDb::open(temp_db_path("family-direct")).unwrap();
+    let product_id = make_revision_product(&db, "family-direct");
+
+    let design_id = make_in_review_design_task(&db, &product_id, "https://github.com/spinyfin/mono/pull/900");
+    let design = query_task(&db.connect().unwrap(), &design_id).unwrap().unwrap();
+    assert!(db.is_design_family(&design).unwrap(), "a design task is design-family");
+
+    let investigation_id = make_in_review_investigation(&db, &product_id, "https://github.com/spinyfin/mono/pull/901");
+    let investigation = query_task(&db.connect().unwrap(), &investigation_id).unwrap().unwrap();
+    assert!(
+        db.is_design_family(&investigation).unwrap(),
+        "an investigation task is design-family"
+    );
+}
+
+#[test]
+fn is_design_family_false_for_plain_chore() {
+    let db = WorkDb::open(temp_db_path("family-chore")).unwrap();
+    let product_id = make_revision_product(&db, "family-chore");
+    let chore = create_test_chore_manual(&db, &product_id, "Ordinary chore");
+    assert!(!db.is_design_family(&chore).unwrap());
+}
+
+#[test]
+fn is_design_family_true_transitively_through_revision_chain() {
+    let db = WorkDb::open(temp_db_path("family-lineage")).unwrap();
+    let product_id = make_revision_product(&db, "family-lineage");
+    let design_id = make_in_review_design_task(&db, &product_id, "https://github.com/spinyfin/mono/pull/910");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    // R1: revision of the design task.
+    let r1 = db.create_revision(revision_input(&design_id), &checker).unwrap();
+    assert!(
+        db.is_design_family(&r1).unwrap(),
+        "a revision of a design task is design-family"
+    );
+
+    // R2: revision of R1 — lineage walk must go two hops deep.
+    let r2 = db.create_revision(revision_input(&r1.id), &checker).unwrap();
+    assert!(
+        db.is_design_family(&r2).unwrap(),
+        "a revision of a revision of a design task is design-family"
+    );
+}
+
+#[test]
+fn is_design_family_false_for_revision_of_ordinary_chore() {
+    let db = WorkDb::open(temp_db_path("family-lineage-chore")).unwrap();
+    let product_id = make_revision_product(&db, "family-lineage-chore");
+    let pr_url = "https://github.com/spinyfin/mono/pull/911";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&chore_id), &checker).unwrap();
+    assert!(
+        !db.is_design_family(&revision).unwrap(),
+        "a revision of an ordinary chore is not design-family"
+    );
+}
+
+// ── create_revision: design-family default effort ──────────────────────────
+
+#[test]
+fn create_revision_defaults_to_large_effort_for_design_task_parent() {
+    let db = WorkDb::open(temp_db_path("default-large-design")).unwrap();
+    let product_id = make_revision_product(&db, "default-large-design");
+    let design_id = make_in_review_design_task(&db, &product_id, "https://github.com/spinyfin/mono/pull/920");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&design_id), &checker).unwrap();
+    assert_eq!(
+        revision.effort_level,
+        Some(boss_protocol::EffortLevel::Large),
+        "a revision of a design task with no explicit --effort defaults to large"
+    );
+}
+
+#[test]
+fn create_revision_defaults_to_large_effort_for_investigation_parent() {
+    let db = WorkDb::open(temp_db_path("default-large-investigation")).unwrap();
+    let product_id = make_revision_product(&db, "default-large-investigation");
+    let investigation_id = make_in_review_investigation(&db, &product_id, "https://github.com/spinyfin/mono/pull/921");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&investigation_id), &checker).unwrap();
+    assert_eq!(
+        revision.effort_level,
+        Some(boss_protocol::EffortLevel::Large),
+        "a revision of an investigation task with no explicit --effort defaults to large"
+    );
+}
+
+#[test]
+fn create_revision_of_revision_of_design_task_still_defaults_to_large() {
+    let db = WorkDb::open(temp_db_path("default-large-chain")).unwrap();
+    let product_id = make_revision_product(&db, "default-large-chain");
+    let design_id = make_in_review_design_task(&db, &product_id, "https://github.com/spinyfin/mono/pull/922");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let r1 = db.create_revision(revision_input(&design_id), &checker).unwrap();
+    assert_eq!(r1.effort_level, Some(boss_protocol::EffortLevel::Large));
+
+    let r2 = db.create_revision(revision_input(&r1.id), &checker).unwrap();
+    assert_eq!(
+        r2.effort_level,
+        Some(boss_protocol::EffortLevel::Large),
+        "a revision-of-a-revision of a design task still defaults to large"
+    );
+}
+
+#[test]
+fn create_revision_explicit_effort_overrides_design_family_default() {
+    // T289's regression: an explicit --effort must always win over the
+    // design-family default, on either side (up or down).
+    let db = WorkDb::open(temp_db_path("explicit-overrides-default")).unwrap();
+    let product_id = make_revision_product(&db, "explicit-overrides-default");
+    let design_id = make_in_review_design_task(&db, &product_id, "https://github.com/spinyfin/mono/pull/923");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let input = CreateRevisionInput::builder()
+        .parent_task_id(design_id)
+        .description("mechanical doc-typo fix")
+        .effort_level(boss_protocol::EffortLevel::Small)
+        .build();
+    let revision = db.create_revision(input, &checker).unwrap();
+    assert_eq!(
+        revision.effort_level,
+        Some(boss_protocol::EffortLevel::Small),
+        "an explicit --effort on a design-family revision must be stored verbatim"
+    );
+}
+
+#[test]
+fn create_revision_still_defaults_to_small_for_non_design_family_parent() {
+    // Regression guard: the design-family carve-out must not change the
+    // existing default for ordinary chore/task parents (revision-tasks.md
+    // §Q7). Covered indirectly by `create_revision_inherits_product_and_project_from_root`;
+    // pinned here explicitly next to the design-family cases for contrast.
+    let db = WorkDb::open(temp_db_path("default-small-unchanged")).unwrap();
+    let product_id = make_revision_product(&db, "default-small-unchanged");
+    let pr_url = "https://github.com/spinyfin/mono/pull/924";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&chore_id), &checker).unwrap();
+    assert_eq!(revision.effort_level, Some(boss_protocol::EffortLevel::Small));
+}
