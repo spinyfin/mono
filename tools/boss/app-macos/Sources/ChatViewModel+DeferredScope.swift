@@ -42,4 +42,19 @@ extension ChatViewModel {
         else { return }
         engine.sendListDeferredScopeAttentions(productId: productID)
     }
+
+    /// Dispatches the deferred-scope-related `EngineEvent` cases delegated
+    /// from `ChatViewModel.handle(_:)`'s main switch.
+    func handleDeferredScopeEvent(_ event: EngineEvent) {
+        switch event {
+        case .attentionItemCreated(let item), .attentionItemUpdated(let item):
+            handleDeferredScopeAttentionLivePush(item)
+        case .attentionItemConverted(let item, _):
+            handleDeferredScopeAttentionLivePush(item)
+        case .deferredScopeAttentionsList(let productID, let items):
+            deferredScopeAttentionsByProductID[productID] = items
+        default:
+            break
+        }
+    }
 }

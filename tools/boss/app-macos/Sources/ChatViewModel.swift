@@ -2338,14 +2338,8 @@ final class ChatViewModel: ObservableObject {
             engine.sendListCiRemediations(limit: 200)
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
-        case .attentionItemCreated(let item):
-            handleDeferredScopeAttentionLivePush(item)
-        case .attentionItemUpdated(let item):
-            handleDeferredScopeAttentionLivePush(item)
-        case .attentionItemConverted(let item, _):
-            handleDeferredScopeAttentionLivePush(item)
-        case .deferredScopeAttentionsList(let productID, let items):
-            deferredScopeAttentionsByProductID[productID] = items
+        case .attentionItemCreated, .attentionItemUpdated, .attentionItemConverted, .deferredScopeAttentionsList:
+            handleDeferredScopeEvent(event)
         case .plannerRunsList(let projectID, let runs):
             plannerRunsByProjectID[projectID] = runs
         case .releaseProjectResult(let projectID, _, _):
