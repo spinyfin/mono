@@ -239,12 +239,9 @@ pub const HEARTBEAT_CUBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// falling back to [`DEFAULT_HEARTBEAT_INTERVAL`]. A zero or unparseable
 /// value falls back to the default (a zero interval would busy-loop).
 pub fn heartbeat_interval() -> Duration {
-    std::env::var(HEARTBEAT_INTERVAL_SECS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+    // A zero interval would busy-loop, so require ≥ 1 s; anything below the
+    // guard (including a `0`) falls back to the default.
+    crate::env_parse::env_duration_secs_min(HEARTBEAT_INTERVAL_SECS_ENV, DEFAULT_HEARTBEAT_INTERVAL, 1)
 }
 
 /// Counts from one heartbeat pass; logged at `info` when activity occurs.
