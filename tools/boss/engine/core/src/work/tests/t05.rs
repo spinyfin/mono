@@ -1188,6 +1188,72 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
     let _ = std::fs::remove_file(path);
 }
 
+/// One-time cleanup migration (mono#58-shown-for-4): a terminal (`done`/
+/// `archived`) row that still carries `merge_queue_state = 'queued'` from
+/// before terminal transitions started clearing that column must be reset
+/// to `NULL` on the next DB open; a live (`in_review`) row's queue state
+/// must survive untouched.
+#[test]
+fn migrate_clear_merge_queue_state_on_terminal_tasks_clears_orphans_preserves_live() {
+    let (_dir, path) = disk_db_path("migration-clear-merge-queue-orphans");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    let product = create_test_product_with_repo(&db, "Foo", Some("git@example.com:foo.git"));
+
+    let seed = |id: &str, status: &str| {
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, merge_queue_state, merge_queue_detail)
+             VALUES (?1, ?2, NULL, 'chore', ?3, '', ?4, NULL, NULL, NULL, ?5, ?5, 0, 'medium', 'test', 'queued', '{\"position\":1}')",
+            params![id, product.id, format!("chore-{status}"), status, now],
+        ).unwrap();
+    };
+    let done_id = next_id("task");
+    seed(&done_id, "done");
+    let archived_id = next_id("task");
+    seed(&archived_id, "archived");
+    let cancelled_id = next_id("task");
+    seed(&cancelled_id, "cancelled");
+    let live_id = next_id("task");
+    seed(&live_id, "in_review");
+
+    drop(conn);
+    let db2 = WorkDb::open(path.clone()).unwrap();
+    let conn2 = db2.connect().unwrap();
+
+    let read_queue = |id: &str| -> (Option<String>, Option<String>) {
+        conn2
+            .query_row(
+                "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    for id in [&done_id, &archived_id, &cancelled_id] {
+        let (state, detail) = read_queue(id);
+        assert!(state.is_none(), "terminal row {id} must have merge_queue_state cleared");
+        assert!(
+            detail.is_none(),
+            "terminal row {id} must have merge_queue_detail cleared"
+        );
+    }
+    let (live_state, live_detail) = read_queue(&live_id);
+    assert_eq!(
+        live_state.as_deref(),
+        Some("queued"),
+        "a live (in_review) row's merge_queue_state must survive the cleanup migration"
+    );
+    assert!(
+        live_detail.is_some(),
+        "a live row's merge_queue_detail must survive the cleanup migration"
+    );
+
+    drop(conn2);
+    let _ = std::fs::remove_file(path);
+}
+
 /// Two threads creating chores against the same `WorkDb` (and the
 /// same product) must each get a distinct `short_id`. The
 /// allocator is wrapped in SQLite's per-write serialisation

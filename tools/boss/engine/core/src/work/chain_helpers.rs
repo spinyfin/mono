@@ -259,7 +259,9 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
-                     deleted_at        = ?2
+                     deleted_at        = ?2,
+                     merge_queue_state  = NULL,
+                     merge_queue_detail = NULL
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -339,7 +341,9 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
-                     deleted_at        = ?2
+                     deleted_at        = ?2,
+                     merge_queue_state  = NULL,
+                     merge_queue_detail = NULL
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",

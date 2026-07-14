@@ -250,6 +250,74 @@ fn merged_is_noop_for_terminal_or_deleted_task() {
     );
 }
 
+/// A task that reached `done`/`archived` while still carrying
+/// `merge_queue_state = 'queued'` (e.g. via a terminal-transition path that
+/// predates clearing merge-queue columns) must have those columns cleared
+/// even on the no-op (`None`-returning) idempotent path — otherwise the
+/// orphaned row permanently inflates `list_queued_merge_queue_members`'s
+/// membership set and every live card's renumbered position
+/// (mono#58-shown-for-4). Deleted rows are deliberately out of scope: the
+/// merge path already leaves deleted rows untouched in every other respect.
+#[test]
+fn merged_clears_stale_merge_queue_state_on_already_terminal_task() {
+    let pr_url = "https://github.com/spinyfin/mono/pull/802";
+
+    let db = WorkDb::open(temp_db_path("merged-noop-clears-queue-done")).unwrap();
+    let done_id = make_done_chore(&db, &make_revision_product(&db, "merged-done-queue"), pr_url);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET merge_queue_state = 'queued', merge_queue_detail = '{\"position\":1}' WHERE id = ?1",
+            params![done_id],
+        )
+        .unwrap();
+    assert!(db.mark_chore_pr_merged(&done_id, pr_url).unwrap().is_none());
+    let conn = db.connect().unwrap();
+    let (state, detail): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            [&done_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        state.is_none(),
+        "already-done idempotent path must clear merge_queue_state"
+    );
+    assert!(
+        detail.is_none(),
+        "already-done idempotent path must clear merge_queue_detail"
+    );
+    drop(conn);
+
+    let arch_id = make_in_review_chore(&db, &make_revision_product(&db, "merged-arch-queue"), pr_url);
+    set_archived(&db, &arch_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET merge_queue_state = 'queued', merge_queue_detail = '{\"position\":1}' WHERE id = ?1",
+            params![arch_id],
+        )
+        .unwrap();
+    assert!(db.mark_chore_pr_merged(&arch_id, pr_url).unwrap().is_none());
+    let conn = db.connect().unwrap();
+    let (state, detail): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            [&arch_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        state.is_none(),
+        "already-archived idempotent path must clear merge_queue_state"
+    );
+    assert!(
+        detail.is_none(),
+        "already-archived idempotent path must clear merge_queue_detail"
+    );
+}
+
 // ── advance_pending_review_task_to_in_review ────────────────────────────────
 
 /// Put a chore into `active` (Doing) with a bound PR url — the state the

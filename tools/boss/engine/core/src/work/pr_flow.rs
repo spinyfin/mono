@@ -652,6 +652,22 @@ impl WorkDb {
             return Ok(None);
         }
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
+            // Already terminal — no status transition, but a task that
+            // reached done/archived via a path that predates (or missed)
+            // clearing merge_queue_state would otherwise sit forever in
+            // `list_queued_merge_queue_members`'s membership set and
+            // inflate every live card's renumbered position. Clear it here
+            // too so a late-arriving merge-poller observation of an
+            // already-terminal task self-heals the orphan.
+            tx.execute(
+                "UPDATE tasks
+                 SET merge_queue_state  = NULL,
+                     merge_queue_detail = NULL
+                 WHERE id = ?1
+                   AND merge_queue_state IS NOT NULL",
+                params![task.id],
+            )?;
+            tx.commit()?;
             return Ok(None);
         }
         let now = now_string();
@@ -973,6 +989,7 @@ impl WorkDb {
              FROM tasks
              WHERE product_id = ?1
                AND merge_queue_state = 'queued'
+               AND status NOT IN ('done', 'archived', 'cancelled')
                AND deleted_at IS NULL",
         )?;
         let rows = stmt.query_map(params![product_id], |row| {

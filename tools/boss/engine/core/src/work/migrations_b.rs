@@ -1966,3 +1966,24 @@ pub(crate) fn migrate_conflict_resolutions_telemetry_columns(conn: &Connection) 
     }
     Ok(())
 }
+
+/// One-time cleanup for orphaned `merge_queue_state = 'queued'` rows left
+/// behind by terminal transitions (done/archived paths in `exec_tail.rs`,
+/// `chain_helpers.rs`, `dispatch_helpers.rs`) that predated clearing
+/// `merge_queue_state`/`merge_queue_detail` on the way to a terminal status.
+/// `list_queued_merge_queue_members` now also guards on status, so these
+/// orphans can no longer inflate `renumber_merge_queue`'s ranking — but the
+/// dead rows shouldn't keep stale `queued` state forever, so snap them back
+/// to `NULL` immediately after deploy rather than waiting for each row's own
+/// next (never-arriving) terminal transition.
+pub(crate) fn migrate_clear_merge_queue_state_on_terminal_tasks(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET merge_queue_state = NULL,
+             merge_queue_detail = NULL
+         WHERE merge_queue_state IS NOT NULL
+           AND status IN ('done', 'archived', 'cancelled')",
+        [],
+    )?;
+    Ok(())
+}

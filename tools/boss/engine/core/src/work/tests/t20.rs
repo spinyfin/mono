@@ -59,6 +59,49 @@ fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
     assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
 }
 
+/// A revision archived because its parent PR merged (the non-moot,
+/// convert-to-chore path) must not leave a stale `merge_queue_state` behind —
+/// otherwise the archived-but-`queued` row permanently inflates
+/// `list_queued_merge_queue_members`'s membership set and every live card's
+/// renumbered position (mono#58-shown-for-4).
+#[test]
+fn mark_chore_pr_merged_clears_merge_queue_state_on_converted_revision() {
+    let db = WorkDb::open(temp_db_path("rev-convert-clears-queue")).unwrap();
+    let product_id = make_revision_product(&db, "conv-todo-queue");
+    let pr_url = "https://github.com/spinyfin/mono/pull/807";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET merge_queue_state = 'queued', merge_queue_detail = '{\"position\":1}' WHERE id = ?1",
+        rusqlite::params![revision.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    let conn = db.connect().unwrap();
+    let (state, detail): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            [&revision.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        state.is_none(),
+        "revision converted to standalone chore must have merge_queue_state cleared"
+    );
+    assert!(
+        detail.is_none(),
+        "revision converted to standalone chore must have merge_queue_detail cleared"
+    );
+}
+
 /// A revision already in `in_review` must be flipped to `done` (not
 /// `blocked`) — it delivered its commit before the parent merged.
 #[test]
@@ -174,6 +217,42 @@ fn mark_chore_pr_merged_retires_moot_merge_conflict_revision() {
         !tree.tasks.iter().any(|t| t.id == rev_id),
         "archived moot revision must not appear in get_work_tree output (kanban board data)",
     );
+}
+
+/// A moot revision archived silently on parent-PR-merge must not leave a
+/// stale `merge_queue_state` behind — mirrors
+/// `mark_chore_pr_merged_clears_merge_queue_state_on_converted_revision` but
+/// for the moot (silent-archive) branch instead of the convert-to-chore one.
+#[test]
+fn mark_chore_pr_merged_clears_merge_queue_state_on_moot_revision() {
+    let db = WorkDb::open(temp_db_path("rev-moot-clears-queue")).unwrap();
+    let product_id = make_revision_product(&db, "moot-crz-queue");
+    let pr_url = "https://github.com/spinyfin/mono/pull/821";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let crz_id = "crz_fake_for_moot_queue_test";
+    let rev_id = insert_conflict_revision_row(&db, &product_id, &parent_id, crz_id);
+
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET merge_queue_state = 'queued', merge_queue_detail = '{\"position\":1}' WHERE id = ?1",
+        rusqlite::params![rev_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    let conn = db.connect().unwrap();
+    let (state, detail): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            [&rev_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(state.is_none(), "moot revision archive must clear merge_queue_state");
+    assert!(detail.is_none(), "moot revision archive must clear merge_queue_detail");
 }
 
 /// A CI-fix revision is moot by construction — the PR cannot merge while CI

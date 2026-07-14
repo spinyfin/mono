@@ -644,7 +644,9 @@ pub(crate) fn reconcile_revision_execution(
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
-                     deleted_at        = ?2
+                     deleted_at        = ?2,
+                     merge_queue_state  = NULL,
+                     merge_queue_detail = NULL
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -696,7 +698,9 @@ pub(crate) fn reconcile_revision_execution(
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
-                     deleted_at        = ?2
+                     deleted_at        = ?2,
+                     merge_queue_state  = NULL,
+                     merge_queue_detail = NULL
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -1960,6 +1964,70 @@ mod tests {
             deleted_at.is_some(),
             "dispatch-time catch-up archive must also tombstone the row, matching \
              block_pending_revisions_on_parent_close"
+        );
+    }
+
+    /// A revision that slipped through with `merge_queue_state = 'queued'`
+    /// still set (e.g. it briefly entered GitHub's merge queue before the
+    /// parent chore's own merge made it moot) must not leave that state
+    /// behind when archived at dispatch-time catch-up — otherwise it
+    /// permanently inflates `list_queued_merge_queue_members`'s membership
+    /// set and every live card's renumbered position (mono#58-shown-for-4).
+    #[test]
+    fn reconcile_revision_execution_clears_merge_queue_state_on_moot_archive() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+
+        let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', pr_url = 'https://github.com/spinyfin/mono/pull/56' WHERE id = ?1",
+                params![chore_id],
+            )
+            .unwrap();
+
+        let revision_id = next_id("task");
+        let now = now_string();
+        let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}rem_queued");
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+                 created_at, updated_at, parent_task_id, autostart, priority, created_via, \
+                 merge_queue_state, merge_queue_detail) \
+                 VALUES (?1, ?2, 'revision', 'Rev', '', 'todo', ?3, ?3, ?4, 1, 'medium', ?5, \
+                 'queued', '{\"position\":1,\"state\":\"QUEUED\"}')",
+                params![revision_id, product, now, chore_id, created_via],
+            )
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        let revision_task = query_task(&conn, &revision_id)
+            .unwrap()
+            .expect("revision task must exist");
+        let mut result = ExecutionReconcileResult::default();
+        {
+            let mut conn2 = db.connect().unwrap();
+            let tx = conn2.transaction().unwrap();
+            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let (merge_queue_state, merge_queue_detail): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+                params![revision_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            merge_queue_state.is_none(),
+            "moot-revision archive at dispatch-time catch-up must clear merge_queue_state"
+        );
+        assert!(
+            merge_queue_detail.is_none(),
+            "moot-revision archive at dispatch-time catch-up must clear merge_queue_detail"
         );
     }
 

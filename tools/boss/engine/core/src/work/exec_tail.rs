@@ -489,7 +489,9 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
-                 completed_at       = COALESCE(completed_at, ?2)
+                 completed_at       = COALESCE(completed_at, ?2),
+                 merge_queue_state  = NULL,
+                 merge_queue_detail = NULL
              WHERE id = ?1
                AND status NOT IN ('done', 'archived')
                AND deleted_at IS NULL",

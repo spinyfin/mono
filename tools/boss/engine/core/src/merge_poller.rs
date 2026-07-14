@@ -9878,6 +9878,63 @@ mod tests {
         );
     }
 
+    /// Regression (mono#58-shown-for-4): a terminal (`done`/`archived`) task
+    /// that still carries `merge_queue_state = 'queued'` — an orphan left
+    /// behind by a terminal transition that predates clearing merge-queue
+    /// columns — must be excluded from `list_queued_merge_queue_members`'s
+    /// membership set entirely, so it can never occupy a rank and inflate
+    /// the live cards' positions, even before any cleanup pass has run.
+    #[tokio::test]
+    async fn renumber_merge_queue_excludes_orphaned_terminal_rows() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "RenumberOrphan", Some("git@github.com:foo/bar.git"));
+        let live_a = chore_in_review_for_product(&db, &product.id, "LiveA", "https://github.com/foo/bar/pull/1");
+        let live_b = chore_in_review_for_product(&db, &product.id, "LiveB", "https://github.com/foo/bar/pull/2");
+        let orphan_done =
+            chore_in_review_for_product(&db, &product.id, "OrphanDone", "https://github.com/foo/bar/pull/3");
+        let orphan_archived =
+            chore_in_review_for_product(&db, &product.id, "OrphanArchived", "https://github.com/foo/bar/pull/4");
+
+        // Fifty-six-orphans-style setup: the orphans were enqueued earliest,
+        // so an unguarded query would rank them #1/#2 and push the two live
+        // members to #3/#4 — mirroring the reported #58-for-a-4-deep-queue bug.
+        seed_queued(&db, &orphan_done, Some(1), "2026-07-15T09:00:00Z", "QUEUED");
+        seed_queued(&db, &orphan_archived, Some(2), "2026-07-15T09:01:00Z", "QUEUED");
+        seed_queued(&db, &live_a, Some(3), "2026-07-15T10:00:00Z", "QUEUED");
+        seed_queued(&db, &live_b, Some(4), "2026-07-15T10:01:00Z", "QUEUED");
+
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done' WHERE id = ?1",
+                rusqlite::params![orphan_done],
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'archived' WHERE id = ?1",
+                rusqlite::params![orphan_archived],
+            )
+            .unwrap();
+
+        let publisher = RecordingPublisher::default();
+        renumber_merge_queue(&db, &publisher, &product.id).await;
+
+        let (_, live_a_detail) = merge_queue_columns(&db, &live_a);
+        let (_, live_b_detail) = merge_queue_columns(&db, &live_b);
+        assert_eq!(
+            live_a_detail["position"],
+            serde_json::json!(1),
+            "the earliest-enqueued LIVE member must become #1, not #3"
+        );
+        assert_eq!(
+            live_b_detail["position"],
+            serde_json::json!(2),
+            "the second live member must become #2, not #4"
+        );
+    }
+
     /// End-to-end regression through the real wiring: a mid-queue member
     /// leaving the queue (fails, GitHub dequeues it) must immediately
     /// renumber its still-queued siblings via `update_pr_poll_state` alone
