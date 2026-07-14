@@ -140,6 +140,45 @@ fn reconciler_close_work_item_sets_completed_at() {
     );
 }
 
+/// reconciler_close_work_item's `done` transition must also clear
+/// `merge_queue_state`/`merge_queue_detail` — otherwise a task that entered
+/// the merge queue but was closed out via the external-tracker reconciler
+/// path (rather than `mark_chore_pr_merged`) leaves a permanent orphan row
+/// with `merge_queue_state = 'queued'`, inflating every live card's
+/// renumbered position (mono#58-shown-for-4).
+#[test]
+fn reconciler_close_work_item_clears_merge_queue_state() {
+    let db = WorkDb::open(temp_db_path("reconciler-close-clears-queue")).unwrap();
+    let product_id = make_revision_product(&db, "rec-close-queue");
+    let pr_url = "https://github.com/spinyfin/mono/pull/9006";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET merge_queue_state = 'queued', merge_queue_detail = '{\"position\":1}' WHERE id = ?1",
+            rusqlite::params![chore_id],
+        )
+        .unwrap();
+
+    let closed = db.reconciler_close_work_item(&chore_id).unwrap();
+    assert!(
+        closed,
+        "reconciler_close_work_item must return true for an in_review row"
+    );
+
+    let conn = db.connect().unwrap();
+    let (state, detail): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            [&chore_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(state.is_none(), "reconciler close must clear merge_queue_state");
+    assert!(detail.is_none(), "reconciler close must clear merge_queue_detail");
+}
+
 /// re-opening a done row must clear completed_at back to NULL.
 #[test]
 fn reopen_done_row_clears_completed_at() {

@@ -465,8 +465,14 @@ impl WorkDb {
         // `REBASED_WITH_CONFLICTS`) and per-rung outcomes are captured,
         // not just in-review `conflict_watch` detections.
         migrate_conflict_resolutions_telemetry_columns(&conn)?;
+        // One-time cleanup of orphaned `merge_queue_state = 'queued'` rows on
+        // already-terminal tasks (see `mark_chore_pr_merged` and its sibling
+        // terminal-transition sites, which now clear these columns going
+        // forward) — snaps stale queue positions back to 1..N immediately
+        // after deploy instead of leaving dead rows in `queued` state forever.
+        migrate_clear_merge_queue_state_on_terminal_tasks(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '25')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
