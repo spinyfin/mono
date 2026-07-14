@@ -2171,6 +2171,14 @@ impl ExecutionCoordinator {
     /// what a "sibling" was, which task was blocking, or which PR was
     /// involved. When more than one sibling is queued, names the count and
     /// the currently-live one.
+    /// Persist the operator-facing `dispatch_wait_reason` for an execution,
+    /// logging a warning (rather than failing dispatch) if the DB write errors.
+    fn record_dispatch_wait_reason(&self, execution_id: &str, reason: &str) {
+        if let Err(err) = self.work_db.set_dispatch_wait_reason(execution_id, reason) {
+            tracing::warn!(execution_id = %execution_id, ?err, "failed to record dispatch_wait_reason");
+        }
+    }
+
     fn chain_serialized_wait_reason(&self, sibling: &WorkExecution, review_held: bool, queue_len: usize) -> String {
         let sibling_task = self
             .resolve_execution_work_item(sibling)
@@ -2478,9 +2486,7 @@ impl ExecutionCoordinator {
                     // this is the string persisted into `dispatch_wait_reason`
                     // and rendered verbatim on the kanban card.
                     let wait_reason = self.chain_serialized_wait_reason(&sibling, review_held, queue_len);
-                    if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, &wait_reason) {
-                        tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
-                    }
+                    self.record_dispatch_wait_reason(&execution.id, &wait_reason);
                     self.surface_chain_serialized_stall_if_overdue(&execution, &sibling);
                     // Leave the row `ready`; do NOT mark any pool exhausted —
                     // other executions in this pass may still dispatch.
@@ -2649,9 +2655,7 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                if let Err(err) = self.work_db.set_dispatch_wait_reason(&execution.id, "pool_exhausted") {
-                    tracing::warn!(execution_id = %execution.id, ?err, "failed to record dispatch_wait_reason");
-                }
+                self.record_dispatch_wait_reason(&execution.id, "pool_exhausted");
 
                 if is_review {
                     review_pool_exhausted = true;
