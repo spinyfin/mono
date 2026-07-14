@@ -160,95 +160,19 @@ pub async fn on_conflict_detected(
             match work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
                 Ok(true) => {
                     // Parent is blocked with an active revision in flight — fall
-                    // through to the reconciliation path in the re-arm branch.
+                    // through to the reconciliation path in the re-arm branch,
+                    // which applies the same `supersede_if_stale` check before
+                    // deciding whether to reconcile or supersede (T4/dead-revision
+                    // fix): a dead/stale attempt must not survive a blind reconcile
+                    // just because the parent happened to be `blocked` this pass.
                 }
                 Ok(false) | Err(_) => {
-                    // Parent is in_review (or human-moved).  Before treating
-                    // this as an idempotent no-op, check whether the active crz
-                    // is stale.  A crz is stale when either:
-                    //   (a) the probe head SHA has moved since the crz was
-                    //       created — the revision pushed a commit but didn't
-                    //       resolve the conflict, then its exec was abandoned
-                    //       by the orphan sweep (not NudgeBreakerParked, so
-                    //       finalize_conflict_resolution_attempt never ran),
-                    //       leaving the crz `pending` with `revision_task_id`
-                    //       set against an old head; or
-                    //   (b) the linked revision task is in a terminal status
-                    //       (in_review/done/cancelled) but the crz was never
-                    //       finalised — same orphan-sweep abandonment scenario
-                    //       where the head SHA happened not to change.
-                    // In either case, abandon the stale crz and fall through to
-                    // spawn a fresh resolution against the current head.
-                    // Mirrors ci_watch's stale-head supersede logic.
-                    let current_head_sha = probe.head_ref_oid.as_deref();
-                    let head_sha_stale = match current_head_sha {
-                        Some(current) => active_crz
-                            .head_sha_before
-                            .as_deref()
-                            .map(|s| s != current)
-                            .unwrap_or(false),
-                        None => false, // can't compare — conservative: don't supersede
-                    };
-                    let revision_dead = active_crz
-                        .revision_task_id
-                        .as_deref()
-                        .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
-                        .unwrap_or(false);
-                    if head_sha_stale || revision_dead {
-                        // base_sha_changed is true when the PR's base (main) has
-                        // also advanced since this crz was created — the realistic
-                        // path for crz rows that sat pending for hours (T1764).
-                        // In that case the stale row's UNIQUE key
-                        // (work_item_id, base_sha_at_trigger) differs from the
-                        // fresh row's, so a plain abandon is safe.
-                        // When base SHA is unchanged (same-base head-move or
-                        // terminal-revision), we must also nullify
-                        // base_sha_at_trigger on the abandoned row so the INSERT
-                        // below can create a fresh row at the same key and the
-                        // churn guard can count this supersede, matching
-                        // ci_watch's abandon path.
-                        let base_sha_changed = head_sha_stale
-                            && probe.base_ref_oid.as_deref() != active_crz.base_sha_at_trigger.as_deref();
-                        tracing::info!(
-                            work_item_id = %candidate.work_item_id,
-                            attempt_id = %active_crz.id,
-                            stale_sha = ?active_crz.head_sha_before,
-                            current_sha = ?current_head_sha,
-                            revision_task_id = ?active_crz.revision_task_id,
-                            head_sha_stale,
-                            revision_dead,
-                            base_sha_changed,
-                            "conflict_watch: active crz is stale; superseding and re-detecting",
-                        );
-                        if base_sha_changed {
-                            // Base SHA advanced: plain abandon suffices; the
-                            // INSERT below uses a new (work_item_id, base_sha)
-                            // key and will not collide.
-                            if let Err(err) =
-                                work_db.mark_conflict_resolution_abandoned(&active_crz.id, "superseded_stale_head")
-                            {
-                                tracing::warn!(
-                                    work_item_id = %candidate.work_item_id,
-                                    attempt_id = %active_crz.id,
-                                    ?err,
-                                    "conflict_watch: failed to abandon stale crz (base changed); falling through anyway",
-                                );
-                            }
-                        } else {
-                            // Same base SHA: abandon AND nullify base_sha_at_trigger
-                            // to free the UNIQUE slot so the INSERT can proceed and
-                            // the churn guard counts this supersede.
-                            if let Err(err) = work_db
-                                .abandon_conflict_resolution_for_supersede(&active_crz.id, "superseded_stale_head")
-                            {
-                                tracing::warn!(
-                                    work_item_id = %candidate.work_item_id,
-                                    attempt_id = %active_crz.id,
-                                    ?err,
-                                    "conflict_watch: failed to abandon stale crz (same base); falling through anyway",
-                                );
-                            }
-                        }
+                    // Parent is in_review (or human-moved). Before treating this
+                    // as an idempotent no-op, check whether the active crz is
+                    // stale (see `supersede_if_stale`) and, if so, abandon it and
+                    // fall through to spawn a fresh resolution against the
+                    // current head.
+                    if supersede_if_stale(work_db, candidate, probe, active_crz) {
                         // Fall through: mark_chore_blocked → insert_conflict_resolution
                         // creates a new row → spawn fresh revision.
                     } else {
@@ -389,75 +313,94 @@ pub async fn on_conflict_detected(
             match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
                 Ok(Some(active_crz)) => {
                     if active_crz.revision_task_id.is_some() {
-                        // Active revision fix vehicle, but parent is blocked.
-                        // This is the reconciliation path for rows that were
-                        // blocked before the revision-unification model shipped.
-                        // Flip parent back to in_review; the revision card in
-                        // Doing is the user-visible "something is happening."
-                        tracing::info!(
-                            work_item_id = %candidate.work_item_id,
-                            pr_url = %candidate.pr_url,
-                            attempt_id = %active_crz.id,
-                            revision_task_id = %active_crz.revision_task_id.as_deref().unwrap_or(""),
-                            "conflict_watch: active revision in flight but parent blocked; reconciling to in_review",
-                        );
-                        let reconciled = match work_db
-                            .clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
-                        {
-                            Ok(Some(_)) => true,
-                            Ok(None) => false,
-                            Err(err) => {
-                                tracing::warn!(
-                                    work_item_id = %candidate.work_item_id,
-                                    ?err,
-                                    "conflict_watch: failed to reconcile block during re-arm",
-                                );
-                                false
-                            }
-                        };
-                        if reconciled {
-                            if let Err(err) =
-                                work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id)
+                        // Before blindly reconciling, check whether this attempt
+                        // is stale/dead (`supersede_if_stale`) — e.g. the linked
+                        // revision died in an engine restart. Reconciling a dead
+                        // attempt back to `in_review` would strand the parent
+                        // with no live fix vehicle until some *later* pass
+                        // happened to observe it via the `in_review` branch
+                        // above; superseding here instead means a dead revision
+                        // is caught on the very first pass that finds it,
+                        // regardless of which state the parent is in.
+                        if supersede_if_stale(work_db, candidate, probe, &active_crz) {
+                            // Fall through (do not reconcile-and-return): the
+                            // shared flip+insert logic below re-affirms the
+                            // (already blocked) parent, inserts a fresh attempt
+                            // at the now-freed UNIQUE key, and spawns a
+                            // replacement revision — which unblocks the parent
+                            // back to in_review once it spawns.
+                        } else {
+                            // Active revision fix vehicle, but parent is blocked.
+                            // This is the reconciliation path for rows that were
+                            // blocked before the revision-unification model shipped.
+                            // Flip parent back to in_review; the revision card in
+                            // Doing is the user-visible "something is happening."
+                            tracing::info!(
+                                work_item_id = %candidate.work_item_id,
+                                pr_url = %candidate.pr_url,
+                                attempt_id = %active_crz.id,
+                                revision_task_id = %active_crz.revision_task_id.as_deref().unwrap_or(""),
+                                "conflict_watch: active revision in flight but parent blocked; reconciling to in_review",
+                            );
+                            let reconciled = match work_db
+                                .clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
                             {
-                                tracing::warn!(
-                                    work_item_id = %candidate.work_item_id,
-                                    ?err,
-                                    "conflict_watch: failed to record in-flight signal during reconcile",
-                                );
+                                Ok(Some(_)) => true,
+                                Ok(None) => false,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        work_item_id = %candidate.work_item_id,
+                                        ?err,
+                                        "conflict_watch: failed to reconcile block during re-arm",
+                                    );
+                                    false
+                                }
+                            };
+                            if reconciled {
+                                if let Err(err) =
+                                    work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id)
+                                {
+                                    tracing::warn!(
+                                        work_item_id = %candidate.work_item_id,
+                                        ?err,
+                                        "conflict_watch: failed to record in-flight signal during reconcile",
+                                    );
+                                }
+                                publisher
+                                    .publish_work_item_changed(
+                                        &candidate.product_id,
+                                        &candidate.work_item_id,
+                                        "conflict_revision_in_flight",
+                                    )
+                                    .await;
                             }
                             publisher
-                                .publish_work_item_changed(
+                                .publish_frontend_event_on_product(
                                     &candidate.product_id,
-                                    &candidate.work_item_id,
-                                    "conflict_revision_in_flight",
+                                    FrontendEvent::ConflictResolutionStarted {
+                                        product_id: candidate.product_id.clone(),
+                                        work_item_id: candidate.work_item_id.clone(),
+                                        attempt_id: active_crz.id.clone(),
+                                        pr_url: candidate.pr_url.clone(),
+                                    },
                                 )
                                 .await;
+                            tracing::info!(
+                                work_item_id = %candidate.work_item_id,
+                                reconciled,
+                                "conflict_watch: re-arm reconciliation complete",
+                            );
+                            return reconciled;
                         }
-                        publisher
-                            .publish_frontend_event_on_product(
-                                &candidate.product_id,
-                                FrontendEvent::ConflictResolutionStarted {
-                                    product_id: candidate.product_id.clone(),
-                                    work_item_id: candidate.work_item_id.clone(),
-                                    attempt_id: active_crz.id.clone(),
-                                    pr_url: candidate.pr_url.clone(),
-                                },
-                            )
-                            .await;
-                        tracing::info!(
+                    } else {
+                        // Old-style crz (no revision), still in flight.
+                        tracing::debug!(
                             work_item_id = %candidate.work_item_id,
-                            reconciled,
-                            "conflict_watch: re-arm reconciliation complete",
+                            pr_url = %candidate.pr_url,
+                            "conflict_watch: blocked signal re-armed; active crz still in flight; no new dispatch",
                         );
-                        return reconciled;
+                        return false;
                     }
-                    // Old-style crz (no revision), still in flight.
-                    tracing::debug!(
-                        work_item_id = %candidate.work_item_id,
-                        pr_url = %candidate.pr_url,
-                        "conflict_watch: blocked signal re-armed; active crz still in flight; no new dispatch",
-                    );
-                    return false;
                 }
                 Ok(None) => {
                     // No active crz. Check the most recent crz status to
@@ -750,6 +693,101 @@ pub async fn on_conflict_detected(
         "conflict_watch: PR conflicts with base; conflict detection ran",
     );
     task_flipped_to_blocked || task_unblocked_for_revision
+}
+
+/// Is `active_crz` (an in-flight attempt with a linked revision) stale?
+/// A crz is stale when either:
+///   (a) the probe head SHA has moved since the crz was created — the
+///       revision pushed a commit but didn't resolve the conflict, then its
+///       exec was abandoned by the orphan sweep (not NudgeBreakerParked, so
+///       finalize_conflict_resolution_attempt never ran), leaving the crz
+///       `pending` with `revision_task_id` set against an old head; or
+///   (b) the linked revision task is dead — either it reached a terminal
+///       status (in_review/done/cancelled) without the crz ever being
+///       finalised (same orphan-sweep abandonment scenario, head SHA
+///       unchanged), or its execution died outright (e.g. an engine
+///       restart) while the task itself never progressed past a live
+///       status.
+/// Mirrors ci_watch's stale-head supersede logic.
+///
+/// When stale, abandons the row (nullifying `base_sha_at_trigger` when the
+/// base hasn't also moved, so the UNIQUE key is freed for a fresh insert)
+/// and returns `true` — the caller falls through to re-detect instead of
+/// treating the probe as an idempotent no-op or a plain reconcile.
+///
+/// Called from **both** places `on_conflict_detected` discovers an active
+/// crz with a linked revision — the `in_review` idempotency check and the
+/// `blocked` reconciliation path — so a dead/stale attempt is superseded on
+/// the first detection pass that observes it, regardless of which state the
+/// parent happens to be in on that pass. Previously only the `in_review`
+/// branch ran this check; the `blocked` branch just reconciled blindly,
+/// which let a revision killed by an engine restart survive until some
+/// later pass happened to find the parent back in `in_review`.
+fn supersede_if_stale(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    active_crz: &crate::work::ConflictResolution,
+) -> bool {
+    let current_head_sha = probe.head_ref_oid.as_deref();
+    let head_sha_stale = match current_head_sha {
+        Some(current) => active_crz
+            .head_sha_before
+            .as_deref()
+            .map(|s| s != current)
+            .unwrap_or(false),
+        None => false, // can't compare — conservative: don't supersede
+    };
+    let revision_dead = active_crz
+        .revision_task_id
+        .as_deref()
+        .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
+        .unwrap_or(false);
+    if !(head_sha_stale || revision_dead) {
+        return false;
+    }
+    // base_sha_changed is true when the PR's base (main) has also advanced
+    // since this crz was created — the realistic path for crz rows that sat
+    // pending for hours (T1764). In that case the stale row's UNIQUE key
+    // (work_item_id, base_sha_at_trigger) differs from the fresh row's, so a
+    // plain abandon is safe. When base SHA is unchanged (same-base head-move,
+    // terminal-revision, or dead-revision-with-no-head-move), we must also
+    // nullify base_sha_at_trigger on the abandoned row so the INSERT below can
+    // create a fresh row at the same key and the churn guard can count this
+    // supersede, matching ci_watch's abandon path.
+    let base_sha_changed = head_sha_stale && probe.base_ref_oid.as_deref() != active_crz.base_sha_at_trigger.as_deref();
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        attempt_id = %active_crz.id,
+        stale_sha = ?active_crz.head_sha_before,
+        current_sha = ?current_head_sha,
+        revision_task_id = ?active_crz.revision_task_id,
+        head_sha_stale,
+        revision_dead,
+        base_sha_changed,
+        "conflict_watch: active crz is stale; superseding and re-detecting",
+    );
+    if base_sha_changed {
+        // Base SHA advanced: plain abandon suffices; the INSERT below uses a
+        // new (work_item_id, base_sha) key and will not collide.
+        if let Err(err) = work_db.mark_conflict_resolution_abandoned(&active_crz.id, "superseded_stale_head") {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %active_crz.id,
+                ?err,
+                "conflict_watch: failed to abandon stale crz (base changed); falling through anyway",
+            );
+        }
+    } else if let Err(err) = work_db.abandon_conflict_resolution_for_supersede(&active_crz.id, "superseded_stale_head")
+    {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            attempt_id = %active_crz.id,
+            ?err,
+            "conflict_watch: failed to abandon stale crz (same base); falling through anyway",
+        );
+    }
+    true
 }
 
 /// Abandon any active `ci_remediations` attempt for this work item and
