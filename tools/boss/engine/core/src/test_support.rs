@@ -234,9 +234,11 @@ impl ExecutionRunner for NoopRunner {
 /// Overrides are written as ordinary `async fn`s with their real bodies
 /// and **must appear in the trait's declaration order** (the order the
 /// arms below enumerate: `ensure_repo`, `lease_workspace`, `create_change`,
-/// `goto_workspace`, `release_workspace`, `workspace_status`,
-/// `heartbeat_lease`, `force_release_lease`, `list_workspaces`,
-/// `list_repos`). The macro emits the `#[async_trait]` impl for you.
+/// `goto_workspace`, `rebase_workspace`, `release_workspace`,
+/// `workspace_status`, `heartbeat_lease`, `force_release_lease`,
+/// `list_workspaces`, `list_repos`). `rebase_workspace` has a trait default
+/// (erroring), so leaving it unlisted keeps that default rather than an
+/// `unimplemented!()`. The macro emits the `#[async_trait]` impl for you.
 ///
 /// ```ignore
 /// stub_cube_client! { RecordingCube {
@@ -284,12 +286,23 @@ macro_rules! stub_cube_client {
 
     // ── goto_workspace ──────────────────────────────────────────────────────
     (@munch $ty:ty [$($acc:tt)*] @goto_workspace async fn goto_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @release_workspace $($rest)*);
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn goto_workspace $a -> $r $b] @rebase_workspace $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @goto_workspace $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*
             async fn goto_workspace(&self, _workspace_path: &::std::path::Path, _pr: u64) -> ::anyhow::Result<()> { ::core::unimplemented!() }
-        ] @release_workspace $($rest)*);
+        ] @rebase_workspace $($rest)*);
+    };
+
+    // ── rebase_workspace ────────────────────────────────────────────────────
+    // Has a trait default (erroring), so when a double doesn't override it the
+    // macro emits nothing and the default applies — matching how the many
+    // pre-ladder stubs behave (they never drive rung 1).
+    (@munch $ty:ty [$($acc:tt)*] @rebase_workspace async fn rebase_workspace $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace $a -> $r $b] @release_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @rebase_workspace $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*] @release_workspace $($rest)*);
     };
 
     // ── release_workspace ───────────────────────────────────────────────────
