@@ -623,21 +623,10 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
          - `gh pr diff <url>` — fetch the PR diff (useful for the annotated diff view).\n\
          - `gh pr view <url>` — read the PR description.\n\
          \n\
-         ## Boundaries\n\
-         \n\
-         - Do not modify files outside your workspace. Other workspaces\n\
-           belong to other workers.\n\
-         - Do not modify cube's database, lease state, or workspace registry.\n\
-         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
-           Never read, write, or touch it.\n\
-           `bossctl` is coordinator-only.\n\
-         \n\
-         ## Coordinator\n\
-         \n\
-         The coordinator may probe this session between turns. Treat probes\n\
-         as questions from a human reviewer — short, specific answers.\n",
+         {boundaries_and_coordinator}",
         lease = lease_id,
         workspace_path = workspace_path,
+        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
     )
 }
 

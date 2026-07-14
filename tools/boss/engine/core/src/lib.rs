@@ -82,6 +82,7 @@ pub use boss_pr_template as pr_template;
 pub mod pr_review;
 pub mod pr_review_recovery;
 pub mod pr_url_capture;
+pub(crate) mod prompt_fragments;
 pub mod protocol;
 pub(crate) mod reconcile_audit;
 pub mod recovery_backup;
