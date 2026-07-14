@@ -5,7 +5,7 @@ use super::*;
 /// drags wait their turn.
 #[test]
 fn rescan_orders_candidates_by_updated_at_ascending() {
-    let path = disk_db_path("rescan-fifo");
+    let (_dir, path) = disk_db_path("rescan-fifo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     let mut chore_ids = Vec::new();
@@ -49,7 +49,7 @@ fn rescan_orders_candidates_by_updated_at_ascending() {
 /// for every later candidate too.
 #[test]
 fn rescan_skips_gated_active_chore_silently() {
-    let path = disk_db_path("rescan-gated");
+    let (_dir, path) = disk_db_path("rescan-gated");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     let prereq = create_test_chore(&db, product.id.clone(), "Prereq");
@@ -319,7 +319,7 @@ fn complete_pane_parked_execution_is_idempotent() {
 #[test]
 fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
     // disk_db_path required: re-opens the DB to trigger migration.
-    let path = disk_db_path("ts-migrate");
+    let (_dir, path) = disk_db_path("ts-migrate");
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
@@ -1261,7 +1261,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
 /// the engine writes the latest `schema_version`.
 #[test]
 fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
-    let path = disk_db_path("deps-migrate");
+    let (_dir, path) = disk_db_path("deps-migrate");
     // Stand up a minimal v3 schema: just `tasks`, `projects`,
     // `metadata`, no dep table, no last_status_actor.
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1318,7 +1318,7 @@ fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
 /// `None` on each pointer field.
 #[test]
 fn migration_adds_project_design_doc_columns() {
-    let path = disk_db_path("design-doc-migrate");
+    let (_dir, path) = disk_db_path("design-doc-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1418,7 +1418,7 @@ fn create_via_round_trip_per_source() {
 /// writes that follow continue to set their own value.
 #[test]
 fn migration_adds_created_via_with_unknown_default() {
-    let path = disk_db_path("created-via-migrate");
+    let (_dir, path) = disk_db_path("created-via-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1521,7 +1521,7 @@ fn fresh_init_includes_tasks_repo_remote_url() {
 /// value.
 #[test]
 fn migration_from_v4_adds_tasks_repo_remote_url() {
-    let path = disk_db_path("tasks-repo-migrate");
+    let (_dir, path) = disk_db_path("tasks-repo-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     // Stand up a minimal v4 schema: just enough to round-trip a
     // single task row that pre-dates the new column.

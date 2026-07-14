@@ -322,7 +322,7 @@ fn concurrent_writes_do_not_return_database_locked() {
     // concurrent writers via busy_timeout) is incompatible with
     // SQLite's shared-cache in-memory mode, causing
     // SQLITE_LOCKED_SHAREDCACHE errors that busy_timeout cannot retry.
-    let path = disk_db_path("concurrent-writes");
+    let (_dir, path) = disk_db_path("concurrent-writes");
     let db = std::sync::Arc::new(WorkDb::open(path.clone()).unwrap());
 
     let product = create_test_product(&db);
@@ -391,7 +391,7 @@ fn concurrent_writes_do_not_return_database_locked() {
 
 #[test]
 fn resolve_repo_returns_task_override_when_set() {
-    let (_path, db, _product_id, task_id) = make_resolve_scaffold(
+    let (_dir, _path, db, _product_id, task_id) = make_resolve_scaffold(
         "resolve-override-set",
         Some("git@github.com:spinyfin/product-default.git"),
     );
@@ -408,7 +408,7 @@ fn resolve_repo_returns_task_override_when_set() {
 
 #[test]
 fn resolve_repo_treats_empty_override_as_unset() {
-    let (_path, db, _product_id, task_id) = make_resolve_scaffold(
+    let (_dir, _path, db, _product_id, task_id) = make_resolve_scaffold(
         "resolve-override-empty",
         Some("git@github.com:spinyfin/product-default.git"),
     );
@@ -425,7 +425,7 @@ fn resolve_repo_treats_empty_override_as_unset() {
 
 #[test]
 fn resolve_repo_falls_back_to_product_when_override_null() {
-    let (_path, db, _product_id, task_id) = make_resolve_scaffold(
+    let (_dir, _path, db, _product_id, task_id) = make_resolve_scaffold(
         "resolve-override-null",
         Some("git@github.com:spinyfin/product-default.git"),
     );
@@ -442,7 +442,7 @@ fn resolve_repo_falls_back_to_product_when_override_null() {
 
 #[test]
 fn resolve_repo_returns_none_when_both_null() {
-    let (_path, db, _product_id, task_id) = make_resolve_scaffold("resolve-both-null", None);
+    let (_dir, _path, db, _product_id, task_id) = make_resolve_scaffold("resolve-both-null", None);
     // Both tasks.repo_remote_url and products.repo_remote_url are
     // NULL; the dispatcher will treat the Ok(None) as an
     // unresolved row and record an attention item.
@@ -462,7 +462,7 @@ fn resolve_repo_returns_none_when_both_null() {
 /// without any task-level `--repo` set."
 #[test]
 fn resolve_repo_uses_design_repo_for_design_kind() {
-    let path = disk_db_path("resolve-design-repo");
+    let (_dir, path) = disk_db_path("resolve-design-repo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(CreateProductInput {
@@ -522,7 +522,7 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
 /// exactly as before.
 #[test]
 fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() {
-    let path = disk_db_path("resolve-design-no-override");
+    let (_dir, path) = disk_db_path("resolve-design-no-override");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product(&db);
     let project = db
@@ -563,7 +563,7 @@ fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() 
 /// task-creation invariant and writes the column directly.
 #[test]
 fn resolve_repo_task_override_wins_over_design_repo() {
-    let path = disk_db_path("resolve-design-override-wins");
+    let (_dir, path) = disk_db_path("resolve-design-override-wins");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(CreateProductInput {
@@ -617,7 +617,7 @@ fn resolve_repo_task_override_wins_over_design_repo() {
 /// the column rather than silently ignoring it.
 #[test]
 fn product_design_repo_set_and_clear() {
-    let path = disk_db_path("design-repo-set-clear");
+    let (_dir, path) = disk_db_path("design-repo-set-clear");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(CreateProductInput {
@@ -663,7 +663,7 @@ fn product_design_repo_set_and_clear() {
 /// Implementation-kind tasks on the same product are unaffected.
 #[test]
 fn resolve_repo_uses_docs_repo_for_investigation_kind() {
-    let path = disk_db_path("resolve-docs-repo");
+    let (_dir, path) = disk_db_path("resolve-docs-repo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(CreateProductInput {
@@ -714,7 +714,7 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
 /// silently ignoring it.
 #[test]
 fn product_docs_repo_set_and_clear() {
-    let path = disk_db_path("docs-repo-set-clear");
+    let (_dir, path) = disk_db_path("docs-repo-set-clear");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
         .create_product(CreateProductInput {
@@ -775,7 +775,7 @@ fn product_docs_repo_set_and_clear() {
 
 #[test]
 fn resolve_repo_errors_when_parent_product_is_missing() {
-    let (path, db, product_id, task_id) = make_resolve_scaffold(
+    let (_dir, path, db, product_id, task_id) = make_resolve_scaffold(
         "resolve-orphan-product",
         Some("git@github.com:spinyfin/product-default.git"),
     );
@@ -968,7 +968,7 @@ fn product_default_model_set_and_clear() {
 #[test]
 fn migration_re_adds_effort_and_model_columns_on_upgrade() {
     // disk_db_path required: drops columns and re-opens the DB to trigger migration.
-    let path = disk_db_path("effort-upgrade");
+    let (_dir, path) = disk_db_path("effort-upgrade");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = create_test_chore(&db, product.id.clone(), "Legacy chore");
@@ -1040,7 +1040,7 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
 #[test]
 fn migration_leaves_existing_rows_with_null_effort_and_model() {
     // disk_db_path required: re-opens the DB to trigger migration.
-    let path = disk_db_path("effort-migrate");
+    let (_dir, path) = disk_db_path("effort-migrate");
 
     // Stand up a "pre-migration" DB by hand-rolling rows with the
     // older column set, then re-open via `WorkDb::open` so the
@@ -1093,7 +1093,7 @@ fn migration_leaves_existing_rows_with_null_effort_and_model() {
 #[test]
 fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_divergent() {
     // disk_db_path required: the test re-opens the DB to trigger the migration.
-    let path = disk_db_path("migration-null-redundant-repos");
+    let (_dir, path) = disk_db_path("migration-null-redundant-repos");
     let db = WorkDb::open(path.clone()).unwrap();
     let conn = db.connect().unwrap();
 
@@ -1199,7 +1199,7 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
     // Must use an on-disk database: WAL mode (which serialises
     // concurrent writers via busy_timeout) is incompatible with
     // SQLite's shared-cache in-memory mode.
-    let path = disk_db_path("short-id-concurrent");
+    let (_dir, path) = disk_db_path("short-id-concurrent");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:concurrent.git"));
 
@@ -1686,7 +1686,7 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
 /// status.
 #[test]
 fn list_ci_remediations_filters_and_orders_freshest_first() {
-    let path = disk_db_path("list-ci-remediations-filters");
+    let (_dir, path) = disk_db_path("list-ci-remediations-filters");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore_a = create_test_chore_manual(&db, product.id.clone(), "chore-a");
@@ -1786,7 +1786,7 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
 /// currently `status='blocked'`.
 #[test]
 fn ci_budget_snapshot_combines_override_and_product_default() {
-    let path = disk_db_path("ci-budget-snapshot");
+    let (_dir, path) = disk_db_path("ci-budget-snapshot");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-budget");
@@ -1891,7 +1891,7 @@ fn ci_attempts_used_increment_and_reset_accounting() {
 /// reliable.
 #[test]
 fn migration_normalises_empty_effort_level_to_null() {
-    let path = disk_db_path("effort-empty-to-null");
+    let (_dir, path) = disk_db_path("effort-empty-to-null");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = create_test_chore(&db, product.id.clone(), "Chore with empty effort");

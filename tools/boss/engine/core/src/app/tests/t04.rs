@@ -13,7 +13,7 @@ async fn retire_pane_refuses_when_live_run_tracked_in_slot() {
     // still considers live (non-terminal) is NOT a husk. Retiring it
     // would tear down a pane the engine thinks is doing work — the
     // caller must go through `agents stop` instead.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state
         .live_worker_states
         .register_spawn(3, "run-live", "claude-opus-4-7", 0, None);
@@ -60,7 +60,7 @@ async fn retire_pane_succeeds_for_husk_slot_with_no_app_session() {
     // must still succeed — there's nothing to round-trip to, and the
     // engine-side cleanup (which is what this call chiefly guarantees
     // for a genuine husk) is unconditional.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
 
     let result = server_state.retire_pane(4).await;
     assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -72,7 +72,7 @@ async fn retire_pane_sends_slot_keyed_release_request_with_no_run_id_resolution(
     // never resolves through worker_registry (there is no run id for
     // a husk) — it goes straight to the app with the slot id the
     // caller supplied.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), sink.clone())
@@ -111,7 +111,7 @@ async fn retire_pane_sends_slot_keyed_release_request_with_no_run_id_resolution(
 async fn list_husk_panes_returns_empty_when_no_app_session_registered() {
     // Best-effort query: with no app session there is nothing to
     // diff, so this must not be a hard error.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let panes = server_state.list_husk_panes().await.expect("expected Ok");
     assert!(panes.is_empty());
 }
@@ -122,7 +122,7 @@ async fn list_husk_panes_filters_out_slots_the_engine_still_tracks_live() {
     // live (non-terminal) run for — not a husk, must be filtered —
     // and one the engine has no live entry for at all — a genuine
     // husk, must be reported.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state
         .live_worker_states
         .register_spawn(2, "run-live", "claude-opus-4-7", 0, None);

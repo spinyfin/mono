@@ -345,7 +345,7 @@ async fn broker_publish_disconnects_slow_subscriber() {
 /// would put us right back at the #699 failure mode.
 #[tokio::test]
 async fn engine_health_report_flags_missing_anthropic_api_key() {
-    let state = test_server_state();
+    let (state, _dir) = test_server_state();
     // Pin: the test fixture intentionally builds without an
     // ANTHROPIC_API_KEY so the missing-key arm is exercised.
     assert!(
@@ -385,7 +385,6 @@ async fn engine_health_report_is_empty_when_api_key_present() {
         cwd: work.cwd.clone(),
     };
     let cfg = Arc::new(RuntimeConfig::from_parts(work, Some(agent)));
-    std::mem::forget(temp);
     let state = ServerState::new_arc_with_app_pid(cfg, None, None).unwrap();
 
     let report = build_engine_health_report(&state);
@@ -404,7 +403,7 @@ async fn engine_health_report_is_empty_when_api_key_present() {
 /// starting after `bossctl dispatch pause`.
 #[tokio::test]
 async fn engine_health_report_flags_dispatch_paused() {
-    let state = test_server_state();
+    let (state, _dir) = test_server_state();
 
     let has_dispatch_issue =
         |report: &boss_protocol::EngineHealthReport| report.issues.iter().any(|i| i.kind == "dispatch_paused");
@@ -452,7 +451,7 @@ async fn engine_health_report_flags_dispatch_paused() {
 async fn engine_health_report_flags_syspolicyd_wedged() {
     use crate::syspolicyd_monitor::{SATURATION_SAMPLES_TO_ALERT, SyspolicydSample};
 
-    let state = test_server_state();
+    let (state, _dir) = test_server_state();
 
     let has_wedged_issue =
         |report: &boss_protocol::EngineHealthReport| report.issues.iter().any(|i| i.kind == "syspolicyd_wedged");
@@ -515,7 +514,7 @@ async fn engine_health_report_flags_syspolicyd_wedged() {
 #[tokio::test]
 async fn engine_startup_eagerly_initializes_binary_fingerprint() {
     crate::build_info::reset_eager_init_for_test();
-    let _state = test_server_state();
+    let (_state, _dir) = test_server_state();
     assert!(
         crate::build_info::eager_init_called_for_test(),
         "build_info::init() must be called during ServerState construction; \
@@ -538,7 +537,7 @@ async fn engine_startup_eagerly_initializes_binary_fingerprint() {
 async fn get_engine_version_response_matches_swift_app_parser() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let (engine_side, app_side) = tokio::net::UnixStream::pair().unwrap();
     let conn = tokio::spawn(handle_frontend_connection(engine_side, server_state, None));
 
@@ -579,7 +578,7 @@ async fn get_engine_version_response_matches_swift_app_parser() {
 
 #[tokio::test]
 async fn send_to_app_returns_not_registered_when_no_app() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let result = server_state
         .send_to_app(
             EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
@@ -599,7 +598,7 @@ async fn send_to_app_returns_not_registered_when_no_app() {
 
 #[tokio::test]
 async fn send_to_app_round_trips_via_deliver_response() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), sink.clone())
@@ -658,7 +657,7 @@ async fn send_to_app_round_trips_via_deliver_response() {
 
 #[tokio::test]
 async fn send_to_app_resolves_app_disconnected_on_session_drop() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), sink.clone())
@@ -698,7 +697,7 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
 
 #[tokio::test]
 async fn send_to_app_times_out_when_app_silent() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state.register_app_session("session-app".into(), sink).await;
 
@@ -729,7 +728,7 @@ async fn send_to_app_times_out_when_app_silent() {
 /// see `send_to_app_admitted_when_only_bulk_lane_saturated`).
 #[tokio::test]
 async fn send_to_app_reports_session_wedged_when_priority_lane_saturated() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     // Fill the priority lane to its cap so the send_to_app enqueue reports Slow.
     {
@@ -781,7 +780,7 @@ async fn send_to_app_reports_session_wedged_when_priority_lane_saturated() {
 /// both shared one FIFO lane — and it drains *ahead* of the bulk backlog.
 #[tokio::test]
 async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     {
         let mut q = sink.queue.lock().unwrap();
@@ -874,7 +873,7 @@ async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
 /// health signal.
 #[tokio::test]
 async fn engine_health_report_flags_unresponsive_app_channel() {
-    let state = test_server_state();
+    let (state, _dir) = test_server_state();
     let stats = QueueStats {
         depth: 220,
         priority_depth: 0,
@@ -917,7 +916,7 @@ async fn engine_health_report_flags_unresponsive_app_channel() {
 
 #[tokio::test]
 async fn second_register_invalidates_first() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let first_sink = make_session_sink();
     server_state
         .register_app_session("session-1".into(), first_sink.clone())
@@ -965,7 +964,7 @@ async fn spawn_worker_pane_requests_are_serialized() {
     // not appear in the queue until after the first has resolved.
     use crate::spawn_flow::WorkerSpawner;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), sink.clone())
@@ -1059,7 +1058,7 @@ async fn release_worker_pane_drops_live_worker_state() {
     // this, the kanban Doing dot and the pane titlebar pill stayed
     // pinned at the worker's last activity (e.g. WaitingForInput)
     // even after the libghostty pane was torn down.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-x", 1);
     server_state
         .live_worker_states
@@ -1099,7 +1098,7 @@ async fn release_worker_pane_releases_matching_worker_pool_slot() {
     // subsequent `claim_worker` can reuse it — otherwise the
     // engine and the app drift apart and the next
     // SpawnWorkerPane gets rejected as SlotBusy.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let pool = server_state.execution_coordinator.worker_pool();
 
     // Pre-claim slot 1 the way the coordinator would, then wire
@@ -1136,7 +1135,7 @@ async fn release_worker_pane_pool_release_is_idempotent() {
     // mapping and short-circuits before touching the pool — so a
     // racy double-release must not zero out an unrelated execution
     // that has already re-claimed the slot.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let pool = server_state.execution_coordinator.worker_pool();
 
     let _claimed = pool.claim_worker("exec-1", None).await.unwrap();
@@ -1175,7 +1174,7 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
     // run either.
     use boss_protocol::{CreateProductInput, RequestExecutionInput};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = server_state
         .work_db
         .create_product(CreateProductInput {
@@ -1269,7 +1268,7 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
 
 #[tokio::test]
 async fn focus_worker_pane_unknown_run_returns_unknown_run() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state.register_app_session("session-app".into(), sink).await;
     let err = server_state
@@ -1285,7 +1284,7 @@ async fn focus_worker_pane_round_trips_to_app() {
     // worker registry, sends a FocusWorkerPane EngineRequest to
     // the registered app session, and surfaces the slot id once
     // the app replies success.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-focus", 5);
 
     let sink = make_session_sink();
@@ -1324,7 +1323,7 @@ async fn focus_worker_pane_round_trips_to_app() {
 
 #[tokio::test]
 async fn focus_worker_pane_surfaces_app_error() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-focus", 3);
 
     let sink = make_session_sink();
@@ -1360,7 +1359,7 @@ async fn focus_worker_pane_surfaces_app_error() {
 
 #[tokio::test]
 async fn send_input_to_worker_unknown_run_returns_unknown_run() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state.register_app_session("session-app".into(), sink).await;
     let err = server_state
@@ -1378,7 +1377,7 @@ async fn send_input_to_worker_round_trips_to_app() {
     // `UserPromptSubmit` hook confirming the CLI actually enqueued
     // it (not just that the app accepted the pty write), and
     // surfaces the slot id once both land.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-send", 7);
 
     let sink = make_session_sink();
@@ -1449,7 +1448,7 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     // time at its next Stop boundary. This locks in the corrected
     // behavior: an unconfirmed write returns Ok (the pane write did
     // succeed) without being queued again.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-unverified", 3);
 
     let sink = make_session_sink();
@@ -1503,7 +1502,7 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
 
 #[tokio::test]
 async fn send_input_to_worker_surfaces_app_error() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-send", 2);
 
     let sink = make_session_sink();
@@ -1539,7 +1538,7 @@ async fn send_input_to_worker_surfaces_app_error() {
 
 #[tokio::test]
 async fn interrupt_worker_pane_unknown_run_returns_unknown_run() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let sink = make_session_sink();
     server_state.register_app_session("session-app".into(), sink).await;
     let err = server_state
@@ -1555,7 +1554,7 @@ async fn interrupt_worker_pane_round_trips_to_app() {
     // worker registry, sends an InterruptWorkerPane EngineRequest
     // to the registered app session, and surfaces the slot id
     // once the app replies success.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-int", 6);
 
     let sink = make_session_sink();
@@ -1594,7 +1593,7 @@ async fn interrupt_worker_pane_round_trips_to_app() {
 
 #[tokio::test]
 async fn interrupt_worker_pane_surfaces_app_error() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     server_state.worker_registry.register_run_slot("run-int", 2);
 
     let sink = make_session_sink();
@@ -1630,14 +1629,14 @@ async fn interrupt_worker_pane_surfaces_app_error() {
 
 #[test]
 fn authorize_user_tier_always_allowed() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     assert!(server_state.authorize_rpc(RpcTier::User, None));
     assert!(server_state.authorize_rpc(RpcTier::User, Some(1234)));
 }
 
 #[test]
 fn authorize_no_trust_roots_is_permissive_for_test_mode() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     // In tests, both app_pid and boss_pid are None — the engine
     // treats this as permissive so unit tests can drive any RPC.
     assert!(server_state.authorize_rpc(RpcTier::AppOrBoss, Some(1234)));
@@ -1646,7 +1645,7 @@ fn authorize_no_trust_roots_is_permissive_for_test_mode() {
 
 #[test]
 fn set_boss_pid_round_trips() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     assert_eq!(server_state.current_boss_pid(), None);
     server_state.set_boss_pid(98765);
     assert_eq!(server_state.current_boss_pid(), Some(98765));
@@ -1655,7 +1654,7 @@ fn set_boss_pid_round_trips() {
 }
 
 #[cfg(target_os = "macos")]
-fn server_state_with_app_pid(app_pid: libc::pid_t) -> Arc<ServerState> {
+fn server_state_with_app_pid(app_pid: libc::pid_t) -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
         crate::config::WorkConfig::builder()
@@ -1664,8 +1663,8 @@ fn server_state_with_app_pid(app_pid: libc::pid_t) -> Arc<ServerState> {
             .build(),
         None,
     ));
-    std::mem::forget(temp);
-    ServerState::new_arc_with_app_pid(cfg, Some(app_pid), None).unwrap()
+    let state = ServerState::new_arc_with_app_pid(cfg, Some(app_pid), None).unwrap();
+    (state, temp)
 }
 
 #[cfg(target_os = "macos")]
@@ -1679,7 +1678,7 @@ fn boss_only_admits_app_descendant_when_boss_pid_unregistered() {
     // is its own descendant; with app_pid set to it the BossOnly
     // gate must let us through.
     let self_pid = std::process::id() as libc::pid_t;
-    let server_state = server_state_with_app_pid(self_pid);
+    let (server_state, _dir) = server_state_with_app_pid(self_pid);
     assert_eq!(server_state.current_boss_pid(), None);
     assert!(
         server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
@@ -1696,7 +1695,7 @@ fn app_or_boss_admits_worker_descendant() {
     // descend from a registered worker shell (workers are
     // siblings under the app), even though BossOnly does not.
     let self_pid = std::process::id() as libc::pid_t;
-    let server_state = server_state_with_app_pid(self_pid);
+    let (server_state, _dir) = server_state_with_app_pid(self_pid);
     server_state.worker_registry.register(self_pid, "fake-run".to_owned());
     assert!(
         server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
@@ -1792,7 +1791,7 @@ fn set_app_pid_repins_trust_root() {
     // After a successful reattach the engine re-pins app_pid so RPC
     // authorization (SpawnWorkerPane, BossOnly/AppOrBoss) follows the
     // live app across the restart.
-    let server_state = server_state_with_app_pid(1);
+    let (server_state, _dir) = server_state_with_app_pid(1);
     assert_eq!(server_state.current_app_pid(), Some(1));
     let self_pid = std::process::id() as libc::pid_t;
     server_state.set_app_pid(self_pid);
@@ -1811,7 +1810,7 @@ fn boss_only_rejects_worker_descendant_when_boss_pid_unregistered() {
     // BossOnly — workers are siblings under the app and must not
     // pass live-control checks.
     let self_pid = std::process::id() as libc::pid_t;
-    let server_state = server_state_with_app_pid(self_pid);
+    let (server_state, _dir) = server_state_with_app_pid(self_pid);
     // Mark the test process itself as a "worker" by registering its
     // pid in the WorkerRegistry. The auth check walks its own
     // ancestor chain looking for any registered worker pid; the
@@ -1830,7 +1829,7 @@ fn boss_only_uses_boss_pid_when_registered() {
     // Use a clearly bogus pid for app — the BossOnly path should
     // never reach the app-fallback when boss_pid is set. Setting
     // boss_pid to self_pid lets the boss-pid descendant check pass.
-    let server_state = server_state_with_app_pid(1);
+    let (server_state, _dir) = server_state_with_app_pid(1);
     server_state.set_boss_pid(self_pid);
     assert!(
         server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
@@ -1854,7 +1853,7 @@ fn user_tier_admits_caller_outside_app_and_boss_subtrees() {
     // when the caller IS a worker descendant. We exercise that
     // worker-rejection invariant in
     // `app_or_boss_rejects_worker_descendant_outside_app_subtree`.
-    let server_state = server_state_with_app_pid(1);
+    let (server_state, _dir) = server_state_with_app_pid(1);
     server_state.set_boss_pid(2);
     let self_pid = std::process::id() as libc::pid_t;
     assert!(
@@ -1878,7 +1877,7 @@ fn app_or_boss_admits_caller_outside_subtrees_when_not_a_worker() {
     // pre-dating the app, separate Claude Code instances driving
     // bossctl, etc. Workers are still excluded — locked in by the
     // companion test below.
-    let server_state = server_state_with_app_pid(1);
+    let (server_state, _dir) = server_state_with_app_pid(1);
     server_state.set_boss_pid(2);
     let self_pid = std::process::id() as libc::pid_t;
     assert!(
@@ -1901,7 +1900,7 @@ fn app_or_boss_rejects_worker_descendant_outside_app_subtree() {
     // app_pid is set to i32::MAX (an impossible PID on any platform)
     // so the fast-path trust-subtree check definitely fails — PID 1
     // (launchd/init) would NOT work because all processes descend from it.
-    let server_state = server_state_with_app_pid(i32::MAX);
+    let (server_state, _dir) = server_state_with_app_pid(i32::MAX);
     let self_pid = std::process::id() as libc::pid_t;
     server_state.worker_registry.register(self_pid, "fake-run".to_owned());
     assert!(
@@ -1912,7 +1911,7 @@ fn app_or_boss_rejects_worker_descendant_outside_app_subtree() {
 
 #[test]
 fn queue_probe_mints_unique_probe_ids() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let id_one = server_state.queue_probe("run-x".into(), "first".into(), false);
     let id_two = server_state.queue_probe("run-x".into(), "second".into(), false);
     assert_ne!(id_one, id_two, "probe ids must be unique per call");
@@ -1974,7 +1973,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
 
     // Seed: product → chore → execution → run with a real
     // transcript path on disk. Without the run row the engine's
@@ -2137,7 +2136,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
 async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit() {
     use crate::protocol::WorkerEvent;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let run_id = "run-urgent-confirmed";
     server_state.worker_registry.register_run_slot(run_id, 5);
 
@@ -2228,7 +2227,7 @@ async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit(
 async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_redelivery() {
     use crate::protocol::WorkerEvent;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let run_id = "run-urgent-midturn";
     server_state.worker_registry.register_run_slot(run_id, 6);
 
@@ -2348,7 +2347,7 @@ async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_rede
 async fn probe_queued_for_idle_worker_dispatches_immediately() {
     use boss_protocol::{RequestExecutionInput, WorkerActivity, WorkerEvent};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
 
     // Minimal DB rows so transcript lookup has something to resolve.
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
@@ -2448,7 +2447,7 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
 async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
     use boss_protocol::{RequestExecutionInput, WorkerActivity, WorkerEvent};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
 
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
@@ -2549,7 +2548,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
 
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");

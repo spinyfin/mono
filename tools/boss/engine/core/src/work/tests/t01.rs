@@ -472,7 +472,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
 /// index without erroring.
 #[test]
 fn opens_pre_v3_database_without_priority_column() {
-    let path = disk_db_path("pre-v3");
+    let (_dir, path) = disk_db_path("pre-v3");
     // Build a minimal pre-v3 schema: just the table the migration
     // touches, missing the three v3 columns.
     let conn = rusqlite::Connection::open(&path).unwrap();

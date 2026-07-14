@@ -17,7 +17,7 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -92,7 +92,7 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
     use crate::worker_registry::REMOTE_SLOT_BASE;
     use boss_protocol::{RequestExecutionInput, WorkerActivity};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "remote chore");
     let execution = server_state
@@ -169,7 +169,7 @@ async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "remote chore");
     let execution = server_state
@@ -240,7 +240,7 @@ async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -337,7 +337,7 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -406,7 +406,7 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
     use crate::protocol::{SessionStartSource, WorkerEvent};
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -550,7 +550,7 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
         }
     }
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -661,7 +661,7 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -757,7 +757,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -843,7 +843,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
 async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() {
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -901,7 +901,7 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state
@@ -1013,7 +1013,7 @@ fn current_parent_pid_only_trusts_env_var() {
 /// shells reparented to launchd and `claude` keeps burning tokens.
 #[tokio::test]
 async fn shutdown_workers_releases_each_live_worker_via_release_worker_pane() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
 
     // Two workers, both registered against slot ids and the
     // live-state registry — exactly the shape `release_worker_pane`
@@ -1096,7 +1096,7 @@ async fn shutdown_workers_releases_each_live_worker_via_release_worker_pane() {
 /// and against gratuitous SIGTERMs at idle shutdown.
 #[tokio::test]
 async fn shutdown_workers_is_noop_when_no_workers_registered() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     // No app session, no slot registrations — must still return.
     server_state
         .shutdown_workers(Duration::from_millis(50), Duration::from_millis(0))
@@ -1116,7 +1116,7 @@ async fn shutdown_workers_is_noop_when_no_workers_registered() {
 
 #[test]
 fn resolve_status_actor_returns_boss_when_peer_is_boss_descendant() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let our_pid = std::process::id() as libc::pid_t;
     server_state.set_boss_pid(our_pid);
     // Our own pid is in the boss subtree (pid is descendant of itself).
@@ -1128,7 +1128,7 @@ fn resolve_status_actor_returns_boss_when_peer_is_boss_descendant() {
 
 #[test]
 fn resolve_status_actor_returns_human_when_no_boss_pid_registered() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let our_pid = std::process::id() as libc::pid_t;
     // No call to set_boss_pid — boss trust root is absent.
     assert_eq!(
@@ -1139,7 +1139,7 @@ fn resolve_status_actor_returns_human_when_no_boss_pid_registered() {
 
 #[test]
 fn resolve_status_actor_returns_human_when_peer_is_not_boss_descendant() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     // Register a non-existent pid as the boss root — our process is
     // not a descendant of it.
     server_state.set_boss_pid(99_999_999);
@@ -1152,7 +1152,7 @@ fn resolve_status_actor_returns_human_when_peer_is_not_boss_descendant() {
 
 #[test]
 fn resolve_status_actor_returns_human_when_peer_pid_is_none() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let our_pid = std::process::id() as libc::pid_t;
     server_state.set_boss_pid(our_pid);
     // peer_pid is None — falls through to human (no pid to match against).
@@ -1248,20 +1248,19 @@ fn constant_time_eq_true_for_two_empty_slices() {
 
 // ---- in_review_chore_execution ----
 
-fn make_work_db_with_chore() -> (Arc<WorkDb>, String, String) {
+fn make_work_db_with_chore() -> (tempfile::TempDir, Arc<WorkDb>, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
-    std::mem::forget(dir);
     let db = Arc::new(WorkDb::open(path).unwrap());
     let product = create_test_product_with_repo(&db, "Test", Some("git@github.com:test/test.git"));
     let chore = create_test_chore(&db, product.id.clone(), "In-review reap test");
-    (db, product.id, chore.id)
+    (dir, db, product.id, chore.id)
 }
 
 #[test]
 fn in_review_chore_execution_returns_none_for_non_in_review_status() {
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     // Default chore status is "todo" (autostart=true → "active" actually,
     // but either way it is not "in_review").
     let item = db.get_work_item(&chore_id).unwrap();
@@ -1288,7 +1287,7 @@ fn in_review_chore_execution_returns_none_for_non_in_review_status() {
 #[test]
 fn in_review_chore_execution_returns_none_when_no_execution() {
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let item = db
         .update_work_item(
             &chore_id,
@@ -1308,7 +1307,7 @@ fn in_review_chore_execution_returns_none_when_no_execution() {
 fn in_review_chore_execution_returns_execution_id_when_in_review() {
     use crate::work::CreateExecutionInput;
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     // Create an execution for the chore.
     let execution = db
         .create_execution(
@@ -1340,7 +1339,6 @@ fn in_review_chore_execution_returns_execution_id_when_in_review() {
 fn in_review_chore_execution_returns_none_for_product() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
-    std::mem::forget(dir);
     let db = Arc::new(WorkDb::open(path).unwrap());
     let product_item = create_test_product_with_repo(&db, "Prod", None);
     let item = WorkItem::Product(product_item);
@@ -1355,7 +1353,7 @@ fn in_review_chore_execution_returns_none_for_product() {
 #[test]
 fn active_to_todo_execution_returns_none_when_not_todo() {
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let item = db
         .update_work_item(
             &chore_id,
@@ -1374,7 +1372,7 @@ fn active_to_todo_execution_returns_none_when_not_todo() {
 #[test]
 fn active_to_todo_execution_returns_none_when_prev_not_active() {
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let item = db
         .update_work_item(
             &chore_id,
@@ -1397,7 +1395,7 @@ fn active_to_todo_execution_returns_none_when_prev_not_active() {
 #[test]
 fn active_to_todo_execution_returns_none_when_no_execution() {
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let item = db
         .update_work_item(
             &chore_id,
@@ -1417,7 +1415,7 @@ fn active_to_todo_execution_returns_none_when_no_execution() {
 fn active_to_todo_execution_returns_execution_id() {
     use crate::work::CreateExecutionInput;
     use boss_protocol::WorkItemPatch;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -1448,7 +1446,6 @@ fn active_to_todo_execution_returns_execution_id() {
 fn active_to_todo_execution_returns_none_for_product() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
-    std::mem::forget(dir);
     let db = Arc::new(WorkDb::open(path).unwrap());
     let product_item = create_test_product_with_repo(&db, "Prod", None);
     let item = WorkItem::Product(product_item);
@@ -1462,7 +1459,7 @@ fn active_to_todo_execution_returns_none_for_product() {
 
 #[test]
 fn live_execution_for_deleted_item_returns_none_when_no_execution() {
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let item = db.get_work_item(&chore_id).unwrap();
     assert!(
         live_execution_for_deleted_item(&db, &item).is_none(),
@@ -1473,7 +1470,7 @@ fn live_execution_for_deleted_item_returns_none_when_no_execution() {
 #[test]
 fn live_execution_for_deleted_item_returns_execution_id_when_running() {
     use crate::work::CreateExecutionInput;
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -1502,7 +1499,7 @@ fn live_execution_for_deleted_item_returns_none_when_terminal() {
         ExecutionStatus::Cancelled,
         ExecutionStatus::Orphaned,
     ] {
-        let (db, _, chore_id) = make_work_db_with_chore();
+        let (_dir, db, _, chore_id) = make_work_db_with_chore();
         db.create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
@@ -1523,7 +1520,6 @@ fn live_execution_for_deleted_item_returns_none_when_terminal() {
 fn live_execution_for_deleted_item_returns_none_for_product() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
-    std::mem::forget(dir);
     let db = Arc::new(WorkDb::open(path).unwrap());
     let product_item = create_test_product_with_repo(&db, "Prod", None);
     let item = WorkItem::Product(product_item);
@@ -1574,8 +1570,8 @@ fn build_chore_update_message_includes_both_when_both_change() {
 #[test]
 fn active_chore_run_id_returns_none_for_todo_chore() {
     use boss_protocol::WorkItemPatch;
-    let state = test_server_state();
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (state, _dir) = test_server_state();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     // Default status is todo (autostart=true makes it active in
     // make_work_db_with_chore, but let's force todo here).
     let _ = db
@@ -1597,8 +1593,8 @@ fn active_chore_run_id_returns_none_for_todo_chore() {
 #[test]
 fn active_chore_run_id_returns_none_when_no_live_worker() {
     use boss_protocol::WorkItemPatch;
-    let state = test_server_state();
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (state, _dir) = test_server_state();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let item = db
         .update_work_item(
             &chore_id,
@@ -1623,8 +1619,8 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     // message is enqueued toward the app session.
     use boss_protocol::{WorkItemBinding, WorkItemPatch};
 
-    let server_state = test_server_state();
-    let (db, _, chore_id) = make_work_db_with_chore();
+    let (server_state, _dir) = test_server_state();
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
 
     // Put the chore in active status.
     let active_item = db
@@ -1816,7 +1812,7 @@ fn segment_to_wire_all_roles() {
 
 #[tokio::test]
 async fn execution_transcript_no_path_returns_unavailable() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let execution = make_execution_for_test(&server_state);
 
     // No run row → no transcript_path.
@@ -1833,7 +1829,7 @@ async fn execution_transcript_no_path_returns_unavailable() {
 
 #[tokio::test]
 async fn execution_transcript_missing_file_case() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let execution = make_execution_for_test(&server_state);
 
     // Create a run row pointing at a non-existent file.
@@ -1870,7 +1866,7 @@ async fn execution_transcript_missing_file_case() {
 
 #[tokio::test]
 async fn execution_transcript_normal_case() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let execution = make_execution_for_test(&server_state);
 
     let transcript_dir = tempfile::tempdir().unwrap();
@@ -1923,7 +1919,7 @@ async fn execution_transcript_normal_case() {
 
 #[tokio::test]
 async fn execution_transcript_live_flag() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let execution = make_execution_for_test(&server_state);
 
     // Start the execution so its status becomes "running".
@@ -1945,7 +1941,7 @@ async fn execution_transcript_live_flag() {
 
 #[test]
 fn executions_list_returns_empty_for_task_with_no_executions() {
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let task = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let executions = server_state.work_db.list_executions(Some(&task.id)).unwrap();
@@ -1993,18 +1989,20 @@ fn tail_lines_from_content_nonzero_larger_than_total_returns_all() {
 
 // ── live-status disabled-slot persistence ────────────────────────────────
 
-/// Open a bare `WorkDb` on a leaked temp path — enough for the pure
-/// metadata-KV helpers below, which need no product/chore fixtures.
-fn open_temp_work_db() -> WorkDb {
+/// Open a bare `WorkDb` on a throwaway temp path — enough for the pure
+/// metadata-KV helpers below, which need no product/chore fixtures. The
+/// returned `TempDir` must be kept alive by the caller for the DB's
+/// lifetime; dropping it deletes the backing file.
+fn open_temp_work_db() -> (tempfile::TempDir, WorkDb) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
-    std::mem::forget(dir);
-    WorkDb::open(path).unwrap()
+    let db = WorkDb::open(path).unwrap();
+    (dir, db)
 }
 
 #[test]
 fn disabled_slots_roundtrip_preserves_set() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     persist_live_status_disabled_slots(&db, &[3, 1, 7]).unwrap();
     let mut loaded = load_live_status_disabled_slots(&db);
     loaded.sort();
@@ -2017,7 +2015,7 @@ fn disabled_slots_roundtrip_preserves_set() {
 
 #[test]
 fn disabled_slots_empty_roundtrips_to_empty() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     persist_live_status_disabled_slots(&db, &[]).unwrap();
     assert!(
         load_live_status_disabled_slots(&db).is_empty(),
@@ -2027,7 +2025,7 @@ fn disabled_slots_empty_roundtrips_to_empty() {
 
 #[test]
 fn disabled_slots_absent_key_loads_empty() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     // Never persisted — the metadata row is absent. Must degrade to an
     // empty Vec rather than erroring (first-boot behaviour).
     assert!(
@@ -2038,7 +2036,7 @@ fn disabled_slots_absent_key_loads_empty() {
 
 #[test]
 fn disabled_slots_malformed_entries_are_filtered() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     // Write raw malformed metadata directly (bypassing the persist
     // helper, which only ever emits clean output): whitespace-padded,
     // non-numeric, empty, and out-of-u8-range entries must all be
@@ -2057,7 +2055,7 @@ fn disabled_slots_malformed_entries_are_filtered() {
 
 #[test]
 fn dispatch_paused_state_defaults_when_absent() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     assert_eq!(
         load_dispatch_paused_state(&db),
         (false, 0, DispatchPauseOrigin::Breaker),
@@ -2067,7 +2065,7 @@ fn dispatch_paused_state_defaults_when_absent() {
 
 #[test]
 fn dispatch_paused_state_reads_paused_and_since() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "1700000000")
         .unwrap();
@@ -2081,7 +2079,7 @@ fn dispatch_paused_state_reads_paused_and_since() {
 
 #[test]
 fn dispatch_paused_state_since_defaults_to_zero_when_missing_or_garbage() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     // Paused, but the since key is absent → since defaults to 0.
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1").unwrap();
     assert_eq!(
@@ -2101,7 +2099,7 @@ fn dispatch_paused_state_since_defaults_to_zero_when_missing_or_garbage() {
 
 #[test]
 fn dispatch_paused_state_non_one_flag_is_not_paused() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     // Any flag value other than exactly "1" reads as not paused, but the
     // since component is parsed independently.
     db.set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0").unwrap();
@@ -2117,7 +2115,7 @@ fn dispatch_paused_state_non_one_flag_is_not_paused() {
 
 #[test]
 fn dispatch_paused_state_missing_origin_defaults_to_breaker() {
-    let db = open_temp_work_db();
+    let (_dir, db) = open_temp_work_db();
     // A pause persisted before the origin key existed (or corrupted data)
     // must NOT be restored as review-exempt — default conservatively to the
     // non-exempt breaker origin.
@@ -2185,7 +2183,7 @@ async fn hook_for_terminal_execution_is_counted_not_silently_dropped() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::{CreateChoreInput, RequestExecutionInput};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = server_state
         .work_db
@@ -2247,7 +2245,7 @@ async fn hook_for_live_execution_without_slot_is_not_counted_as_reconcile() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::{CreateChoreInput, RequestExecutionInput};
 
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = server_state
         .work_db

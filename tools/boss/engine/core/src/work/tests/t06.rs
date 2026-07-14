@@ -7,7 +7,7 @@ use super::*;
 /// `task_blocked_signals` row is also cleared.
 #[test]
 fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
-    let path = disk_db_path("ci-retry-resets");
+    let (_dir, path) = disk_db_path("ci-retry-resets");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-retry");
@@ -82,7 +82,7 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
 /// and orders by `created_at DESC`.
 #[test]
 fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
-    let path = disk_db_path("list-engine-attempts");
+    let (_dir, path) = disk_db_path("list-engine-attempts");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-attempts");
@@ -405,7 +405,7 @@ fn fresh_db_has_prefer_is_soft_column() {
 
 #[test]
 fn upgrade_from_schema_without_revision_columns_yields_same_shape() {
-    let path = disk_db_path("revision-schema-upgrade");
+    let (_dir, path) = disk_db_path("revision-schema-upgrade");
 
     // Build a pre-revision schema that is missing the two new columns.
     // The tasks table must include all columns present before the revision
