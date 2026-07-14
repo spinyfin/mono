@@ -4710,6 +4710,26 @@ impl DetailTable {
         self
     }
 
+    /// Add the six-row lifecycle tail shared by attempt detail views:
+    /// the cube/worker identifiers followed by the created/started/finished
+    /// timestamps.
+    fn lifecycle_rows(
+        self,
+        cube_lease_id: Option<String>,
+        cube_workspace_id: Option<String>,
+        worker_id: Option<String>,
+        created_at: &str,
+        started_at: Option<String>,
+        finished_at: Option<String>,
+    ) -> Self {
+        self.opt_row("cube_lease_id", cube_lease_id)
+            .opt_row("cube_workspace_id", cube_workspace_id)
+            .opt_row("worker_id", worker_id)
+            .row("created_at", created_at)
+            .opt_row("started_at", started_at)
+            .opt_row("finished_at", finished_at)
+    }
+
     /// Render the accumulated table to stdout.
     fn print(self) {
         print_table(self.table);
@@ -6174,17 +6194,34 @@ fn print_conflict_hotspot_report(report: &ConflictHotspotReport) {
     print_table(pair_table);
 }
 
+/// The trailing cells shared by the attempt list tables: pr_url, work_item_id
+/// (falling back to `""` when absent), failure_reason (likewise), created_at.
+/// Callers supply their own differing leading columns.
+fn attempt_trailing_cells<'a>(
+    pr_url: &'a str,
+    work_item_id: Option<&'a str>,
+    failure_reason: Option<&'a str>,
+    created_at: &'a str,
+) -> [&'a str; 4] {
+    [
+        pr_url,
+        work_item_id.unwrap_or(""),
+        failure_reason.unwrap_or(""),
+        created_at,
+    ]
+}
+
 fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
     let mut table = new_dynamic_table(vec!["ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for attempt in attempts {
-        table.add_row(vec![
-            attempt.id.as_str(),
-            attempt.status.as_str(),
+        let mut cells = vec![attempt.id.as_str(), attempt.status.as_str()];
+        cells.extend(attempt_trailing_cells(
             attempt.pr_url.as_str(),
-            attempt.work_item_id.as_str(),
-            attempt.failure_reason.as_deref().unwrap_or(""),
+            Some(attempt.work_item_id.as_str()),
+            attempt.failure_reason.as_deref(),
             attempt.created_at.as_str(),
-        ]);
+        ));
+        table.add_row(cells);
     }
     print_table(table);
 }
@@ -6203,12 +6240,14 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
         .opt_row("head_sha_before", attempt.head_sha_before.clone())
         .opt_row("head_sha_after", attempt.head_sha_after.clone())
         .opt_row("failure_reason", attempt.failure_reason.clone())
-        .opt_row("cube_lease_id", attempt.cube_lease_id.clone())
-        .opt_row("cube_workspace_id", attempt.cube_workspace_id.clone())
-        .opt_row("worker_id", attempt.worker_id.clone())
-        .row("created_at", &attempt.created_at)
-        .opt_row("started_at", attempt.started_at.clone())
-        .opt_row("finished_at", attempt.finished_at.clone())
+        .lifecycle_rows(
+            attempt.cube_lease_id.clone(),
+            attempt.cube_workspace_id.clone(),
+            attempt.worker_id.clone(),
+            &attempt.created_at,
+            attempt.started_at.clone(),
+            attempt.finished_at.clone(),
+        )
         .print();
     if let Some(diag) = &attempt.conflict_diagnosis {
         println!();
@@ -6220,15 +6259,18 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
 fn print_ci_remediations_table(attempts: &[CiRemediation]) {
     let mut table = new_dynamic_table(vec!["ID", "KIND", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for attempt in attempts {
-        table.add_row(vec![
+        let mut cells = vec![
             attempt.id.as_str(),
             attempt.attempt_kind.as_str(),
             attempt.status.as_str(),
+        ];
+        cells.extend(attempt_trailing_cells(
             attempt.pr_url.as_str(),
-            attempt.work_item_id.as_str(),
-            attempt.failure_reason.as_deref().unwrap_or(""),
+            Some(attempt.work_item_id.as_str()),
+            attempt.failure_reason.as_deref(),
             attempt.created_at.as_str(),
-        ]);
+        ));
+        table.add_row(cells);
     }
     print_table(table);
 }
@@ -6248,12 +6290,14 @@ fn print_ci_remediation_detail(attempt: &CiRemediation) {
         .opt_row("head_sha_after", attempt.head_sha_after.clone())
         .opt_row("triage_class", attempt.triage_class.clone())
         .opt_row("failure_reason", attempt.failure_reason.clone())
-        .opt_row("cube_lease_id", attempt.cube_lease_id.clone())
-        .opt_row("cube_workspace_id", attempt.cube_workspace_id.clone())
-        .opt_row("worker_id", attempt.worker_id.clone())
-        .row("created_at", &attempt.created_at)
-        .opt_row("started_at", attempt.started_at.clone())
-        .opt_row("finished_at", attempt.finished_at.clone())
+        .lifecycle_rows(
+            attempt.cube_lease_id.clone(),
+            attempt.cube_workspace_id.clone(),
+            attempt.worker_id.clone(),
+            &attempt.created_at,
+            attempt.started_at.clone(),
+            attempt.finished_at.clone(),
+        )
         .print();
     if !attempt.failed_checks.is_empty() {
         println!();
@@ -6303,15 +6347,14 @@ fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetSnapshot, wa
 fn print_engine_attempts_table(attempts: &[EngineAttemptListEntry]) {
     let mut table = new_dynamic_table(vec!["KIND", "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for row in attempts {
-        table.add_row(vec![
-            row.kind.as_str(),
-            row.id.as_str(),
-            row.status.as_str(),
+        let mut cells = vec![row.kind.as_str(), row.id.as_str(), row.status.as_str()];
+        cells.extend(attempt_trailing_cells(
             row.pr_url.as_str(),
-            row.work_item_id.as_deref().unwrap_or(""),
-            row.failure_reason.as_deref().unwrap_or(""),
+            row.work_item_id.as_deref(),
+            row.failure_reason.as_deref(),
             row.created_at.as_str(),
-        ]);
+        ));
+        table.add_row(cells);
     }
     print_table(table);
 }
