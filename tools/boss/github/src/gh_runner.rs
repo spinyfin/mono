@@ -224,16 +224,33 @@ fn gh_status_error(output: &std::process::Output) -> GhRunnerError {
     GhRunnerError::with_status(status, stderr.trim().to_owned())
 }
 
+/// Construct a `gh` [`Command`], applying the `GH_TOKEN` env when a token is
+/// present. Shared by [`execute_gh`] and the streaming POST path so the
+/// command/token setup lives in one place.
+fn gh_command(token: Option<&str>) -> Command {
+    let mut cmd = Command::new("gh");
+    if let Some(t) = token {
+        cmd.env("GH_TOKEN", t);
+    }
+    cmd
+}
+
+/// Verify a completed `gh` [`Output`]'s exit status, mapping non-zero exits via
+/// [`gh_status_error`]. Shared so the success/failure branch isn't spelled out
+/// at each call site.
+fn finalize_gh(output: std::process::Output) -> std::result::Result<std::process::Output, GhRunnerError> {
+    if !output.status.success() {
+        return Err(gh_status_error(&output));
+    }
+    Ok(output)
+}
+
 /// Spawn `gh <args>` (optionally with `GH_TOKEN` set), wait for completion, and
 /// return its captured [`Output`](std::process::Output) once the exit status is
 /// verified. Spawn failures map to transient errors; non-zero exits map via
 /// [`gh_status_error`].
 async fn execute_gh(args: &[String], token: Option<&str>) -> std::result::Result<std::process::Output, GhRunnerError> {
-    let mut cmd = Command::new("gh");
-    if let Some(t) = token {
-        cmd.env("GH_TOKEN", t);
-    }
-    let output = cmd
+    let output = gh_command(token)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -243,10 +260,7 @@ async fn execute_gh(args: &[String], token: Option<&str>) -> std::result::Result
         .await
         .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
 
-    if !output.status.success() {
-        return Err(gh_status_error(&output));
-    }
-    Ok(output)
+    finalize_gh(output)
 }
 
 #[async_trait]
@@ -308,10 +322,7 @@ impl GhRunner for CommandGhRunner {
         use tokio::io::AsyncWriteExt as _;
         let stdin_bytes = serde_json::to_vec(body)
             .map_err(|e| GhRunnerError::transient(format!("failed to serialize POST body: {e}")))?;
-        let mut cmd = Command::new("gh");
-        if let Some(t) = token {
-            cmd.env("GH_TOKEN", t);
-        }
+        let mut cmd = gh_command(token);
         cmd.args(["api", "-X", "POST", "--input", "-", path])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -331,9 +342,7 @@ impl GhRunner for CommandGhRunner {
             .await
             .map_err(|e| GhRunnerError::transient(format!("failed to wait for gh: {e}")))?;
 
-        if !output.status.success() {
-            return Err(gh_status_error(&output));
-        }
+        let output = finalize_gh(output)?;
 
         let body = serde_json::from_slice(&output.stdout)
             .map_err(|e| GhRunnerError::transient(format!("failed to parse POST response: {e}")))?;
