@@ -58,20 +58,13 @@ pub fn default_backup_dir(state_root: &Path) -> PathBuf {
 /// Read the backup interval from `BOSS_BACKUP_INTERVAL_SECS`, or fall
 /// back to [`DEFAULT_BACKUP_INTERVAL`].
 pub fn backup_interval() -> Duration {
-    std::env::var(BACKUP_INTERVAL_SECS_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_BACKUP_INTERVAL)
+    crate::env_parse::env_duration_secs(BACKUP_INTERVAL_SECS_ENV, DEFAULT_BACKUP_INTERVAL)
 }
 
 /// Read the retention count from `BOSS_BACKUP_RETENTION`, or fall back
 /// to [`DEFAULT_RETENTION_COUNT`].
 pub fn retention_count() -> usize {
-    std::env::var(BACKUP_RETENTION_ENV)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_RETENTION_COUNT)
+    crate::env_parse::env_parsed_or(BACKUP_RETENTION_ENV, DEFAULT_RETENTION_COUNT)
 }
 
 /// Take a snapshot of `work_db` to `dest` using SQLite's `VACUUM INTO`.
