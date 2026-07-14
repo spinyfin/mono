@@ -1154,6 +1154,17 @@ fn print_dispatch_event_detailed(event: &DispatchEvent, stage_duration_ms: u128)
         "  {}  {}/{}  +{}ms  worker={}",
         event.ts_epoch_ms, event.stage, event.outcome, stage_duration_ms, worker,
     );
+    // Decode the claimed slot + interactive page from the worker id so a
+    // Lower Decks spawn/claim failure is distinguishable from a Bridge Crew
+    // one at a glance. Automation/review workers resolve a slot but no page.
+    if let Some(worker_id) = &event.worker_id
+        && let Some(slot) = boss_engine::coordinator::slot_id_from_worker_id(worker_id)
+    {
+        match boss_engine::coordinator::worker_page_label(slot) {
+            Some(page) => println!("    page:      {page} (slot {slot})"),
+            None => println!("    slot:      {slot}"),
+        }
+    }
     if let Some(lease) = &event.cube_lease_id {
         println!("    lease:     {lease}");
     }

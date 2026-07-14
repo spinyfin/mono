@@ -29,8 +29,9 @@ const ANCESTOR_WALK_DEPTH: usize = 8;
 /// allocates a real pool slot for it. But the live-status surface is
 /// slot-keyed, so the dispatcher assigns each live remote run a synthetic
 /// slot from a high range that cannot collide with the local worker pool
-/// (`1..=MAX_WORKER_POOL_SIZE`, currently 8) or the automation pool
-/// (`MAX_WORKER_POOL_SIZE+1..`, currently 9..=11). 200 leaves generous
+/// (`1..=MAX_WORKER_POOL_SIZE`, currently 16 — Bridge Crew 1..=8, Lower Decks
+/// 9..=16) or the automation pool (`MAX_WORKER_POOL_SIZE+1..`, currently
+/// 17..=22). 200 leaves generous
 /// headroom below for pool growth and 56 ids above for concurrent remote
 /// runs — far more than any real deployment. See
 /// [`WorkerRegistry::get_or_allocate_remote_slot`].

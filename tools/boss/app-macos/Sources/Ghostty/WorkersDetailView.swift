@@ -1,17 +1,23 @@
 import AppKit
 import SwiftUI
 
-/// Which worker pool the Agents tab is currently displaying.
+/// Which worker pool page the Agents tab is currently displaying.
+///
+/// Bridge Crew and Lower Decks are the two pages of the single interactive
+/// worker pool (slots 1...8 and 9...16 respectively). They are one engine
+/// pool — dispatch just fills Bridge Crew before spilling into Lower Decks.
 enum AgentPoolKind: String, CaseIterable, Identifiable {
-    case main
+    case bridgeCrew
+    case lowerDecks
     case automations
     case reviewers
 
     var id: String { rawValue }
 
-    func label(mainCount: Int, automationCount: Int, reviewCount: Int) -> String {
+    func label(bridgeCrewCount: Int, lowerDecksCount: Int, automationCount: Int, reviewCount: Int) -> String {
         switch self {
-        case .main: return "Main (\(mainCount))"
+        case .bridgeCrew: return "Bridge Crew (\(bridgeCrewCount))"
+        case .lowerDecks: return "Lower Decks (\(lowerDecksCount))"
         case .automations: return "Automations (\(automationCount))"
         case .reviewers: return "Reviewers (\(reviewCount))"
         }
@@ -27,7 +33,7 @@ struct WorkersDetailView: View {
     /// `ChatViewModel`'s state.
     @ObservedObject var liveStatusModel: ChatViewModel
 
-    @State private var selectedPool: AgentPoolKind = .main
+    @State private var selectedPool: AgentPoolKind = .bridgeCrew
 
     var body: some View {
         VStack(spacing: 0) {
@@ -38,14 +44,25 @@ struct WorkersDetailView: View {
             // churn, no dismantleNSView, no libghostty surface teardown.
             // Only the visible grid receives hit-testing and is rendered.
             ZStack {
+                // Bridge Crew and Lower Decks are the two pages of the same
+                // interactive pool, filtered out of the flat `slots` array.
                 WorkerGrid(
                     runtime: workspace.runtime,
-                    slots: workspace.slots,
+                    slots: workspace.bridgeCrewSlots,
                     liveStates: liveStates,
                     liveStatusModel: liveStatusModel
                 )
-                .opacity(selectedPool == .main ? 1 : 0)
-                .allowsHitTesting(selectedPool == .main)
+                .opacity(selectedPool == .bridgeCrew ? 1 : 0)
+                .allowsHitTesting(selectedPool == .bridgeCrew)
+
+                WorkerGrid(
+                    runtime: workspace.runtime,
+                    slots: workspace.lowerDecksSlots,
+                    liveStates: liveStates,
+                    liveStatusModel: liveStatusModel
+                )
+                .opacity(selectedPool == .lowerDecks ? 1 : 0)
+                .allowsHitTesting(selectedPool == .lowerDecks)
 
                 WorkerGrid(
                     runtime: workspace.runtime,
@@ -76,14 +93,15 @@ struct WorkersDetailView: View {
             Picker("Pool", selection: $selectedPool) {
                 ForEach(AgentPoolKind.allCases) { pool in
                     Text(pool.label(
-                        mainCount: WorkersWorkspaceModel.workerSlotCount,
+                        bridgeCrewCount: workspace.bridgeCrewSlots.count,
+                        lowerDecksCount: workspace.lowerDecksSlots.count,
                         automationCount: WorkersWorkspaceModel.automationSlotCount,
                         reviewCount: workspace.reviewSlotCount
                     )).tag(pool)
                 }
             }
             .pickerStyle(.segmented)
-            .frame(maxWidth: 280)
+            .frame(maxWidth: 460)
             Spacer()
         }
         .padding(.horizontal, 12)
@@ -206,6 +224,17 @@ private struct WorkerSlotView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
                     .lineLimit(3)
+            } else if WorkersWorkspaceModel.lowerDecksSlotRange.contains(slot.slotId) {
+                // Lower Decks has no bespoke portrait asset, but it is still a
+                // real crew: show the canonical name (same `WorkerNames` source
+                // as the running-pane title) so the page reads as a roster
+                // rather than bare slot numbers.
+                Text(WorkerNames.name(forSlot: slot.slotId))
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                Text("Free")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.white.opacity(0.7))
             } else {
                 Text("Slot \(slot.slotId)")
                     .font(.caption2)

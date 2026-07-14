@@ -77,10 +77,28 @@ impl ExecutionStartedHook for NoopExecutionStartedHook {
     async fn on_execution_started(&self, _execution_id: &str) {}
 }
 
-/// Hard cap on the worker pool. The runtime config can request a smaller
-/// pool, but values above this are clamped (with a warning). The V2
-/// design fixes 8 as the upper bound.
-pub const MAX_WORKER_POOL_SIZE: usize = 8;
+/// Number of interactive-worker slots shown on a single page (one macOS
+/// tab). The main pool is partitioned into fixed-size pages so that
+/// capacity is expressed as `pages × page size` rather than a magic total —
+/// keeping the model general as pages later grow (e.g. remote-worker-backed
+/// pages) instead of hard-coding a flat pane count.
+pub const WORKER_PAGE_SIZE: usize = 8;
+
+/// Number of interactive-worker pages. Page 0 is "Bridge Crew" (the original
+/// 8 slots); page 1 is "Lower Decks", a strict spillover pool the dispatcher
+/// only claims into once every Bridge Crew slot is occupied. Bumping this is
+/// the single knob that adds another page of capacity.
+pub const WORKER_PAGE_COUNT: usize = 2;
+
+/// Hard cap on the interactive/main worker pool. The runtime config can
+/// request a smaller pool, but values above this are clamped (with a
+/// warning). Derived from the page geometry: `WORKER_PAGE_SIZE *
+/// WORKER_PAGE_COUNT` (currently 16 = two pages of 8). All pool-namespace
+/// derivations (`worker_id_for_slot`, `slot_id_from_worker_id`, and the app's
+/// mirrored `workerSlotCount`) key off this constant so the interactive,
+/// automation, and review ranges stay disjoint and engine/app agree on the
+/// slot namespace across both pages.
+pub const MAX_WORKER_POOL_SIZE: usize = WORKER_PAGE_SIZE * WORKER_PAGE_COUNT;
 
 /// Hard cap on the automation worker pool. The runtime config can request a
 /// smaller pool via `BOSS_AUTOMATION_POOL_SIZE`, but values above this are
@@ -696,10 +714,6 @@ pub struct WorkerPool {
 #[derive(Debug)]
 struct WorkerPoolInner {
     workers: Vec<WorkerSlot>,
-    /// Per-pool RNG used to pick a uniformly-random free worker when
-    /// no workspace-affinity match is available. Seeded once at pool
-    /// construction; advanced on each claim.
-    rng: fastrand::Rng,
 }
 
 #[derive(Debug, Clone)]
@@ -707,6 +721,46 @@ struct WorkerSlot {
     worker_id: String,
     execution_id: Option<String>,
     last_workspace_id: Option<String>,
+}
+
+/// Deterministic, page-aware free-slot selection shared by
+/// [`WorkerPool::claim_worker`] and [`WorkerPool::claim_worker_force`].
+///
+/// Returns the index of the slot to claim plus a short label describing why
+/// it was chosen, or `None` when every slot is occupied.
+///
+/// Selection enforces **strict spillover across pages**: the candidate set is
+/// restricted to the *lowest page* (a contiguous [`WORKER_PAGE_SIZE`] block of
+/// slot indices) that still has a free slot, so a Lower Decks slot (page 1) is
+/// only ever chosen once every Bridge Crew slot (page 0) is occupied. Within
+/// that page, workspace affinity wins if an idle slot last ran the preferred
+/// workspace; otherwise the lowest free index is chosen. Selection is fully
+/// deterministic — no RNG — so the engine and app never disagree about which
+/// slot a dispatch will land on.
+fn select_claim_index(workers: &[WorkerSlot], preferred_workspace_id: Option<&str>) -> Option<(usize, &'static str)> {
+    // `enumerate()` yields ascending indices and `filter` preserves order, so
+    // `free` is sorted ascending and `free[0]` is the globally-lowest free slot.
+    let free: Vec<usize> = workers
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.execution_id.is_none())
+        .map(|(idx, _)| idx)
+        .collect();
+    let lowest_free = *free.first()?;
+    let target_page = lowest_free / WORKER_PAGE_SIZE;
+
+    // Affinity is honored only within the lowest non-full page, so it can
+    // never jump the dispatch ahead into Lower Decks while Bridge Crew is free.
+    let affinity_idx = preferred_workspace_id.and_then(|target| {
+        free.iter().copied().find(|&idx| {
+            idx / WORKER_PAGE_SIZE == target_page && workers[idx].last_workspace_id.as_deref() == Some(target)
+        })
+    });
+
+    Some(match affinity_idx {
+        Some(idx) => (idx, "affinity"),
+        None => (lowest_free, "spillover"),
+    })
 }
 
 /// A snapshot of one currently-claimed worker-pool slot: which logical
@@ -770,51 +824,29 @@ impl WorkerPool {
             })
             .collect();
         Self {
-            inner: Arc::new(Mutex::new(WorkerPoolInner {
-                workers,
-                rng: fastrand::Rng::new(),
-            })),
+            inner: Arc::new(Mutex::new(WorkerPoolInner { workers })),
         }
     }
 
-    /// Claim an idle worker for `execution_id`. Selection is affinity-first:
-    /// if `preferred_workspace_id` is set and an idle worker last ran in
-    /// that workspace, that worker is chosen. Otherwise a free slot is
-    /// picked uniformly at random — a cosmetic spread so we don't always
-    /// hammer slot 1.
+    /// Claim an idle worker for `execution_id`. Selection is deterministic and
+    /// page-aware (see [`select_claim_index`]): the lowest free slot in the
+    /// lowest non-full page is chosen, with workspace affinity preferred within
+    /// that page. For the interactive pool this yields **strict spillover** —
+    /// a Lower Decks slot (page 1) is claimed only once every Bridge Crew slot
+    /// (page 0) is occupied — and the choice is reproducible, so the engine and
+    /// app never disagree about which slot a dispatch lands on.
     pub async fn claim_worker(&self, execution_id: &str, preferred_workspace_id: Option<&str>) -> Option<String> {
         let mut inner = self.inner.lock().await;
-
-        if let Some(target) = preferred_workspace_id
-            && let Some(idx) = inner
-                .workers
-                .iter()
-                .position(|w| w.execution_id.is_none() && w.last_workspace_id.as_deref() == Some(target))
-        {
-            let worker = &mut inner.workers[idx];
-            worker.execution_id = Some(execution_id.to_owned());
-            let worker_id = worker.worker_id.clone();
-            log_pool_claim(&worker_id, execution_id, "affinity");
-            return Some(worker_id);
-        }
-
-        let free: Vec<usize> = inner
-            .workers
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| w.execution_id.is_none())
-            .map(|(idx, _)| idx)
-            .collect();
-        let chosen_idx = *inner.rng.choice(&free)?;
+        let (chosen_idx, selection) = select_claim_index(&inner.workers, preferred_workspace_id)?;
         let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
         let worker_id = worker.worker_id.clone();
-        log_pool_claim(&worker_id, execution_id, "random");
+        log_pool_claim(&worker_id, execution_id, selection);
         Some(worker_id)
     }
 
     /// Skip-the-queue claim used by `bossctl agents launch`. Same
-    /// affinity-then-random selection as `claim_worker`, but if every
+    /// deterministic, page-aware selection as `claim_worker`, but if every
     /// configured slot is busy and the pool is still below the hard
     /// cap (`MAX_WORKER_POOL_SIZE`) we grow the pool by one fresh slot
     /// and hand it back. Returns `None` only when the pool is already
@@ -824,36 +856,23 @@ impl WorkerPool {
     pub async fn claim_worker_force(&self, execution_id: &str, preferred_workspace_id: Option<&str>) -> Option<String> {
         let mut inner = self.inner.lock().await;
 
-        if let Some(target) = preferred_workspace_id
-            && let Some(idx) = inner
-                .workers
-                .iter()
-                .position(|w| w.execution_id.is_none() && w.last_workspace_id.as_deref() == Some(target))
-        {
-            let worker = &mut inner.workers[idx];
+        if let Some((chosen_idx, selection)) = select_claim_index(&inner.workers, preferred_workspace_id) {
+            let worker = &mut inner.workers[chosen_idx];
             worker.execution_id = Some(execution_id.to_owned());
             let worker_id = worker.worker_id.clone();
-            log_pool_claim(&worker_id, execution_id, "force-affinity");
-            return Some(worker_id);
-        }
-
-        let free: Vec<usize> = inner
-            .workers
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| w.execution_id.is_none())
-            .map(|(idx, _)| idx)
-            .collect();
-        if let Some(&idx) = inner.rng.choice(&free) {
-            let worker = &mut inner.workers[idx];
-            worker.execution_id = Some(execution_id.to_owned());
-            let worker_id = worker.worker_id.clone();
-            log_pool_claim(&worker_id, execution_id, "force-random");
+            log_pool_claim(
+                &worker_id,
+                execution_id,
+                match selection {
+                    "affinity" => "force-affinity",
+                    _ => "force-spillover",
+                },
+            );
             return Some(worker_id);
         }
 
         // Every existing slot is busy. Grow the pool — bounded by the
-        // hard cap so the app's 8-pane workspace can always render the
+        // hard cap so the app's fixed pane workspace can always render the
         // forced worker.
         if inner.workers.len() >= MAX_WORKER_POOL_SIZE {
             return None;
@@ -1003,10 +1022,13 @@ impl WorkerPool {
 /// Automation-pool `auto-worker-{N}` ids map to slot
 /// `N + MAX_WORKER_POOL_SIZE`; review-pool `review-{N}` ids map to
 /// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE` so the
-/// three pools occupy disjoint slot ranges (1..=8 regular, 9..=14
-/// automation, 15..=22 review). This means "auto-worker-1" → slot 9
-/// (Kira), "review-1" → slot 15, never colliding with another pool's
-/// range.
+/// three pools occupy disjoint slot ranges. With the current geometry
+/// (`MAX_WORKER_POOL_SIZE = 16`) that is `1..=16` interactive (Bridge
+/// Crew 1..=8, Lower Decks 9..=16), `17..=22` automation, `23..=30`
+/// review — so "auto-worker-1" → slot 17, "review-1" → slot 23, never
+/// colliding with another pool's range. Every boundary is derived from
+/// the pool-size constants, so bumping [`WORKER_PAGE_COUNT`] shifts the
+/// automation/review ranges up in lock-step on both the engine and app.
 ///
 /// Returns `None` for ids that don't match any recognised shape
 /// or whose suffix isn't a positive `u8`. Callers should treat
@@ -1067,6 +1089,25 @@ pub fn worker_id_for_slot(slot_id: u8) -> String {
             slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE
         )
     }
+}
+
+/// Human-readable page label for an interactive/main-pool `slot_id`, or
+/// `None` for slots outside the interactive pool (automation, review, or
+/// remote virtual slots). Page 0 is "Bridge Crew", page 1 is "Lower Decks";
+/// further pages fall back to `Deck N` so the label never panics if
+/// [`WORKER_PAGE_COUNT`] grows. Recorded into `dispatch.jsonl` details at
+/// claim/spawn time so a failure on a Lower Decks slot is distinguishable
+/// from a Bridge Crew one in `bossctl dispatch diagnose`.
+pub fn worker_page_label(slot_id: u8) -> Option<String> {
+    let slot = slot_id as usize;
+    if !(1..=MAX_WORKER_POOL_SIZE).contains(&slot) {
+        return None;
+    }
+    Some(match (slot - 1) / WORKER_PAGE_SIZE {
+        0 => "Bridge Crew".to_owned(),
+        1 => "Lower Decks".to_owned(),
+        n => format!("Deck {}", n + 1),
+    })
 }
 
 /// If `err` is (transitively) a `SlotBusy` app-error from the spawn
@@ -2603,11 +2644,22 @@ impl ExecutionCoordinator {
                 continue;
             };
 
+            // Record the physical slot + page the claim landed on so a later
+            // spawn failure on this slot is attributable to Bridge Crew vs
+            // Lower Decks in `bossctl dispatch diagnose` (the page is `null`
+            // for automation/review pools, which are single-page).
+            let claimed_slot = slot_id_from_worker_id(&worker_id);
+            let claimed_page = claimed_slot.and_then(worker_page_label);
             self.dispatch_events
                 .emit(
                     DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
                         .with_work_item(&execution.work_item_id)
-                        .with_worker(&worker_id),
+                        .with_worker(&worker_id)
+                        .with_details(serde_json::json!({
+                            "pool": pool_label,
+                            "slot_id": claimed_slot,
+                            "page": claimed_page,
+                        })),
                 )
                 .await;
             if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
@@ -4792,6 +4844,8 @@ impl ExecutionCoordinator {
                 // launch with."
                 let mut details = serde_json::json!({
                     "run_id": run.id,
+                    "slot_id": slot_id_from_worker_id(&worker_id),
+                    "page": slot_id_from_worker_id(&worker_id).and_then(worker_page_label),
                 });
                 if let Some(spawn) = spawn_config_for_event {
                     details["spawn_config"] = serde_json::json!({
@@ -4884,6 +4938,8 @@ impl ExecutionCoordinator {
                         let mut error_details = serde_json::json!({
                             "run_id": run.id,
                             "released_workspace": released,
+                            "slot_id": slot_id_from_worker_id(&worker_id),
+                            "page": slot_id_from_worker_id(&worker_id).and_then(worker_page_label),
                         });
                         // A `SlotBusy` spawn rejection means the engine and
                         // the app disagree about slot occupancy — the
@@ -5506,8 +5562,9 @@ mod tests {
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
         DispatchPauseOrigin, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter,
         HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-        REVIEW_WORKER_ID_PREFIX, WorkerPool, occupying_live_worker, pick_worst_failing_check,
+        REVIEW_WORKER_ID_PREFIX, WORKER_PAGE_SIZE, WorkerPool, occupying_live_worker, pick_worst_failing_check,
         pool_model_override_for_worker_id, slot_busy_occupant, slot_id_from_worker_id, worker_id_for_slot,
+        worker_page_label,
     };
     use crate::spawn_flow::StartWorkerError;
     use boss_protocol::{EngineToAppError, ExecutionStatus};
@@ -8349,28 +8406,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pool_prefers_workspace_affinity_over_random() {
+    async fn worker_pool_prefers_workspace_affinity_over_lowest_index() {
         let pool = WorkerPool::new(2);
 
-        // Take both slots at once so we can record distinct affinities
-        // without depending on which slot random selection lands on.
+        // Deterministic selection fills the lowest free slot first, so the
+        // two claims land on worker-1 then worker-2.
         let w_a = pool.claim_worker("exec-a", None).await.unwrap();
         let w_b = pool.claim_worker("exec-b", None).await.unwrap();
-        assert_ne!(w_a, w_b, "second claim must fill the other free slot");
+        assert_eq!(w_a, "worker-1");
+        assert_eq!(w_b, "worker-2");
         pool.release_worker(&w_a, Some("ws-a")).await;
         pool.release_worker(&w_b, Some("ws-b")).await;
 
-        // Preferring ws-b must pick whichever worker recorded ws-b
-        // affinity, even though random selection from the free pool
-        // would otherwise be a coin flip.
+        // Preferring ws-b must pick the worker that recorded ws-b affinity
+        // (worker-2), even though the lowest-index default would otherwise
+        // pick worker-1.
         let claimed = pool.claim_worker("exec-c", Some("ws-b")).await.unwrap();
         assert_eq!(claimed, w_b);
         pool.release_worker(&claimed, Some("ws-b")).await;
 
-        // Preferring an unknown workspace falls through to random
-        // selection from the free pool — either worker is a valid pick.
+        // Preferring an unknown workspace has no affinity match, so it falls
+        // through to the deterministic lowest-index slot (worker-1).
         let fallback = pool.claim_worker("exec-d", Some("ws-unknown")).await.unwrap();
-        assert!(fallback == w_a || fallback == w_b);
+        assert_eq!(fallback, w_a);
     }
 
     /// `worker-{N}` and slot N must round-trip 1:1. The
@@ -8381,7 +8439,9 @@ mod tests {
     /// numbering systems.
     #[test]
     fn worker_id_and_slot_id_round_trip() {
-        for slot in 1u8..=8 {
+        // Covers the full interactive pool — Bridge Crew (1..=8) and Lower
+        // Decks (9..=16) — so the second page round-trips 1:1 too.
+        for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
             let worker_id = WorkerPool::worker_id_for_slot(slot);
             assert_eq!(worker_id, format!("worker-{slot}"));
             assert_eq!(slot_id_from_worker_id(&worker_id), Some(slot));
@@ -8390,8 +8450,8 @@ mod tests {
 
     #[test]
     fn slot_id_from_worker_id_accepts_automation_pool_format() {
-        // Automation-pool ordinals are offset by MAX_WORKER_POOL_SIZE (8) so the
-        // two pools occupy disjoint slot ranges: regular 1..=8, automation 9..=14.
+        // Automation-pool ordinals are offset by MAX_WORKER_POOL_SIZE (16) so the
+        // two pools occupy disjoint slot ranges: interactive 1..=16, automation 17..=22.
         for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
             let auto_worker_id = format!("auto-worker-{ordinal}");
             let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8;
@@ -8408,13 +8468,13 @@ mod tests {
 
     #[test]
     fn worker_id_for_slot_round_trips_with_slot_id_from_worker_id() {
-        // Regular pool: slots 1..=8 → "worker-N" → back to the same slot.
-        for slot in 1u8..=8 {
+        // Interactive pool: slots 1..=16 → "worker-N" → back to the same slot.
+        for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
             let wid = worker_id_for_slot(slot);
             assert_eq!(wid, format!("worker-{slot}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
-        // Automation pool: slots 9..=14 → "auto-worker-M" → back to the same slot.
+        // Automation pool: slots 17..=22 → "auto-worker-M" → back to the same slot.
         let automation_end = MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
         for slot in (MAX_WORKER_POOL_SIZE as u8 + 1)..=automation_end {
             let wid = worker_id_for_slot(slot);
@@ -8422,7 +8482,7 @@ mod tests {
             assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
-        // Review pool: slots 15..=22 → "review-M" → back to the same slot.
+        // Review pool: slots 23..=30 → "review-M" → back to the same slot.
         for slot in (automation_end + 1)..=(automation_end + MAX_REVIEW_POOL_SIZE as u8) {
             let wid = worker_id_for_slot(slot);
             let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
@@ -8433,8 +8493,8 @@ mod tests {
 
     #[test]
     fn slot_id_from_worker_id_accepts_review_pool_format() {
-        // Review-pool ordinals are offset past both the regular (8) and
-        // automation (6) ranges, so they occupy slots 15..=22 — disjoint
+        // Review-pool ordinals are offset past both the interactive (16) and
+        // automation (6) ranges, so they occupy slots 23..=30 — disjoint
         // from every other pool.
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_worker_id = format!("review-{ordinal}");
@@ -8452,8 +8512,8 @@ mod tests {
 
     #[test]
     fn review_pool_slots_are_disjoint_from_other_pools() {
-        // The slot IDs produced by review-N (15..=22) must not overlap
-        // with any regular-pool (1..=8) or automation-pool (9..=14) slot.
+        // The slot IDs produced by review-N (23..=30) must not overlap
+        // with any interactive-pool (1..=16) or automation-pool (17..=22) slot.
         let automation_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE;
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_wid = format!("review-{ordinal}");
@@ -8469,6 +8529,30 @@ mod tests {
                 "slot {slot} must produce a review-pool worker_id, got {back:?}"
             );
         }
+    }
+
+    #[test]
+    fn worker_page_label_partitions_interactive_pool_only() {
+        // Bridge Crew is page 0 (slots 1..=8), Lower Decks is page 1
+        // (slots 9..=16). Non-interactive slots (automation/review/remote)
+        // have no page label.
+        for slot in 1u8..=WORKER_PAGE_SIZE as u8 {
+            assert_eq!(worker_page_label(slot).as_deref(), Some("Bridge Crew"), "slot {slot}");
+        }
+        for slot in (WORKER_PAGE_SIZE as u8 + 1)..=MAX_WORKER_POOL_SIZE as u8 {
+            assert_eq!(worker_page_label(slot).as_deref(), Some("Lower Decks"), "slot {slot}");
+        }
+        assert_eq!(worker_page_label(0), None);
+        assert_eq!(
+            worker_page_label(MAX_WORKER_POOL_SIZE as u8 + 1),
+            None,
+            "first automation slot has no page"
+        );
+        assert_eq!(
+            worker_page_label(crate::worker_registry::REMOTE_SLOT_BASE),
+            None,
+            "remote virtual slot has no page"
+        );
     }
 
     #[test]
@@ -8572,27 +8656,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pool_random_fallback_spreads_across_free_slots() {
-        // With M free slots and N >> M claims, every slot should be
-        // hit at least once. This is the cosmetic guarantee the
-        // randomization is for: don't always start at slot 1.
-        let pool_size = 4;
-        let trials = 200;
-        let pool = WorkerPool::new(pool_size);
-        let mut hits = vec![0usize; pool_size];
-        for i in 0..trials {
+    async fn worker_pool_claims_lowest_free_slot_deterministically() {
+        // Claim-release-claim must always return to the lowest free slot —
+        // the deterministic replacement for the old random spread. Every
+        // claim after a release lands back on worker-1, never a higher slot.
+        let pool = WorkerPool::new(4);
+        for i in 0..50 {
             let claimed = pool.claim_worker(&format!("exec-{i}"), None).await.unwrap();
-            let slot: usize = claimed.strip_prefix("worker-").unwrap().parse().unwrap();
-            hits[slot - 1] += 1;
+            assert_eq!(
+                claimed, "worker-1",
+                "deterministic claim must always pick the lowest free slot"
+            );
             pool.release_worker(&claimed, None).await;
         }
-        for (slot, count) in hits.iter().enumerate() {
-            assert!(
-                *count > 0,
-                "slot worker-{} was never picked across {trials} claims",
-                slot + 1
+        // Held claims fill strictly in ascending slot order.
+        let mut held = Vec::new();
+        for i in 0..4 {
+            held.push(pool.claim_worker(&format!("hold-{i}"), None).await.unwrap());
+        }
+        assert_eq!(held, vec!["worker-1", "worker-2", "worker-3", "worker-4"]);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_strict_spillover_fills_bridge_crew_before_lower_decks() {
+        // The interactive pool is two pages of WORKER_PAGE_SIZE. Bridge Crew
+        // (page 0) must be fully occupied before any Lower Decks (page 1) slot
+        // is claimed, and a freed Bridge Crew slot must be preferred over an
+        // idle Lower Decks slot at the next claim (preference is claim-time
+        // only — running Lower Decks workers are never migrated).
+        let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
+
+        // The first WORKER_PAGE_SIZE claims all land on Bridge Crew, in order.
+        for n in 1..=WORKER_PAGE_SIZE {
+            let claimed = pool.claim_worker(&format!("bc-{n}"), None).await.unwrap();
+            assert_eq!(claimed, format!("worker-{n}"), "claim {n} must stay on Bridge Crew");
+            assert_eq!(
+                worker_page_label(slot_id_from_worker_id(&claimed).unwrap()).as_deref(),
+                Some("Bridge Crew")
             );
         }
+
+        // With all 8 Bridge Crew slots occupied, the 9th concurrent claim is
+        // the first to spill into Lower Decks — worker-9, slot 9, page 1.
+        let spill = pool.claim_worker("ld-1", None).await.unwrap();
+        assert_eq!(spill, format!("worker-{}", WORKER_PAGE_SIZE + 1));
+        let spill_slot = slot_id_from_worker_id(&spill).unwrap();
+        assert_eq!(spill_slot, WORKER_PAGE_SIZE as u8 + 1);
+        assert_eq!(worker_page_label(spill_slot).as_deref(), Some("Lower Decks"));
+
+        // Free a Bridge Crew slot (worker-3). The next claim must reclaim it
+        // rather than continuing to grow Lower Decks — strict spillover applies
+        // at claim time, so a free page-0 slot always beats an idle page-1 one.
+        pool.release_worker("worker-3", None).await;
+        let reclaim = pool.claim_worker("bc-again", None).await.unwrap();
+        assert_eq!(
+            reclaim, "worker-3",
+            "a freed Bridge Crew slot must be preferred over Lower Decks"
+        );
     }
 
     #[tokio::test]
@@ -9444,7 +9564,10 @@ mod tests {
             running, 5,
             "expected all 5 autostart chores to be dispatched concurrently, got {running} running",
         );
-        assert_eq!(coordinator.worker_pool().idle_count().await, 3);
+        // Five of the default pool's slots are now busy; the remainder stay
+        // idle. Derive the expectation from the pool size so this keeps pinning
+        // the contract as the interactive pool grows pages.
+        assert_eq!(coordinator.worker_pool().idle_count().await, MAX_WORKER_POOL_SIZE - 5);
     }
 
     /// `bossctl agents launch` (Phase 7 of the v2 plan) must dispatch
@@ -9535,9 +9658,9 @@ mod tests {
     }
 
     /// The pool-grow path is hard-capped at `MAX_WORKER_POOL_SIZE`
-    /// because the macOS app only has eight panes. A force-launch
-    /// request that arrives with every hard-cap slot busy must surface
-    /// a real error instead of silently overcommitting.
+    /// because the macOS app renders one pane per interactive slot. A
+    /// force-launch request that arrives with every hard-cap slot busy must
+    /// surface a real error instead of silently overcommitting.
     /// On-free rescan regression: a chore whose `tasks.status` is
     /// `active` but whose latest execution is terminal (worker died,
     /// cube lease errored, kanban-drag-while-pool-was-full) must be

@@ -454,11 +454,15 @@ mod tests {
 
         let exec = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
         let worker_id = pool.claim_worker(&exec, None).await.unwrap();
-        // auto-worker-1 → slot 9.
+        // Derive the automation slot from the claimed worker id rather than
+        // hard-coding it: the automation range floats above the interactive
+        // pool (auto-worker-1 → MAX_WORKER_POOL_SIZE + 1), so it moves when the
+        // interactive pool grows a page.
+        let slot = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         db.mark_execution_orphaned(&exec, "terminal but pane still up").unwrap();
 
         let live_states = LiveWorkerStateRegistry::new();
-        register_live_pane(&live_states, 9, &exec);
+        register_live_pane(&live_states, slot, &exec);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
         let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
