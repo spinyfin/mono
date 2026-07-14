@@ -3350,25 +3350,15 @@ impl ExecutionCoordinator {
         {
             Ok(Ok(repo)) => repo,
             Ok(Err(err)) => {
-                let ensure_repr = adapter.command_repr(&ensure_args);
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_error(&err)
-                            .with_cube_invocation(ensure_repr)
-                            .with_details(serde_json::json!({ "host_id": selected_host.id.clone() })),
-                    )
-                    .await;
-                self.record_start_failure(
-                    Arc::clone(self),
+                self.emit_ensure_failed_and_record(
                     execution,
                     worker_id,
-                    None,
-                    ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
+                    adapter.command_repr(&ensure_args),
                     &err,
-                )?;
+                    serde_json::json!({ "host_id": selected_host.id.clone() }),
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
+                )
+                .await?;
                 return Err(err);
             }
             Err(_elapsed) => {
@@ -3376,29 +3366,19 @@ impl ExecutionCoordinator {
                     "cube `repo ensure` timed out after {}s",
                     CUBE_REPO_ENSURE_TIMEOUT.as_secs()
                 );
-                let ensure_repr = adapter.command_repr(&ensure_args);
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_error(&err)
-                            .with_cube_invocation(ensure_repr)
-                            .with_details(serde_json::json!({
-                                "reason": "timeout",
-                                "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
-                                "host_id": selected_host.id.clone(),
-                            })),
-                    )
-                    .await;
-                self.record_start_failure(
-                    Arc::clone(self),
+                self.emit_ensure_failed_and_record(
                     execution,
                     worker_id,
-                    None,
-                    ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
+                    adapter.command_repr(&ensure_args),
                     &err,
-                )?;
+                    serde_json::json!({
+                        "reason": "timeout",
+                        "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                        "host_id": selected_host.id.clone(),
+                    }),
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -4445,6 +4425,33 @@ impl ExecutionCoordinator {
     ///
     /// Do NOT call this for post-`run_started` failures — those require
     /// `finish_execution_run`.
+    /// Shared shape for the two `cube repo ensure` failure arms (error and
+    /// timeout): emit a `CubeRepoEnsureFailed` dispatch event carrying the
+    /// reproducible cube invocation, then record the pre-start failure. Only
+    /// the error, the details payload, and the (attention_kind, attention_title)
+    /// tuple differ between the arms.
+    async fn emit_ensure_failed_and_record(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        ensure_repr: Option<(String, String)>,
+        error: &anyhow::Error,
+        details: serde_json::Value,
+        attention: (&str, &str),
+    ) -> Result<()> {
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_error(error)
+                    .with_cube_invocation(ensure_repr)
+                    .with_details(details),
+            )
+            .await;
+        self.record_start_failure(Arc::clone(self), execution, worker_id, None, attention, error)
+    }
+
     fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
