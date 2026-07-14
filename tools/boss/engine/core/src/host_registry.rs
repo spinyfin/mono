@@ -7,7 +7,6 @@
 /// on every engine startup via `uname` + `gh auth status`.
 use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
@@ -604,11 +603,7 @@ fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Ve
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn now_epoch_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
+    crate::epoch_time::now_epoch_secs().to_string()
 }
 
 fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {

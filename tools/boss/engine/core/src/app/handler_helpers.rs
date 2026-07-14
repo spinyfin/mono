@@ -18,20 +18,14 @@ pub(super) fn build_effort_audit_report(
     let product = work_db
         .get_product(product_id)?
         .ok_or_else(|| anyhow::anyhow!("unknown product: {product_id}"))?;
-    let since_epoch_secs = window_days.and_then(|days| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs() as i64;
+    let since_epoch_secs = window_days.map(|days| {
+        let now = crate::epoch_time::now_epoch_secs();
         let span = (days as i64).saturating_mul(86_400);
-        Some(now - span)
+        now - span
     });
     let events = work_db.list_effort_escalations_for_product(&product.id, since_epoch_secs)?;
     let chores = work_db.list_chores_for_audit(&product.id)?;
-    let generated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
+    let generated_at = crate::epoch_time::now_epoch_secs().to_string();
     Ok(audit_effort::build_report(
         &product.id,
         &product.slug,

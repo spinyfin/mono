@@ -143,10 +143,7 @@ pub fn apply_retention(backup_dir: &Path, keep: usize) -> Result<()> {
 /// [`chrono::TimeZone::timestamp_opt`], which does not need the clock
 /// feature.
 fn utc_timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let secs = crate::epoch_time::now_epoch_secs();
     use chrono::TimeZone as _;
     chrono::Utc
         .timestamp_opt(secs, 0)
