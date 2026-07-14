@@ -3140,30 +3140,11 @@ must not be asked to open one",
         // revision is created (deletion of merged code is an operator decision,
         // not an auto-remediation the pipeline should quietly attempt).
         if !deletion_signoff.is_empty() {
-            let removed_list = deletion_signoff
-                .iter()
-                .map(|d| format!("- {d}"))
-                .collect::<Vec<_>>()
-                .join("\n");
             let _ = self.work_db.create_attention_item(CreateAttentionItemInput {
                 work_item_id: Some(work_item_id.clone()),
-                kind: "merged_parent_deletion_signoff".to_owned(),
-                title: "Merge resolution removed a merged parent's surface — operator sign-off required".to_owned(),
-                body_markdown: format!(
-                    "This PR resolves a merge / forward-port. The engine diffed the \
-                     resolution against **both merge parents** and found it removes \
-                     {n} surface(s) a **merged** parent had already added — the \
-                     incident-002 failure class (a forward-port silently deleting a \
-                     just-merged feature). This is anchored on the fact of the \
-                     deletion, independent of any \"supersedes\" narrative.\n\n\
-                     Auto-progression is **halted**; the task is blocked pending your \
-                     sign-off. Removed merged-parent surfaces:\n\n{removed_list}\n\n\
-                     If the removal is genuinely correct (a design-doc-authorised \
-                     supersession), move this task back to Review to sign off. \
-                     Otherwise the resolution must be revised to restore the \
-                     surface (integrate both parents).\n\nPR: {pr_url}",
-                    n = deletion_signoff.len(),
-                ),
+                kind: crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND.to_owned(),
+                title: crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE.to_owned(),
+                body_markdown: crate::merge_parent_deletion::render_signoff_attention_body(&deletion_signoff, &pr_url),
                 execution_id: None,
                 status: None,
                 resolved_at: None,

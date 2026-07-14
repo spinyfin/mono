@@ -376,9 +376,20 @@ macro_rules! stub_cube_client {
     // ── push_resolution ─────────────────────────────────────────────────────
     // Has a trait default (erroring), same convention as rebase_workspace.
     (@munch $ty:ty [$($acc:tt)*] @push_resolution async fn push_resolution $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn push_resolution $a -> $r $b] @release_workspace $($rest)*);
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn push_resolution $a -> $r $b] @verify_deletion_tripwire $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @push_resolution $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*] @verify_deletion_tripwire $($rest)*);
+    };
+
+    // ── verify_deletion_tripwire ────────────────────────────────────────────
+    // Has a trait default (fails open, empty findings) — same "unlisted keeps
+    // the default" convention as rebase_workspace/push_resolution: a double
+    // that doesn't script this never makes a network call.
+    (@munch $ty:ty [$($acc:tt)*] @verify_deletion_tripwire async fn verify_deletion_tripwire $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn verify_deletion_tripwire $a -> $r $b] @release_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @verify_deletion_tripwire $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*] @release_workspace $($rest)*);
     };
 

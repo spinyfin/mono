@@ -354,6 +354,56 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// T9 (T2562) result-gate halt: flip a chore/project_task currently
+    /// `blocked: merge_conflict` to `blocked: deletion_signoff` when the
+    /// escalation ladder's mechanical rungs (0/1) push a resolution the
+    /// both-parents deletion tripwire (incident-002 P2) rejects. Mirrors
+    /// the `blocked_reason` the worker-driven `pr_review` path stamps via
+    /// `record_worker_pr_completion`'s
+    /// `WorkerPrCompletionTarget::BlockedDeletionSignoff` (`work/pr_flow.rs`),
+    /// so a deletion halts identically regardless of which rung produced
+    /// it. Requires the task to still be in the `blocked: merge_conflict`
+    /// state the caller flipped it into up front — a WHERE guard, so a
+    /// row a human already moved is left alone. Idempotent: `Ok(None)`
+    /// when the guard misses.
+    pub fn mark_chore_blocked_deletion_signoff(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status             = 'blocked',
+                    blocked_reason     = 'deletion_signoff',
+                    blocked_attempt_id = NULL,
+                    pr_url             = ?2,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        // Leaving the merge_conflict state for deletion_signoff — clear the
+        // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = 'merge_conflict'
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after deletion_signoff flip: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// Symmetric retire path: flip a chore/project_task currently
     /// `blocked: merge_conflict` back to `in_review` and clear the
     /// reason / attempt-id columns. Idempotent. Returns the updated

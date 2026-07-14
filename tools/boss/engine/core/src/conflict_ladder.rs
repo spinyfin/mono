@@ -64,23 +64,57 @@
 //!   calls [`attempt_rung0`] directly, bypassing the gate) so a follow-up
 //!   only needs to flip the constant once it's safe to.
 //!
+//! ## T9 (T2562) result-gate: the deletion tripwire on rungs 0/1
+//!
+//! Before either mechanical rung auto-retires a pushed resolution, the
+//! harness now calls [`CubeClient::verify_deletion_tripwire`] — the same
+//! both-parents deletion tripwire (incident-002 P2,
+//! `merge_parent_deletion::compute_merged_parent_deletions`) the
+//! worker-driven `pr_review` pass already runs for rung 2/3's output
+//! (`completion.rs::compute_merge_parent_deletion_signoff`). A finding
+//! halts the attempt in `blocked: deletion_signoff` — the identical
+//! operator-sign-off state rung 2/3 land in on the same tripwire — via
+//! [`halt_attempt_for_deletion_signoff`], instead of auto-retiring an
+//! unvetted deletion. This closes the gap [`RUNG0_APPLY_LIVE`]'s doc
+//! comment describes: there is now a standalone check this harness calls
+//! to vet a mechanical rung's output before auto-retiring it. Flipping
+//! `RUNG0_APPLY_LIVE` itself remains a separate, deliberate follow-up
+//! decision (see that constant's doc comment) — this task only wires the
+//! gate, it does not turn rung 0 on.
+//!
+//! The "build gate" half of T9's scope is the PR's own CI: once a rung
+//! retires an attempt, the task returns to ordinary `in_review` (or, on a
+//! tripwire hit, `blocked: deletion_signoff`) — either way it is a normal
+//! task the existing `ci_watch` detection sweep already covers generically
+//! for *any* in-review PR, independent of which rung produced the push.
+//! No rung-specific build-gate machinery is needed to get that coverage;
+//! it falls out of retiring into the same lifecycle every other PR uses.
+//!
 //! ## Deferred (declared in the T4 PR, still open)
 //!
-//! - **Escalation-on-rejection → rung 3 with findings.** When a completed
-//!   resolution is rejected *post-resolution* (build gate / tripwire / AI
-//!   review), the design escalates straight to rung 3 with the findings
-//!   attached. For rung 1 the post-resolution gate is the PR's own CI, which
-//!   the existing `ci_watch` path already observes on a later sweep; the full
-//!   findings-attached escalation is gated on T9 (T2562). What the harness
-//!   *does* guarantee today is the ladder's other invariant: a rung that
-//!   **declines** (rebase errors, an unresolvable residual file, or a failed
-//!   push) climbs — it never retries the same rung against the same state
-//!   (the `conflict_resolutions` UNIQUE key dedupes identical base+head
-//!   states; a genuinely new state gets a fresh attempt, bounded by the
-//!   churn guard).
+//! - **Escalation-on-rejection → rung 3 with findings, for CI/AI-review
+//!   rejections specifically.** The design's aspirational text describes
+//!   *any* post-resolution rejection (tripwire, build gate, AI reviewer)
+//!   auto-escalating to a rung-3 worker. For the deletion tripwire this
+//!   task deliberately does NOT build that: the already-landed P1/P2
+//!   behavior for rung 2/3 (`completion.rs`) requires **explicit operator
+//!   sign-off** on a flagged deletion rather than any auto-remediation —
+//!   incident-002's own lesson is that letting an agent "fix" a flagged
+//!   deletion is the failure mode, not the safety net. Extending rungs 0/1
+//!   to the *same* human-gated halt (this task) is the correct application
+//!   of "compose with T2253, never weaken it": auto-escalating to a rung-3
+//!   agent instead would be *weaker* than what rung 2/3 already do. A CI
+//!   failure or AI-review severity-gate rejection on a rung 2/3 PR already
+//!   mints a normal revision (`ci_watch.rs` / `completion.rs`) — untouched
+//!   by this task. What the harness *does* guarantee is the ladder's other
+//!   invariant: a rung that **declines** (rebase errors, an unresolvable
+//!   residual file, or a failed push) climbs — it never retries the same
+//!   rung against the same state (the `conflict_resolutions` UNIQUE key
+//!   dedupes identical base+head states; a genuinely new state gets a
+//!   fresh attempt, bounded by the churn guard).
 
 use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
-use boss_protocol::FrontendEvent;
+use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
 use crate::coordinator::{CubeClient, CubeWorkspaceLease, ExecutionPublisher};
 use crate::merge_poller::parse_pr_number;
@@ -97,20 +131,16 @@ const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 
 /// Rung 0 (deterministic-resolver apply/commit/push, [`attempt_rung0`]) is
 /// fully implemented and unit-tested but **must not run on the live
-/// `conflict_watch` path** until T2562 (the design's T9 "result-gate" —
-/// see `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`,
-/// "Composition with T2253") lands. Today the both-parents deletion
-/// tripwire (T2253 P2) and the build gate only vet the rung-3 full-worker
-/// path (via the `pr_review` reviewer pass); there is no standalone check
-/// this harness can call to vet a mechanical rung's output before
-/// auto-retiring it. Auto-pushing an unvetted resolution straight to a
-/// real PR branch would violate the design's own safety model.
+/// `conflict_watch` path** yet. T2562 (T9, "T2253 safety integration for
+/// the ladder") has now landed the result-gate: both rungs 0 and 1 route
+/// their pushed output through [`CubeClient::verify_deletion_tripwire`]
+/// before auto-retiring (see the module doc comment). What remains is a
+/// separate, deliberate decision, not a technical gap: this constant is
+/// **not** flipped as part of that landing.
 ///
 /// Deliberately a compile-time constant, not a `feature_flags`
-/// debug-pane toggle: the result-gate's call shape isn't decided yet, so
-/// there is nothing safe to expose as an operator-flippable switch today.
-/// Flipping this to `true` — once T2562 lands and this module routes rung
-/// 0's output through it — is a reviewed follow-up PR, not a runtime
+/// debug-pane toggle: flipping this to `true` is a reviewed follow-up PR
+/// that gets its own scrutiny of the now-wired result-gate, not a runtime
 /// decision.
 const RUNG0_APPLY_LIVE: bool = false;
 
@@ -138,6 +168,16 @@ pub(crate) enum LadderOutcome {
     /// parent is back in Review, and the success events are published. The
     /// caller must NOT spawn a worker revision.
     Retired,
+    /// A mechanical rung (0 or 1) pushed a resolution, but the T9/T2562
+    /// both-parents deletion tripwire rejected it
+    /// ([`halt_attempt_for_deletion_signoff`]): the attempt is halted in
+    /// `blocked: deletion_signoff` pending operator sign-off — the same
+    /// state rung 2/3's worker-driven resolutions land in on the same
+    /// tripwire — rather than retired as a success. Like `Retired`, the
+    /// caller must NOT spawn a worker revision (there is no automatic
+    /// remediation for a flagged deletion), but callers must not log or
+    /// report this as an auto-resolution.
+    HaltedForSignoff,
     /// No mechanical rung produced a resolution (rung 1 unavailable, the
     /// rebase errored, or residual conflicts remain). The caller falls
     /// through to the existing worker-spawn path. Any leased workspace has
@@ -304,6 +344,21 @@ async fn run_rung1_in_lease(
 
     if rebase.clean {
         if rebase.pushed {
+            // T9 (T2562): vet rung 1's pushed resolution against the
+            // both-parents deletion tripwire before auto-retiring.
+            let deletions = verify_deletion_tripwire(work_db, cube_client, candidate, attempt, pr_number).await;
+            if !deletions.is_empty() {
+                halt_attempt_for_deletion_signoff(
+                    work_db,
+                    publisher,
+                    candidate,
+                    attempt,
+                    RUNG_ENGINE_DIRECT_REBASE,
+                    &deletions,
+                )
+                .await;
+                return LadderOutcome::HaltedForSignoff;
+            }
             // Rung 1 rebased cleanly and pushed the updated branch — the PR is
             // resolved with no agent. Retire the attempt at rung 1.
             retire_attempt_at_rung(work_db, publisher, candidate, attempt, RUNG_ENGINE_DIRECT_REBASE).await;
@@ -330,14 +385,16 @@ async fn run_rung1_in_lease(
 
     // Residual conflicts after the structural rebase are genuine overlap.
     // Try rung 0 (deterministic resolvers) first — gated off live by
-    // RUNG0_APPLY_LIVE (see its doc comment) until T2562's result-gate
-    // lands; `attempt_rung0` itself decides whether every residual file
-    // actually resolves. If rung 0 is gated off or declines, the caller
-    // uses the residual file count to decide between rung 2 (a small
-    // focused agent, when the residue is bounded — see `rung2_eligible`)
-    // and rung 3 (full worker, for a large/architectural conflict).
-    if RUNG0_APPLY_LIVE
-        && attempt_rung0(
+    // RUNG0_APPLY_LIVE (see its doc comment). `attempt_rung0` itself
+    // decides whether every residual file actually resolves, and (T9/T2562)
+    // vets any pushed result against the deletion tripwire before retiring.
+    // If rung 0 is gated off, declines, or its resolution is halted for
+    // sign-off, the caller uses the residual file count to decide between
+    // rung 2 (a small focused agent, when the residue is bounded — see
+    // `rung2_eligible`) and rung 3 (full worker, for a large/architectural
+    // conflict).
+    if RUNG0_APPLY_LIVE {
+        let rung0_outcome = attempt_rung0(
             work_db,
             publisher,
             cube_client,
@@ -346,10 +403,10 @@ async fn run_rung1_in_lease(
             lease,
             &rebase.conflicted_files,
         )
-        .await
-            == LadderOutcome::Retired
-    {
-        return LadderOutcome::Retired;
+        .await;
+        if !matches!(rung0_outcome, LadderOutcome::FellThrough { .. }) {
+            return rung0_outcome;
+        }
     }
 
     let residual_conflict_files = rebase.conflicted_files.len();
@@ -450,6 +507,22 @@ pub(crate) async fn attempt_rung0(
         };
     }
 
+    // T9 (T2562): vet rung 0's pushed resolution against the both-parents
+    // deletion tripwire before auto-retiring.
+    let deletions = verify_deletion_tripwire(work_db, cube_client, candidate, attempt, pr_number).await;
+    if !deletions.is_empty() {
+        halt_attempt_for_deletion_signoff(
+            work_db,
+            publisher,
+            candidate,
+            attempt,
+            RUNG_DETERMINISTIC_RESOLVER,
+            &deletions,
+        )
+        .await;
+        return LadderOutcome::HaltedForSignoff;
+    }
+
     retire_attempt_at_rung(work_db, publisher, candidate, attempt, RUNG_DETERMINISTIC_RESOLVER).await;
     tracing::info!(
         work_item_id = %candidate.work_item_id,
@@ -538,6 +611,145 @@ async fn retire_attempt_at_rung(
             )
             .await;
     }
+}
+
+/// T9 (T2562) result-gate: verify a mechanical rung's (0 or 1) freshly
+/// pushed resolution against the both-parents deletion tripwire
+/// (incident-002 P2) before the caller retires the attempt. Delegates to
+/// [`CubeClient::verify_deletion_tripwire`] (test doubles fail open with
+/// no network call by default; only [`crate::coordinator::CommandCubeClient`]
+/// makes the real gh-backed check).
+///
+/// Re-derives the repo slug from `work_db` rather than adding a parameter
+/// to every call site — mirrors [`attempt_rung0`]'s existing
+/// re-derive-rather-than-thread pattern for `pr_number`. Returns an empty
+/// set (fails open) when `head_sha_before` / `base_sha_at_trigger` are
+/// unrecorded on the attempt or the repo slug is unresolvable.
+///
+/// **Fail-open has no backstop on these rungs.** The worker-driven rung
+/// 2/3 path is double-checked: even if this tripwire itself failed open,
+/// the spawned `pr_review` pass re-derives the same
+/// `compute_merged_parent_deletions` check on the worker's actual PR
+/// output before it can retire. Rungs 0 and 1 retire straight to
+/// `in_review` with **no worker spawned at all**, so a transient
+/// `gh`/network error here (in [`crate::coordinator::CommandCubeClient`]'s
+/// `fetch_pr_head_sha` or the `gh compare` calls inside
+/// `compute_merged_parent_deletions`) — as opposed to a genuinely clean
+/// tripwire result — silently auto-retires a possibly-deletion-bearing
+/// mechanical resolution with nothing left to catch it. This is a known,
+/// currently-accepted gap (see the module doc's "Deferred" section), not
+/// an oversight.
+async fn verify_deletion_tripwire(
+    work_db: &WorkDb,
+    cube_client: &dyn CubeClient,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    pr_number: u64,
+) -> Vec<String> {
+    let (Some(head_before), Some(base_sha)) = (
+        attempt.head_sha_before.as_deref(),
+        attempt.base_sha_at_trigger.as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(repo_slug) = work_db
+        .resolve_repo_for_task(&candidate.work_item_id)
+        .ok()
+        .flatten()
+        .and_then(|remote| crate::completion::parse_repo_slug(&remote).ok())
+    else {
+        return Vec::new();
+    };
+    cube_client
+        .verify_deletion_tripwire(&repo_slug, head_before, base_sha, pr_number)
+        .await
+}
+
+/// Halt a `conflict_resolutions` attempt a mechanical rung (0 or 1) pushed
+/// but the T9/T2562 deletion tripwire rejected: stamp the attempt
+/// `succeeded` at `rung` (it did produce a mechanical resolution — the
+/// telemetry fact stands independent of the safety gate), flip the parent
+/// from `blocked: merge_conflict` to `blocked: deletion_signoff` via
+/// [`WorkDb::mark_chore_blocked_deletion_signoff`], and file the same
+/// operator sign-off attention item `completion.rs`'s worker-driven
+/// `pr_review` path files for rung 2/3 — so a deletion halts identically
+/// regardless of which rung produced it. Does NOT publish
+/// `ConflictResolutionSucceeded` (this is not a success) and does not spawn
+/// any worker (there is no automatic remediation for a flagged deletion —
+/// see the module doc comment's "Deferred" section for why).
+async fn halt_attempt_for_deletion_signoff(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    attempt: &ConflictResolution,
+    rung: i64,
+    deletions: &[String],
+) {
+    if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
+        tracing::warn!(
+            attempt_id = %attempt.id,
+            rung,
+            ?err,
+            "conflict_ladder: failed to stamp attempt on deletion-signoff halt",
+        );
+    }
+
+    match work_db.mark_chore_blocked_deletion_signoff(&candidate.work_item_id, &candidate.pr_url) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                rung,
+                "conflict_ladder: could not flip task to blocked:deletion_signoff (already moved?)",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                rung,
+                ?err,
+                "conflict_ladder: failed to flip task to blocked:deletion_signoff",
+            );
+        }
+    }
+
+    let _ = work_db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(candidate.work_item_id.clone()),
+        kind: crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND.to_owned(),
+        title: crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE.to_owned(),
+        body_markdown: crate::merge_parent_deletion::render_signoff_attention_body(deletions, &candidate.pr_url),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    });
+
+    // Clear the in-flight merge_conflict signal so `maybe_clear_blocked` does
+    // not re-fire on the next probe — mirrors `retire_attempt_at_rung`.
+    if let Err(err) = work_db.clear_merge_conflict_signal_only(&candidate.work_item_id) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            rung,
+            ?err,
+            "conflict_ladder: failed to clear in-flight signal on deletion-signoff halt",
+        );
+    }
+
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "pr_review_deletion_signoff",
+        )
+        .await;
+
+    tracing::warn!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        rung,
+        removed = deletions.len(),
+        "conflict_ladder: merge-parent deletion tripwire fired for a mechanical rung; halted in \
+         blocked:deletion_signoff pending operator sign-off (T9/T2562)",
+    );
 }
 
 #[cfg(test)]

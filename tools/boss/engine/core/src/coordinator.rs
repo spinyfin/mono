@@ -459,6 +459,30 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace_path, pr);
         Err(anyhow!("push_resolution is not supported by this CubeClient"))
     }
+    /// T9 (T2562) result-gate: verify a resolution already pushed to PR
+    /// `pr`'s branch against the both-parents deletion tripwire
+    /// (incident-002 P2, `merge_parent_deletion::compute_merged_parent_deletions`).
+    /// Returns the tripwire's rendered finding lines — empty means clean.
+    /// Used by the merge-conflict escalation ladder's mechanical rungs (0
+    /// and 1, `conflict_ladder.rs`) to vet an auto-retiring resolution the
+    /// same way the worker-driven `pr_review` pass already vets rung 2/3's
+    /// output (`completion.rs::compute_merge_parent_deletion_signoff`).
+    ///
+    /// Default: fails open (empty — no finding, matching
+    /// `compute_merged_parent_deletions`'s own fail-open contract) and
+    /// makes no network call, so the many test doubles need no change —
+    /// same "unlisted keeps the default" convention as `rebase_workspace`
+    /// / `push_resolution` above. Only [`CommandCubeClient`] overrides
+    /// this with the real gh-backed check.
+    async fn verify_deletion_tripwire(
+        &self,
+        _repo_slug: &str,
+        _head_before: &str,
+        _base_sha: &str,
+        _pr_number: u64,
+    ) -> Vec<String> {
+        Vec::new()
+    }
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
@@ -691,6 +715,20 @@ impl CubeClient for CommandCubeClient {
             return Err(anyhow!("cube workspace push did not report pushed=true: {payload}"));
         }
         Ok(())
+    }
+
+    async fn verify_deletion_tripwire(
+        &self,
+        repo_slug: &str,
+        head_before: &str,
+        base_sha: &str,
+        pr_number: u64,
+    ) -> Vec<String> {
+        let Some(head_after) = crate::merge_parent_deletion::fetch_pr_head_sha(repo_slug, pr_number).await else {
+            return Vec::new();
+        };
+        crate::merge_parent_deletion::compute_merged_parent_deletions(repo_slug, head_before, base_sha, &head_after)
+            .await
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
