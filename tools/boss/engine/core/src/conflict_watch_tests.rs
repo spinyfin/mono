@@ -1831,10 +1831,7 @@ async fn resolution_skipped_when_product_opt_out_flag_disabled() {
 /// minutes." Pure plumbing — production code never touches
 /// `created_at` after insert.
 fn rewind_attempt_created_at(db_path: &std::path::Path, attempt_id: &str, secs_ago: i64) {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now_secs = crate::epoch_time::now_epoch_secs();
     let new_ts = (now_secs - secs_ago).to_string();
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute(
