@@ -34,9 +34,11 @@ enum TrekCharacter: String, CaseIterable {
         }
     }
 
-    /// Slot 1..8 → character. Slots beyond the roster (the engine caps
-    /// at 8 today, but `WorkerNames` wraps modulo a longer roster) get
-    /// `nil` and the UI falls back to text-only.
+    /// Slot 1..8 → character. The interactive pool is 16 slots (Bridge
+    /// Crew 1..8, Lower Decks 9..16), but the icon roster only has 8
+    /// named characters, so slots 9..16 get `nil` and the UI falls back
+    /// to text-only (`WorkerNames` still provides a crew name for those
+    /// slots via a longer, wrapping roster).
     static func forSlot(_ slotId: Int) -> TrekCharacter? {
         let roster: [TrekCharacter] = [
             .riker, .data, .worf, .laforge,
