@@ -491,7 +491,7 @@ pub async fn serve(
         tracing::debug!("no persisted in-flight executions to probe at startup");
         crate::run_reconcile::RunReconcileReport::default()
     } else {
-        let now_epoch_s = crate::run_reconcile::current_epoch_s();
+        let now_epoch_s = crate::epoch_time::now_epoch_secs();
         let report =
             crate::run_reconcile::probe_in_flight_runs(server_state.cube_client.as_ref(), &in_flight, now_epoch_s)
                 .await;
