@@ -482,6 +482,46 @@ impl WorkDb {
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
+    /// Invalidate a **terminal `succeeded`** attempt whose resolution did not
+    /// hold: the PR is CONFLICTING again at the SAME `(base_sha_at_trigger,
+    /// head_sha_before)` UNIQUE key, so the succeeded row still occupies that
+    /// slot and `insert_conflict_resolution` can never create a fresh attempt
+    /// for the re-conflicting PR — the `conflict_watch` stale-base re-arm
+    /// wedge (mono#1398/#1764): "succeeded crz but PR still CONFLICTING",
+    /// re-detected every ~6s forever.
+    ///
+    /// Flips the row `succeeded → failed` with `reason` and NULLs
+    /// `base_sha_at_trigger` (SQLite treats NULL as distinct in UNIQUE
+    /// constraints — see [`Self::abandon_conflict_resolution_for_supersede`])
+    /// so the fall-through INSERT can land exactly one fresh, churn-guarded
+    /// attempt at the same key. Unlike every other terminal transition here
+    /// (which all guard `status IN ('pending','running')`), this deliberately
+    /// targets a `succeeded` row — the false-success record — because no other
+    /// primitive can free a slot a stale success is holding. Clears
+    /// `resolved_by_rung` to match the failed-transition convention. Idempotent
+    /// `Ok(None)` when the row is no longer `succeeded`.
+    pub fn invalidate_stale_succeeded_conflict_resolution(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status              = 'failed',
+                    failure_reason      = ?2,
+                    base_sha_at_trigger = NULL,
+                    resolved_by_rung    = NULL,
+                    finished_at         = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status = 'succeeded'",
+            params![attempt_id, reason, now],
+        )?;
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+    }
+
     /// Read-only list of `conflict_resolutions` rows for the Phase 5
     /// `boss engine conflicts list` CLI. Filters are AND-ed; an empty
     /// `status` slice means "any status." Rows come back freshest first

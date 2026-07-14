@@ -5513,8 +5513,26 @@ status is otherwise left unchanged for re-dispatch or manual review."
         };
 
         // --- Conflict signal check ---
+        // Retire only when GitHub reports the PR *genuinely mergeable* again
+        // (`Clean`) — NOT merely "not CONFLICTING". `Unknown` means the
+        // mergeability recompute is still in flight (typically right after a
+        // base move or this worker's own push). Retiring on `Unknown` records a
+        // premature `succeeded` that can settle back to CONFLICTING; and when
+        // the worker pushed nothing this run (the NoContribution caller), that
+        // strands a `succeeded` attempt at an un-advanced head, whose
+        // `(work_item, base, head)` UNIQUE key then permanently wedges
+        // `conflict_watch`'s stale-base re-arm loop (mono#1398/#1764). Defer to
+        // the next merge-poller probe instead of guessing.
+        if conflict_attempt.is_some() && open_status.mergeability == OpenPrMergeability::Unknown {
+            tracing::debug!(
+                execution_id,
+                bound_pr_url,
+                "stop event: conflict signal-cleared check saw mergeable=UNKNOWN (GitHub recomputing); \
+                 not retiring — deferring to the next merge-poller probe",
+            );
+        }
         if let Some(ref attempt) = conflict_attempt
-            && open_status.mergeability != OpenPrMergeability::Conflict
+            && open_status.mergeability == OpenPrMergeability::Clean
         {
             tracing::info!(
                 execution_id,
@@ -12960,6 +12978,67 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     )
             }),
             "ConflictResolutionSucceeded must be published; typed events: {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_signal_cleared_defers_on_unknown_mergeability() {
+        // mono#1398/#1764 root cause: the signal-cleared gate used to retire
+        // the conflict attempt on ANY `mergeability != Conflict`, which treats
+        // `Unknown` (GitHub still recomputing mergeability) as success. On a
+        // NoContribution Stop (worker pushed nothing → head unchanged) that
+        // records a premature `succeeded` at an un-advanced head; when GitHub
+        // settles back to CONFLICTING, the succeeded row's UNIQUE key wedges
+        // conflict_watch's re-arm loop forever. The gate must require GENUINE
+        // mergeability (`Clean`) and defer on `Unknown` — so the attempt here
+        // must NOT be marked succeeded.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1398";
+        let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None); // no branch-keyed PR
+
+        // SHA-delta gate: head unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // MergeProbe: GitHub reports mergeable=UNKNOWN (recompute in flight).
+        struct UnknownMergeProbe;
+        #[async_trait]
+        impl MergeProbe for UnknownMergeProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(PrLifecycleState::Open(
+                        crate::merge_poller::OpenPrStatus::unknown_mergeability(),
+                    ))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .build())
+            }
+        }
+
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(UnknownMergeProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        // The signal-cleared retire path must NOT fire on Unknown.
+        assert!(
+            !matches!(outcome, StopOutcome::SignalAlreadyCleared { .. }),
+            "signal-cleared retire must not fire on mergeable=UNKNOWN; got {outcome:?}",
+        );
+
+        // Crucially: the conflict attempt must stay `pending` — no premature
+        // `succeeded` recorded while mergeability is indeterminate.
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "pending",
+            "conflict_resolutions attempt must NOT be retired as succeeded on mergeable=UNKNOWN",
         );
     }
 

@@ -68,23 +68,59 @@ impl ResolverRegistry {
         let mut resolved = Vec::new();
         let mut declined = Vec::new();
 
+        // One INFO trace line per resolver invocation (conflict class,
+        // resolver id, outcome) so rung-0 activity is answerable from the
+        // engine trace — the "runs silently" logging gap this crate had
+        // before (mono#1398/#1764 diagnosis).
         for file in files {
             match self.resolvers.iter().find(|resolver| resolver.applies_to(file)) {
-                Some(resolver) => match resolver.resolve(workspace_path, file).await {
-                    ResolveOutcome::Resolved { summary } => resolved.push(ResolvedFile {
-                        path: file.path.clone(),
-                        class: resolver.class(),
-                        summary,
-                    }),
-                    ResolveOutcome::Declined { reason } => declined.push(DeclinedFile {
+                Some(resolver) => {
+                    let class = resolver.class();
+                    match resolver.resolve(workspace_path, file).await {
+                        ResolveOutcome::Resolved { summary } => {
+                            tracing::info!(
+                                path = %file.path,
+                                conflict_class = class.as_str(),
+                                resolver = class.as_str(),
+                                outcome = "resolved",
+                                summary = %summary,
+                                "deterministic_resolvers: resolver resolved conflicted file",
+                            );
+                            resolved.push(ResolvedFile {
+                                path: file.path.clone(),
+                                class,
+                                summary,
+                            });
+                        }
+                        ResolveOutcome::Declined { reason } => {
+                            tracing::info!(
+                                path = %file.path,
+                                conflict_class = class.as_str(),
+                                resolver = class.as_str(),
+                                outcome = "declined",
+                                reason = %reason,
+                                "deterministic_resolvers: resolver declined conflicted file",
+                            );
+                            declined.push(DeclinedFile {
+                                path: file.path.clone(),
+                                reason,
+                            });
+                        }
+                    }
+                }
+                None => {
+                    let reason = "no registered resolver applies to this file".to_owned();
+                    tracing::info!(
+                        path = %file.path,
+                        outcome = "declined",
+                        reason = %reason,
+                        "deterministic_resolvers: no resolver applies to conflicted file",
+                    );
+                    declined.push(DeclinedFile {
                         path: file.path.clone(),
                         reason,
-                    }),
-                },
-                None => declined.push(DeclinedFile {
-                    path: file.path.clone(),
-                    reason: "no registered resolver applies to this file".to_owned(),
-                }),
+                    });
+                }
             }
         }
 
