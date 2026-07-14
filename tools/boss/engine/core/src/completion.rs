@@ -53,6 +53,8 @@ use boss_protocol::{
 
 use crate::attentions_detector;
 use crate::automation_triage::{TriageDecision, parse_triage_decision};
+use crate::build_wait::detect_build_wait_signal;
+use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::gh_invocation::run_gh;
@@ -717,7 +719,16 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
         }
     }
     if rows >= SCAN_LIMIT {
-        tracing::warn!(
+        // Downgraded from `warn!` (2026-07-14 incident, T2608 / T2612): in a
+        // busy repo with well over `SCAN_LIMIT` total PRs, hitting the row
+        // cap is the expected steady state every single time the worker
+        // genuinely has no PR yet — not evidence of a truncated search. This
+        // fired on essentially every PR-less Stop while a worker legitimately
+        // waited on a build, drowning out the rarer case worth a human's
+        // attention (a worker that already pushed under a non-`boss/` prefix
+        // whose PR is genuinely beyond the scanned page). `debug!` keeps the
+        // information available without the log-volume cost.
+        tracing::debug!(
             repo = %repo_slug,
             suffix,
             scanned = rows,
@@ -884,6 +895,20 @@ pub struct WorkerCompletionHandler {
     /// trips. Defaults to [`DEFAULT_MAX_UNPRODUCTIVE_NUDGES`]; tests
     /// override it via [`Self::with_max_unproductive_nudges`].
     max_unproductive_nudges: u32,
+    /// Time-bounded suppression tracker for the [`crate::build_wait`]
+    /// signal: a worker narrating that it is waiting on a backgrounded
+    /// build/test gate must not be nudged (each nudge just manufactures the
+    /// next Stop and burns the breaker cap above), but that trust is not
+    /// indefinite — see [`crate::build_wait_tracker`] for the incident this
+    /// exists to fix. Shared via `Arc` so per-execution state survives
+    /// across the multiple `on_stop` calls of a single worker session.
+    build_wait_tracker: Arc<BuildWaitTracker>,
+    /// How long a continuously-reported build-wait is trusted before
+    /// [`Self::nudge_or_park`] stops suppressing and falls back to the
+    /// normal nudge/park flow. Defaults to
+    /// [`DEFAULT_BUILD_WAIT_HORIZON_SECS`]; tests override it via
+    /// [`Self::with_build_wait_horizon_secs`].
+    build_wait_horizon_secs: i64,
     /// Maximum number of automated reviewer passes per PR (P992 design §7).
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances to human Review directly.
@@ -995,6 +1020,8 @@ impl WorkerCompletionHandler {
             merge_probe: Arc::new(NoopMergeProbe),
             nudge_breaker: Arc::new(NudgeBreaker::new()),
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
+            build_wait_tracker: Arc::new(BuildWaitTracker::new()),
+            build_wait_horizon_secs: DEFAULT_BUILD_WAIT_HORIZON_SECS,
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
             enable_revision_triggered_reviews: false,
@@ -1032,6 +1059,21 @@ impl WorkerCompletionHandler {
     /// default.
     pub fn with_max_unproductive_nudges(mut self, max: u32) -> Self {
         self.max_unproductive_nudges = max;
+        self
+    }
+
+    /// Wire an externally-owned [`BuildWaitTracker`] into this handler.
+    /// Tests use it to share / inspect tracker state.
+    pub fn with_build_wait_tracker(mut self, tracker: Arc<BuildWaitTracker>) -> Self {
+        self.build_wait_tracker = tracker;
+        self
+    }
+
+    /// Override the build-wait suppression horizon. Tests set this low (or
+    /// to `0`) to exercise the post-expiry fallback to the normal
+    /// nudge/park flow deterministically; production uses the default.
+    pub fn with_build_wait_horizon_secs(mut self, horizon_secs: i64) -> Self {
+        self.build_wait_horizon_secs = horizon_secs;
         self
     }
 
@@ -3685,6 +3727,7 @@ must not be asked to open one",
         // The worker contributed a PR — reset any accumulated nudge
         // count so a later unrelated nudge cycle starts clean.
         self.nudge_breaker.forget(execution_id);
+        self.build_wait_tracker.forget(execution_id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -4157,6 +4200,10 @@ must not be asked to open one",
             // auto-nudge is suppressed, not the attempt marked failed —
             // mirrors NudgeBreakerParked.
             StopOutcome::EscalationPending { .. } => false,
+            // Worker is narrating a legitimate backgrounded build/test wait;
+            // the auto-nudge is suppressed, not the attempt marked failed —
+            // mirrors EscalationPending/NudgeBreakerParked.
+            StopOutcome::BuildWaitPending { .. } => false,
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,
@@ -4528,6 +4575,60 @@ must not be asked to open one",
                 .await;
             return StopOutcome::EscalationPending { reason };
         }
+        // Build-wait suppression (2026-07-14 incident, T2608 / T2612): a
+        // worker narrating that it is legitimately waiting on a
+        // backgrounded build/test gate must not be nudged — each nudge
+        // wakes it, gets an unproductive-but-honest "still building,
+        // waiting" reply, and manufactures the very Stop cadence that
+        // exhausts the breaker below. Check this BEFORE touching
+        // `nudge_breaker` so a suppressed Stop never burns the cap; once
+        // the worker's own armed monitor wakes it with real news (a push,
+        // a different reply), the next Stop simply won't match the
+        // heuristic and falls through to the normal flow. Bounded by
+        // `build_wait_tracker`'s horizon so a worker that keeps saying
+        // "waiting" forever without ever finishing still eventually
+        // reaches the normal nudge/park path (requirement: genuine wedge
+        // detection must keep working).
+        if let Some(text) = self.read_final_triage_message(&execution.id).await.into_message()
+            && let Some(signal) = detect_build_wait_signal(&text)
+        {
+            let now_epoch_secs = crate::epoch_time::now_epoch_secs();
+            match self
+                .build_wait_tracker
+                .record(&execution.id, now_epoch_secs, self.build_wait_horizon_secs)
+            {
+                BuildWaitDecision::Suppress { waited_secs } => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        matched_phrase = signal.matched_phrase,
+                        waited_secs,
+                        horizon_secs = self.build_wait_horizon_secs,
+                        "auto-nudge: suppressed — worker is narrating a legitimate backgrounded \
+                         build/test wait (breaker not consulted, no probe queued)"
+                    );
+                    self.publisher
+                        .publish(
+                            &execution.id,
+                            &execution.work_item_id,
+                            execution.status.as_str(),
+                            "worker_build_wait_pending",
+                        )
+                        .await;
+                    return StopOutcome::BuildWaitPending { waited_secs };
+                }
+                BuildWaitDecision::Expired { waited_secs } => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        matched_phrase = signal.matched_phrase,
+                        waited_secs,
+                        horizon_secs = self.build_wait_horizon_secs,
+                        "auto-nudge: build-wait horizon elapsed — no longer suppressing, falling \
+                         back to the normal nudge/park flow"
+                    );
+                    // Fall through to the normal nudge/park flow below.
+                }
+            }
+        }
         match self
             .nudge_breaker
             .record(&execution.id, fingerprint, self.max_unproductive_nudges)
@@ -4569,17 +4670,28 @@ must not be asked to open one",
             Some(url) => format!("A PR already exists for this work: {url}."),
             None => "No PR was produced.".to_owned(),
         };
+        // Legibility (2026-07-14 incident, T2608 / T2612): the parked/yellow
+        // state — active, no live execution, autostart cleared — carries no
+        // surfaced reason of its own; an operator staring at the row has no
+        // way to tell it apart from an ordinary backlog item without opening
+        // this attention item. Stamp the explicit wall-clock time the park
+        // happened so at least "why is this yellow, and since when" is
+        // answerable at a glance.
+        let parked_at = crate::iso8601::format_epoch_iso8601(crate::epoch_time::now_epoch_secs());
         let reason = if nudge_count > 0 {
             format!(
                 "Auto-nudge circuit breaker tripped: nudged {nudge_count} times with {detail}. \
-{pr_clause} Parked for human review. The execution's cube lease and worker slot have been \
-released; the task/chore status is left unchanged for re-dispatch or manual review."
+{pr_clause} Parked for human review at {parked_at}. The execution's cube lease and worker slot \
+have been released; `autostart` has been cleared so the automated rescan will not immediately \
+re-dispatch a replacement worker onto this task/chore — status is otherwise left unchanged for \
+re-dispatch or manual review."
             )
         } else {
             format!(
-                "Worker parked without nudging: {detail}. {pr_clause} The execution's cube lease \
-and worker slot have been released; the task/chore status is left unchanged for re-dispatch or \
-manual review."
+                "Worker parked without nudging: {detail}. {pr_clause} Parked at {parked_at}. The \
+execution's cube lease and worker slot have been released; `autostart` has been cleared so the \
+automated rescan will not immediately re-dispatch a replacement worker onto this task/chore — \
+status is otherwise left unchanged for re-dispatch or manual review."
             )
         };
 
@@ -4688,6 +4800,7 @@ manual review."
         };
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
+        self.build_wait_tracker.forget(&execution.id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -5023,6 +5136,7 @@ manual review."
         // the nudge counter so nothing lingers for this finalized execution.
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
+        self.build_wait_tracker.forget(&execution.id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -6150,6 +6264,20 @@ pub enum StopOutcome {
     /// probe is sent. Resolving the attention item (coordinator ack)
     /// resumes normal nudging on the next Stop.
     EscalationPending { reason: String },
+    /// The worker's Stop-boundary text matched the [`crate::build_wait`]
+    /// heuristic — it is narrating that it is legitimately waiting on a
+    /// backgrounded build/test gate (2026-07-14 incident, T2608 / T2612:
+    /// `exec_18c21add1416b5e8_3b`, `exec_18c21ba9b3fd2ef8_9e`). The
+    /// "produce a PR" auto-nudge is suppressed — and, critically, the
+    /// circuit breaker in [`crate::nudge_breaker`] is never even consulted,
+    /// so this Stop does not burn any of its cap — for as long as
+    /// [`crate::build_wait_tracker::BuildWaitTracker`] considers the wait
+    /// still within its horizon. `waited_secs` is how long this execution
+    /// has been continuously reporting the wait. The execution stays
+    /// `waiting_human`; no probe is sent, nothing is parked. Once the
+    /// horizon elapses, the normal nudge/park flow resumes automatically
+    /// (no coordinator action required — unlike [`StopOutcome::EscalationPending`]).
+    BuildWaitPending { waited_secs: i64 },
     /// The worker is a conflict-resolution or CI-failure revision that
     /// stopped without pushing, but the blocking signal was already
     /// cleared (conflict: PR `mergeable`; CI: required checks green)
@@ -10779,6 +10907,115 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 .status,
             "resolved",
         );
+    }
+
+    // -----------------------------------------------------------
+    // Build-wait suppression (2026-07-14 incident, T2608 / T2612:
+    // `exec_18c21add1416b5e8_3b`, `exec_18c21ba9b3fd2ef8_9e`). A worker
+    // narrating that it is legitimately waiting on a backgrounded
+    // build/test gate must not be nudged — each nudge manufactured the
+    // very Stop cadence that exhausted the auto-nudge circuit breaker in
+    // about two minutes and parked/abandoned a healthy worker mid-wait.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn build_wait_narration_suppresses_nudge_across_repeated_stops() {
+        // The incident transcript, verbatim in spirit: the worker explains
+        // it is waiting on an armed monitor for a backgrounded build/test
+        // gate before it can push. Fire more Stops than the (lowered)
+        // breaker cap would tolerate for an ordinary unproductive nudge —
+        // if build-wait suppression did not short-circuit before the
+        // breaker, this would trip `park_for_unproductive_nudges` and
+        // discard the worker's in-progress session.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "the build gate requires an actual green build before I push, so I must let it finish. \
+             The monitor (task b9qrwn8c7) is armed... I'm not going to push until the test run \
+             comes back green. Waiting.",
+        );
+        let detector = StubPrDetector::ok(None);
+        let TestHarness {
+            handler,
+            cube,
+            pane,
+            probes,
+            ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_max_unproductive_nudges(2);
+
+        for _ in 0..5 {
+            let outcome = handler.on_stop(&execution_id).await;
+            assert!(
+                matches!(outcome, StopOutcome::BuildWaitPending { .. }),
+                "every Stop while the worker narrates a build wait must be BuildWaitPending; got {outcome:?}",
+            );
+        }
+
+        assert!(
+            probes.snapshot().is_empty(),
+            "a worker legitimately waiting on a build must never be nudged; got {:?}",
+            probes.snapshot(),
+        );
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "a healthy build-waiting worker's lease must never be released",
+        );
+        assert!(
+            pane.calls.lock().await.is_empty(),
+            "a healthy build-waiting worker's pane must never be torn down",
+        );
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::WaitingHuman,
+            "a healthy build-waiting worker must stay live, not be finalized",
+        );
+        assert!(execution.cube_lease_id.is_some(), "lease must remain attached");
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // No nudge-breaker attention item was filed — the breaker was
+        // never even consulted.
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+            "build-wait suppression must not masquerade as a breaker trip",
+        );
+    }
+
+    #[tokio::test]
+    async fn build_wait_horizon_expiry_falls_back_to_normal_nudge() {
+        // Requirement: genuine wedge detection must keep working — a
+        // worker that keeps narrating "waiting" without the horizon's
+        // trust budget resets to normal nudging. A `0`-second horizon
+        // means the very first detection is already past its budget,
+        // deterministically exercising the fallback without a real
+        // wall-clock wait (the elapsed-time arithmetic itself is covered
+        // by `crate::build_wait_tracker`'s own unit tests).
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(&db, workspace.path(), &execution_id, "still building, waiting");
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_build_wait_horizon_secs(0);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "an expired build-wait horizon must fall back to the normal produce-a-PR nudge; got {outcome:?}",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(
+            queued.len(),
+            1,
+            "the normal nudge must fire once the horizon has elapsed"
+        );
+        assert_eq!(queued[0].1, PROBE_NO_PR);
     }
 
     // -----------------------------------------------------------
