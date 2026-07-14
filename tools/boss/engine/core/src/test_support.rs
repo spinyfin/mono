@@ -22,8 +22,8 @@ use crate::coordinator::{
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 use boss_protocol::{
-    CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus, FrontendEvent, Product, Task,
-    WorkExecution,
+    Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
+    ExecutionStatus, FrontendEvent, Product, Task, WorkExecution,
 };
 
 /// The mono repo remote used by the overwhelming majority of tests.
@@ -148,6 +148,31 @@ pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>
             .work_item_id(work_item_id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap()
+}
+
+/// Seed the standard "daily automation" fixture under `product_id`:
+/// name `daily`, a `0 14 * * *` UTC [`AutomationTrigger::Schedule`],
+/// standing instruction `"do the thing"`, every other field defaulted.
+///
+/// Returns the whole [`Automation`] record; call sites that only need
+/// the id take `.id`. The automation-scheduler and sweep test modules
+/// (`automation_scheduler`, `cube_lease_heartbeat`, `dead_pane_sweep`,
+/// `execution_liveness`, `lost_workspace_sweep`) all hand-rolled this
+/// exact block, so centralising it means a new field on
+/// [`CreateAutomationInput`] touches one site instead of all of them.
+pub fn seed_daily_automation(db: &WorkDb, product_id: &str) -> Automation {
+    db.create_automation(
+        CreateAutomationInput::builder()
+            .product_id(product_id.to_owned())
+            .name("daily")
+            .trigger(AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("do the thing")
             .build(),
     )
     .unwrap()

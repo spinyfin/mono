@@ -1464,27 +1464,11 @@ mod tests {
     #[tokio::test]
     async fn automation_triage_auto_reap_records_failed_gave_up() {
         use crate::work::AutomationFireRecord;
-        use boss_protocol::{
-            AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AutomationTrigger,
-            CreateAutomationInput,
-        };
+        use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY};
 
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
-        let automation_id = db
-            .create_automation(
-                CreateAutomationInput::builder()
-                    .product_id(product_id.as_str())
-                    .name("daily")
-                    .trigger(AutomationTrigger::Schedule {
-                        cron: "0 14 * * *".to_owned(),
-                        timezone: "UTC".to_owned(),
-                    })
-                    .standing_instruction("do the thing")
-                    .build(),
-            )
-            .unwrap()
-            .id;
+        let automation_id = seed_daily_automation(&db, &product_id).id;
         let exec = db
             .create_automation_triage_execution(&automation_id, "https://github.com/test/repo")
             .unwrap();

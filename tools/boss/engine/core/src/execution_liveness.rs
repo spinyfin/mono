@@ -190,9 +190,11 @@ mod tests {
     use boss_protocol::{ExecutionKind, ExecutionStatus};
 
     use crate::dispatch_events::{RecordingDispatchEventSink, Stage};
-    use crate::test_support::{create_test_chore_manual, create_test_product_with_repo, open_db};
+    use crate::test_support::{
+        create_test_chore_manual, create_test_product_with_repo, open_db, seed_daily_automation,
+    };
     use crate::work::AutomationFireRecord;
-    use boss_protocol::{AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AutomationTrigger, CreateAutomationInput};
+    use boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY;
 
     const TEST_REPO: &str = "https://github.com/test/repo";
 
@@ -201,19 +203,7 @@ mod tests {
     }
 
     fn create_automation(db: &WorkDb, product_id: &str) -> String {
-        db.create_automation(
-            CreateAutomationInput::builder()
-                .product_id(product_id.to_owned())
-                .name("daily")
-                .trigger(AutomationTrigger::Schedule {
-                    cron: "0 14 * * *".to_owned(),
-                    timezone: "UTC".to_owned(),
-                })
-                .standing_instruction("do the thing")
-                .build(),
-        )
-        .unwrap()
-        .id
+        seed_daily_automation(db, product_id).id
     }
 
     /// Seed the pessimistic dispatch-time run row the scheduler writes at

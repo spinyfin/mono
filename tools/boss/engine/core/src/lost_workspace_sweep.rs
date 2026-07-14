@@ -270,23 +270,11 @@ mod tests {
     use crate::work::{AutomationFireRecord, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
-        AutomationTrigger, CreateAutomationInput, ExecutionStatus, FinishExecutionRunInput,
+        ExecutionStatus, FinishExecutionRunInput,
     };
 
     fn create_automation(db: &WorkDb, product_id: &str) -> String {
-        db.create_automation(
-            CreateAutomationInput::builder()
-                .product_id(product_id.to_owned())
-                .name("daily")
-                .trigger(AutomationTrigger::Schedule {
-                    cron: "0 14 * * *".to_owned(),
-                    timezone: "UTC".to_owned(),
-                })
-                .standing_instruction("do the thing")
-                .build(),
-        )
-        .unwrap()
-        .id
+        seed_daily_automation(db, product_id).id
     }
 
     /// Create a triage execution, start its run (stamping `host_id` +
