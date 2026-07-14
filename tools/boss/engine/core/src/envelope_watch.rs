@@ -208,16 +208,12 @@ pub fn run_one_pass(
         }
 
         let execution_id = &state.run_id;
-        let execution = match work_db.get_execution(execution_id) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "envelope-watch: failed to look up execution; skipping slot"
-                );
-                continue;
-            }
+        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+            work_db,
+            execution_id,
+            "envelope-watch: failed to look up execution; skipping slot",
+        ) else {
+            continue;
         };
 
         // A completion may have raced the sweep — a terminal execution is done.

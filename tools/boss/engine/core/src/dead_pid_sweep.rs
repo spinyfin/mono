@@ -332,16 +332,12 @@ pub async fn run_one_pass(
         let execution_id = &state.run_id;
 
         // Look up the execution for the age guard and work_item_id.
-        let execution = match work_db.get_execution(execution_id) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "dead-pid sweep: failed to look up execution; skipping slot",
-                );
-                continue;
-            }
+        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+            work_db,
+            execution_id,
+            "dead-pid sweep: failed to look up execution; skipping slot",
+        ) else {
+            continue;
         };
 
         // Skip executions already in a terminal DB state (completion
@@ -531,16 +527,12 @@ pub async fn reap_reported_pane_death(
         return false;
     }
 
-    let execution = match work_db.get_execution(run_id) {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(
-                run_id,
-                ?err,
-                "worker_pane_died: failed to look up execution; skipping reap",
-            );
-            return false;
-        }
+    let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+        work_db,
+        run_id,
+        "worker_pane_died: failed to look up execution; skipping reap",
+    ) else {
+        return false;
     };
 
     if execution.status.is_terminal() {

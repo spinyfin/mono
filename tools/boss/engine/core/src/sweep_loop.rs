@@ -25,6 +25,39 @@
 use std::future::Future;
 use std::time::Duration;
 
+use boss_protocol::WorkExecution;
+
+use crate::work::WorkDb;
+
+/// Look up an execution by id for a periodic sweep, logging a
+/// per-sweep `warn` and returning `None` on lookup failure.
+///
+/// Several sweep/watch modules repeat the identical "look the execution
+/// up, and if it's gone log a warning and skip this slot" block; the
+/// only per-site difference is the log message. `context` is that
+/// complete `warn` message (e.g. `"spawn-ack sweep: failed to look up
+/// execution; skipping slot"`). On failure the emitted line preserves
+/// the `execution_id` and `?err` fields so log output is unchanged.
+///
+/// Call sites keep their own skip behaviour via `let ... else`:
+///
+/// ```ignore
+/// let Some(execution) =
+///     lookup_execution_or_warn(&work_db, execution_id, "spawn-ack sweep: failed to look up execution; skipping slot")
+/// else {
+///     continue;
+/// };
+/// ```
+pub(crate) fn lookup_execution_or_warn(work_db: &WorkDb, execution_id: &str, context: &str) -> Option<WorkExecution> {
+    match work_db.get_execution(execution_id) {
+        Ok(execution) => Some(execution),
+        Err(err) => {
+            tracing::warn!(execution_id, ?err, "{context}");
+            None
+        }
+    }
+}
+
 /// Per-pass result of a periodic sweep. The loop scaffold uses
 /// [`has_activity`](SweepOutcome::has_activity) to decide whether the
 /// pass did meaningful work and [`log`](SweepOutcome::log) to emit the
