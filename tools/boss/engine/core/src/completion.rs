@@ -12627,7 +12627,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1980";
         let head = "520191ca85b57aeceb458de88058f371a1d43149";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
 
         // Cold-path branch-keyed detector always finds nothing for revisions.
         let detector = StubPrDetector::ok(None);
@@ -12701,7 +12702,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1981";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, _revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, _revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
