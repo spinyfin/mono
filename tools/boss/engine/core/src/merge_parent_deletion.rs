@@ -217,24 +217,11 @@ pub async fn fetch_pr_head_sha(repo_slug: &str, pr_number: u64) -> Option<String
 
 /// Fetch and parse the `.files[]` array of a GitHub compare between two refs.
 async fn fetch_compare_files(repo_slug: &str, base: &str, head: &str) -> Result<Vec<CompareFile>> {
-    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
-    let stdout = crate::gh_invocation::run_gh(
-        &[
-            "api",
-            &endpoint,
-            "-H",
-            "Accept: application/vnd.github+json",
-            "--jq",
-            ".files // []",
-        ],
-        &format!("gh api {endpoint}"),
-    )
-    .await?;
-    let trimmed = stdout.trim();
+    let trimmed = crate::gh_invocation::gh_compare_jq(repo_slug, base, head, ".files // []").await?;
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let files: Vec<CompareFile> = serde_json::from_str(trimmed)?;
+    let files: Vec<CompareFile> = serde_json::from_str(&trimmed)?;
     Ok(files)
 }
 

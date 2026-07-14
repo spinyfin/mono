@@ -195,6 +195,32 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 // all existing call sites within `boss-engine` need no changes.
 pub(crate) use boss_github::gh_runner::{gh_output, run_gh};
 
+/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` with the
+/// GitHub JSON `Accept` header and the caller-supplied `jq` projection,
+/// returning the trimmed stdout.
+///
+/// This is the single source of truth for the `compare` endpoint + header +
+/// spawn envelope shared by every engine compare fetcher. Callers keep their
+/// own type-specific parsing of the returned string (e.g. `serde_json` into a
+/// `Vec<CompareFile>`, or a `u64` line-count parse) and their own fail-open
+/// semantics — this helper only builds the request and returns raw stdout.
+pub(crate) async fn gh_compare_jq(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let stdout = run_gh(
+        &[
+            "api",
+            &endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--jq",
+            jq,
+        ],
+        &format!("gh api {endpoint}"),
+    )
+    .await?;
+    Ok(stdout.trim().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
