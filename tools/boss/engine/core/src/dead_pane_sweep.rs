@@ -294,7 +294,7 @@ mod tests {
     use crate::work::{AutomationFireRecord, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
-        AutomationTrigger, CreateAutomationInput, ExecutionStatus, FinishExecutionRunInput,
+        ExecutionStatus, FinishExecutionRunInput,
     };
 
     /// Test-local alias for the shared epoch helper the production code uses.
@@ -303,19 +303,7 @@ mod tests {
     }
 
     fn create_automation(db: &WorkDb, product_id: &str) -> String {
-        db.create_automation(
-            CreateAutomationInput::builder()
-                .product_id(product_id.to_owned())
-                .name("daily")
-                .trigger(AutomationTrigger::Schedule {
-                    cron: "0 14 * * *".to_owned(),
-                    timezone: "UTC".to_owned(),
-                })
-                .standing_instruction("do the thing")
-                .build(),
-        )
-        .unwrap()
-        .id
+        seed_daily_automation(db, product_id).id
     }
 
     /// A PID guaranteed not to exist: spawn `true`, wait for it to exit, reuse

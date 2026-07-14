@@ -483,18 +483,7 @@ mod tests {
 
     /// Create a daily-2pm-UTC automation. `open_task_limit` default 1.
     fn create_daily_automation(db: &WorkDb, product_id: &str) -> Automation {
-        db.create_automation(
-            CreateAutomationInput::builder()
-                .product_id(product_id.to_owned())
-                .name("daily")
-                .trigger(AutomationTrigger::Schedule {
-                    cron: "0 14 * * *".to_owned(),
-                    timezone: "UTC".to_owned(),
-                })
-                .standing_instruction("do the thing")
-                .build(),
-        )
-        .unwrap()
+        seed_daily_automation(db, product_id)
     }
 
     fn utc_epoch(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
