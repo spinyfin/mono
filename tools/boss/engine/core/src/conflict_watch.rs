@@ -845,9 +845,17 @@ fn take_over_foreign_ci_block(work_db: &WorkDb, candidate: &PendingMergeCheck, f
 /// back to `in_review` or leave it `blocked: merge_conflict`.
 ///
 /// `use_small_agent_profile` selects rung 2 (T6) — a bounded residue rung 1
-/// left behind gets `effort_level = small` (the escalation ladder's small,
-/// cheap, focused-agent profile) instead of the default effort resolution,
-/// and the attempt is stamped `resolved_by_rung = 2` up front so a later
+/// left behind gets `effort_level = trivial` (the escalation ladder's small,
+/// cheap, focused-agent profile) instead of the default effort resolution.
+/// `trivial` — not `small` — is deliberate: `default_revision_effort_level`
+/// already resolves an un-overridden task/chore-rooted revision (rung 3's
+/// fallback) to `small`, so pinning rung 2 to `small` would dispatch
+/// byte-identical model/effort knobs to rung 3 for the dominant case,
+/// defeating the "cheap, bounded-scope agent" goal. `trivial` still floors
+/// to the Sonnet model (never Haiku — issue #746) but resolves to
+/// `claude --effort low` instead of rung 3's `medium`, so rung 2 is a real,
+/// observably cheaper dispatch rather than a telemetry-only distinction.
+/// The attempt is stamped `resolved_by_rung = 2` up front so a later
 /// default-to-rung-3 stamp is a no-op. `false` preserves today's behaviour
 /// (the full-worker rung 3 path) unchanged.
 async fn maybe_spawn_conflict_revision(
@@ -880,7 +888,7 @@ async fn maybe_spawn_conflict_revision(
             .parent_task_id(candidate.work_item_id.clone())
             .description(description)
             .created_via(created_via)
-            .maybe_effort_level(use_small_agent_profile.then_some(EffortLevel::Small))
+            .maybe_effort_level(use_small_agent_profile.then_some(EffortLevel::Trivial))
             .build(),
         pr_checker,
     ) {

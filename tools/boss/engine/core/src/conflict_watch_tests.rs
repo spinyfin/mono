@@ -223,7 +223,7 @@ crate::stub_cube_client! { ConflictsCube {
 
 /// Escalation ladder rung 2 (T6): a single residual conflicted file after
 /// rung 1's rebase is bounded — `on_conflict_detected` spawns the revision
-/// with the small-agent profile (`effort_level = small`) and stamps the
+/// with the small-agent profile (`effort_level = trivial`) and stamps the
 /// attempt `resolved_by_rung = 2` up front.
 #[tokio::test]
 async fn conflict_with_bounded_residue_spawns_rung2_small_agent_revision() {
@@ -262,8 +262,10 @@ async fn conflict_with_bounded_residue_spawns_rung2_small_agent_revision() {
         WorkItem::Task(t) | WorkItem::Chore(t) => {
             assert_eq!(
                 t.effort_level,
-                Some(boss_protocol::EffortLevel::Small),
-                "rung 2's revision must use the small-agent profile"
+                Some(boss_protocol::EffortLevel::Trivial),
+                "rung 2's revision must use the small-agent profile (trivial: cheaper than \
+                 rung 3's un-overridden `small` default, while still respecting the #746 \
+                 no-Haiku floor)"
             );
         }
         other => panic!("expected a task-shaped revision, got {other:?}"),
@@ -299,20 +301,30 @@ async fn conflict_with_unbounded_residue_declines_rung2() {
         .active_conflict_resolution_for_work_item(&chore)
         .unwrap()
         .expect("an active attempt with a spawned revision");
-    // The real discriminator between "rung 2 spawned this" and "rung 3's
-    // default path spawned this" is `resolved_by_rung`, stamped up front only
-    // on the rung-2 branch — `effort_level` alone doesn't distinguish them
-    // here because a plain chore parent's un-overridden default is already
-    // `small` (see `default_revision_effort_level`), same as rung 2's
-    // explicit override.
     assert_eq!(
         active.resolved_by_rung, None,
         "a declined rung 2 must not stamp resolved_by_rung (defaults to 3 at actual completion)"
     );
-    assert!(
-        active.revision_task_id.is_some(),
-        "rung 3 must still spawn a worker revision"
-    );
+    let revision_id = active
+        .revision_task_id
+        .clone()
+        .expect("rung 3 must still spawn a worker revision");
+    // Rung 3's fallback leaves `effort_level` unset on `CreateRevisionInput`;
+    // `default_revision_effort_level` resolves an un-overridden plain-chore
+    // root to `small` — genuinely distinct from rung 2's explicit `trivial`
+    // override (see `conflict_with_bounded_residue_spawns_rung2_small_agent_revision`),
+    // so `effort_level` is now itself a real discriminator between the two
+    // paths, not just `resolved_by_rung`.
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(
+                t.effort_level,
+                Some(boss_protocol::EffortLevel::Small),
+                "rung 3's fallback must use the ordinary small default, not rung 2's trivial profile"
+            );
+        }
+        other => panic!("expected a task-shaped revision, got {other:?}"),
+    }
 }
 
 /// New-model acceptance: when a revision fix vehicle is successfully spawned,

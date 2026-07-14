@@ -310,6 +310,15 @@ impl WorkDb {
     /// The companion success path is part of the auto-retire flow
     /// elsewhere; this method intentionally only handles the failure
     /// signal a worker emits when it hits a stop condition.
+    ///
+    /// Clears `resolved_by_rung` back to `NULL`: rung 2's up-front stamp
+    /// (see [`Self::stamp_conflict_resolution_rung`]) records the rung that
+    /// is *attempting* the resolution, not one that has resolved anything
+    /// yet. A `failed` attempt was never resolved by any rung, so leaving a
+    /// premature stamp on it would over-count rung 2 in telemetry that
+    /// reads `resolved_by_rung` without also filtering `status =
+    /// 'succeeded'`. This matches rung 1's convention, which only ever
+    /// stamps a rung on the succeeded transition.
     pub fn mark_conflict_resolution_failed(
         &self,
         attempt_id: &str,
@@ -320,9 +329,10 @@ impl WorkDb {
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
-                SET status         = 'failed',
-                    failure_reason = ?2,
-                    finished_at    = COALESCE(finished_at, ?3)
+                SET status           = 'failed',
+                    failure_reason   = ?2,
+                    finished_at      = COALESCE(finished_at, ?3),
+                    resolved_by_rung = NULL
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
@@ -385,6 +395,14 @@ impl WorkDb {
     /// it. Does not touch `status` — the attempt stays `pending`/`running`
     /// until the spawned revision actually finishes. Idempotent no-op
     /// (`Ok(None)`) once the row is terminal.
+    ///
+    /// This early stamp is provisional, not a claim of success:
+    /// [`Self::mark_conflict_resolution_failed`] and
+    /// [`Self::mark_conflict_resolution_abandoned`] both clear
+    /// `resolved_by_rung` back to `NULL` on their terminal transition, so a
+    /// rung-2 attempt that never actually resolves the conflict never ends
+    /// up mislabeled `resolved_by_rung = 2` — only `succeeded` rows carry a
+    /// rung stamp, matching rung 1's convention.
     pub fn stamp_conflict_resolution_rung(&self, attempt_id: &str, rung: i64) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -402,6 +420,11 @@ impl WorkDb {
     /// with the provided reason. Used for "we stepped away on purpose"
     /// terminations (parent PR closed, parent merged externally,
     /// manual override) where `failed` would be misleading. Idempotent.
+    ///
+    /// Clears `resolved_by_rung` back to `NULL` for the same reason as
+    /// [`Self::mark_conflict_resolution_failed`]: an abandoned attempt was
+    /// never resolved by any rung, so a rung-2 up-front stamp must not
+    /// survive onto it.
     pub fn mark_conflict_resolution_abandoned(
         &self,
         attempt_id: &str,
@@ -412,9 +435,10 @@ impl WorkDb {
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
-                SET status         = 'abandoned',
-                    failure_reason = ?2,
-                    finished_at    = COALESCE(finished_at, ?3)
+                SET status           = 'abandoned',
+                    failure_reason   = ?2,
+                    finished_at      = COALESCE(finished_at, ?3),
+                    resolved_by_rung = NULL
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],

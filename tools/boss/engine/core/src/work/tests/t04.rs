@@ -223,6 +223,79 @@ fn conflict_resolution_round_trip() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A rung-2 up-front `resolved_by_rung` stamp (see
+/// `WorkDb::stamp_conflict_resolution_rung`) must not survive onto an
+/// attempt that ends up `failed` or `abandoned` — nothing resolved it, so
+/// the column must go back to `NULL` rather than mislabeling the row
+/// `resolved_by_rung = 2`. Regression guard for the finding that the
+/// up-front stamp diverges from rung 1's stamp-on-success-only convention.
+#[test]
+fn premature_rung_stamp_is_cleared_on_failed_and_abandoned() {
+    let path = temp_db_path("conflict-resolution-rung-clear");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@example.invalid:foo/bar.git"));
+
+    // Attempt A: stamped rung 2 up front, then fails.
+    let chore_a = create_test_chore_manual(&db, product.id.clone(), "C-A");
+    let attempt_a = db
+        .insert_conflict_resolution(super::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore_a.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/50".into(),
+            pr_number: 50,
+            head_branch: "feature-a".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("aaa111".into()),
+            head_sha_before: Some("bbb222".into()),
+        })
+        .unwrap()
+        .expect("first insert must produce a row");
+    let stamped = db
+        .stamp_conflict_resolution_rung(&attempt_a.id, 2)
+        .unwrap()
+        .expect("stamp on a live attempt returns the updated row");
+    assert_eq!(stamped.resolved_by_rung, Some(2));
+
+    let failed = db
+        .mark_conflict_resolution_failed(&attempt_a.id, "gave_up")
+        .unwrap()
+        .expect("failure flip returns updated row");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(
+        failed.resolved_by_rung, None,
+        "a failed attempt was never resolved by any rung; the premature stamp must be cleared"
+    );
+
+    // Attempt B: stamped rung 2 up front, then abandoned.
+    let chore_b = create_test_chore_manual(&db, product.id.clone(), "C-B");
+    let attempt_b = db
+        .insert_conflict_resolution(super::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore_b.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/51".into(),
+            pr_number: 51,
+            head_branch: "feature-b".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("ccc333".into()),
+            head_sha_before: Some("ddd444".into()),
+        })
+        .unwrap()
+        .expect("first insert must produce a row");
+    db.stamp_conflict_resolution_rung(&attempt_b.id, 2).unwrap();
+
+    let abandoned = db
+        .mark_conflict_resolution_abandoned(&attempt_b.id, "parent_pr_closed")
+        .unwrap()
+        .expect("abandon flip returns updated row");
+    assert_eq!(abandoned.status, "abandoned");
+    assert_eq!(
+        abandoned.resolved_by_rung, None,
+        "an abandoned attempt was never resolved by any rung; the premature stamp must be cleared"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// Fresh init lands the merge-conflict-handling columns and the
 /// `conflict_resolutions` side table. Phase 1 of the
 /// merge-conflict-handling design.
