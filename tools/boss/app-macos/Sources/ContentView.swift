@@ -106,9 +106,14 @@ struct ContentView: View {
             // initial-connect window. Replaces the previous behavior
             // where every reconnect attempt re-popped a "Work Error"
             // modal (#698) — transport errors are now routed away from
-            // `workErrorMessage` in `ChatViewModel.handle`.
+            // `workErrorMessage` in `ChatViewModel.handle`. Also gated on
+            // `showConnectionLostBanner` rather than the raw `isConnected`
+            // flag: a drop that self-heals within `connectionLostBannerDelay`
+            // (reconnect backoff starts at 0.5s) never surfaces this at
+            // all, so a brief blip reads as silent self-healing rather than
+            // a user-visible connection error.
             VStack(spacing: 0) {
-                if !model.isConnected && model.hasConnectedOnce {
+                if model.showConnectionLostBanner {
                     EngineUnreachableBanner(
                         isRestarting: model.isRestartingEngine,
                         onRestart: { model.restartEngine() }
@@ -125,7 +130,7 @@ struct ContentView: View {
                 }
             }
         }
-        .animation(.easeInOut(duration: 0.15), value: model.isConnected)
+        .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
         .animation(.easeInOut(duration: 0.15), value: model.engineHealthIssues)
         #if canImport(GhosttyKit)
         .task {

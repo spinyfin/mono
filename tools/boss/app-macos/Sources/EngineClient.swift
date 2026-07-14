@@ -119,6 +119,12 @@ enum EngineRequestKind: Sendable {
 enum EngineEvent {
     case connected
     case disconnected
+    /// The engine had to drop pending invalidations for this session's
+    /// outbound queue while riding out a publish burst (e.g. a
+    /// merge-poller sweep across many products/executions) instead of
+    /// disconnecting. The socket is still up — treat this like the
+    /// refetch-on-reconnect path, silently, with no connection-lost UI.
+    case resyncRequired
     case workInvalidated(topic: String, productId: String?, itemIds: [String])
     case appSessionRegistered
     case bossSessionRegistered
@@ -1562,6 +1568,8 @@ final class EngineClient: @unchecked Sendable {
                     let productId = eventPayload["product_id"] as? String
                     let itemIds = eventPayload["item_ids"] as? [String] ?? []
                     emit(.workInvalidated(topic: topic, productId: productId, itemIds: itemIds))
+                } else if eventType == "resync_required" {
+                    emit(.resyncRequired)
                 }
             case "products_list":
                 let products = (payload["products"] as? [[String: Any]] ?? []).compactMap(parseProduct)

@@ -824,11 +824,12 @@ final class ChatViewModel: ObservableObject {
     private let showSystemMessages: Bool
     private var didStart = false
     private var didStartEngine = false
-    /// Becomes `true` the first time the socket reaches `.ready`. The
-    /// Disconnected banner reads this so it stays hidden during the
-    /// short initial-connect window (avoiding a flash on launch) and
-    /// only appears once the engine has been reachable at least once.
+    /// Becomes `true` the first time the socket reaches `.ready`, so the
+    /// Disconnected banner stays hidden during the initial-connect window.
     @Published private(set) var hasConnectedOnce = false
+    @Published var showConnectionLostBanner = false // see ChatViewModel+Connection.swift
+    static let connectionLostBannerDelay: TimeInterval = 2.0 // grace period before a disconnect may raise the banner
+    var connectionGeneration = 0 // bumped on connect/disconnect; supersedes a stale banner-reveal
     private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
@@ -1891,6 +1892,7 @@ final class ChatViewModel: ObservableObject {
         case .connected:
             isConnected = true
             hasConnectedOnce = true
+            resetConnectionLostBanner()
             engine.sendRegisterAppSession()
             refreshWorkSubscriptions()
             // Re-subscribe any open markdown viewers' comment topics and reload
@@ -1916,6 +1918,8 @@ final class ChatViewModel: ObservableObject {
                 engine.sendGetWorkTree(productId: productID, flow: .coldStart)
                 engine.sendListAttentionGroups(productId: productID)
             }
+        case .resyncRequired:
+            handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
         case .appSessionRegistered:
             isAppSessionRegistered = true
             maybeRegisterBossSession()
@@ -1997,6 +2001,7 @@ final class ChatViewModel: ObservableObject {
                     automationsFetchStateByProductID[productID] = .failed("Connection lost")
                 }
             }
+            scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, _):
             if CommentEngineBridge.isCommentTopic(topic) {
                 // A comment row on an open viewer's artifact changed elsewhere;
