@@ -172,104 +172,101 @@ mod tests {
     use super::*;
     use crate::ResolveOutcome;
 
-    /// Non-zero exit with EMPTY stderr must fall back to the `(no stderr)`
-    /// placeholder in the decline reason. This branch (command.rs:46-50) is
-    /// otherwise never exercised — every other failing call passes real
-    /// stderr text.
-    #[tokio::test]
-    async fn declines_with_no_stderr_placeholder_when_stderr_empty() {
-        let runner = FakeCommandRunner::failure("");
-        let result = run_or_decline(&runner, Path::new("/tmp/ws"), "cargo", &["generate-lockfile"], "").await;
+    /// Unwraps the `Declined` reason string, panicking on `Ok`. Every
+    /// failure branch of `run_or_decline` returns `Err(Declined { .. })`;
+    /// this keeps each assertion focused on the observable reason text.
+    fn declined_reason(result: Result<(), ResolveOutcome>) -> String {
+        match result {
+            Err(ResolveOutcome::Declined { reason }) => reason,
+            other => panic!("expected Err(Declined), got {other:?}"),
+        }
+    }
 
-        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
-            panic!("expected Declined");
-        };
+    #[tokio::test]
+    async fn success_returns_ok() {
+        let runner = FakeCommandRunner::success();
+        let result = run_or_decline(&runner, Path::new("/w"), "cargo", &["generate-lockfile"], "").await;
+        assert!(result.is_ok(), "successful command should return Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_error_declines_naming_the_program() {
+        let runner = FakeCommandRunner::spawn_error();
+        let reason = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        assert!(reason.contains("failed to spawn"), "reason was: {reason}");
         assert!(
-            reason.contains("(no stderr)"),
-            "reason should use the placeholder, got: {reason}"
+            reason.contains("cargo"),
+            "reason should name the program, was: {reason}"
         );
     }
 
-    /// A non-zero exit with real stderr surfaces the stderr text, the exit
-    /// code, and the joined args string in the decline reason.
     #[tokio::test]
-    async fn declines_with_stderr_code_and_args_on_failure() {
-        let runner = FakeCommandRunner::failure("boom: dependency conflict");
-        let result = run_or_decline(
-            &runner,
-            Path::new("/tmp/ws"),
-            "cargo",
-            &["generate-lockfile", "--offline"],
-            "",
-        )
-        .await;
-
-        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
-            panic!("expected Declined");
-        };
-        assert!(
-            reason.contains("boom: dependency conflict"),
-            "reason should contain stderr, got: {reason}"
+    async fn nonzero_exit_with_stderr_reports_command_code_and_stderr() {
+        let runner = FakeCommandRunner::failure("manifest is invalid");
+        let reason = declined_reason(
+            run_or_decline(
+                &runner,
+                Path::new("/w"),
+                "cargo",
+                &["generate-lockfile", "--offline"],
+                "",
+            )
+            .await,
         );
         assert!(
-            reason.contains("Some(1)"),
-            "reason should contain the exit code, got: {reason}"
+            reason.contains("cargo"),
+            "reason should name the program, was: {reason}"
         );
         assert!(
             reason.contains("generate-lockfile --offline"),
-            "reason should contain the joined args, got: {reason}"
+            "reason should include the joined args, was: {reason}"
+        );
+        // `code` is `Some(1)` in `FakeCommandRunner::failure`, formatted via `{:?}`.
+        assert!(
+            reason.contains("Some(1)"),
+            "reason should include the exit code, was: {reason}"
+        );
+        assert!(
+            reason.contains("manifest is invalid"),
+            "reason should include stderr, was: {reason}"
         );
     }
 
-    /// A spawn failure (the runner itself errors) reports `failed to spawn`
-    /// with the program name and the underlying error text.
     #[tokio::test]
-    async fn declines_with_spawn_error_details() {
-        let runner = FakeCommandRunner::spawn_error();
-        let result = run_or_decline(&runner, Path::new("/tmp/ws"), "bazel", &["mod", "deps"], "").await;
-
-        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
-            panic!("expected Declined");
-        };
+    async fn nonzero_exit_with_empty_stderr_uses_no_stderr_placeholder() {
+        // The one branch no lockfile/recipe resolver test exercises: a
+        // command that fails but writes nothing to stderr falls back to the
+        // literal "(no stderr)" placeholder.
+        let runner = FakeCommandRunner::failure("");
+        let reason = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
         assert!(
-            reason.contains("failed to spawn `bazel`"),
-            "reason should name the program, got: {reason}"
+            reason.contains("(no stderr)"),
+            "reason should use the placeholder, was: {reason}"
         );
         assert!(
-            reason.contains("program not found"),
-            "reason should contain the underlying error, got: {reason}"
+            !reason.contains("manifest"),
+            "sanity: empty stderr should not leak unrelated text, was: {reason}"
         );
     }
 
-    /// A successful (exit 0) command yields `Ok(())`.
     #[tokio::test]
-    async fn returns_ok_on_success() {
-        let runner = FakeCommandRunner::success();
-        let result = run_or_decline(&runner, Path::new("/tmp/ws"), "cargo", &["generate-lockfile"], "").await;
+    async fn reason_prefix_is_prepended_verbatim() {
+        let prefix = "recipe \"schema\" (verify_command): ";
 
-        assert_eq!(result, Ok(()));
-    }
-
-    /// A non-empty `reason_prefix` is prepended verbatim to the decline
-    /// reason, letting each caller identify which command/strategy failed.
-    #[tokio::test]
-    async fn prepends_reason_prefix_verbatim() {
-        let runner = FakeCommandRunner::failure("nope");
-        let result = run_or_decline(
-            &runner,
-            Path::new("/tmp/ws"),
-            "cargo",
-            &["check"],
-            "recipe \"schema\" (verify_command): ",
-        )
-        .await;
-
-        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
-            panic!("expected Declined");
-        };
+        let runner = FakeCommandRunner::failure("boom");
+        let with_prefix = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], prefix).await);
         assert!(
-            reason.starts_with("recipe \"schema\" (verify_command): "),
-            "reason should start with the prefix, got: {reason}"
+            with_prefix.starts_with(prefix),
+            "reason should start with the verbatim prefix, was: {with_prefix}"
+        );
+
+        // Empty prefix adds nothing: the reason starts with the command
+        // backtick rather than any prefix text.
+        let runner = FakeCommandRunner::failure("boom");
+        let without_prefix = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        assert!(
+            without_prefix.starts_with('`'),
+            "empty prefix should add no leading text, was: {without_prefix}"
         );
     }
 }
