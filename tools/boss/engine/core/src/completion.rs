@@ -12995,7 +12995,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1398";
         let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None); // no branch-keyed PR
