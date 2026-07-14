@@ -128,9 +128,10 @@ pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> O
 }
 
 /// In-memory `execution_id` set tracking revision workers that ran a push
-/// command (`jj git push`) since the last Stop event. Populated by the
-/// `PostToolUse` hook dispatcher; consumed (and cleared) by
-/// `WorkerCompletionHandler::on_stop_inner`'s SHA-delta gate.
+/// command (`cube pr update`, or a legacy direct `jj git push`) since the
+/// last Stop event. Populated by the `PostToolUse` hook dispatcher; consumed
+/// (and cleared) by `WorkerCompletionHandler::on_stop_inner`'s SHA-delta
+/// gate.
 ///
 /// A revision worker that pushed is far more likely to be the source of a
 /// SHA delta than the concurrently-active parent worker. `take` returns
@@ -165,17 +166,27 @@ impl StagedRevisionPushCache {
     }
 }
 
-/// Check whether a Bash `tool_input` command is a `jj git push` (or
-/// `git push`) invocation that would advance a branch on the remote. Used
-/// to populate the [`StagedRevisionPushCache`] for revision workers.
+/// Check whether a Bash `tool_input` command is a push invocation that
+/// would advance the parent PR's branch on the remote. Used to populate the
+/// [`StagedRevisionPushCache`] for revision workers.
 ///
-/// Returns `true` for `jj git push …` commands (excluding `--dry-run`).
-/// Plain `git push` is intentionally excluded — revision workers in this
-/// repo use `jj` exclusively.
+/// Returns `true` for:
+/// - `cube pr update …` (and the deprecated `cube pr ensure` alias) — the
+///   sanctioned way every worker pushes to an existing PR today. The
+///   worker-facing contract (`worker_setup.rs`) forbids bare `jj git push`
+///   via a `PreToolUse` hook, so this is the command a compliant revision
+///   worker's Bash tool call actually shows; the push itself happens inside
+///   the `cube` subprocess and is invisible to the hook stream.
+/// - `jj git push …` (excluding `--dry-run`) — kept for defence-in-depth /
+///   older worker prompts that still push directly. Plain `git push` is
+///   intentionally excluded — the worker fleet uses `jj` exclusively.
 pub fn is_revision_push_command(tool_input: &serde_json::Value) -> bool {
     let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
+    if command.contains("cube pr update") || command.contains("cube pr ensure") {
+        return true;
+    }
     command.contains("jj git push") && !command.contains("--dry-run")
 }
 
@@ -578,6 +589,69 @@ mod tests {
     #[test]
     fn null_tool_input_returns_false() {
         assert!(!is_gh_pr_command(&json!(null)));
+    }
+
+    // ── is_revision_push_command ─────────────────────────────────
+
+    #[test]
+    fn cube_pr_update_is_a_revision_push_command() {
+        // Regression: every worker (including revisions) pushes via `cube pr
+        // update`, not bare `jj git push` (blocked by a PreToolUse hook). If
+        // this stops matching, the SHA-delta gate's push-evidence check
+        // never sees a revision's own push on any Stop after the first,
+        // stranding multi-turn revisions in `active` forever.
+        assert!(is_revision_push_command(&json!({
+            "command": "cube pr update --branch boss/exec_abc123_01"
+        })));
+    }
+
+    #[test]
+    fn cube_pr_update_with_git_dir_prefix_is_a_revision_push_command() {
+        assert!(is_revision_push_command(&json!({
+            "command": "GIT_DIR=.jj/repo/store/git cube pr update --branch boss/exec_abc123_01"
+        })));
+    }
+
+    #[test]
+    fn deprecated_cube_pr_ensure_is_a_revision_push_command() {
+        assert!(is_revision_push_command(&json!({
+            "command": "cube pr ensure --branch boss/exec_abc123_01"
+        })));
+    }
+
+    #[test]
+    fn jj_git_push_is_still_a_revision_push_command() {
+        // Defence-in-depth for any worker prompt that still pushes directly.
+        assert!(is_revision_push_command(&json!({
+            "command": "GIT_DIR=.jj/repo/store/git jj git push -b boss/exec_abc123_01"
+        })));
+    }
+
+    #[test]
+    fn jj_git_push_dry_run_is_not_a_revision_push_command() {
+        assert!(!is_revision_push_command(&json!({
+            "command": "jj git push -b boss/exec_abc123_01 --dry-run"
+        })));
+    }
+
+    #[test]
+    fn cube_pr_create_is_not_a_revision_push_command() {
+        // Revisions never open a new PR (blocked by the OQ3 PreToolUse
+        // guard); `cube pr create` staying unmatched here is defensive, not
+        // load-bearing.
+        assert!(!is_revision_push_command(&json!({
+            "command": "cube pr create --branch boss/exec_abc123_01 --title 'my feature'"
+        })));
+    }
+
+    #[test]
+    fn unrelated_command_is_not_a_revision_push_command() {
+        assert!(!is_revision_push_command(&json!({ "command": "bazel test //..." })));
+    }
+
+    #[test]
+    fn missing_command_field_is_not_a_revision_push_command() {
+        assert!(!is_revision_push_command(&json!({ "timeout": 30000 })));
     }
 
     // ── validate_pr_url ───────────────────────────────────────────

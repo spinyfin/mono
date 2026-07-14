@@ -1300,75 +1300,113 @@ impl WorkerCompletionHandler {
         // and we fall through to `detect_pr` to reconstruct the URL
         // via the GitHub API.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            let expected_branch = expected_branch_name(
-                execution_id,
-                &execution.branch_naming,
-                execution.worker_branch_prefix.as_deref(),
-            );
-            let repo_slug = parse_repo_slug(&execution.repo_remote_url);
-            let branch_ok = match repo_slug {
-                Ok(ref slug) => match pr_number_from_url(&staged_url) {
-                    Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                        Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
-                            if head_ref.as_str() != expected_branch.as_str() {
-                                tracing::info!(
+            // `RevisionImplementation` executions push to the CHAIN ROOT's
+            // existing branch, never one derived from their own execution
+            // id. `expected_branch_name(execution_id, ...)` computes a
+            // branch that structurally never exists for a revision, so the
+            // work-item-suffix check below would always "mismatch" and
+            // discard a legitimate staged URL (2026-07-14 incident, T342 /
+            // exec_18c2124d2f06d768_106d: `cube pr update`'s printed URL —
+            // the chain root's real PR — was dropped here, and the
+            // fallthrough to the SHA-delta gate is what actually caused the
+            // stall). Verify against the resolved bound PR instead: the
+            // URL a compliant `cube pr update` call prints for a revision
+            // IS the chain root's PR.
+            let branch_ok = if execution.kind == ExecutionKind::RevisionImplementation {
+                match self.resolve_bound_pr_url(&execution) {
+                    Some(bound_url) if bound_url == staged_url => true,
+                    Some(bound_url) => {
+                        tracing::warn!(
+                            execution_id,
+                            staged_pr_url = %staged_url,
+                            bound_pr_url = %bound_url,
+                            "pr_recheck_staged_branch_mismatch: staged PR URL does not match the revision's bound (chain root) PR; dropping staged URL",
+                        );
+                        PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                        self.staged_pr_urls.forget(execution_id);
+                        false
+                    }
+                    None => {
+                        // No bound PR resolvable (execution.pr_url not
+                        // stamped and the chain-root lookup failed) — trust
+                        // the staged URL rather than discard legitimate
+                        // evidence; a wrong URL here would still have to
+                        // pass `validate_pr_url`'s product-repo gate at
+                        // staging time.
+                        true
+                    }
+                }
+            } else {
+                let expected_branch = expected_branch_name(
+                    execution_id,
+                    &execution.branch_naming,
+                    execution.worker_branch_prefix.as_deref(),
+                );
+                let repo_slug = parse_repo_slug(&execution.repo_remote_url);
+                match repo_slug {
+                    Ok(ref slug) => match pr_number_from_url(&staged_url) {
+                        Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
+                            Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
+                                if head_ref.as_str() != expected_branch.as_str() {
+                                    tracing::info!(
+                                        execution_id,
+                                        staged_pr_url = %staged_url,
+                                        staged_pr_branch = %head_ref,
+                                        %expected_branch,
+                                        "stop event: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                    );
+                                }
+                                true
+                            }
+                            Ok(head_ref) => {
+                                tracing::warn!(
                                     execution_id,
                                     staged_pr_url = %staged_url,
                                     staged_pr_branch = %head_ref,
                                     %expected_branch,
-                                    "stop event: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                    "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
                                 );
+                                PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                                self.staged_pr_urls.forget(execution_id);
+                                false
                             }
-                            true
-                        }
-                        Ok(head_ref) => {
+                            Err(err) => {
+                                // Transient API failure: cannot verify this turn, but do NOT
+                                // discard the staged URL. The cold-path detector runs below
+                                // as a fallback for this Stop. On the next merge-poller sweep
+                                // the staged URL is still present and verification is retried —
+                                // dropping here would strand the worker if the cold path also
+                                // fails. A definitive branch-name mismatch (the Ok(head_ref)
+                                // arm above) still evicts the URL immediately.
+                                tracing::warn!(
+                                    execution_id,
+                                    staged_pr_url = %staged_url,
+                                    ?err,
+                                    "stop event: branch verification failed transiently; \
+                                     keeping staged URL for retry on next sweep",
+                                );
+                                false
+                            }
+                        },
+                        None => {
                             tracing::warn!(
                                 execution_id,
                                 staged_pr_url = %staged_url,
-                                staged_pr_branch = %head_ref,
-                                %expected_branch,
-                                "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
+                                "stop event: cannot parse PR number from staged URL; dropping for safety",
                             );
-                            PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
                             self.staged_pr_urls.forget(execution_id);
                             false
                         }
-                        Err(err) => {
-                            // Transient API failure: cannot verify this turn, but do NOT
-                            // discard the staged URL. The cold-path detector runs below
-                            // as a fallback for this Stop. On the next merge-poller sweep
-                            // the staged URL is still present and verification is retried —
-                            // dropping here would strand the worker if the cold path also
-                            // fails. A definitive branch-name mismatch (the Ok(head_ref)
-                            // arm above) still evicts the URL immediately.
-                            tracing::warn!(
-                                execution_id,
-                                staged_pr_url = %staged_url,
-                                ?err,
-                                "stop event: branch verification failed transiently; \
-                                 keeping staged URL for retry on next sweep",
-                            );
-                            false
-                        }
                     },
-                    None => {
+                    Err(err) => {
                         tracing::warn!(
                             execution_id,
-                            staged_pr_url = %staged_url,
-                            "stop event: cannot parse PR number from staged URL; dropping for safety",
+                            ?err,
+                            "stop event: cannot parse repo slug; dropping staged URL for safety",
                         );
                         self.staged_pr_urls.forget(execution_id);
                         false
                     }
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id,
-                        ?err,
-                        "stop event: cannot parse repo slug; dropping staged URL for safety",
-                    );
-                    self.staged_pr_urls.forget(execution_id);
-                    false
                 }
             };
             if branch_ok {
@@ -1923,73 +1961,96 @@ must not be asked to open one",
         // invocation (e.g. reading a chore description that referenced
         // an old PR number) and must be discarded.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            let expected_branch = expected_branch_name(
-                execution_id,
-                &execution.branch_naming,
-                execution.worker_branch_prefix.as_deref(),
-            );
-            let repo_slug = parse_repo_slug(&execution.repo_remote_url);
-            let branch_ok = match repo_slug {
-                Ok(ref slug) => match pr_number_from_url(&staged_url) {
-                    Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                        Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
-                            if head_ref.as_str() != expected_branch.as_str() {
-                                tracing::info!(
+            // See the identical `RevisionImplementation` special-case in
+            // `on_stop_inner`'s primary path for the rationale: a
+            // revision's branch is the chain root's, never one derived
+            // from its own execution id, so the suffix check would always
+            // mismatch and discard a legitimate staged URL.
+            let branch_ok = if execution.kind == ExecutionKind::RevisionImplementation {
+                match self.resolve_bound_pr_url(&execution) {
+                    Some(bound_url) if bound_url == staged_url => true,
+                    Some(bound_url) => {
+                        tracing::warn!(
+                            execution_id,
+                            staged_pr_url = %staged_url,
+                            bound_pr_url = %bound_url,
+                            "pr_recheck_staged_branch_mismatch: staged PR URL does not match the revision's bound (chain root) PR; dropping staged URL",
+                        );
+                        PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                        self.staged_pr_urls.forget(execution_id);
+                        false
+                    }
+                    None => true,
+                }
+            } else {
+                let expected_branch = expected_branch_name(
+                    execution_id,
+                    &execution.branch_naming,
+                    execution.worker_branch_prefix.as_deref(),
+                );
+                let repo_slug = parse_repo_slug(&execution.repo_remote_url);
+                match repo_slug {
+                    Ok(ref slug) => match pr_number_from_url(&staged_url) {
+                        Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
+                            Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
+                                if head_ref.as_str() != expected_branch.as_str() {
+                                    tracing::info!(
+                                        execution_id,
+                                        staged_pr_url = %staged_url,
+                                        staged_pr_branch = %head_ref,
+                                        %expected_branch,
+                                        "pr-recheck: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                    );
+                                }
+                                true
+                            }
+                            Ok(head_ref) => {
+                                tracing::warn!(
                                     execution_id,
                                     staged_pr_url = %staged_url,
                                     staged_pr_branch = %head_ref,
                                     %expected_branch,
-                                    "pr-recheck: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                    "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
                                 );
+                                PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                                self.staged_pr_urls.forget(execution_id);
+                                false
                             }
-                            true
-                        }
-                        Ok(head_ref) => {
+                            Err(err) => {
+                                // Transient API failure: cannot verify this pass. Keep the
+                                // staged URL so the next sweep can retry verification rather
+                                // than falling back to the cold-path detector indefinitely.
+                                // Only a definitive branch-name mismatch (Ok arm above) evicts
+                                // the entry.
+                                tracing::warn!(
+                                    execution_id,
+                                    staged_pr_url = %staged_url,
+                                    ?err,
+                                    "pr-recheck: branch verification failed transiently; \
+                                     keeping staged URL for retry on next sweep",
+                                );
+                                false
+                            }
+                        },
+                        None => {
                             tracing::warn!(
                                 execution_id,
                                 staged_pr_url = %staged_url,
-                                staged_pr_branch = %head_ref,
-                                %expected_branch,
-                                "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
+                                "pr-recheck: cannot parse PR number from staged URL; dropping for safety",
                             );
-                            PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
                             self.staged_pr_urls.forget(execution_id);
                             false
                         }
-                        Err(err) => {
-                            // Transient API failure: cannot verify this pass. Keep the
-                            // staged URL so the next sweep can retry verification rather
-                            // than falling back to the cold-path detector indefinitely.
-                            // Only a definitive branch-name mismatch (Ok arm above) evicts
-                            // the entry.
-                            tracing::warn!(
-                                execution_id,
-                                staged_pr_url = %staged_url,
-                                ?err,
-                                "pr-recheck: branch verification failed transiently; \
-                                 keeping staged URL for retry on next sweep",
-                            );
-                            false
-                        }
                     },
-                    None => {
+                    Err(err) => {
                         tracing::warn!(
                             execution_id,
-                            staged_pr_url = %staged_url,
-                            "pr-recheck: cannot parse PR number from staged URL; dropping for safety",
+                            ?err,
+                            "pr-recheck: cannot parse repo slug; dropping staged URL for safety",
                         );
                         self.staged_pr_urls.forget(execution_id);
                         false
                     }
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id,
-                        ?err,
-                        "pr-recheck: cannot parse repo slug; dropping staged URL for safety",
-                    );
-                    self.staged_pr_urls.forget(execution_id);
-                    false
                 }
             };
             if branch_ok {
@@ -2083,26 +2144,38 @@ must not be asked to open one",
                         )
                         .await;
                 }
-                // Head moved but revision_stop_contributed_head doesn't match
-                // (or was never set): attribute to the parent worker and absorb.
+                // Head moved but revision_stop_contributed_head doesn't
+                // match (or was never set). This could be a genuine
+                // parent-worker push — OR the revision's own worker is
+                // still actively running and simply hasn't reached its own
+                // Stop boundary yet: `execution.status` is `waiting_human`
+                // for the worker's ENTIRE session, not just once it goes
+                // idle (PaneSpawnRunner sets it at pane spawn), so this
+                // periodic sweep can land between the worker's push and its
+                // own Stop event. Do NOT mutate `pr_head_before` here —
+                // 2026-07-14 incident (T342 / exec_18c2124d2f06d768_106d):
+                // a poller sweep raced a live worker's in-flight push,
+                // absorbed the just-pushed head as the new baseline here,
+                // and when the worker's own on_stop ran moments later its
+                // SHA-delta gate saw head_now == pr_head_before and
+                // produced a false NoContribution — stranding the revision
+                // in `active` forever, since no future delta could ever be
+                // observed again. Only `on_stop_inner`'s own
+                // already_stop_seen-gated absorption is trustworthy: it
+                // runs at a turn boundary the worker itself just crossed.
+                // Leave the baseline untouched and defer to the worker's
+                // own next Stop; a genuinely dead/abandoned revision with
+                // no worker left to Stop is a liveness question for a
+                // different reconciler, not this sweep.
                 tracing::debug!(
                     execution_id,
                     pr_url = %pr_url,
                     head_now = %head_now,
                     committed_head = ?committed_head,
-                    "pr-recheck: revision Contributed suppressed — head_now does not match \
-                     revision_stop_contributed_head (parent push or no prior on_stop Contributed); \
-                     absorbing baseline",
+                    "pr-recheck: revision Contributed unattributed — deferring to the worker's \
+                     own Stop boundary rather than absorbing a possibly-in-flight push as baseline",
                 );
-                if let Err(err) = self.work_db.set_execution_pr_head_before(execution_id, &head_now) {
-                    tracing::warn!(
-                        execution_id,
-                        ?err,
-                        "pr-recheck: failed to advance pr_head_before baseline after \
-                         suppression; next sweep may re-trigger spuriously",
-                    );
-                }
-                // Fall through to cold-path (returns AwaitingInput for revisions).
+                return StopOutcome::AwaitingInput;
             }
             ShaDeltaGateOutcome::Contributed { pr_url, head_now: _ } => {
                 tracing::info!(
@@ -2168,6 +2241,26 @@ must not be asked to open one",
                 "pr-recheck: detect_pr_cold_fallback flag is OFF — skipping fallback",
             );
             return StopOutcome::FallbackDisabledByFlag;
+        }
+
+        // A `revision_implementation` execution pushes to the CHAIN ROOT's
+        // existing branch, never one derived from its own execution id —
+        // the branch-keyed cold-path detector below can structurally never
+        // find a match for it (`query_pr_by_branch_suffix` scans up to the
+        // 100-PR API cap looking for a branch that can never exist). Every
+        // inconclusive sweep landed here and burned that futile scan before
+        // reaching the exact same `AwaitingInput` outcome a quiet skip
+        // reaches directly (2026-07-14 incident, T342 /
+        // exec_18c2124d2f06d768_106d — the poller looped this scan every
+        // sweep until an unrelated recovery path noticed the PR had
+        // merged). Skip straight to that outcome instead.
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            tracing::debug!(
+                execution_id,
+                "pr-recheck: skipping branch-keyed cold-path detector for a revision — it can \
+                 never match a branch of its own; awaiting the worker's next Stop",
+            );
+            return StopOutcome::AwaitingInput;
         }
 
         let expected_branch = expected_branch_name(
@@ -11343,6 +11436,232 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     // -----------------------------------------------------------
+    // 2026-07-14 incident (T342 / exec_18c2124d2f06d768_106d): a revision
+    // worker's fix was pushed and its Stop was terminal, but the row was
+    // neither reaped nor advanced. Root-caused to three chained defects,
+    // each regression-guarded below:
+    //   (a) the primary staged-URL path computed `expected_branch` from
+    //       the revision's OWN execution id, which can never match the
+    //       chain root's branch a revision actually pushes to, so a
+    //       legitimate staged URL was always dropped.
+    //   (b) the merge-poller's `recheck_for_pr`, which runs for the
+    //       worker's ENTIRE `waiting_human` session (not just once it
+    //       goes idle), could race a live worker's in-flight push and
+    //       misattribute an unattributed SHA delta as "parent pushed",
+    //       absorbing the just-pushed head as the new baseline — poisoning
+    //       the worker's own later SHA-delta comparison.
+    //   (c) the branch-keyed cold-path detector was invoked for revisions
+    //       on every inconclusive sweep, burning a futile
+    //       `query_pr_by_branch_suffix` scan (up to the 100-PR API cap)
+    //       that can never match a revision's branch.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_stop_staged_url_accepted_for_revision_chain_root_branch() {
+        // Fix (a): the staged URL a compliant `cube pr update` call prints
+        // for a revision IS the chain root's PR — accept it whenever it
+        // matches the execution's resolved bound PR, with no branch-name
+        // lookup (which can never succeed for a revision).
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_staged_pr_urls(staged_pr_urls.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "staged chain-root URL must finalize the revision via the primary path; got {outcome:?}",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review"),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released via the primary staged-URL path",
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stop_staged_url_rejected_for_revision_wrong_pr() {
+        // Fix (a), negative case: a staged URL that is NOT the revision's
+        // bound (chain root) PR — e.g. captured from an unrelated `gh pr
+        // view` the worker ran mid-session — must still be rejected.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/1");
+
+        // SHA-delta gate fallback: head unchanged, so it won't finalize either.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head_before.into())).await;
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "a staged URL that isn't the revision's bound (chain root) PR must not finalize; got {outcome:?}",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert!(
+            staged_pr_urls.get(&execution_id).is_none(),
+            "mismatched staged URL must be cleared from the cache",
+        );
+        assert!(cube.release_calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_revision_unattributed_contributed_does_not_clobber_baseline() {
+        // Fix (b): `execution.status` is `waiting_human` for a worker's
+        // ENTIRE session (set at pane spawn, not at exit), so a
+        // merge-poller sweep can land between a live worker's push and its
+        // own Stop event — observing a head movement with
+        // `revision_stop_contributed_head` not yet stamped (on_stop_inner
+        // hasn't run for this delta yet). Before the fix, this absorbed
+        // the just-observed head as the new `pr_head_before` baseline; the
+        // worker's own later on_stop would then see head_now ==
+        // pr_head_before (the clobbered baseline) and falsely conclude
+        // NoContribution, stranding the revision forever. The fix: leave
+        // `pr_head_before` untouched and defer to the worker's own Stop.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+        let detector = StubPrDetector::ok(None);
+
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "unattributed Contributed must defer to the worker's own Stop, not finalize here; got {outcome:?}",
+        );
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.pr_head_before.as_deref(),
+            Some(head_before),
+            "recheck_for_pr must NOT absorb an unattributed Contributed head into pr_head_before — \
+             doing so poisons the worker's own later SHA-delta comparison",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(probes.snapshot().is_empty(), "recheck_for_pr must not nudge");
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_unattributed_then_worker_own_stop_still_finalizes() {
+        // Companion to the regression above: after an earlier poller sweep
+        // deferred (leaving `pr_head_before` untouched), the worker's own
+        // on_stop must still see the real delta and finalize correctly —
+        // proving the fix closes the loop rather than just suppressing
+        // the false positive.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+        let detector = StubPrDetector::ok(None);
+
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_branch_verifier(verifier);
+
+        // A poller sweep races in first and defers.
+        let recheck_outcome = handler.recheck_for_pr(&execution_id).await;
+        assert_eq!(recheck_outcome, StopOutcome::AwaitingInput);
+
+        // The worker's own Stop now fires for the same push.
+        let stop_outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(stop_outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "the worker's own Stop must still detect and finalize its real contribution \
+             after an earlier unattributed poller sweep deferred; got {stop_outcome:?}",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_never_calls_cold_path_detector_for_revision() {
+        // Fix (c): the branch-keyed cold-path detector can structurally
+        // never match a revision (it pushes to the chain root's branch,
+        // never one derived from its own execution id) — calling it burns
+        // a `query_pr_by_branch_suffix` scan (up to the 100-PR API cap)
+        // for nothing before landing on the same AwaitingInput outcome
+        // anyway. Assert recheck_for_pr skips it entirely for a revision
+        // whose SHA-delta gate is Inapplicable.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Force the SHA-delta gate to Inapplicable via a transient fetch failure.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Err("transient GitHub API error".to_owned()))
+            .await;
+        let detector = StubPrDetector::ok(None);
+
+        let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+        let handler = handler.with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+        assert_eq!(
+            detector.call_count(),
+            0,
+            "recheck_for_pr must never invoke the branch-keyed cold-path detector for a revision",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected task, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------
     // PR-metadata-only CI-fix revision finalize (issue #1252), re-solved
     // without the #1262 regression (rolled back in #1293).
     //
@@ -15049,15 +15368,17 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
     }
 
-    /// Regression (multi-turn revision, foreign push absorbed): after `on_stop_inner`
-    /// stamps `stop_seen` and the pre-stop suppression path has advanced
-    /// `pr_head_before` to absorb a parent-chore push ("bbbb"), the merge poller
-    /// must NOT advance the revision if the head has not moved since the last
-    /// Stop boundary. The revision worker is still active between turns.
+    /// Regression (multi-turn revision, foreign push absorbed): after
+    /// `on_stop_inner`'s own already-stop-seen-gated suppression path has
+    /// advanced `pr_head_before` to absorb a parent-chore push ("bbbb" —
+    /// `recheck_for_pr` never does this absorption itself, see the
+    /// 2026-07-14 incident regressions above), the merge poller must NOT
+    /// advance the revision if the head has not moved since the last Stop
+    /// boundary. The revision worker is still active between turns.
     ///
     /// This tests the case the reviewer flagged: stop_seen=true but the SHA move
-    /// is attributable to a different (parent) worker. Because the suppression path
-    /// in `recheck_for_pr` already advanced `pr_head_before` to the parent's commit,
+    /// is attributable to a different (parent) worker. Because on_stop_inner's
+    /// suppression path already advanced `pr_head_before` to the parent's commit,
     /// the next merge-poller sweep finds no new delta and leaves the revision active.
     #[tokio::test]
     async fn recheck_for_pr_sha_delta_suppressed_when_baseline_matches_current_head() {
@@ -15122,12 +15443,20 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
     }
 
-    /// The pre-first-Stop suppression path must advance `pr_head_before` to the
-    /// current head. This ensures subsequent merge-poller sweeps (once stop_seen
-    /// becomes true) compare against the post-parent-push head rather than the
-    /// stale execution-start head, preventing re-triggering on the same delta.
+    /// 2026-07-14 incident (T342 / exec_18c2124d2f06d768_106d) regression:
+    /// the pre-first-Stop suppression path in `recheck_for_pr` must NOT
+    /// advance `pr_head_before` to the current head. `execution.status` is
+    /// `waiting_human` for a worker's ENTIRE session, not just once it goes
+    /// idle, so this poller sweep can race a live worker's own in-flight
+    /// push — absorbing it here would poison the worker's own later
+    /// SHA-delta comparison at its real Stop boundary (see
+    /// `recheck_for_pr_revision_unattributed_contributed_does_not_clobber_baseline`
+    /// for the end-to-end version of this regression). Only
+    /// `on_stop_inner`'s own already-stop-seen-gated absorption — which
+    /// runs at a turn boundary the worker itself just crossed — is
+    /// trustworthy enough to advance the baseline.
     #[tokio::test]
-    async fn recheck_for_pr_pre_stop_suppression_advances_pr_head_before_baseline() {
+    async fn recheck_for_pr_pre_stop_suppression_does_not_clobber_pr_head_before_baseline() {
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
         // Execution-start baseline.
@@ -15164,15 +15493,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             StopOutcome::AwaitingInput,
             "pre-stop suppression must return AwaitingInput; got {outcome:?}",
         );
-        // The baseline must have been advanced to the parent's commit "bbbb".
-        // After on_stop_inner stamps stop_seen, the next sweep will compare
-        // current head against "bbbb" — not "aaaa" — preventing re-triggering.
+        // The baseline must be untouched — advancing it here would race a
+        // live worker's own in-flight push (2026-07-14 incident).
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
             execution.pr_head_before.as_deref(),
-            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            "pre-stop suppression must advance pr_head_before to current head \
-             so subsequent sweeps don't re-trigger on the same stale delta",
+            Some(head_before),
+            "recheck_for_pr must NOT advance pr_head_before on an unattributed \
+             Contributed observation — only on_stop_inner's own \
+             already-stop-seen-gated absorption may do that",
         );
     }
 
@@ -15180,8 +15509,17 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     /// but `revision_stop_contributed_head` is NOT set (on_stop_inner never
     /// observed a Contributed outcome for this execution), a head movement caused
     /// by a *different* worker (e.g. the parent chore's still-active worker)
-    /// must NOT advance the revision to `in_review`. The baseline is absorbed
-    /// so subsequent sweeps don't re-trigger on the same foreign delta.
+    /// must NOT advance the revision to `in_review`.
+    ///
+    /// 2026-07-14 incident (T342) regression: the baseline must NOT be
+    /// absorbed here either — this sweep cannot distinguish "the parent
+    /// worker pushed" from "this revision's own worker pushed and just
+    /// hasn't reached its Stop boundary yet" (`execution.status` is
+    /// `waiting_human` for the worker's entire session). Absorbing
+    /// unconditionally would silently erase real evidence in the latter
+    /// case. Leave the baseline alone in both cases and defer to
+    /// `on_stop_inner`'s own already-stop-seen-gated absorption, which can
+    /// tell the difference via `StagedRevisionPushCache`.
     ///
     /// Scenario: stop_seen=true (multi-turn revision), pr_head_before=aaaa,
     /// parent pushes bbbb; revision made no commit → revision stays Active.
@@ -15248,13 +15586,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             cube.release_calls.lock().await.is_empty(),
             "no cube lease must be released when gate is suppressed",
         );
-        // The baseline must have been advanced to absorb the foreign push.
-        // Subsequent sweeps won't re-trigger on the same delta.
+        // The baseline must be untouched — recheck_for_pr cannot tell a
+        // foreign push apart from this revision's own not-yet-Stopped push,
+        // so it must not absorb either (2026-07-14 incident).
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
             execution.pr_head_before.as_deref(),
-            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            "foreign push must be absorbed into baseline to prevent re-triggering",
+            Some(head_before),
+            "recheck_for_pr must NOT advance pr_head_before on an unattributed \
+             Contributed observation, foreign push or not",
         );
     }
 
@@ -15335,6 +15675,101 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             execution.pr_head_before.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             "on_stop_inner must absorb foreign push into pr_head_before baseline",
+        );
+    }
+
+    /// Regression for the revision reap gap (2026-07-14 live incident,
+    /// exec_18c2124d2f06d768_106d / T342): a revision worker's own push,
+    /// staged via `StagedRevisionPushCache` (populated when the worker runs
+    /// `cube pr update`, not the legacy direct `jj git push` — see
+    /// `pr_url_capture::is_revision_push_command`), must be recognised as
+    /// push evidence on a multi-turn Stop (`already_stop_seen = true`, e.g.
+    /// the worker spent earlier turns investigating review findings before
+    /// finally pushing on this one) so the revision is finalised to
+    /// `in_review` AND its pane/lease are reaped in the same `on_stop`
+    /// call — one engine tick, no merge-poller sweep required.
+    ///
+    /// Companion to `on_stop_foreign_push_post_stop_does_not_finalize_revision`
+    /// above, which covers the opposite half of the same gate (no push
+    /// evidence for THIS execution → a concurrent parent push must NOT
+    /// finalize the revision). Before the fix, `is_revision_push_command`
+    /// only matched a literal `jj git push` command, which no compliant
+    /// worker ever runs directly (a `PreToolUse` hook blocks it) — so
+    /// `StagedRevisionPushCache` was never populated in production and this
+    /// scenario always fell through to `nudge_or_park`, stranding
+    /// multi-turn revisions in `active` with their pane sitting idle.
+    #[tokio::test]
+    async fn on_stop_revision_own_push_post_stop_finalizes_and_reaps() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Stamp stop_seen BEFORE calling on_stop so already_stop_seen=true
+        // inside on_stop_inner, simulating a multi-turn revision's second+
+        // (terminal) stop.
+        db.set_execution_stop_seen(&execution_id).unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // The bound PR's head moved because THIS revision pushed.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+        // Stage push evidence exactly as the PostToolUse dispatcher does
+        // when it sees the worker's `cube pr update` Bash call.
+        let staged_pushes = Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
+        staged_pushes.record(&execution_id);
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_staged_revision_pushes(staged_pushes);
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "on_stop must finalize a revision's own push even at a multi-turn \
+             Stop when push evidence is staged; got {outcome:?}",
+        );
+        // No probe fired — the worker must not be nudged after finalization.
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must fire when revision finalises via its own staged push; got {:?}",
+            probes.snapshot(),
+        );
+        // "row advanced": revision task reaches in_review.
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // "pane reaped": the pane releaser was invoked and the cube lease
+        // released, synchronously inside this single on_stop call — no
+        // poller sweep required.
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "worker pane must be reaped in the same tick that finalizes the revision",
+        );
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released in the same tick that finalizes the revision",
         );
     }
 }
