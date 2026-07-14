@@ -29,17 +29,68 @@ pub async fn fetch_repo_file(owner: &str, repo: &str, path: &str, ref_name: &str
     ])
     .await?;
 
-    if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
-    }
-
     let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_contents_response(output.status.success(), &output.stdout, &stderr)
+        .map_err(|e| anyhow::anyhow!("`gh api {endpoint}` failed (exit {:?}): {}", output.status.code(), e))
+}
+
+/// Classify a `gh api` contents response into the three observable outcomes:
+///
+/// - `Ok(Some(body))` — the request succeeded; the decoded stdout is the file
+///   content at that ref.
+/// - `Ok(None)` — the file does not exist at that ref (HTTP 404). Detected via
+///   gh's stderr containing `"Not Found"` or `"404"`.
+/// - `Err(_)` — any other non-zero exit (transport failure, rate limit, auth
+///   error, …). The error message is the trimmed stderr.
+///
+/// Kept as a pure helper (no I/O) so the classification branching can be
+/// pinned by unit tests.
+fn classify_contents_response(status_success: bool, stdout: &[u8], stderr: &str) -> anyhow::Result<Option<String>> {
+    if status_success {
+        return Ok(Some(String::from_utf8_lossy(stdout).into_owned()));
+    }
     if stderr.contains("Not Found") || stderr.contains("404") {
         return Ok(None);
     }
-    anyhow::bail!(
-        "`gh api {endpoint}` failed (exit {:?}): {}",
-        output.status.code(),
-        stderr.trim()
-    )
+    anyhow::bail!("{}", stderr.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_returns_decoded_body() {
+        let body = b"fn main() {}\n";
+        let result = classify_contents_response(true, body, "").unwrap();
+        assert_eq!(result, Some("fn main() {}\n".to_string()));
+    }
+
+    #[test]
+    fn not_found_stderr_returns_none() {
+        let stderr = "gh: Not Found (HTTP 404)";
+        let result = classify_contents_response(false, b"", stderr).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn status_404_stderr_returns_none() {
+        // Some gh error shapes surface the numeric code without "Not Found".
+        let stderr = "HTTP 404: the resource could not be located";
+        let result = classify_contents_response(false, b"", stderr).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn unrelated_failure_returns_err() {
+        let stderr = "error connecting to api.github.com: dial tcp: lookup failed";
+        let err = classify_contents_response(false, b"", stderr).unwrap_err();
+        assert!(err.to_string().contains("dial tcp"));
+    }
+
+    #[test]
+    fn rate_limit_failure_returns_err() {
+        let stderr = "gh: API rate limit exceeded (HTTP 403)";
+        assert!(classify_contents_response(false, b"", stderr).is_err());
+    }
 }
