@@ -172,6 +172,104 @@ mod tests {
     use super::*;
     use crate::ResolveOutcome;
 
+    /// Unwraps the `Declined` reason string, panicking on `Ok`. Every
+    /// failure branch of `run_or_decline` returns `Err(Declined { .. })`;
+    /// this keeps each assertion focused on the observable reason text.
+    fn declined_reason(result: Result<(), ResolveOutcome>) -> String {
+        match result {
+            Err(ResolveOutcome::Declined { reason }) => reason,
+            other => panic!("expected Err(Declined), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn success_returns_ok() {
+        let runner = FakeCommandRunner::success();
+        let result = run_or_decline(&runner, Path::new("/w"), "cargo", &["generate-lockfile"], "").await;
+        assert!(result.is_ok(), "successful command should return Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_error_declines_naming_the_program() {
+        let runner = FakeCommandRunner::spawn_error();
+        let reason = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        assert!(reason.contains("failed to spawn"), "reason was: {reason}");
+        assert!(
+            reason.contains("cargo"),
+            "reason should name the program, was: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_with_stderr_reports_command_code_and_stderr() {
+        let runner = FakeCommandRunner::failure("manifest is invalid");
+        let reason = declined_reason(
+            run_or_decline(
+                &runner,
+                Path::new("/w"),
+                "cargo",
+                &["generate-lockfile", "--offline"],
+                "",
+            )
+            .await,
+        );
+        assert!(
+            reason.contains("cargo"),
+            "reason should name the program, was: {reason}"
+        );
+        assert!(
+            reason.contains("generate-lockfile --offline"),
+            "reason should include the joined args, was: {reason}"
+        );
+        // `code` is `Some(1)` in `FakeCommandRunner::failure`, formatted via `{:?}`.
+        assert!(
+            reason.contains("Some(1)"),
+            "reason should include the exit code, was: {reason}"
+        );
+        assert!(
+            reason.contains("manifest is invalid"),
+            "reason should include stderr, was: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_with_empty_stderr_uses_no_stderr_placeholder() {
+        // The one branch no lockfile/recipe resolver test exercises: a
+        // command that fails but writes nothing to stderr falls back to the
+        // literal "(no stderr)" placeholder.
+        let runner = FakeCommandRunner::failure("");
+        let reason = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        assert!(
+            reason.contains("(no stderr)"),
+            "reason should use the placeholder, was: {reason}"
+        );
+        assert!(
+            !reason.contains("manifest"),
+            "sanity: empty stderr should not leak unrelated text, was: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reason_prefix_is_prepended_verbatim() {
+        let prefix = "recipe \"schema\" (verify_command): ";
+
+        let runner = FakeCommandRunner::failure("boom");
+        let with_prefix = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], prefix).await);
+        assert!(
+            with_prefix.starts_with(prefix),
+            "reason should start with the verbatim prefix, was: {with_prefix}"
+        );
+
+        // Empty prefix adds nothing: the reason starts with the command
+        // backtick rather than any prefix text.
+        let runner = FakeCommandRunner::failure("boom");
+        let without_prefix = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        assert!(
+            without_prefix.starts_with('`'),
+            "empty prefix should add no leading text, was: {without_prefix}"
+        );
+    }
+
     /// Non-zero exit with EMPTY stderr must fall back to the `(no stderr)`
     /// placeholder in the decline reason. This branch (command.rs:46-50) is
     /// otherwise never exercised — every other failing call passes real
