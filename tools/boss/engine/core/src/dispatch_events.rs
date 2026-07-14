@@ -378,6 +378,28 @@ pub enum Stage {
     /// resets the breaker. The `details` object carries the
     /// `distinct_work_items` count that tripped it and the `window_secs`.
     SpawnCapabilityUnhealthy,
+    /// The periodic husk-pane sweep ([`crate::husk_pane_sweep`]) found a
+    /// worker pane the macOS app is STILL hosting for a slot the engine has
+    /// no live-tracked run for at all, confirmed across two consecutive
+    /// passes, and retired it (the same teardown `bossctl agents
+    /// retire-pane` performs). This is the general backstop for the
+    /// 2026-07-14 pool-exhaustion incident: every other reap path
+    /// (`dead_pid_reconcile`, `spawn_ack_timeout`, `terminal_work_reconcile`,
+    /// `pool_claim_reconcile`, …) is driven by the ENGINE's own bookkeeping
+    /// (`LiveWorkerStateRegistry` / the worker-pool claim), so a path that
+    /// clears its own state without the app's `ReleaseWorkerPane` RPC
+    /// actually landing (an ack timeout, a wedged/unreachable app session, a
+    /// terminal-transition bug) leaves the real pane alive and hosted while
+    /// the engine believes the slot is free — a "husk" invisible to every
+    /// engine-state-driven sweep and to `bossctl agents list` (which only
+    /// ever shows what the engine tracks). This sweep instead asks the APP
+    /// what it hosts (`ListHostedPanes`) and diffs against the engine's live
+    /// set, so it catches a husk regardless of which terminal-transition
+    /// site produced the divergence. Two-pass confirmation (mirroring
+    /// `terminal_work_reconcile`) guards against racing a fresh spawn whose
+    /// live-state registration hasn't landed yet. The `details` object
+    /// carries the retired `slot_id` and, when known, the work item's title.
+    HuskPaneReconcile,
 }
 
 impl Stage {
@@ -419,6 +441,7 @@ impl Stage {
             Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
             Stage::SpawnNack => "spawn_nack",
             Stage::SpawnCapabilityUnhealthy => "spawn_capability_unhealthy",
+            Stage::HuskPaneReconcile => "husk_pane_reconcile",
         }
     }
 }
@@ -927,6 +950,7 @@ mod tests {
         );
         assert_eq!(Stage::SpawnNack.as_str(), "spawn_nack");
         assert_eq!(Stage::SpawnCapabilityUnhealthy.as_str(), "spawn_capability_unhealthy");
+        assert_eq!(Stage::HuskPaneReconcile.as_str(), "husk_pane_reconcile");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

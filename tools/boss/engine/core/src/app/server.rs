@@ -138,6 +138,32 @@ impl crate::terminal_work_sweep::WorkerReaper for ServerState {
     }
 }
 
+// Lets `Arc<ServerState>` be coerced to `Arc<dyn HuskPaneSweepSource>` for the
+// husk-pane reconciler (wired in `run` below). Delegates straight to the
+// existing `list_husk_panes` / `retire_pane` methods (the manual
+// `bossctl agents list --all` / `agents retire-pane` break-glass path) —
+// this sweep is what calls them automatically instead of waiting for an
+// operator to notice. (Defined here rather than in `app.rs` for the same
+// file-size-hygiene reason as the `WorkerReaper` impl above.)
+#[async_trait::async_trait]
+impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
+    async fn list_husk_candidates(&self) -> Option<Vec<boss_protocol::HostedPaneEntry>> {
+        match self.list_husk_panes().await {
+            Ok(panes) => Some(panes),
+            Err(err) => {
+                tracing::debug!(?err, "husk-pane sweep: list_husk_panes failed; skipping this pass",);
+                None
+            }
+        }
+    }
+
+    async fn retire_husk(&self, slot_id: u8) {
+        if let Err(err) = self.retire_pane(slot_id).await {
+            tracing::warn!(?err, slot_id, "husk-pane sweep: retire_pane failed");
+        }
+    }
+}
+
 fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let controller = server_state.github_auth.clone();
@@ -764,6 +790,34 @@ pub async fn serve(
         Arc::clone(&server_state) as Arc<dyn crate::terminal_work_sweep::WorkerReaper>,
         server_state.dispatch_events.clone(),
         crate::terminal_work_sweep::DEFAULT_INTERVAL,
+    );
+
+    // Periodic husk-pane reconciler: the general backstop for a pane the app
+    // is STILL hosting for a slot the engine has already forgotten entirely
+    // (no live-state entry, no pool claim) — a "husk". Every sweep above is
+    // driven by the engine's OWN bookkeeping, which `release_worker_pane`
+    // clears unconditionally once it has asked the app to tear a pane down
+    // "successfully or not"; if that app RPC never actually lands (a timeout,
+    // an unreachable app session, an ack-timeout or other terminal-transition
+    // site that races the app round-trip), the engine's state goes clean
+    // while the real pane stays up — invisible to `terminal_work_sweep` /
+    // `pool_claim_sweep` (both iterate structures this leak already emptied)
+    // and to `bossctl agents list` (which reads the same emptied registry).
+    // This sweep instead asks the app what it hosts and diffs against the
+    // engine's live set — the same check `list_husk_panes` already performs
+    // for the manual `bossctl agents list --all` / `agents retire-pane`
+    // break-glass path — so it catches a husk regardless of which
+    // terminal-transition site produced it. Two-pass confirmation (mirroring
+    // `terminal_work_sweep`) guards against racing a fresh spawn whose
+    // live-state registration hasn't landed yet. This is the automated
+    // backstop for the 2026-07-14 pool-exhaustion incident (worker
+    // "O'Brien": twelve `request_recorded` → `worker_claimed=skipped` cycles
+    // while a stray husk pane held a slot the pool believed free). Runs every
+    // 60s.
+    let _husk_pane_sweep_handle = crate::husk_pane_sweep::spawn_loop(
+        Arc::clone(&server_state) as Arc<dyn crate::husk_pane_sweep::HuskPaneSweepSource>,
+        server_state.dispatch_events.clone(),
+        crate::husk_pane_sweep::DEFAULT_INTERVAL,
     );
 
     // Periodic lost-workspace reconciler: finalizes non-terminal executions

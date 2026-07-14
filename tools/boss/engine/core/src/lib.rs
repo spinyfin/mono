@@ -53,6 +53,7 @@ pub mod host_adapter;
 pub mod host_reconcile;
 pub mod host_registry;
 pub mod host_scheduling;
+pub mod husk_pane_sweep;
 pub mod ipc_log;
 pub(crate) mod iso8601;
 pub(crate) mod json_extract;
