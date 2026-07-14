@@ -425,6 +425,22 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace_path, pr);
         Err(anyhow!("rebase_workspace_no_push is not supported by this CubeClient"))
     }
+    /// Land whatever is now resolved in `workspace_path`'s working copy
+    /// onto PR `pr`'s branch: advance the branch bookmark to `@` and push,
+    /// via `cube workspace push --pr <pr>`. The engine-side counterpart to
+    /// a worker hand-rolling `jj bookmark set` + `jj git push` — used by
+    /// rung 0 of the merge-conflict escalation ladder (deterministic
+    /// resolvers) to land a resolution it produced by editing the
+    /// conflicted files directly, with no further rebase. Errors if `@`
+    /// still has unresolved conflicts, or if the push itself fails.
+    ///
+    /// The default implementation errors so the many test doubles and the
+    /// host-adapter layers need no change; only [`CommandCubeClient`]
+    /// provides a real implementation.
+    async fn push_resolution(&self, workspace_path: &Path, pr: u64) -> Result<()> {
+        let _ = (workspace_path, pr);
+        Err(anyhow!("push_resolution is not supported by this CubeClient"))
+    }
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
@@ -642,6 +658,21 @@ impl CubeClient for CommandCubeClient {
             )
             .await?;
         parse_rebase_payload(payload)
+    }
+
+    async fn push_resolution(&self, workspace_path: &Path, pr: u64) -> Result<()> {
+        let pr_str = pr.to_string();
+        // `cube workspace push` resolves the workspace from the current
+        // directory (no `--workspace` flag), so it must run inside the
+        // leased workspace, same as `rebase_workspace` above.
+        let payload = self
+            .run_json_in_dir(workspace_path, &["--json", "workspace", "push", "--pr", &pr_str])
+            .await?;
+        let pushed = payload.get("pushed").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !pushed {
+            return Err(anyhow!("cube workspace push did not report pushed=true: {payload}"));
+        }
+        Ok(())
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {

@@ -1,12 +1,13 @@
 use super::*;
 
-/// The only escalation-ladder rung that exists today (design's rung 3,
-/// "Full worker — unchanged fallback"). Rungs 0-2 (deterministic
-/// resolvers, engine-direct mechanical rebase, the small pre-staged
-/// agent) are designed but not yet built (T2/T4/T6 of
-/// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`);
-/// until they ship, every conflict this engine records was resolved by
-/// a full worker doing the whole job by hand.
+/// The full-worker fallback rung (design's rung 3). Rung 1 (engine-direct
+/// mechanical rebase) is live on the `conflict_watch` path; rung 0
+/// (deterministic resolvers, `crate::conflict_ladder::attempt_rung0`) is
+/// implemented but gated off (`RUNG0_APPLY_LIVE`) pending T2562's
+/// result-gate; rung 2 (the small pre-staged agent) is not yet built (T6 of
+/// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+/// Every conflict not resolved by a live mechanical rung still falls
+/// through to a full worker doing the whole job by hand.
 const RUNG_FULL_WORKER: i64 = 3;
 
 impl WorkDb {

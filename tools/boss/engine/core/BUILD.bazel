@@ -39,6 +39,7 @@ rust_library(
         "//lib/rust/git_utils",
         "//tools/boss/claude_client",
         "//tools/boss/engine/conflict-diagnosis",
+        "//tools/boss/engine/deterministic-resolvers",
         "//tools/boss/engine/editorial",
         "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/pr-template",

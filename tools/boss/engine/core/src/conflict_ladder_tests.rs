@@ -253,3 +253,226 @@ async fn rung1_ensure_repo_error_falls_through_without_lease() {
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
 }
+
+#[tokio::test]
+async fn rung0_stays_off_even_for_a_resolvable_residual_file_hard_gate() {
+    // RUNG0_APPLY_LIVE is false (see its doc comment: gated on T2562's
+    // result-gate landing) — even though "Cargo.lock" has a registered
+    // resolver, try_mechanical_rungs must not attempt rung 0 today; a
+    // residual Cargo.lock conflict falls straight through to the worker
+    // path exactly like any other unresolvable residual conflict.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ScriptCube::new(Script::Conflicts(vec!["Cargo.lock".to_owned()]));
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::FellThrough);
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.resolved_by_rung, None);
+    let (_status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+// ─────────────────────────── attempt_rung0 ────────────────────────────
+//
+// `attempt_rung0` is called directly here, bypassing the RUNG0_APPLY_LIVE
+// gate proven off above, so these tests exercise the rung's actual
+// mechanics: feeding residual files to the deterministic-resolver
+// registry, landing an all-resolved result via `push_resolution`, and
+// declining (leaving the attempt untouched) when any file can't be
+// resolved or the push fails.
+
+/// [`CubeClient`] double for direct `attempt_rung0` tests. Only
+/// `push_resolution` is exercised — `attempt_rung0` never calls any other
+/// method, so everything else stays `unimplemented!()` via the macro
+/// default.
+struct Rung0Cube {
+    push_ok: bool,
+    pushes: Mutex<Vec<(PathBuf, u64)>>,
+}
+
+impl Rung0Cube {
+    fn new(push_ok: bool) -> Self {
+        Self {
+            push_ok,
+            pushes: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+crate::stub_cube_client! { Rung0Cube {
+    async fn push_resolution(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
+        self.pushes.lock().await.push((workspace_path.to_path_buf(), pr));
+        if self.push_ok {
+            Ok(())
+        } else {
+            anyhow::bail!("push boom");
+        }
+    }
+} }
+
+fn which(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Write a workspace fixture with a conflicted `Cargo.lock` that
+/// `CargoLockResolver` (a `ResolverRegistry::with_builtins()` built-in) can
+/// regenerate cleanly against the sibling `Cargo.toml`.
+fn write_resolvable_cargo_lock_fixture(ws: &std::path::Path, package_name: &str) {
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    std::fs::create_dir(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src").join("lib.rs"), "").unwrap();
+    std::fs::write(
+        ws.join("Cargo.lock"),
+        "<<<<<<< ours\ngarbage\n=======\n>>>>>>> theirs\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rung0_all_resolved_pushes_and_retires_at_rung_0() {
+    // Exercises the real built-in CargoLockResolver (ResolverRegistry has no
+    // injection seam for a fake one here), so this needs a real `cargo` —
+    // skip gracefully where it's absent, mirroring
+    // `boss_deterministic_resolvers`'s own real-execution test.
+    if which("cargo").is_none() {
+        eprintln!("skipping: cargo not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let ws = tempdir().unwrap();
+    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0");
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-r0".to_owned(),
+        workspace_id: "ws-r0".to_owned(),
+        workspace_path: ws.path().to_path_buf(),
+    };
+    let cube = Rung0Cube::new(true);
+
+    let outcome = attempt_rung0(
+        &db,
+        pub_.as_ref(),
+        &cube,
+        &candidate,
+        &attempt,
+        &lease,
+        &["Cargo.lock".to_owned()],
+    )
+    .await;
+
+    assert_eq!(outcome, LadderOutcome::Retired);
+    // Attempt retired at rung 0.
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    // Parent back in Review, unblocked — same retire contract as rung 1.
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none(), "block should be cleared, got {reason:?}");
+    // Landed via push_resolution, not any other verb.
+    assert_eq!(*cube.pushes.lock().await, vec![(ws.path().to_path_buf(), 42)]);
+    let regenerated = std::fs::read_to_string(ws.path().join("Cargo.lock")).unwrap();
+    assert!(!regenerated.contains("<<<<<<<"), "conflict markers must be gone");
+    // Success event published, same as rung 1.
+    let typed = pub_.typed_events.lock().await;
+    assert!(
+        typed
+            .iter()
+            .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { .. })),
+        "expected ConflictResolutionSucceeded"
+    );
+}
+
+#[tokio::test]
+async fn rung0_declined_file_falls_through_without_pushing() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-r0b".to_owned(),
+        workspace_id: "ws-r0b".to_owned(),
+        workspace_path: PathBuf::from("/tmp/rung0-declined"),
+    };
+    let cube = Rung0Cube::new(true);
+
+    // No registered resolver claims an ordinary source file.
+    let outcome = attempt_rung0(
+        &db,
+        pub_.as_ref(),
+        &cube,
+        &candidate,
+        &attempt,
+        &lease,
+        &["src/lib.rs".to_owned()],
+    )
+    .await;
+
+    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert!(
+        cube.pushes.lock().await.is_empty(),
+        "must not push when any residual file is declined"
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.resolved_by_rung, None);
+}
+
+#[tokio::test]
+async fn rung0_push_failure_falls_through_without_marking_succeeded() {
+    if which("cargo").is_none() {
+        eprintln!("skipping: cargo not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let ws = tempdir().unwrap();
+    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0-pf");
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-r0c".to_owned(),
+        workspace_id: "ws-r0c".to_owned(),
+        workspace_path: ws.path().to_path_buf(),
+    };
+    let cube = Rung0Cube::new(false);
+
+    let outcome = attempt_rung0(
+        &db,
+        pub_.as_ref(),
+        &cube,
+        &candidate,
+        &attempt,
+        &lease,
+        &["Cargo.lock".to_owned()],
+    )
+    .await;
+
+    assert_eq!(outcome, LadderOutcome::FellThrough);
+    // Every file resolved, but the push failed — must not mark succeeded.
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.resolved_by_rung, None);
+    let (_status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}

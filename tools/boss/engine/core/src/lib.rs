@@ -31,6 +31,7 @@ pub mod dead_pid_sweep;
 pub mod deferred_scope;
 pub mod dep_unblock_sweep;
 pub mod design_detector;
+pub use boss_deterministic_resolvers as deterministic_resolvers;
 pub mod dispatch_events;
 pub mod dispatch_failure_recovery_sweep;
 pub mod doc_fetcher;

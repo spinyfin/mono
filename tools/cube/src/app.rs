@@ -2134,6 +2134,7 @@ fn run_workspace(
         WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
             workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
         }
+        WorkspaceCommand::Push { bookmark, pr } => workspace_push(database_path, runner, bookmark, pr),
     }
 }
 
@@ -2826,6 +2827,98 @@ fn rebase_workspace_branch(
             "conflicted_files": Vec::<String>::new(),
             "pushed": true,
             "rebase_output": rebase_out,
+        }),
+    )
+}
+
+/// `cube workspace push`: advance this workspace's `boss/exec_*` branch
+/// bookmark to `@` and push it to GitHub, without re-running a rebase.
+///
+/// The counterpart to [`rebase_workspace_branch`]'s clean-rebase tail,
+/// callable on its own once `@`'s conflicts (left by an earlier `cube
+/// workspace rebase`) have been resolved by editing the conflicted files
+/// directly rather than by a fresh rebase. See the `WorkspaceCommand::Push`
+/// doc comment for the full contract.
+fn workspace_push(
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    bookmark: Option<String>,
+    pr: Option<u64>,
+) -> Result<RunResult> {
+    let cwd = std::env::current_dir().map_err(CubeError::Io)?;
+    let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
+
+    let opts = RebaseOpts {
+        explicit_bookmark: bookmark,
+        explicit_pr: pr,
+        no_push: false,
+    };
+    let boss_branch = resolve_boss_branch(runner, &cwd, &owner_repo, &opts)?;
+
+    // Refuse to push unresolved conflicts — this command lands whatever is
+    // currently in the working copy, so a lingering conflict must not reach
+    // GitHub silently.
+    let conflict_check = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                r#"if(conflict, "CONFLICT", "CLEAN")"#,
+            ],
+        ),
+    )?;
+    if conflict_check.trim() == "CONFLICT" {
+        return Err(CubeError::InvalidArgument(
+            "`@` still has unresolved conflicts — resolve them first (`jj resolve --list`, `jj st`) \
+             before `cube workspace push`."
+                .to_string(),
+        ));
+    }
+
+    // Advance the branch bookmark to @. A prior rebase already legitimately
+    // moved it off its previous remote position, so --allow-backwards is
+    // expected here, not a footgun.
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["bookmark", "set", &boss_branch, "-r", "@", "--allow-backwards"],
+        ),
+    )?;
+
+    // Same push gate `cube pr push` runs before landing an agent/engine-
+    // authored diff on a PR branch.
+    run_checkleft_gate(&cwd)?;
+
+    // jj's own tracked remote-bookmark state (refreshed by callers via `cube
+    // workspace goto`/`rebase`'s fetch) is the compare-and-swap token here —
+    // no destructive `--force` flag needed for what is, from jj's point of
+    // view, an ordinary bookmark advance.
+    runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["git", "push", "-b", &boss_branch, "--remote", &github_remote],
+        ))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to push `{boss_branch}`: {e}")))?;
+
+    verify_push_reached_github(runner, &cwd, &owner_repo, &boss_branch)?;
+
+    RunResult::new(
+        format!("PUSHED: branch `{boss_branch}` pushed to `{github_remote}`."),
+        json!({
+            "status": "pushed",
+            "branch": boss_branch,
+            "pushed": true,
         }),
     )
 }
@@ -6095,7 +6188,7 @@ mod tests {
         gc_aged_unhealthy_workspaces, is_retryable_network_error, is_stdin_path, rebase_workspace_branch,
         render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
         run_checkleft_gate_impl, run_jj_push, run_with_context, run_with_dependencies, upsert_managed_exclude,
-        workspace_goto,
+        workspace_goto, workspace_push,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -14350,6 +14443,179 @@ steps:
         assert_eq!(result.payload["branch"], branch);
         assert_eq!(result.payload["pushed"], true);
         assert!(result.message.starts_with("REBASED_CLEAN"));
+    }
+
+    // ───────────────────────── workspace push ─────────────────────────
+    //
+    // `workspace_push` is the testable unit for `cube workspace push`. Like
+    // `pr_push`, it reads `std::env::current_dir()` directly rather than
+    // taking an explicit `cwd` param, so these tests capture the ambient
+    // test-process cwd (matching the `pr_push` test convention) instead of
+    // a synthetic path.
+
+    fn run_push(runner: &FakeRunner, bookmark: Option<&str>, pr: Option<u64>) -> Result<super::RunResult> {
+        workspace_push(None, runner, bookmark.map(str::to_string), pr)
+    }
+
+    #[test]
+    fn workspace_push_happy_path_advances_and_pushes() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let branch = "boss/exec_abc";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                "CLEAN",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", branch, "--remote", "github"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+                "deadbeef\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "deadbeef\n",
+            ),
+        ]);
+
+        let result = run_push(&runner, Some(branch), None).expect("push happy path");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["status"], "pushed");
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["pushed"], true);
+        assert!(result.message.starts_with("PUSHED"));
+    }
+
+    #[test]
+    fn workspace_push_pr_arg_resolves_head_branch_from_github() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let branch = "boss/exec_pr9";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &["pr", "view", "9", "-R", "spinyfin/mono", "--json", "headRefName"],
+                r#"{"headRefName":"boss/exec_pr9"}"#,
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                "CLEAN",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", branch, "--remote", "github"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+                "cafe\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_pr9",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "cafe\n",
+            ),
+        ]);
+
+        let result = run_push(&runner, None, Some(9)).expect("push via --pr");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+    }
+
+    #[test]
+    fn workspace_push_refuses_unresolved_conflicts_without_pushing() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let branch = "boss/exec_conflicted";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                "CONFLICT",
+            ),
+            // No bookmark-set / push commands expected — the conflict check
+            // must short-circuit before either.
+        ]);
+
+        let err = run_push(&runner, Some(branch), None).expect_err("must refuse unresolved conflicts");
+        runner.assert_exhausted();
+        let msg = err.to_string();
+        assert!(msg.contains("unresolved conflicts"), "{msg}");
+        assert!(msg.contains("jj resolve --list"), "{msg}");
+    }
+
+    #[test]
+    fn workspace_push_failure_surfaces_clear_error() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let branch = "boss/exec_pf2";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                "CLEAN",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
+                "",
+            ),
+            failing_cmd(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", branch, "--remote", "github"],
+                "Error: remote bookmark changed",
+            ),
+        ]);
+
+        let err = run_push(&runner, Some(branch), None).expect_err("push failure must surface");
+        runner.assert_exhausted();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to push"), "{msg}");
+        assert!(msg.contains(branch), "{msg}");
     }
 
     // ───────────────────────── workspace goto ─────────────────────────
