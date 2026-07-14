@@ -226,16 +226,12 @@ pub async fn run_one_pass(
         let execution_id = &state.run_id;
 
         // Look up the execution for the age guard and work_item_id.
-        let execution = match work_db.get_execution(execution_id) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "stale-worker sweep: failed to look up execution; skipping slot",
-                );
-                continue;
-            }
+        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+            work_db,
+            execution_id,
+            "stale-worker sweep: failed to look up execution; skipping slot",
+        ) else {
+            continue;
         };
 
         // Skip executions already in a terminal DB state (completion

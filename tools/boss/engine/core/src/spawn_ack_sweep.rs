@@ -213,16 +213,12 @@ pub async fn run_one_pass(
 
         let execution_id = &state.run_id;
 
-        let execution = match work_db.get_execution(execution_id) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "spawn-ack sweep: failed to look up execution; skipping slot",
-                );
-                continue;
-            }
+        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+            work_db,
+            execution_id,
+            "spawn-ack sweep: failed to look up execution; skipping slot",
+        ) else {
+            continue;
         };
 
         // Skip executions already in a terminal DB state (completion
