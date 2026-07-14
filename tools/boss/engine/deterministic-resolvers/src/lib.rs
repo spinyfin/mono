@@ -88,3 +88,18 @@ pub enum ResolveOutcome {
     /// success — see [`RegistryResolution`].
     Declined { reason: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_class_as_str_maps_each_variant_to_its_telemetry_label() {
+        // These strings are persisted as telemetry
+        // (`conflict_resolutions.conflict_class`); pin the exact wire
+        // values so a rename can't silently change the recorded label.
+        assert_eq!(ConflictClass::CargoLock.as_str(), "cargo_lock");
+        assert_eq!(ConflictClass::BazelModuleLock.as_str(), "bazel_module_lock");
+        assert_eq!(ConflictClass::RegistryAppendUnion.as_str(), "registry_append_union");
+    }
+}
