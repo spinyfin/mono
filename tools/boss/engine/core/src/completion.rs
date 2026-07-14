@@ -1120,6 +1120,14 @@ impl WorkerCompletionHandler {
         self.feature_flags.is_enabled("conflict_ladder_mechanical_rebase")
     }
 
+    /// Whether the speculative conflict-prediction sweep is enabled (Layer 4
+    /// / T10). Read by the merge poller's periodic loop to decide whether to
+    /// run [`crate::speculative_conflict::run_speculative_pass`] alongside
+    /// the normal full sweep. Default OFF (see the flag registry).
+    pub fn speculative_conflict_prediction_enabled(&self) -> bool {
+        self.feature_flags.is_enabled("speculative_conflict_prediction")
+    }
+
     /// Wire the shared [`MergeProbe`] for the on-transition CI pre-fetch.
     /// `app.rs` passes the same [`CommandMergeProbe`] used by the merge
     /// poller so both paths share probe logic. Tests that do not need the

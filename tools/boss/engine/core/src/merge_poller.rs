@@ -142,7 +142,11 @@ pub fn record_conflict_class_counter(registry: &Registry, product_id: &str, conf
 /// allowed charset (`a-z 0-9 . _`) with `_`, so an arbitrary
 /// `product_id` or `conflict_class` can't produce an invalid dynamic
 /// metric name or let two distinct products collide on one counter.
-fn sanitize_metric_name_component(raw: &str) -> String {
+///
+/// `pub(crate)` so other per-product dynamic-counter call sites (e.g.
+/// [`crate::speculative_conflict`]) reuse the same sanitization instead of
+/// duplicating it.
+pub(crate) fn sanitize_metric_name_component(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
         .map(|c| {
@@ -3770,6 +3774,7 @@ pub fn spawn_loop(
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
+        let mut spec_schedule = crate::speculative_conflict::SpeculativeCheckSchedule::default();
         loop {
             let outcome = run_one_pass(
                 work_db.as_ref(),
@@ -3805,6 +3810,28 @@ pub fn spawn_loop(
             // default must not clobber a tier already learned from a
             // real probe.
             schedule.seed_defaults(current_pr_candidate_urls(work_db.as_ref()), last_run_at);
+
+            // Layer 4 / T10: piggyback the speculative conflict-prediction
+            // sweep on this same full-sweep cadence. Gated by its own
+            // feature flag (default OFF) — off, this is a single cheap
+            // local-DB read with no cube/GitHub activity.
+            if completion_handler.speculative_conflict_prediction_enabled() {
+                match work_db.list_chores_pending_merge_check() {
+                    Ok(candidates) => {
+                        crate::speculative_conflict::run_speculative_pass(
+                            work_db.as_ref(),
+                            cube_client.as_ref(),
+                            &metrics,
+                            &mut spec_schedule,
+                            &candidates,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "merge poller: failed to list candidates for speculative sweep");
+                    }
+                }
+            }
 
             // Wait for the periodic full-sweep interval, an activation
             // kick, a targeted kick, or the next PR's adaptive poll time —

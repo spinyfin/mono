@@ -317,6 +317,7 @@ pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
 pub use mappers::ProducerConflictInsertInput;
+pub use mappers::SpeculativeConflictInsertInput;
 pub use metrics_types::MetricsCounterRow;
 pub use metrics_types::MetricsGaugeRow;
 pub use output_types::HostBoundExecution;

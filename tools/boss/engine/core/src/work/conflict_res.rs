@@ -93,10 +93,17 @@ impl WorkDb {
         // the bar.
         let now_secs: i64 = now.parse().unwrap_or(0);
         let cutoff_secs = now_secs - CHURN_GUARD_WINDOW_SECS;
+        // Excludes `event_source = 'speculative_predicted'` rows: those are
+        // telemetry-only observations from the Layer 4 speculative-rebase
+        // sweep (T10), never a live resolution attempt, and must not eat
+        // into the churn budget that gates *real* conflict-resolution
+        // cycles. Without this exclusion a burst of speculative predictions
+        // for one work item could pre-abandon its next genuine attempt.
         let recent_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM conflict_resolutions
               WHERE work_item_id = ?1
-                AND CAST(created_at AS INTEGER) >= ?2",
+                AND CAST(created_at AS INTEGER) >= ?2
+                AND event_source != 'speculative_predicted'",
             params![input.work_item_id, cutoff_secs],
             |row| row.get(0),
         )?;
@@ -718,6 +725,75 @@ impl WorkDb {
         )?;
         let inserted = query_conflict_resolution(&tx, &id)?
             .with_context(|| format!("unknown conflict_resolution after producer-side insert: {id}"))?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Record a speculative-conflict-prediction event: the merge poller's
+    /// Layer 4 sweep (T10) ran a throwaway, no-push engine-direct rebase of
+    /// an in-review PR against current `main` and it came back conflicted.
+    /// This is purely a telemetry observation — it never touches the parent
+    /// task's status, never gates the escalation ladder, and is inserted
+    /// already terminal (`status = 'predicted'`, a status value no
+    /// dispatcher or lifecycle query ever matches: `active_conflict_
+    /// resolution_for_work_item` only reads `pending`/`running`, and the
+    /// churn guard above explicitly excludes `event_source =
+    /// 'speculative_predicted'` rows). Feeds the hotspot report
+    /// (`conflict_hotspots`) with signal from a PR *before* it would
+    /// otherwise reach `conflict_watch`.
+    ///
+    /// `head_branch`/`base_branch` are stamped `"unknown"` — the speculative
+    /// sweep only has a PR number and a leased workspace, not the branch
+    /// names GitHub would return from an extra probe; they don't feed
+    /// classification or aggregation (only `conflict_diagnosis`'s file
+    /// paths do).
+    pub fn record_speculative_conflict_prediction(
+        &self,
+        input: SpeculativeConflictInsertInput,
+    ) -> Result<ConflictResolution> {
+        let diagnosis = crate::conflict_diagnosis::ConflictDiagnosis {
+            schema_version: 1,
+            base_sha: "unknown".to_owned(),
+            head_sha: "unknown".to_owned(),
+            files: input
+                .conflicted_files
+                .iter()
+                .map(|path| crate::conflict_diagnosis::ConflictedFile {
+                    path: path.clone(),
+                    marker_count: None,
+                    shape: "content".to_owned(),
+                })
+                .collect(),
+            error: None,
+        };
+        let conflict_class = crate::conflict_diagnosis::classify_conflict_class(&input.conflicted_files);
+        let diagnosis_json =
+            serde_json::to_string(&diagnosis).context("failed to serialize speculative conflict diagnosis")?;
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let id = next_id("crz");
+        let now = now_string();
+        tx.execute(
+            "INSERT INTO conflict_resolutions
+                (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                 status, conflict_diagnosis, created_at, finished_at, event_source, conflict_class)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'unknown', 'unknown', 'predicted', ?6,
+                     ?7, ?8, 'speculative_predicted', ?9)",
+            params![
+                id,
+                input.product_id,
+                input.work_item_id,
+                input.pr_url,
+                input.pr_number,
+                diagnosis_json,
+                now,
+                now,
+                conflict_class,
+            ],
+        )?;
+        let inserted = query_conflict_resolution(&tx, &id)?
+            .with_context(|| format!("unknown conflict_resolution after speculative-prediction insert: {id}"))?;
         tx.commit()?;
         Ok(inserted)
     }
