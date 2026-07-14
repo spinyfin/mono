@@ -5006,10 +5006,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             return;
         }
 
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let epoch = crate::epoch_time::now_epoch_secs();
         let audit_line = crate::deferred_scope::render_audit_line(epoch, item);
         if let Err(err) =
             crate::reconcile_audit::append_description_line(&self.work_db, &execution.work_item_id, &audit_line)
