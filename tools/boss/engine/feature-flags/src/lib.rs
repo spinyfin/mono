@@ -201,6 +201,23 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: false,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: "stacked_pr_auto_structuring",
+        description: "Piggyback on the merge poller's sweep to detect pairs of in-flight (in-review) PR branches \
+             whose changed-file sets overlap on non-mechanical files — i.e. two branches predicted to conflict \
+             with *each other*, not just with main (design: \
+             merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, Layer 4 / T11). For each such \
+             pair the engine emits an advisory `StackProposalOffered` frontend event offering to restack the \
+             newer PR onto the older so the (future) auto_rebase machinery keeps them ordered. Detection + offer \
+             only — nothing is mutated and no PR is retargeted (the accept-and-convert step ships with \
+             auto-rebase-stacked-prs.md). Changed-file lists are fetched via `gh pr view --json files`; \
+             rate-limited by a minimum inter-pass interval, a per-pass candidate cap, and a per-pair re-offer \
+             interval to bound `gh` churn. DEFAULT OFF — enable per operator once validated. Kill switch: set \
+             false to stop the stacking sweep immediately.",
+        category: "conflict",
+        default_enabled: false,
+        capability_id: None,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.

@@ -27,9 +27,8 @@
 //!   branch (typically `main`). If the project has no path yet, the
 //!   full pointer is written.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::gh_invocation::gh_output;
 use crate::work::WorkDb;
 use boss_protocol::{SetProjectDesignDocInput, TaskKind};
 
@@ -615,22 +614,11 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
 /// parse stdout into a JSON value. Shared by the design and per-task doc
 /// scans so the gh shell-out lives in exactly one place; the doc-selection
 /// logic differs only in which [`parse_pr_scan_matching`] matcher each
-/// caller applies.
+/// caller applies. Delegates the shellout/parse boilerplate to
+/// [`boss_github::pr_files::fetch_pr_view_json`], shared with `runner.rs`
+/// and `stacked_pr_structuring.rs`.
 async fn fetch_pr_view_json(pr_url: &str) -> Result<serde_json::Value> {
-    let output = gh_output(&["pr", "view", pr_url, "--json", "files,headRefName,baseRefName"])
-        .await
-        .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "`gh pr view {pr_url} --json files,headRefName,baseRefName` failed: {}",
-            stderr.trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))
+    boss_github::pr_files::fetch_pr_view_json(pr_url, "files,headRefName,baseRefName").await
 }
 
 /// Pure parse of the `gh pr view --json files,headRefName,baseRefName`

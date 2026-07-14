@@ -608,6 +608,25 @@ pub enum FrontendEvent {
         pr_url: String,
         failure_reason: String,
     },
+    /// Advisory push (Layer 4 / T11, `stacked-pr-auto-structuring`): two
+    /// *in-flight* PR branches are predicted to conflict with each other —
+    /// their changed-file sets overlap on non-mechanical files — so the
+    /// engine offers to restack the newer PR (`dependent`) on top of the
+    /// older one (`base`), turning the would-be conflict into an ordered
+    /// stack the `auto_rebase` machinery keeps in sync. Purely advisory:
+    /// nothing is mutated and no PR is retargeted until the offer is
+    /// accepted (the accept-and-convert step lands with the `auto_rebase`
+    /// flow, which is designed but not yet shipped). `base` is the PR with
+    /// the lower number (the older, likelier-to-merge-first branch);
+    /// `dependent` is the higher-numbered one that would rebase onto it.
+    StackProposalOffered {
+        product_id: String,
+        base_pr_url: String,
+        base_pr_number: i64,
+        dependent_pr_url: String,
+        dependent_pr_number: i64,
+        overlapping_files: Vec<String>,
+    },
     /// Activity-feed push: a fresh CI-remediation attempt has been
     /// created for an in-review PR (design §"CI worker spawn",
     /// Phase 8 #22). `attempt_kind` is `"fix"` or `"retrigger"` —

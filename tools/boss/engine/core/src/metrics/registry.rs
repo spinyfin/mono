@@ -765,11 +765,16 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // Layer 4 / T11: stacked-PR auto-structuring offer counter.
+        assert!(
+            names.contains(&"stacked_pr_structuring.offered".to_owned()),
+            "init_all must register stacked_pr_structuring.offered"
+        );
         assert_eq!(
             names.len(),
-            47,
+            48,
             "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
-             18 external_tracker + 2 speculative_conflict counters"
+             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring counters"
         );
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

@@ -11,6 +11,7 @@
 
 pub mod contents;
 pub mod gh_runner;
+pub mod pr_files;
 pub mod pr_url;
 
 use std::sync::OnceLock;

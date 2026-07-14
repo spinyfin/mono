@@ -3846,6 +3846,8 @@ pub fn spawn_loop(
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
         let mut spec_schedule = crate::speculative_conflict::SpeculativeCheckSchedule::default();
+        let mut stacking_schedule = crate::stacked_pr_structuring::StackingSchedule::default();
+        let stacking_fetcher = crate::stacked_pr_structuring::GhPrChangedFiles;
         loop {
             let outcome = run_one_pass(
                 work_db.as_ref(),
@@ -3900,6 +3902,34 @@ pub fn spawn_loop(
                     }
                     Err(err) => {
                         tracing::warn!(?err, "merge poller: failed to list candidates for speculative sweep");
+                    }
+                }
+            }
+
+            // Layer 4 / T11: stacked-PR auto-structuring. Also piggybacks on
+            // the full-sweep cadence and its own default-OFF feature flag —
+            // off, this block is skipped entirely (not even the local-DB
+            // read below runs). On, `stacking_schedule.pass_due` gates the
+            // local-DB read too, so throttled ticks (most of them —
+            // `run_stacking_pass` self-throttles to at most one
+            // `gh`-fetching pass per its own interval) do neither the DB
+            // read nor the sweep; co-scheduling it here is safe regardless
+            // of how often the loop ticks.
+            if completion_handler.stacked_pr_auto_structuring_enabled() && stacking_schedule.pass_due(Instant::now()) {
+                match work_db.list_chores_pending_merge_check() {
+                    Ok(candidates) => {
+                        crate::stacked_pr_structuring::run_stacking_pass(
+                            work_db.as_ref(),
+                            publisher.as_ref(),
+                            &stacking_fetcher,
+                            &metrics,
+                            &mut stacking_schedule,
+                            &candidates,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "merge poller: failed to list candidates for stacking sweep");
                     }
                 }
             }

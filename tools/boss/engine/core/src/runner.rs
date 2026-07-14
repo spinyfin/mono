@@ -691,18 +691,12 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         base_ref_oid: String,
         #[serde(rename = "headRefOid")]
         head_ref_oid: String,
-        files: Vec<PrFile>,
         #[serde(default)]
         body: String,
         #[serde(default)]
         commits: Vec<PrCommit>,
         #[serde(default)]
         comments: Vec<PrComment>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PrFile {
-        path: String,
     }
 
     #[derive(serde::Deserialize)]
@@ -721,26 +715,24 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 
     let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)?;
 
-    let output = crate::gh_invocation::gh_output(&[
-        "pr",
-        "view",
-        pr_url,
-        "--json",
-        "baseRefOid,headRefOid,files,body,commits,comments",
-    ])
-    .await
-    .ok()?;
+    // Shellout + exit-code/parse boilerplate lives once in
+    // `boss_github::pr_files`, shared with `design_detector.rs` and
+    // `stacked_pr_structuring.rs`.
+    let root = boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,body,commits,comments")
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                pr_url,
+                error = %e,
+                "fetch_pr_review_context: gh pr view failed; reviewer will use URL-only prompt",
+            );
+            e
+        })
+        .ok()?;
 
-    if !output.status.success() {
-        tracing::warn!(
-            pr_url,
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "fetch_pr_review_context: gh pr view failed; reviewer will use URL-only prompt",
-        );
-        return None;
-    }
+    let changed_files = boss_github::pr_files::parse_changed_file_paths(&root);
 
-    let response: PrViewResponse = serde_json::from_slice(&output.stdout)
+    let response: PrViewResponse = serde_json::from_value(root)
         .map_err(|e| {
             tracing::warn!(
                 pr_url,
@@ -776,7 +768,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         pr_number,
         base_sha: response.base_ref_oid,
         head_sha: response.head_ref_oid,
-        changed_files: response.files.into_iter().map(|f| f.path).collect(),
+        changed_files,
         diff_content: None,
         // Filled in by the caller, which has the `WorkDb` handle needed to
         // resolve the review-cycle root for a revision-triggered pass.
