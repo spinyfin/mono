@@ -188,7 +188,16 @@ async fn rung1_residual_conflicts_falls_through_and_releases() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: Some(1)
+        }
+    );
+    assert!(
+        rung2_eligible(Some(1)),
+        "a single residual file must be rung-2 eligible"
+    );
     // Attempt untouched (still pending) — the worker path will drive it.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
@@ -201,6 +210,31 @@ async fn rung1_residual_conflicts_falls_through_and_releases() {
 }
 
 #[tokio::test]
+async fn rung1_residual_conflicts_beyond_rung2_bound_declines_rung2() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ScriptCube::new(Script::Conflicts(vec![
+        "src/a.rs 2-sided conflict".to_owned(),
+        "src/b.rs 2-sided conflict".to_owned(),
+    ]));
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: Some(2)
+        }
+    );
+    assert!(
+        !rung2_eligible(Some(2)),
+        "two residual files must exceed the (conservative, single-file) rung-2 bound and decline to rung 3"
+    );
+}
+
+#[tokio::test]
 async fn rung1_rebase_error_falls_through_and_releases() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
@@ -210,7 +244,12 @@ async fn rung1_rebase_error_falls_through_and_releases() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
     // Leased then released even though the rebase blew up.
@@ -228,7 +267,12 @@ async fn rung1_clean_but_unpushed_falls_through() {
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
     // Never retire on an unpushed branch — the PR wasn't updated.
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
     let (_status, reason) = chore_state(&db, &chore_id);
@@ -246,7 +290,12 @@ async fn rung1_ensure_repo_error_falls_through_without_lease() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     // Never leased (ensure_repo failed first), so nothing to release, no goto.
     assert!(cube.gotos.lock().await.is_empty());
     assert!(cube.released.lock().await.is_empty());
@@ -269,7 +318,12 @@ async fn rung0_stays_off_even_for_a_resolvable_residual_file_hard_gate() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: Some(1)
+        }
+    );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
     assert_eq!(row.resolved_by_rung, None);
@@ -427,7 +481,12 @@ async fn rung0_declined_file_falls_through_without_pushing() {
     )
     .await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     assert!(
         cube.pushes.lock().await.is_empty(),
         "must not push when any residual file is declined"
@@ -468,7 +527,12 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     )
     .await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     // Every file resolved, but the push failed — must not mark succeeded.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");

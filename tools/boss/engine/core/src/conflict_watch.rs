@@ -26,7 +26,7 @@
 //!
 //! [`OpenPrMergeability`]: crate::merge_poller::OpenPrMergeability
 
-use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, FrontendEvent};
+use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, EffortLevel, FrontendEvent};
 #[cfg(test)]
 use boss_protocol::{ExecutionKind, TaskKind};
 
@@ -629,27 +629,48 @@ pub async fn on_conflict_detected(
 
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
-            // Escalation ladder (T4): before spawning a full worker, try the
-            // engine-direct mechanical rungs. On a clean rebase (rung 1) the
-            // conflict is resolved and pushed with no agent; the harness
+            // Escalation ladder (T4/T6): before spawning a full worker, try
+            // the engine-direct mechanical rungs. On a clean rebase (rung 1)
+            // the conflict is resolved and pushed with no agent; the harness
             // retires this attempt and clears the parent back to Review, so we
             // return without ever spawning a worker. `cube_client` is `Some`
             // only when the mechanical-rebase flag is enabled (gated at the
             // sweep call site); `None` preserves the pre-ladder worker path.
-            if let Some(cube) = cube_client
-                && conflict_ladder::try_mechanical_rungs(work_db, publisher, cube, candidate, a).await
-                    == conflict_ladder::LadderOutcome::Retired
-            {
-                tracing::info!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    attempt_id = %a.id,
-                    "conflict_watch: conflict auto-resolved by engine-direct rebase (rung 1); no worker spawned",
-                );
-                return true;
+            //
+            // A `FellThrough` residue that is bounded (`rung2_eligible`) means
+            // the residual conflict is a small, focused fix rather than a
+            // large/architectural one — the spawn below uses rung 2's small-
+            // agent profile instead of the default full-worker one.
+            let mut use_small_agent_profile = false;
+            if let Some(cube) = cube_client {
+                match conflict_ladder::try_mechanical_rungs(work_db, publisher, cube, candidate, a).await {
+                    conflict_ladder::LadderOutcome::Retired => {
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: conflict auto-resolved by engine-direct rebase (rung 1); no worker spawned",
+                        );
+                        return true;
+                    }
+                    conflict_ladder::LadderOutcome::FellThrough {
+                        residual_conflict_files,
+                    } => {
+                        use_small_agent_profile = conflict_ladder::rung2_eligible(residual_conflict_files);
+                    }
+                }
             }
             // Fresh attempt — try to spawn a revision.
-            let spawned = maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a).await;
+            let spawned = maybe_spawn_conflict_revision(
+                work_db,
+                publisher,
+                pr_checker,
+                candidate,
+                probe,
+                a,
+                use_small_agent_profile,
+            )
+            .await;
             if spawned {
                 task_unblocked_for_revision =
                     blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &a.id);
@@ -822,6 +843,21 @@ fn take_over_foreign_ci_block(work_db: &WorkDb, candidate: &PendingMergeCheck, f
 /// `revision_task_id` was stamped; `false` on any failure (attempt
 /// abandoned). The caller uses this to decide whether to flip the parent
 /// back to `in_review` or leave it `blocked: merge_conflict`.
+///
+/// `use_small_agent_profile` selects rung 2 (T6) — a bounded residue rung 1
+/// left behind gets `effort_level = trivial` (the escalation ladder's small,
+/// cheap, focused-agent profile) instead of the default effort resolution.
+/// `trivial` — not `small` — is deliberate: `default_revision_effort_level`
+/// already resolves an un-overridden task/chore-rooted revision (rung 3's
+/// fallback) to `small`, so pinning rung 2 to `small` would dispatch
+/// byte-identical model/effort knobs to rung 3 for the dominant case,
+/// defeating the "cheap, bounded-scope agent" goal. `trivial` still floors
+/// to the Sonnet model (never Haiku — issue #746) but resolves to
+/// `claude --effort low` instead of rung 3's `medium`, so rung 2 is a real,
+/// observably cheaper dispatch rather than a telemetry-only distinction.
+/// The attempt is stamped `resolved_by_rung = 2` up front so a later
+/// default-to-rung-3 stamp is a no-op. `false` preserves today's behaviour
+/// (the full-worker rung 3 path) unchanged.
 async fn maybe_spawn_conflict_revision(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -829,6 +865,7 @@ async fn maybe_spawn_conflict_revision(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
     attempt: &crate::work::ConflictResolution,
+    use_small_agent_profile: bool,
 ) -> bool {
     let base_branch = probe
         .base_ref_name
@@ -839,7 +876,10 @@ async fn maybe_spawn_conflict_revision(
     // branch, never the diagnosis body. The long worker directive
     // (diagnosis tables, step-by-step rebase recipe) is injected at
     // dispatch by `compose_revision_directive`, keyed off `created_via`
-    // (Phase 2).
+    // (Phase 2). It is already scoped to "resolve only these conflicted
+    // hunks" (`compose_conflict_resolution_fragment`), so rung 2 reuses it
+    // unchanged — the small-agent profile only changes the effort/model
+    // knob, not the prompt.
     let description = format!("Resolve merge conflict against {base_branch}");
     let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{}", attempt.id);
 
@@ -848,6 +888,7 @@ async fn maybe_spawn_conflict_revision(
             .parent_task_id(candidate.work_item_id.clone())
             .description(description)
             .created_via(created_via)
+            .maybe_effort_level(use_small_agent_profile.then_some(EffortLevel::Trivial))
             .build(),
         pr_checker,
     ) {
@@ -894,10 +935,25 @@ async fn maybe_spawn_conflict_revision(
         }
     }
 
+    // Rung 2 (T6): stamp the rung before the revision has actually run, so
+    // `mark_conflict_resolution_succeeded`'s default-to-rung-3 `COALESCE`
+    // preserves this instead of overwriting it later.
+    if use_small_agent_profile
+        && let Err(err) =
+            work_db.stamp_conflict_resolution_rung(&attempt.id, conflict_ladder::RUNG_SMALL_RESOLUTION_AGENT)
+    {
+        tracing::warn!(
+            attempt_id = %attempt.id,
+            ?err,
+            "conflict_watch: failed to stamp rung-2 small-agent profile on attempt",
+        );
+    }
+
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
         attempt_id = %attempt.id,
+        use_small_agent_profile,
         revision_task_id = %revision.id,
         "conflict_watch: spawned engine-triggered revision for merge conflict",
     );
