@@ -653,6 +653,21 @@ pub async fn on_conflict_detected(
                         );
                         return true;
                     }
+                    conflict_ladder::LadderOutcome::HaltedForSignoff => {
+                        // T9/T2562: a mechanical rung pushed a resolution the
+                        // deletion tripwire rejected. The task is already
+                        // `blocked: deletion_signoff` pending operator
+                        // sign-off — do NOT spawn a worker (no automatic
+                        // remediation for a flagged deletion).
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: mechanical rung's resolution rejected by the deletion tripwire; \
+                             halted for operator sign-off, no worker spawned",
+                        );
+                        return true;
+                    }
                     conflict_ladder::LadderOutcome::FellThrough {
                         residual_conflict_files,
                     } => {
