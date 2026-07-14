@@ -166,3 +166,110 @@ impl CommandRunner for FakeCommandRunner {
         outcome
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ResolveOutcome;
+
+    /// Non-zero exit with EMPTY stderr must fall back to the `(no stderr)`
+    /// placeholder in the decline reason. This branch (command.rs:46-50) is
+    /// otherwise never exercised — every other failing call passes real
+    /// stderr text.
+    #[tokio::test]
+    async fn declines_with_no_stderr_placeholder_when_stderr_empty() {
+        let runner = FakeCommandRunner::failure("");
+        let result = run_or_decline(&runner, Path::new("/tmp/ws"), "cargo", &["generate-lockfile"], "").await;
+
+        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
+            panic!("expected Declined");
+        };
+        assert!(
+            reason.contains("(no stderr)"),
+            "reason should use the placeholder, got: {reason}"
+        );
+    }
+
+    /// A non-zero exit with real stderr surfaces the stderr text, the exit
+    /// code, and the joined args string in the decline reason.
+    #[tokio::test]
+    async fn declines_with_stderr_code_and_args_on_failure() {
+        let runner = FakeCommandRunner::failure("boom: dependency conflict");
+        let result = run_or_decline(
+            &runner,
+            Path::new("/tmp/ws"),
+            "cargo",
+            &["generate-lockfile", "--offline"],
+            "",
+        )
+        .await;
+
+        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
+            panic!("expected Declined");
+        };
+        assert!(
+            reason.contains("boom: dependency conflict"),
+            "reason should contain stderr, got: {reason}"
+        );
+        assert!(
+            reason.contains("Some(1)"),
+            "reason should contain the exit code, got: {reason}"
+        );
+        assert!(
+            reason.contains("generate-lockfile --offline"),
+            "reason should contain the joined args, got: {reason}"
+        );
+    }
+
+    /// A spawn failure (the runner itself errors) reports `failed to spawn`
+    /// with the program name and the underlying error text.
+    #[tokio::test]
+    async fn declines_with_spawn_error_details() {
+        let runner = FakeCommandRunner::spawn_error();
+        let result = run_or_decline(&runner, Path::new("/tmp/ws"), "bazel", &["mod", "deps"], "").await;
+
+        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
+            panic!("expected Declined");
+        };
+        assert!(
+            reason.contains("failed to spawn `bazel`"),
+            "reason should name the program, got: {reason}"
+        );
+        assert!(
+            reason.contains("program not found"),
+            "reason should contain the underlying error, got: {reason}"
+        );
+    }
+
+    /// A successful (exit 0) command yields `Ok(())`.
+    #[tokio::test]
+    async fn returns_ok_on_success() {
+        let runner = FakeCommandRunner::success();
+        let result = run_or_decline(&runner, Path::new("/tmp/ws"), "cargo", &["generate-lockfile"], "").await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    /// A non-empty `reason_prefix` is prepended verbatim to the decline
+    /// reason, letting each caller identify which command/strategy failed.
+    #[tokio::test]
+    async fn prepends_reason_prefix_verbatim() {
+        let runner = FakeCommandRunner::failure("nope");
+        let result = run_or_decline(
+            &runner,
+            Path::new("/tmp/ws"),
+            "cargo",
+            &["check"],
+            "recipe \"schema\" (verify_command): ",
+        )
+        .await;
+
+        let ResolveOutcome::Declined { reason } = result.expect_err("expected a decline") else {
+            panic!("expected Declined");
+        };
+        assert!(
+            reason.starts_with("recipe \"schema\" (verify_command): "),
+            "reason should start with the prefix, got: {reason}"
+        );
+    }
+}
