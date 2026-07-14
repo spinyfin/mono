@@ -860,6 +860,15 @@ impl WorkDb {
             )
             .optional()?
             .flatten();
+        let prior_merge_queue_state: Option<String> = tx
+            .query_row(
+                "SELECT merge_queue_state FROM tasks
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
         // Always stamp the poll timestamp so operators can observe that sweeps
         // are running even when CI/review/merge-queue state is unchanged (e.g. a
         // PR that stays CONFLICTING for an extended period). Without this,
@@ -902,6 +911,7 @@ impl WorkDb {
         Ok(PrPollStateOutcome {
             changed: changed > 0,
             prior_ci_state,
+            prior_merge_queue_state,
         })
     }
 }
@@ -930,6 +940,72 @@ pub struct PrPollStateOutcome {
     /// when the column was NULL / the row was absent. Lets the caller detect
     /// a `fail → success` transition and clear a stale "ci failing" badge.
     pub prior_ci_state: Option<String>,
+    /// The `merge_queue_state` value stored *before* this update, or `None`
+    /// when the column was NULL / the row was absent. Lets the caller detect
+    /// merge-queue entry/exit (`_ → "queued"` or `"queued" → _`) and trigger
+    /// a whole-queue renumbering pass (`merge_poller::renumber_merge_queue`)
+    /// rather than patching only this row.
+    pub prior_merge_queue_state: Option<String>,
+}
+
+/// One row from [`WorkDb::list_queued_merge_queue_members`]: a task
+/// currently sitting in GitHub's merge queue, keyed with its raw
+/// `merge_queue_detail` JSON blob so the caller can re-derive a canonical
+/// ordering across every member.
+#[derive(Debug, Clone)]
+pub struct QueuedMergeQueueMember {
+    pub task_id: String,
+    pub merge_queue_detail: Option<String>,
+}
+
+impl WorkDb {
+    /// Every task in `product_id` currently in GitHub's merge queue
+    /// (`merge_queue_state = 'queued'`). Used by the merge poller's
+    /// whole-queue renumbering pass (`merge_poller::renumber_merge_queue`)
+    /// to recompute every member's displayed position whenever any one of
+    /// them enters, exits, fails, or reorders — rather than leaving
+    /// siblings with a stale (possibly now-duplicate or now-missing)
+    /// position until their own next individual probe.
+    pub fn list_queued_merge_queue_members(&self, product_id: &str) -> Result<Vec<QueuedMergeQueueMember>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, merge_queue_detail
+             FROM tasks
+             WHERE product_id = ?1
+               AND merge_queue_state = 'queued'
+               AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![product_id], |row| {
+            Ok(QueuedMergeQueueMember {
+                task_id: row.get(0)?,
+                merge_queue_detail: row.get(1)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Overwrite `merge_queue_detail` for one task after a whole-queue
+    /// renumbering pass recomputed its canonical position. Guarded by
+    /// `merge_queue_state = 'queued'` so a row that exited the queue
+    /// between [`list_queued_merge_queue_members`](Self::list_queued_merge_queue_members)'s
+    /// read and this write is left untouched — it will simply no longer
+    /// appear in the next renumbering pass's member list either. Returns
+    /// `true` when a row was actually updated (so the caller knows to emit
+    /// a change event), `false` when the stored value already matched or
+    /// the row is no longer a live queue member.
+    pub fn update_task_merge_queue_detail(&self, task_id: &str, merge_queue_detail: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let changed = conn.execute(
+            "UPDATE tasks
+             SET merge_queue_detail = ?2
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND merge_queue_state = 'queued'
+               AND COALESCE(merge_queue_detail, '') != ?2",
+            params![task_id, merge_queue_detail],
+        )?;
+        Ok(changed > 0)
+    }
 }
 
 impl WorkDb {

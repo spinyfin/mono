@@ -3369,6 +3369,20 @@ pub(crate) async fn update_pr_poll_state(
         );
     }
 
+    // Whole-queue renumbering (mono#1997): this write only ever touched
+    // `candidate`'s own row, so a sibling still sitting on a now-stale
+    // position from before this PR entered/exited/reordered would be left
+    // showing a duplicate or missing badge until its own next individual
+    // probe. Any transition into or out of `"queued"` — or a position/
+    // state change while still queued — can shift where every OTHER queued
+    // member of this product belongs, so re-derive the whole set whenever
+    // this row's queue membership moved on either side of the update.
+    let now_queued = merge_queue_state == Some("queued");
+    let was_queued = outcome.prior_merge_queue_state.as_deref() == Some("queued");
+    if outcome.changed && (now_queued || was_queued) {
+        renumber_merge_queue(work_db, publisher, &candidate.product_id).await;
+    }
+
     // Badge reconciliation (issue #1151): the macOS "ci failing" chip is
     // driven by `ci_remediations` rows and is cleared only by an explicit
     // `CiFailureCleared` / `CiRemediationSucceeded` event. The blocked-signal
@@ -3402,6 +3416,153 @@ pub(crate) async fn update_pr_poll_state(
             "merge poller: CI recovered to success at current head; \
              broadcast CiFailureCleared to clear any stale ci-failing badge",
         );
+    }
+}
+
+/// Fields pulled back out of a stored `merge_queue_detail` JSON blob — the
+/// read-side counterpart to [`merge_queue_detail_json`]'s write. Used only
+/// by [`renumber_merge_queue`] to re-sort and rebuild the blob for every
+/// currently queued member of a product.
+struct StoredMergeQueueDetail {
+    state: Option<String>,
+    enqueued_at: Option<String>,
+    position: Option<i64>,
+}
+
+fn parse_stored_merge_queue_detail(json: Option<&str>) -> StoredMergeQueueDetail {
+    let parsed: Option<serde_json::Value> = json.and_then(|s| serde_json::from_str(s).ok());
+    StoredMergeQueueDetail {
+        state: parsed
+            .as_ref()
+            .and_then(|v| v.get("state"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        enqueued_at: parsed
+            .as_ref()
+            .and_then(|v| v.get("enqueued_at"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        position: parsed.as_ref().and_then(|v| v.get("position")).and_then(|v| v.as_i64()),
+    }
+}
+
+/// Sort key for [`renumber_merge_queue`]: ascending `enqueued_at` (GitHub's
+/// immutable FIFO join time for a queue entry) first since it can't be
+/// clobbered by our own renumbering the way a raw `position` value can;
+/// falls back to the last-known raw `position`, then `task_id`, for members
+/// missing an `enqueued_at` so the ranking stays fully deterministic. A
+/// missing value on either axis always sorts after every present value on
+/// that axis, rather than comparing as smaller/earlier.
+fn merge_queue_sort_key(detail: &StoredMergeQueueDetail, task_id: &str) -> (u8, String, u8, i64, String) {
+    let (enqueued_rank, enqueued_val) = match &detail.enqueued_at {
+        Some(ts) => (0u8, ts.clone()),
+        None => (1u8, String::new()),
+    };
+    let (position_rank, position_val) = match detail.position {
+        Some(p) => (0u8, p),
+        None => (1u8, i64::MAX),
+    };
+    (
+        enqueued_rank,
+        enqueued_val,
+        position_rank,
+        position_val,
+        task_id.to_owned(),
+    )
+}
+
+/// Recompute a canonical, contiguous, duplicate-free position for every
+/// task in `product_id` currently in GitHub's merge queue
+/// (`merge_queue_state = 'queued'`), and re-broadcast for every member
+/// whose displayed position actually changed (mono#1997).
+///
+/// [`update_pr_poll_state`] only ever learns and writes a probed PR's OWN
+/// raw `mergeQueueEntry.position` — siblings aren't touched by that write.
+/// So when one member enters, exits, fails, or reorders, every other
+/// member can keep showing a stale number, including one that now
+/// collides with a sibling's (two cards both showing `#2`) or a missing
+/// number for a member GitHub hadn't yet reported a position for. This
+/// pass is the fix: called after every merge-queue-relevant probe write —
+/// not just for the row that changed — it re-derives a fresh `1..N`
+/// ranking from every currently-tracked queued member and rewrites +
+/// re-broadcasts every row whose rank changed, so the WHOLE queue stays
+/// self-consistent rather than only the mutated item.
+///
+/// Membership in the renumbered set is governed *only* by
+/// `merge_queue_state == "queued"` — a queued-but-failing member (e.g. one
+/// GitHub reports as `UNMERGEABLE` while it's being dequeued) keeps a
+/// position like any other member for as long as that column still reads
+/// `"queued"`, and is excluded the moment it flips away. That is the one
+/// rule callers need: a failed member's number never races between
+/// "kept" and "excluded" mid-transition.
+pub(crate) async fn renumber_merge_queue(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, product_id: &str) {
+    let members = match work_db.list_queued_merge_queue_members(product_id) {
+        Ok(members) => members,
+        Err(err) => {
+            tracing::warn!(
+                product_id,
+                ?err,
+                "merge poller: failed to list queued merge-queue members for renumbering",
+            );
+            return;
+        }
+    };
+    if members.is_empty() {
+        return;
+    }
+
+    let mut parsed: Vec<(String, StoredMergeQueueDetail)> = members
+        .into_iter()
+        .map(|m| {
+            (
+                m.task_id,
+                parse_stored_merge_queue_detail(m.merge_queue_detail.as_deref()),
+            )
+        })
+        .collect();
+    parsed.sort_by_key(|(task_id, detail)| merge_queue_sort_key(detail, task_id));
+
+    for (rank, (task_id, detail)) in parsed.iter().enumerate() {
+        let position = (rank + 1) as i64;
+        // Diff on the parsed position, not the raw JSON string: a member
+        // already at its canonical rank must be skipped even though the
+        // rewritten blob's key order/section_order differs byte-for-byte
+        // from whatever an earlier write (or a legacy/pre-migration row)
+        // left behind — this is the "only touch what changed" guarantee,
+        // not merely a micro-optimisation.
+        if detail.position == Some(position) {
+            continue;
+        }
+        let Ok(json) = serde_json::to_string(&serde_json::json!({
+            "position": position,
+            "state": detail.state,
+            "enqueued_at": detail.enqueued_at,
+            "section_order": position,
+        })) else {
+            continue;
+        };
+        match work_db.update_task_merge_queue_detail(task_id, &json) {
+            Ok(true) => {
+                publisher
+                    .publish_work_item_changed(product_id, task_id, "merge_queue_renumbered")
+                    .await;
+                tracing::debug!(
+                    work_item_id = %task_id,
+                    product_id,
+                    position,
+                    "merge poller: renumbered merge-queue position",
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %task_id,
+                    product_id,
+                    ?err,
+                    "merge poller: failed to persist renumbered merge-queue position",
+                );
+            }
+        }
     }
 }
 
@@ -9540,6 +9701,245 @@ mod tests {
         let json = merge_queue_detail_json(&probe).expect("queued → Some");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(parsed["section_order"], serde_json::json!(3));
+    }
+
+    // ── renumber_merge_queue (mono#1997: whole-queue renumbering) ──────────
+
+    /// Second (or later) chore in an existing product, moved straight to
+    /// `in_review` with a bound `pr_url` — mirrors `make_chore_in_review`
+    /// but reuses a caller-supplied product so multiple chores land in the
+    /// same merge queue.
+    fn chore_in_review_for_product(db: &WorkDb, product_id: &str, name: &str, pr_url: &str) -> String {
+        let chore = create_test_chore_manual(db, product_id.to_owned(), name);
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        chore.id
+    }
+
+    /// Read back `merge_queue_state` / `merge_queue_detail` for a task,
+    /// parsing the detail JSON into a `serde_json::Value` (or `Value::Null`
+    /// when the column is NULL) for easy field assertions.
+    fn merge_queue_columns(db: &WorkDb, task_id: &str) -> (Option<String>, serde_json::Value) {
+        let conn = db.connect().unwrap();
+        let (state, detail): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+                rusqlite::params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let detail_json = detail
+            .as_deref()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .unwrap_or(serde_json::Value::Null);
+        (state, detail_json)
+    }
+
+    fn seed_queued(db: &WorkDb, task_id: &str, position: Option<i64>, enqueued_at: &str, state: &str) {
+        // Mirrors `merge_queue_detail_json`'s real shape (section_order always
+        // present alongside position) so these fixtures match what a genuine
+        // probe write leaves behind, rather than an artifact of the test.
+        let detail = serde_json::json!({
+            "position": position,
+            "state": state,
+            "enqueued_at": enqueued_at,
+            "section_order": position.unwrap_or(QUEUED_NO_POSITION_SECTION_ORDER),
+        })
+        .to_string();
+        db.update_task_pr_poll_state(
+            task_id,
+            PrPollStateInput {
+                ci_required_state: "success",
+                review_required_state: "approved",
+                merge_queue_state: Some("queued"),
+                merge_queue_detail: Some(&detail),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Reproduces the reported bug directly: four members whose stored
+    /// `merge_queue_detail.position` is duplicated (two cards both `#2`,
+    /// mirroring T2613/T2614) and missing (mirroring T2621's clock-icon-but-
+    /// no-number card) because each was written in isolation by its own
+    /// probe. A single `renumber_merge_queue` pass must re-derive a unique,
+    /// contiguous `1..N` ranking across every currently queued member —
+    /// ordered by `enqueued_at` — and only touch (and only publish a change
+    /// event for) the rows whose rank actually moved.
+    #[tokio::test]
+    async fn renumber_merge_queue_repairs_duplicate_and_missing_positions() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "Renumber", Some("git@github.com:foo/bar.git"));
+        let a = chore_in_review_for_product(&db, &product.id, "A", "https://github.com/foo/bar/pull/1");
+        let b = chore_in_review_for_product(&db, &product.id, "B", "https://github.com/foo/bar/pull/2");
+        let c = chore_in_review_for_product(&db, &product.id, "C", "https://github.com/foo/bar/pull/3");
+        let d = chore_in_review_for_product(&db, &product.id, "D", "https://github.com/foo/bar/pull/4");
+
+        seed_queued(&db, &a, Some(1), "2026-07-15T10:00:00Z", "QUEUED");
+        seed_queued(&db, &b, Some(2), "2026-07-15T10:01:00Z", "QUEUED");
+        // Duplicate of `b`'s position, enqueued later, failed — mirrors T2614.
+        seed_queued(&db, &c, Some(2), "2026-07-15T10:02:00Z", "UNMERGEABLE");
+        // Missing position entirely, enqueued last — mirrors T2621.
+        seed_queued(&db, &d, None, "2026-07-15T10:03:00Z", "QUEUED");
+
+        let publisher = RecordingPublisher::default();
+        renumber_merge_queue(&db, &publisher, &product.id).await;
+
+        let (_, a_detail) = merge_queue_columns(&db, &a);
+        let (_, b_detail) = merge_queue_columns(&db, &b);
+        let (_, c_detail) = merge_queue_columns(&db, &c);
+        let (_, d_detail) = merge_queue_columns(&db, &d);
+        assert_eq!(a_detail["position"], serde_json::json!(1));
+        assert_eq!(b_detail["position"], serde_json::json!(2));
+        assert_eq!(
+            c_detail["position"],
+            serde_json::json!(3),
+            "duplicate must resolve to a unique rank"
+        );
+        assert_eq!(
+            d_detail["position"],
+            serde_json::json!(4),
+            "missing position must be filled in"
+        );
+        // section_order mirrors position so the kanban's sort key and its
+        // displayed badge never disagree.
+        assert_eq!(a_detail["section_order"], serde_json::json!(1));
+        assert_eq!(d_detail["section_order"], serde_json::json!(4));
+        // Non-position fields survive the rewrite untouched.
+        assert_eq!(c_detail["state"], serde_json::json!("UNMERGEABLE"));
+        assert_eq!(c_detail["enqueued_at"], serde_json::json!("2026-07-15T10:02:00Z"));
+
+        // Only the two rows whose rank actually moved get a change event —
+        // `a` and `b` were already correct and must not be touched.
+        let renumbered: Vec<String> = publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, _, reason)| reason == "merge_queue_renumbered")
+            .map(|(_, task_id, _)| task_id.clone())
+            .collect();
+        assert_eq!(
+            renumbered.iter().collect::<std::collections::HashSet<_>>(),
+            [&c, &d].into_iter().collect::<std::collections::HashSet<_>>(),
+            "only c (duplicate) and d (missing) should have been rewritten; got {renumbered:?}"
+        );
+    }
+
+    /// Membership in the renumbered set is governed only by
+    /// `merge_queue_state == "queued"` — a sibling that isn't queued (e.g.
+    /// only Merge-When-Ready armed, or plain `in_review` with no queue
+    /// sub-state at all) must never be touched or counted against the
+    /// ranking, regardless of whatever is left in its own `merge_queue_detail`.
+    #[tokio::test]
+    async fn renumber_merge_queue_ignores_non_queued_members() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "RenumberIgnore", Some("git@github.com:foo/bar.git"));
+        let queued = chore_in_review_for_product(&db, &product.id, "Queued", "https://github.com/foo/bar/pull/1");
+        let armed = chore_in_review_for_product(&db, &product.id, "Armed", "https://github.com/foo/bar/pull/2");
+
+        // Wrong position on purpose so a real rewrite is observable.
+        seed_queued(&db, &queued, Some(5), "2026-07-15T10:00:00Z", "QUEUED");
+        db.update_task_pr_poll_state(
+            &armed,
+            PrPollStateInput {
+                ci_required_state: "success",
+                review_required_state: "approved",
+                merge_queue_state: Some("auto_merge_enabled"),
+                merge_queue_detail: Some(r#"{"position":null,"state":null,"enqueued_at":null}"#),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let armed_detail_before = merge_queue_columns(&db, &armed).1;
+
+        let publisher = RecordingPublisher::default();
+        renumber_merge_queue(&db, &publisher, &product.id).await;
+
+        let (_, queued_detail) = merge_queue_columns(&db, &queued);
+        assert_eq!(
+            queued_detail["position"],
+            serde_json::json!(1),
+            "the sole queued member must become #1"
+        );
+        let (armed_state, armed_detail_after) = merge_queue_columns(&db, &armed);
+        assert_eq!(armed_state.as_deref(), Some("auto_merge_enabled"));
+        assert_eq!(
+            armed_detail_after, armed_detail_before,
+            "a non-queued member's detail must be left untouched by the queued-only renumbering pass"
+        );
+    }
+
+    /// End-to-end regression through the real wiring: a mid-queue member
+    /// leaving the queue (fails, GitHub dequeues it) must immediately
+    /// renumber its still-queued siblings via `update_pr_poll_state` alone
+    /// — no separate call to `renumber_merge_queue` — reproducing the
+    /// acceptance scenario (queue of 3+, cause a mid-queue member to
+    /// fail/leave, remaining cards get unique positions).
+    #[tokio::test]
+    async fn mid_queue_member_leaving_renumbers_remaining_siblings_via_update_pr_poll_state() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "RenumberWiring", Some("git@github.com:foo/bar.git"));
+        let t1 = chore_in_review_for_product(&db, &product.id, "T1", "https://github.com/foo/bar/pull/1");
+        let t2 = chore_in_review_for_product(&db, &product.id, "T2", "https://github.com/foo/bar/pull/2");
+        let t3 = chore_in_review_for_product(&db, &product.id, "T3", "https://github.com/foo/bar/pull/3");
+
+        seed_queued(&db, &t1, Some(1), "2026-07-15T10:00:00Z", "MERGEABLE");
+        seed_queued(&db, &t2, Some(2), "2026-07-15T10:01:00Z", "MERGEABLE");
+        seed_queued(&db, &t3, Some(3), "2026-07-15T10:02:00Z", "MERGEABLE");
+
+        let publisher = RecordingPublisher::default();
+        // T2 fails and GitHub dequeues it: still an open, clean-enough PR,
+        // but `in_merge_queue` flips false.
+        let left_queue_probe = probe_with_queue_fields(false, None, None, None, false, None);
+        let candidate = PendingMergeCheck {
+            work_item_id: t2.clone(),
+            product_id: product.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/2".to_owned(),
+        };
+        update_pr_poll_state(&db, &publisher, &candidate, &left_queue_probe).await;
+
+        let (t2_state, t2_detail) = merge_queue_columns(&db, &t2);
+        assert!(t2_state.is_none(), "T2 must leave the queued set once it's dequeued");
+        assert_eq!(t2_detail, serde_json::Value::Null);
+
+        let (_, t1_detail) = merge_queue_columns(&db, &t1);
+        let (_, t3_detail) = merge_queue_columns(&db, &t3);
+        assert_eq!(
+            t1_detail["position"],
+            serde_json::json!(1),
+            "T1 was already correct and stays #1"
+        );
+        assert_eq!(
+            t3_detail["position"],
+            serde_json::json!(2),
+            "T3 must shift down to #2 once T2 leaves — no gap, no stale #3"
+        );
+
+        let renumbered: std::collections::HashSet<String> = publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, _, reason)| reason == "merge_queue_renumbered")
+            .map(|(_, task_id, _)| task_id.clone())
+            .collect();
+        assert!(
+            renumbered.contains(&t3),
+            "T3's position change must be broadcast so its card refreshes; events={renumbered:?}"
+        );
+        assert!(
+            !renumbered.contains(&t1),
+            "T1's position didn't change and must not generate a redundant event"
+        );
     }
 
     #[test]
