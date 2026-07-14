@@ -14,9 +14,14 @@ fn temp_db_path(_label: &str) -> PathBuf {
 /// schema-migration tests that pre-populate a legacy schema and then
 /// re-open via `WorkDb::open`). All other tests should use
 /// `temp_db_path` so the database stays in RAM.
-fn disk_db_path(label: &str) -> PathBuf {
+///
+/// The returned `TempDir` must be kept alive for as long as the path
+/// is in use — dropping it deletes the backing file.
+fn disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
     let file = format!("boss-{label}-{}.sqlite3", next_id("test"));
-    std::env::temp_dir().join(file)
+    let path = dir.path().join(file);
+    (dir, path)
 }
 
 /// Project creation auto-spawns a `kind = 'design'` task, which
@@ -180,10 +185,13 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
 /// whose own `repo_remote_url` is left `NULL`. Tests plant the
 /// override they want via `set_task_repo` and then exercise the
 /// helper.
-fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, WorkDb, String, String) {
+fn make_resolve_scaffold(
+    label: &str,
+    product_repo: Option<&str>,
+) -> (tempfile::TempDir, PathBuf, WorkDb, String, String) {
     // disk_db_path so that resolve_repo_errors_when_parent_product_is_missing
     // can open a second raw connection to the same database file.
-    let path = disk_db_path(label);
+    let (dir, path) = disk_db_path(label);
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", product_repo);
     let project = db
@@ -223,7 +231,7 @@ fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, W
         .unwrap()
         .id
     };
-    (path, db, product.id, task_id)
+    (dir, path, db, product.id, task_id)
 }
 
 /// Resolver tests plant the override directly via SQL so they can

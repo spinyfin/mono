@@ -40,7 +40,10 @@ fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
     topic_event_topic(&env.payload)
 }
 
-pub(super) fn test_server_state() -> Arc<ServerState> {
+/// Build a `ServerState` backed by a throwaway on-disk DB. The returned
+/// `TempDir` must be kept alive for as long as the `ServerState` is used —
+/// dropping it deletes the backing `state.db`.
+pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
         crate::config::WorkConfig::builder()
@@ -49,10 +52,8 @@ pub(super) fn test_server_state() -> Arc<ServerState> {
             .build(),
         None,
     ));
-    // Leak the temp dir for the lifetime of the test process; the
-    // ServerState's WorkDb keeps a handle to a path inside it.
-    std::mem::forget(temp);
-    ServerState::new_arc_with_app_pid(cfg, None, None).unwrap()
+    let state = ServerState::new_arc_with_app_pid(cfg, None, None).unwrap();
+    (state, temp)
 }
 
 pub(super) fn make_session_sink() -> Arc<SessionSink> {

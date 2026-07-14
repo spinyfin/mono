@@ -6682,7 +6682,7 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use tokio::sync::Mutex;
 
     use super::*;
@@ -7173,12 +7173,9 @@ mod tests {
     /// a cube lease attached — this is the state the engine is in once
     /// `PaneSpawnRunner::run_execution` has returned and
     /// `record_run_completion` has run.
-    fn fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String) {
+    fn fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String) {
         let dir = tempdir().unwrap();
-        // Box-leak the dir; tests are short-lived and this avoids
-        // returning the TempDir handle.
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, product.id.clone(), "Detect worker stop");
@@ -7208,7 +7205,7 @@ mod tests {
             )
             .unwrap();
 
-        (db, product.id, chore.id, execution.id)
+        (dir, db, product.id, chore.id, execution.id)
     }
 
     /// Stand up a `question`-classified comment already `answering`, with its
@@ -7216,10 +7213,9 @@ mod tests {
     /// `answer_agent` execution bound to it — the state `finalize_answer_agent`
     /// (called from `on_stop`) expects to find. Returns `(db, comment_id,
     /// run_id, execution_id)`.
-    fn answer_agent_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String) {
+    fn answer_agent_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = db
             .create_product(CreateProductInput {
@@ -7271,7 +7267,7 @@ mod tests {
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        (db, comment.id, run.id, execution.id)
+        (dir, db, comment.id, run.id, execution.id)
     }
 
     /// Stand up a `ready` `automation_triage` execution bound to a fresh
@@ -7279,10 +7275,9 @@ mod tests {
     /// leaves a worker awaiting its Stop hook — the state
     /// `finalize_automation_triage` (called from `on_stop`) expects to find.
     /// Returns `(db, automation_id, execution_id)`.
-    fn automation_triage_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String) {
+    fn automation_triage_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         let automation = db
@@ -7336,7 +7331,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        (db, automation.id, execution.id)
+        (dir, db, automation.id, execution.id)
     }
 
     #[tokio::test]
@@ -7353,7 +7348,7 @@ mod tests {
         // once it lands and the run finalises `skipped` — zero retries, not
         // the failed/marker-recovery fallback path.
         let workspace = tempdir().unwrap();
-        let (db, _automation_id, execution_id) = automation_triage_fixture(workspace.path());
+        let (_dir, db, _automation_id, execution_id) = automation_triage_fixture(workspace.path());
 
         let transcript_path = workspace.path().join(format!("transcript-{execution_id}.jsonl"));
         let mut partial = String::new();
@@ -7448,7 +7443,7 @@ mod tests {
         // entry, and force the comment `answering -> answered` so it doesn't
         // sit unanswered forever.
         let workspace = tempdir().unwrap();
-        let (db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
+        let (_dir, db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
 
         let TestHarness {
@@ -7495,7 +7490,7 @@ mod tests {
         // alone — it should only finalise the execution/run rows and
         // release resources.
         let workspace = tempdir().unwrap();
-        let (db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
+        let (_dir, db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
         db.complete_answer_agent_run(
             &run_id,
             boss_protocol::ANSWER_AGENT_RUN_STATUS_REPLIED,
@@ -7536,10 +7531,9 @@ mod tests {
         assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
     }
 
-    fn ci_remediation_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String, String) {
+    fn ci_remediation_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String, String) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, product.id.clone(), "Fix CI");
@@ -7604,13 +7598,13 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        (db, product.id, chore.id, execution.id, attempt.id)
+        (dir, db, product.id, chore.id, execution.id, attempt.id)
     }
 
     #[tokio::test]
     async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
         let workspace = tempdir().unwrap();
-        let (db, product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
 
         let TestHarness {
@@ -7690,7 +7684,7 @@ mod tests {
         // accidental fall-through to the cold path would be visible
         // as a wrong pr_url on the work item.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
@@ -7768,7 +7762,7 @@ mod tests {
         // staging cache is empty here and we must still find the
         // PR through the legacy jj+gh path).
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
 
         // No `with_staged_pr_urls` call — handler uses the default
@@ -7805,7 +7799,7 @@ mod tests {
         // dispatcher staged a URL between Stop and now, recheck
         // uses it without the detector.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::err("jj broken");
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
@@ -7855,7 +7849,7 @@ mod tests {
         // sees no PR for the correct branch) rather than incorrectly
         // advancing the work item to in_review.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Detector returns None → this execution has no PR yet.
         let detector = StubPrDetector::ok(None);
 
@@ -7906,7 +7900,7 @@ mod tests {
         // check as recheck_for_pr. A staged URL for a different execution's
         // PR must be dropped and fall through to the cold-path detector.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Detector returns None → no real PR for this execution's branch.
         let detector = StubPrDetector::ok(None);
 
@@ -7965,7 +7959,7 @@ mod tests {
         // PR so we can confirm the cold-path ran this turn AND the staged URL
         // is still in the cache for the next sweep's retry.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1449"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
@@ -8038,7 +8032,7 @@ mod tests {
     #[tokio::test]
     async fn on_stop_chore_pr_opened_advances_to_in_review_slot_freed() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Cold-path detector is not reached (staged URL takes the primary
         // path), but wire it with a wrong URL so any accidental fall-through
         // would produce an observable wrong `pr_url`.
@@ -8116,7 +8110,7 @@ mod tests {
     #[tokio::test]
     async fn recheck_staged_url_preserved_when_branch_verification_errors() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1449"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
@@ -8170,7 +8164,7 @@ mod tests {
         // the whole point of the fix is that the worker no longer has to
         // close a compliant `bduff/` PR and recreate it under `boss/`.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Cold-path detector wired with a wrong URL: any fall-through
         // would surface as a wrong pr_url, proving the staged URL was
         // (incorrectly) dropped.
@@ -8225,7 +8219,7 @@ mod tests {
     #[tokio::test]
     async fn pr_absent_publishes_awaiting_pr_and_queues_probe() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
 
         let TestHarness {
@@ -8276,7 +8270,7 @@ mod tests {
         // stay held, and the worker gets probed to push the missing
         // commits so the next Stop sees a fresh PR.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok_status(PrStatus::Stale {
             url: "https://github.com/foo/bar/pull/42".into(),
             reason: "local HEAD abcd1234 is ahead of PR head 9876fedc".into(),
@@ -8333,7 +8327,7 @@ mod tests {
         // again → …  The merge-poller recheck recovers the transition once
         // the failure clears.
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, _, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::err("gh broken");
 
         let TestHarness {
@@ -8377,7 +8371,7 @@ mod tests {
     #[tokio::test]
     async fn force_release_releases_pane_and_cube_lease_then_idempotent() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, _, execution_id) = fixture(workspace.path());
 
         let TestHarness {
             handler, cube, pane, ..
@@ -8408,7 +8402,7 @@ mod tests {
     #[tokio::test]
     async fn force_release_no_lease_skips_cube_release() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, _, execution_id) = fixture(workspace.path());
 
         // Pre-clear the lease so force_release can confirm it skips
         // cube release when there's nothing to release.
@@ -8433,7 +8427,7 @@ mod tests {
     #[tokio::test]
     async fn force_release_mid_spawn_holds_cube_lease() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, _, execution_id) = fixture(workspace.path());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
         let TestHarness { handler, cube, .. } =
             TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
@@ -8464,7 +8458,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_and_release_mid_spawn_cancels_row_but_holds_lease() {
         let workspace = tempdir().unwrap();
-        let (db, _, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
         let TestHarness { handler, cube, .. } =
             TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
@@ -8496,7 +8490,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_and_release_with_live_worker_releases_lease() {
         let workspace = tempdir().unwrap();
-        let (db, _, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
 
         let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
 
@@ -8532,7 +8526,7 @@ mod tests {
     #[tokio::test]
     async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execution() {
         let workspace = tempdir().unwrap();
-        let (db, _, chore_id, execution_id) = fixture_running(workspace.path());
+        let (_dir, db, _, chore_id, execution_id) = fixture_running(workspace.path());
 
         let TestHarness {
             handler, cube, pane, ..
@@ -8598,7 +8592,7 @@ mod tests {
     #[tokio::test]
     async fn delete_while_dispatching_cancels_row_but_holds_lease_for_inflight_spawn() {
         let workspace = tempdir().unwrap();
-        let (db, _, chore_id, execution_id) = fixture_running(workspace.path());
+        let (_dir, db, _, chore_id, execution_id) = fixture_running(workspace.path());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
         let TestHarness { handler, cube, .. } =
             TestHarness::with_pane(db.clone(), StubPrDetector::ok(None), pane.clone());
@@ -8640,7 +8634,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_stop_after_pr_detection_is_idempotent() {
         let workspace = tempdir().unwrap();
-        let (db, _, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
         let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
 
@@ -8672,7 +8666,7 @@ mod tests {
         // the publish reason is `worker_pr_merged` so the frontend
         // can paint the right activity.
         let workspace = tempdir().unwrap();
-        let (db, product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok_status(PrStatus::Merged {
             url: "https://github.com/foo/bar/pull/42".into(),
         });
@@ -8733,7 +8727,7 @@ mod tests {
         // `in_review` or `done`. Behave like the no-PR case so the
         // worker is asked to confirm what they want.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok_status(PrStatus::Closed {
             url: "https://github.com/foo/bar/pull/9".into(),
         });
@@ -8766,7 +8760,7 @@ mod tests {
         // row happens to exist for the same work item (e.g. a prior
         // attempt was archived).
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Pre-existing failed attempt unrelated to this execution.
         let attempt = db
             .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
@@ -8802,11 +8796,11 @@ mod tests {
     async fn cross_execution_attribution_uses_per_execution_branch_name() {
         let alice_ws = tempdir().unwrap();
         let bob_ws = tempdir().unwrap();
-        let (db, _alice_product, _alice_chore, alice_exec) = fixture(alice_ws.path());
+        let (_dir, db, _alice_product, _alice_chore, alice_exec) = fixture(alice_ws.path());
         // Fresh DB for Bob so the two executions are independent —
         // we're modelling them as living in different cube
         // workspaces, not contending for the same chore.
-        let (bob_db, _bob_product, _bob_chore, bob_exec) = fixture(bob_ws.path());
+        let (_dir, bob_db, _bob_product, _bob_chore, bob_exec) = fixture(bob_ws.path());
 
         // Detector returns Fresh URLs unique per branch — the
         // production behaviour of `gh pr list --head <branch>` once
@@ -8901,7 +8895,6 @@ mod tests {
         let ws = tempdir().unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
 
@@ -8972,10 +8965,9 @@ mod tests {
     /// in-cube worker pane is alive, and a `Stop` hook fires for the
     /// first assistant turn before the upper layer has had a chance to
     /// stamp `waiting_human`.
-    fn fixture_running(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String) {
+    fn fixture_running(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, String) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, product.id.clone(), "Running execution");
@@ -8994,13 +8986,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(execution.status, ExecutionStatus::Running);
-        (db, product.id, chore.id, execution.id)
+        (dir, db, product.id, chore.id, execution.id)
     }
 
     #[tokio::test]
     async fn running_status_short_circuits_without_calling_detector() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture_running(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture_running(workspace.path());
 
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
 
@@ -9041,7 +9033,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_human_status_invokes_detector_with_expected_branch() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         // Fixture leaves the execution in `waiting_human`; the on-Stop
         // handler should fall through to the detector.
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/501"));
@@ -9070,7 +9062,7 @@ mod tests {
     #[tokio::test]
     async fn empty_diff_pr_publishes_awaiting_pr_and_queues_empty_pr_probe() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok_status(PrStatus::EmptyDiff {
             url: "https://github.com/foo/bar/pull/77".into(),
         });
@@ -9146,7 +9138,6 @@ mod tests {
         let workspace = tempdir().unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         let description_with_pr_refs = "\
@@ -9246,7 +9237,6 @@ PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         // Description points at PR #379 repeatedly as prior art. The
@@ -9345,7 +9335,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // `waiting_human` with a workspace_path — exactly the state
         // PR #415 was in after its on-Stop hook missed.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
 
         // Simulate "on-Stop already ran and saw no PR" by leaving
         // the chore's pr_url unset. The recheck path is what we're
@@ -9435,7 +9425,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn recheck_for_pr_is_quiet_when_detector_still_reports_no_pr() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
 
         let TestHarness {
@@ -9478,7 +9468,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn recheck_for_pr_is_quiet_on_stale_pr() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (_dir, db, _, _, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok_status(PrStatus::Stale {
             url: "https://github.com/foo/bar/pull/42".into(),
             reason: "local HEAD ahead of PR head".into(),
@@ -9541,7 +9531,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let ws1 = tempdir().unwrap();
         let ws2 = tempdir().unwrap();
         let ws3 = tempdir().unwrap();
-        let (db, _p1, c1, e1) = fixture(ws1.path());
+        let (_dir, db, _p1, c1, e1) = fixture(ws1.path());
         // Reuse the same DB for the next two so a single merge-poller
         // pass sees all three executions.
         let chore2 = db
@@ -9780,7 +9770,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn on_stop_skips_detector_when_feature_flag_is_off() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // Detector wired with a deliberately-wrong URL so any
         // accidental fall-through would surface as a wrong pr_url on
         // the chore.
@@ -9841,7 +9831,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn recheck_for_pr_skips_detector_when_feature_flag_is_off() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
 
         let flags_dir = tempdir().unwrap();
@@ -9867,7 +9857,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn on_stop_calls_detector_when_feature_flag_defaults_on() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
 
         let flags_dir = tempdir().unwrap();
@@ -9923,8 +9913,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         bound_pr_url: &str,
         head_before: &str,
-    ) -> (Arc<WorkDb>, String, String, String) {
-        let (db, product_id, chore_id, execution_id) = fixture(workspace_path);
+    ) -> (TempDir, Arc<WorkDb>, String, String, String) {
+        let (dir, db, product_id, chore_id, execution_id) = fixture(workspace_path);
         db.update_work_item(
             &chore_id,
             crate::work::WorkItemPatch {
@@ -9934,7 +9924,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         )
         .unwrap();
         db.set_execution_pr_head_before(&execution_id, head_before).unwrap();
-        (db, product_id, chore_id, execution_id)
+        (dir, db, product_id, chore_id, execution_id)
     }
 
     #[tokio::test]
@@ -9948,7 +9938,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
         let head_before = "1111111111111111111111111111111111111111";
-        let (db, product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head_before);
+        let (_dir, db, product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head_before);
         // Cold-path detector reports None — this is what the live
         // engine sees on a resume because the detector searches by
         // `boss/<new-execution-id>`, which has no PR.
@@ -10016,7 +10006,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
         let head = "1111111111111111111111111111111111111111";
-        let (db, _product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head);
+        let (_dir, db, _product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head);
         let detector = StubPrDetector::ok(None);
         let verifier = StubBranchVerifier::ok("boss/exec_old");
         // Head SHA matches the snapshot — worker didn't push.
@@ -10067,7 +10057,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // branch-keyed detector run unchanged. Otherwise the fix
         // would regress the brand-new-PR path.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // No `chore.pr_url` set; no `pr_head_before` snapshot.
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
 
@@ -10106,7 +10096,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // so the worker is pointed at the existing PR instead.
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         db.update_work_item(
             &chore_id,
             crate::work::WorkItemPatch {
@@ -10155,7 +10145,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn ci_remediation_with_bound_pr_never_creates_and_breaker_parks() {
         let workspace = tempdir().unwrap();
-        let (db, product_id, _chore_id, execution_id, _attempt_id) = ci_remediation_fixture(workspace.path());
+        let (_dir, db, product_id, _chore_id, execution_id, _attempt_id) = ci_remediation_fixture(workspace.path());
         let bound_pr = "https://github.com/spinyfin/mono/pull/88";
         // Cold-path detector finds no PR on the remediation exec's own
         // branch — exactly the Worf false miss.
@@ -10231,7 +10221,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // loop is the bug. It must also NOT mark the (already-terminal)
         // attempt failed.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id, attempt_id) = ci_remediation_fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id, attempt_id) = ci_remediation_fixture(workspace.path());
         // The worker's marker: flip the attempt terminal + arm the signal.
         db.mark_ci_remediation_retriggered(&attempt_id)
             .unwrap()
@@ -10294,7 +10284,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // lease and worker slot forever once the breaker gives up on it —
         // the auto-remediation this test now also proves.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
 
         let TestHarness {
@@ -10417,7 +10407,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // → done (no pr_url), NO probe queued, lease + pane released, NO
         // breaker attention item.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10501,7 +10491,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // already done". The legitimate produce-a-PR nudge must still fire —
         // the no-op gate must NOT globally suppress it.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // A real transcript exists, but it does NOT contain the marker.
         write_assistant_transcript(
             &db,
@@ -10550,7 +10540,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn well_formed_effort_escalation_files_attention_and_suppresses_nudge() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10607,7 +10597,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // O'Brien's incident marker: bare, no requested_level, no reason.
         // Malformed markers must still be surfaced, not silently dropped.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10638,7 +10628,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn blocked_marker_files_attention_and_suppresses_nudge() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10681,7 +10671,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // unresolved worker signal, on the FIRST Stop that carries the
         // marker — not just refrain from adding a new one.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10720,7 +10710,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn well_formed_deferred_scope_records_audit_line_and_attention_item() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10778,7 +10768,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn malformed_deferred_scope_is_still_recorded_with_a_parse_warning() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(&db, workspace.path(), &execution_id, "[deferred-scope]\n");
         let detector = StubPrDetector::ok(None);
         let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
@@ -10804,7 +10794,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // already produced its narrower deliverable, so the normal
         // produce-a-PR nudge must still fire.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10827,7 +10817,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // once emitted, so repeated Stops must not re-append the audit line
         // or re-file the attention item.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10870,7 +10860,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // so `park_for_unproductive_nudges` (and its new
         // lease/pane-releasing finalizer) must never run for this case.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -10941,7 +10931,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // resume the normal produce-a-PR nudge even though the marker line
         // is still present in the cumulative transcript.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -11022,7 +11012,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // breaker, this would trip `park_for_unproductive_nudges` and
         // discard the worker's in-progress session.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(
             &db,
             workspace.path(),
@@ -11092,7 +11082,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // wall-clock wait (the elapsed-time arithmetic itself is covered
         // by `crate::build_wait_tracker`'s own unit tests).
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         write_assistant_transcript(&db, workspace.path(), &execution_id, "still building, waiting");
         let detector = StubPrDetector::ok(None);
         let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
@@ -11138,13 +11128,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     fn revision_fixture_no_execution_pr_url(
         workspace_path: &Path,
         parent_pr_url: &str,
-    ) -> (Arc<WorkDb>, String, String, String) {
+    ) -> (TempDir, Arc<WorkDb>, String, String, String) {
         use crate::work::{FakePrStateChecker, PrOpenState};
         use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-revision-chain-root-test");
         let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
@@ -11200,7 +11189,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     .build(),
             )
             .unwrap();
-        (db, product.id, revision.id, execution.id)
+        (dir, db, product.id, revision.id, execution.id)
     }
 
     #[tokio::test]
@@ -11212,7 +11201,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // return `probe_push_to_existing_pr` instead.
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
-        let (db, _product_id, _revision_id, execution_id) =
+        let (_dir, db, _product_id, _revision_id, execution_id) =
             revision_fixture_no_execution_pr_url(workspace.path(), parent_pr_url);
         // Cold-path detector returns None — correct for revisions which
         // have no branch of their own.
@@ -11255,7 +11244,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-revision-no-pr-test");
         // Parent chore with NO pr_url (never opened a PR).
@@ -11363,7 +11351,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // reset on finalize, so it doesn't carry over to poison a later
         // cycle.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         // First two stops find no PR; the third finds a fresh PR.
         let detector = StubPrDetector::ok(None);
 
@@ -11403,7 +11391,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // gracefully when no PR is bound (new-PR flow).
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         db.update_work_item(
             &chore_id,
             crate::work::WorkItemPatch {
@@ -11432,7 +11420,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn execution_started_hook_skips_when_no_pr_bound() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
         let verifier = StubBranchVerifier::ok("boss/exec_old");
         // A verifier that would explode if called — we expect it not
@@ -11455,10 +11443,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     /// Build a WorkDb with a chore whose execution is `abandoned` and
     /// `workspace_path` is still set (mirrors the double-spawn race where
     /// exec_A is abandoned by the orphan sweep while its pane is running).
-    fn abandoned_execution_fixture() -> (Arc<WorkDb>, String, String, String) {
+    fn abandoned_execution_fixture() -> (TempDir, Arc<WorkDb>, String, String, String) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss-late.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, product.id.clone(), "Late PR chore");
@@ -11495,12 +11482,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         .unwrap();
         // Simulate orphan sweep abandoning exec_A.
         db.mark_execution_redundant(&execution.id).unwrap();
-        (db, product.id, chore.id, execution.id)
+        (dir, db, product.id, chore.id, execution.id)
     }
 
     #[tokio::test]
     async fn recheck_for_pr_late_binds_pr_to_active_task() {
-        let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
+        let (_dir, db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
         let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
 
@@ -11531,7 +11518,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     #[tokio::test]
     async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
-        let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
+        let (_dir, db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
         let detector = StubPrDetector::ok(None); // no PR found
         let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
 
@@ -11582,13 +11569,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         parent_pr_url: &str,
         head_before: &str,
-    ) -> (Arc<WorkDb>, String, String, String) {
+    ) -> (TempDir, Arc<WorkDb>, String, String, String) {
         use crate::work::{FakePrStateChecker, PrOpenState};
         use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-revision-test");
         // Parent chore: in_review with a bound pr_url.
@@ -11650,7 +11636,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         // Snapshot the parent PR's head SHA as `on_execution_started` does.
         db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
-        (db, product.id, revision.id, execution.id)
+        (dir, db, product.id, revision.id, execution.id)
     }
 
     #[tokio::test]
@@ -11673,7 +11659,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/922";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, product_id, revision_id, execution_id) =
+        let (_dir, db, product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Stamp stop_seen and revision_stop_contributed_head to simulate
         // on_stop_inner having observed Contributed (revision pushed "bbbb")
@@ -11752,7 +11738,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/922";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         let detector = StubPrDetector::ok(None);
         // Branch verifier: SHA unchanged.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -11812,7 +11799,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
@@ -11847,7 +11834,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
@@ -11896,7 +11883,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier
@@ -11941,7 +11928,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier
@@ -11982,7 +11969,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Force the SHA-delta gate to Inapplicable via a transient fetch failure.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -12049,7 +12036,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1252";
         let head = "1111111111111111111111111111111111111111";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         // Worker edited the PR body during this run: live body differs from
         // the run-start snapshot. Head SHA unchanged → NoContribution.
         db.set_execution_pr_body_before(&execution_id, "## Summary\nold body")
@@ -12109,7 +12097,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1253";
         let head = "2222222222222222222222222222222222222222";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         db.set_execution_pr_body_before(&execution_id, "old body").unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
@@ -12177,7 +12166,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1254";
         let head = "3333333333333333333333333333333333333333";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         db.set_execution_pr_body_before(&execution_id, "unchanged body")
             .unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -12221,7 +12211,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1255";
         let head = "4444444444444444444444444444444444444444";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         // Simulate the marker on_stop stamped on a prior turn.
         db.mark_execution_metadata_fix_confirmed(&execution_id).unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -12265,7 +12256,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1256";
         let head = "5555555555555555555555555555555555555555";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         // NO marker stamped (the load-bearing difference from the test above).
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await; // head unchanged → NoContribution
@@ -12329,7 +12321,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1032";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, product_id, revision_id, execution_id) =
+        let (_dir, db, product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Branch verifier: SHA moved (worker pushed revision commit).
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -12402,7 +12394,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1032";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, _revision_id, execution_id) =
+        let (_dir, db, _product_id, _revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Branch verifier: fetch_pr_head_oid fails — simulates transient GitHub API failure.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -12466,7 +12458,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
-        let (db, product_id, revision_id, execution_id) = revision_fixture(
+        let (_dir, db, product_id, revision_id, execution_id) = revision_fixture(
             workspace.path(),
             parent_pr_url,
             "0000000000000000000000000000000000000000",
@@ -12555,7 +12547,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1710";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(
+        let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(
             workspace.path(),
             parent_pr_url,
             "0000000000000000000000000000000000000000",
@@ -12774,13 +12766,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         parent_pr_url: &str,
         head_before: &str,
-    ) -> (Arc<WorkDb>, String, String, String, String, String) {
+    ) -> (TempDir, Arc<WorkDb>, String, String, String, String, String) {
         use crate::work::{ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState};
         use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-conflict-rev-test");
         // Parent chore: blocked:merge_conflict with a bound pr_url.
@@ -12860,7 +12851,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             )
             .unwrap();
         db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
-        (db, product.id, parent.id, revision.id, execution.id, attempt.id)
+        (dir, db, product.id, parent.id, revision.id, execution.id, attempt.id)
     }
 
     #[tokio::test]
@@ -12874,7 +12865,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None); // no branch-keyed PR
@@ -13007,7 +12998,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1710";
         let head = "cccccccccccccccccccccccccccccccccccccccc";
-        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
         // Simulate the dispatch-time snapshot never landing (the actual
         // trigger observed in production): no SHA-delta baseline exists.
@@ -13077,7 +13068,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
@@ -13150,7 +13141,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, parent_chore_id, revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, parent_chore_id, revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         // Simulate the merge-poller's `on_resolved` having already retired
@@ -13215,7 +13206,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
@@ -13266,7 +13257,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             conflict_revision_fixture(workspace.path(), parent_pr_url, head);
 
         let detector = StubPrDetector::ok(None);
@@ -13299,13 +13290,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         parent_pr_url: &str,
         head: &str,
         failed_checks: &str,
-    ) -> (Arc<WorkDb>, String, String, String, String, String) {
+    ) -> (TempDir, Arc<WorkDb>, String, String, String, String, String) {
         use crate::work::{FakePrStateChecker, PrOpenState};
         use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Boss-ci-rev-test");
         let parent = create_test_chore_manual(&db, product.id.clone(), "Fix failing CI: Pull Request Description");
@@ -13387,7 +13377,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             )
             .unwrap();
         db.set_execution_pr_head_before(&execution.id, head).unwrap();
-        (db, product.id, parent.id, revision.id, execution.id, attempt.id)
+        (dir, db, product.id, parent.id, revision.id, execution.id, attempt.id)
     }
 
     /// Build a `PrLifecycleProbe` for an open PR with the given CI status.
@@ -13427,7 +13417,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let failed_checks = r#"[{"name":"Pull Request Description","conclusion":"FAILURE","target_url":"","provider":"other","provider_job_id":null}]"#;
-        let (db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
             ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
 
         let detector = StubPrDetector::ok(None);
@@ -13511,7 +13501,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let failed_checks = r#"[{"name":"Pull Request Description","conclusion":"FAILURE","target_url":"","provider":"other","provider_job_id":null}]"#;
-        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
 
         let detector = StubPrDetector::ok(None);
@@ -13568,7 +13558,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let failed_checks = r#"[{"name":"Pull Request Description","conclusion":"FAILURE","target_url":"","provider":"other","provider_job_id":null}]"#;
-        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
             ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
 
         let detector = StubPrDetector::ok(None);
@@ -13913,7 +13903,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // not attributed to an execution in repo-B.
         let workspace = tempdir().unwrap();
         // Build a product and a chore for repo-A.
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         let repo_a = "git@github.com:spinyfin/mono.git";
         let repo_b = "git@github.com:otherorg/otherrepo.git";
 
@@ -13945,7 +13935,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn detector_uses_branch_naming_from_execution_row() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
 
         // Patch the execution's branch_naming to OpaqueHash so we can verify
         // the detector is called with the opaque-hash branch form.
@@ -13984,6 +13974,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         last_reviewed_sha: Option<&str>,
     ) -> (
+        TempDir,
         Arc<WorkDb>,
         String, // chore_id
         String, // execution_id
@@ -13991,7 +13982,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         String, // expected_branch
     ) {
         const PR_URL: &str = "https://github.com/spinyfin/mono/pull/88";
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace_path);
+        let (dir, db, _product_id, chore_id, execution_id) = fixture(workspace_path);
         if let Some(sha) = last_reviewed_sha {
             db.increment_task_review_cycle(&chore_id, Some(sha))
                 .expect("failed to set last_reviewed_sha");
@@ -13999,7 +13990,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged.record_if_unset(&execution_id, PR_URL);
         let branch = expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None);
-        (db, chore_id, execution_id, staged, branch)
+        (dir, db, chore_id, execution_id, staged, branch)
     }
 
     /// First review of a PR is never skipped by the trivial rule (design §8).
@@ -14010,7 +14001,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn noop_skip_gate_first_review_never_skipped() {
         let workspace = tempdir().unwrap();
         // last_reviewed_sha = None → first review
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), None);
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), None);
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Return a 0-line diff — if the gate were applied, this would trigger a skip.
@@ -14035,7 +14026,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn noop_skip_gate_skips_when_sha_unchanged() {
         const SAME_SHA: &str = "sha_abc123";
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some(SAME_SHA));
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some(SAME_SHA));
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Current head == last_reviewed_sha → skip.
@@ -14059,7 +14050,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_skips_on_empty_diff() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Different head SHA (new commit) but 0 changed lines → pure rebase.
@@ -14083,7 +14074,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_skips_trivial_diff_when_threshold_set() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
@@ -14108,7 +14099,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_does_not_skip_when_diff_meets_threshold() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
@@ -14133,7 +14124,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_default_does_not_skip_nonzero_diff() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
@@ -14159,7 +14150,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_fails_open_on_head_oid_error() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (_dir, db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Simulate a GitHub API failure when fetching the PR head OID.
@@ -14236,7 +14227,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     fn pr_review_exec_fixture(
         workspace_path: &Path,
         review_result_json: Option<&str>,
-    ) -> (Arc<WorkDb>, String, String, String, String) {
+    ) -> (TempDir, Arc<WorkDb>, String, String, String, String) {
         let transcript_jsonl = review_result_json.map(make_review_transcript_jsonl);
         pr_review_exec_fixture_with_jsonl(workspace_path, transcript_jsonl.as_deref())
     }
@@ -14248,11 +14239,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     fn pr_review_exec_fixture_with_jsonl(
         workspace_path: &Path,
         transcript_jsonl: Option<&str>,
-    ) -> (Arc<WorkDb>, String, String, String, String) {
+    ) -> (TempDir, Arc<WorkDb>, String, String, String, String) {
         const PR_URL: &str = "https://github.com/spinyfin/mono/pull/88";
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
 
         let product = create_test_product(&db);
@@ -14323,7 +14313,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 .unwrap();
         }
 
-        (db, product.id, chore.id, pr_review_exec.id, PR_URL.to_owned())
+        (dir, db, product.id, chore.id, pr_review_exec.id, PR_URL.to_owned())
     }
 
     /// Produce a minimal valid `ReviewResult` JSON with no qualifying findings
@@ -14424,7 +14414,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json = clean_review_result_json(pr_url);
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14470,7 +14460,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json = high_finding_review_result_json(pr_url);
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14528,7 +14518,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json = t793_regression_review_result_json(pr_url);
-        let (db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
+        let (_dir, db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14555,7 +14545,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json_a = high_finding_review_result_json(pr_url);
-        let (db, product_id, chore_id, pr_review_exec_a, _pr_url) =
+        let (_dir, db, product_id, chore_id, pr_review_exec_a, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json_a));
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14662,7 +14652,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
         let workspace = tempdir().unwrap();
         // No review result JSON → no transcript written, no artifact written.
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
         let probe_queuer = Arc::new(RecordingProbeQueuer::default());
 
@@ -14715,7 +14706,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14767,7 +14759,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json = high_finding_review_result_json(pr_url);
         // No transcript — the artifact is the only source.
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
         std::fs::write(
             crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
@@ -14813,7 +14806,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         // Transcript contains bare JSON (no fence) — the T1359 shape.
         let jsonl = make_bare_review_transcript_jsonl(&json);
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture_with_jsonl(workspace.path(), Some(&jsonl));
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14897,7 +14890,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json = t1687_regression_string_deletions_json(pr_url);
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), Some(&json));
 
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -14942,7 +14935,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         })
         .to_string();
 
-        let (db, _product_id, _chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
+        let (_dir, db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
         std::fs::write(
             crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
@@ -14990,7 +14984,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn pr_review_cycle_bound_skips_reviewer_and_creates_attention_item() {
         let workspace = tempdir().unwrap();
-        let (db, chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), None);
+        let (_dir, db, chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), None);
 
         // Pre-increment the cycle counter to `max_review_cycles` so the bound
         // is already reached when the producing worker finishes.
@@ -15056,7 +15050,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
 
         // ── Step 1: ChoreImplementation completes → reviewer enqueued ────────
-        let (db, _product_id, chore_id, chore_exec_id) = fixture(workspace.path());
+        let (_dir, db, _product_id, chore_id, chore_exec_id) = fixture(workspace.path());
 
         let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged.record_if_unset(&chore_exec_id, PR_URL);
@@ -15312,7 +15306,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/737";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
 
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -15347,7 +15341,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // The kill-switch off (bare handler default) must preserve the
         // legacy no-reviewer behaviour — belt-and-suspenders check that the
         // ON case above is actually the flag doing the work.
-        let (db2, _product_id2, revision_id2, execution_id2) =
+        let (_dir, db2, _product_id2, revision_id2, execution_id2) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         let verifier2 = StubBranchVerifier::ok("boss/exec_parent");
         verifier2
@@ -15383,7 +15377,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/737";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
 
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -15477,7 +15471,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/737";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
 
         // Head SHA unchanged — the revision worker stopped without pushing
@@ -15528,7 +15522,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1490";
         let head = "abcdef1111111111111111111111111111111111";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         // SHA unchanged → SHA-delta gate returns NoContribution.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
@@ -15583,7 +15578,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1491";
         let head = "1111111111111111111111111111111111111111";
-        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        let (_dir, db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
         // SHA unchanged → NoContribution.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
@@ -15634,7 +15630,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Create a chore with a bound PR URL (simulates a prior run's completion).
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
-        std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = create_test_product_named(&db, "Satisfied Chore Test");
         let chore = create_test_chore(&db, product.id.clone(), "Implement feature X");
@@ -15737,7 +15732,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // NOTE: stop_seen is NOT set — this simulates the revision worker
         // having just been dispatched, pane spawned, but no Stop event yet.
@@ -15812,7 +15807,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // so pr_head_before stays at "aaaa" (not advanced), preserving the
         // delta for merge-poller recovery.
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Stamp stop_seen and revision_stop_contributed_head to simulate
         // on_stop_inner having confirmed the revision's own push ("bbbb")
@@ -15878,7 +15873,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // The pre-stop suppression path advanced pr_head_before to "bbbb".
         // The revision has NOT pushed anything; PR head is still "bbbb".
         let head_before_after_absorption = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before_after_absorption);
         // stop_seen = true: first Stop has already fired (advancing the baseline).
         db.set_execution_stop_seen(&execution_id).unwrap();
@@ -15951,7 +15946,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
         // Execution-start baseline.
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, _revision_id, execution_id) =
+        let (_dir, db, _product_id, _revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // NOTE: stop_seen is NOT set — pre-first-Stop window.
 
@@ -16018,7 +16013,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // stop_seen = true: at least one stop has been observed.
         db.set_execution_stop_seen(&execution_id).unwrap();
@@ -16101,7 +16096,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Stamp stop_seen BEFORE calling on_stop so already_stop_seen=true
         // inside on_stop_inner (simulating a multi-turn revision's second+ stop).
@@ -16193,7 +16188,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/826";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
+        let (_dir, db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
         // Stamp stop_seen BEFORE calling on_stop so already_stop_seen=true
         // inside on_stop_inner, simulating a multi-turn revision's second+

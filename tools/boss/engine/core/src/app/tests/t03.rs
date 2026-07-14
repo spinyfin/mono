@@ -20,7 +20,7 @@ fn authorize_rpc_boss_only_admits_boss_subtree_pid() {
     // With boss_pid installed, a peer whose process tree contains
     // boss_pid as an ancestor (or is boss_pid itself) must be admitted.
     // Use the current process pid — it is "a descendant of itself".
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let our_pid = std::process::id() as libc::pid_t;
     server_state.set_boss_pid(our_pid);
 
@@ -38,7 +38,7 @@ fn authorize_rpc_boss_only_rejects_non_boss_pid_even_when_worker_registered() {
     // the worker registry is irrelevant for the admission decision,
     // but the worker's pid is still outside the boss subtree and
     // must be rejected.
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     let our_pid = std::process::id() as libc::pid_t;
     server_state.set_boss_pid(our_pid);
 
@@ -66,7 +66,7 @@ fn authorize_rpc_boss_only_rejects_when_boss_pid_not_registered() {
     // coordinator's bossctl cannot satisfy BossOnly via the app_pid
     // fallback (its tree goes through Boss.app's libghostty pane, not
     // through BOSS_APP_PID).
-    let server_state = test_server_state();
+    let (server_state, _dir) = test_server_state();
     // test_server_state() passes None for app_pid; with both trust roots
     // absent the permissive "no-roots-configured" path applies. Guard
     // the test against a state machine change by only asserting when

@@ -176,7 +176,7 @@ fn reopen_done_row_clears_completed_at() {
 /// leave non-terminal rows NULL.
 #[test]
 fn migration_completed_at_backfills_from_created_at_not_updated_at() {
-    let path = disk_db_path("migrate-completed-at-backfill");
+    let (_dir, path) = disk_db_path("migrate-completed-at-backfill");
     let conn = rusqlite::Connection::open(&path).unwrap();
 
     // Build a minimal schema without completed_at (simulates pre-v21 DB).
@@ -491,7 +491,7 @@ fn record_worker_idle_abandonment_is_idempotent() {
 /// overwrite already-set completed_at values (the COALESCE/column-exists guard).
 #[test]
 fn migration_completed_at_is_idempotent() {
-    let path = disk_db_path("migrate-completed-at-idempotent");
+    let (_dir, path) = disk_db_path("migrate-completed-at-idempotent");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);

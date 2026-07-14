@@ -595,7 +595,7 @@ mod tests {
     /// NACK must be a pure no-op, never touching the execution.
     #[tokio::test]
     async fn nack_ignored_when_no_live_slot() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let execution_id = create_ready_execution(&server_state);
 
         call_nack(&server_state, &execution_id).await;
@@ -611,7 +611,7 @@ mod tests {
     /// pane actually came up. Reaping here would tear down a live worker.
     #[tokio::test]
     async fn nack_ignored_when_shell_pid_already_reported() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let execution_id = create_ready_execution(&server_state);
         server_state
             .live_worker_states
@@ -634,7 +634,7 @@ mod tests {
     /// it hasn't reported a pid or left `Spawning` yet.
     #[tokio::test]
     async fn nack_ignored_when_hook_event_already_seen() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let execution_id = create_ready_execution(&server_state);
         server_state
             .live_worker_states
@@ -662,7 +662,7 @@ mod tests {
     /// Guard 2c: the slot's activity already progressed past `Spawning`.
     #[tokio::test]
     async fn nack_ignored_when_activity_past_spawning() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let execution_id = create_ready_execution(&server_state);
         server_state
             .live_worker_states
@@ -695,7 +695,7 @@ mod tests {
     /// execution) — must never re-reap a terminal execution.
     #[tokio::test]
     async fn nack_ignored_when_execution_already_terminal() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let execution_id = create_ready_execution(&server_state);
         server_state
             .live_worker_states

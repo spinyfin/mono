@@ -7,7 +7,7 @@ use super::*;
 /// CHECK constraint accepts work-item-scoped writes afterwards.
 #[test]
 fn migration_v6_to_v7_relaxes_work_attention_items() {
-    let path = disk_db_path("attn-v7-migrate");
+    let (_dir, path) = disk_db_path("attn-v7-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     // Stand up just enough of the v6 schema to land an existing
     // attention item against an execution row. Everything else
@@ -328,7 +328,7 @@ fn fresh_init_includes_merge_conflict_schema() {
 /// Idempotent across re-opens.
 #[test]
 fn migration_renames_auto_rebase_enabled_when_present() {
-    let path = disk_db_path("mc-rename-auto-rebase");
+    let (_dir, path) = disk_db_path("mc-rename-auto-rebase");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -396,7 +396,7 @@ fn migration_renames_auto_rebase_enabled_when_present() {
 /// `done` (legacy human-set block).
 #[test]
 fn migration_backfills_blocked_reason_for_active_prereqs() {
-    let path = disk_db_path("mc-blocked-backfill");
+    let (_dir, path) = disk_db_path("mc-blocked-backfill");
     // Stand up the pre-Phase-1 schema by hand: needs `tasks`,
     // `projects`, `products`, `work_item_dependencies`, plus
     // `last_status_actor`. We pre-seed two blocked dependents,
@@ -672,7 +672,7 @@ fn fresh_init_includes_external_tracker_schema() {
 /// one row is unbound (`external_ref_unbound_at IS NOT NULL`).
 #[test]
 fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
-    let path = disk_db_path("ext-tracker-migrate");
+    let (_dir, path) = disk_db_path("ext-tracker-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1055,7 +1055,7 @@ fn list_external_refs_returns_empty_when_no_refs_set() {
 /// `task_blocked_signals` side table. Idempotent across re-opens.
 #[test]
 fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
-    let path = disk_db_path("ci-p7-migrate");
+    let (_dir, path) = disk_db_path("ci-p7-migrate");
     // Stand up a "MC P1-only" schema: tasks have blocked_reason
     // + blocked_attempt_id (the Phase-1 additions), there's a
     // conflict_resolutions table, but none of the Phase-7
@@ -1252,7 +1252,7 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
 /// distinct, because `attempt_kind` is part of the key.
 #[test]
 fn ci_remediations_unique_key_enforced() {
-    let path = disk_db_path("ci-rem-unique");
+    let (_dir, path) = disk_db_path("ci-rem-unique");
     let _db = WorkDb::open(path.clone()).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     let insert = |id: &str, head: &str, kind: &str| -> rusqlite::Result<usize> {
@@ -1292,7 +1292,7 @@ fn ci_remediations_unique_key_enforced() {
 /// the side table exists to model).
 #[test]
 fn task_blocked_signals_pk_enforced() {
-    let path = disk_db_path("tbs-pk");
+    let (_dir, path) = disk_db_path("tbs-pk");
     let _db = WorkDb::open(path.clone()).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
@@ -1346,7 +1346,7 @@ fn task_blocked_signals_pk_enforced() {
 /// invalidates it automatically per design §Q5.
 #[test]
 fn manual_override_writes_ci_failure_suppression() {
-    let path = disk_db_path("ci-manual-override");
+    let (_dir, path) = disk_db_path("ci-manual-override");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-manual");
@@ -1410,7 +1410,7 @@ fn manual_override_writes_ci_failure_suppression() {
 /// reasons as equivalent triggers for the suppression write.
 #[test]
 fn manual_override_from_exhausted_writes_suppression() {
-    let path = disk_db_path("ci-manual-override-exh");
+    let (_dir, path) = disk_db_path("ci-manual-override-exh");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-exh");
@@ -1460,7 +1460,7 @@ fn manual_override_from_exhausted_writes_suppression() {
 /// still proceed after surfacing a loud warning.
 #[test]
 fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
-    let path = disk_db_path("ci-churn");
+    let (_dir, path) = disk_db_path("ci-churn");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-churn");
@@ -1548,7 +1548,7 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
 /// `ci_failure_exhausted` are an override signal.
 #[test]
 fn manual_move_unrelated_to_ci_does_not_write_suppression() {
-    let path = disk_db_path("ci-manual-override-noop");
+    let (_dir, path) = disk_db_path("ci-manual-override-noop");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = create_test_chore_manual(&db, product.id.clone(), "chore-noop");
@@ -2172,7 +2172,7 @@ fn fresh_init_includes_editorial_controls_schema() {
 /// table idempotently; pre-existing product rows read back as NULL.
 #[test]
 fn migration_adds_editorial_controls_columns() {
-    let path = disk_db_path("editorial-migrate");
+    let (_dir, path) = disk_db_path("editorial-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);

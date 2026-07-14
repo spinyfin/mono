@@ -1224,7 +1224,7 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
 mod tests {
     use super::*;
 
-    fn test_server_state() -> Arc<ServerState> {
+    fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let cfg = Arc::new(RuntimeConfig::from_parts(
             crate::config::WorkConfig::builder()
@@ -1233,10 +1233,8 @@ mod tests {
                 .build(),
             None,
         ));
-        // Leak the temp dir for the lifetime of the test process; the
-        // ServerState's WorkDb keeps a handle to a path inside it.
-        std::mem::forget(temp);
-        ServerState::new_arc_with_app_pid(cfg, None, None).unwrap()
+        let state = ServerState::new_arc_with_app_pid(cfg, None, None).unwrap();
+        (state, temp)
     }
 
     fn make_session_sink() -> Arc<SessionSink> {
@@ -1306,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_answer_replies_and_transitions_comment_to_answered() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let (comment_id, execution_id) = seed_answering_comment(&work_db);
@@ -1351,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_answer_rejects_duplicate_reply_on_the_same_run() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let (comment_id, execution_id) = seed_answering_comment(&work_db);
@@ -1397,7 +1395,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_answer_rejects_a_non_answer_agent_execution() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let (_comment_id, _execution_id) = seed_answering_comment(&work_db);
@@ -1484,7 +1482,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_followup_appends_thread_entry_and_transitions_to_awaiting_followup() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let comment_id = seed_answered_comment(&work_db);
@@ -1524,7 +1522,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_followup_rejects_empty_body() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let comment_id = seed_answered_comment(&work_db);
@@ -1554,7 +1552,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_followup_rejects_a_comment_that_is_not_answered() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let comment = work_db
@@ -1662,7 +1660,7 @@ mod tests {
 
     #[test]
     fn resolve_answer_agent_repo_falls_back_to_product_docs_repo_for_investigation_task() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
 
@@ -1674,7 +1672,7 @@ mod tests {
 
     #[test]
     fn resolve_answer_agent_repo_falls_back_to_product_repo_remote_url_when_no_docs_repo() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         // No `docs_repo` configured — the resolver's next fallback is the
         // product's default code repo, exactly like real dispatch does for
@@ -1689,7 +1687,7 @@ mod tests {
 
     #[test]
     fn resolve_answer_agent_repo_reports_failed_when_product_has_no_repo_at_all() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let comment = seed_investigation_question_comment(&work_db, None, None);
 
@@ -1701,7 +1699,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_answer_agent_records_a_failed_run_and_leaves_the_comment_active_when_repo_unresolved() {
-        let server_state = test_server_state();
+        let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let comment = seed_investigation_question_comment(&work_db, None, None);

@@ -1436,7 +1436,7 @@ fn create_project_no_design_task_creates_project_alone() {
 /// card sits at the head of each project's chain on next open.
 #[test]
 fn migration_backfills_design_tasks_for_existing_projects() {
-    let path = disk_db_path("migration-design-backfill");
+    let (_dir, path) = disk_db_path("migration-design-backfill");
     // First open establishes the schema. We then forcibly delete
     // the auto-created design task to mirror a database created
     // before this column existed.
@@ -1578,7 +1578,7 @@ fn start_execution_run_clears_autostart() {
 /// single-shot semantics apply to pre-migration databases.
 #[test]
 fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
-    let path = disk_db_path("autostart-backfill");
+    let (_dir, path) = disk_db_path("autostart-backfill");
     // Pre-populate a v9 schema with rows in various statuses, all
     // with autostart = 1, then re-open via WorkDb to run migrations.
     {
