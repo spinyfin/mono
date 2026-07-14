@@ -4680,6 +4680,42 @@ fn print_table(table: Table) {
     println!("{table}");
 }
 
+/// Builder for the `FIELD`/`VALUE` detail tables used by the various
+/// `print_*_detail` / snapshot printers. Starts a two-column table,
+/// accumulates rows via [`row`](DetailTable::row) /
+/// [`opt_row`](DetailTable::opt_row) (the latter applying the shared
+/// `<unset>` fallback for absent optional values), and renders with
+/// [`print`](DetailTable::print).
+struct DetailTable {
+    table: Table,
+}
+
+impl DetailTable {
+    fn new() -> Self {
+        DetailTable {
+            table: new_dynamic_table(vec!["FIELD", "VALUE"]),
+        }
+    }
+
+    /// Add a row with a value that is always present.
+    fn row(mut self, field: &str, value: impl AsRef<str>) -> Self {
+        self.table.add_row(vec![field, value.as_ref()]);
+        self
+    }
+
+    /// Add a row for an optional value, rendering `<unset>` when absent.
+    fn opt_row(mut self, field: &str, value: Option<String>) -> Self {
+        let rendered = value.unwrap_or_else(|| "<unset>".to_owned());
+        self.table.add_row(vec![field, rendered.as_str()]);
+        self
+    }
+
+    /// Render the accumulated table to stdout.
+    fn print(self) {
+        print_table(self.table);
+    }
+}
+
 fn print_automations_table(automations: &[Automation]) {
     let mut table = new_dynamic_table(["#", "NAME", "SCHEDULE", "ENABLED", "OPEN", "LAST OUTCOME", "NEXT DUE"]);
     for a in automations {
@@ -6154,56 +6190,26 @@ fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
 }
 
 fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
-    let mut table = new_dynamic_table(vec!["FIELD", "VALUE"]);
-    let unset = "<unset>".to_owned();
-    let rows: Vec<(&str, String)> = vec![
-        ("id", attempt.id.clone()),
-        ("status", attempt.status.clone()),
-        ("product_id", attempt.product_id.clone()),
-        ("work_item_id", attempt.work_item_id.clone()),
-        ("pr_url", attempt.pr_url.clone()),
-        ("pr_number", attempt.pr_number.to_string()),
-        ("head_branch", attempt.head_branch.clone()),
-        ("base_branch", attempt.base_branch.clone()),
-        (
-            "base_sha_at_trigger",
-            attempt.base_sha_at_trigger.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "head_sha_before",
-            attempt.head_sha_before.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "head_sha_after",
-            attempt.head_sha_after.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "failure_reason",
-            attempt.failure_reason.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "cube_lease_id",
-            attempt.cube_lease_id.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "cube_workspace_id",
-            attempt.cube_workspace_id.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        ("worker_id", attempt.worker_id.clone().unwrap_or_else(|| unset.clone())),
-        ("created_at", attempt.created_at.clone()),
-        (
-            "started_at",
-            attempt.started_at.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "finished_at",
-            attempt.finished_at.clone().unwrap_or_else(|| unset.clone()),
-        ),
-    ];
-    for (field, value) in &rows {
-        table.add_row(vec![*field, value.as_str()]);
-    }
-    print_table(table);
+    DetailTable::new()
+        .row("id", &attempt.id)
+        .row("status", &attempt.status)
+        .row("product_id", &attempt.product_id)
+        .row("work_item_id", &attempt.work_item_id)
+        .row("pr_url", &attempt.pr_url)
+        .row("pr_number", attempt.pr_number.to_string())
+        .row("head_branch", &attempt.head_branch)
+        .row("base_branch", &attempt.base_branch)
+        .opt_row("base_sha_at_trigger", attempt.base_sha_at_trigger.clone())
+        .opt_row("head_sha_before", attempt.head_sha_before.clone())
+        .opt_row("head_sha_after", attempt.head_sha_after.clone())
+        .opt_row("failure_reason", attempt.failure_reason.clone())
+        .opt_row("cube_lease_id", attempt.cube_lease_id.clone())
+        .opt_row("cube_workspace_id", attempt.cube_workspace_id.clone())
+        .opt_row("worker_id", attempt.worker_id.clone())
+        .row("created_at", &attempt.created_at)
+        .opt_row("started_at", attempt.started_at.clone())
+        .opt_row("finished_at", attempt.finished_at.clone())
+        .print();
     if let Some(diag) = &attempt.conflict_diagnosis {
         println!();
         println!("conflict_diagnosis (raw):");
@@ -6228,54 +6234,27 @@ fn print_ci_remediations_table(attempts: &[CiRemediation]) {
 }
 
 fn print_ci_remediation_detail(attempt: &CiRemediation) {
-    let mut table = new_dynamic_table(vec!["FIELD", "VALUE"]);
-    let unset = "<unset>".to_owned();
-    let rows: Vec<(&str, String)> = vec![
-        ("id", attempt.id.clone()),
-        ("status", attempt.status.clone()),
-        ("attempt_kind", attempt.attempt_kind.clone()),
-        ("consumes_budget", attempt.consumes_budget.to_string()),
-        ("product_id", attempt.product_id.clone()),
-        ("work_item_id", attempt.work_item_id.clone()),
-        ("pr_url", attempt.pr_url.clone()),
-        ("pr_number", attempt.pr_number.to_string()),
-        ("head_branch", attempt.head_branch.clone()),
-        ("head_sha_at_trigger", attempt.head_sha_at_trigger.clone()),
-        (
-            "head_sha_after",
-            attempt.head_sha_after.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "triage_class",
-            attempt.triage_class.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "failure_reason",
-            attempt.failure_reason.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "cube_lease_id",
-            attempt.cube_lease_id.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "cube_workspace_id",
-            attempt.cube_workspace_id.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        ("worker_id", attempt.worker_id.clone().unwrap_or_else(|| unset.clone())),
-        ("created_at", attempt.created_at.clone()),
-        (
-            "started_at",
-            attempt.started_at.clone().unwrap_or_else(|| unset.clone()),
-        ),
-        (
-            "finished_at",
-            attempt.finished_at.clone().unwrap_or_else(|| unset.clone()),
-        ),
-    ];
-    for (field, value) in &rows {
-        table.add_row(vec![*field, value.as_str()]);
-    }
-    print_table(table);
+    DetailTable::new()
+        .row("id", &attempt.id)
+        .row("status", &attempt.status)
+        .row("attempt_kind", &attempt.attempt_kind)
+        .row("consumes_budget", attempt.consumes_budget.to_string())
+        .row("product_id", &attempt.product_id)
+        .row("work_item_id", &attempt.work_item_id)
+        .row("pr_url", &attempt.pr_url)
+        .row("pr_number", attempt.pr_number.to_string())
+        .row("head_branch", &attempt.head_branch)
+        .row("head_sha_at_trigger", &attempt.head_sha_at_trigger)
+        .opt_row("head_sha_after", attempt.head_sha_after.clone())
+        .opt_row("triage_class", attempt.triage_class.clone())
+        .opt_row("failure_reason", attempt.failure_reason.clone())
+        .opt_row("cube_lease_id", attempt.cube_lease_id.clone())
+        .opt_row("cube_workspace_id", attempt.cube_workspace_id.clone())
+        .opt_row("worker_id", attempt.worker_id.clone())
+        .row("created_at", &attempt.created_at)
+        .opt_row("started_at", attempt.started_at.clone())
+        .opt_row("finished_at", attempt.finished_at.clone())
+        .print();
     if !attempt.failed_checks.is_empty() {
         println!();
         println!("failed_checks (raw):");
@@ -6289,24 +6268,19 @@ fn print_ci_remediation_detail(attempt: &CiRemediation) {
 }
 
 fn print_ci_budget_snapshot(snapshot: &CiBudgetSnapshot) {
-    let mut table = new_dynamic_table(vec!["FIELD", "VALUE"]);
     let override_text = match snapshot.per_pr_override {
         Some(n) => n.to_string(),
         None => "<inherit>".to_owned(),
     };
     let blocked = snapshot.blocked_reason.clone().unwrap_or_else(|| "—".to_owned());
-    let rows = vec![
-        ("work_item_id", snapshot.work_item_id.clone()),
-        ("per_pr_override", override_text),
-        ("product_default", snapshot.product_default.to_string()),
-        ("effective", snapshot.effective.to_string()),
-        ("used", snapshot.used.to_string()),
-        ("blocked_reason", blocked),
-    ];
-    for (field, value) in &rows {
-        table.add_row(vec![*field, value.as_str()]);
-    }
-    print_table(table);
+    DetailTable::new()
+        .row("work_item_id", &snapshot.work_item_id)
+        .row("per_pr_override", override_text)
+        .row("product_default", snapshot.product_default.to_string())
+        .row("effective", snapshot.effective.to_string())
+        .row("used", snapshot.used.to_string())
+        .row("blocked_reason", blocked)
+        .print();
 }
 
 fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetSnapshot, was_exhausted: bool) {
