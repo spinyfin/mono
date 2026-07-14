@@ -829,22 +829,6 @@ mod tests {
     use crate::test_support::*;
     use crate::work::{ExecutionStatus, WorkDb};
 
-    /// Create a `ready` execution for `work_item_id` and stamp its
-    /// `started_at` to 5 minutes ago so the grace-period guard passes.
-    fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
-        use boss_protocol::RequestExecutionInput;
-        let execution = db
-            .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
-            .unwrap();
-        let old_started_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(300) as i64; // 5 minutes ago
-        db.force_started_at_for_test(&execution.id, old_started_at).unwrap();
-        execution.id
-    }
-
     /// Register a slot in the live-state registry with the given PID and
     /// an optional work-item binding. Activity is left as `Spawning`
     /// (non-terminal, so the sweep considers it).

@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 use boss_protocol::{
     Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
-    ExecutionStatus, FrontendEvent, Product, Task, WorkExecution,
+    ExecutionStatus, FrontendEvent, Product, RequestExecutionInput, Task, WorkExecution,
 };
 
 /// The mono repo remote used by the overwhelming majority of tests.
@@ -151,6 +152,35 @@ pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>
             .build(),
     )
     .unwrap()
+}
+
+/// Request an execution for `work_item_id`, then stamp its `started_at`
+/// to `secs_ago` seconds in the past. Returns the execution id.
+///
+/// The sweep test modules use this to age an execution past a
+/// grace-period guard so the sweep under test considers it. `secs_ago`
+/// is saturated against the epoch, so an implausibly large value simply
+/// clamps to `0` rather than underflowing.
+pub fn create_execution_started_secs_ago(db: &WorkDb, work_item_id: &str, secs_ago: u64) -> String {
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
+        .unwrap();
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(secs_ago) as i64;
+    db.force_started_at_for_test(&execution.id, started_at).unwrap();
+    execution.id
+}
+
+/// Create a `ready` execution for `work_item_id` and stamp its
+/// `started_at` to 5 minutes ago so a grace-period guard passes.
+///
+/// Thin wrapper over [`create_execution_started_secs_ago`] with the
+/// 300-second offset the sweep tests share.
+pub fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
+    create_execution_started_secs_ago(db, work_item_id, 300)
 }
 
 /// Seed the standard "daily automation" fixture under `product_id`:
