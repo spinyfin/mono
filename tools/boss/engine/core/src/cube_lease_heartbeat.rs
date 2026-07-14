@@ -710,7 +710,8 @@ async fn auto_reap_dead_lease(
 
     if !host_offline {
         let verdict =
-            run_reconcile::confirm_execution_dead(ctx.cube_client, execution, run_reconcile::current_epoch_s()).await;
+            run_reconcile::confirm_execution_dead(ctx.cube_client, execution, crate::epoch_time::now_epoch_secs())
+                .await;
         if !matches!(verdict, RunReconcileVerdict::Dead) {
             // Sustained heartbeat failure alone is not proof of death — could be
             // a transient cube CLI error or a cube outage hitting every lease at

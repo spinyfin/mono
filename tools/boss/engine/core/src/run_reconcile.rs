@@ -89,7 +89,7 @@ impl RunReconcileReport {
 /// Probe `cube workspace list` once and decide the verdict for every
 /// in-flight execution against that snapshot. `now_epoch_s` is plumbed
 /// in so unit tests can pin a deterministic clock; production callers
-/// should use [`current_epoch_s`].
+/// pass [`crate::epoch_time::now_epoch_secs`].
 pub async fn probe_in_flight_runs(
     cube: &dyn CubeClient,
     in_flight: &[WorkExecution],
@@ -253,13 +253,6 @@ pub async fn confirm_execution_dead(
     let by_workspace_id: HashMap<&str, &CubeWorkspaceStatus> =
         snapshot.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
     classify(execution, &by_workspace_id, now_epoch_s)
-}
-
-/// Production wall-clock helper for the probe. Tests pass a fixed
-/// epoch directly to [`probe_in_flight_runs`] so they don't depend on
-/// the system clock.
-pub fn current_epoch_s() -> i64 {
-    crate::epoch_time::now_epoch_secs()
 }
 
 #[cfg(test)]

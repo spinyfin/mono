@@ -223,7 +223,7 @@ pub fn spawn_loop(
         // from completed/orphaned executions are harmless.
         let mut nudged_executions: HashSet<String> = HashSet::new();
         loop {
-            let now = current_epoch_s();
+            let now = crate::epoch_time::now_epoch_secs();
             let cx = RecoveryContext {
                 work_db: work_db.as_ref(),
                 live_states: live_states.as_ref(),
@@ -640,10 +640,6 @@ fn clip(s: &str, max_bytes: usize) -> String {
     crate::string_clip::clip_to_bytes(&one_line, max_bytes)
 }
 
-pub fn current_epoch_s() -> i64 {
-    crate::epoch_time::now_epoch_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -773,7 +769,7 @@ mod tests {
     const NORMAL_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on the task"}]}}"#;
 
     fn now() -> i64 {
-        super::current_epoch_s()
+        crate::epoch_time::now_epoch_secs()
     }
 
     /// Build the six-field [`RecoveryContext`] shared by nearly every test,
