@@ -1756,6 +1756,11 @@ pub fn pr_labels_opt_out(labels: &[String]) -> bool {
 ///   - `state=MERGED` or non-empty `mergedAt` → `Merged`.
 ///   - `state=CLOSED` (and not merged) → `ClosedUnmerged`.
 ///   - `state=OPEN` (or unknown / empty, treated as still-open):
+///
+/// The merged / closed / open decision from `(state, mergedAt)` is
+/// delegated to the shared [`crate::work::classify_pr_merge_state`]
+/// helper (also used by the revision gate's `map_gh_state`); this
+/// function layers the open-PR mergeability / CI axes on top:
 ///       * `mergeable=CONFLICTING` AND `mergeStateStatus=DIRTY` → `Conflict`
 ///       * `mergeable=UNKNOWN` → `Unknown` (GitHub is recomputing; skip conflict transitions)
 ///       * everything else → `Clean`.
@@ -1781,12 +1786,10 @@ fn classify_state(
     merge_state_status: &str,
     ci: OpenPrCiStatus,
 ) -> PrLifecycleState {
-    let merged_at_present = !merged_at.is_empty() && !merged_at.eq_ignore_ascii_case("null");
-    if raw_state.eq_ignore_ascii_case("MERGED") || merged_at_present {
-        return PrLifecycleState::Merged;
-    }
-    if raw_state.eq_ignore_ascii_case("CLOSED") {
-        return PrLifecycleState::ClosedUnmerged;
+    match crate::work::classify_pr_merge_state(raw_state, merged_at) {
+        crate::work::PrMergeClass::Merged => return PrLifecycleState::Merged,
+        crate::work::PrMergeClass::ClosedUnmerged => return PrLifecycleState::ClosedUnmerged,
+        crate::work::PrMergeClass::Open => {}
     }
     let conflicting = mergeable.eq_ignore_ascii_case("CONFLICTING") && merge_state_status.eq_ignore_ascii_case("DIRTY");
     let mergeability = if conflicting {

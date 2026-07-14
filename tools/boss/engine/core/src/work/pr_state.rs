@@ -19,6 +19,53 @@ pub enum PrOpenState {
     ClosedUnmerged,
 }
 
+/// Coarse GitHub PR lifecycle classification derivable purely from the
+/// `(state, mergedAt)` pair returned by `gh pr view`.
+///
+/// This is the single source of truth for the merged / closed-unmerged /
+/// open tri-state. Both the merge poller
+/// ([`crate::merge_poller::classify_state`]) and the revision gate
+/// ([`map_gh_state`]) map from this shared classification into their own
+/// richer enums ([`crate::merge_poller::PrLifecycleState`] /
+/// [`PrOpenState`]), so the (state, mergedAt) decision lives in exactly
+/// one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrMergeClass {
+    /// `state == MERGED`, or a non-empty `mergedAt` timestamp is present.
+    Merged,
+    /// `state == CLOSED` and the PR was not merged.
+    ClosedUnmerged,
+    /// Still open, or an unknown / empty state treated as still-open.
+    Open,
+}
+
+/// Classify a GitHub PR's `(state, mergedAt)` fields into the shared
+/// [`PrMergeClass`] tri-state.
+///
+/// Rules:
+///   - `state == MERGED` (case-insensitive) **or** a non-empty,
+///     non-`"null"` `mergedAt` → [`PrMergeClass::Merged`].
+///   - `state == CLOSED` (case-insensitive), not merged →
+///     [`PrMergeClass::ClosedUnmerged`].
+///   - anything else (including a missing / empty / unrecognized state)
+///     → [`PrMergeClass::Open`].
+///
+/// Matching is case-insensitive so `gh`'s canonical uppercase values and
+/// any lowercase drift map alike. `merged_at` is treated as absent when
+/// it is empty or the literal string `"null"` — a JSON `null` surfaces
+/// either as an absent field (empty here) or, when stringified, as the
+/// text `null`.
+pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
+    let merged_at_present = !merged_at.is_empty() && !merged_at.eq_ignore_ascii_case("null");
+    if state.eq_ignore_ascii_case("MERGED") || merged_at_present {
+        PrMergeClass::Merged
+    } else if state.eq_ignore_ascii_case("CLOSED") {
+        PrMergeClass::ClosedUnmerged
+    } else {
+        PrMergeClass::Open
+    }
+}
+
 /// Production implementation: shells out to `gh pr view`.
 pub struct GhPrStateChecker;
 
@@ -43,15 +90,19 @@ impl PrStateChecker for GhPrStateChecker {
 /// [`PrOpenState`]. Extracted from [`GhPrStateChecker::check`] so the mapping
 /// can be unit-tested without shelling out to `gh`.
 ///
-/// `state` is upper-cased before matching, so `gh`'s canonical uppercase
-/// values (`MERGED`/`CLOSED`/`OPEN`) and any lowercase variants map alike;
-/// a missing or unrecognized state falls through to [`PrOpenState::Open`].
+/// Delegates the merged / closed / open decision to the shared
+/// [`classify_pr_merge_state`] helper, so matching is case-insensitive
+/// (`gh`'s canonical uppercase values and any lowercase drift map alike)
+/// and a non-empty `mergedAt` counts as merged even when `state` is not
+/// `MERGED`. A missing or unrecognized state falls through to
+/// [`PrOpenState::Open`].
 fn map_gh_state(v: &serde_json::Value) -> PrOpenState {
-    let state = v["state"].as_str().unwrap_or("").to_ascii_uppercase();
-    match state.as_str() {
-        "MERGED" => PrOpenState::Merged,
-        "CLOSED" => PrOpenState::ClosedUnmerged,
-        _ => PrOpenState::Open,
+    let state = v["state"].as_str().unwrap_or("");
+    let merged_at = v["mergedAt"].as_str().unwrap_or("");
+    match classify_pr_merge_state(state, merged_at) {
+        PrMergeClass::Merged => PrOpenState::Merged,
+        PrMergeClass::ClosedUnmerged => PrOpenState::ClosedUnmerged,
+        PrMergeClass::Open => PrOpenState::Open,
     }
 }
 
@@ -193,5 +244,43 @@ mod tests {
     fn non_string_state_maps_to_open() {
         // A non-string `state` value can't be read as a str, so it falls through to Open.
         assert_eq!(map_gh_state(&json!({"state": 42})), PrOpenState::Open);
+    }
+
+    #[test]
+    fn non_empty_merged_at_maps_to_merged_even_if_state_not_merged() {
+        // Previously map_gh_state ignored `mergedAt`; now a non-empty
+        // timestamp classifies as Merged regardless of `state`, matching
+        // the merge poller's `classify_state`.
+        assert_eq!(
+            map_gh_state(&json!({"state": "OPEN", "mergedAt": "2026-01-01T00:00:00Z"})),
+            PrOpenState::Merged
+        );
+    }
+
+    #[test]
+    fn classify_pr_merge_state_covers_the_tri_state() {
+        // state == MERGED
+        assert_eq!(classify_pr_merge_state("MERGED", ""), PrMergeClass::Merged);
+        // non-empty mergedAt wins even when state isn't MERGED
+        assert_eq!(
+            classify_pr_merge_state("OPEN", "2026-01-01T00:00:00Z"),
+            PrMergeClass::Merged
+        );
+        // closed and not merged
+        assert_eq!(classify_pr_merge_state("CLOSED", ""), PrMergeClass::ClosedUnmerged);
+        assert_eq!(classify_pr_merge_state("CLOSED", "null"), PrMergeClass::ClosedUnmerged);
+        // open / unknown / empty
+        assert_eq!(classify_pr_merge_state("OPEN", ""), PrMergeClass::Open);
+        assert_eq!(classify_pr_merge_state("", ""), PrMergeClass::Open);
+        assert_eq!(classify_pr_merge_state("SOMETHING_ELSE", ""), PrMergeClass::Open);
+    }
+
+    #[test]
+    fn classify_pr_merge_state_is_case_insensitive() {
+        assert_eq!(classify_pr_merge_state("merged", ""), PrMergeClass::Merged);
+        assert_eq!(classify_pr_merge_state("closed", "null"), PrMergeClass::ClosedUnmerged);
+        assert_eq!(classify_pr_merge_state("open", ""), PrMergeClass::Open);
+        // "null" in any case is treated as absent mergedAt.
+        assert_eq!(classify_pr_merge_state("OPEN", "NULL"), PrMergeClass::Open);
     }
 }
