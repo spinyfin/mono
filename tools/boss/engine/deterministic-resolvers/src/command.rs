@@ -41,8 +41,11 @@ impl CommandRunner for RealCommandRunner {
 
 #[cfg(test)]
 pub(crate) struct FakeCommandRunner {
-    outcome: std::sync::Mutex<Option<std::io::Result<CommandOutput>>>,
-    /// File to (re)write in `cwd` when `run` succeeds, simulating a real
+    /// Outcomes returned in order, one per call. A resolver that issues
+    /// more calls than outcomes were queued panics (test bug, not a
+    /// production path).
+    outcomes: std::sync::Mutex<std::collections::VecDeque<std::io::Result<CommandOutput>>>,
+    /// File to (re)write in `cwd` when a call succeeds, simulating a real
     /// `cargo`/`bazel` invocation actually regenerating the lockfile.
     writes_file: Option<(String, String)>,
     pub(crate) calls: std::sync::Mutex<Vec<(String, Vec<String>, std::path::PathBuf)>>,
@@ -81,8 +84,15 @@ impl FakeCommandRunner {
     }
 
     fn with_outcome(outcome: std::io::Result<CommandOutput>) -> Self {
+        Self::sequence(vec![outcome])
+    }
+
+    /// Returns `outcomes[0]` on the first call, `outcomes[1]` on the
+    /// second, and so on — for resolvers (like the recipe resolver)
+    /// that issue more than one command per `resolve` call.
+    pub(crate) fn sequence(outcomes: Vec<std::io::Result<CommandOutput>>) -> Self {
         Self {
-            outcome: std::sync::Mutex::new(Some(outcome)),
+            outcomes: std::sync::Mutex::new(outcomes.into_iter().collect()),
             writes_file: None,
             calls: std::sync::Mutex::new(Vec::new()),
         }
@@ -99,11 +109,11 @@ impl CommandRunner for FakeCommandRunner {
             cwd.to_path_buf(),
         ));
         let outcome = self
-            .outcome
+            .outcomes
             .lock()
             .unwrap()
-            .take()
-            .expect("FakeCommandRunner outcome consumed more than once");
+            .pop_front()
+            .expect("FakeCommandRunner ran out of queued outcomes");
         if let (Ok(output), Some((filename, contents))) = (&outcome, &self.writes_file)
             && output.success
         {

@@ -305,10 +305,14 @@ dependencies = [
 name = "boss-deterministic-resolvers"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "boss-conflict-diagnosis",
+ "globset",
+ "serde",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
