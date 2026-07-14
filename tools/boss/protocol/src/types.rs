@@ -3621,6 +3621,25 @@ pub struct WorkAttentionItem {
     /// `execution_id` — exactly one of the two is `Some`.
     #[serde(default)]
     pub work_item_id: Option<String>,
+    /// Set when this item was closed via "create task" (currently only
+    /// `deferred_scope` items support that closure path) — the id of the
+    /// followup task the conversion produced. `None` for every item still
+    /// open or closed by another path (e.g. accepted/resolved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converted_task_id: Option<String>,
+}
+
+/// One open `deferred_scope` attention item, paired with the id of the
+/// work item whose execution recorded it. `WorkAttentionItem` itself
+/// carries only `execution_id` for this kind (never `work_item_id` — see
+/// [`WorkAttentionItem::work_item_id`]), so callers that need to place the
+/// item on a specific kanban card (rather than just an execution) need the
+/// join already done. Produced by the engine's product-wide deferred-scope
+/// listing (`WorkDb::list_open_deferred_scope_attentions_for_product`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredScopeAttention {
+    pub item: WorkAttentionItem,
+    pub source_work_item_id: String,
 }
 
 /// An engine-persisted comment row (`work_comments` table). Anchored to an
@@ -3902,6 +3921,16 @@ impl WorkItem {
             WorkItem::Product(p) => &p.id,
             WorkItem::Project(p) => &p.id,
             WorkItem::Task(t) | WorkItem::Chore(t) => &t.id,
+        }
+    }
+
+    /// The owning product's id — the product's own id for a `Product`,
+    /// otherwise the `product_id` foreign key every other variant carries.
+    pub fn product_id(&self) -> &str {
+        match self {
+            WorkItem::Product(p) => &p.id,
+            WorkItem::Project(p) => &p.product_id,
+            WorkItem::Task(t) | WorkItem::Chore(t) => &t.product_id,
         }
     }
 }

@@ -2395,6 +2395,10 @@ struct WorkAttentionItem: Identifiable, Codable, Hashable {
     var bodyMarkdown: String
     var createdAt: String
     var resolvedAt: String?
+    /// Set only when this item was closed via "create task" (currently only
+    /// `deferred_scope` items support that path) — the id of the followup
+    /// task the conversion produced.
+    var convertedTaskID: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -2406,7 +2410,21 @@ struct WorkAttentionItem: Identifiable, Codable, Hashable {
         case bodyMarkdown = "body_markdown"
         case createdAt = "created_at"
         case resolvedAt = "resolved_at"
+        case convertedTaskID = "converted_task_id"
     }
+}
+
+/// Swift mirror of `boss_protocol::DeferredScopeAttention` — one open
+/// `deferred_scope` attention item paired with the id of the work item
+/// whose execution recorded it. `WorkAttentionItem.workItemID` is always
+/// `nil` for this kind (it carries only `executionID` — see
+/// [`WorkAttentionItem.workItemID`]), so this join is what lets the kanban
+/// place the item on the right card.
+struct DeferredScopeAttention: Identifiable, Hashable {
+    var item: WorkAttentionItem
+    var sourceWorkItemID: String
+
+    var id: String { item.id }
 }
 
 // AttentionGroup / Attention / AttentionMerge and their extensions live in

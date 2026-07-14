@@ -4,6 +4,20 @@ use std::time::Instant;
 
 use crate::population_timing::{PopulationTrace, elapsed_ms, segment};
 
+/// Truncate `s` to at most `max_chars` characters (char-boundary-safe —
+/// `s.len()` counts bytes, which would panic mid-codepoint on non-ASCII
+/// input), appending `…` when it was cut. Used to keep a `deferred_scope`
+/// marker's freeform `summary=` text from producing an unreasonably long
+/// task title.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_owned();
+    }
+    let mut truncated: String = s.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
+}
+
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
@@ -43,7 +57,7 @@ impl WorkDb {
         ensure_execution_exists(&conn, execution_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items
              WHERE execution_id = ?1
              ORDER BY created_at ASC, id ASC",
@@ -64,7 +78,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
         let mut stmt = conn.prepare(
-            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items
              WHERE work_item_id = ?1
              ORDER BY created_at ASC, id ASC",
@@ -214,6 +228,173 @@ impl WorkDb {
             ],
         )?;
         Ok(rows)
+    }
+
+    /// Close an open `deferred_scope` attention item without producing a
+    /// followup task — the human's conscious call that the deferred
+    /// remainder needs no further tracking. Rejects any other kind (the
+    /// closure verb `worker_escalation`/`worker_blocked` already have via
+    /// [`Self::resolve_worker_signal_attentions_for_execution`] doesn't
+    /// apply here) and any non-`open` item (no double-closing).
+    pub fn resolve_deferred_scope_attention(&self, id: &str) -> Result<WorkAttentionItem> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let attention = query_attention_item(&tx, id)?.with_context(|| format!("unknown attention item: {id}"))?;
+        if attention.kind != crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND {
+            bail!(
+                "attention item {id} is not a deferred_scope item (kind = {})",
+                attention.kind
+            );
+        }
+        if attention.status != "open" {
+            bail!("attention item {id} is not open (status = {})", attention.status);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_attention_items SET status = 'accepted', resolved_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        let updated =
+            query_attention_item(&tx, id)?.with_context(|| format!("missing attention item after update: {id}"))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// File a followup task from an open `deferred_scope` attention item
+    /// (the "Create task" gesture) and atomically flip the item to
+    /// `status = "converted"` with `converted_task_id` set to the new
+    /// task. The new task's name/description are prefilled from the
+    /// marker's `summary`/`reason` fields plus provenance to the source
+    /// task and (when it has one) its PR — mirroring the
+    /// `TaskKind::Followup` / `origin_task_short_id` / `origin_pr_number`
+    /// convention `action_attention_group`'s followup-group path already
+    /// uses for PR-review findings.
+    pub fn create_task_from_deferred_scope_attention(&self, attention_id: &str) -> Result<(WorkAttentionItem, Task)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let attention = query_attention_item(&tx, attention_id)?
+            .with_context(|| format!("unknown attention item: {attention_id}"))?;
+        if attention.kind != crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND {
+            bail!(
+                "attention item {attention_id} is not a deferred_scope item (kind = {})",
+                attention.kind
+            );
+        }
+        if attention.status != "open" {
+            bail!(
+                "attention item {attention_id} is not open (status = {})",
+                attention.status
+            );
+        }
+        let execution_id = attention
+            .execution_id
+            .as_deref()
+            .with_context(|| format!("deferred_scope attention item {attention_id} has no execution_id"))?;
+        let execution =
+            query_execution(&tx, execution_id)?.with_context(|| format!("unknown execution: {execution_id}"))?;
+        let source_task = query_task(&tx, &execution.work_item_id)?
+            .with_context(|| format!("unknown source work item: {}", execution.work_item_id))?;
+
+        // The marker line lives verbatim inside `body_markdown`'s fenced
+        // code block; re-run the same detector that filed it rather than
+        // re-implementing fenced-block extraction.
+        let marker_line = crate::deferred_scope::detect_deferred_scope_items(&attention.body_markdown)
+            .into_iter()
+            .next()
+            .map(|parsed| parsed.marker_line)
+            .unwrap_or_else(|| attention.body_markdown.clone());
+        let (summary, reason) = crate::deferred_scope::summary_and_reason(&marker_line);
+        let summary_text = summary.unwrap_or_else(|| "(summary not parseable — see marker below)".to_owned());
+        let reason_text = reason.unwrap_or_else(|| "(reason not parseable — see marker below)".to_owned());
+
+        let name = format!("Deferred: {}", truncate_chars(&summary_text, 100));
+        let pr_number = source_task
+            .pr_url
+            .as_deref()
+            .and_then(boss_github::pr_url::pr_number_from_url)
+            .map(|n| n as i64);
+        let pr_suffix = source_task
+            .pr_url
+            .as_deref()
+            .map(|url| format!(", PR {url}"))
+            .unwrap_or_default();
+        let description = format!(
+            "Deferred scope from {source_id} (\"{source_name}\").\n\n\
+             **Deferred:** {summary_text}\n\n\
+             **Reason:** {reason_text}\n\n\
+             ---\n\
+             Filed from attention item `{attention_id}` via \"Create task\" on the deferred-scope \
+             marker recorded by execution `{execution_id}`{pr_suffix}.\n\n\
+             Marker (verbatim):\n\n```\n{marker_line}\n```",
+            source_id = source_task.id,
+            source_name = source_task.name,
+        );
+
+        let new_task = insert_chore_in_tx(
+            &tx,
+            CreateChoreInput::builder()
+                .product_id(source_task.product_id.clone())
+                .name(name)
+                .maybe_description(Some(description))
+                .created_via(CREATED_VIA_ATTENTION)
+                .force_duplicate(true)
+                .maybe_priority(Some(source_task.priority.clone()))
+                .maybe_repo_remote_url(source_task.repo_remote_url.clone())
+                .maybe_kind_override(Some(TaskKind::Followup))
+                .maybe_origin_task_short_id(source_task.short_id)
+                .maybe_origin_pr_number(pr_number)
+                .build(),
+        )?;
+
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_attention_items
+             SET status = 'converted', resolved_at = ?2, converted_task_id = ?3
+             WHERE id = ?1",
+            params![attention_id, now, new_task.id],
+        )?;
+        let updated = query_attention_item(&tx, attention_id)?
+            .with_context(|| format!("missing attention item after update: {attention_id}"))?;
+        tx.commit()?;
+        Ok((updated, new_task))
+    }
+
+    /// Every open `deferred_scope` attention item across `product_id`,
+    /// paired with the id of the work item whose execution recorded it.
+    /// Deferred-scope items carry only `execution_id` (never
+    /// `work_item_id` — see [`WorkAttentionItem::work_item_id`]), so this
+    /// crosses the execution→work-item join
+    /// [`Self::list_attention_items_for_work_item`] doesn't need. Backs
+    /// the kanban review-lane card affordance (badge + popup) and the
+    /// first-class deferred-scope presentation.
+    pub fn list_open_deferred_scope_attentions_for_product(
+        &self,
+        product_id: &str,
+    ) -> Result<Vec<DeferredScopeAttention>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT ai.id, ai.execution_id, ai.work_item_id, ai.kind, ai.status, ai.title, ai.body_markdown,
+                    ai.created_at, ai.resolved_at, ai.converted_task_id, we.work_item_id
+             FROM work_attention_items ai
+             JOIN work_executions we ON we.id = ai.execution_id
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE t.product_id = ?1
+               AND t.deleted_at IS NULL
+               AND ai.kind = ?2
+               AND ai.status = 'open'
+             ORDER BY ai.created_at ASC, ai.id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![product_id, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND],
+            |row| {
+                Ok(DeferredScopeAttention {
+                    item: map_attention_item(row)?,
+                    source_work_item_id: row.get(10)?,
+                })
+            },
+        )?;
+        collect_rows(rows)
     }
 
     pub fn update_work_item(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {

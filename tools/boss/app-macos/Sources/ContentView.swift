@@ -1791,7 +1791,10 @@ private struct WorkBoardCardItem: View {
                                        !(task.prURL?.isEmpty ?? true) &&
                                        task.mergeQueueState == nil)
                         ? { model.mergeWhenReady(for: task) }
-                        : nil
+                        : nil,
+                    deferredScopeItems: column == .review ? model.deferredScopeAttentions(forWorkItemID: task.id) : [],
+                    onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
+                    onCreateTaskFromDeferredScope: { id in model.createTaskFromDeferredScopeAttention(attentionID: id) }
                 )
             }
             .buttonStyle(.plain)
@@ -2276,6 +2279,17 @@ struct WorkBoardCardView: View {
     /// "Merging" section (see `WorkTask.isInMergingSection`), so the button
     /// naturally disappears with it.
     var onMergeWhenReady: (() -> Void)? = nil
+    /// Open `deferred_scope` attention items filed against this work item.
+    /// Empty hides the badge entirely — callers only populate this for
+    /// Review-lane cards (mirrors `ciRequiredState`'s column gate above).
+    var deferredScopeItems: [DeferredScopeAttention] = []
+    /// Invoked with an attention item id when the popup's "Accept" button
+    /// is tapped. `nil` when `deferredScopeItems` is always empty for this
+    /// card kind.
+    var onAcceptDeferredScope: ((String) -> Void)? = nil
+    /// Invoked with an attention item id when the popup's "Create task"
+    /// button is tapped.
+    var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
 
     @Environment(\.kanbanBoardStyle) private var boardStyle
 
@@ -2491,6 +2505,13 @@ struct WorkBoardCardView: View {
                         } message: {
                             Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
                         }
+                    }
+                    if !deferredScopeItems.isEmpty {
+                        DeferredScopeCardBadge(
+                            items: deferredScopeItems,
+                            onAccept: { onAcceptDeferredScope?($0) },
+                            onCreateTask: { onCreateTaskFromDeferredScope?($0) }
+                        )
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

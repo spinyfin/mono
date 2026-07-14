@@ -253,6 +253,21 @@ enum EngineEvent {
     /// Response to `list_attention_items_for_work_item` — open and
     /// resolved attention items for a given product/work-item id.
     case attentionItemsForWorkItemList(workItemID: String, items: [WorkAttentionItem])
+    /// Live push: a worker filed a new attention item (e.g. a
+    /// `[deferred-scope]` marker). Consumers filter on `item.kind`.
+    case attentionItemCreated(item: WorkAttentionItem)
+    /// Response to `accept_deferred_scope_attention`, also pushed live on
+    /// the owning product's work-tree topic.
+    case attentionItemUpdated(item: WorkAttentionItem)
+    /// Response to `create_task_from_deferred_scope_attention`, also
+    /// pushed live on the owning product's work-tree topic. `task` is the
+    /// followup filed from the deferred-scope marker.
+    case attentionItemConverted(item: WorkAttentionItem, task: WorkTask)
+    /// Response to `list_deferred_scope_attentions` — every open
+    /// `deferred_scope` item across a product, paired with the id of the
+    /// work item whose execution recorded it. Backs the kanban
+    /// review-lane card affordance.
+    case deferredScopeAttentionsList(productID: String, items: [DeferredScopeAttention])
     /// Response to `list_planner_runs` — every `planner_runs` audit row
     /// for the project, newest first. Drives the Planner review/release/
     /// undo surface (design auto-populate-project-tasks-on-design-pr-merge.md
@@ -668,6 +683,33 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "list_attention_items_for_work_item",
             "work_item_id": workItemID,
+        ])
+    }
+
+    /// Accept an open `deferred_scope` attention item without filing a
+    /// followup task. Replies with `attention_item_updated`.
+    func sendAcceptDeferredScopeAttention(id: String) {
+        sendLine([
+            "type": "accept_deferred_scope_attention",
+            "id": id,
+        ])
+    }
+
+    /// File a followup task from an open `deferred_scope` attention item.
+    /// Replies with `attention_item_converted`.
+    func sendCreateTaskFromDeferredScopeAttention(attentionID: String) {
+        sendLine([
+            "type": "create_task_from_deferred_scope_attention",
+            "attention_id": attentionID,
+        ])
+    }
+
+    /// List every open `deferred_scope` attention item across a product.
+    /// Replies with `deferred_scope_attentions_list`.
+    func sendListDeferredScopeAttentions(productId: String) {
+        sendLine([
+            "type": "list_deferred_scope_attentions",
+            "product_id": productId,
         ])
     }
 
@@ -1869,6 +1911,28 @@ final class EngineClient: @unchecked Sendable {
                 if !workItemID.isEmpty {
                     emit(.attentionItemsForWorkItemList(workItemID: workItemID, items: items))
                 }
+            case "attention_item_created":
+                if let raw = payload["item"] as? [String: Any], let item = parseAttentionItem(raw) {
+                    emit(.attentionItemCreated(item: item))
+                }
+            case "attention_item_updated":
+                if let raw = payload["item"] as? [String: Any], let item = parseAttentionItem(raw) {
+                    emit(.attentionItemUpdated(item: item))
+                }
+            case "attention_item_converted":
+                if let itemRaw = payload["item"] as? [String: Any],
+                   let item = parseAttentionItem(itemRaw),
+                   let taskRaw = payload["task"] as? [String: Any],
+                   let task = parseTask(taskRaw) {
+                    emit(.attentionItemConverted(item: item, task: task))
+                }
+            case "deferred_scope_attentions_list":
+                let productID = payload["product_id"] as? String ?? ""
+                let raw = payload["items"] as? [[String: Any]] ?? []
+                let items = raw.compactMap(parseDeferredScopeAttention)
+                if !productID.isEmpty {
+                    emit(.deferredScopeAttentionsList(productID: productID, items: items))
+                }
             case "planner_runs_list":
                 let projectID = payload["project_id"] as? String ?? ""
                 let raw = payload["runs"] as? [[String: Any]] ?? []
@@ -2573,6 +2637,16 @@ final class EngineClient: @unchecked Sendable {
             return nil
         }
         return item
+    }
+
+    private func parseDeferredScopeAttention(_ payload: [String: Any]) -> DeferredScopeAttention? {
+        guard let itemRaw = payload["item"] as? [String: Any],
+              let item = parseAttentionItem(itemRaw),
+              let sourceWorkItemID = payload["source_work_item_id"] as? String
+        else {
+            return nil
+        }
+        return DeferredScopeAttention(item: item, sourceWorkItemID: sourceWorkItemID)
     }
 
     private func parsePlannerRun(_ payload: [String: Any]) -> PlannerRun? {

@@ -7,6 +7,8 @@
 
 use super::*;
 
+use crate::protocol::WorkAttentionItem;
+
 pub(super) async fn handle_create_attention_item(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
@@ -99,6 +101,135 @@ pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req
             }
         }
     }
+}
+
+/// Accept an open `deferred_scope` attention item without producing a
+/// followup task. See [`crate::work::WorkDb::resolve_deferred_scope_attention`]
+/// for the validation rules (must be kind `deferred_scope`, must be open).
+pub(super) async fn handle_accept_deferred_scope_attention(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::AcceptDeferredScopeAttention { id } = req else {
+        unreachable!()
+    };
+    match work_db.resolve_deferred_scope_attention(&id) {
+        Ok(item) => {
+            if let Some(product_id) = deferred_scope_item_product_id(&work_db, &item) {
+                server_state
+                    .publisher
+                    .publish_frontend_event_on_product(
+                        &product_id,
+                        FrontendEvent::AttentionItemUpdated { item: item.clone() },
+                    )
+                    .await;
+            }
+            send_response(&sink, &request_id, FrontendEvent::AttentionItemUpdated { item });
+        }
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+        }
+    }
+}
+
+/// File a followup task from an open `deferred_scope` attention item and
+/// flip it to `converted`. See
+/// [`crate::work::WorkDb::create_task_from_deferred_scope_attention`] for
+/// how the new task's name/description/provenance are derived.
+pub(super) async fn handle_create_task_from_deferred_scope_attention(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CreateTaskFromDeferredScopeAttention { attention_id } = req else {
+        unreachable!()
+    };
+    match work_db.create_task_from_deferred_scope_attention(&attention_id) {
+        Ok((item, task)) => {
+            server_state
+                .publisher
+                .publish_frontend_event_on_product(
+                    &task.product_id,
+                    FrontendEvent::AttentionItemConverted {
+                        item: item.clone(),
+                        task: Box::new(task.clone()),
+                    },
+                )
+                .await;
+            // Refresh the kanban so the new followup card appears without
+            // a manual reload, mirroring `handle_action_attention_group`.
+            publish_work_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                vec![work_product_topic(&task.product_id)],
+                "deferred_scope_attention_converted",
+                Some(task.product_id.clone()),
+                vec![task.id.clone()],
+            )
+            .await;
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::AttentionItemConverted {
+                    item,
+                    task: Box::new(task),
+                },
+            );
+        }
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+        }
+    }
+}
+
+/// List every open `deferred_scope` attention item across a product, each
+/// paired with the id of the work item whose execution recorded it. Backs
+/// the kanban review-lane card affordance (badge + popup).
+pub(super) async fn handle_list_deferred_scope_attentions(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListDeferredScopeAttentions { product_id } = req else {
+        unreachable!()
+    };
+    match work_db.list_open_deferred_scope_attentions_for_product(&product_id) {
+        Ok(items) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::DeferredScopeAttentionsList { product_id, items },
+            );
+        }
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+        }
+    }
+}
+
+/// Resolve the owning product id for an execution-scoped attention item
+/// (`deferred_scope` items carry only `execution_id`, never `work_item_id`
+/// — see [`WorkAttentionItem::work_item_id`]) so
+/// [`handle_accept_deferred_scope_attention`] can publish its live-update
+/// on the right product topic. `None` if the execution or its work item
+/// has since vanished; the RPC still replies to the direct caller either
+/// way, it just skips the broadcast.
+fn deferred_scope_item_product_id(work_db: &WorkDb, item: &WorkAttentionItem) -> Option<String> {
+    let execution_id = item.execution_id.as_deref()?;
+    let execution = work_db.get_execution(execution_id).ok()?;
+    let work_item = work_db.get_work_item(&execution.work_item_id).ok()?;
+    Some(work_item.product_id().to_owned())
 }
 
 /// P1203 task 8: the Notifications UI's merge-provenance affordance reads

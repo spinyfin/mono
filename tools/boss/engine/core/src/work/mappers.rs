@@ -455,6 +455,7 @@ pub(crate) fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentio
         body_markdown: row.get(6)?,
         created_at: row.get(7)?,
         resolved_at: row.get(8)?,
+        converted_task_id: row.get(9)?,
     })
 }
 

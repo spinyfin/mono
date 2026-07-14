@@ -65,6 +65,9 @@ final class ChatViewModel: ObservableObject {
     /// Attention items keyed by work-item id (product id for external-tracker
     /// items). Populated on product selection and on every workTree refresh.
     @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
+    /// Open `deferred_scope` attention items keyed by product id. See
+    /// `ChatViewModel+DeferredScope.swift`.
+    @Published var deferredScopeAttentionsByProductID: [String: [DeferredScopeAttention]] = [:]
     /// Attention *groups* keyed by product id — the agent-authored
     /// notification feature (attentions.md), distinct from the operational
     /// `attentionItemsByWorkItemID` store above. Loaded on product selection /
@@ -1005,6 +1008,7 @@ final class ChatViewModel: ObservableObject {
             engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
             engine.sendListAttentionItemsForWorkItem(workItemID: productID)
             engine.sendListAttentionGroups(productId: productID)
+            engine.sendListDeferredScopeAttentions(productId: productID)
         }
     }
 
@@ -2008,12 +2012,14 @@ final class ChatViewModel: ObservableObject {
                 engine.sendGetWorkTree(productId: selectedProductID, flow: .invalidationRefetch)
                 engine.sendListAttentionItemsForWorkItem(workItemID: selectedProductID)
                 engine.sendListAttentionGroups(productId: selectedProductID)
+                engine.sendListDeferredScopeAttentions(productId: selectedProductID)
                 refreshPlannerRuns(forProductID: selectedProductID)
             } else if let productId,
                       productId == currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productId, flow: .invalidationRefetch)
                 engine.sendListAttentionItemsForWorkItem(workItemID: productId)
                 engine.sendListAttentionGroups(productId: productId)
+                engine.sendListDeferredScopeAttentions(productId: productId)
                 refreshPlannerRuns(forProductID: productId)
             }
         case .productsList(let products):
@@ -2332,6 +2338,8 @@ final class ChatViewModel: ObservableObject {
             engine.sendListCiRemediations(limit: 200)
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
+        case .attentionItemCreated, .attentionItemUpdated, .attentionItemConverted, .deferredScopeAttentionsList:
+            handleDeferredScopeEvent(event)
         case .plannerRunsList(let projectID, let runs):
             plannerRunsByProjectID[projectID] = runs
         case .releaseProjectResult(let projectID, _, _):
