@@ -8557,8 +8557,8 @@ mod tests {
 
     #[test]
     fn automation_pool_slots_are_disjoint_from_regular_pool() {
-        // The slot IDs produced by auto-worker-N (9, 10, 11) must not
-        // overlap with any regular-pool slot (1..=8).
+        // The slot IDs produced by auto-worker-N (17..=22) must not
+        // overlap with any interactive-pool slot (1..=16).
         for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
             let auto_wid = format!("auto-worker-{ordinal}");
             let slot = slot_id_from_worker_id(&auto_wid).unwrap();
