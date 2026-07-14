@@ -14,7 +14,7 @@
 /// nearest boundary so a subsequent `&s[..idx]` never panics and no partial
 /// codepoint leaks through. `max` is clamped to `s.len()` first, so callers
 /// may pass a `max` past the end of the string.
-pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
+pub fn floor_char_boundary(s: &str, max: usize) -> usize {
     let mut end = max.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;

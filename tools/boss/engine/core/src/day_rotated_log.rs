@@ -135,7 +135,7 @@ pub fn prune_old_files(dir: &Path, file_prefix: &str, keep_days: u64) {
 }
 
 pub fn now_ms() -> u128 {
-    crate::epoch_time::now_epoch_ms()
+    boss_engine_utils::epoch_time::now_epoch_ms()
 }
 
 /// UTC `YYYY-MM-DD` for an epoch-millis instant.

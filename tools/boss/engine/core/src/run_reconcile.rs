@@ -89,7 +89,7 @@ impl RunReconcileReport {
 /// Probe `cube workspace list` once and decide the verdict for every
 /// in-flight execution against that snapshot. `now_epoch_s` is plumbed
 /// in so unit tests can pin a deterministic clock; production callers
-/// pass [`crate::epoch_time::now_epoch_secs`].
+/// pass [`boss_engine_utils::epoch_time::now_epoch_secs`].
 pub async fn probe_in_flight_runs(
     cube: &dyn CubeClient,
     in_flight: &[WorkExecution],

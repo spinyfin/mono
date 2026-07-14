@@ -243,7 +243,7 @@ pub fn record_event<T: Serialize>(event: &str, payload: &T) {
 }
 
 fn epoch_now_s() -> i64 {
-    crate::epoch_time::now_epoch_secs()
+    boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
 fn parent_pid() -> Option<u32> {
@@ -261,7 +261,7 @@ fn write_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) {
 
     fields.insert(
         "ts".into(),
-        Value::String(crate::iso8601::format_epoch_iso8601(now_epoch_s)),
+        Value::String(boss_engine_utils::iso8601::format_epoch_iso8601(now_epoch_s)),
     );
     fields.insert("ts_epoch_s".into(), json!(now_epoch_s));
     fields.insert("event".into(), Value::String(event.to_owned()));
@@ -563,7 +563,7 @@ mod tests {
     fn make_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) -> Value {
         fields.insert(
             "ts".into(),
-            Value::String(crate::iso8601::format_epoch_iso8601(now_epoch_s)),
+            Value::String(boss_engine_utils::iso8601::format_epoch_iso8601(now_epoch_s)),
         );
         fields.insert("ts_epoch_s".into(), json!(now_epoch_s));
         fields.insert("event".into(), Value::String(event.to_owned()));

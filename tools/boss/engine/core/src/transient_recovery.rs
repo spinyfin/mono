@@ -223,7 +223,7 @@ pub fn spawn_loop(
         // from completed/orphaned executions are harmless.
         let mut nudged_executions: HashSet<String> = HashSet::new();
         loop {
-            let now = crate::epoch_time::now_epoch_secs();
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
             let cx = RecoveryContext {
                 work_db: work_db.as_ref(),
                 live_states: live_states.as_ref(),
@@ -637,7 +637,7 @@ async fn read_transcript_tail(path: &str, max_bytes: u64) -> Vec<Value> {
 /// snippets; the byte-bounded clip is shared.
 fn clip(s: &str, max_bytes: usize) -> String {
     let one_line = s.trim().replace('\n', " ");
-    crate::string_clip::clip_to_bytes(&one_line, max_bytes)
+    boss_engine_utils::string_clip::clip_to_bytes(&one_line, max_bytes)
 }
 
 #[cfg(test)]
@@ -769,7 +769,7 @@ mod tests {
     const NORMAL_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on the task"}]}}"#;
 
     fn now() -> i64 {
-        crate::epoch_time::now_epoch_secs()
+        boss_engine_utils::epoch_time::now_epoch_secs()
     }
 
     /// Build the six-field [`RecoveryContext`] shared by nearly every test,

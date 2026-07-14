@@ -10,7 +10,7 @@
 //! string value or trailing prose.
 //!
 //! It also hosts [`strip_wrapping_quotes`], the tiny prelude both worker
-//! summarizers ([`crate::pane_summary`] and [`crate::live_status`]) run over
+//! summarizers (`pane_summary` and `live_status` in `boss_engine`) run over
 //! a model reply before their post-processing diverges.
 
 /// Trim a model reply and strip any surrounding quote/backtick characters
@@ -18,11 +18,11 @@
 ///
 /// Models routinely wrap a short phrase in quotes or backticks and tack on a
 /// period (`"fixing the scraper."`), none of which belongs in a UI label.
-/// Both [`crate::pane_summary::clean_summary`] and
-/// [`crate::live_status::clean_summary`] begin with this identical pass and
+/// Both `pane_summary::clean_summary` and
+/// `live_status::clean_summary` (in `boss_engine`) begin with this identical pass and
 /// then diverge (pane word-clamps and strips a leading `is `; live_status
 /// redacts), so the shared prelude lives here as one helper.
-pub(crate) fn strip_wrapping_quotes(raw: &str) -> &str {
+pub fn strip_wrapping_quotes(raw: &str) -> &str {
     raw.trim()
         .trim_start_matches(['"', '\'', '`'])
         .trim_end_matches(['"', '\'', '`', '.'])
@@ -32,7 +32,7 @@ pub(crate) fn strip_wrapping_quotes(raw: &str) -> &str {
 /// Given a string starting with `{`, return the slice covering the balanced
 /// `{…}` object (handling nested braces and string literals). Returns `None`
 /// if the input doesn't start with `{` or the braces are unbalanced.
-pub(crate) fn extract_balanced_object(s: &str) -> Option<&str> {
+pub fn extract_balanced_object(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'{') {
         return None;
@@ -72,7 +72,7 @@ pub(crate) fn extract_balanced_object(s: &str) -> Option<&str> {
 /// (string/escape-aware via [`extract_balanced_object`]). Unlike that
 /// function, the input need not itself start with `{` — this walks forward
 /// looking for the first `{` that yields a balanced object.
-pub(crate) fn find_first_balanced_object(s: &str) -> Option<&str> {
+pub fn find_first_balanced_object(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -95,7 +95,7 @@ pub(crate) fn find_first_balanced_object(s: &str) -> Option<&str> {
 /// the nesting and both `]` and `}` close it, so an object nested inside the
 /// array is spanned correctly and its closing `}` cannot be mistaken for the
 /// array terminator.
-pub(crate) fn extract_balanced_array(s: &str) -> Option<&str> {
+pub fn extract_balanced_array(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'[') {
         return None;
@@ -136,7 +136,7 @@ pub(crate) fn extract_balanced_array(s: &str) -> Option<&str> {
 /// start with `[` — this walks forward to the first `[` that yields a balanced
 /// array. Fenced blocks are transparent: the fence markers sit outside the
 /// array.
-pub(crate) fn find_first_balanced_array(s: &str) -> Option<&str> {
+pub fn find_first_balanced_array(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

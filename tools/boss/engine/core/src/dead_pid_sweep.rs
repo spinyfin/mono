@@ -314,7 +314,7 @@ pub async fn run_one_pass(
     let mut outcome = DeadPidSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
-    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - DEAD_PID_GRACE_SECS;
 
     for state in snapshot {
@@ -540,7 +540,7 @@ pub async fn reap_reported_pane_death(
         return false;
     }
 
-    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let reason = format!("worker-pane-died: {detail}");
     reap_dead_execution(
         work_db,
@@ -585,7 +585,7 @@ impl LivenessProbeObservation {
         let last_event_age_secs = state
             .last_event_at
             .as_deref()
-            .and_then(crate::iso8601::parse_iso8601_to_epoch)
+            .and_then(boss_engine_utils::iso8601::parse_iso8601_to_epoch)
             .map(|e| now_epoch_secs - e);
         Self {
             probe: "kill(pid,0)",
@@ -1003,7 +1003,7 @@ mod tests {
             )
             .unwrap();
         // Stamp started_at = NOW so the grace guard fires.
-        let now_secs = crate::epoch_time::now_epoch_secs();
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
@@ -1379,7 +1379,7 @@ mod tests {
             .unwrap();
         // Stamp started_at = NOW — within the grace window the periodic
         // sweep would respect, but reap_reported_pane_death must not.
-        let now_secs = crate::epoch_time::now_epoch_secs();
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());

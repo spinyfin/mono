@@ -457,7 +457,7 @@ fn outcome_from_error(err: ClaudeError) -> PlannerOutcome {
     match err {
         ClaudeError::Api { status, body } => PlannerOutcome::ApiError {
             status,
-            snippet: crate::string_clip::clip_to_bytes(&body, 200),
+            snippet: boss_engine_utils::string_clip::clip_to_bytes(&body, 200),
         },
         ClaudeError::Transport(msg) | ClaudeError::Decode(msg) => PlannerOutcome::Transport(msg),
     }

@@ -406,7 +406,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             );
             return;
         }
-        let now_epoch_s = crate::epoch_time::now_epoch_secs() as u64;
+        let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         // A human toggling `bossctl dispatch pause` / the app's pause switch
         // is always an operator-originated pause, so PR-review executions —
         // the lifecycle of a change already in flight, not new work — stay

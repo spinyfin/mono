@@ -682,7 +682,7 @@ impl WorkDb {
         let Some((run_id, automation_id)) = row else {
             return Ok(false);
         };
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         tx.execute(
             "UPDATE automation_runs
                 SET outcome = ?2,

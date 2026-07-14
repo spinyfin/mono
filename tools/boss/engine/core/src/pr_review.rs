@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::json_extract::extract_balanced_object;
+use boss_engine_utils::json_extract::extract_balanced_object;
 
 /// Authoritative PR metadata fetched from GitHub at reviewer-spawn time.
 ///

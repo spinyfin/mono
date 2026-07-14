@@ -517,7 +517,7 @@ pub async fn run_stage_stalled_pass(
     thresholds: &StageThresholds,
     sink: &dyn DispatchEventSink,
 ) -> Result<usize> {
-    let now_ms = crate::epoch_time::now_epoch_ms();
+    let now_ms = boss_engine_utils::epoch_time::now_epoch_ms();
     let stalls = pending_stalls(root, now_ms, thresholds)?;
     let count = stalls.len();
     for stall in stalls {

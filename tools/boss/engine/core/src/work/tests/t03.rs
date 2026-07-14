@@ -313,7 +313,7 @@ fn complete_pane_parked_execution_is_idempotent() {
 }
 
 // Direct unit coverage of `parse_iso8601_to_epoch` now lives with the
-// consolidated helper in `crate::iso8601`; the end-to-end migration test
+// consolidated helper in `boss_engine_utils::iso8601`; the end-to-end migration test
 // below exercises it through the real rewrite path.
 
 #[test]

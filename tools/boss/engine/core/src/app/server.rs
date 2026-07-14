@@ -491,7 +491,7 @@ pub async fn serve(
         tracing::debug!("no persisted in-flight executions to probe at startup");
         crate::run_reconcile::RunReconcileReport::default()
     } else {
-        let now_epoch_s = crate::epoch_time::now_epoch_secs();
+        let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs();
         let report =
             crate::run_reconcile::probe_in_flight_runs(server_state.cube_client.as_ref(), &in_flight, now_epoch_s)
                 .await;
@@ -1192,7 +1192,7 @@ pub async fn serve(
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                let now = crate::epoch_time::now_epoch_secs();
+                let now = boss_engine_utils::epoch_time::now_epoch_secs();
                 let changed =
                     live_worker_states.mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
                 if !changed.is_empty() {

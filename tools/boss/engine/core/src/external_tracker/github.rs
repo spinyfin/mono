@@ -161,7 +161,7 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
     let state_reason = content.get("stateReason").and_then(|v| v.as_str()).unwrap_or("");
     let url = content.get("url")?.as_str()?.to_owned();
     let updated_at_str = content.get("updatedAt")?.as_str()?;
-    let updated_at = crate::iso8601::parse_iso8601_lenient(updated_at_str).unwrap_or(0);
+    let updated_at = boss_engine_utils::iso8601::parse_iso8601_lenient(updated_at_str).unwrap_or(0);
 
     // The repo the issue lives in, canonical `owner/repo` form.
     let repo_name_with_owner = content
@@ -207,7 +207,7 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
             let merged_at = n
                 .get("mergedAt")
                 .and_then(|v| v.as_str())
-                .and_then(crate::iso8601::parse_iso8601_lenient);
+                .and_then(boss_engine_utils::iso8601::parse_iso8601_lenient);
             Some(UpstreamPrAssociation {
                 pr_url,
                 merged,
@@ -279,7 +279,7 @@ fn parse_rest_issue(body: &Value, org: &str, repo: &str) -> Option<UpstreamItem>
     let state_reason = body.get("state_reason").and_then(|v| v.as_str()).unwrap_or("");
     let url = body.get("html_url")?.as_str()?.to_owned();
     let updated_at_str = body.get("updated_at")?.as_str()?;
-    let updated_at = crate::iso8601::parse_iso8601_lenient(updated_at_str).unwrap_or(0);
+    let updated_at = boss_engine_utils::iso8601::parse_iso8601_lenient(updated_at_str).unwrap_or(0);
 
     let labels: Vec<String> = body
         .get("labels")

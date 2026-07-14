@@ -143,7 +143,7 @@ pub async fn run_one_pass(work_db: &WorkDb) -> DepUnblockSweepOutcome {
 
     outcome.rows_evaluated = candidates.len();
 
-    let now_secs = crate::epoch_time::now_epoch_secs() as u64;
+    let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
 
     for (work_item_id, updated_at_epoch) in candidates {
         let stale_secs = now_secs.saturating_sub(updated_at_epoch as u64);

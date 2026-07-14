@@ -58,13 +58,13 @@ pub fn default_backup_dir(state_root: &Path) -> PathBuf {
 /// Read the backup interval from `BOSS_BACKUP_INTERVAL_SECS`, or fall
 /// back to [`DEFAULT_BACKUP_INTERVAL`].
 pub fn backup_interval() -> Duration {
-    crate::env_parse::env_duration_secs(BACKUP_INTERVAL_SECS_ENV, DEFAULT_BACKUP_INTERVAL)
+    boss_engine_utils::env_parse::env_duration_secs(BACKUP_INTERVAL_SECS_ENV, DEFAULT_BACKUP_INTERVAL)
 }
 
 /// Read the retention count from `BOSS_BACKUP_RETENTION`, or fall back
 /// to [`DEFAULT_RETENTION_COUNT`].
 pub fn retention_count() -> usize {
-    crate::env_parse::env_parsed_or(BACKUP_RETENTION_ENV, DEFAULT_RETENTION_COUNT)
+    boss_engine_utils::env_parse::env_parsed_or(BACKUP_RETENTION_ENV, DEFAULT_RETENTION_COUNT)
 }
 
 /// Take a snapshot of `work_db` to `dest` using SQLite's `VACUUM INTO`.
@@ -136,7 +136,7 @@ pub fn apply_retention(backup_dir: &Path, keep: usize) -> Result<()> {
 /// [`chrono::TimeZone::timestamp_opt`], which does not need the clock
 /// feature.
 fn utc_timestamp() -> String {
-    let secs = crate::epoch_time::now_epoch_secs();
+    let secs = boss_engine_utils::epoch_time::now_epoch_secs();
     use chrono::TimeZone as _;
     chrono::Utc
         .timestamp_opt(secs, 0)

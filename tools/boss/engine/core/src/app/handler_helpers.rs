@@ -5,7 +5,7 @@
 
 use super::*;
 
-use crate::iso8601::format_epoch_iso8601;
+use boss_engine_utils::iso8601::format_epoch_iso8601;
 
 /// Build the per-product effort-audit report. Handles the product
 /// lookup, window filter, and chore-corpus / event-log fan-in so
@@ -19,13 +19,13 @@ pub(super) fn build_effort_audit_report(
         .get_product(product_id)?
         .ok_or_else(|| anyhow::anyhow!("unknown product: {product_id}"))?;
     let since_epoch_secs = window_days.map(|days| {
-        let now = crate::epoch_time::now_epoch_secs();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let span = (days as i64).saturating_mul(86_400);
         now - span
     });
     let events = work_db.list_effort_escalations_for_product(&product.id, since_epoch_secs)?;
     let chores = work_db.list_chores_for_audit(&product.id)?;
-    let generated_at = crate::epoch_time::now_epoch_secs().to_string();
+    let generated_at = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
     Ok(audit_effort::build_report(
         &product.id,
         &product.slug,

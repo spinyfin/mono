@@ -40,8 +40,8 @@ pub const DEFAULT_TRACE_MAX_FILES: usize = 5;
 
 /// Read rotation config from env vars, falling back to safe defaults.
 pub fn trace_rotation_config() -> (u64, usize) {
-    let max_bytes = crate::env_parse::env_parsed_or(TRACE_MAX_BYTES_ENV, DEFAULT_TRACE_MAX_BYTES);
-    let max_files = crate::env_parse::env_parsed_or(TRACE_MAX_FILES_ENV, DEFAULT_TRACE_MAX_FILES);
+    let max_bytes = boss_engine_utils::env_parse::env_parsed_or(TRACE_MAX_BYTES_ENV, DEFAULT_TRACE_MAX_BYTES);
+    let max_files = boss_engine_utils::env_parse::env_parsed_or(TRACE_MAX_FILES_ENV, DEFAULT_TRACE_MAX_FILES);
     (max_bytes, max_files)
 }
 

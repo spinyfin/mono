@@ -97,7 +97,7 @@ pub(crate) fn check_recent_duplicate(
     name: &str,
 ) -> Result<Option<DuplicateTaskError>> {
     let trimmed = name.trim();
-    let now_secs = crate::epoch_time::now_epoch_secs();
+    let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let cutoff = now_secs - DUPLICATE_GUARD_WINDOW_SECS;
 
     let row: Option<(String, Option<i64>, i64)> = conn

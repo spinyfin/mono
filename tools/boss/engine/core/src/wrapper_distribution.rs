@@ -307,7 +307,7 @@ pub fn subclass_label(kind: &SshFailureKind) -> &'static str {
 /// drop; tests call it directly and unlink the file themselves.
 pub fn materialize_wrapper_to_disk() -> Result<PathBuf> {
     let dir = std::env::temp_dir();
-    let suffix = crate::epoch_time::now_epoch_nanos();
+    let suffix = boss_engine_utils::epoch_time::now_epoch_nanos();
     let path = dir.join(format!("boss-remote-run.{}.{}.sh", std::process::id(), suffix));
     let mut file =
         std::fs::File::create(&path).with_context(|| format!("creating wrapper staging file at {path:?}"))?;

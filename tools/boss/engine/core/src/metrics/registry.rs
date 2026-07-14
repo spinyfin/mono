@@ -527,7 +527,7 @@ fn validate_name(name: &str) {
 }
 
 pub(crate) fn now_ms() -> i64 {
-    crate::epoch_time::now_epoch_ms() as i64
+    boss_engine_utils::epoch_time::now_epoch_ms() as i64
 }
 
 #[cfg(test)]

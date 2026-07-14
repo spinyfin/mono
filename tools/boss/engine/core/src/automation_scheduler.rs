@@ -173,7 +173,7 @@ pub fn spawn_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let now = crate::epoch_time::now_epoch_secs();
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
             let pass = run_one_pass(work_db.as_ref(), now, dispatcher.as_ref()).await;
             if pass.evaluated > 0 {
                 tracing::info!(

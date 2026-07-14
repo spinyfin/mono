@@ -1,0 +1,8 @@
+[package]
+name = "boss-engine-utils"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+chrono = { workspace = true }

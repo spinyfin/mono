@@ -128,7 +128,7 @@ fn map_editorial_action(row: &Row<'_>) -> rusqlite::Result<boss_protocol::Editor
 }
 
 fn truncate_command(cmd: &str) -> String {
-    crate::string_clip::clip_to_bytes(cmd, COMMAND_MAX_BYTES)
+    boss_engine_utils::string_clip::clip_to_bytes(cmd, COMMAND_MAX_BYTES)
 }
 
 #[cfg(test)]

@@ -4615,7 +4615,7 @@ must not be asked to open one",
         if let Some(text) = self.read_final_triage_message(&execution.id).await.into_message()
             && let Some(signal) = detect_build_wait_signal(&text)
         {
-            let now_epoch_secs = crate::epoch_time::now_epoch_secs();
+            let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
             match self
                 .build_wait_tracker
                 .record(&execution.id, now_epoch_secs, self.build_wait_horizon_secs)
@@ -4722,7 +4722,8 @@ must not be asked to open one",
         // this attention item. Stamp the explicit wall-clock time the park
         // happened so at least "why is this yellow, and since when" is
         // answerable at a glance.
-        let parked_at = crate::iso8601::format_epoch_iso8601(crate::epoch_time::now_epoch_secs());
+        let parked_at =
+            boss_engine_utils::iso8601::format_epoch_iso8601(boss_engine_utils::epoch_time::now_epoch_secs());
         let reason = if nudge_count > 0 {
             format!(
                 "Auto-nudge circuit breaker tripped: nudged {nudge_count} times with {detail}. \
@@ -5043,7 +5044,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             return;
         }
 
-        let epoch = crate::epoch_time::now_epoch_secs();
+        let epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         let audit_line = crate::deferred_scope::render_audit_line(epoch, item);
         if let Err(err) =
             crate::reconcile_audit::append_description_line(&self.work_db, &execution.work_item_id, &audit_line)
@@ -6650,7 +6651,7 @@ fn tail_snippet(text: &str, max_chars: usize) -> String {
 /// engine surfaces can track cost without a schema change.
 fn elapsed_secs_since(timestamp: &str) -> Option<i64> {
     let then: i64 = timestamp.parse().ok()?;
-    let now = crate::epoch_time::now_epoch_secs();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
     Some((now - then).max(0))
 }
 

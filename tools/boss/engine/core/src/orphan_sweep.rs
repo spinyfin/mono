@@ -145,7 +145,7 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let churn_cutoff = now_epoch_secs - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
 
     for work_item_id in candidates {
@@ -328,7 +328,7 @@ mod tests {
 
     /// Stamp tasks.updated_at to 10 minutes ago so the age guard passes.
     fn make_old(db: &WorkDb, work_item_id: &str) {
-        let old_epoch = crate::epoch_time::now_epoch_secs() - 600;
+        let old_epoch = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
         db.force_updated_at_for_test(work_item_id, old_epoch).unwrap();
     }
 
@@ -434,7 +434,7 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
                 .unwrap();
@@ -462,7 +462,7 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         make_old(&db, &work_item_id);
 
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
                 .unwrap();

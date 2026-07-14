@@ -1876,7 +1876,7 @@ impl ExecutionCoordinator {
                 return Vec::new();
             }
         };
-        let now_secs = crate::epoch_time::now_epoch_secs() as u64;
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let cutoff_ms = min_age_ms;
         ready
             .into_iter()
@@ -2066,7 +2066,7 @@ impl ExecutionCoordinator {
                         self.work_db.as_ref(),
                         self.dispatch_events.as_ref(),
                         sibling,
-                        crate::epoch_time::now_epoch_secs(),
+                        boss_engine_utils::epoch_time::now_epoch_secs(),
                     )
                     .await;
                 if reconciled_lost_workspace || reconciled_dead_pane {
@@ -2233,7 +2233,7 @@ impl ExecutionCoordinator {
         let Some(created_at) = execution.created_epoch() else {
             return;
         };
-        let elapsed = crate::epoch_time::now_epoch_secs() - created_at;
+        let elapsed = boss_engine_utils::epoch_time::now_epoch_secs() - created_at;
         if elapsed < CHAIN_SERIALIZED_STALL_THRESHOLD_SECS {
             return;
         }
@@ -2964,7 +2964,7 @@ impl ExecutionCoordinator {
                         self.work_db.as_ref(),
                         self.dispatch_events.as_ref(),
                         &live,
-                        crate::epoch_time::now_epoch_secs(),
+                        boss_engine_utils::epoch_time::now_epoch_secs(),
                     )
                     .await;
                 if reconciled_lost_workspace || reconciled_dead_pane {
@@ -12421,7 +12421,8 @@ mod tests {
         {
             let conn = db.connect().unwrap();
             let stale_created_at =
-                (crate::epoch_time::now_epoch_secs() - CHAIN_SERIALIZED_STALL_THRESHOLD_SECS - 60).to_string();
+                (boss_engine_utils::epoch_time::now_epoch_secs() - CHAIN_SERIALIZED_STALL_THRESHOLD_SECS - 60)
+                    .to_string();
             conn.execute(
                 "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
                 rusqlite::params![revision_exec.id, stale_created_at],

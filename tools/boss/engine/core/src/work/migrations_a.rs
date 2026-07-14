@@ -273,7 +273,7 @@ pub(crate) fn migrate_timestamps_to_epoch(conn: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (rowid, value) in rows {
-            if let Some(epoch) = crate::iso8601::parse_iso8601_to_epoch(&value) {
+            if let Some(epoch) = boss_engine_utils::iso8601::parse_iso8601_to_epoch(&value) {
                 let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
                 conn.execute(&update_sql, params![epoch.to_string(), rowid])?;
             }

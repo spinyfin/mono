@@ -353,7 +353,7 @@ fn dispatch_retry_at_for_execution(execution: &WorkExecution) -> Option<String> 
         return None;
     }
     let dispatch_not_before: i64 = execution.dispatch_not_before.as_deref()?.parse().ok()?;
-    let now_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     if dispatch_not_before > now_secs {
         Some(dispatch_not_before.to_string())
     } else {
