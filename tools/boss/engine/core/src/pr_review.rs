@@ -201,6 +201,14 @@ pub enum ReviewFindingCategory {
     /// assigned severity (see [`passes_severity_gate`]) — the same
     /// treatment as [`Self::Regression`].
     Duplication,
+    /// Undeclared deferral (brief asked for scope the diff doesn't deliver
+    /// and no `[deferred-scope]` marker covers it), misdeclared deferral
+    /// (prose "## Deferred" / "out of scope" language with no matching
+    /// marker), or a malformed `[deferred-scope]` marker. Forces a revision
+    /// regardless of assigned severity (see [`passes_severity_gate`]) — the
+    /// same treatment as [`Self::Regression`] and [`Self::Duplication`].
+    #[serde(rename = "deferred_scope")]
+    DeferredScope,
 }
 
 /// Reviewer's confidence in a finding.
@@ -429,7 +437,11 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
 ///   confirmed infrastructure reimplementation is a revision-required finding,
 ///   not advisory (operator directive: reuse/duplication findings get the
 ///   exact same forcing treatment as regressions, not a parallel escalation
-///   path).
+///   path), **or**
+/// - any finding with `category = DeferredScope` (regardless of severity) —
+///   undeclared/misdeclared deferred scope or a malformed `[deferred-scope]`
+///   marker is a process gap the engine cannot otherwise catch, so it gets
+///   the same forcing treatment as regression/duplication.
 ///
 /// `revision_warranted = false` in the `ReviewResult` does not suppress the
 /// gate — the engine's own threshold governs.
@@ -440,7 +452,9 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
             ReviewFindingSeverity::Critical | ReviewFindingSeverity::High
         ) || matches!(
             f.category,
-            ReviewFindingCategory::Regression | ReviewFindingCategory::Duplication
+            ReviewFindingCategory::Regression
+                | ReviewFindingCategory::Duplication
+                | ReviewFindingCategory::DeferredScope
         )
     })
 }
@@ -502,6 +516,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
             ReviewFindingCategory::Tests => "tests",
             ReviewFindingCategory::EdgeCase => "edgecase",
             ReviewFindingCategory::Duplication => "duplication",
+            ReviewFindingCategory::DeferredScope => "deferred_scope",
         };
         out.push_str(&format!(
             "### [{severity}] {title}\n\
@@ -856,7 +871,7 @@ pub fn render_reviewer_initial_prompt(
            \"findings\": [\n\
              {{\n\
                \"severity\": \"critical | high | medium | low\",\n\
-               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication\",\n\
+               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope\",\n\
                \"file\": \"path/to/file.rs\",\n\
                \"location\": \"fn foo, ~L42\",\n\
                \"title\": \"<short scannable title>\",\n\
@@ -875,10 +890,10 @@ pub fn render_reviewer_initial_prompt(
          \n\
          - `revision_warranted`: set to `true` when there is at least one \
            finding at `critical`/`high` severity, or any finding with \
-           `category: \"regression\"` or `category: \"duplication\"`, \
-           regardless of severity. Set to `false` for findings that are \
-           purely `medium`/`low` correctness/style (the engine applies its \
-           own gate on top).\n\
+           `category: \"regression\"`, `category: \"duplication\"`, or \
+           `category: \"deferred_scope\"`, regardless of severity. Set to \
+           `false` for findings that are purely `medium`/`low` \
+           correctness/style (the engine applies its own gate on top).\n\
          - `regression_check.performed` MUST be `true` — you cannot skip the \
            deletion check. Always set `suspected_deletions: []`; regression \
            findings go in `findings` with `category: \"regression\"` and the \
@@ -1009,6 +1024,37 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                duplication finding forces a revision regardless of the \
                severity you assign it — the same treatment as a regression \
                finding, not an advisory suggestion.\n\
+             - **Deferred-scope hygiene** *(first-class, explicit check)* — \
+               compare the PR's delivered changes against the owning work \
+               item's brief (given above in **Task description**) and check \
+               for three distinct failure modes:\n\
+               (1) **Undeclared deferral** — the brief asked for scope that \
+               the diff does not deliver, and no `[deferred-scope] \
+               summary=\"...\" reason=\"...\"` marker (recorded by the \
+               engine from the worker's final response) covers the gap. The \
+               worker narrowed scope without declaring it anywhere the \
+               engine can see.\n\
+               (2) **Misdeclared deferral** — the PR body, summary, or a \
+               commit message contains prose deferral language (a \
+               \"## Deferred\" section, \"left for a followup\", \"out of \
+               scope for this PR\", \"will address later\", etc.) that has \
+               no matching `[deferred-scope]` marker backing it. Prose alone \
+               creates no engine-tracked record, so the deferred work is \
+               silently lost. Live example: PR spinyfin/mono#1968 declared \
+               two deferred items only in a prose section — nothing was \
+               recorded, and the coordinator had to hand-file T2576 after \
+               the fact to recover the lost scope.\n\
+               (3) **Malformed markers** — a `[deferred-scope]` marker is \
+               present but missing `summary=`/`reason=` or improperly \
+               quoted. Flag it so the worker fixes the marker's grammar \
+               while the PR is still open; the engine records malformed \
+               markers with a parse warning, but a clean marker is the \
+               contract.\n\
+               (`category: \"deferred_scope\"`) Any confirmed finding in \
+               this dimension forces a revision regardless of the severity \
+               you assign it — the same treatment as a regression or \
+               duplication finding: an undeclared or unrecorded deferral is \
+               a process gap, not a style nit.\n\
              - **Code quality/readability** — fails to match surrounding style, \
                naming issues, dead/confusing code. (`category: \"readability\"`)\n\
              - **Lint/warning suppressions** — scrutinize every new \
@@ -1430,6 +1476,76 @@ mod tests {
         );
     }
 
+    /// The deferred-scope hygiene rubric dimension (operator directive,
+    /// 2026-07-14: reviewers must push back on undeclared/misdeclared
+    /// deferred scope) must be present with all three detection modes —
+    /// undeclared deferral, prose-only misdeclared deferral, and malformed
+    /// markers — plus the revision-forcing note and the concrete
+    /// spinyfin/mono#1968 acceptance example.
+    ///
+    /// This test doubles as the "run a review against a fixture PR body
+    /// containing a prose ## Deferred section with no markers" acceptance
+    /// check from the brief: the fixture is the task description below (a
+    /// stand-in for a PR body/summary carrying prose-only deferral
+    /// language), and the assertion confirms the rendered reviewer prompt
+    /// instructs the reviewer to raise exactly this as a finding.
+    #[test]
+    fn code_scope_prompt_contains_deferred_scope_dimension() {
+        let fixture_task_description = "Implement the widget importer.\n\n\
+            ## Deferred\n\
+            - CSV import support (left for a followup)\n\
+            - Retry on transient network errors (out of scope for this PR)\n";
+        let prompt = render_reviewer_initial_prompt(
+            "Add widget importer",
+            fixture_task_description,
+            "https://github.com/spinyfin/mono/pull/1968",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            None,
+            "spinyfin/mono",
+        );
+        assert!(
+            prompt.contains("Deferred-scope hygiene"),
+            "code rubric must contain an explicit deferred-scope hygiene dimension"
+        );
+        assert!(
+            prompt.contains("Undeclared deferral"),
+            "rubric must cover undeclared deferral (brief scope missing, no marker)"
+        );
+        assert!(
+            prompt.contains("Misdeclared deferral"),
+            "rubric must cover misdeclared deferral (prose deferral with no matching marker)"
+        );
+        assert!(
+            prompt.contains("## Deferred"),
+            "rubric must call out prose \"## Deferred\" sections as a misdeclaration signal"
+        );
+        assert!(
+            prompt.contains("Malformed markers"),
+            "rubric must cover malformed [deferred-scope] markers"
+        );
+        assert!(
+            prompt.contains("spinyfin/mono#1968"),
+            "rubric must cite the live spinyfin/mono#1968 undeclared-deferral incident"
+        );
+        assert!(
+            prompt.contains("\"deferred_scope\""),
+            "rubric must name the deferred_scope category"
+        );
+        assert!(
+            prompt.contains("forces a revision regardless of the severity"),
+            "rubric must state deferred-scope findings are revision-required, not advisory"
+        );
+        // The fixture's prose-only "## Deferred" section (no [deferred-scope]
+        // marker) is embedded in the task description the reviewer receives,
+        // so a reviewer following the rubric above would raise exactly the
+        // misdeclared-deferral finding this dimension exists to catch.
+        assert!(
+            prompt.contains(fixture_task_description),
+            "the fixture PR body/task description must be embedded in the prompt for the reviewer to inspect"
+        );
+    }
+
     // --- revision-triggered review context (2026-07-01 experiment) ---
 
     /// When `last_reviewed_sha` is set (a revision pushed after a prior
@@ -1660,6 +1776,7 @@ mod tests {
             (ReviewFindingCategory::Tests, "\"tests\""),
             (ReviewFindingCategory::EdgeCase, "\"edgecase\""),
             (ReviewFindingCategory::Duplication, "\"duplication\""),
+            (ReviewFindingCategory::DeferredScope, "\"deferred_scope\""),
         ] {
             let json = serde_json::to_string(&cat).unwrap();
             assert_eq!(json, expected);
@@ -2196,6 +2313,32 @@ mod tests {
         assert!(
             passes_severity_gate(&result),
             "a duplication finding must force a revision even at low severity"
+        );
+    }
+
+    /// Undeclared/misdeclared deferred-scope findings must force a revision
+    /// exactly like regression/duplication findings, regardless of assigned
+    /// severity (operator directive, 2026-07-14: undeclared deferral is a
+    /// process gap, not a style nit).
+    #[test]
+    fn severity_gate_passes_on_deferred_scope_regardless_of_severity() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Low,
+                ReviewFindingCategory::DeferredScope,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(
+            passes_severity_gate(&result),
+            "a deferred-scope finding must force a revision even at low severity"
         );
     }
 
