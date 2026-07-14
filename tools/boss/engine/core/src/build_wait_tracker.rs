@@ -25,8 +25,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Default horizon a continuously-reported build-wait is trusted for before
-/// the tracker stops suppressing nudges and falls back to the normal
+/// Default horizon a build-wait is trusted for, measured from the first
+/// reported sighting, before the tracker stops suppressing nudges and falls
+/// back to the normal
 /// nudge/park flow. 45 minutes: comfortably longer than the stale-worker
 /// sweep's 30-minute wedge threshold
 /// ([`crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS`]) plus margin
@@ -37,8 +38,10 @@ pub const DEFAULT_BUILD_WAIT_HORIZON_SECS: i64 = 45 * 60;
 /// Decision returned by [`BuildWaitTracker::record`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildWaitDecision {
-    /// Still within the horizon — suppress the nudge. `waited_secs` is how
-    /// long this execution has been continuously reporting a build wait.
+    /// Still within the horizon — suppress the nudge. `waited_secs` is the
+    /// elapsed time since this execution's first recorded build-wait sighting
+    /// (not a guarantee that every intervening Stop reported one — see
+    /// [`BuildWaitTracker::record`]).
     Suppress { waited_secs: i64 },
     /// The horizon has elapsed — stop trusting the narration and fall back
     /// to the normal nudge/park flow. `waited_secs` is how long it waited
@@ -48,8 +51,15 @@ pub enum BuildWaitDecision {
 
 #[derive(Debug, Clone, Copy)]
 struct BuildWaitRecord {
-    /// Epoch seconds of the first Stop that reported a build-wait signal
-    /// for this execution, continuously since (a `forget` call resets this).
+    /// Epoch seconds of the first Stop that reported a build-wait signal for
+    /// this execution. Elapsed time is measured from this stamp, not from
+    /// verified continuous reporting: an intervening Stop that does not
+    /// report a build-wait signal falls through to the normal nudge/park
+    /// flow without calling [`BuildWaitTracker::forget`], so this stamp is
+    /// left in place and a later build-wait is still measured from it. That
+    /// only ever shortens the effective suppression window, never lengthens
+    /// it, so it is safe — but callers should not read `first_seen_epoch` as
+    /// proof of an unbroken reporting streak. (A `forget` call resets this.)
     first_seen_epoch: i64,
 }
 
