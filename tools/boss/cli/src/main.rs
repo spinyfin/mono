@@ -2675,6 +2675,16 @@ mod status_vocab {
     pub fn to_ui(stored: &str) -> &str {
         RENAMED.iter().find(|(s, _)| *s == stored).map_or(stored, |(_, ui)| *ui)
     }
+
+    /// Map a board (UI) status name back to the stored string the engine
+    /// persists and filters on — the inverse of [`to_ui`]. `blocked`,
+    /// `done`, and `archived` are identical in both vocabularies and pass
+    /// through, as does any unknown value. This is the single source of
+    /// truth for the board→stored direction; both [`TaskStatusArg::as_str`]
+    /// and [`MoveTarget::as_status`] delegate here.
+    pub fn to_stored(ui: &str) -> &str {
+        RENAMED.iter().find(|(_, u)| *u == ui).map_or(ui, |(stored, _)| *stored)
+    }
 }
 
 /// Identity function kept for call-site symmetry: all display boundaries
@@ -2774,11 +2784,17 @@ impl TaskStatusArg {
     /// status-filter comparisons. Maps the board (UI) variant name back
     /// to the legacy stored vocabulary.
     fn as_str(self) -> &'static str {
+        status_vocab::to_stored(self.board_name())
+    }
+
+    /// The board (UI) name for this variant, i.e. the primary spelling of
+    /// its `ValueEnum`. Fed to [`status_vocab::to_stored`] by [`Self::as_str`].
+    fn board_name(self) -> &'static str {
         match self {
-            Self::Backlog => "todo",
-            Self::Doing => "active",
+            Self::Backlog => "backlog",
+            Self::Doing => "doing",
             Self::Blocked => "blocked",
-            Self::Review => "in_review",
+            Self::Review => "review",
             Self::Done => "done",
             Self::Archived => "archived",
         }
@@ -2787,12 +2803,19 @@ impl TaskStatusArg {
 
 impl MoveTarget {
     /// The stored status string the engine persists. Maps the board (UI)
-    /// variant name back to the legacy stored vocabulary.
+    /// variant name back to the legacy stored vocabulary via the shared
+    /// [`status_vocab::to_stored`] table.
     fn as_status(self) -> &'static str {
+        status_vocab::to_stored(self.board_name())
+    }
+
+    /// The board (UI) name for this variant, i.e. the primary spelling of
+    /// its `ValueEnum`. Fed to [`status_vocab::to_stored`] by [`Self::as_status`].
+    fn board_name(self) -> &'static str {
         match self {
-            Self::Backlog => "todo",
-            Self::Doing => "active",
-            Self::Review => "in_review",
+            Self::Backlog => "backlog",
+            Self::Doing => "doing",
+            Self::Review => "review",
             Self::Done => "done",
             Self::Blocked => "blocked",
             Self::Archived => "archived",
@@ -9784,6 +9807,26 @@ mod tests {
         assert_eq!(status_vocab::to_ui("blocked"), "blocked");
         // Unknown values pass through unchanged.
         assert_eq!(status_vocab::to_ui("archived"), "archived");
+    }
+
+    #[test]
+    fn status_vocab_maps_board_names_to_stored() {
+        // `to_stored` is the shared inverse of `to_ui` that both
+        // `TaskStatusArg::as_str` and `MoveTarget::as_status` delegate to.
+        assert_eq!(status_vocab::to_stored("backlog"), "todo");
+        assert_eq!(status_vocab::to_stored("doing"), "active");
+        assert_eq!(status_vocab::to_stored("review"), "in_review");
+        // done / blocked are identical in both vocabularies.
+        assert_eq!(status_vocab::to_stored("done"), "done");
+        assert_eq!(status_vocab::to_stored("blocked"), "blocked");
+        // Unknown values (incl. archived) pass through unchanged.
+        assert_eq!(status_vocab::to_stored("archived"), "archived");
+        assert_eq!(status_vocab::to_stored("unknown"), "unknown");
+
+        // `to_stored` and `to_ui` round-trip on the renamed statuses.
+        for stored in ["todo", "active", "in_review"] {
+            assert_eq!(status_vocab::to_stored(status_vocab::to_ui(stored)), stored);
+        }
     }
 
     #[test]
