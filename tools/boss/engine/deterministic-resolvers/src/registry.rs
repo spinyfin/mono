@@ -81,7 +81,6 @@ impl ResolverRegistry {
                             tracing::info!(
                                 path = %file.path,
                                 conflict_class = class.as_str(),
-                                resolver = class.as_str(),
                                 outcome = "resolved",
                                 summary = %summary,
                                 "deterministic_resolvers: resolver resolved conflicted file",
@@ -96,7 +95,6 @@ impl ResolverRegistry {
                             tracing::info!(
                                 path = %file.path,
                                 conflict_class = class.as_str(),
-                                resolver = class.as_str(),
                                 outcome = "declined",
                                 reason = %reason,
                                 "deterministic_resolvers: resolver declined conflicted file",
