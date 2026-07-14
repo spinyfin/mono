@@ -1620,10 +1620,12 @@ extension WorkTask {
     ///
     /// Dispatch-pending rows (`status=todo AND autostart=true`) route to
     /// Doing rather than Backlog. From the user's perspective these rows
-    /// are already committed — the engine will start them the moment a
-    /// slot frees up — so they belong visually with active work, not with
-    /// unscheduled backlog items. The card renders a distinct hourglass
-    /// indicator to distinguish "queued" from "working".
+    /// are already committed — the engine will start them as soon as
+    /// scheduling reaches them — so they belong visually with active work,
+    /// not with unscheduled backlog items. The card renders a distinct
+    /// hourglass indicator to distinguish "queued" from "working"; see
+    /// `WorkBoardCardItem.liveStatusForCard` for how the subtitle picks
+    /// apart "not yet scheduled" from "genuinely waiting on pool capacity".
     ///
     /// A row the engine gave up starting (`dispatchFailedReason` set) is
     /// NOT dispatch-pending: the engine clears `autostart` in the same

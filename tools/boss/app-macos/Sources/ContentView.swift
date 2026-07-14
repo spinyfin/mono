@@ -1608,9 +1608,12 @@ private struct WorkBoardCardItem: View {
         }()
 
         // A dispatch-pending card has status=todo+autostart=true; it
-        // landed in Doing because the engine intends to run it but no
-        // slot is free yet. We give it its own activity state and a
-        // "waiting for a slot" subtitle distinct from an active worker.
+        // landed in Doing because the engine intends to run it. This
+        // covers two distinct waits — the row may not have an execution
+        // yet (queued for scheduling; T2655 incident) or it may be `ready`
+        // and genuinely waiting on pool capacity — see `liveStatusForCard`
+        // below, which picks the subtitle apart by `runtime?.executionStatus`
+        // instead of assuming capacity is always the cause.
         let isDispatchPending = task.status == "todo" && task.autostart
 
         // `dispatchRetryAt` is set only while the engine is withholding
@@ -1669,7 +1672,19 @@ private struct WorkBoardCardItem: View {
                 }
                 return label
             }
-            if isDispatchPending { return "Waiting for a slot" }
+            // No `dispatchWaitReason` means the scheduler hasn't stamped a
+            // defer reason for this row — either because it hasn't reached
+            // `ready` yet (no execution row at all, or still
+            // `waiting_dependency`) or because it just became `ready` and
+            // the scheduler hasn't evaluated it against the pool. Only the
+            // latter is an actual capacity wait; genuine pool exhaustion
+            // always gets stamped `pool_exhausted` (handled above) within
+            // one scheduler pass. Claiming "Waiting for a slot" for the
+            // former misdirects diagnosis toward pool capacity when the
+            // pool had free workers the whole time (T2655 incident).
+            if isDispatchPending {
+                return runtime?.executionStatus == "ready" ? "Waiting for a slot" : "Queued"
+            }
             if isResolvingConflicts { return nil }
             if isRemediatingCI { return nil }
             if isAIReviewing { return nil }
