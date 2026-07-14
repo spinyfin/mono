@@ -6,12 +6,17 @@
 //! The engine core stays agnostic to any particular repo's tooling: all
 //! format knowledge lives behind the [`DeterministicResolver`] trait and
 //! its [`ResolverRegistry`], which is the extension seam the design calls
-//! out (built-ins today; declarative recipes and user-authored resolvers
-//! later). This crate is standalone and unit-tested against fixture
-//! conflicts; it is not yet wired into `conflict_watch` (a later task).
+//! out: built-ins today, plus [`RecipeResolver`] — the declarative
+//! recipe mechanism (design §"Extension mechanism — declarative
+//! resolution recipes", tracked as T13) — for user-configured formulas
+//! that don't warrant a compiled-in resolver. See [`recipe_config`] for
+//! the recipe format and its boss-side config file. This crate is
+//! standalone and unit-tested against fixture conflicts; it is not yet
+//! wired into `conflict_watch` (a later task).
 
 mod command;
 mod lockfile;
+mod recipe_config;
 mod registry;
 mod resolvers;
 
@@ -20,8 +25,11 @@ use std::path::Path;
 use async_trait::async_trait;
 pub use boss_conflict_diagnosis::ConflictedFile;
 
+pub use recipe_config::{ConflictRecipe, ConflictRecipesStore};
 pub use registry::{DeclinedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
-pub use resolvers::{BazelModuleLockResolver, CargoLockResolver, RegistryAppendUnionResolver};
+pub use resolvers::{
+    BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, RecipeResolver, RegistryAppendUnionResolver,
+};
 
 /// Coarse classification of a conflicted file's resolution strategy, kept
 /// for telemetry attribution (`conflict_resolutions.conflict_class`,
@@ -31,6 +39,10 @@ pub enum ConflictClass {
     CargoLock,
     BazelModuleLock,
     RegistryAppendUnion,
+    /// Resolved by a [`RecipeResolver`] — a user-configured declarative
+    /// recipe rather than a compiled-in resolver. Coarse on purpose;
+    /// [`ResolvedFile::summary`] carries the specific recipe name.
+    Recipe,
 }
 
 impl ConflictClass {
@@ -39,6 +51,7 @@ impl ConflictClass {
             ConflictClass::CargoLock => "cargo_lock",
             ConflictClass::BazelModuleLock => "bazel_module_lock",
             ConflictClass::RegistryAppendUnion => "registry_append_union",
+            ConflictClass::Recipe => "recipe",
         }
     }
 }

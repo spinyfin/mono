@@ -5,9 +5,13 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+globset = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

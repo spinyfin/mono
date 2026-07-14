@@ -104,7 +104,11 @@ impl Default for ResolverRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::command::FakeCommandRunner;
+    use crate::resolvers::RecipeResolver;
     use async_trait::async_trait;
 
     struct AlwaysResolves {
@@ -259,6 +263,39 @@ mod tests {
                 assert_eq!(declined[0].reason, "nope");
             }
             other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recipe_resolver_drops_into_the_registry_alongside_builtins() {
+        // Proves the design's "drop in without rework" claim: a
+        // declarative recipe registers through the same `register`
+        // method as any compiled-in resolver — no registry API change
+        // was needed to support recipes.
+        let recipe = crate::ConflictRecipe {
+            name: "generated_schema".to_owned(),
+            glob: "**/schema.generated.json".to_owned(),
+            resolve_command: vec!["make".to_owned(), "regen-schema".to_owned()],
+            verify_command: None,
+            workdir: None,
+        };
+        let runner = Arc::new(FakeCommandRunner::success_writing_file("schema.generated.json", "{}\n"));
+        let recipe_resolver = RecipeResolver::with_runner(recipe, runner);
+
+        let mut registry = ResolverRegistry::with_builtins();
+        registry.register(Box::new(recipe_resolver));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.generated.json"), "<<<<<<< ours\n").unwrap();
+
+        let result = registry.resolve_all(dir.path(), &[file("schema.generated.json")]).await;
+
+        match result {
+            RegistryResolution::AllResolved(resolved) => {
+                assert_eq!(resolved.len(), 1);
+                assert_eq!(resolved[0].class, ConflictClass::Recipe);
+            }
+            other => panic!("expected AllResolved, got {other:?}"),
         }
     }
 

@@ -7,6 +7,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+use crate::ResolveOutcome;
+
 /// Minimal captured shape of a finished child process — just enough for a
 /// resolver to decide success/failure and report a reason.
 #[derive(Debug, Clone)]
@@ -14,6 +16,48 @@ pub(crate) struct CommandOutput {
     pub(crate) success: bool,
     pub(crate) code: Option<i32>,
     pub(crate) stderr: String,
+}
+
+/// Runs one command, mapping a spawn failure or non-zero exit to a
+/// `Declined` outcome — the shared "run a command, decide success/failure"
+/// core used by every discard→run→verify strategy (the built-in lockfile
+/// resolvers in `lockfile.rs` and the generic [`crate::RecipeResolver`] in
+/// `resolvers/recipe.rs`). `reason_prefix` is prepended verbatim to the
+/// decline reason so each caller can identify which command/strategy
+/// failed (e.g. `"recipe \"schema\" (verify_command): "`); pass `""` for
+/// no prefix.
+pub(crate) async fn run_or_decline(
+    runner: &dyn CommandRunner,
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    reason_prefix: &str,
+) -> Result<(), ResolveOutcome> {
+    let output = match runner.run(program, args, dir).await {
+        Ok(output) => output,
+        Err(e) => {
+            return Err(ResolveOutcome::Declined {
+                reason: format!("{reason_prefix}failed to spawn `{program}`: {e}"),
+            });
+        }
+    };
+
+    if !output.success {
+        let stderr = if output.stderr.is_empty() {
+            "(no stderr)"
+        } else {
+            &output.stderr
+        };
+        return Err(ResolveOutcome::Declined {
+            reason: format!(
+                "{reason_prefix}`{program} {}` exited {:?}: {stderr}",
+                args.join(" "),
+                output.code
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -41,8 +85,11 @@ impl CommandRunner for RealCommandRunner {
 
 #[cfg(test)]
 pub(crate) struct FakeCommandRunner {
-    outcome: std::sync::Mutex<Option<std::io::Result<CommandOutput>>>,
-    /// File to (re)write in `cwd` when `run` succeeds, simulating a real
+    /// Outcomes returned in order, one per call. A resolver that issues
+    /// more calls than outcomes were queued panics (test bug, not a
+    /// production path).
+    outcomes: std::sync::Mutex<std::collections::VecDeque<std::io::Result<CommandOutput>>>,
+    /// File to (re)write in `cwd` when a call succeeds, simulating a real
     /// `cargo`/`bazel` invocation actually regenerating the lockfile.
     writes_file: Option<(String, String)>,
     pub(crate) calls: std::sync::Mutex<Vec<(String, Vec<String>, std::path::PathBuf)>>,
@@ -81,8 +128,15 @@ impl FakeCommandRunner {
     }
 
     fn with_outcome(outcome: std::io::Result<CommandOutput>) -> Self {
+        Self::sequence(vec![outcome])
+    }
+
+    /// Returns `outcomes[0]` on the first call, `outcomes[1]` on the
+    /// second, and so on — for resolvers (like the recipe resolver)
+    /// that issue more than one command per `resolve` call.
+    pub(crate) fn sequence(outcomes: Vec<std::io::Result<CommandOutput>>) -> Self {
         Self {
-            outcome: std::sync::Mutex::new(Some(outcome)),
+            outcomes: std::sync::Mutex::new(outcomes.into_iter().collect()),
             writes_file: None,
             calls: std::sync::Mutex::new(Vec::new()),
         }
@@ -99,11 +153,11 @@ impl CommandRunner for FakeCommandRunner {
             cwd.to_path_buf(),
         ));
         let outcome = self
-            .outcome
+            .outcomes
             .lock()
             .unwrap()
-            .take()
-            .expect("FakeCommandRunner outcome consumed more than once");
+            .pop_front()
+            .expect("FakeCommandRunner ran out of queued outcomes");
         if let (Ok(output), Some((filename, contents))) = (&outcome, &self.writes_file)
             && output.success
         {
