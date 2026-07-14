@@ -14,6 +14,8 @@ extension ChatViewModel {
     func handleResyncRequired() {
         engine.sendListProducts()
         engine.sendListWorkerLiveStates()
+        engine.sendListLiveStatusDisabledSlots()
+        commentBridge.reloadOpenLayers()
         if let productID = currentSelectedProductID {
             engine.sendGetWorkTree(productId: productID, flow: .invalidationRefetch)
             engine.sendListAttentionItemsForWorkItem(workItemID: productID)
@@ -39,7 +41,7 @@ extension ChatViewModel {
         connectionGeneration += 1
         let generation = connectionGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.connectionLostBannerDelay) { [weak self] in
-            guard let self, self.connectionGeneration == generation, !self.isConnected else { return }
+            guard let self, self.connectionGeneration == generation, !self.isConnected, self.hasConnectedOnce else { return }
             self.showConnectionLostBanner = true
         }
     }

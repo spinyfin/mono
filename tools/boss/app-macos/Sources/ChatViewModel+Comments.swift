@@ -224,6 +224,15 @@ final class CommentEngineBridge: CommentBackend {
         }
     }
 
+    /// The socket never went down (see `EngineEvent.resyncRequired`), so
+    /// subscriptions are still live — just reload every open layer to
+    /// recover any comment invalidation the engine dropped during the burst.
+    func reloadOpenLayers() {
+        for reg in registrations.values {
+            reg.layer?.reload()
+        }
+    }
+
     private func forEachLayer(kind: String, id: String, _ body: (CommentLayer) -> Void) {
         for reg in registrations.values where reg.artifactKind == kind && reg.artifactId == id {
             if let layer = reg.layer { body(layer) }

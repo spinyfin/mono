@@ -301,8 +301,8 @@ pub(super) fn topic_event_topic(payload: &FrontendEvent) -> Option<String> {
     }
 }
 
-/// Build the marker envelope [`SessionQueue::pop_front`] injects once it
-/// has dropped a pending bulk entry to survive a burst. Carries no
+/// Build the marker envelope [`SessionQueue::admit_under_pressure`] injects
+/// once it has dropped a pending bulk entry to survive a burst. Carries no
 /// meaningful `revision` (the app doesn't use `TopicEvent::revision` for
 /// gap detection) — its only job is to tell the app "you may have missed
 /// an invalidation; refetch" without tearing down the connection the way a

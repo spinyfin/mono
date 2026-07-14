@@ -2177,8 +2177,8 @@ final class ChatViewModel: ObservableObject {
                 // work-error modal makes the app unusable: dismissing
                 // re-opens it on the next retry. The disconnected
                 // banner in the main chrome is the user-facing signal
-                // for this state — see `hasConnectedOnce` /
-                // `isConnected` in ContentView.
+                // for this state — see `showConnectionLostBanner` in
+                // ContentView.
                 appendSystemMessage(message)
                 return
             }
