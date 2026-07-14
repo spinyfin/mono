@@ -1759,12 +1759,14 @@ private struct WorkBoardCardItem: View {
                     designDocState: designDocState,
                     onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } }
                         ?? (task.docLinkState != nil ? { model.openTaskDoc(task) } : nil),
-                    ciRequiredState: column == .review ? (task.ciRequiredState ?? "in_progress") : nil,
-                    ciRequiredDetail: column == .review ? task.ciRequiredDetail : nil,
+                    ciRequiredState: (column == .review || task.isInMergingSection)
+                        ? (task.ciRequiredState ?? "in_progress")
+                        : nil,
+                    ciRequiredDetail: (column == .review || task.isInMergingSection) ? task.ciRequiredDetail : nil,
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
-                    mergeQueueState: column == .review ? task.mergeQueueState : nil,
-                    mergeQueueDetail: column == .review ? task.mergeQueueDetail : nil,
+                    mergeQueueState: task.isInMergingSection ? task.mergeQueueState : nil,
+                    mergeQueueDetail: task.isInMergingSection ? task.mergeQueueDetail : nil,
                     externalRefLink: externalRefLink,
                     ambiguousRepoNames: model.ambiguousVisibleRepoNames,
                     inReviewRevisions: inReviewRevisions,
@@ -1787,7 +1789,7 @@ private struct WorkBoardCardItem: View {
                                        task.status == "in_review" &&
                                        task.prURL != nil &&
                                        !(task.prURL?.isEmpty ?? true) &&
-                                       task.mergeQueueState != "queued")
+                                       task.mergeQueueState == nil)
                         ? { model.mergeWhenReady(for: task) }
                         : nil
                 )
@@ -2214,15 +2216,17 @@ struct WorkBoardCardView: View {
     var reviewRequiredState: String? = nil
     /// JSON-encoded reviewer list for the review tooltip.
     var reviewRequiredDetail: String? = nil
-    /// Merge-queue state for the merging indicator. `"queued"` when the PR
-    /// is in GitHub's merge queue; `nil` otherwise. When set, replaces the
-    /// CI indicator so the card clearly shows the PR is actively being shipped.
+    /// Merge-queue / auto-merge state for the Merging-section badge.
+    /// `"queued"` or `"auto_merge_enabled"` when the card is in the
+    /// kanban's "Merging" section; `nil` otherwise (including for a
+    /// Review-lane card, which is never in that section — see
+    /// `WorkTask.isInMergingSection`). When set, replaces the CI indicator
+    /// with `MergeQueueBadge`.
     var mergeQueueState: String? = nil
     /// JSON-encoded merge-queue sub-state (`{"position", "state",
-    /// "enqueued_at"}`), mirrors `WorkTask.mergeQueueDetail`. `nil` unless
-    /// `mergeQueueState == "queued"`. Parsed by `PrMergingIndicator` to
-    /// render "queue position N, awaiting checks" with the relative
-    /// enqueued time.
+    /// "enqueued_at", "section_order"}`), mirrors `WorkTask.mergeQueueDetail`.
+    /// `nil` unless `mergeQueueState` is non-nil. Parsed by `MergeQueueBadge`
+    /// to render the queue position and readiness icon.
     var mergeQueueDetail: String? = nil
     /// Upstream-link affordance derived from `task.externalRef`. `nil`
     /// when the task has no external binding — the affordance is hidden
@@ -2266,8 +2270,11 @@ struct WorkBoardCardView: View {
     var terminalTooltip: String = "Open terminal on PR branch"
     /// Invoked after the user confirms the "Merge When Ready" button on a
     /// Review-column card. `nil` hides the button — callers only pass a
-    /// closure when the card is in the Review lane, has a PR URL, and the
-    /// PR is not already in the merge queue (`mergeQueueState != "queued"`).
+    /// closure when the card is in the Review lane, has a PR URL, and Merge
+    /// When Ready hasn't already been requested (`mergeQueueState == nil`).
+    /// Once requested, the card leaves Review for the Done column's
+    /// "Merging" section (see `WorkTask.isInMergingSection`), so the button
+    /// naturally disappears with it.
     var onMergeWhenReady: (() -> Void)? = nil
 
     @Environment(\.kanbanBoardStyle) private var boardStyle
@@ -2491,9 +2498,13 @@ struct WorkBoardCardView: View {
 
             if let prURL = task.prURL, !prURL.isEmpty {
                 HStack(alignment: .center, spacing: 6) {
-                    if mergeQueueState == "queued" {
-                        PrMergingIndicator(detail: mergeQueueDetail)
-                            .layoutPriority(-1)
+                    if let mergeQueueState {
+                        MergeQueueBadge(
+                            mergeQueueState: mergeQueueState,
+                            detail: mergeQueueDetail,
+                            ciRequiredState: ciRequiredState
+                        )
+                        .layoutPriority(-1)
                     } else if let ciState = ciRequiredState {
                         PrCiIndicator(state: ciState, detail: ciRequiredDetail)
                     }
@@ -5079,35 +5090,42 @@ private struct PrCiIndicator: View {
 }
 
 /// Parsed form of `WorkTask.mergeQueueDetail` — the JSON sub-state blob
-/// (`{"position", "state", "enqueued_at"}`) the merge poller writes while a
-/// PR sits in GitHub's merge queue. Kept free of SwiftUI so the parsing
-/// contract can be unit-tested without hosting a view (mirrors
-/// `AutomationTime`).
+/// (`{"position", "state", "enqueued_at", "section_order"}`) the merge
+/// poller writes while a PR sits in GitHub's merge queue or has Merge When
+/// Ready armed. Kept free of SwiftUI so the parsing contract can be
+/// unit-tested without hosting a view (mirrors `AutomationTime`).
 struct MergeQueueDetail: Equatable {
-    /// 1-indexed queue position. `nil` when GitHub didn't report one.
+    /// 1-indexed queue position. `nil` while the PR is only Merge-When-Ready
+    /// armed (not yet queued), or when GitHub didn't report one.
     var position: Int?
     /// GitHub's raw `mergeQueueEntry.state` (e.g. `"AWAITING_CHECKS"`,
-    /// `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`, `"UNMERGEABLE"`). `nil` when
-    /// GitHub didn't report one.
+    /// `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`, `"UNMERGEABLE"`). `nil` while
+    /// not queued, or when GitHub didn't report one.
     var state: String?
     /// RFC 3339 timestamp of when the PR entered the queue. `nil` when
     /// GitHub didn't report one.
     var enqueuedAt: String?
+    /// Engine-computed sort key for the kanban "Merging" section — ascending
+    /// order matches the real merge-queue order, with Merge-When-Ready cards
+    /// (no queue position) always sorting below every queued card. `nil`
+    /// only for a malformed/legacy payload; callers should sort those last.
+    var sectionOrder: Int64?
 
     /// Parse the engine's JSON blob. Returns `nil` for `nil`/empty/
-    /// unparseable input so the caller can fall back to the plain
-    /// "merging" chip rather than propagate a parse error into the view.
+    /// unparseable input so the caller can fall back to a sane default
+    /// rather than propagate a parse error into the view.
     static func parse(_ json: String?) -> MergeQueueDetail? {
         guard let json, let data = json.data(using: .utf8) else { return nil }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return MergeQueueDetail(
             position: (obj["position"] as? NSNumber)?.intValue,
             state: obj["state"] as? String,
-            enqueuedAt: obj["enqueued_at"] as? String
+            enqueuedAt: obj["enqueued_at"] as? String,
+            sectionOrder: (obj["section_order"] as? NSNumber)?.int64Value
         )
     }
 
-    /// Human-readable form of `state` for the card chip (e.g.
+    /// Human-readable form of `state` for tooltips (e.g.
     /// `"AWAITING_CHECKS"` → `"awaiting checks"`). Falls back to a
     /// lowercased, underscore-stripped rendering of any unrecognised value
     /// so a future GitHub enum addition still reads sensibly.
@@ -5124,59 +5142,101 @@ struct MergeQueueDetail: Equatable {
     }
 }
 
-/// Merge-queue indicator for Review-lane cards. Shown when the PR is
-/// currently in GitHub's merge queue — replaces the CI icon so the user
-/// can immediately distinguish cards that are actively being shipped from
-/// cards waiting for CI or human action. When `detail` carries queue
-/// position / sub-state / enqueued time, the chip and tooltip surface those
-/// instead of the bare "merging" label (T2467/mono#1904).
-private struct PrMergingIndicator: View {
+/// Compact queue badge for a card in the kanban's "Merging" section (Done
+/// column, above "Today"). Shows the queue position (`"#3"`) plus an icon
+/// for mergeable / unmergeable / checks-running — replacing the old verbose
+/// "merging — #1, awaiting checks" text chip. A Merge-When-Ready card that
+/// hasn't reached the queue yet has no position to show, so it renders the
+/// readiness icon alone (T2531/mono#1939: the old chip's unbounded text
+/// truncated the PR number off review cards; this one keeps the same
+/// `.layoutPriority(-1)` / single-line shape so the PR link — laid out at
+/// `.layoutPriority(1)` — always wins the available width first).
+private struct MergeQueueBadge: View {
+    var mergeQueueState: String
     var detail: String?
+    /// Required-CI state (`WorkTask.ciRequiredState`) for the
+    /// not-yet-queued Merge-When-Ready case, where there is no
+    /// `mergeQueueEntry.state` to read readiness from.
+    var ciRequiredState: String?
 
     @Environment(\.colorScheme) private var colorScheme
 
     private var parsed: MergeQueueDetail? { MergeQueueDetail.parse(detail) }
 
-    private var chipText: String {
-        guard let parsed else { return "merging" }
-        let positionText = parsed.position.map { "#\($0)" }
-        switch (positionText, parsed.displayState) {
-        case let (.some(position), .some(state)):
-            return "merging — \(position), \(state)"
-        case let (.some(position), .none):
-            return "merging — \(position)"
-        case let (.none, .some(state)):
-            return "merging — \(state)"
-        case (.none, .none):
-            return "merging"
+    private enum Readiness {
+        case mergeable
+        case unmergeable
+        case checksRunning
+
+        var systemImage: String {
+            switch self {
+            case .mergeable: return "checkmark.circle.fill"
+            case .unmergeable: return "xmark.circle.fill"
+            case .checksRunning: return "clock.fill"
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .mergeable: return "mergeable"
+            case .unmergeable: return "unmergeable"
+            case .checksRunning: return "checks running"
+            }
         }
     }
 
+    private var readiness: Readiness {
+        if mergeQueueState == "queued" {
+            switch parsed?.state?.uppercased() {
+            case "MERGEABLE": return .mergeable
+            case "UNMERGEABLE": return .unmergeable
+            default: return .checksRunning // AWAITING_CHECKS, QUEUED, LOCKED, unknown
+            }
+        }
+        switch ciRequiredState {
+        case "success": return .mergeable
+        case "fail": return .unmergeable
+        default: return .checksRunning // in_progress, unknown, nil
+        }
+    }
+
+    private var queuePosition: Int? {
+        guard mergeQueueState == "queued" else { return nil }
+        return parsed?.position
+    }
+
     private var tooltipText: String {
-        guard let parsed else {
-            return "PR is in the merge queue and actively being shipped."
+        var parts: [String]
+        if mergeQueueState == "queued" {
+            parts = ["PR is in the merge queue."]
+            if let queuePosition {
+                parts.append("Queue position \(queuePosition).")
+            }
+        } else {
+            parts = ["Merge When Ready is armed — PR will merge automatically once required checks pass."]
         }
-        var parts = ["PR is in the merge queue and actively being shipped."]
-        if let position = parsed.position {
-            parts.append("Queue position \(position).")
-        }
-        if let displayState = parsed.displayState {
-            parts.append("Status: \(displayState).")
-        }
-        if let enqueuedAt = parsed.enqueuedAt {
+        parts.append("Status: \(readiness.label).")
+        if let enqueuedAt = parsed?.enqueuedAt {
             parts.append("Enqueued \(AutomationTime.relative(enqueuedAt, now: Date())).")
         }
         return parts.joined(separator: " ")
     }
 
+    private var accessibilityLabel: String {
+        let subject = queuePosition.map { "Queue position \($0)" } ?? "Merge when ready"
+        return "\(subject), \(readiness.label)"
+    }
+
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: "arrow.triangle.merge")
+            if let queuePosition {
+                Text("#\(queuePosition)")
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Image(systemName: readiness.systemImage)
                 .font(.caption2.weight(.semibold))
-            Text(chipText)
-                .font(.caption.weight(.semibold))
-                .lineLimit(1)
-                .truncationMode(.tail)
         }
         .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
@@ -5184,7 +5244,7 @@ private struct PrMergingIndicator: View {
         .background(backgroundColor)
         .clipShape(Capsule())
         .help(tooltipText)
-        .accessibilityLabel("In merge queue — \(chipText)")
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private var backgroundColor: Color {

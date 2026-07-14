@@ -2627,12 +2627,17 @@ final class ChatViewModel: ObservableObject {
             .sorted(by: sort)
         // Revisions don't appear as standalone cards in Review or Done — they
         // roll up as single lines on the parent task's card in both lanes.
-        // They are still visible in Backlog/Doing as distinct cards.
+        // They are still visible in Backlog/Doing as distinct cards. An
+        // `in_review` revision normally routes to Review, but one whose own
+        // PR is in the merge queue / Merge When Ready
+        // (`isInMergingSection`) routes to Done instead (`boardColumn`), so
+        // the Done-column filter excludes `in_review` revisions too, not
+        // just `done` ones.
         if column == .review {
             items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
         }
         if column == .done {
-            items = items.filter { !($0.kind == "revision" && $0.status == "done") }
+            items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }
         }
         cachedItemsByColumn[column] = items
         return items
@@ -2650,7 +2655,18 @@ final class ChatViewModel: ObservableObject {
     private func computeWorkSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
         let items = workItems(in: column)
         if column == .done {
-            return Self.doneSections(items: items)
+            // `isInMergingSection` in_review tasks route into `.done` via
+            // `boardColumn` so they render in the Merging section; split
+            // them out here so `doneSections`'s recency bucketing only ever
+            // sees genuinely completed (`status == "done"`) tasks.
+            let merging = items.filter(\.isInMergingSection)
+            let completed = items.filter { !$0.isInMergingSection }
+            var sections: [WorkBoardSection] = []
+            if let mergingSection = Self.mergingSection(items: merging) {
+                sections.append(mergingSection)
+            }
+            sections.append(contentsOf: Self.doneSections(items: completed))
+            return sections
         }
         guard workBoardGrouping == .project else {
             return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]

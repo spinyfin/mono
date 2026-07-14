@@ -810,14 +810,18 @@ struct WorkTask: Identifiable, Hashable {
     /// RFC 3339 timestamp of the most recent successful poll that wrote the
     /// PR state fields above. `nil` until the first probe completes.
     var prStatePolledAt: String? = nil
-    /// Merge-queue state at last poll. `"queued"` when the PR is currently in
-    /// GitHub's merge queue; `nil` when not queued or the repo has no merge
-    /// queue. Replaces the CI indicator on Review-lane cards while merging.
+    /// Merge-queue / auto-merge state at last poll. `"queued"` when the PR
+    /// is currently in GitHub's merge queue; `"auto_merge_enabled"` when
+    /// GitHub auto-merge is armed (Merge When Ready is still waiting on
+    /// checks, or the repo has no merge queue) but the PR hasn't reached a
+    /// queue; `nil` when neither. Either non-nil value moves the task into
+    /// the kanban's "Merging" section — see `boardColumn` /
+    /// `isInMergingSection`.
     var mergeQueueState: String? = nil
-    /// JSON-encoded merge-queue sub-state: `{"position", "state",
-    /// "enqueued_at"}`. `nil` unless `mergeQueueState == "queued"`. Parsed by
-    /// `MergeQueueDetail.parse(json:)` for the Review card's merging
-    /// indicator ("queue position N, awaiting checks").
+    /// JSON-encoded merge-queue/auto-merge sub-state: `{"position",
+    /// "state", "enqueued_at", "section_order"}`. `nil` unless
+    /// `mergeQueueState` is non-nil. Parsed by `MergeQueueDetail.parse(json:)`
+    /// for the Merging section's compact badge and sort order.
     var mergeQueueDetail: String? = nil
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
@@ -1629,10 +1633,21 @@ extension WorkTask {
     /// "waiting for a slot" card indistinguishable from genuine capacity
     /// wait. The card still surfaces the failure via the error banner —
     /// see `WorkBoardCardView`.
+    ///
+    /// An `in_review` task that is either in GitHub's merge queue or has
+    /// Merge When Ready armed (`isInMergingSection`) routes to Done instead
+    /// of Review — it renders in the Done column's collapsible "Merging"
+    /// section, above "Today". This is a pure re-derivation of existing
+    /// engine state (`mergeQueueState`), not a new transition: the task's
+    /// `status` never changes, so if the PR later drops out of the queue
+    /// without merging, the next poll clears `mergeQueueState` and this
+    /// same switch naturally routes the card back to Review.
     var boardColumn: WorkBoardColumnKey {
         switch status {
         case "active":
             return .doing
+        case "in_review" where isInMergingSection:
+            return .done
         case "in_review":
             return .review
         case "done":
@@ -1656,6 +1671,14 @@ extension WorkTask {
         default:
             return false
         }
+    }
+
+    /// `true` when the task's PR is either in GitHub's merge queue or has
+    /// Merge When Ready armed (`mergeQueueState == "queued"` or
+    /// `"auto_merge_enabled"`). Drives both `boardColumn` (routes the card
+    /// into Done's "Merging" section) and the compact queue badge.
+    var isInMergingSection: Bool {
+        mergeQueueState != nil
     }
 
 }

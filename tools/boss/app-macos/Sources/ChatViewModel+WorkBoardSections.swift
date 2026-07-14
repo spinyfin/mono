@@ -1,6 +1,36 @@
 import Foundation
 
 extension ChatViewModel {
+    /// Build the Done column's "Merging" section — tasks whose PR is either
+    /// in GitHub's merge queue or has Merge When Ready armed
+    /// (`WorkTask.isInMergingSection`), rendered collapsible above "Today".
+    /// Returns `nil` when `items` is empty so the caller can omit the
+    /// section entirely rather than render an empty collapsible header.
+    ///
+    /// Ordering is the engine-computed `section_order` from each task's
+    /// `mergeQueueDetail` (queue position first, in queue order; then
+    /// Merge-When-Ready tasks below) — the client never reconstructs that
+    /// rule itself, only renders the key it's given. A task with a
+    /// missing/unparseable `section_order` (only possible with a malformed
+    /// or pre-migration payload) sorts last; ties break on task id for a
+    /// stable order.
+    static func mergingSection(items: [WorkTask]) -> WorkBoardSection? {
+        guard !items.isEmpty else { return nil }
+        let sorted = items.sorted { lhs, rhs in
+            let lhsOrder = MergeQueueDetail.parse(lhs.mergeQueueDetail)?.sectionOrder ?? .max
+            let rhsOrder = MergeQueueDetail.parse(rhs.mergeQueueDetail)?.sectionOrder ?? .max
+            if lhsOrder != rhsOrder { return lhsOrder < rhsOrder }
+            return lhs.id < rhs.id
+        }
+        return WorkBoardSection(
+            id: "done-merging",
+            title: "Merging",
+            items: sorted,
+            isCollapsible: true,
+            defaultExpanded: true
+        )
+    }
+
     /// Bucket completed tasks by recency for the Done lane:
     ///   Today | Yesterday | <weekday names back to start of current week>
     ///   | Last Week | Earlier

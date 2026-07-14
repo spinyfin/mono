@@ -3261,22 +3261,36 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<WorkItemExternalRef>,
 
-    /// Merge-queue state at last poll. `Some("queued")` when the PR is
-    /// currently in GitHub's merge queue; `None` when it is not queued or the
-    /// repo does not have a merge queue configured. Replaces the CI indicator
-    /// on Review-lane cards while the PR is actively merging.
+    /// Merge-queue / auto-merge state at last poll. `Some("queued")` when
+    /// the PR is currently in GitHub's merge queue; `Some("auto_merge_enabled")`
+    /// when GitHub auto-merge is armed (the "Merge When Ready" request is
+    /// still waiting on required checks, or the repo has no merge queue at
+    /// all) but the PR hasn't reached a queue; `None` when neither. Either
+    /// `Some` value moves the task into the macOS kanban's "Merging"
+    /// section (rendered above "Today" in the Done column) — the task's
+    /// own `status` stays `"in_review"` the whole time, so a drop-out (the
+    /// PR leaves the queue/auto-merge without merging) needs no special
+    /// transition: this field just reverts to `None` on the next poll and
+    /// the task falls back to rendering under Review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_state: Option<String>,
 
-    /// Structured sub-state for the merge-queue indicator, JSON-encoded as
-    /// `{"position": <i64>, "state": "<GitHub mergeQueueEntry.state>",
-    /// "enqueued_at": "<RFC3339>"}`. `Some` only while `merge_queue_state ==
-    /// Some("queued")`; cleared (`None`) the moment the probe no longer sees
-    /// a `mergeQueueEntry` for the PR (merged, or removed from the queue).
-    /// `state` is GitHub's raw enum value (`AWAITING_CHECKS`, `MERGEABLE`,
-    /// `LOCKED`, `QUEUED`, `UNMERGEABLE`) — the client maps it to display
-    /// text. `position` and `enqueued_at` are omitted from the JSON when
-    /// GitHub didn't report them.
+    /// Structured sub-state for the merge-queue/auto-merge indicator,
+    /// JSON-encoded as `{"position": <i64>, "state": "<GitHub
+    /// mergeQueueEntry.state>", "enqueued_at": "<RFC3339>", "section_order":
+    /// <i64>}`. `Some` whenever `merge_queue_state` is `Some`; cleared
+    /// (`None`) the moment the probe no longer sees a `mergeQueueEntry` or
+    /// an armed `autoMergeRequest` for the PR (merged, or dropped out).
+    /// `state` is GitHub's raw `mergeQueueEntry.state` enum value
+    /// (`AWAITING_CHECKS`, `MERGEABLE`, `LOCKED`, `QUEUED`, `UNMERGEABLE`) —
+    /// `None` while `merge_queue_state == Some("auto_merge_enabled")`, since
+    /// that state has no queue entry. The client maps `state` to display
+    /// text; `position` and `enqueued_at` are omitted from the JSON when
+    /// GitHub didn't report them. `section_order` is the engine-computed
+    /// sort key for the Merging section — ascending order matches the real
+    /// merge-queue order, with `auto_merge_enabled` cards (no queue
+    /// position) always sorting below every queued card; the client
+    /// renders it as-is rather than deriving its own ordering rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_detail: Option<String>,
 

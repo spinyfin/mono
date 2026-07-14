@@ -52,6 +52,7 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::gh_invocation::gh_output;
+use crate::iso8601::parse_iso8601_lenient;
 use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;
@@ -280,6 +281,19 @@ pub struct PrLifecycleProbe {
     /// for diagnosability on transition log lines.
     #[builder(default)]
     pub raw_merge_state_status: String,
+    /// Whether GitHub's auto-merge is currently armed for this PR
+    /// (`autoMergeRequest` non-null) — the PR will merge automatically once
+    /// required checks and reviews pass, independent of whether it is also
+    /// in a merge queue. Used to render the "Merging" kanban section for a
+    /// task that requested Merge When Ready but hasn't reached the queue
+    /// (or the repo has no queue at all).
+    #[builder(default)]
+    pub auto_merge_enabled: bool,
+    /// GitHub's raw `autoMergeRequest.enabledAt` (RFC 3339). `None` when
+    /// `auto_merge_enabled` is `false` or GitHub omitted the field. Used
+    /// only as a deterministic secondary ordering key for the Merging
+    /// section (earlier-armed PRs sort above later ones).
+    pub auto_merge_enabled_at: Option<String>,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -615,8 +629,10 @@ impl MergeProbe for CommandMergeProbe {
             // NOTE: `mergeQueueEntry` is intentionally omitted here —
             // `gh pr view --json` does not expose it in all `gh` versions.
             // Merge-queue state is queried separately via `gh api graphql`
-            // in `fetch_merge_queue_status` below.
-            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews",
+            // in `fetch_merge_queue_status` below. `autoMergeRequest` (used
+            // to detect a "Merge When Ready" PR that hasn't reached the
+            // queue) IS a valid `--json` field, so it's requested directly.
+            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,autoMergeRequest",
         ])
         .await
         .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
@@ -681,6 +697,7 @@ const PR_PROBE_FIELDS: &str = concat!(
     "labels(first: 100) { nodes { name } } ",
     "reviewDecision reviews(last: 100) { nodes { author { login } state } } ",
     "mergeQueueEntry { state position enqueuedAt } ",
+    "autoMergeRequest { enabledAt } ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ",
     "__typename ... on CheckRun { name status conclusion detailsUrl } ",
     "... on StatusContext { context state targetUrl } } } } } } }",
@@ -939,6 +956,7 @@ fn flatten_batched_pr_node(node: &serde_json::Value) -> serde_json::Value {
         "reviewDecision": node["reviewDecision"],
         "reviews": reviews,
         "mergeQueueEntry": node["mergeQueueEntry"],
+        "autoMergeRequest": node["autoMergeRequest"],
     })
 }
 
@@ -1291,6 +1309,17 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    // `autoMergeRequest` is non-null while GitHub auto-merge is armed for
+    // this PR (the "Merge When Ready" state before it reaches a merge
+    // queue, or on repos with no merge queue at all). Null, missing, or
+    // explicit JSON null → auto-merge not requested / already resolved.
+    let auto_merge_request_node = root.get("autoMergeRequest").filter(|v| !v.is_null());
+    let auto_merge_enabled = auto_merge_request_node.is_some();
+    let auto_merge_enabled_at = auto_merge_request_node
+        .and_then(|v| v.get("enabledAt"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -1306,6 +1335,8 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         merge_queue_enqueued_at,
         raw_mergeable: mergeable.to_owned(),
         raw_merge_state_status: merge_state_status.to_owned(),
+        auto_merge_enabled,
+        auto_merge_enabled_at,
     })
 }
 
@@ -3200,32 +3231,69 @@ fn review_detail_json(reviewers: &[String]) -> Option<String> {
     serde_json::to_string(reviewers).ok()
 }
 
-/// Derive the `merge_queue_state` DB string from a probe's merge-queue flag.
-/// Returns `Some("queued")` when in queue, `None` when not (NULL in DB).
-fn merge_queue_state_str(in_merge_queue: bool) -> Option<&'static str> {
-    if in_merge_queue { Some("queued") } else { None }
+/// Derive the `merge_queue_state` DB string from a probe's merge-queue and
+/// auto-merge flags. `Some("queued")` when the PR is in GitHub's merge
+/// queue; `Some("auto_merge_enabled")` when auto-merge is armed but the PR
+/// hasn't reached a queue (either the "Merge When Ready" request is still
+/// pending required checks, or the repo has no merge queue at all); `None`
+/// (NULL in DB) when neither. A queue entry always implies auto-merge is
+/// also armed on GitHub's side, so `in_merge_queue` takes precedence.
+///
+/// Both values place the task in the macOS kanban's "Merging" section
+/// (above "Today" in Done) — see [`merge_queue_detail_json`] for the
+/// section's ordering key.
+fn merge_queue_state_str(in_merge_queue: bool, auto_merge_enabled: bool) -> Option<&'static str> {
+    if in_merge_queue {
+        Some("queued")
+    } else if auto_merge_enabled {
+        Some("auto_merge_enabled")
+    } else {
+        None
+    }
 }
 
+/// `section_order` sentinel for a queued PR whose GitHub queue position
+/// wasn't reported (rare — schema allows it). Sorts below every PR with a
+/// real numbered position but above the merge-when-ready bucket.
+const QUEUED_NO_POSITION_SECTION_ORDER: i64 = 500_000;
+
+/// `section_order` fallback for a merge-when-ready PR whose
+/// `autoMergeRequest.enabledAt` GitHub didn't report. Sorts after every
+/// merge-when-ready PR with a known enable time, at the very bottom of the
+/// Merging section.
+const MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER: i64 = i64::MAX;
+
 /// Build the `merge_queue_detail` JSON blob (`{"position", "state",
-/// "enqueued_at"}`) from a probe's merge-queue sub-state fields. Returns
-/// `None` when the probe isn't queued, or when queued but GitHub reported no
-/// sub-state fields at all (nothing to show beyond the plain "merging" chip)
-/// — this keeps the column `NULL` rather than a `"{}"` the client would have
-/// to special-case.
+/// "enqueued_at", "section_order"}`) from a probe's merge-queue and
+/// auto-merge sub-state. Returns `None` when the probe is in neither state
+/// (nothing to show). Otherwise always includes `section_order` — the
+/// engine-computed sort key the macOS kanban's Merging section renders in,
+/// so the client never has to reconstruct "queue position first, then
+/// merge-when-ready" ordering itself:
+///   - queued: the GitHub queue position (falls back to
+///     [`QUEUED_NO_POSITION_SECTION_ORDER`] if GitHub omitted it).
+///   - auto-merge armed but not queued: the `enabledAt` epoch (falls back
+///     to [`MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER`]) — always
+///     larger than any realistic queue position/sentinel, so this bucket
+///     sorts below every queued PR, and multiple armed PRs order by which
+///     requested Merge When Ready first.
 fn merge_queue_detail_json(probe: &PrLifecycleProbe) -> Option<String> {
-    if !probe.in_merge_queue {
+    let section_order = if probe.in_merge_queue {
+        probe.merge_queue_position.unwrap_or(QUEUED_NO_POSITION_SECTION_ORDER)
+    } else if probe.auto_merge_enabled {
+        probe
+            .auto_merge_enabled_at
+            .as_deref()
+            .and_then(parse_iso8601_lenient)
+            .unwrap_or(MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER)
+    } else {
         return None;
-    }
-    if probe.merge_queue_entry_state.is_none()
-        && probe.merge_queue_position.is_none()
-        && probe.merge_queue_enqueued_at.is_none()
-    {
-        return None;
-    }
+    };
     serde_json::to_string(&serde_json::json!({
         "position": probe.merge_queue_position,
         "state": probe.merge_queue_entry_state,
         "enqueued_at": probe.merge_queue_enqueued_at,
+        "section_order": section_order,
     }))
     .ok()
 }
@@ -3247,7 +3315,7 @@ pub(crate) async fn update_pr_poll_state(
     let review_state = probe.review.as_db_str();
     let ci_detail = ci_detail_json(&open.ci);
     let review_detail = review_detail_json(probe.review.reviewers());
-    let merge_queue_state = merge_queue_state_str(probe.in_merge_queue);
+    let merge_queue_state = merge_queue_state_str(probe.in_merge_queue, probe.auto_merge_enabled);
     let merge_queue_detail = merge_queue_detail_json(probe);
 
     let outcome = match work_db.update_task_pr_poll_state(
@@ -4574,6 +4642,8 @@ mod tests {
             merge_queue_enqueued_at: None,
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
+            auto_merge_enabled: false,
+            auto_merge_enabled_at: None,
         };
 
         assert_eq!(
@@ -6887,6 +6957,54 @@ mod tests {
         assert_eq!(probe_not_queued.merge_queue_enqueued_at, None);
     }
 
+    /// `autoMergeRequest` non-null → `auto_merge_enabled = true` and its
+    /// `enabledAt` parses through; null, absent, or an unrelated document
+    /// clear it back to `false` — this is the "Merge When Ready, not yet
+    /// queued" signal the Merging section keys off.
+    #[test]
+    fn parse_probe_surfaces_auto_merge_request() {
+        let body_armed = {
+            let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+                "OPEN",
+                "",
+                "MERGEABLE",
+                "CLEAN",
+                ("", ""),
+                &[],
+                serde_json::json!([]),
+            ))
+            .unwrap();
+            doc["autoMergeRequest"] = serde_json::json!({"enabledAt": "2026-07-10T11:54:54Z"});
+            doc.to_string()
+        };
+        let probe = parse_probe_json("https://example.test/pr/amr1", &body_armed, None).unwrap();
+        assert!(probe.auto_merge_enabled);
+        assert_eq!(probe.auto_merge_enabled_at.as_deref(), Some("2026-07-10T11:54:54Z"));
+
+        let body_null = {
+            let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+                "OPEN",
+                "",
+                "MERGEABLE",
+                "CLEAN",
+                ("", ""),
+                &[],
+                serde_json::json!([]),
+            ))
+            .unwrap();
+            doc["autoMergeRequest"] = serde_json::Value::Null;
+            doc.to_string()
+        };
+        let probe_null = parse_probe_json("https://example.test/pr/amr2", &body_null, None).unwrap();
+        assert!(!probe_null.auto_merge_enabled);
+        assert_eq!(probe_null.auto_merge_enabled_at, None);
+
+        let body_absent = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("", ""), &[], serde_json::json!([]));
+        let probe_absent = parse_probe_json("https://example.test/pr/amr3", &body_absent, None).unwrap();
+        assert!(!probe_absent.auto_merge_enabled);
+        assert_eq!(probe_absent.auto_merge_enabled_at, None);
+    }
+
     /// T2467/mono#1904 note: while a PR sits in the merge queue,
     /// `mergeStateStatus` commonly reads `UNKNOWN` (GitHub is mid-recompute
     /// against the synthetic merge commit). `classify_state`'s conflict
@@ -7988,6 +8106,8 @@ mod tests {
                 merge_queue_enqueued_at: None,
                 raw_mergeable: "CONFLICTING".into(),
                 raw_merge_state_status: "DIRTY".into(),
+                auto_merge_enabled: false,
+                auto_merge_enabled_at: None,
             }),
         );
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
@@ -9228,18 +9348,23 @@ mod tests {
     }
 
     #[test]
-    fn merge_queue_state_str_maps_flag() {
-        assert_eq!(merge_queue_state_str(true), Some("queued"));
-        assert_eq!(merge_queue_state_str(false), None);
+    fn merge_queue_state_str_maps_flags() {
+        assert_eq!(merge_queue_state_str(true, false), Some("queued"));
+        assert_eq!(merge_queue_state_str(true, true), Some("queued"));
+        assert_eq!(merge_queue_state_str(false, true), Some("auto_merge_enabled"));
+        assert_eq!(merge_queue_state_str(false, false), None);
     }
 
     /// Test-only helper for building a minimal `Open(clean)` probe with the
-    /// merge-queue fields under test; every other field is a harmless default.
+    /// merge-queue and auto-merge fields under test; every other field is a
+    /// harmless default.
     fn probe_with_queue_fields(
         in_merge_queue: bool,
         merge_queue_entry_state: Option<&str>,
         merge_queue_position: Option<i64>,
         merge_queue_enqueued_at: Option<&str>,
+        auto_merge_enabled: bool,
+        auto_merge_enabled_at: Option<&str>,
     ) -> PrLifecycleProbe {
         PrLifecycleProbe {
             url: "https://github.com/foo/bar/pull/1".to_owned(),
@@ -9256,33 +9381,98 @@ mod tests {
             merge_queue_enqueued_at: merge_queue_enqueued_at.map(str::to_owned),
             raw_mergeable: String::new(),
             raw_merge_state_status: String::new(),
+            auto_merge_enabled,
+            auto_merge_enabled_at: auto_merge_enabled_at.map(str::to_owned),
         }
     }
 
     #[test]
     fn merge_queue_detail_json_builds_blob_when_queued_with_sub_state() {
-        let probe = probe_with_queue_fields(true, Some("AWAITING_CHECKS"), Some(1), Some("2026-07-10T11:54:54Z"));
+        let probe = probe_with_queue_fields(
+            true,
+            Some("AWAITING_CHECKS"),
+            Some(1),
+            Some("2026-07-10T11:54:54Z"),
+            false,
+            None,
+        );
         let json = merge_queue_detail_json(&probe).expect("queued with sub-state → Some");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(
             parsed,
-            serde_json::json!({"position": 1, "state": "AWAITING_CHECKS", "enqueued_at": "2026-07-10T11:54:54Z"})
+            serde_json::json!({
+                "position": 1,
+                "state": "AWAITING_CHECKS",
+                "enqueued_at": "2026-07-10T11:54:54Z",
+                "section_order": 1,
+            })
         );
     }
 
     #[test]
-    fn merge_queue_detail_json_none_when_not_queued() {
-        let probe = probe_with_queue_fields(false, None, None, None);
+    fn merge_queue_detail_json_none_when_neither_queued_nor_auto_merge() {
+        let probe = probe_with_queue_fields(false, None, None, None, false, None);
         assert_eq!(merge_queue_detail_json(&probe), None);
     }
 
     #[test]
-    fn merge_queue_detail_json_none_when_queued_but_no_sub_state_reported() {
+    fn merge_queue_detail_json_uses_position_sentinel_when_queued_but_no_sub_state_reported() {
         // Degenerate case: GitHub reported a non-null mergeQueueEntry but none
         // of the sub-fields (shouldn't happen per schema, but the parser
-        // degrades gracefully rather than emitting an empty "{}" blob).
-        let probe = probe_with_queue_fields(true, None, None, None);
-        assert_eq!(merge_queue_detail_json(&probe), None);
+        // degrades gracefully — `section_order` still needs a value so the
+        // Merging section can place the card, so this falls back to the
+        // "queued, unknown position" sentinel rather than going `None`.
+        let probe = probe_with_queue_fields(true, None, None, None, false, None);
+        let json = merge_queue_detail_json(&probe).expect("queued → Some, even with no sub-state");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "position": null,
+                "state": null,
+                "enqueued_at": null,
+                "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+            })
+        );
+    }
+
+    #[test]
+    fn merge_queue_detail_json_builds_blob_when_auto_merge_enabled_not_queued() {
+        let probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
+        let json = merge_queue_detail_json(&probe).expect("auto-merge armed → Some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "position": null,
+                "state": null,
+                "enqueued_at": null,
+                "section_order": 1_783_684_494i64,
+            })
+        );
+    }
+
+    #[test]
+    fn merge_queue_detail_json_auto_merge_enabled_falls_back_when_enabled_at_missing() {
+        let probe = probe_with_queue_fields(false, None, None, None, true, None);
+        let json = merge_queue_detail_json(&probe).expect("auto-merge armed → Some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed["section_order"],
+            serde_json::json!(MERGE_WHEN_READY_UNKNOWN_ENABLED_AT_SECTION_ORDER)
+        );
+    }
+
+    #[test]
+    fn merge_queue_detail_json_queued_takes_precedence_over_auto_merge_for_section_order() {
+        // A queued PR also has auto-merge armed on GitHub's side (queueing
+        // requires it) — the queue position must win, not the enabledAt
+        // epoch, so a queued card never sorts into the merge-when-ready
+        // bucket.
+        let probe = probe_with_queue_fields(true, Some("QUEUED"), Some(3), None, true, Some("2026-07-10T11:54:54Z"));
+        let json = merge_queue_detail_json(&probe).expect("queued → Some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["section_order"], serde_json::json!(3));
     }
 
     #[test]
