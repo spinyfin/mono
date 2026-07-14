@@ -239,20 +239,9 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          Lease held for the lifetime of this run. Do not lease, release,\n\
          or mutate cube state.\n\
          \n\
-         ## Boundaries\n\
-         \n\
-         - Do not modify files outside your workspace. Other workspaces\n\
-           belong to other workers.\n\
-         - Do not modify cube's database, lease state, or workspace registry.\n\
-         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
-           Never read, write, or touch it.\n\
-           `bossctl` is coordinator-only.\n\
-         \n\
-         ## Coordinator\n\
-         \n\
-         The coordinator may probe this session between turns. Treat probes\n\
-         as questions from a human reviewer — short, specific answers.\n",
+         {boundaries_and_coordinator}",
         lease = lease_id,
+        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
     )
 }
 
