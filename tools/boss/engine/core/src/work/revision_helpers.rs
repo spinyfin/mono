@@ -163,6 +163,35 @@ pub(crate) fn assert_parent_revisable_and_insert(
         maybe_engine_block_dependent(conn, &new_revision.id, &now)?;
     }
 
+    // ── 9. Create the initial execution row now ─────────────────────────────
+    // Every other creation path (`task create`, `chore create`, …) gets its
+    // first execution from the caller's immediate follow-up `RequestExecution`
+    // call (the macOS app and CLI both fire it right after the create RPC
+    // returns). `create_revision` has no such follow-up for its engine-
+    // triggered callers (conflict_watch, ci_watch): those spawn a revision
+    // from a background sweep with no client on the other end to issue the
+    // follow-up. Without this, the row sat in `todo` (or `blocked`) with zero
+    // `work_executions` rows until the periodic dep-unblock sweep's stuck-
+    // execution rescue happened to notice it on its next ≤30s pass — see
+    // `dep_unblock_sweep.rs`'s Part B, which was never meant to be the
+    // primary dispatch path. Reconciling here, inside the same transaction as
+    // the insert and the gates above, closes that gap for every caller
+    // (engine-triggered and human/CLI alike) instead of just the reported one.
+    //
+    // `reconcile_revision_execution` runs its own gating check
+    // (`deps::gating_prereqs_for`), so this is safe to call unconditionally
+    // once the gates above have been applied: a gated revision (chain-tail or
+    // caller `--depends-on`) is born with a `waiting_dependency` execution —
+    // promoted the normal way once its prerequisite clears — while an
+    // ungated one is born `ready` immediately. `task_accepts_execution` keeps
+    // this in step with `autostart = false`: that flag means "create the row
+    // but do not auto-dispatch," so no execution is created here and the
+    // caller must explicitly start it later, exactly as today.
+    if task_accepts_execution(&new_revision) {
+        let mut result = ExecutionReconcileResult::default();
+        reconcile_revision_execution(conn, &mut result, &new_revision)?;
+    }
+
     if has_chain_tail_gate || !depends_on.is_empty() {
         // Re-read the row so the caller sees the updated status.
         return query_task(conn, &new_revision.id)?
