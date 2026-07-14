@@ -477,6 +477,91 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// Aggregate `conflict_resolutions.conflict_diagnosis` for one
+    /// product into a hotspot report (Layer 0 telemetry, T5): per-file
+    /// conflict frequency, per-file-_pair_ co-conflict frequency, and
+    /// per-class counts. Backs `boss engine conflicts hotspots`.
+    ///
+    /// Always scoped to a single `product_id` — never a cross-product
+    /// blend (design's hard requirement; hotspot data is only
+    /// meaningful within one repo). `top_n` caps each ranked list
+    /// (file/pair frequency) to its highest-count entries; class
+    /// counts are never truncated since there are only a handful of
+    /// classes. Rows with no `conflict_diagnosis` still count toward
+    /// `total_events` and `class_counts` (via the `conflict_class`
+    /// column) but contribute nothing to file/pair frequency.
+    pub fn conflict_hotspots(&self, product_id: &str, top_n: usize) -> Result<ConflictHotspotReport> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT conflict_diagnosis, conflict_class FROM conflict_resolutions WHERE product_id = ?1")?;
+        let rows = stmt.query_map(params![product_id], |row| {
+            let diagnosis_json: Option<String> = row.get(0)?;
+            let conflict_class: Option<String> = row.get(1)?;
+            Ok((diagnosis_json, conflict_class))
+        })?;
+
+        let mut total_events: u64 = 0;
+        let mut file_counts: HashMap<String, u64> = HashMap::new();
+        let mut pair_counts: HashMap<(String, String), u64> = HashMap::new();
+        let mut class_counts: HashMap<String, u64> = HashMap::new();
+
+        for row in rows {
+            let (diagnosis_json, conflict_class) = row?;
+            total_events += 1;
+            *class_counts
+                .entry(conflict_class.unwrap_or_else(|| "unknown".to_owned()))
+                .or_insert(0) += 1;
+
+            let Some(json) = diagnosis_json else { continue };
+            let Ok(diagnosis) = serde_json::from_str::<crate::conflict_diagnosis::ConflictDiagnosis>(&json) else {
+                continue;
+            };
+            let mut paths: Vec<String> = diagnosis.files.into_iter().map(|f| f.path).collect();
+            paths.sort();
+            paths.dedup();
+            for path in &paths {
+                *file_counts.entry(path.clone()).or_insert(0) += 1;
+            }
+            for i in 0..paths.len() {
+                for j in (i + 1)..paths.len() {
+                    *pair_counts.entry((paths[i].clone(), paths[j].clone())).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut file_frequency: Vec<ConflictFileFrequency> = file_counts
+            .into_iter()
+            .map(|(path, count)| ConflictFileFrequency { path, count })
+            .collect();
+        file_frequency.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
+        file_frequency.truncate(top_n);
+
+        let mut file_pair_frequency: Vec<ConflictFilePairFrequency> = pair_counts
+            .into_iter()
+            .map(|((path_a, path_b), count)| ConflictFilePairFrequency { path_a, path_b, count })
+            .collect();
+        file_pair_frequency.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| (a.path_a.as_str(), a.path_b.as_str()).cmp(&(b.path_a.as_str(), b.path_b.as_str())))
+        });
+        file_pair_frequency.truncate(top_n);
+
+        let mut class_counts_vec: Vec<ConflictClassCount> = class_counts
+            .into_iter()
+            .map(|(class, count)| ConflictClassCount { class, count })
+            .collect();
+        class_counts_vec.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.class.cmp(&b.class)));
+
+        Ok(ConflictHotspotReport {
+            product_id: product_id.to_owned(),
+            total_events,
+            file_frequency,
+            file_pair_frequency,
+            class_counts: class_counts_vec,
+        })
+    }
+
     /// Reset a terminal-failure attempt back to `pending` so the
     /// dispatcher re-spawns a worker. Only valid when the row's current
     /// status is `failed` or `abandoned`; the caller (CLI) is

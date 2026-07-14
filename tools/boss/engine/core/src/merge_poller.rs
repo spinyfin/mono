@@ -115,6 +115,52 @@ crate::register_counter!(
     "merge_poller.conflict_cleared",
     "PRs cleared from blocked:merge_conflict in one sweep."
 );
+
+/// Increment the per-product, per-class conflict counter for one
+/// newly-classified conflict event (Layer 0 telemetry, T5 — see
+/// `tools/boss/docs/designs/merge-conflict-reduction-and-fast-
+/// resolution-for-parallel-tasks.md`, "Counters — must be scopable
+/// per-product"). `product_id` isn't a fixed set known at compile
+/// time, so this can't be a `register_counter!` static handle like
+/// [`CONFLICT_FLAGGED`] — it dynamically registers (and increments)
+/// `conflict.<product>.<class>.classified` via
+/// [`crate::metrics::Registry::counter_inc_by_dynamic`]. Call once
+/// per `conflict_resolutions` row the moment its `conflict_class`
+/// becomes known (diagnosis-set time on the review-watch path,
+/// record time on the producer-rebase path) so it fires exactly
+/// once per event, alongside `CONFLICT_FLAGGED`.
+pub fn record_conflict_class_counter(registry: &Registry, product_id: &str, conflict_class: &str) {
+    let name = format!(
+        "conflict.{}.{}.classified",
+        sanitize_metric_name_component(product_id),
+        sanitize_metric_name_component(conflict_class),
+    );
+    registry.counter_inc_by_dynamic(&name, "Conflict events classified into this class for this product.", 1);
+}
+
+/// Lowercase and replace any character outside the registry's
+/// allowed charset (`a-z 0-9 . _`) with `_`, so an arbitrary
+/// `product_id` or `conflict_class` can't produce an invalid dynamic
+/// metric name or let two distinct products collide on one counter.
+fn sanitize_metric_name_component(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_owned()
+    } else {
+        sanitized
+    }
+}
 crate::register_counter!(
     PR_RECHECK_RECOVERED,
     "merge_poller.pr_recheck_recovered",
@@ -9279,5 +9325,39 @@ mod tests {
     fn leaf_matches_check_name_no_match_is_false() {
         let leaf = serde_json::json!({"name": "ci/test"});
         assert!(!leaf_matches_check_name(&leaf, &["ci/lint", "ci/build"]));
+    }
+
+    // ── record_conflict_class_counter (Layer 0 / T5 per-product counters) ──
+
+    #[test]
+    fn record_conflict_class_counter_increments_per_product_per_class() {
+        let registry = crate::metrics::Registry::new();
+        record_conflict_class_counter(&registry, "acme", "lockfile");
+        record_conflict_class_counter(&registry, "acme", "lockfile");
+        record_conflict_class_counter(&registry, "acme", "semantic");
+        record_conflict_class_counter(&registry, "other_co", "lockfile");
+
+        assert_eq!(registry.counter_value("conflict.acme.lockfile.classified"), Some(2));
+        assert_eq!(registry.counter_value("conflict.acme.semantic.classified"), Some(1));
+        assert_eq!(registry.counter_value("conflict.other_co.lockfile.classified"), Some(1));
+    }
+
+    #[test]
+    fn sanitize_metric_name_component_lowercases_and_replaces_invalid_chars() {
+        assert_eq!(sanitize_metric_name_component("Acme-Corp"), "acme_corp");
+        assert_eq!(sanitize_metric_name_component("already_ok_123"), "already_ok_123");
+        assert_eq!(sanitize_metric_name_component(""), "_");
+    }
+
+    #[test]
+    fn record_conflict_class_counter_tolerates_unsanitary_product_id() {
+        // A product id with characters outside the registry's allowed
+        // charset must not produce an invalid dynamic metric name.
+        let registry = crate::metrics::Registry::new();
+        record_conflict_class_counter(&registry, "Acme Corp!", "lockfile");
+        assert_eq!(
+            registry.counter_value("conflict.acme_corp_.lockfile.classified"),
+            Some(1)
+        );
     }
 }

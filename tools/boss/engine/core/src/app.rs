@@ -2767,6 +2767,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
             r @ FrontendRequest::GetCiRemediation { .. } => ci_remediation::handle_get_ci_remediation(ctx, r).await,
+            r @ FrontendRequest::GetConflictHotspots { .. } => {
+                conflict_resolution::handle_get_conflict_hotspots(ctx, r).await
+            }
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }

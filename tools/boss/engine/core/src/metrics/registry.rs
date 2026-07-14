@@ -226,6 +226,33 @@ impl Registry {
         }
     }
 
+    /// Increment a dynamically-named counter by `n`, registering it
+    /// on first use with `description`. Unlike [`Self::register_counter`]
+    /// / [`CounterHandle`] (one static handle per compile-time-known
+    /// name, panicking on a duplicate registration), this is the entry
+    /// point for names only known at runtime — e.g. a counter keyed by
+    /// `product_id`, which isn't a fixed set the binary can declare
+    /// ahead of time. "Already registered" is the expected steady
+    /// state here, not a bug, so repeat calls are idempotent rather
+    /// than panicking. Still panics on an invalid name (see
+    /// [`validate_name`]).
+    pub fn counter_inc_by_dynamic(&self, name: &str, description: &str, n: u64) {
+        validate_name(name);
+        let mut counters = self.counters.write().expect("metrics counters lock poisoned");
+        let entry = counters.entry(name.to_owned()).or_insert_with(|| {
+            Arc::new(CounterEntry {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                value: AtomicU64::new(0),
+                updated_at_ms: AtomicI64::new(now_ms()),
+                stale: AtomicBool::new(false),
+            })
+        });
+        entry.stale.store(false, Ordering::Relaxed);
+        entry.value.fetch_add(n, Ordering::Relaxed);
+        entry.updated_at_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
     /// Register a [`GaugeHandle`]. Panics on duplicate name or
     /// invalid name.
     pub fn register_gauge(&self, handle: &GaugeHandle) {
@@ -556,6 +583,45 @@ mod tests {
         let registry = Registry::new();
         registry.register_counter(&TEST_COUNTER_A);
         registry.register_counter(&TEST_COUNTER_A);
+    }
+
+    #[test]
+    fn dynamic_counter_registers_on_first_use_and_accumulates() {
+        let registry = Registry::new();
+        registry.counter_inc_by_dynamic("conflict.acme.lockfile.classified", "test dynamic counter", 1);
+        registry.counter_inc_by_dynamic("conflict.acme.lockfile.classified", "test dynamic counter", 4);
+
+        assert_eq!(registry.counter_value("conflict.acme.lockfile.classified"), Some(5));
+    }
+
+    #[test]
+    fn dynamic_counter_repeat_registration_does_not_panic() {
+        // Unlike `register_counter`, a dynamically-named counter's
+        // "already registered" state is the expected steady state,
+        // not a bug — product/class names aren't known at compile
+        // time, so every increment after the first re-registers.
+        let registry = Registry::new();
+        for _ in 0..3 {
+            registry.counter_inc_by_dynamic("conflict.acme.semantic.classified", "test dynamic counter", 1);
+        }
+        assert_eq!(registry.counter_value("conflict.acme.semantic.classified"), Some(3));
+    }
+
+    #[test]
+    fn dynamic_counter_keys_are_independent_per_name() {
+        let registry = Registry::new();
+        registry.counter_inc_by_dynamic("conflict.acme.lockfile.classified", "d", 2);
+        registry.counter_inc_by_dynamic("conflict.other_co.lockfile.classified", "d", 5);
+
+        assert_eq!(registry.counter_value("conflict.acme.lockfile.classified"), Some(2));
+        assert_eq!(registry.counter_value("conflict.other_co.lockfile.classified"), Some(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid character")]
+    fn dynamic_counter_rejects_invalid_name() {
+        let registry = Registry::new();
+        registry.counter_inc_by_dynamic("Bad.Name", "d", 1);
     }
 
     #[test]

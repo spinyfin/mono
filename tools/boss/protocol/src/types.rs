@@ -1119,6 +1119,49 @@ fn default_review_watch_event_source() -> String {
     "review_watch".to_owned()
 }
 
+/// Aggregated hotspot report over `conflict_resolutions.conflict_diagnosis`
+/// for one product (Layer 0 telemetry, T5 — see `tools/boss/docs/designs/
+/// merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+/// Exposed as `boss engine conflicts hotspots`. Always scoped to a single
+/// `product_id` — hotspot data is only meaningful within one repo, so the
+/// query never blends products.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictHotspotReport {
+    pub product_id: String,
+    /// Number of `conflict_resolutions` rows scanned for this product.
+    pub total_events: u64,
+    /// Per-file conflict frequency, most-frequent first, capped to the
+    /// requested top-N.
+    pub file_frequency: Vec<ConflictFileFrequency>,
+    /// Per-file-pair co-conflict frequency (how often two files
+    /// conflicted in the same event), most-frequent first, capped to
+    /// the requested top-N. `path_a` < `path_b` lexicographically so
+    /// each pair appears once.
+    pub file_pair_frequency: Vec<ConflictFilePairFrequency>,
+    /// Per-class counts (lockfile / build_file / registry / migration /
+    /// test / semantic / mixed / unknown), most-frequent first.
+    pub class_counts: Vec<ConflictClassCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictFileFrequency {
+    pub path: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictFilePairFrequency {
+    pub path_a: String,
+    pub path_b: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictClassCount {
+    pub class: String,
+    pub count: u64,
+}
+
 /// Input for creating a new attention (question or followup member).
 /// The engine resolves or creates the appropriate group based on the
 /// association and source fields; callers may pass an explicit

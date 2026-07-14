@@ -8,13 +8,13 @@ use boss_client::{
 };
 use boss_protocol::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
-    CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution, CreateAttentionInput, CreateAutomationInput,
-    CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState,
-    PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
+    CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictHotspotReport, ConflictResolution, CreateAttentionInput,
+    CreateAutomationInput, CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge,
+    DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry,
+    ExecutionKind, FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    OrgAuthState, PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
+    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
     WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
     WorkItemPatch,
@@ -1390,6 +1390,12 @@ enum EngineConflictsCommand {
     /// in-review `conflict_watch` path. Best-effort — this never
     /// blocks or reverts your actual work.
     RecordProducer(EngineConflictsRecordProducerArgs),
+    /// Aggregate `conflict_diagnosis` for one product into a hotspot
+    /// report: per-file conflict frequency, per-file-pair co-conflict
+    /// frequency, and per-class counts (Layer 0 telemetry, T5).
+    /// Machine-readable with `--json`. Always scoped to a single
+    /// product — never a cross-product blend.
+    Hotspots(EngineConflictsHotspotsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1476,6 +1482,21 @@ struct EngineConflictsRecordProducerArgs {
     /// rebase` printed.
     #[arg(long, value_delimiter = ',')]
     files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsHotspotsArgs {
+    /// Product to scope the report to (id or slug). Required unless
+    /// exactly one product exists or the CLI is running interactively.
+    /// Hotspot data is only meaningful within one repo, so this never
+    /// blends across products.
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Cap each ranked list (file frequency, file-pair frequency) to
+    /// its top N entries. Class counts are never truncated. Default 20.
+    #[arg(long)]
+    top: Option<u32>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -6060,7 +6081,61 @@ async fn run_engine_conflicts_command(command: EngineConflictsCommand, ctx: &Run
                 other => Err(unexpected_event("conflicts record-producer", &other)),
             }
         }
+        EngineConflictsCommand::Hotspots(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let product = resolve_product(&mut client, args.product.clone(), ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::GetConflictHotspots {
+                    product_id: product.id.clone(),
+                    top: args.top,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictHotspots { report } => {
+                    print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                        print_conflict_hotspot_report(&report)
+                    })
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts hotspots", &other)),
+            }
+        }
     }
+}
+
+fn print_conflict_hotspot_report(report: &ConflictHotspotReport) {
+    println!(
+        "Conflict hotspots for product {} ({} event(s) scanned)",
+        report.product_id, report.total_events,
+    );
+
+    println!("\nBy class:");
+    let mut class_table = new_dynamic_table(vec!["CLASS", "COUNT"]);
+    for entry in &report.class_counts {
+        class_table.add_row(vec![entry.class.as_str(), entry.count.to_string().as_str()]);
+    }
+    print_table(class_table);
+
+    println!("\nTop conflicted files:");
+    let mut file_table = new_dynamic_table(vec!["FILE", "COUNT"]);
+    for entry in &report.file_frequency {
+        file_table.add_row(vec![entry.path.as_str(), entry.count.to_string().as_str()]);
+    }
+    print_table(file_table);
+
+    println!("\nTop co-conflicting file pairs:");
+    let mut pair_table = new_dynamic_table(vec!["FILE A", "FILE B", "COUNT"]);
+    for entry in &report.file_pair_frequency {
+        pair_table.add_row(vec![
+            entry.path_a.as_str(),
+            entry.path_b.as_str(),
+            entry.count.to_string().as_str(),
+        ]);
+    }
+    print_table(pair_table);
 }
 
 fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
