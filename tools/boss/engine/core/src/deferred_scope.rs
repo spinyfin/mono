@@ -101,6 +101,21 @@ fn validate_deferred_scope_fields(rest: &str) -> Option<String> {
 /// `[deferred-scope] epoch 1700000000: summary="…" reason="…"`), matching
 /// the grep-able `[engine-reconcile] epoch …: …` convention already used for
 /// audit lines on work item descriptions.
+/// Extract `(summary, reason)` from a `[deferred-scope]` marker line's
+/// quoted fields, e.g. for prefilling the followup task created by
+/// [`crate::app::attentions::handle_create_task_from_deferred_scope_attention`].
+/// `None` for a field that's missing or malformed — mirrors
+/// [`validate_deferred_scope_fields`]'s leniency: a malformed marker still
+/// yields whatever DID parse instead of nothing. Accepts the line with or
+/// without its `[deferred-scope]` prefix.
+pub fn summary_and_reason(marker_line: &str) -> (Option<String>, Option<String>) {
+    let rest = marker_line.strip_prefix(DEFERRED_SCOPE_MARKER).unwrap_or(marker_line);
+    (
+        extract_quoted(rest, "summary").map(str::to_owned),
+        extract_quoted(rest, "reason").map(str::to_owned),
+    )
+}
+
 pub fn render_audit_line(epoch: i64, item: &DeferredScopeItem) -> String {
     let fields = item
         .marker_line
@@ -184,5 +199,27 @@ mod tests {
         let line = render_audit_line(1_700_000_000, &item);
         assert_eq!(line, "\n[deferred-scope] epoch 1700000000: summary=\"a\" reason=\"b\"");
         assert_eq!(line.matches("[deferred-scope]").count(), 1);
+    }
+
+    #[test]
+    fn summary_and_reason_extracts_both_fields() {
+        let (summary, reason) =
+            summary_and_reason("[deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new pipeline\"");
+        assert_eq!(summary.as_deref(), Some("T11 data plumbing"));
+        assert_eq!(reason.as_deref(), Some("needs a new pipeline"));
+    }
+
+    #[test]
+    fn summary_and_reason_tolerates_a_missing_field() {
+        let (summary, reason) = summary_and_reason("[deferred-scope] summary=\"only this\"");
+        assert_eq!(summary.as_deref(), Some("only this"));
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn summary_and_reason_accepts_the_line_without_its_prefix() {
+        let (summary, reason) = summary_and_reason("summary=\"a\" reason=\"b\"");
+        assert_eq!(summary.as_deref(), Some("a"));
+        assert_eq!(reason.as_deref(), Some("b"));
     }
 }

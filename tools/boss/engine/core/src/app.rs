@@ -2713,6 +2713,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::AbandonConflictResolution { .. } => {
                 conflict_resolution::handle_abandon_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::AcceptDeferredScopeAttention { .. } => {
+                attentions::handle_accept_deferred_scope_attention(ctx, r).await
+            }
             r @ FrontendRequest::ActionAttentionGroup { .. } => attentions::handle_action_attention_group(ctx, r).await,
             r @ FrontendRequest::AddDependency { .. } => dependencies::handle_add_dependency(ctx, r).await,
             r @ FrontendRequest::AddHost { .. } => hosts::handle_add_host(ctx, r).await,
@@ -2750,6 +2753,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::CreateRevision { .. } => work_items::handle_create_revision(ctx, r).await,
             r @ FrontendRequest::CreateRun { .. } => executions::handle_create_run(ctx, r).await,
             r @ FrontendRequest::CreateTask { .. } => work_items::handle_create_task(ctx, r).await,
+            r @ FrontendRequest::CreateTaskFromDeferredScopeAttention { .. } => {
+                attentions::handle_create_task_from_deferred_scope_attention(ctx, r).await
+            }
             r @ FrontendRequest::DebugLiveStatusPipeline => {
                 live_status::handle_debug_live_status_pipeline(ctx, r).await
             }
@@ -2811,6 +2817,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListCiRemediations { .. } => ci_remediation::handle_list_ci_remediations(ctx, r).await,
             r @ FrontendRequest::ListConflictResolutions { .. } => {
                 conflict_resolution::handle_list_conflict_resolutions(ctx, r).await
+            }
+            r @ FrontendRequest::ListDeferredScopeAttentions { .. } => {
+                attentions::handle_list_deferred_scope_attentions(ctx, r).await
             }
             r @ FrontendRequest::ListDependencies { .. } => dependencies::handle_list_dependencies(ctx, r).await,
             r @ FrontendRequest::ListDependenciesDetailed { .. } => {

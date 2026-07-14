@@ -142,7 +142,7 @@ pub(crate) fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> 
 
 pub(crate) fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttentionItem>> {
     conn.query_row(
-        "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+        "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
          FROM work_attention_items
          WHERE id = ?1",
         [id],

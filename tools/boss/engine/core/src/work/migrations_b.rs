@@ -304,6 +304,20 @@ pub(crate) fn migrate_work_attention_items_work_item_id(conn: &Connection) -> Re
     Ok(())
 }
 
+/// Add `converted_task_id` to `work_attention_items` — set when a
+/// `deferred_scope` item is closed via "create task", linking the
+/// item to the followup task it produced (see
+/// [`crate::work::WorkDb::create_task_from_deferred_scope_attention`]).
+/// `NULL` for every item closed by another path (accept/resolve) and
+/// for every non-`deferred_scope` kind. A plain nullable column, so a
+/// simple `ADD COLUMN` suffices — no table rebuild needed.
+pub(crate) fn migrate_work_attention_items_converted_task_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_attention_items", "converted_task_id")? {
+        conn.execute("ALTER TABLE work_attention_items ADD COLUMN converted_task_id TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Add `tasks.effort_level` and `tasks.model_override` per the
 /// effort-and-model-estimation design (PR #370). Both columns are
 /// nullable TEXT; existing rows keep `NULL` across the upgrade so
