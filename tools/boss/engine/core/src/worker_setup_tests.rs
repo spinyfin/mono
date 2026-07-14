@@ -1028,6 +1028,110 @@ fn purge_leaked_worker_hooks_is_noop_when_absent() {
     assert!(!dir.path().join(".claude").join("settings.json").exists());
 }
 
+/// Build a single hook group `{matcher, hooks: [{type, command}]}` whose inner
+/// command carries (or not) the leaked engine signature.
+fn hook_group(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": command }],
+    })
+}
+
+#[test]
+fn hook_group_is_leaked_detects_signature_in_inner_command() {
+    // A group whose inner command carries the BOSS_RUN_ID= signature is
+    // engine-injected (leaked); a group with an ordinary command is not.
+    assert!(
+        hook_group_is_leaked(&hook_group("BOSS_RUN_ID='exec_x' /bin/boss-event")),
+        "a group with the BOSS_RUN_ID signature is leaked",
+    );
+    assert!(
+        !hook_group_is_leaked(&hook_group("echo hi")),
+        "a group with no signature is not leaked",
+    );
+    // A group missing the inner `hooks` array entirely is trivially not leaked.
+    assert!(
+        !hook_group_is_leaked(&serde_json::json!({ "matcher": "*" })),
+        "a malformed group with no inner hooks array is not leaked",
+    );
+}
+
+#[test]
+fn strip_leaked_hooks_removes_leaked_group_and_reports_change() {
+    // A settings value whose only hook group is engine-injected: the group is
+    // removed, the now-empty event key is dropped, the now-empty `hooks` key is
+    // dropped, and the function reports that it changed the value.
+    let mut value = serde_json::json!({
+        "permissions": { "deny": ["Bash(bossctl)"] },
+        "hooks": {
+            "Stop": [ hook_group("BOSS_RUN_ID='exec_stale' /bin/boss-event") ],
+        },
+    });
+    let changed = strip_leaked_hooks(&mut value);
+    assert!(changed, "stripping a leaked group must report a change");
+    assert!(
+        value.get("hooks").is_none(),
+        "the sole event's group was leaked, so the empty hooks key is dropped: {value}",
+    );
+    // Non-hook content is preserved untouched.
+    assert_eq!(value["permissions"]["deny"][0], "Bash(bossctl)");
+}
+
+#[test]
+fn strip_leaked_hooks_leaves_clean_value_unchanged() {
+    // A settings value with only legitimate (non-signature) hooks is left
+    // structurally intact and the function reports no change.
+    let original = serde_json::json!({
+        "hooks": {
+            "Stop": [ hook_group("echo hi") ],
+        },
+    });
+    let mut value = original.clone();
+    let changed = strip_leaked_hooks(&mut value);
+    assert!(!changed, "a clean value must report no change");
+    assert_eq!(value, original, "a clean value must be left unchanged");
+}
+
+#[test]
+fn strip_leaked_hooks_removes_only_the_leaked_group_from_mixed_value() {
+    // A mixed event array holding one leaked group and one legitimate group:
+    // only the leaked group is removed; the clean group (and its event key)
+    // survives, and the change is reported.
+    let mut value = serde_json::json!({
+        "hooks": {
+            "Stop": [
+                hook_group("BOSS_RUN_ID='exec_stale' /bin/boss-event"),
+                hook_group("echo keep-me"),
+            ],
+            // A second, entirely-clean event must be preserved intact.
+            "SessionEnd": [ hook_group("echo session-end") ],
+        },
+    });
+    let changed = strip_leaked_hooks(&mut value);
+    assert!(changed, "removing the leaked group must report a change");
+
+    let stop = value["hooks"]["Stop"].as_array().expect("Stop event survives");
+    assert_eq!(stop.len(), 1, "only the leaked group is removed: {value}");
+    assert_eq!(
+        stop[0]["hooks"][0]["command"], "echo keep-me",
+        "the legitimate Stop group must survive",
+    );
+    assert_eq!(
+        value["hooks"]["SessionEnd"][0]["hooks"][0]["command"], "echo session-end",
+        "an unrelated clean event must be preserved intact",
+    );
+}
+
+#[test]
+fn strip_leaked_hooks_returns_false_when_no_hooks_key() {
+    // A value with no `hooks` object is a no-op that reports no change.
+    let mut value = serde_json::json!({ "permissions": { "deny": [] } });
+    assert!(
+        !strip_leaked_hooks(&mut value),
+        "a value with no hooks key must report no change",
+    );
+}
+
 #[test]
 fn write_workspace_files_purges_leaked_in_tree_settings() {
     let _shared = lock_shared_settings_dir();
@@ -1337,6 +1441,34 @@ fn heal_hook_command_no_op_when_no_boss_event_present() {
     let new_path = PathBuf::from("/stable/boss-event");
     let healed = heal_hook_command(cmd, &new_path);
     assert_eq!(healed, cmd, "should return original when boss-event not found");
+}
+
+#[test]
+fn heal_hook_command_no_op_when_no_opening_quote_before_shim() {
+    // `boss-event` is present, but there is no single quote anywhere before
+    // it, so there is no quoted token to rewrite — the early return leaves
+    // the command untouched (rather than corrupting an unquoted invocation).
+    let cmd = "BOSS_RUN_ID=run-1 /bare/path/boss-event";
+    let new_path = PathBuf::from("/stable/bin/boss-event");
+    let healed = heal_hook_command(cmd, &new_path);
+    assert_eq!(
+        healed, cmd,
+        "no opening single quote before boss-event must return the original unchanged",
+    );
+}
+
+#[test]
+fn heal_hook_command_no_op_when_no_closing_quote_after_shim() {
+    // There is an opening single quote before `boss-event`, but the token is
+    // never closed (truncated/malformed command). Without a closing quote the
+    // replacement span is undefined, so the helper leaves the command as-is.
+    let cmd = "BOSS_RUN_ID='run-1' '/some/path/boss-event";
+    let new_path = PathBuf::from("/stable/bin/boss-event");
+    let healed = heal_hook_command(cmd, &new_path);
+    assert_eq!(
+        healed, cmd,
+        "no closing single quote after boss-event must return the original unchanged",
+    );
 }
 
 #[test]
