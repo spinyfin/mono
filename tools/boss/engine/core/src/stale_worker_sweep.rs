@@ -404,7 +404,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
-    use crate::work::{ExecutionStatus, WorkDb};
+    use crate::work::ExecutionStatus;
 
     // A staleness threshold whose cutoff lands in the *future*, so any
     // `last_event_at` stamped "now" by `apply_event` compares as stale.
@@ -458,22 +458,6 @@ mod tests {
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
-
-    /// Create a `ready` execution and stamp `started_at` to 5 minutes ago
-    /// so the grace-period guard passes.
-    fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
-        use boss_protocol::RequestExecutionInput;
-        let execution = db
-            .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
-            .unwrap();
-        let old_started_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(300) as i64; // 5 minutes ago
-        db.force_started_at_for_test(&execution.id, old_started_at).unwrap();
-        execution.id
-    }
 
     fn register_slot(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str, work_item_id: &str) {
         live_states.register_spawn(
