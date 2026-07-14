@@ -300,6 +300,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_registered_matching_resolver_wins_tie_break() {
+        // Both resolvers apply to every file; registration order must
+        // decide which one resolves it. First registered → CargoLock.
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(AlwaysResolves {
+            class: ConflictClass::CargoLock,
+        }));
+        registry.register(Box::new(AlwaysResolves {
+            class: ConflictClass::BazelModuleLock,
+        }));
+
+        let result = registry.resolve_all(Path::new("/tmp"), &[file("Cargo.lock")]).await;
+
+        match result {
+            RegistryResolution::AllResolved(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].class, ConflictClass::CargoLock);
+            }
+            other => panic!("expected AllResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tie_break_follows_registration_order_not_resolver_identity() {
+        // Symmetric to the previous test with the order swapped: the same
+        // two resolvers, registered in the opposite order, now yield the
+        // other class. This proves registration order — not which resolver
+        // instance it is — decides the winner.
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(AlwaysResolves {
+            class: ConflictClass::BazelModuleLock,
+        }));
+        registry.register(Box::new(AlwaysResolves {
+            class: ConflictClass::CargoLock,
+        }));
+
+        let result = registry.resolve_all(Path::new("/tmp"), &[file("Cargo.lock")]).await;
+
+        match result {
+            RegistryResolution::AllResolved(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].class, ConflictClass::BazelModuleLock);
+            }
+            other => panic!("expected AllResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_match_wins_even_when_it_declines() {
+        // The first matching resolver declines; a later resolver would
+        // have resolved the same file. Per the `.find()` semantics the
+        // registry does NOT fall through — it records the first resolver's
+        // decline rather than the second resolver's success.
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(AlwaysDeclines));
+        registry.register(Box::new(AlwaysResolves {
+            class: ConflictClass::CargoLock,
+        }));
+
+        let result = registry.resolve_all(Path::new("/tmp"), &[file("Cargo.lock")]).await;
+
+        match result {
+            RegistryResolution::Declined { resolved, declined } => {
+                assert!(resolved.is_empty(), "later resolver must not resolve the file");
+                assert_eq!(declined.len(), 1);
+                assert_eq!(declined[0].reason, "nope");
+            }
+            other => panic!("expected Declined from the first matching resolver, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn with_builtins_registers_cargo_and_bazel_lock_resolvers() {
         let registry = ResolverRegistry::with_builtins();
         assert!(registry.resolvers.iter().any(|r| r.applies_to(&file("Cargo.lock"))));
