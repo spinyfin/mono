@@ -149,6 +149,49 @@ fn prune_drops_stale_offer_timestamps() {
     );
 }
 
+fn candidate(pr_number: i64) -> PendingMergeCheck {
+    PendingMergeCheck {
+        work_item_id: format!("wi-{pr_number}"),
+        product_id: "p1".to_owned(),
+        pr_url: format!("https://github.com/foo/bar/pull/{pr_number}"),
+    }
+}
+
+#[test]
+fn take_window_rotates_across_passes_so_the_tail_is_eventually_considered() {
+    // MAX_BRANCHES_PER_PASS is 12; use a backlog just over twice that so a
+    // fixed oldest-N window would never reach the last few candidates.
+    let candidates: Vec<PendingMergeCheck> = (0..30).map(candidate).collect();
+    let mut sched = StackingSchedule::default();
+
+    let mut seen: HashSet<i64> = HashSet::new();
+    // Three passes of 12 cover all 30 distinct candidates (with wraparound
+    // overlap on the last pass), proving the tail isn't permanently stranded.
+    for _ in 0..3 {
+        let window = sched.take_window(&candidates);
+        assert_eq!(window.len(), MAX_BRANCHES_PER_PASS);
+        for c in window {
+            let pr: i64 = c.pr_url.rsplit('/').next().unwrap().parse().unwrap();
+            seen.insert(pr);
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        30,
+        "every candidate was considered within 3 rotating passes"
+    );
+}
+
+#[test]
+fn take_window_is_a_stable_no_op_when_backlog_fits_in_one_pass() {
+    let candidates: Vec<PendingMergeCheck> = (0..5).map(candidate).collect();
+    let mut sched = StackingSchedule::default();
+    for _ in 0..3 {
+        let window = sched.take_window(&candidates);
+        assert_eq!(window.len(), 5, "every candidate fits under the cap every pass");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Orchestration (`run_stacking_pass`) — WorkDb + fake fetcher + publisher.
 // ---------------------------------------------------------------------------

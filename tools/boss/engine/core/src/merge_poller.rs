@@ -3905,11 +3905,14 @@ pub fn spawn_loop(
 
             // Layer 4 / T11: stacked-PR auto-structuring. Also piggybacks on
             // the full-sweep cadence and its own default-OFF feature flag —
-            // off, this is a single cheap local-DB read with no `gh`
-            // activity. When on, `run_stacking_pass` self-throttles to at
-            // most one pass per its own interval, so co-scheduling it here is
-            // safe regardless of how often the loop ticks.
-            if completion_handler.stacked_pr_auto_structuring_enabled() {
+            // off, this block is skipped entirely (not even the local-DB
+            // read below runs). On, `stacking_schedule.pass_due` gates the
+            // local-DB read too, so throttled ticks (most of them —
+            // `run_stacking_pass` self-throttles to at most one
+            // `gh`-fetching pass per its own interval) do neither the DB
+            // read nor the sweep; co-scheduling it here is safe regardless
+            // of how often the loop ticks.
+            if completion_handler.stacked_pr_auto_structuring_enabled() && stacking_schedule.pass_due(Instant::now()) {
                 match work_db.list_chores_pending_merge_check() {
                     Ok(candidates) => {
                         crate::stacked_pr_structuring::run_stacking_pass(

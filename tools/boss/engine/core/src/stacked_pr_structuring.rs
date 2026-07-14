@@ -55,7 +55,6 @@ use anyhow::Result;
 use boss_protocol::FrontendEvent;
 
 use crate::coordinator::ExecutionPublisher;
-use crate::gh_invocation::gh_output;
 use crate::merge_poller::{parse_pr_number, sanitize_metric_name_component};
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, WorkDb};
@@ -73,8 +72,12 @@ const REOFFER_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Upper bound on how many in-flight PRs one pass fetches changed files for,
 /// so a large in-review backlog can't fan out an unbounded burst of `gh`
-/// calls in a single pass. The remainder is considered on the next pass
-/// (logged, never silently dropped).
+/// calls in a single pass. When the backlog exceeds this cap,
+/// [`StackingSchedule::take_window`] selects a rotating window into
+/// `candidates` (advancing by the window size each pass) rather than always
+/// the same oldest-N slice, so the tail is guaranteed to be considered
+/// within `ceil(backlog / MAX_BRANCHES_PER_PASS)` passes instead of only
+/// when `updated_at` churn happens to rotate it into a fixed window.
 const MAX_BRANCHES_PER_PASS: usize = 12;
 
 /// Minimum number of overlapping *non-mechanical* files for a pair to be
@@ -209,7 +212,8 @@ pub trait PrChangedFilesFetcher: Send + Sync {
     async fn changed_files(&self, pr_url: &str) -> Result<Vec<String>>;
 }
 
-/// Production [`PrChangedFilesFetcher`]: `gh pr view <url> --json files`.
+/// Production [`PrChangedFilesFetcher`]: `gh pr view <url> --json files` via
+/// the shared [`boss_github::pr_files::fetch_pr_changed_files`] helper.
 /// Zero-sized — the PR URL fully identifies the repo, exactly as the merge
 /// poller's own `gh pr view` probe relies on.
 pub struct GhPrChangedFiles;
@@ -217,28 +221,7 @@ pub struct GhPrChangedFiles;
 #[async_trait::async_trait]
 impl PrChangedFilesFetcher for GhPrChangedFiles {
     async fn changed_files(&self, pr_url: &str) -> Result<Vec<String>> {
-        let output = gh_output(&["pr", "view", pr_url, "--json", "files"])
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to spawn `gh pr view {pr_url} --json files`: {e}"))?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "`gh pr view {pr_url} --json files` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| anyhow::anyhow!("failed to parse `gh pr view {pr_url} --json files`: {e}"))?;
-        let paths = value
-            .get("files")
-            .and_then(|f| f.as_array())
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(paths)
+        boss_github::pr_files::fetch_pr_changed_files(pr_url).await
     }
 }
 
@@ -252,10 +235,19 @@ pub struct StackingSchedule {
     last_pass_at: Option<Instant>,
     /// Last time each pair (keyed by `(base_pr, dependent_pr)`) was offered.
     last_offered: HashMap<(i64, i64), Instant>,
+    /// Start index of the next pass's [`MAX_BRANCHES_PER_PASS`]-sized window
+    /// into `candidates`, rotated forward by the window size after every
+    /// pass so an oldest-N cap doesn't permanently starve the tail of a
+    /// backlog bigger than the cap (see [`run_stacking_pass`]).
+    next_window_offset: usize,
 }
 
 impl StackingSchedule {
-    fn pass_due(&self, now: Instant) -> bool {
+    /// Whether a full pass (the `gh`-fetching work) is due right now. Exposed
+    /// so callers can skip even the cheap candidate-listing DB read on
+    /// throttled ticks, rather than fetching candidates just to hand them to
+    /// [`run_stacking_pass`] which immediately discards them.
+    pub fn pass_due(&self, now: Instant) -> bool {
         match self.last_pass_at {
             Some(last) => now.duration_since(last) >= MIN_PASS_INTERVAL,
             None => true,
@@ -275,6 +267,23 @@ impl StackingSchedule {
 
     fn mark_offered(&mut self, pair: (i64, i64), now: Instant) {
         self.last_offered.insert(pair, now);
+    }
+
+    /// Select up to [`MAX_BRANCHES_PER_PASS`] candidates starting at the
+    /// current rotating offset (wrapping around `candidates`), then advance
+    /// the offset by however many were taken so the next pass picks up
+    /// where this one left off. When `candidates.len() <= MAX_BRANCHES_PER_PASS`
+    /// every candidate is taken each pass and the offset never moves.
+    fn take_window<'a>(&mut self, candidates: &'a [PendingMergeCheck]) -> Vec<&'a PendingMergeCheck> {
+        let total = candidates.len();
+        if total == 0 {
+            return Vec::new();
+        }
+        let considered = total.min(MAX_BRANCHES_PER_PASS);
+        let offset = self.next_window_offset % total;
+        let window: Vec<&PendingMergeCheck> = (0..considered).map(|i| &candidates[(offset + i) % total]).collect();
+        self.next_window_offset = (offset + considered) % total;
+        window
     }
 
     /// Drop offer timestamps older than [`REOFFER_INTERVAL`] so the map does
@@ -310,17 +319,22 @@ pub async fn run_stacking_pass(
     schedule.prune(now);
 
     // Gather in-flight branches with their (stack-worthy) changed files,
-    // honoring the per-product opt-out and capping the fan-out per pass.
-    let considered = candidates.len().min(MAX_BRANCHES_PER_PASS);
+    // honoring the per-product opt-out and capping the fan-out per pass. The
+    // window rotates across passes (`StackingSchedule::take_window`) so a
+    // backlog bigger than the cap doesn't permanently strand the tail behind
+    // the oldest `MAX_BRANCHES_PER_PASS` candidates — see the type's doc.
+    let window = schedule.take_window(candidates);
+    let considered = window.len();
     if candidates.len() > MAX_BRANCHES_PER_PASS {
         tracing::info!(
-            considered = MAX_BRANCHES_PER_PASS,
+            considered,
             total = candidates.len(),
-            "stacked_pr_structuring: capped candidates this pass; remainder considered next pass",
+            next_offset = schedule.next_window_offset,
+            "stacked_pr_structuring: capped candidates this pass; window rotates so the remainder is considered on a later pass",
         );
     }
     let mut branches: Vec<InFlightBranch> = Vec::with_capacity(considered);
-    for candidate in candidates.iter().take(MAX_BRANCHES_PER_PASS) {
+    for candidate in window {
         // Same unified opt-out the escalation ladder, conflict_watch, and the
         // speculative sweep honour (design Q7): an opted-out product gets no
         // engine-driven PR activity, not even read-only offers.
