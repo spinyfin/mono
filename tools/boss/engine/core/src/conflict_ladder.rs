@@ -625,6 +625,20 @@ async fn retire_attempt_at_rung(
 /// re-derive-rather-than-thread pattern for `pr_number`. Returns an empty
 /// set (fails open) when `head_sha_before` / `base_sha_at_trigger` are
 /// unrecorded on the attempt or the repo slug is unresolvable.
+///
+/// **Fail-open has no backstop on these rungs.** The worker-driven rung
+/// 2/3 path is double-checked: even if this tripwire itself failed open,
+/// the spawned `pr_review` pass re-derives the same
+/// `compute_merged_parent_deletions` check on the worker's actual PR
+/// output before it can retire. Rungs 0 and 1 retire straight to
+/// `in_review` with **no worker spawned at all**, so a transient
+/// `gh`/network error here (in [`crate::coordinator::CommandCubeClient`]'s
+/// `fetch_pr_head_sha` or the `gh compare` calls inside
+/// `compute_merged_parent_deletions`) — as opposed to a genuinely clean
+/// tripwire result — silently auto-retires a possibly-deletion-bearing
+/// mechanical resolution with nothing left to catch it. This is a known,
+/// currently-accepted gap (see the module doc's "Deferred" section), not
+/// an oversight.
 async fn verify_deletion_tripwire(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
