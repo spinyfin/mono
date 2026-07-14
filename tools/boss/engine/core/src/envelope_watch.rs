@@ -364,7 +364,6 @@ fn file_overrun_attention(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use boss_protocol::{RequestExecutionInput, WorkItemBinding, WorkItemPatch, WorkerEvent};
 
@@ -373,7 +372,7 @@ mod tests {
     use crate::work::WorkDb;
 
     fn now() -> i64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+        crate::epoch_time::now_epoch_secs()
     }
 
     /// Create an execution for `work_item_id` whose `started_at` is

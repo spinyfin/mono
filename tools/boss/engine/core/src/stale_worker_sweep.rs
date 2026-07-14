@@ -390,7 +390,6 @@ pub async fn run_one_pass(
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
@@ -695,7 +694,7 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_secs = crate::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());

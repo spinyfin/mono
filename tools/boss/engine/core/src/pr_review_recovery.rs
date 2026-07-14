@@ -266,7 +266,6 @@ fn file_dead_review_attention(work_db: &WorkDb, work_item_id: &str, dead_executi
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use boss_protocol::{ExecutionKind, RequestExecutionInput};
 
@@ -381,7 +380,7 @@ mod tests {
         let (work_item_id, _dead_execution_id) =
             create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/3");
 
-        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_epoch = crate::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
                 .unwrap();
@@ -439,7 +438,7 @@ mod tests {
         let (work_item_id, _dead_execution_id) =
             create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/5");
 
-        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_epoch = crate::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
                 .unwrap();
