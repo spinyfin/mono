@@ -105,6 +105,26 @@ final class MergingSectionKanbanTests: XCTestCase {
         )
     }
 
+    /// A `done` task carrying a stale `mergeQueueState` (the merge
+    /// transition doesn't clear it and the poller never re-polls merged
+    /// PRs) must land in a recency bucket, not the "Merging" section —
+    /// otherwise it stays stuck there forever once merged.
+    func testDoneTaskWithStaleMergeQueueStateLandsInRecencyBucketNotMerging() {
+        let model = makeModel()
+        let staleDone = makeTask(id: "task_stale_done", status: "done", mergeQueueState: "queued", sectionOrder: 1)
+        model.choresByProductID = ["prod_test": [staleDone]]
+
+        let sections = model.workSections(in: .done)
+        XCTAssertFalse(
+            sections.contains { $0.title == "Merging" },
+            "a done task must never keep the Merging section alive via stale merge_queue_state"
+        )
+        XCTAssertTrue(
+            sections.contains { $0.items.contains { $0.id == "task_stale_done" } },
+            "the done task must still appear somewhere (a recency bucket)"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeTask(

@@ -804,6 +804,57 @@ fn cyclic_edges_do_not_loop_the_cascade() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A PR that merges while still carrying merge-queue state (e.g. it merged
+/// via GitHub's merge queue) must not leave that state behind on the `done`
+/// row. `update_pr_poll_state` — the only other writer of
+/// `merge_queue_state` — is skipped once the PR is no longer `Open`, so
+/// `mark_chore_pr_merged` itself must clear it. Otherwise the client's
+/// `WorkTask.isInMergingSection` (gated on `mergeQueueState != nil`) would
+/// keep routing the merged task into the kanban's "Merging" section forever.
+#[test]
+fn mark_chore_pr_merged_clears_stale_merge_queue_state() {
+    let path = temp_db_path("merge-clears-queue-state");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let chore = create_test_chore(&db, product.id.clone(), "A");
+
+    db.update_task_pr_poll_state(
+        &chore.id,
+        PrPollStateInput {
+            ci_required_state: "success",
+            review_required_state: "approved",
+            merge_queue_state: Some("queued"),
+            merge_queue_detail: Some(r#"{"section_order":1}"#),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let updated = db
+        .mark_chore_pr_merged(&chore.id, "https://example.test/pr/1")
+        .unwrap()
+        .expect("mark_chore_pr_merged should report a transition");
+    assert_eq!(updated.status, TaskStatus::Done);
+
+    let conn = db.connect().unwrap();
+    let (state, detail): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            params![chore.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        state.is_none(),
+        "merge_queue_state must be cleared on merge, not left stale"
+    );
+    assert!(
+        detail.is_none(),
+        "merge_queue_detail must be cleared alongside merge_queue_state"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
 /// T701-class deadlock: a `kind = 'revision'` task gated on its parent
 /// via a `blocks` edge must unblock as soon as the parent reaches
 /// `in_review` (PR open). Previously the cascade bailed out on

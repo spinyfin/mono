@@ -1677,8 +1677,17 @@ extension WorkTask {
     /// Merge When Ready armed (`mergeQueueState == "queued"` or
     /// `"auto_merge_enabled"`). Drives both `boardColumn` (routes the card
     /// into Done's "Merging" section) and the compact queue badge.
+    ///
+    /// Gated on `status == "in_review"`: a `done` task can carry a stale
+    /// `mergeQueueState` if the merge transition raced the poller's next
+    /// dequeue write (the engine also clears it server-side in
+    /// `mark_chore_pr_merged`, but this guard keeps the client correct even
+    /// against a row that predates that fix or a late-arriving write). Without
+    /// the guard, `computeWorkSections` would bucket a just-merged task into
+    /// the "Merging" section forever instead of the normal Done/recency
+    /// buckets.
     var isInMergingSection: Bool {
-        mergeQueueState != nil
+        status == "in_review" && mergeQueueState != nil
     }
 
 }

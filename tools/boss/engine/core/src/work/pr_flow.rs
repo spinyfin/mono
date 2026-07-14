@@ -660,6 +660,14 @@ impl WorkDb {
         // (branch-protection override) of a PR currently in
         // `blocked: merge_conflict`. The new state must be coherent —
         // `done` rows never carry a blocked reason.
+        // Clearing merge_queue_state / merge_queue_detail here is load-bearing:
+        // update_pr_poll_state (the merge poller's dequeue writer) is only
+        // invoked for `Open` PRs, so a just-merged PR would otherwise keep
+        // whatever queue state it carried at merge time forever. A stale
+        // `merge_queue_state` on a `done` row makes the client's
+        // `isInMergingSection` (see `Models.swift`) misroute the task into
+        // the kanban's "Merging" section instead of the normal Done/recency
+        // buckets.
         tx.execute(
             "UPDATE tasks
              SET status             = 'done',
@@ -668,6 +676,8 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
+                 merge_queue_state  = NULL,
+                 merge_queue_detail = NULL,
                  completed_at       = COALESCE(completed_at, ?3)
              WHERE id = ?1",
             params![task.id, pr_url, now],

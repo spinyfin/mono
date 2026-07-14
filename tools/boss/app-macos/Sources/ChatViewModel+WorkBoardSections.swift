@@ -16,12 +16,13 @@ extension ChatViewModel {
     /// stable order.
     static func mergingSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
-        let sorted = items.sorted { lhs, rhs in
-            let lhsOrder = MergeQueueDetail.parse(lhs.mergeQueueDetail)?.sectionOrder ?? .max
-            let rhsOrder = MergeQueueDetail.parse(rhs.mergeQueueDetail)?.sectionOrder ?? .max
-            if lhsOrder != rhsOrder { return lhsOrder < rhsOrder }
-            return lhs.id < rhs.id
+        let keyed = items.map { task in
+            (task: task, order: MergeQueueDetail.parse(task.mergeQueueDetail)?.sectionOrder ?? .max)
         }
+        let sorted = keyed.sorted { lhs, rhs in
+            if lhs.order != rhs.order { return lhs.order < rhs.order }
+            return lhs.task.id < rhs.task.id
+        }.map(\.task)
         return WorkBoardSection(
             id: "done-merging",
             title: "Merging",
