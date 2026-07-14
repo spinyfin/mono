@@ -916,13 +916,11 @@ pub async fn reheartbeat_live_runs(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use anyhow::{Result, anyhow};
     use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput, WorkItemBinding};
-    use tempfile::TempDir;
 
     use super::*;
     use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
@@ -1003,12 +1001,6 @@ mod tests {
             .task("test")
             .leased_at_epoch_s(1_700_000_000)
             .build()
-    }
-
-    fn open_db() -> (TempDir, Arc<WorkDb>) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(db))
     }
 
     fn create_chore(db: &WorkDb, product_id: &str) -> String {
@@ -1099,7 +1091,7 @@ mod tests {
     /// engine-owned TTL every pass.
     #[tokio::test]
     async fn live_lease_is_heartbeated() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-live");
@@ -1122,7 +1114,7 @@ mod tests {
     /// expire so cube frees the workspace within ~TTL after a kill.
     #[tokio::test]
     async fn dead_pid_lease_is_not_heartbeated() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-dead");
@@ -1144,7 +1136,7 @@ mod tests {
     /// minted with a full TTL).
     #[tokio::test]
     async fn zero_pid_slot_is_skipped() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-z");
@@ -1164,7 +1156,7 @@ mod tests {
     /// A terminal execution's lease is not re-extended (completion owns it).
     #[tokio::test]
     async fn terminal_execution_is_skipped() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-term");
@@ -1185,7 +1177,7 @@ mod tests {
     /// A live slot whose execution never recorded a lease is skipped.
     #[tokio::test]
     async fn missing_lease_is_skipped() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = ready_execution(&db, &work_item_id); // ready, no lease
@@ -1206,7 +1198,7 @@ mod tests {
     /// `cube_lease_heartbeat` error event for observability.
     #[tokio::test]
     async fn heartbeat_failure_emits_error_event() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-fail");
@@ -1239,7 +1231,7 @@ mod tests {
     /// and blocked the redundant-spawn guard.
     #[tokio::test]
     async fn auto_reaps_after_consecutive_heartbeat_failures() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-dead-forever");
@@ -1293,7 +1285,7 @@ mod tests {
     /// failed a few times in the past.
     #[tokio::test]
     async fn heartbeat_success_resets_failure_streak() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-flaky");
@@ -1332,7 +1324,7 @@ mod tests {
     /// failures, not just the registry-driven path.
     #[tokio::test]
     async fn db_fallback_auto_reaps_after_consecutive_failures() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-never-registered");
@@ -1369,7 +1361,7 @@ mod tests {
     /// many passes run.
     #[tokio::test]
     async fn sustained_failure_without_cube_confirmation_never_auto_reaps() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-outage");
@@ -1415,7 +1407,7 @@ mod tests {
     /// stranded anaplian's `pr_review` executions heartbeat-erroring forever.
     #[tokio::test]
     async fn auto_reaps_offline_host_execution_without_cube_confirmation() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
@@ -1467,7 +1459,7 @@ mod tests {
         use crate::work::AutomationFireRecord;
         use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY};
 
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let automation_id = seed_daily_automation(&db, &product_id).id;
         let exec = db
@@ -1586,7 +1578,7 @@ mod tests {
     /// slot is heartbeated successfully.
     #[tokio::test]
     async fn hung_heartbeat_does_not_block_other_slots() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
 
         // Two live executions: one with the hung lease, one normal.
@@ -1629,7 +1621,7 @@ mod tests {
     /// hook events continue receiving beats after an engine restart.
     #[tokio::test]
     async fn db_fallback_heartbeats_unregistered_in_flight_executions() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-orphan");
