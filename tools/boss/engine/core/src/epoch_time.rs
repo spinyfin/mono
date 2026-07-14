@@ -30,3 +30,13 @@ pub fn now_epoch_ms() -> u128 {
         .map(|d| d.as_millis())
         .unwrap_or(0)
 }
+
+/// Current wall-clock time as whole nanoseconds since the Unix epoch.
+///
+/// Falls back to `0` if the system clock is set before the epoch.
+pub fn now_epoch_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}

@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -511,10 +510,7 @@ fn non_empty(stderr: &str, status: i32) -> String {
 /// Mirrors `wrapper_distribution`'s staging pattern.
 fn stage_local_file(label: &str, contents: &str) -> Result<StagedFile> {
     let dir = std::env::temp_dir();
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nonce = crate::epoch_time::now_epoch_nanos();
     let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
     std::fs::write(&path, contents).with_context(|| format!("writing staging file {path:?}"))?;
     Ok(StagedFile(path))

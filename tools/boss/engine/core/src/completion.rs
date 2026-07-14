@@ -6650,10 +6650,7 @@ fn tail_snippet(text: &str, max_chars: usize) -> String {
 /// engine surfaces can track cost without a schema change.
 fn elapsed_secs_since(timestamp: &str) -> Option<i64> {
     let then: i64 = timestamp.parse().ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
+    let now = crate::epoch_time::now_epoch_secs();
     Some((now - then).max(0))
 }
 
