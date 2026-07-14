@@ -950,6 +950,17 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_structured_output_dir`] so they can seed/inspect the
     /// artifact without touching the shared system temp dir.
     structured_output_dir: std::path::PathBuf,
+    /// Clock the auto-nudge debounce guard reads from
+    /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Defaults to the
+    /// real wall clock (`Instant::now`) — correct for production, where
+    /// consecutive Stops for the same execution really are seconds to
+    /// minutes apart (a worker's own turn latency). Tests that
+    /// intentionally drive several `on_stop` calls back-to-back to
+    /// exercise the circuit breaker's *count* (rather than its timing)
+    /// wire in an auto-advancing fake clock via [`Self::with_now_fn`] so
+    /// each call lands past the debounce window without a real sleep;
+    /// dedicated debounce tests wire in a clock they control directly.
+    now_fn: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
 }
 
 /// What [`WorkerCompletionHandler::force_release`] actually did. Surfaced
@@ -1027,6 +1038,7 @@ impl WorkerCompletionHandler {
             enable_revision_triggered_reviews: false,
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
             structured_output_dir: crate::structured_output::default_dir(),
+            now_fn: Arc::new(std::time::Instant::now),
         }
     }
 
@@ -1185,6 +1197,16 @@ impl WorkerCompletionHandler {
     /// [`NoopMergeProbe`].
     pub fn with_merge_probe(mut self, probe: Arc<dyn MergeProbe>) -> Self {
         self.merge_probe = probe;
+        self
+    }
+
+    /// Override the clock the auto-nudge debounce guard
+    /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]) reads. See the
+    /// `now_fn` field doc. `app.rs` does not need to call this — the
+    /// default real wall clock is correct for production.
+    #[cfg(test)]
+    fn with_now_fn(mut self, now_fn: Arc<dyn Fn() -> std::time::Instant + Send + Sync>) -> Self {
+        self.now_fn = now_fn;
         self
     }
 
@@ -2931,10 +2953,22 @@ must not be asked to open one",
         // the shared auto-nudge breaker so a reviewer that never produces a
         // valid result cannot loop forever.
         if review_result.is_none() {
-            match self
-                .nudge_breaker
-                .record(&execution.id, "pr_review:awaiting_result", self.max_unproductive_nudges)
-            {
+            match self.nudge_breaker.record(
+                &execution.id,
+                "pr_review:awaiting_result",
+                self.max_unproductive_nudges,
+                (self.now_fn)(),
+            ) {
+                NudgeDecision::TooSoon { since_last } => {
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        since_last_ms = since_last.as_millis(),
+                        "pr_review finalize: identical re-prompt suppressed (debounce) — waiting \
+                         for the reviewer's next natural Stop before asking again",
+                    );
+                    return StopOutcome::ReviewPassAwaitingResult;
+                }
                 NudgeDecision::Proceed { count } => {
                     let output_path = crate::structured_output::path_in(&self.structured_output_dir, &execution.id);
                     // Include the specific serde error in the probe when we have one so
@@ -4637,10 +4671,12 @@ must not be asked to open one",
                 }
             }
         }
-        match self
-            .nudge_breaker
-            .record(&execution.id, fingerprint, self.max_unproductive_nudges)
-        {
+        match self.nudge_breaker.record(
+            &execution.id,
+            fingerprint,
+            self.max_unproductive_nudges,
+            (self.now_fn)(),
+        ) {
             NudgeDecision::Proceed { count } => {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -4650,6 +4686,26 @@ must not be asked to open one",
                 );
                 self.publish_awaiting_pr(execution).await;
                 self.probe_queuer.queue_probe(&execution.id, probe_text);
+                proceed_outcome
+            }
+            NudgeDecision::TooSoon { since_last } => {
+                // The identical fingerprint was just nudged; a Stop this
+                // close on its heels can't carry new information (see
+                // `nudge_breaker` module docs — this is the fix for the
+                // 2026-07-14 exec_18c21b03972f3920_49 incident: three
+                // identical "push to the existing PR" probes fired 8-9s
+                // apart against a revision that had already pushed).
+                // Wait quietly rather than re-sending the same probe text;
+                // the next Stop (or the merge poller) re-evaluates from
+                // scratch and can still finalize or nudge once state
+                // actually moves.
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    fingerprint,
+                    since_last_ms = since_last.as_millis(),
+                    "auto-nudge: suppressed — identical fingerprint re-fired inside the debounce \
+                     window; waiting for external state to change before re-nudging",
+                );
                 proceed_outcome
             }
             NudgeDecision::Trip { count } => {
@@ -5865,6 +5921,26 @@ status is otherwise left unchanged for re-dispatch or manual review."
         // mergeability alone is the completion signal.
         let merge_conflict_revision = self.is_merge_conflict_revision(execution);
 
+        // A PR that GitHub has already accepted into its merge queue (or
+        // armed for auto-merge) is, from the worker's point of view, done:
+        // GitHub — not the worker — owns getting it to `main` from here.
+        // The merge queue re-runs required checks against a synthetic ref
+        // before merging, so `open.ci` legitimately reads `InFlight` (not
+        // `Clean`) for the entire time the PR sits queued; requiring CI
+        // clean here as well means a revision that pushed its fix and
+        // re-enqueued for auto-merge gets nudged to "push to the existing
+        // PR" on every Stop until the circuit breaker parks it — even
+        // though there is nothing left to push (2026-07-14 incident,
+        // exec_18c21b03972f3920_49 / spinyfin/mono#1980: the revision
+        // pushed, re-enqueued, and reported done; the gate only recognised
+        // `Clean` CI, so it nudged three times before the breaker tripped
+        // and abandoned an already-finished execution). `UNMERGEABLE` is
+        // excluded: that state means the queue itself rejected the PR
+        // (e.g. a check failed inside the queue run), which is a real
+        // problem the gate must not paper over — it falls through to the
+        // normal nudge/park path like any other non-clean CI state.
+        let queued_for_merge = probe.in_merge_queue && probe.merge_queue_entry_state.as_deref() != Some("UNMERGEABLE");
+
         let inner = match probe.state {
             PrLifecycleState::Merged => {
                 tracing::info!(
@@ -5882,7 +5958,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             }
             PrLifecycleState::Open(ref open)
                 if open.mergeability != OpenPrMergeability::Conflict
-                    && (matches!(open.ci, OpenPrCiStatus::Clean) || merge_conflict_revision) =>
+                    && (matches!(open.ci, OpenPrCiStatus::Clean) || merge_conflict_revision || queued_for_merge) =>
             {
                 tracing::info!(
                     execution_id,
@@ -5890,8 +5966,11 @@ status is otherwise left unchanged for re-dispatch or manual review."
                     kind = %execution.kind,
                     merge_conflict_revision,
                     ci_status = ?open.ci,
-                    "satisfied-deliverable gate: PR open with no conflict (CI clean, or CI \
-                     irrelevant for a merge-conflict revision) — finalizing without nudge"
+                    in_merge_queue = probe.in_merge_queue,
+                    merge_queue_entry_state = ?probe.merge_queue_entry_state,
+                    "satisfied-deliverable gate: PR open with no conflict (CI clean, CI irrelevant \
+                     for a merge-conflict revision, or already queued for auto-merge) — finalizing \
+                     without nudge"
                 );
                 self.finalize_pr_transition(
                     execution_id,
@@ -7072,7 +7151,15 @@ mod tests {
                 publisher.clone(),
                 pane.clone(),
                 probes.clone(),
-            );
+            )
+            // Auto-advancing by default: most tests drive several `on_stop`
+            // calls back-to-back to exercise the circuit breaker's *count*,
+            // not its timing, and a synchronous test loop would otherwise
+            // spuriously hit the debounce guard on the second call (see
+            // `auto_advancing_clock` doc). Tests that specifically exercise
+            // debounce timing override with their own clock via
+            // `.with_now_fn`.
+            .with_now_fn(auto_advancing_clock());
             Self {
                 handler,
                 cube,
@@ -7081,6 +7168,27 @@ mod tests {
                 probes,
             }
         }
+    }
+
+    /// Auto-advancing fake clock for the auto-nudge debounce guard
+    /// ([`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]). Each call to the
+    /// returned closure yields a timestamp comfortably past the previous
+    /// one, so a test that calls `on_stop` several times in a tight loop —
+    /// the standard way this suite exercises the circuit breaker's *count*
+    /// — never trips the debounce guard by accident: in production,
+    /// consecutive Stops for one execution are seconds to minutes apart (a
+    /// real worker turn); a synchronous test loop is not. Tests that
+    /// specifically exercise debounce timing (nudge fires, then an
+    /// immediate re-Stop must be suppressed) wire in their own clock via
+    /// `with_now_fn` instead of this default.
+    fn auto_advancing_clock() -> Arc<dyn Fn() -> std::time::Instant + Send + Sync> {
+        let next = std::sync::Mutex::new(std::time::Instant::now());
+        Arc::new(move || {
+            let mut guard = next.lock().expect("auto_advancing_clock mutex poisoned");
+            let now = *guard;
+            *guard = now + crate::nudge_breaker::MIN_RENUDGE_INTERVAL + std::time::Duration::from_secs(1);
+            now
+        })
     }
 
     /// Build a WorkDb plus a chore in `waiting_human` execution state with
@@ -12521,6 +12629,149 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "execution stays live so a later Stop can retry",
         );
         assert!(cube.release_calls.lock().await.is_empty());
+    }
+
+    // -----------------------------------------------------------
+    // Merge-queue satisfied-deliverable regression (2026-07-14 incident,
+    // exec_18c21b03972f3920_49 / spinyfin/mono#1980): a revision worker
+    // pushed its fix, re-enqueued the PR for GitHub's merge queue, and
+    // stopped cleanly. The bound PR's head had already advanced to the
+    // pushed commit by the time this Stop's SHA-delta gate ran, so the
+    // gate reported `NoContribution` (head unchanged *this* Stop). CI was
+    // `InFlight` (the merge queue re-runs required checks against a
+    // synthetic ref before merging), which the old satisfied-deliverable
+    // gate didn't recognise as anything but "not ready" — it fell through
+    // to `probe_push_to_existing_pr`, the exact identical nudge that fired
+    // three times in the incident before the circuit breaker parked (and
+    // effectively abandoned) an execution that had already finished.
+    //
+    // The fix: `probe.in_merge_queue` (short of `UNMERGEABLE`) is itself
+    // satisfying evidence — GitHub, not the worker, owns getting the PR to
+    // `main` from here.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn revision_queued_for_merge_finalizes_without_nudge_even_with_ci_in_flight() {
+        use crate::merge_poller::{OpenPrMergeability, OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1980";
+        let head = "520191ca85b57aeceb458de88058f371a1d43149";
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+
+        // Cold-path branch-keyed detector always finds nothing for revisions.
+        let detector = StubPrDetector::ok(None);
+        // SHA-delta gate: head unchanged since the baseline captured for
+        // *this* Stop (the push already landed before this Stop's fetch) →
+        // NoContribution, the arm that used to fall straight to the "push
+        // to the existing PR" nudge once the satisfied-deliverable gate
+        // declined it.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        struct QueuedForMergeProbe;
+        #[async_trait]
+        impl MergeProbe for QueuedForMergeProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(PrLifecycleState::Open(OpenPrStatus {
+                        mergeability: OpenPrMergeability::Clean,
+                        ci: OpenPrCiStatus::InFlight,
+                    }))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .in_merge_queue(true)
+                    .merge_queue_entry_state("AWAITING_CHECKS")
+                    .build())
+            }
+        }
+
+        let TestHarness {
+            handler, cube, probes, ..
+        } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(QueuedForMergeProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+            "a PR queued for auto-merge (CI InFlight, not Conflict, not UNMERGEABLE) must finalize \
+             without a nudge; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no push-to-existing-PR probe must fire once the PR is queued for merge; got {:?}",
+            probes.snapshot(),
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review"),
+            other => panic!("expected task, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released — the slot must not be stranded waiting on a merge \
+             GitHub is already handling",
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_merge_queue_rejection_still_falls_through_to_nudge() {
+        // The flip side: `mergeQueueEntry.state == "UNMERGEABLE"` means the
+        // queue itself rejected the PR — that is a real problem, not a
+        // "nothing left to do" state, and must not be papered over by the
+        // merge-queue carve-out. It falls through to the ordinary nudge
+        // like any other non-clean CI state.
+        use crate::merge_poller::{OpenPrMergeability, OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1981";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, _revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None);
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        struct RejectedFromQueueProbe;
+        #[async_trait]
+        impl MergeProbe for RejectedFromQueueProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(PrLifecycleState::Open(OpenPrStatus {
+                        mergeability: OpenPrMergeability::Clean,
+                        ci: OpenPrCiStatus::InFlight,
+                    }))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .in_merge_queue(true)
+                    .merge_queue_entry_state("UNMERGEABLE")
+                    .build())
+            }
+        }
+
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(RejectedFromQueueProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "an UNMERGEABLE queue entry must not be treated as satisfied; got {outcome:?}",
+        );
+        assert_eq!(
+            probes.snapshot().len(),
+            1,
+            "an UNMERGEABLE queue rejection must still fall through to the ordinary nudge; got {:?}",
+            probes.snapshot(),
+        );
     }
 
     // -----------------------------------------------------------
