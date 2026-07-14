@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use globset::GlobMatcher;
 
-use crate::command::{CommandRunner, RealCommandRunner};
+use crate::command::{CommandRunner, RealCommandRunner, run_or_decline};
 use crate::recipe_config::ConflictRecipe;
 use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome};
 
@@ -33,10 +33,12 @@ impl fmt::Display for InvalidRecipe {
 impl std::error::Error for InvalidRecipe {}
 
 pub struct RecipeResolver {
-    name: String,
+    // Holds the whole recipe (rather than destructuring it into
+    // separate fields) to keep this struct's field count under the
+    // repo's giant-structs threshold without reaching for a builder —
+    // `ConflictRecipe` is already the natural unit of recipe config.
+    recipe: ConflictRecipe,
     matcher: GlobMatcher,
-    resolve_command: Vec<String>,
-    verify_command: Option<Vec<String>>,
     runner: Arc<dyn CommandRunner>,
 }
 
@@ -65,10 +67,8 @@ impl RecipeResolver {
             .map_err(|e| InvalidRecipe(format!("recipe {:?}: invalid glob {:?}: {e}", recipe.name, recipe.glob)))?
             .compile_matcher();
         Ok(Self {
-            name: recipe.name,
+            recipe,
             matcher,
-            resolve_command: recipe.resolve_command,
-            verify_command: recipe.verify_command,
             runner: Arc::new(RealCommandRunner),
         })
     }
@@ -96,9 +96,10 @@ impl DeterministicResolver for RecipeResolver {
             self.runner.as_ref(),
             workspace_path,
             file,
-            &self.name,
-            &self.resolve_command,
-            self.verify_command.as_deref(),
+            &self.recipe.name,
+            &self.recipe.resolve_command,
+            self.recipe.verify_command.as_deref(),
+            self.recipe.workdir.as_deref(),
         )
         .await
     }
@@ -108,7 +109,10 @@ impl DeterministicResolver for RecipeResolver {
 /// `resolve_command`, then verify — either by running `verify_command`
 /// (must exit 0) or, when none is configured, by re-checking the
 /// target file exists. Both commands run with cwd = the conflicted
-/// file's parent directory.
+/// file's parent directory, unless `workdir` overrides it with a path
+/// relative to the workspace root (needed for recipes whose command
+/// must run at the workspace root, e.g. a top-level `make
+/// regen-schema`).
 async fn resolve_recipe(
     runner: &dyn CommandRunner,
     workspace_path: &Path,
@@ -116,13 +120,21 @@ async fn resolve_recipe(
     recipe_name: &str,
     resolve_command: &[String],
     verify_command: Option<&[String]>,
+    workdir: Option<&str>,
 ) -> ResolveOutcome {
     let target_path = workspace_path.join(&file.path);
-    let Some(dir) = target_path.parent() else {
-        return ResolveOutcome::Declined {
-            reason: format!("recipe {recipe_name:?}: {} has no parent directory", file.path),
-        };
+    let dir = match workdir {
+        Some(workdir) => workspace_path.join(workdir),
+        None => match target_path.parent() {
+            Some(dir) => dir.to_path_buf(),
+            None => {
+                return ResolveOutcome::Declined {
+                    reason: format!("recipe {recipe_name:?}: {} has no parent directory", file.path),
+                };
+            }
+        },
     };
+    let dir = dir.as_path();
 
     // Discard the conflicted content so the resolve command writes
     // fresh output instead of tripping over merge markers — same
@@ -161,9 +173,9 @@ async fn resolve_recipe(
     }
 }
 
-/// Runs one recipe command (`resolve_command` or `verify_command`),
-/// mapping spawn/exit failures to a `Declined` outcome. `field_name` is
-/// only used to make the decline reason legible.
+/// Runs one recipe command (`resolve_command` or `verify_command`) via
+/// the shared [`run_or_decline`] core. `field_name` is only used to make
+/// the decline reason legible.
 async fn run_command(
     runner: &dyn CommandRunner,
     dir: &Path,
@@ -176,31 +188,14 @@ async fn run_command(
         .expect("recipe commands are validated non-empty at construction");
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let output = match runner.run(program, &args, dir).await {
-        Ok(output) => output,
-        Err(e) => {
-            return Err(ResolveOutcome::Declined {
-                reason: format!("recipe {recipe_name:?}: failed to spawn `{program}` ({field_name}): {e}"),
-            });
-        }
-    };
-
-    if !output.success {
-        let stderr = if output.stderr.is_empty() {
-            "(no stderr)"
-        } else {
-            &output.stderr
-        };
-        return Err(ResolveOutcome::Declined {
-            reason: format!(
-                "recipe {recipe_name:?}: `{}` ({field_name}) exited {:?}: {stderr}",
-                command.join(" "),
-                output.code
-            ),
-        });
-    }
-
-    Ok(())
+    run_or_decline(
+        runner,
+        dir,
+        program,
+        &args,
+        &format!("recipe {recipe_name:?} ({field_name}): "),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -238,6 +233,7 @@ mod tests {
             glob: glob.to_owned(),
             resolve_command: resolve_command.iter().map(|s| s.to_string()).collect(),
             verify_command: None,
+            workdir: None,
         }
     }
 
@@ -383,5 +379,50 @@ mod tests {
 
         let outcome = resolver.resolve(dir.path(), &file("schema.generated.json")).await;
         assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_declines_when_resolve_command_fails_to_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.generated.json"), "<<<<<<< ours\n").unwrap();
+
+        let runner = Arc::new(FakeCommandRunner::spawn_error());
+        let r = recipe("schema", "**/schema.generated.json", &["make", "regen-schema"]);
+        let resolver = RecipeResolver::with_runner(r, runner);
+
+        let outcome = resolver.resolve(dir.path(), &file("schema.generated.json")).await;
+        match outcome {
+            ResolveOutcome::Declined { reason } => assert!(reason.contains("failed to spawn"), "reason: {reason}"),
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_runs_command_in_configured_workdir_instead_of_targets_parent() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("api")).unwrap();
+        std::fs::write(workspace.path().join("api/schema.generated.json"), "<<<<<<< ours\n").unwrap();
+
+        // Command writes its output relative to `dir` (the cwd it's run
+        // with), so if `workdir` isn't honored the file lands in the
+        // wrong place and the resolve fails to find it.
+        let runner = Arc::new(FakeCommandRunner::success_writing_file(
+            "api/schema.generated.json",
+            "{}\n",
+        ));
+        let mut r = recipe("schema", "**/schema.generated.json", &["make", "regen-schema"]);
+        r.workdir = Some(".".to_owned());
+        let resolver = RecipeResolver::with_runner(r, runner.clone());
+
+        let outcome = resolver
+            .resolve(workspace.path(), &file("api/schema.generated.json"))
+            .await;
+        assert!(
+            matches!(outcome, ResolveOutcome::Resolved { .. }),
+            "outcome: {outcome:?}"
+        );
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls[0].2, workspace.path());
     }
 }

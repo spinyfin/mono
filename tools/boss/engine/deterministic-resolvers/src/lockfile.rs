@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::ConflictedFile;
 use crate::ResolveOutcome;
-use crate::command::CommandRunner;
+use crate::command::{CommandRunner, run_or_decline};
 
 /// `manifest_filename` is the sibling manifest (`Cargo.toml`,
 /// `MODULE.bazel`) the regeneration command reads; it must already be
@@ -47,24 +47,8 @@ pub(crate) async fn regenerate_lockfile(
         };
     }
 
-    let output = match runner.run(program, args, dir).await {
-        Ok(output) => output,
-        Err(e) => {
-            return ResolveOutcome::Declined {
-                reason: format!("failed to spawn `{program}`: {e}"),
-            };
-        }
-    };
-
-    if !output.success {
-        let stderr = if output.stderr.is_empty() {
-            "(no stderr)"
-        } else {
-            &output.stderr
-        };
-        return ResolveOutcome::Declined {
-            reason: format!("`{program} {}` exited {:?}: {stderr}", args.join(" "), output.code),
-        };
+    if let Err(outcome) = run_or_decline(runner, dir, program, args, "").await {
+        return outcome;
     }
 
     if !lock_path.is_file() {

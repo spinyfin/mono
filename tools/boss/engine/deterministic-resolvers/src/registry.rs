@@ -277,6 +277,7 @@ mod tests {
             glob: "**/schema.generated.json".to_owned(),
             resolve_command: vec!["make".to_owned(), "regen-schema".to_owned()],
             verify_command: None,
+            workdir: None,
         };
         let runner = Arc::new(FakeCommandRunner::success_writing_file("schema.generated.json", "{}\n"));
         let recipe_resolver = RecipeResolver::with_runner(recipe, runner);

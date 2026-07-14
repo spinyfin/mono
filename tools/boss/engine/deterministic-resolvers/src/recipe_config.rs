@@ -28,14 +28,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// One declarative resolution recipe: a file-glob paired with the
 /// discard/run/verify formula. Deliberately minimal — the formula is
 /// always "discard the conflicted file, run `resolve_command`, then
 /// verify" (either via `verify_command` if set, or by re-checking the
 /// target file exists, mirroring the built-in lockfile resolvers).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ConflictRecipe {
     /// Stable identifier, used in telemetry summaries and decline
     /// reasons so operators can tell which recipe fired.
@@ -47,15 +47,25 @@ pub struct ConflictRecipe {
     /// path, the one listed first in the config file wins.
     pub glob: String,
     /// Program + args run (with cwd = the conflicted file's parent
-    /// directory) after the conflicted file is discarded, e.g.
-    /// `["cargo", "generate-lockfile"]`. Must be non-empty.
+    /// directory, unless `workdir` overrides it) after the conflicted
+    /// file is discarded, e.g. `["cargo", "generate-lockfile"]`. Must
+    /// be non-empty.
     pub resolve_command: Vec<String>,
     /// Optional program + args that must exit 0 to accept the
-    /// resolution, run (same cwd) after `resolve_command` succeeds.
-    /// `None` falls back to verifying the target file exists again,
-    /// same as the built-in lockfile resolvers.
+    /// resolution, run (same cwd as `resolve_command`) after it
+    /// succeeds. `None` falls back to verifying the target file exists
+    /// again, same as the built-in lockfile resolvers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_command: Option<Vec<String>>,
+    /// Optional cwd override, relative to the workspace root, for both
+    /// `resolve_command` and `verify_command`. Defaults to the
+    /// conflicted file's parent directory, which is non-overridable
+    /// without this field — set it for recipes whose command must run
+    /// at the workspace root or another fixed location (e.g. a
+    /// top-level `make regen-schema`, or `bazel mod deps` for a nested
+    /// `MODULE.bazel`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
 }
 
 /// On-disk file shape: a flat list of recipes under a `[[recipe]]`
@@ -67,7 +77,7 @@ pub struct ConflictRecipe {
 /// glob = "**/Cargo.lock"
 /// resolve_command = ["cargo", "generate-lockfile"]
 /// ```
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct FileShape {
     #[serde(default)]
     recipe: Vec<ConflictRecipe>,
@@ -194,6 +204,29 @@ verify_command = ["make", "validate-schema"]
             recipes[1].verify_command,
             Some(vec!["make".to_owned(), "validate-schema".to_owned()])
         );
+        assert_eq!(recipes[0].workdir, None);
+    }
+
+    #[test]
+    fn parses_recipe_with_workdir_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("conflict-recipes.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[recipe]]
+name = "generated_schema"
+glob = "**/schema.generated.json"
+resolve_command = ["make", "regen-schema"]
+workdir = "."
+"#,
+        )
+        .unwrap();
+
+        let store = ConflictRecipesStore::new(path);
+        let recipes = store.load().unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].workdir.as_deref(), Some("."));
     }
 
     #[test]
