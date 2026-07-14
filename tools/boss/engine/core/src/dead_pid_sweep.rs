@@ -811,7 +811,6 @@ pub(crate) fn probe_pid(pid: i32) -> PidStatus {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use boss_protocol::WorkItemBinding;
 
@@ -1004,7 +1003,7 @@ mod tests {
             )
             .unwrap();
         // Stamp started_at = NOW so the grace guard fires.
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_secs = crate::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
@@ -1380,7 +1379,7 @@ mod tests {
             .unwrap();
         // Stamp started_at = NOW — within the grace window the periodic
         // sweep would respect, but reap_reported_pane_death must not.
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_secs = crate::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());

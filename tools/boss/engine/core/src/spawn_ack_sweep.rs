@@ -419,7 +419,6 @@ pub(crate) async fn reap_never_started_spawn(
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
@@ -670,7 +669,7 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_secs = crate::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
@@ -841,7 +840,7 @@ mod tests {
 
         // Operator pause is already active before the spawn path breaks —
         // this is what exempts pr_review executions from the pause.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = crate::epoch_time::now_epoch_secs();
         coordinator.set_dispatch_paused(
             true,
             now.max(0) as u64,
@@ -914,7 +913,7 @@ mod tests {
             reaper: reaper.as_ref(),
             spawn_health: &spawn_health,
         };
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = crate::epoch_time::now_epoch_secs();
         let reason = "ghostty_surface_new returned NULL (no active display)";
         let reaped = reap_never_started_spawn(&ctx, &execution, 1, 0, ReapCause::AppNack { reason }, now).await;
 
