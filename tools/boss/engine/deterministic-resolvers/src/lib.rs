@@ -21,7 +21,7 @@ use async_trait::async_trait;
 pub use boss_conflict_diagnosis::ConflictedFile;
 
 pub use registry::{DeclinedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
-pub use resolvers::{BazelModuleLockResolver, CargoLockResolver};
+pub use resolvers::{BazelModuleLockResolver, CargoLockResolver, RegistryAppendUnionResolver};
 
 /// Coarse classification of a conflicted file's resolution strategy, kept
 /// for telemetry attribution (`conflict_resolutions.conflict_class`,
@@ -30,6 +30,7 @@ pub use resolvers::{BazelModuleLockResolver, CargoLockResolver};
 pub enum ConflictClass {
     CargoLock,
     BazelModuleLock,
+    RegistryAppendUnion,
 }
 
 impl ConflictClass {
@@ -37,6 +38,7 @@ impl ConflictClass {
         match self {
             ConflictClass::CargoLock => "cargo_lock",
             ConflictClass::BazelModuleLock => "bazel_module_lock",
+            ConflictClass::RegistryAppendUnion => "registry_append_union",
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::resolvers::{BazelModuleLockResolver, CargoLockResolver};
+use crate::resolvers::{BazelModuleLockResolver, CargoLockResolver, RegistryAppendUnionResolver};
 use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome};
 
 /// A file some resolver successfully resolved.
@@ -52,6 +52,7 @@ impl ResolverRegistry {
         let mut registry = Self::empty();
         registry.register(Box::new(CargoLockResolver::new()));
         registry.register(Box::new(BazelModuleLockResolver::new()));
+        registry.register(Box::new(RegistryAppendUnionResolver::new()));
         registry
     }
 
@@ -271,6 +272,7 @@ mod tests {
                 .iter()
                 .any(|r| r.applies_to(&file("MODULE.bazel.lock")))
         );
+        assert!(registry.resolvers.iter().any(|r| r.applies_to(&file("mod.rs"))));
         assert!(!registry.resolvers.iter().any(|r| r.applies_to(&file("random.txt"))));
     }
 }
