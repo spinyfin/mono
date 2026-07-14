@@ -207,6 +207,14 @@ pub enum ReviewFindingCategory {
     /// marker), or a malformed `[deferred-scope]` marker. Forces a revision
     /// regardless of assigned severity (see [`passes_severity_gate`]) — the
     /// same treatment as [`Self::Regression`] and [`Self::Duplication`].
+    ///
+    /// Does NOT apply to a deferred item that is manual, interactive, or
+    /// display-requiring verification a headless worker cannot perform
+    /// (live GUI runs, "spawn real workers and watch the app",
+    /// screenshot-based checks, physical-device tests) — see the "Exception"
+    /// paragraph in the code rubric ([`render_rubric_section`]). That carve-out
+    /// is narrow: it covers infeasibility-for-a-headless-agent, not deferrals
+    /// of work an agent could actually do.
     #[serde(rename = "deferred_scope")]
     DeferredScope,
 }
@@ -1050,6 +1058,33 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                while the PR is still open; the engine records malformed \
                markers with a parse warning, but a clean marker is the \
                contract.\n\
+               **Exception — manual/interactive verification a headless \
+               worker cannot perform**: none of the three failure modes \
+               above apply when the deferred item is manual, interactive, \
+               or display-requiring verification — live GUI runs, \
+               \"spawn real workers and watch the app\", screenshot-based \
+               checks, physical-device tests, or anything else that needs an \
+               interactive session with a display. A worker running headless \
+               has no way to do this, so do NOT raise a `deferred_scope` \
+               finding demanding a `[deferred-scope]` marker for it, and do \
+               NOT demand the worker actually perform the manual \
+               verification. A prose \"## Deferred\" / \"Validation\" note \
+               describing exactly this kind of deferral is acceptable and \
+               expected — that is the normal, correct way to surface it. \
+               This carve-out is narrow: it keys on infeasibility for a \
+               headless agent, not on the word \"testing\" in general. \
+               Deferring work the agent COULD do headlessly — code changes, \
+               follow-up fixes, or unit/integration tests runnable without a \
+               display — still requires the `[deferred-scope]` marker exactly \
+               as in (1)/(2) above; this exception does not weaken the \
+               spinyfin/mono#1968 lesson that prose deferrals of trackable \
+               work get silently lost; it only narrows the marker \
+               requirement for work no marker could make trackable anyway \
+               (an agent still can't run it after filing a followup). If \
+               it's cheap to do so, you may still mention in the overall \
+               `summary` field that live verification remains outstanding, so \
+               the operator sees it — but do not add it to `findings` and do \
+               not let it affect `revision_warranted`.\n\
                (`category: \"deferred_scope\"`) Any confirmed finding in \
                this dimension forces a revision regardless of the severity \
                you assign it — the same treatment as a regression or \
@@ -1540,6 +1575,66 @@ mod tests {
         // marker) is embedded in the task description the reviewer receives,
         // so a reviewer following the rubric above would raise exactly the
         // misdeclared-deferral finding this dimension exists to catch.
+        assert!(
+            prompt.contains(fixture_task_description),
+            "the fixture PR body/task description must be embedded in the prompt for the reviewer to inspect"
+        );
+    }
+
+    /// Operator directive 2026-07-15: manual/interactive verification a
+    /// headless worker cannot perform (live GUI runs, "spawn real workers
+    /// and watch the app", screenshot-based checks) must be carved out of
+    /// the deferred-scope hygiene dimension — a reviewer must NOT demand a
+    /// `[deferred-scope]` marker, and must NOT demand the verification be
+    /// performed, for that category of deferral. This is the acceptance
+    /// fixture from spinyfin/mono PR #1994: a prose "## Deferred" /
+    /// "Validation" section deferring "live end-to-end GUI verification ...
+    /// not runnable in this headless worker" must not, per the rubric, be
+    /// flagged the way PR #1994's review flagged it.
+    #[test]
+    fn code_scope_prompt_exempts_infeasible_manual_verification_from_deferred_scope() {
+        let fixture_task_description = "Fix the 9th-dispatch spillover bug in the Lower Decks tab.\n\n\
+            ## Deferred\n\
+            Live end-to-end GUI verification of the 9th-dispatch spillover fix — \
+            not runnable in this headless worker; needs an interactive macOS \
+            session with a display.\n";
+        let prompt = render_reviewer_initial_prompt(
+            "Fix 9th-dispatch spillover",
+            fixture_task_description,
+            "https://github.com/spinyfin/mono/pull/1994",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            None,
+            "spinyfin/mono",
+        );
+        assert!(
+            prompt.contains("manual/interactive verification a"),
+            "rubric must carve out an exception for manual/interactive verification a headless worker cannot perform"
+        );
+        assert!(
+            prompt.contains("do NOT raise a `deferred_scope` finding"),
+            "rubric must explicitly instruct the reviewer not to raise a deferred_scope finding for this category"
+        );
+        assert!(
+            prompt.contains("live GUI runs"),
+            "exception must name live GUI runs as an example of infeasible manual verification"
+        );
+        assert!(
+            prompt.contains("spawn real workers and watch the app"),
+            "exception must name the 'spawn real workers and watch the app' phrasing from the triggering finding"
+        );
+        assert!(
+            prompt.contains("screenshot-based"),
+            "exception must name screenshot-based checks as an example"
+        );
+        assert!(
+            prompt.contains("acceptable and expected"),
+            "rubric must state a prose Deferred/Validation note for this category is acceptable and expected"
+        );
+        assert!(
+            prompt.contains("narrow") && prompt.contains("spinyfin/mono#1968"),
+            "exception must stay narrow and reaffirm it does not weaken the spinyfin/mono#1968 lesson"
+        );
         assert!(
             prompt.contains(fixture_task_description),
             "the fixture PR body/task description must be embedded in the prompt for the reviewer to inspect"
