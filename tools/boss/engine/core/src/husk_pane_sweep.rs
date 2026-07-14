@@ -164,28 +164,33 @@ pub async fn run_one_pass(
             // Conservative: leave `seen_husks` untouched rather than
             // clearing it. A transient lookup failure sandwiched between two
             // genuine husk observations should not restart the two-pass
-            // wait from scratch.
+            // wait from scratch. Skipping the `confirm_two_pass` call is what
+            // preserves `seen_husks` unchanged.
             return outcome;
         }
     };
 
-    let mut current_candidates: HashSet<(u8, String)> = HashSet::new();
+    // Two-pass confirmation bookkeeping is shared with `terminal_work_sweep`.
+    // Key on `(slot_id, run_id)` so a slot whose husk run changes between
+    // passes never inherits a prior run's confirmation.
+    let crate::sweep_loop::Confirmation { confirmed, pending } = crate::sweep_loop::confirm_two_pass(
+        seen_husks,
+        candidates
+            .into_iter()
+            .map(|pane| ((pane.slot_id, pane.run_id.clone()), pane)),
+    );
 
-    for pane in candidates {
-        let key = (pane.slot_id, pane.run_id.clone());
-        current_candidates.insert(key.clone());
+    outcome.pending_confirmation = pending.len();
+    for pane in pending {
+        tracing::debug!(
+            slot_id = pane.slot_id,
+            run_id = %pane.run_id,
+            "husk-pane sweep: app-hosted pane with no engine-tracked run observed; \
+             awaiting next-pass confirmation before retiring",
+        );
+    }
 
-        if !seen_husks.contains(&key) {
-            outcome.pending_confirmation += 1;
-            tracing::debug!(
-                slot_id = pane.slot_id,
-                run_id = %pane.run_id,
-                "husk-pane sweep: app-hosted pane with no engine-tracked run observed; \
-                 awaiting next-pass confirmation before retiring",
-            );
-            continue;
-        }
-
+    for pane in confirmed {
         tracing::warn!(
             slot_id = pane.slot_id,
             run_id = %pane.run_id,
@@ -208,7 +213,6 @@ pub async fn run_one_pass(
             .await;
     }
 
-    *seen_husks = current_candidates;
     outcome
 }
 
