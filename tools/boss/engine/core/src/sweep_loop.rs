@@ -22,12 +22,68 @@
 //! implementation of [`SweepOutcome`] that decides when a pass is worth
 //! logging and what to log.
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::hash::Hash;
 use std::time::Duration;
 
 use boss_protocol::WorkExecution;
 
 use crate::work::WorkDb;
+
+/// Partition produced by [`confirm_two_pass`]: this pass's candidates split
+/// by whether their key was also present on the previous pass.
+pub(crate) struct Confirmation<T> {
+    /// Candidates whose key appeared on both the previous pass and this one —
+    /// confirmed across two consecutive passes, safe to act on.
+    pub confirmed: Vec<T>,
+    /// Candidates seen for the first time this pass — held one more interval
+    /// before any action (the deferred, two-pass half).
+    pub pending: Vec<T>,
+}
+
+/// Two-pass confirmation bookkeeping shared by the husk-pane and
+/// terminal-work sweeps. Both build a set of candidate keys each pass, treat
+/// a key absent from the prior `seen` set as pending (deferred one interval),
+/// act on a key present in both the prior and current pass, then carry this
+/// pass's keys forward as the next pass's `seen`.
+///
+/// Given the mutable `seen` set (the previous pass's candidate keys) and this
+/// pass's `candidates` — each paired with the `K` it is identified by — this
+/// partitions the candidates into [`Confirmation::confirmed`] (the key was
+/// also in `seen`) and [`Confirmation::pending`] (first seen this pass), and
+/// overwrites `seen` in place with this pass's full key set so the next pass
+/// can confirm them. `seen` is not mutated mid-scan, so duplicate keys within
+/// one pass are classified consistently.
+///
+/// Per-candidate logging and side effects (retire / reap, dispatch-event
+/// emission) stay at the call sites; only this confirm-and-carry-forward
+/// bookkeeping is shared. A pass the caller chooses to skip entirely (e.g. a
+/// failed candidate lookup) must simply not call this, leaving `seen`
+/// untouched so a transient blip does not restart the two-pass wait.
+pub(crate) fn confirm_two_pass<K, T>(
+    seen: &mut HashSet<K>,
+    candidates: impl IntoIterator<Item = (K, T)>,
+) -> Confirmation<T>
+where
+    K: Eq + Hash,
+{
+    let mut current: HashSet<K> = HashSet::new();
+    let mut confirmed = Vec::new();
+    let mut pending = Vec::new();
+
+    for (key, item) in candidates {
+        if seen.contains(&key) {
+            confirmed.push(item);
+        } else {
+            pending.push(item);
+        }
+        current.insert(key);
+    }
+
+    *seen = current;
+    Confirmation { confirmed, pending }
+}
 
 /// Look up an execution by id for a periodic sweep, logging a
 /// per-sweep `warn` and returning `None` on lookup failure.
@@ -212,6 +268,40 @@ mod tests {
         assert_eq!(passes.load(Ordering::SeqCst), 4, "pass after third interval");
 
         handle.abort();
+    }
+
+    // ─── confirm_two_pass ────────────────────────────────────────────────────
+
+    // First-seen keys land in `pending`; on a second consecutive pass the
+    // same key is `confirmed`. `seen` is carried forward to this pass's keys.
+    #[test]
+    fn confirm_two_pass_defers_then_confirms() {
+        let mut seen: HashSet<u8> = HashSet::new();
+
+        let first = confirm_two_pass(&mut seen, vec![(1u8, "a"), (2u8, "b")]);
+        assert!(first.confirmed.is_empty(), "nothing was seen last pass");
+        assert_eq!(first.pending.len(), 2);
+        assert_eq!(seen, HashSet::from([1, 2]));
+
+        let second = confirm_two_pass(&mut seen, vec![(1u8, "a"), (2u8, "b")]);
+        let mut confirmed = second.confirmed.clone();
+        confirmed.sort_unstable();
+        assert_eq!(confirmed, vec!["a", "b"], "both keys confirmed on the second pass");
+        assert!(second.pending.is_empty());
+    }
+
+    // A key that drops out this pass leaves `seen`, so it cannot confirm; a
+    // brand-new key this pass starts its own confirmation clock as pending.
+    #[test]
+    fn confirm_two_pass_drops_absent_keys_and_defers_new_ones() {
+        let mut seen: HashSet<u8> = HashSet::from([1, 2]);
+
+        // Key 1 persists (confirmed), key 2 vanished, key 3 is new (pending).
+        let out = confirm_two_pass(&mut seen, vec![(1u8, "a"), (3u8, "c")]);
+        assert_eq!(out.confirmed, vec!["a"]);
+        assert_eq!(out.pending, vec!["c"]);
+        // `seen` now reflects only this pass's keys — key 2 is gone.
+        assert_eq!(seen, HashSet::from([1, 3]));
     }
 
     // (3) `log()` is invoked only on passes where `has_activity()` is

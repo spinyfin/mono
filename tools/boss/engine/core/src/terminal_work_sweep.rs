@@ -195,8 +195,10 @@ pub async fn run_one_pass(
     seen_terminal: &mut HashSet<String>,
 ) -> TerminalWorkSweepOutcome {
     let mut outcome = TerminalWorkSweepOutcome::default();
-    // Candidates observed this pass — becomes `seen_terminal` for the next.
-    let mut current_candidates: HashSet<String> = HashSet::new();
+    // Reap candidates gathered this pass (terminal work item and/or terminal
+    // execution, live pane). The shared two-pass confirmation helper turns
+    // these into the confirmed/pending partitions below.
+    let mut candidates: Vec<(String, ReapCandidate)> = Vec::new();
 
     for state in live_states.snapshot() {
         // `run_id` on a live-state entry IS the execution id (see
@@ -265,57 +267,89 @@ pub async fn run_one_pass(
             "execution_terminal"
         };
 
-        // This slot is a reap candidate this pass.
-        current_candidates.insert(run_id.clone());
+        // This slot is a reap candidate this pass. Keyed on `run_id` for the
+        // shared two-pass confirmation helper.
+        candidates.push((
+            run_id.clone(),
+            ReapCandidate::builder()
+                .run_id(run_id)
+                .slot_id(state.slot_id)
+                .work_item_id(execution.work_item_id)
+                .execution_status(execution.status)
+                .work_item_terminal(work_item_terminal)
+                .execution_terminal(execution_terminal)
+                .reason(reason)
+                .build(),
+        ));
+    }
 
-        // Two-pass confirmation: only reap if this run was ALSO a
-        // terminal+live candidate on the previous pass. A teardown still in
-        // flight would have completed within the interval, so survival
-        // across a full interval marks a genuine strand.
-        if !seen_terminal.contains(&run_id) {
-            outcome.pending_confirmation += 1;
-            tracing::debug!(
-                run_id = %run_id,
-                slot_id = state.slot_id,
-                reason,
-                "terminal-work sweep: terminal worker observed; awaiting next-pass confirmation before reaping",
-            );
-            continue;
-        }
+    // Two-pass confirmation (shared with `husk_pane_sweep`): only reap a run
+    // that was ALSO a terminal+live candidate on the previous pass. A
+    // teardown still in flight would have completed within the interval, so
+    // survival across a full interval marks a genuine strand.
+    let crate::sweep_loop::Confirmation { confirmed, pending } =
+        crate::sweep_loop::confirm_two_pass(seen_terminal, candidates);
 
+    outcome.pending_confirmation = pending.len();
+    for candidate in pending {
+        tracing::debug!(
+            run_id = %candidate.run_id,
+            slot_id = candidate.slot_id,
+            reason = candidate.reason,
+            "terminal-work sweep: terminal worker observed; awaiting next-pass confirmation before reaping",
+        );
+    }
+
+    for candidate in confirmed {
         tracing::warn!(
-            run_id = %run_id,
-            slot_id = state.slot_id,
-            work_item_id = %execution.work_item_id,
-            execution_status = %execution.status,
-            reason,
+            run_id = %candidate.run_id,
+            slot_id = candidate.slot_id,
+            work_item_id = %candidate.work_item_id,
+            execution_status = %candidate.execution_status,
+            reason = candidate.reason,
             "terminal-work sweep: live worker pane outlived its terminal work; reaping and freeing slot",
         );
 
         // Reap via the canonical, idempotent, run-id-keyed teardown. If the
         // slot was recycled to a different execution since the snapshot,
         // this is a no-op and the live worker now in the slot is untouched.
-        reaper.reap_terminal_worker(&run_id).await;
+        reaper.reap_terminal_worker(&candidate.run_id).await;
         outcome.reaped += 1;
 
         dispatch_events
             .emit(
-                DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &run_id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_worker(crate::coordinator::worker_id_for_slot(state.slot_id))
+                DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &candidate.run_id)
+                    .with_work_item(&candidate.work_item_id)
+                    .with_worker(crate::coordinator::worker_id_for_slot(candidate.slot_id))
                     .with_details(serde_json::json!({
-                        "reason": reason,
-                        "slot_id": state.slot_id,
-                        "execution_status": execution.status,
-                        "work_item_terminal": work_item_terminal,
-                        "execution_terminal": execution_terminal,
+                        "reason": candidate.reason,
+                        "slot_id": candidate.slot_id,
+                        "execution_status": candidate.execution_status,
+                        "work_item_terminal": candidate.work_item_terminal,
+                        "execution_terminal": candidate.execution_terminal,
                     })),
             )
             .await;
     }
 
-    *seen_terminal = current_candidates;
     outcome
+}
+
+/// A live worker slot that is a reap candidate this pass — its bound work
+/// item and/or its execution is terminal. Carries the fields the deferred
+/// per-candidate logging and reap side effects need, since the shared
+/// two-pass confirmation helper splits candidates into confirmed/pending
+/// after the per-slot lookups have already been done.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct ReapCandidate {
+    run_id: String,
+    slot_id: u8,
+    work_item_id: String,
+    execution_status: boss_protocol::ExecutionStatus,
+    work_item_terminal: bool,
+    execution_terminal: bool,
+    reason: &'static str,
 }
 
 /// Whether a bound work item is in a terminal status. Only task-shaped
