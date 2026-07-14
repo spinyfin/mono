@@ -24,7 +24,7 @@ use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 use boss_protocol::{
     Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
-    ExecutionStatus, FrontendEvent, Product, RequestExecutionInput, Task, WorkExecution,
+    ExecutionStatus, FinishExecutionRunInput, FrontendEvent, Product, RequestExecutionInput, Task, WorkExecution,
 };
 
 /// The mono repo remote used by the overwhelming majority of tests.
@@ -193,6 +193,26 @@ pub fn create_execution_started_secs_ago(db: &WorkDb, work_item_id: &str, secs_a
 /// 300-second offset the sweep tests share.
 pub fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
     create_execution_started_secs_ago(db, work_item_id, 300)
+}
+
+/// Finish an execution's active run the way `PaneSpawnRunner` does: record
+/// the run as `completed` while parking the execution in `waiting_human`
+/// with its workspace lease still held. This is the post-spawn state the
+/// coordinator observes, and the `completion` test module hand-rolled the
+/// same `finish_execution_run(...)` builder block at a dozen-odd sites.
+///
+/// Pass the per-site `result_summary` (or `None` where the test omits it).
+pub fn finish_run_waiting_human(db: &WorkDb, execution_id: &str, run_id: &str, result_summary: Option<&str>) {
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(execution_id)
+            .run_id(run_id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .maybe_result_summary(result_summary)
+            .build(),
+    )
+    .unwrap();
 }
 
 /// Seed the standard "daily automation" fixture under `product_id`:

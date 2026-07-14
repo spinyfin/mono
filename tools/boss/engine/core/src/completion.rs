@@ -7193,17 +7193,7 @@ mod tests {
             .unwrap();
         // Mirror PaneSpawnRunner: run is recorded as completed and the
         // execution sits in `waiting_human` with the lease still held.
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
         (dir, db, product.id, chore.id, execution.id)
     }
@@ -7309,17 +7299,7 @@ mod tests {
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
         db.record_automation_run_and_advance(
             crate::work::AutomationFireRecord::builder()
                 .automation_id(automation.id.clone())
@@ -7587,17 +7567,7 @@ mod tests {
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
         (dir, db, product.id, chore.id, execution.id, attempt.id)
     }
 
@@ -8871,16 +8841,7 @@ mod tests {
         let (_e, run) = db
             .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
             .unwrap();
-        db.finish_execution_run(
-            FinishExecutionRunInput::builder()
-                .execution_id(&exec.id)
-                .run_id(&run.id)
-                .execution_status(ExecutionStatus::WaitingHuman)
-                .run_status("completed")
-                .result_summary("spawned worker pane")
-                .build(),
-        )
-        .unwrap();
+        finish_run_waiting_human(db, &exec.id, &run.id, Some("spawned worker pane"));
         (chore.id, exec.id)
     }
 
@@ -9167,17 +9128,7 @@ PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
         // Worker exited without pushing — the (now-fixed) detector
         // returns `None` rather than misbinding to one of the PRs
@@ -9264,17 +9215,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
         // The worker DID create a real PR — number 500, freshly
         // opened. The (fixed) detector reports that fresh PR's url,
@@ -9556,16 +9497,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 ws2.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&exec2.id)
-                    .run_id(&run2.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &exec2.id, &run2.id, None);
         let chore3 = db
             .create_chore(
                 crate::work::CreateChoreInput::builder()
@@ -9588,16 +9520,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 ws3.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&exec3.id)
-                    .run_id(&run3.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &exec3.id, &run3.id, None);
 
         // Detector that returns Stale for every candidate — simulates
         // the failure mode where the worker's `@`/`@-` drifted from
@@ -11178,17 +11101,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned revision worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
         (dir, db, product.id, revision.id, execution.id)
     }
 
@@ -11306,17 +11219,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned revision worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
 
         let detector = StubPrDetector::ok(None);
 
@@ -11470,16 +11373,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             )
             .unwrap();
         // Mirror the waiting_human state.
-        db.finish_execution_run(
-            FinishExecutionRunInput::builder()
-                .execution_id(&execution.id)
-                .run_id(&run.id)
-                .execution_status(ExecutionStatus::WaitingHuman)
-                .run_status("completed")
-                .result_summary("spawned pane")
-                .build(),
-        )
-        .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned pane"));
         // Simulate orphan sweep abandoning exec_A.
         db.mark_execution_redundant(&execution.id).unwrap();
         (dir, db, product.id, chore.id, execution.id)
@@ -11623,17 +11517,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned revision worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
         // Snapshot the parent PR's head SHA as `on_execution_started` does.
         db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
         (dir, db, product.id, revision.id, execution.id)
@@ -12841,17 +12725,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned conflict-resolution worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(
+            &db,
+            &execution.id,
+            &run.id,
+            Some("spawned conflict-resolution worker pane"),
+        );
         db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
         (dir, db, product.id, parent.id, revision.id, execution.id, attempt.id)
     }
@@ -13367,17 +13246,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned CI-fix revision worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned CI-fix revision worker pane"));
         db.set_execution_pr_head_before(&execution.id, head).unwrap();
         (dir, db, product.id, parent.id, revision.id, execution.id, attempt.id)
     }
@@ -15095,17 +14964,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&pr_review_exec_1.id)
-                    .run_id(&run1.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("reviewer spawned")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &pr_review_exec_1.id, &run1.id, Some("reviewer spawned"));
 
         // Write a transcript with a HIGH finding.
         let high_json = high_finding_review_result_json(PR_URL);
@@ -15161,17 +15020,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&rev_exec.id)
-                    .run_id(&rev_run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("revision worker spawned")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &rev_exec.id, &rev_run.id, Some("revision worker spawned"));
 
         // Stage the same PR URL for the revision execution.
         let rev_staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
@@ -15214,17 +15063,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&pr_review_exec_2.id)
-                    .run_id(&run2.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("reviewer 2 spawned")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &pr_review_exec_2.id, &run2.id, Some("reviewer 2 spawned"));
 
         // Write a clean transcript — no qualifying findings.
         let clean_json = clean_review_result_json(PR_URL);
@@ -15417,17 +15256,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&pr_review_exec.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("reviewer spawned")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &pr_review_exec.id, &run.id, Some("reviewer spawned"));
 
         let dup_json = duplication_finding_review_result_json(parent_pr_url);
         let transcript = workspace.path().join(format!("transcript-{}.jsonl", pr_review_exec.id));
@@ -15663,17 +15492,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 workspace.path().to_str().unwrap(),
             )
             .unwrap();
-        let _ = db
-            .finish_execution_run(
-                FinishExecutionRunInput::builder()
-                    .execution_id(&execution.id)
-                    .run_id(&run.id)
-                    .execution_status(ExecutionStatus::WaitingHuman)
-                    .run_status("completed")
-                    .result_summary("spawned worker pane")
-                    .build(),
-            )
-            .unwrap();
+        finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
         db.set_execution_pr_head_before(&execution.id, head).unwrap();
 
         // SHA unchanged → NoContribution.
