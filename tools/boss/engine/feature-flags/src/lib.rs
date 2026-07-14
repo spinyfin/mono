@@ -187,6 +187,20 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: false,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: "speculative_conflict_prediction",
+        description: "Piggyback on the merge poller's sweep to speculatively rebase in-flight (in-review) PR \
+             branches onto main in a leased scratch workspace with `--no-push` — no worker, no push, the real \
+             branch is never touched (design: merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md, \
+             Layer 4 / T10). A predicted conflict is recorded to `conflict_resolutions` telemetry early, before \
+             the PR would otherwise reach `conflict_watch`; a clean prediction only increments a counter. \
+             Rate-limited per work item and capped per sweep to bound workspace-lease churn. DEFAULT OFF — the \
+             path leases a workspace per candidate; enable per operator once validated in staging. Kill switch: \
+             set false to stop the speculative sweep immediately.",
+        category: "conflict",
+        default_enabled: false,
+        capability_id: None,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.

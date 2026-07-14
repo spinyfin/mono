@@ -758,10 +758,18 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // Layer 4 / T10: speculative conflict-prediction sweep counters.
+        for expected in ["speculative_conflict.predicted", "speculative_conflict.clean"] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         assert_eq!(
             names.len(),
-            45,
-            "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + 18 external_tracker counters"
+            47,
+            "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
+             18 external_tracker + 2 speculative_conflict counters"
         );
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

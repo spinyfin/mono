@@ -536,3 +536,92 @@ fn mark_succeeded_stamps_full_worker_rung() {
         .unwrap();
     assert_eq!(succeeded.resolved_by_rung, Some(3));
 }
+
+// ── record_speculative_conflict_prediction (Layer 4 / T10 telemetry) ───
+
+/// The speculative sweep's predicted-conflict row is inserted already
+/// terminal, tagged with its own `event_source`/`status` so it can never
+/// be mistaken for a live resolution attempt, and its `conflict_class` is
+/// derived from the conflicted-file paths exactly like the other two
+/// telemetry sources.
+#[test]
+fn record_speculative_prediction_stamps_telemetry_fields() {
+    let (db, product, chore) = seed_product_and_chore("speculative-basic");
+
+    let attempt = db
+        .record_speculative_conflict_prediction(
+            SpeculativeConflictInsertInput::builder()
+                .product_id(product.clone())
+                .work_item_id(chore.clone())
+                .pr_url("https://github.com/foo/bar/pull/900")
+                .pr_number(900)
+                .conflicted_files(vec!["Cargo.lock".to_owned()])
+                .build(),
+        )
+        .unwrap();
+
+    assert_eq!(attempt.product_id, product);
+    assert_eq!(attempt.work_item_id, chore);
+    assert_eq!(attempt.pr_url, "https://github.com/foo/bar/pull/900");
+    assert_eq!(attempt.pr_number, 900);
+    assert_eq!(
+        attempt.status, "predicted",
+        "must use a status distinct from the live pending/running/succeeded/failed/abandoned lifecycle"
+    );
+    assert_eq!(attempt.event_source, "speculative_predicted");
+    assert_eq!(attempt.conflict_class.as_deref(), Some("lockfile"));
+    assert!(attempt.conflict_diagnosis.is_some());
+    assert!(attempt.finished_at.is_some(), "must be inserted already terminal");
+
+    // A `predicted` row must never surface as a live/active attempt — the
+    // dispatcher and the escalation ladder must not pick it up.
+    assert!(
+        db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none(),
+        "a speculative prediction is not a live pending/running attempt"
+    );
+}
+
+/// The churn guard (Phase 6 #16) counts every `conflict_resolutions` row
+/// in the trailing window regardless of status — except speculative
+/// predictions. Three real attempts plus any number of speculative
+/// predictions in the same window must NOT trip the guard on the next
+/// real attempt; a fourth *real* attempt still does.
+#[test]
+fn speculative_predictions_are_excluded_from_churn_guard() {
+    let (db, product, chore) = seed_product_and_chore("speculative-churn");
+
+    // Five speculative predictions — well past the real churn threshold
+    // (3) — must never count toward it.
+    for i in 0..5 {
+        db.record_speculative_conflict_prediction(
+            SpeculativeConflictInsertInput::builder()
+                .product_id(product.clone())
+                .work_item_id(chore.clone())
+                .pr_url(format!("https://github.com/foo/bar/pull/{i}"))
+                .pr_number(i)
+                .conflicted_files(vec!["Cargo.lock".to_owned()])
+                .build(),
+        )
+        .unwrap();
+    }
+
+    // Three real attempts still go live...
+    let a1 = insert_attempt(&db, &product, &chore, "sha-real-1");
+    let a2 = insert_attempt(&db, &product, &chore, "sha-real-2");
+    let a3 = insert_attempt(&db, &product, &chore, "sha-real-3");
+    for attempt in [&a1, &a2, &a3] {
+        assert_eq!(
+            attempt.status, "pending",
+            "real attempts must go live despite the speculative rows sharing the window"
+        );
+    }
+
+    // ...and the fourth *real* attempt still trips the guard, proving the
+    // exclusion is speculative-only, not a blanket disablement.
+    let a4 = insert_attempt(&db, &product, &chore, "sha-real-4");
+    assert_eq!(
+        a4.status, "abandoned",
+        "the churn guard must still fire on real attempts once their own count hits the threshold"
+    );
+    assert_eq!(a4.failure_reason.as_deref(), Some("churn_threshold_exceeded"));
+}

@@ -572,6 +572,25 @@ pub struct ProducerConflictInsertInput {
     pub conflicted_files: Vec<String>,
 }
 
+/// Pre-insert payload for [`WorkDb::record_speculative_conflict_prediction`]
+/// — the Layer 4 telemetry surface for a *predicted* conflict
+/// (`merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`
+/// T10). Supplied by the merge poller's speculative-rebase sweep after a
+/// throwaway, no-push `cube workspace rebase` against an in-review PR came
+/// back conflicted. Unlike [`ConflictResolutionInsertInput`], this never
+/// drives the parent task's `blocked` state or the escalation ladder — it
+/// is a telemetry-only observation recorded early, before the PR would
+/// otherwise reach `conflict_watch`.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct SpeculativeConflictInsertInput {
+    pub product_id: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    pub conflicted_files: Vec<String>,
+}
+
 /// Pre-insert payload for [`WorkDb::insert_ci_remediation`]. Mirrors
 /// the `ci_remediations` schema for the engine-known fields at
 /// detection time. `consumes_budget` is `1` for `attempt_kind='fix'`

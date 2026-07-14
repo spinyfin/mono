@@ -412,6 +412,19 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace_path, pr);
         Err(anyhow!("rebase_workspace is not supported by this CubeClient"))
     }
+    /// Like [`Self::rebase_workspace`] but passes `--no-push`: run the
+    /// engine-direct structural rebase without advancing/pushing the boss
+    /// bookmark on a clean result, so the real PR branch is never mutated.
+    /// Used for the speculative/throwaway rebase the merge poller's
+    /// prediction sweep runs against in-review PRs to observe whether they
+    /// would conflict against current `main` (Layer 4 / T10 of the
+    /// merge-conflict-reduction design). Same default-Err pattern as
+    /// `rebase_workspace` — only [`CommandCubeClient`] implements it for
+    /// real.
+    async fn rebase_workspace_no_push(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {
+        let _ = (workspace_path, pr);
+        Err(anyhow!("rebase_workspace_no_push is not supported by this CubeClient"))
+    }
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
@@ -444,6 +457,34 @@ fn shell_quote(arg: &str) -> String {
     } else {
         arg.to_owned()
     }
+}
+
+/// Parse `cube workspace rebase --json`'s `payload` object
+/// (`{status, pushed, conflicted_files, ...}`) into a [`RebaseOutcome`].
+/// Shared by [`CommandCubeClient::rebase_workspace`] and
+/// [`CommandCubeClient::rebase_workspace_no_push`] — the two commands differ
+/// only by the `--no-push` flag, not by output shape.
+fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("cube workspace rebase returned no `status` field: {payload}"))?;
+    let clean = match status {
+        "clean" => true,
+        "conflicts" => false,
+        other => return Err(anyhow!("cube workspace rebase returned unexpected status `{other}`")),
+    };
+    let pushed = payload.get("pushed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let conflicted_files = payload
+        .get("conflicted_files")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    Ok(RebaseOutcome {
+        clean,
+        pushed,
+        conflicted_files,
+    })
 }
 
 impl CommandCubeClient {
@@ -584,26 +625,23 @@ impl CubeClient for CommandCubeClient {
         let payload = self
             .run_json_in_dir(workspace_path, &["--json", "workspace", "rebase", "--pr", &pr_str])
             .await?;
-        let status = payload
-            .get("status")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("cube workspace rebase returned no `status` field: {payload}"))?;
-        let clean = match status {
-            "clean" => true,
-            "conflicts" => false,
-            other => return Err(anyhow!("cube workspace rebase returned unexpected status `{other}`")),
-        };
-        let pushed = payload.get("pushed").and_then(|v| v.as_bool()).unwrap_or(false);
-        let conflicted_files = payload
-            .get("conflicted_files")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default();
-        Ok(RebaseOutcome {
-            clean,
-            pushed,
-            conflicted_files,
-        })
+        parse_rebase_payload(payload)
+    }
+
+    async fn rebase_workspace_no_push(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {
+        let pr_str = pr.to_string();
+        // Same command as `rebase_workspace` plus `--no-push`: a clean
+        // rebase never advances/pushes the boss bookmark, so the real PR
+        // branch is untouched. Used for the speculative/throwaway rebase
+        // (Layer 4 / T10) — the caller only wants to observe whether the PR
+        // would conflict against current `main`.
+        let payload = self
+            .run_json_in_dir(
+                workspace_path,
+                &["--json", "workspace", "rebase", "--pr", &pr_str, "--no-push"],
+            )
+            .await?;
+        parse_rebase_payload(payload)
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
