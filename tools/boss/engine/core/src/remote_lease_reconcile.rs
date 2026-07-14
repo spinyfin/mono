@@ -350,7 +350,6 @@ mod tests {
     use boss_protocol::{ExecutionStatus, RequestExecutionInput};
     use std::sync::Arc;
     use std::sync::Mutex;
-    use tempfile::TempDir;
 
     /// Canned liveness verdict for the stub adapter's probe.
     #[derive(Clone, Copy)]
@@ -398,12 +397,6 @@ mod tests {
         async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
             Ok(self.adapter.clone() as Arc<dyn HostAdapter>)
         }
-    }
-
-    fn open_db() -> (TempDir, Arc<WorkDb>) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(db))
     }
 
     fn create_chore(db: &WorkDb) -> String {
@@ -457,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn reaps_dead_remote_worker_and_force_releases_its_lease() {
-        let (_d, db) = open_db();
+        let (_d, db) = open_db_arc();
         let chore = create_chore(&db);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         let exec_id = start_remote_run(&db, &chore, "anaplian", "lease-XYZ", Some(4242));
@@ -492,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn leaves_live_remote_worker_untouched() {
-        let (_d, db) = open_db();
+        let (_d, db) = open_db_arc();
         let chore = create_chore(&db);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         let exec_id = start_remote_run(&db, &chore, "anaplian", "lease-LIVE", Some(4242));
@@ -513,7 +506,7 @@ mod tests {
         // A host outage (probe Err) must NOT look like proof of death —
         // otherwise every live worker on a briefly-unreachable host would
         // be mass-reaped.
-        let (_d, db) = open_db();
+        let (_d, db) = open_db_arc();
         let chore = create_chore(&db);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         let exec_id = start_remote_run(&db, &chore, "anaplian", "lease-1", Some(4242));
@@ -531,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn run_without_remote_pid_is_skipped() {
         // No pid → no positive death evidence → never reap.
-        let (_d, db) = open_db();
+        let (_d, db) = open_db_arc();
         let chore = create_chore(&db);
         db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
         let exec_id = start_remote_run(&db, &chore, "anaplian", "lease-1", None);
@@ -550,7 +543,7 @@ mod tests {
     async fn local_runs_are_not_candidates() {
         // A local run is covered by the local sweeps and must never appear
         // here (host_id = 'local' is excluded by the candidate query).
-        let (_d, db) = open_db();
+        let (_d, db) = open_db_arc();
         let chore = create_chore(&db);
         let exec_id = start_remote_run(&db, &chore, "local", "lease-1", Some(4242));
 

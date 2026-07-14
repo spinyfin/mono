@@ -42,6 +42,18 @@ pub fn open_db() -> (TempDir, WorkDb) {
     (dir, db)
 }
 
+/// Like [`open_db`], but returns the [`WorkDb`] wrapped in an [`Arc`] for
+/// the modules that share the DB across coordinator/sweep tasks.
+///
+/// The remote-reattach, remote-lease-reconcile, and cube-lease-heartbeat
+/// test modules all hand-rolled this exact `Arc`-returning `open_db()`, so
+/// this replaces the byte-identical local copy each used. Implemented on top
+/// of [`open_db`] so the two stay in sync.
+pub fn open_db_arc() -> (TempDir, Arc<WorkDb>) {
+    let (dir, db) = open_db();
+    (dir, Arc::new(db))
+}
+
 /// Create the standard test product: name `Boss`, the mono repo
 /// remote, all other fields defaulted to `None`.
 pub fn create_test_product(db: &WorkDb) -> Product {

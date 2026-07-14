@@ -177,7 +177,6 @@ mod tests {
     use boss_protocol::RequestExecutionInput;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use tempfile::TempDir;
 
     /// Records each `reattach_events_forward(run_id)` call and returns a
     /// canned result. Every other `HostAdapter` method is unused by the
@@ -215,12 +214,6 @@ mod tests {
             }
             Ok(self.adapter.clone() as Arc<dyn HostAdapter>)
         }
-    }
-
-    fn open_db() -> (TempDir, Arc<WorkDb>) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(db))
     }
 
     fn create_chore(db: &WorkDb) -> String {
@@ -264,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn reattaches_each_active_remote_run() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let chore = create_chore(&db);
         // Register the remote host so get_host resolves it.
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
@@ -282,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_local_runs() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let chore = create_chore(&db);
         // A local run must never be reattached.
         start_run_on_host(&db, &chore, "local");
@@ -297,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn counts_failed_forward() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let chore = create_chore(&db);
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
         start_run_on_host(&db, &chore, "zakalwe");
@@ -311,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn counts_host_missing_when_host_removed() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let chore = create_chore(&db);
         // Start the run on a host, then the run row references "ghost"
         // which is not in the hosts table.
@@ -339,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn counts_failed_when_adapter_build_fails() {
-        let (_dir, db) = open_db();
+        let (_dir, db) = open_db_arc();
         let chore = create_chore(&db);
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
         start_run_on_host(&db, &chore, "zakalwe");
