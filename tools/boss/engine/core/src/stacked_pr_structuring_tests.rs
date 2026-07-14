@@ -138,15 +138,24 @@ fn same_pair_is_not_reoffered_within_the_reoffer_interval() {
 }
 
 #[test]
-fn prune_drops_stale_offer_timestamps() {
+fn prune_drops_stale_entries_but_keeps_newer_ones() {
     let mut sched = StackingSchedule::default();
     let t0 = Instant::now();
+    // A stale pair (offered a full interval ago) and a fresh one offered later.
     sched.mark_offered((10, 20), t0);
+    sched.mark_offered((30, 40), t0 + REOFFER_INTERVAL / 2);
+    // Prune exactly REOFFER_INTERVAL after the stale entry: it is dropped
+    // (>= interval old), the newer one is within the interval and retained.
     sched.prune(t0 + REOFFER_INTERVAL);
     assert!(
-        sched.last_offered.is_empty(),
+        !sched.last_offered.contains_key(&(10, 20)),
         "entries older than the interval are dropped"
     );
+    assert!(
+        sched.last_offered.contains_key(&(30, 40)),
+        "entries newer than the interval are kept"
+    );
+    assert_eq!(sched.last_offered.len(), 1, "only the stale entry was pruned");
 }
 
 fn candidate(pr_number: i64) -> PendingMergeCheck {
