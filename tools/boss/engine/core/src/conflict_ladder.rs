@@ -401,7 +401,9 @@ pub(crate) async fn attempt_rung0(
             pr_url = %candidate.pr_url,
             "conflict_ladder: rung 0 could not parse PR number; declining",
         );
-        return LadderOutcome::FellThrough;
+        return LadderOutcome::FellThrough {
+            residual_conflict_files: None,
+        };
     };
     let pr_number = pr_number as u64;
 
@@ -430,7 +432,9 @@ pub(crate) async fn attempt_rung0(
                 declined = declined.len(),
                 "conflict_ladder: rung 0 declined (not every residual file has a resolver); climbing to worker",
             );
-            return LadderOutcome::FellThrough;
+            return LadderOutcome::FellThrough {
+                residual_conflict_files: None,
+            };
         }
     };
 
@@ -441,7 +445,9 @@ pub(crate) async fn attempt_rung0(
             error = %format!("{err:#}"),
             "conflict_ladder: rung 0 resolved every residual file but the push failed; climbing to worker",
         );
-        return LadderOutcome::FellThrough;
+        return LadderOutcome::FellThrough {
+            residual_conflict_files: None,
+        };
     }
 
     retire_attempt_at_rung(work_db, publisher, candidate, attempt, RUNG_DETERMINISTIC_RESOLVER).await;

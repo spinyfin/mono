@@ -318,7 +318,12 @@ async fn rung0_stays_off_even_for_a_resolvable_residual_file_hard_gate() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: Some(1)
+        }
+    );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
     assert_eq!(row.resolved_by_rung, None);
@@ -476,7 +481,12 @@ async fn rung0_declined_file_falls_through_without_pushing() {
     )
     .await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     assert!(
         cube.pushes.lock().await.is_empty(),
         "must not push when any residual file is declined"
@@ -517,7 +527,12 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     )
     .await;
 
-    assert_eq!(outcome, LadderOutcome::FellThrough);
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
     // Every file resolved, but the push failed — must not mark succeeded.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert_eq!(row.status, "pending");
