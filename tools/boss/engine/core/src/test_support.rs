@@ -235,10 +235,11 @@ impl ExecutionRunner for NoopRunner {
 /// and **must appear in the trait's declaration order** (the order the
 /// arms below enumerate: `ensure_repo`, `lease_workspace`, `create_change`,
 /// `goto_workspace`, `rebase_workspace`, `rebase_workspace_no_push`,
-/// `release_workspace`, `workspace_status`, `heartbeat_lease`,
-/// `force_release_lease`, `list_workspaces`, `list_repos`).
-/// `rebase_workspace` / `rebase_workspace_no_push` both have trait defaults
-/// (erroring), so leaving either unlisted keeps that default rather than an
+/// `push_resolution`, `release_workspace`, `workspace_status`,
+/// `heartbeat_lease`, `force_release_lease`, `list_workspaces`, `list_repos`).
+/// `rebase_workspace`, `rebase_workspace_no_push`, and `push_resolution` all
+/// have trait defaults (erroring), so leaving any unlisted keeps that
+/// default rather than an
 /// `unimplemented!()`. The macro emits the `#[async_trait]` impl for you.
 ///
 /// ```ignore
@@ -311,9 +312,18 @@ macro_rules! stub_cube_client {
     // behaviour as `rebase_workspace`, used by the speculative-conflict
     // prediction sweep (T10).
     (@munch $ty:ty [$($acc:tt)*] @rebase_workspace_no_push async fn rebase_workspace_no_push $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace_no_push $a -> $r $b] @release_workspace $($rest)*);
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace_no_push $a -> $r $b] @push_resolution $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @rebase_workspace_no_push $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)*] @push_resolution $($rest)*);
+    };
+
+    // ── push_resolution ─────────────────────────────────────────────────────
+    // Has a trait default (erroring), same convention as rebase_workspace.
+    (@munch $ty:ty [$($acc:tt)*] @push_resolution async fn push_resolution $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_cube_client!(@munch $ty [$($acc)* async fn push_resolution $a -> $r $b] @release_workspace $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @push_resolution $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)*] @release_workspace $($rest)*);
     };
 

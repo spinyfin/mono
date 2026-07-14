@@ -296,6 +296,44 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         no_push: bool,
     },
+    /// Advance this workspace's `boss/exec_*` branch bookmark to `@` and
+    /// push it to GitHub.
+    ///
+    /// This is the "land the now-resolved working copy" tail of `cube
+    /// workspace rebase`, callable on its own without re-running the
+    /// rebase. Use it after `cube workspace rebase` reports
+    /// `REBASED_WITH_CONFLICTS` and the conflicts are then resolved by
+    /// editing the conflicted files directly (e.g. an engine-side
+    /// deterministic resolver regenerating a lockfile) rather than by a
+    /// fresh rebase.
+    ///
+    /// Refuses if `@` still has unresolved jj conflicts — resolve them
+    /// first (`jj resolve --list`, `jj st`). Advances the branch bookmark
+    /// to `@` with `--allow-backwards` (a prior rebase already
+    /// legitimately moved it, so this is expected, not a footgun) and
+    /// pushes with `jj git push`, which uses jj's own tracked
+    /// remote-bookmark state as its compare-and-swap token — no
+    /// destructive `--force` needed as long as nothing else has pushed to
+    /// the branch since the workspace's last fetch. Runs the same
+    /// checkleft push gate as `cube pr push` before landing the diff.
+    ///
+    /// Branch resolution matches `cube workspace rebase`: explicit
+    /// `--bookmark`, explicit `--pr` (resolves the head branch from
+    /// GitHub), or the nearest `boss/exec_*` bookmark in `@`'s
+    /// 5-ancestor window.
+    ///
+    /// Run from inside the leased cube workspace directory.
+    Push {
+        /// Explicitly name the `boss/exec_*` bookmark to push. A trailing
+        /// `@<remote>` suffix is accepted and stripped. Mutually
+        /// exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
+        bookmark: Option<String>,
+        /// Push the branch backing PR N. Resolves N's head branch from
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
+        #[arg(long, conflicts_with = "bookmark")]
+        pr: Option<u64>,
+    },
     /// Reconcile cached workspace health in the DB with actual on-disk state.
     ///
     /// Re-runs `jj status` on every free workspace that the DB currently
