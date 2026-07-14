@@ -1909,7 +1909,16 @@ fn deferred_scope_directive() -> String {
      this task and surfaced to a human, who decides whether to spin up a followup or accept the \
      gap. This is distinct from the followups mechanism above, which proposes brand-new \
      out-of-scope work you noticed — use `[deferred-scope]` specifically for work the brief asked \
-     for that you did not deliver.\n"
+     for that you did not deliver.\n\n\
+     **The marker is the only sanctioned channel for declaring deferred scope — prose is not \
+     enough.** If your PR body, a summary section, or your final response says anything that \
+     states or implies narrowed scope — \"deferred\", \"not included in this PR\", \"left for a \
+     future task\", \"out of scope for now\", a \"## Deferred\" heading, or similar — every item \
+     it names MUST also have a matching `[deferred-scope]` line in your final response. A prose \
+     deferral section with no matching markers is a protocol violation: reviewers are instructed \
+     to flag it, and it will be flagged. A \"## Deferred\" section in the PR body is fine as \
+     human-readable prose, but only in addition to the markers, never instead of them — the \
+     marker costs one line and is parsed even if malformed, so there is no excuse to skip it.\n"
         .to_string()
 }
 
@@ -4669,6 +4678,17 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("filed as a followup"),
             "directive must forbid the false \"filed as a followup\" claim:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("only sanctioned channel for declaring deferred scope"),
+            "directive must state the marker is the only sanctioned channel — prose-only \
+             deferral declarations (e.g. a \"## Deferred\" section with no markers) must be \
+             called out as insufficient:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("protocol violation"),
+            "directive must state that a prose deferral section with no matching markers is a \
+             protocol violation reviewers are instructed to flag:\n{prompt}",
         );
     }
 
