@@ -1285,7 +1285,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // workspace-rules default of `jj git fetch && jj new main`.
     let existing_pr_url = work_item_pr_url(work_item);
     if let Some(pr_url) = existing_pr_url {
-        let pr_number = extract_pr_number(pr_url)
+        let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
             .map(|n| n.to_string())
             .unwrap_or_else(|| "?".into());
         prompt.push_str(&format!(
@@ -1481,7 +1481,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // creating a new one. The engine's staged-URL detector captures
         // the URL from `gh pr view` output at the end of the run.
         if let Some(pr_url) = existing_pr_url {
-            let pr_number = extract_pr_number(pr_url)
+            let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
             prompt.push_str(&format!(
@@ -3244,12 +3244,6 @@ fn is_github_path_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-fn extract_pr_number(pr_url: &str) -> Option<u64> {
-    let tail = pr_url.rsplit_once("/pull/")?.1;
-    let n = tail.split(|c: char| !c.is_ascii_digit()).next()?;
-    n.parse::<u64>().ok()
-}
-
 fn work_item_details(work_item: &WorkItem) -> Option<String> {
     match work_item {
         WorkItem::Product(product) => {
@@ -3730,16 +3724,10 @@ mod compose_prompt_tests {
         assert!(work_item_pr_url(&project).is_none());
     }
 
-    #[test]
-    fn extract_pr_number_parses_standard_github_url() {
-        assert_eq!(extract_pr_number("https://github.com/org/repo/pull/123"), Some(123),);
-    }
-
-    #[test]
-    fn extract_pr_number_returns_none_for_malformed_url() {
-        assert_eq!(extract_pr_number("https://github.com/org/repo"), None);
-        assert_eq!(extract_pr_number("not-a-url"), None);
-    }
+    // `extract_pr_number` was removed in favour of the shared
+    // `boss_github::pr_url::pr_number_from_url`; its canonical-parse and
+    // malformed-rejection cases are covered by that helper's own unit tests
+    // in `tools/boss/github/src/pr_url.rs`.
 
     #[test]
     fn extract_pr_url_from_text_finds_bare_url() {
