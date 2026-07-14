@@ -871,6 +871,29 @@ pub(crate) async fn compose_worker_spawn(
     } else {
         None
     };
+    // merge_order forward-port stamping (direction 2): when this is a
+    // conflict-resolution revision whose parent has a `merge_order` sibling
+    // that already merged, name that sibling in the brief so the worker
+    // preserves its surfaces. Keyed on the review-cycle root (the in-review
+    // parent), since the merge_order edge is on the original sibling task, not
+    // this revision row. Fail-open: a lookup error just omits the clause (the
+    // generic preservation rule + the deletion tripwire still apply).
+    let merge_order_preservation: Vec<String> = if conflict_attempt.is_some() {
+        let root = work_db.review_cycle_root_id(&execution.work_item_id);
+        match work_db.merge_order_merged_siblings(&root) {
+            Ok(siblings) => render_merge_order_preservation_lines(&siblings),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "merge_order: merged-sibling lookup failed for forward-port brief; omitting sibling clause",
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     // Detect whether this is a respawn after a crash: if the work item has
     // no task-level pr_url (handled by the existing RESUME EXISTING PR path)
     // but has a prior orphaned execution with no pr_url, derive its expected
@@ -1160,6 +1183,7 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
                 .pr_template_set(&pr_template_set)
                 .editorial_enabled(editorial_enabled)
+                .merge_order_preservation(&merge_order_preservation)
                 .build(),
         )
     };
@@ -1242,6 +1266,11 @@ struct ExecutionPromptParams<'a> {
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
     #[builder(default)]
     editorial_enabled: bool,
+    /// Already-merged `merge_order` siblings whose surfaces this forward-port
+    /// must preserve (rendered lines). Empty for non-conflict revisions and
+    /// for conflict revisions with no merged overlap partner.
+    #[builder(default)]
+    merge_order_preservation: &'a [String],
 }
 
 fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
@@ -1257,6 +1286,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         editorial_rules,
         pr_template_set,
         editorial_enabled,
+        merge_order_preservation,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
     // the engine-collected log excerpt, the failing-check set, and the
@@ -1412,6 +1442,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 workspace_path,
                 conflict_attempt,
                 ci_attempt,
+                merge_order_preservation,
             ));
         }
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation => {
@@ -2260,6 +2291,7 @@ fn compose_revision_directive(
     workspace_path: &Path,
     conflict_attempt: Option<&ConflictResolution>,
     ci_attempt: Option<&CiRemediation>,
+    merge_order_preservation: &[String],
 ) -> String {
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
@@ -2392,10 +2424,62 @@ fn compose_revision_directive(
     ));
     if let Some(attempt) = conflict_attempt {
         out.push_str(&compose_conflict_resolution_fragment(attempt));
+        out.push_str(&compose_merge_order_preservation_fragment(merge_order_preservation));
     }
     if let Some(attempt) = ci_attempt {
         out.push_str(&compose_ci_remediation_fragment(attempt));
     }
+    out
+}
+
+/// Render one human-facing line per already-merged `merge_order` sibling,
+/// naming the task and (when known) the PR whose surfaces the forward-port
+/// must preserve.
+fn render_merge_order_preservation_lines(
+    siblings: &[crate::work_dependencies::MergeOrderMergedSibling],
+) -> Vec<String> {
+    siblings
+        .iter()
+        .map(|s| match &s.pr_url {
+            Some(url) if !url.is_empty() => format!("`{}` (merged: {url})", s.task_id),
+            _ => format!("`{}`", s.task_id),
+        })
+        .collect()
+}
+
+/// Sibling-specific preservation clause for a forward-port conflict brief
+/// (merge_order sequencing, direction 2). When the conflict revision's parent
+/// has a `merge_order` sibling that already merged, the base moved *because*
+/// that overlap partner landed — so this resolution is exactly the incident-002
+/// forward-port hazard. Name the merged sibling(s) explicitly so the worker
+/// knows precisely which merged work to preserve; the both-parents deletion
+/// tripwire ([`crate::merge_parent_deletion`]) verifies the result regardless.
+///
+/// Empty `merged_siblings` ⇒ empty string (no overlap partner merged; the
+/// generic preservation rule already present in the conflict fragment stands).
+fn compose_merge_order_preservation_fragment(merged_siblings: &[String]) -> String {
+    if merged_siblings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("\n### Merge-order preservation contract (sibling overlap — CRITICAL)\n\n");
+    out.push_str(
+        "This PR was flagged at planning time as editing files that overlap with a sibling \
+         task, and that sibling has now **merged first** — which is exactly why your base \
+         moved. This is the incident-002 forward-port hazard: the conflict exists *because* \
+         merged work landed on your base. You MUST integrate (never delete) the following \
+         merged sibling's surfaces:\n\n",
+    );
+    for sib in merged_siblings {
+        out.push_str(&format!("- {sib}\n"));
+    }
+    out.push_str(
+        "\nDeleting any surface these siblings added — to make the conflict disappear — is a \
+         defect, not a resolution. If you believe a surface is genuinely superseded, STOP and \
+         escalate per the preservation rule above (cite the design doc; do not push a deletion). \
+         The engine's both-parents deletion tripwire diffs your resolution against the merged \
+         base and will halt auto-progression on any merged-parent surface you remove.\n\n",
+    );
     out
 }
 
@@ -4252,6 +4336,98 @@ mod compose_prompt_tests {
             prompt.contains("The merged code MUST COMPILE"),
             "conflict gate must still require a clean build:\n{prompt}",
         );
+    }
+
+    #[test]
+    fn merge_order_preservation_fragment_names_merged_siblings() {
+        let lines = vec!["`task_abc` (merged: https://github.com/org/repo/pull/12)".to_owned()];
+        let frag = compose_merge_order_preservation_fragment(&lines);
+        assert!(
+            frag.contains("Merge-order preservation contract"),
+            "fragment must carry the section header:\n{frag}",
+        );
+        assert!(
+            frag.contains("task_abc"),
+            "fragment must name the merged sibling:\n{frag}"
+        );
+        assert!(
+            frag.contains("both-parents deletion tripwire"),
+            "fragment must point at the tripwire as verifier:\n{frag}",
+        );
+    }
+
+    #[test]
+    fn merge_order_preservation_fragment_is_empty_without_merged_siblings() {
+        assert!(
+            compose_merge_order_preservation_fragment(&[]).is_empty(),
+            "no merged overlap partner ⇒ no sibling-specific clause",
+        );
+    }
+
+    #[test]
+    fn render_merge_order_lines_include_pr_url_when_present() {
+        let siblings = vec![
+            crate::work_dependencies::MergeOrderMergedSibling {
+                task_id: "task_with_pr".into(),
+                pr_url: Some("https://github.com/org/repo/pull/9".into()),
+            },
+            crate::work_dependencies::MergeOrderMergedSibling {
+                task_id: "task_no_pr".into(),
+                pr_url: None,
+            },
+        ];
+        let lines = render_merge_order_preservation_lines(&siblings);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("task_with_pr") && lines[0].contains("pull/9"));
+        assert!(lines[1].contains("task_no_pr") && !lines[1].contains("merged:"));
+    }
+
+    #[test]
+    fn revision_directive_injects_merge_order_preservation_when_sibling_merged() {
+        let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+        let attempt = sample_conflict_attempt();
+        let lines = vec!["`task_sibling` (merged: https://github.com/org/repo/pull/50)".to_owned()];
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .conflict_attempt(&attempt)
+                .merge_order_preservation(&lines)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("Merge-order preservation contract"),
+            "conflict brief must carry the sibling-specific preservation clause:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("task_sibling"),
+            "clause must name the merged sibling:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn revision_directive_omits_merge_order_clause_without_merged_sibling() {
+        // A conflict revision with no merged overlap partner keeps only the
+        // generic preservation rule — no sibling-specific block.
+        let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+        let attempt = sample_conflict_attempt();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .conflict_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains("Merge-order preservation contract"),
+            "no merged sibling ⇒ no sibling-specific block:\n{prompt}",
+        );
+        // The generic preservation rule is still present.
+        assert!(prompt.contains("Preservation rule (HARD CONSTRAINT"));
     }
 
     #[test]

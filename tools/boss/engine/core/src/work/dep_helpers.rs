@@ -485,6 +485,36 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     Ok(())
 }
 
+/// Merge-time hook for the non-blocking `merge_order` relation: when a PR
+/// merges, order the pair for every in-flight `merge_order` sibling of the
+/// just-merged item. Those siblings become the "later" PRs of their pairing
+/// and, when they next forward-port onto the moved base, must do so
+/// preservingly — the forward-port brief stamps a sibling-specific
+/// preservation clause (see [`crate::runner`]) and the both-parents deletion
+/// tripwire ([`crate::merge_parent_deletion`]) verifies it.
+///
+/// This is observability-only (no status change, never gates dispatch): the
+/// durable "contract" is the `merge_order` edge itself plus the merged
+/// sibling's `done` status. Emitting the ordering decision at merge time
+/// makes it visible after the fact in the engine log. Returns the count of
+/// in-flight siblings that now owe a preserving forward-port.
+pub(crate) fn record_merge_order_on_merge(conn: &Connection, merged_id: &str) -> Result<usize> {
+    let mut later_count = 0usize;
+    for sibling in deps::merge_order_siblings(conn, merged_id)? {
+        let status = deps::lookup_work_item_status(conn, &sibling.sibling_id)?;
+        let in_flight = matches!(status.as_deref(), Some(s) if s != "done" && s != "archived");
+        if in_flight {
+            later_count += 1;
+            tracing::info!(
+                merged_first = merged_id,
+                later_sibling = %sibling.sibling_id,
+                "merge_order: overlap partner merged; sibling PR is now the later side and must forward-port preservingly",
+            );
+        }
+    }
+    Ok(later_count)
+}
+
 /// Internal write that stamps `last_status_actor = 'engine'` on the
 /// row. Used by the auto-block / unblock paths. Returns the new
 /// status.

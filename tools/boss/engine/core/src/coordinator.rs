@@ -1216,6 +1216,14 @@ pub struct ExecutionCoordinator {
     /// [`Self::with_pre_start_retry_delays`] to avoid real sleeps.
     #[builder(default = PRE_START_RETRY_DELAYS.to_vec())]
     pre_start_retry_delays: Vec<Duration>,
+    /// Bounded dispatch-stagger window (seconds) for the "later" side of a
+    /// high-overlap `merge_order` sibling pair. `0` (the default) disables the
+    /// stagger — the non-blocking `merge_order` relation still sequences merges,
+    /// but no dispatch offset is applied. Seeded from
+    /// [`crate::config::WorkConfig::merge_order_stagger_secs`] (already clamped
+    /// to [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]) at construction.
+    #[builder(default)]
+    merge_order_stagger_secs: u64,
     /// Engine-wide counter registry. Defaults to a fresh local registry
     /// with the lease counters pre-registered so tests that do not call
     /// `set_metrics` still get valid increments. Production wires in the
@@ -1340,6 +1348,7 @@ impl ExecutionCoordinator {
             scheduling_pending: AtomicBool::new(false),
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
+            merge_order_stagger_secs: 0,
             metrics: local_metrics,
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
             dispatch_paused: AtomicBool::new(false),
@@ -1348,6 +1357,14 @@ impl ExecutionCoordinator {
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Seed the bounded `merge_order` dispatch-stagger window (seconds).
+    /// `app.rs` calls this with the (already-clamped)
+    /// [`crate::config::WorkConfig::merge_order_stagger_secs`]; `0` disables
+    /// the stagger. Tests set it directly to exercise the deferral.
+    pub fn set_merge_order_stagger_secs(&mut self, secs: u64) {
+        self.merge_order_stagger_secs = secs;
     }
 
     /// Override the automation pool. `app.rs` calls this with a pool sized
@@ -2387,6 +2404,58 @@ impl ExecutionCoordinator {
                         ?err,
                         "drain: chain single-writer check failed — proceeding without pre-claim defer",
                     );
+                }
+            }
+
+            // merge_order dispatch stagger (direction 2, optional, default off):
+            // when configured, the "later" side of a high-overlap merge_order
+            // pair whose "first" side is still in flight gets a one-shot bounded
+            // dispatch offset so the two workers' diffs interleave less. This is
+            // NOT a block and never waits for a merge — the row simply becomes
+            // dispatchable again after the window via the `dispatch_not_before`
+            // gate + the scheduler heartbeat. It runs after the chain-hold gate
+            // (so a serialized row is never double-handled) and before claiming a
+            // slot (so a staggered row never burns a worker). Fail open on any DB
+            // error — a stagger check must never wedge the queue.
+            if self.merge_order_stagger_secs > 0 {
+                match self.work_db.maybe_stagger_merge_order_dispatch(
+                    &execution.id,
+                    &execution.work_item_id,
+                    self.merge_order_stagger_secs,
+                ) {
+                    Ok(Some(not_before)) => {
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            not_before,
+                            stagger_secs = self.merge_order_stagger_secs,
+                            pool = pool_label,
+                            "spawn_attempt status=ready -> deferred reason=merge_order_stagger"
+                        );
+                        self.dispatch_events
+                            .emit(
+                                DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                    .with_work_item(&execution.work_item_id)
+                                    .with_details(serde_json::json!({
+                                        "reason": "merge_order_stagger",
+                                        "not_before": not_before,
+                                        "stagger_secs": self.merge_order_stagger_secs,
+                                    })),
+                            )
+                            .await;
+                        // Leave the row `ready` (now with a future
+                        // `dispatch_not_before`); do NOT mark any pool exhausted.
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "drain: merge_order stagger check failed — dispatching without offset",
+                        );
+                    }
                 }
             }
 

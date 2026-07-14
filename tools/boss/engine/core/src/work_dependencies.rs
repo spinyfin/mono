@@ -15,11 +15,22 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use boss_protocol::WorkItemDependency;
 
-/// The only edge type v1 understands. Storage permits other values
+/// The edge type that gates dispatch. Storage permits other values
 /// for forward compatibility (`relates-to`, `duplicates`, …) but the
-/// engine refuses to *create* anything else and the dispatcher only
-/// reads `blocks` rows.
+/// dispatcher only reads `blocks` rows: [`gating_prereqs_for`] and
+/// `compute_gated_work_item_ids` filter strictly on this relation.
 pub const RELATION_BLOCKS: &str = "blocks";
+
+/// A **non-blocking** edge linking two otherwise-parallel siblings that
+/// the Planner flagged as likely to co-edit the same files (the soft
+/// `merge_order_hints` from a [`boss_protocol::PlannerOutput`]). Unlike
+/// [`RELATION_BLOCKS`] it **never gates dispatch** — dispatch gating keys
+/// strictly on `blocks` (see `dep_helpers::compute_gated_work_item_ids`
+/// and [`gating_prereqs_for`], both of which pass `Some(RELATION_BLOCKS)`).
+/// Its purpose is merge sequencing: the later PR of the pair forward-ports
+/// preservingly (see the merge-conflict-reduction design, Layer 3 /
+/// direction 2, and incident-002 postmortem P5).
+pub const RELATION_MERGE_ORDER: &str = "merge_order";
 
 /// Result of `insert_edge` — `Inserted` if a new row was added,
 /// `AlreadyExists` if the call was an idempotent re-add (Q6: `add`
@@ -174,12 +185,19 @@ pub fn query_edge(
     .map_err(Into::into)
 }
 
-/// True if inserting `(dependent_id → prerequisite_id)` would close a
-/// cycle. Walks the existing edge graph forward from
+/// True if inserting a **`blocks`** `(dependent_id → prerequisite_id)`
+/// edge would close a cycle. Walks the existing edge graph forward from
 /// `prerequisite_id`; if `dependent_id` is reachable, the new edge
 /// would form a cycle. Designed to run inside the same transaction
 /// as the upcoming insert so a concurrent writer sees the proposed
 /// row before adding its own.
+///
+/// The walk is **scoped to `relation='blocks'`** on both legs: a cycle
+/// only matters for the dispatch-gating graph, which is `blocks`-only.
+/// A non-blocking `merge_order` edge must never be able to manufacture a
+/// false cycle that rejects a legitimate `blocks` prerequisite — e.g. a
+/// `merge_order` A→B plus a later `blocks` B→A is perfectly valid and
+/// must be allowed (the two relations are independent graphs).
 pub fn would_create_cycle(conn: &Connection, dependent_id: &str, prerequisite_id: &str) -> Result<bool> {
     if dependent_id == prerequisite_id {
         return Ok(true);
@@ -194,11 +212,12 @@ pub fn would_create_cycle(conn: &Connection, dependent_id: &str, prerequisite_id
             "WITH RECURSIVE forward(id) AS (
                 SELECT prerequisite_id
                 FROM work_item_dependencies
-                WHERE dependent_id = ?1
+                WHERE dependent_id = ?1 AND relation = 'blocks'
               UNION
                 SELECT d.prerequisite_id
                 FROM work_item_dependencies d
                 JOIN forward f ON d.dependent_id = f.id
+                WHERE d.relation = 'blocks'
             )
             SELECT 1 FROM forward WHERE id = ?2 LIMIT 1",
             params![prerequisite_id, dependent_id],
@@ -323,6 +342,55 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     Ok(gating)
 }
 
+/// A `merge_order` sibling that has already merged — the "first" side of a
+/// pairing whose surfaces the later PR's forward-port must preserve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOrderMergedSibling {
+    /// The merged sibling's task id.
+    pub task_id: String,
+    /// Its PR url, if recorded — so the forward-port brief can name it.
+    pub pr_url: Option<String>,
+}
+
+/// One end of a `merge_order` pairing, resolved for `work_item_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOrderSibling {
+    /// The *other* work item in the pairing.
+    pub sibling_id: String,
+    /// `true` when `work_item_id` is the `dependent_id` of the edge — the
+    /// canonical "later" side (the one the dispatch stagger delays). `false`
+    /// when it is the `prerequisite_id` (the canonical "first" side).
+    pub work_item_is_later: bool,
+}
+
+/// Every `merge_order` peer of `work_item_id`, in either direction. Because
+/// a `merge_order` edge is a soft, undirected *pairing* (the stored
+/// direction is only a canonical tiebreaker), callers that need "the other
+/// task in the pair" must look both ways. Ordering is stable
+/// (created_at ASC, then sibling id ASC) so callers are deterministic.
+///
+/// Never consulted by dispatch gating — that path is `blocks`-only. Used by
+/// the merge-sequencing paths (forward-port brief stamping, dispatch
+/// stagger).
+pub fn merge_order_siblings(conn: &Connection, work_item_id: &str) -> Result<Vec<MergeOrderSibling>> {
+    let mut out = Vec::new();
+    // Edges where this item is the dependent (canonical "later") side.
+    for edge in prerequisites_of(conn, work_item_id, Some(RELATION_MERGE_ORDER))? {
+        out.push(MergeOrderSibling {
+            sibling_id: edge.prerequisite_id,
+            work_item_is_later: true,
+        });
+    }
+    // Edges where this item is the prerequisite (canonical "first") side.
+    for edge in dependents_of(conn, work_item_id, Some(RELATION_MERGE_ORDER))? {
+        out.push(MergeOrderSibling {
+            sibling_id: edge.dependent_id,
+            work_item_is_later: false,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +461,66 @@ mod tests {
         assert!(would_create_cycle(&conn, "task_d", "task_a").unwrap());
         // Adding e → a is fine.
         assert!(!would_create_cycle(&conn, "task_e", "task_a").unwrap());
+    }
+
+    // ── merge_order: non-blocking pairing ───────────────────────────────────
+
+    /// A `merge_order` edge must never manufacture a false cycle that would
+    /// reject a legitimate `blocks` edge in the reverse direction. `blocks`
+    /// and `merge_order` are independent graphs.
+    #[test]
+    fn merge_order_edge_does_not_block_reverse_blocks_edge() {
+        let conn = fresh_db();
+        insert_edge(&conn, "task_a", "task_b", RELATION_MERGE_ORDER, "1").unwrap();
+        // A `blocks` B→A must still be allowed — the merge_order A→B edge is
+        // invisible to the (blocks-scoped) cycle walk.
+        assert!(
+            !would_create_cycle(&conn, "task_b", "task_a").unwrap(),
+            "a merge_order edge must not gate a reverse blocks edge",
+        );
+        // And a genuine blocks cycle is still caught.
+        insert_edge(&conn, "task_b", "task_a", RELATION_BLOCKS, "2").unwrap();
+        assert!(would_create_cycle(&conn, "task_a", "task_b").unwrap());
+    }
+
+    /// `merge_order` edges are never returned by the blocks-only gating query.
+    #[test]
+    fn merge_order_edge_is_not_a_gating_prereq() {
+        let conn = fresh_db();
+        insert_edge(&conn, "task_later", "task_first", RELATION_MERGE_ORDER, "1").unwrap();
+        // No `blocks` prerequisites → nothing gates task_later even though a
+        // merge_order edge names task_first.
+        let blocks_prereqs = prerequisites_of(&conn, "task_later", Some(RELATION_BLOCKS)).unwrap();
+        assert!(
+            blocks_prereqs.is_empty(),
+            "merge_order must not appear as a blocks prereq"
+        );
+    }
+
+    /// `merge_order_siblings` resolves the peer in both directions with the
+    /// correct "later" flag.
+    #[test]
+    fn merge_order_siblings_resolves_both_directions() {
+        let conn = fresh_db();
+        // Canonical edge: task_first (prereq) → task_later (dependent).
+        insert_edge(&conn, "task_later", "task_first", RELATION_MERGE_ORDER, "1").unwrap();
+
+        let for_later = merge_order_siblings(&conn, "task_later").unwrap();
+        assert_eq!(for_later.len(), 1);
+        assert_eq!(for_later[0].sibling_id, "task_first");
+        assert!(for_later[0].work_item_is_later, "the dependent side is the later side");
+
+        let for_first = merge_order_siblings(&conn, "task_first").unwrap();
+        assert_eq!(for_first.len(), 1);
+        assert_eq!(for_first[0].sibling_id, "task_later");
+        assert!(
+            !for_first[0].work_item_is_later,
+            "the prerequisite side is the first side"
+        );
+
+        // A pure blocks edge must not show up as a merge_order sibling.
+        insert_edge(&conn, "task_later", "task_gate", RELATION_BLOCKS, "2").unwrap();
+        assert_eq!(merge_order_siblings(&conn, "task_later").unwrap().len(), 1);
     }
 
     #[test]

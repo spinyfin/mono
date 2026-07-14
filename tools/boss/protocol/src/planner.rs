@@ -207,8 +207,14 @@ pub struct ApplyResult {
     /// Names of tasks that were skipped because a non-deleted task with that
     /// name already existed in the project.
     pub skipped: Vec<String>,
-    /// Number of dependency edges inserted.
+    /// Number of `blocks` dependency edges inserted.
     pub edges_created: usize,
+    /// Number of non-blocking `merge_order` edges inserted from the proposal's
+    /// `merge_order_hints` (soft file-overlap pairings; never gate dispatch).
+    /// `#[serde(default)]` so an [`ApplyResult`] serialized before this field
+    /// existed still deserialises.
+    #[serde(default)]
+    pub merge_order_edges_created: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +399,7 @@ mod tests {
             created: vec!["task_abc".into(), "task_def".into()],
             skipped: vec!["Existing task".into()],
             edges_created: 1,
+            merge_order_edges_created: 2,
         };
 
         let json = serde_json::to_string(&result).expect("serialises");
@@ -400,6 +407,17 @@ mod tests {
         assert_eq!(back.created.len(), 2);
         assert_eq!(back.skipped.len(), 1);
         assert_eq!(back.edges_created, 1);
+        assert_eq!(back.merge_order_edges_created, 2);
+    }
+
+    /// An `ApplyResult` JSON payload written before `merge_order_edges_created`
+    /// existed must still deserialise (the field defaults to 0).
+    #[test]
+    fn apply_result_deserialises_without_merge_order_field() {
+        let legacy = r#"{"created":["task_a"],"skipped":[],"edges_created":3}"#;
+        let back: ApplyResult = serde_json::from_str(legacy).expect("legacy payload deserialises");
+        assert_eq!(back.edges_created, 3);
+        assert_eq!(back.merge_order_edges_created, 0);
     }
 
     #[test]

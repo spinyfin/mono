@@ -1141,6 +1141,9 @@ impl ServerState {
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
             execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator);
+            // Bounded merge_order dispatch stagger (direction 2, default off).
+            // Already clamped to MAX_MERGE_ORDER_STAGGER_SECS at config load.
+            execution_coordinator_inner.set_merge_order_stagger_secs(cfg.work.merge_order_stagger_secs);
             execution_coordinator_inner.set_automation_pool(automation_pool);
             execution_coordinator_inner.set_review_pool(review_pool);
             // Wire the SHA-delta gate's run-start snapshot: when an

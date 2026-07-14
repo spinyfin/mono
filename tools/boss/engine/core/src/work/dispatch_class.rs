@@ -325,4 +325,122 @@ mod tests {
             "the merge-conflict revision must win despite its name sorting after the chore's",
         );
     }
+
+    // ── merge_order dispatch stagger ────────────────────────────────────────
+
+    /// Wire a canonical `merge_order` edge `later` (dependent) → `first`
+    /// (prerequisite).
+    fn wire_merge_order(db: &WorkDb, later: &str, first: &str) {
+        let conn = db.connect().unwrap();
+        deps::insert_edge(&conn, later, first, deps::RELATION_MERGE_ORDER, &now_string()).unwrap();
+    }
+
+    fn set_status(db: &WorkDb, task_id: &str, status: &str) {
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![task_id, status])
+            .unwrap();
+    }
+
+    fn dispatch_not_before(db: &WorkDb, execution_id: &str) -> Option<String> {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT dispatch_not_before FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn stagger_defers_later_side_once_when_first_side_in_flight() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let first = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        let later = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        wire_merge_order(&db, &later, &first);
+        let exec = ready_execution_for(&db, &later, ExecutionKind::TaskImplementation);
+
+        // First side (`first`) is `todo` — in flight — so the later side is
+        // staggered exactly once.
+        let stamped = db.maybe_stagger_merge_order_dispatch(&exec, &later, 60).unwrap();
+        assert!(
+            stamped.is_some(),
+            "later side must be staggered when first is in flight"
+        );
+        assert!(
+            dispatch_not_before(&db, &exec).is_some(),
+            "dispatch_not_before must be stamped on the deferred execution",
+        );
+
+        // One-shot: a second pass must NOT re-defer.
+        assert!(
+            db.maybe_stagger_merge_order_dispatch(&exec, &later, 60)
+                .unwrap()
+                .is_none(),
+            "stagger is one-shot — never re-delays an already-deferred execution",
+        );
+    }
+
+    #[test]
+    fn stagger_never_delays_the_first_side() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let first = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        let later = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        wire_merge_order(&db, &later, &first);
+        let first_exec = ready_execution_for(&db, &first, ExecutionKind::TaskImplementation);
+
+        // Only the canonical "later" (dependent) side is ever staggered.
+        assert!(
+            db.maybe_stagger_merge_order_dispatch(&first_exec, &first, 60)
+                .unwrap()
+                .is_none(),
+            "the first side of a merge_order pair is never delayed",
+        );
+        assert!(dispatch_not_before(&db, &first_exec).is_none());
+    }
+
+    #[test]
+    fn stagger_is_a_noop_when_disabled_or_first_side_done() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let first = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        let later = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        wire_merge_order(&db, &later, &first);
+        let exec = ready_execution_for(&db, &later, ExecutionKind::TaskImplementation);
+
+        // secs = 0 → disabled, no stagger.
+        assert!(
+            db.maybe_stagger_merge_order_dispatch(&exec, &later, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(dispatch_not_before(&db, &exec).is_none());
+
+        // First side already merged (`done`) → no concurrency to break up.
+        set_status(&db, &first, "done");
+        assert!(
+            db.maybe_stagger_merge_order_dispatch(&exec, &later, 60)
+                .unwrap()
+                .is_none(),
+            "no stagger once the first side is done",
+        );
+        assert!(dispatch_not_before(&db, &exec).is_none());
+    }
+
+    #[test]
+    fn stagger_is_a_noop_without_a_merge_order_edge() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let solo = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        let exec = ready_execution_for(&db, &solo, ExecutionKind::TaskImplementation);
+        assert!(
+            db.maybe_stagger_merge_order_dispatch(&exec, &solo, 60)
+                .unwrap()
+                .is_none(),
+            "a task with no merge_order edge is never staggered",
+        );
+    }
 }

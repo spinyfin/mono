@@ -1063,6 +1063,91 @@ impl WorkDb {
             .next())
     }
 
+    /// Apply the optional one-shot `merge_order` dispatch stagger to a
+    /// `ready` execution, returning `Some(not_before_epoch)` when a stagger was
+    /// stamped (the caller should skip dispatching it this round) or `None`
+    /// when the execution does not qualify (dispatch proceeds normally).
+    ///
+    /// This is the enforcement half of the non-blocking merge-sequencing
+    /// relation (design Layer 3 / direction 2): a `merge_order` edge never
+    /// gates dispatch, but for the **highest-overlap pairs** an operator may
+    /// opt into a small bounded offset so two edit-overlapping siblings don't
+    /// start (and therefore diff) at exactly the same time. An execution for
+    /// work item X qualifies iff:
+    ///
+    ///   - `stagger_secs > 0` (opt-in; the config loader clamps it to
+    ///     [`crate::config::MAX_MERGE_ORDER_STAGGER_SECS`]), and
+    ///   - X is the **later** side of a `merge_order` pairing (the `dependent`
+    ///     end of the edge — the canonical "second" task; we only ever stagger
+    ///     one deterministic member of a pair, never both), and
+    ///   - a **first**-side peer is still in flight (status not `done` /
+    ///     `archived`) so the two would genuinely run concurrently, and
+    ///   - this execution was **never staggered before**
+    ///     (`dispatch_not_before IS NULL`) — a strict one-shot, so it never
+    ///     re-delays and never contends with the pre-start-failure / transient
+    ///     backoff paths that stamp the same column.
+    ///
+    /// On qualification it stamps `dispatch_not_before = now + stagger_secs`,
+    /// which makes the row invisible to [`Self::list_ready_executions`] until
+    /// the window elapses; the scheduler heartbeat re-kicks it afterward.
+    /// **Never a block and never waits for a merge** — a bounded offset only.
+    pub fn maybe_stagger_merge_order_dispatch(
+        &self,
+        execution_id: &str,
+        work_item_id: &str,
+        stagger_secs: u64,
+    ) -> Result<Option<i64>> {
+        if stagger_secs == 0 {
+            return Ok(None);
+        }
+        let conn = self.connect()?;
+        // Only the canonical "later" side of a pairing is eligible.
+        let later_peers: Vec<deps::MergeOrderSibling> = deps::merge_order_siblings(&conn, work_item_id)?
+            .into_iter()
+            .filter(|s| s.work_item_is_later)
+            .collect();
+        if later_peers.is_empty() {
+            return Ok(None);
+        }
+        // Require at least one first-side peer still in flight, so we only pay
+        // the offset when there is real concurrency to break up.
+        let mut first_in_flight = false;
+        for peer in &later_peers {
+            let status = deps::lookup_work_item_status(&conn, &peer.sibling_id)?;
+            if matches!(status.as_deref(), Some(s) if s != "done" && s != "archived") {
+                first_in_flight = true;
+                break;
+            }
+        }
+        if !first_in_flight {
+            return Ok(None);
+        }
+        // One-shot guard: only a `ready` row that has never been deferred.
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT dispatch_not_before FROM work_executions WHERE id = ?1 AND status = 'ready'",
+                params![execution_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        match current {
+            Some(None) => {}                  // ready and never deferred → eligible
+            Some(Some(_)) => return Ok(None), // already deferred once
+            None => return Ok(None),          // not a ready row (raced away)
+        }
+        let not_before = crate::epoch_time::now_epoch_secs() + stagger_secs as i64;
+        let updated = conn.execute(
+            "UPDATE work_executions
+             SET dispatch_not_before = ?2
+             WHERE id = ?1 AND status = 'ready' AND dispatch_not_before IS NULL",
+            params![execution_id, not_before.to_string()],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(Some(not_before))
+    }
+
     /// Return EVERY live (`running` / `waiting_human`) execution belonging to
     /// ANY *other* work item in the same revision chain as `work_item_id` —
     /// not just the first one encountered. See
