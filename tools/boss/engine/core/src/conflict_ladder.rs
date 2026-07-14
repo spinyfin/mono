@@ -1,6 +1,6 @@
 //! Escalation-ladder harness for the in-review merge-conflict path
 //! (`docs/designs/merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`,
-//! Layer 1 / task T4).
+//! Layer 1 / tasks T4 + T6).
 //!
 //! The ladder restructures conflict handling from "detect → full worker"
 //! into a sequence of strictly-cheaper rungs, each attempted only when the
@@ -8,7 +8,7 @@
 //! [`crate::conflict_watch::on_conflict_detected`] *before*
 //! `maybe_spawn_conflict_revision`, so a mechanical resolution retires the
 //! conflict with no agent and zero tokens, and only genuinely-semantic
-//! conflicts reach the worker path (rung 3).
+//! conflicts reach the worker path (rung 2 or 3).
 //!
 //! ## Rungs implemented here
 //!
@@ -19,6 +19,37 @@
 //!   On `REBASED_CLEAN` the command advances and pushes the boss bookmark
 //!   itself; the harness retires the attempt at rung 1 and the parent
 //!   returns to Review with no worker ever spawned.
+//!
+//! - **Rung 2 (T6) — small focused resolution agent.** When rung 1 leaves a
+//!   *bounded* residue of conflicted files ([`rung2_eligible`],
+//!   [`RUNG2_MAX_RESIDUAL_FILES`]), [`crate::conflict_watch`] spawns the
+//!   revision through the small-agent profile instead of the default one:
+//!   `effort_level = small` (the existing effort-level → model table already
+//!   resolves `small` to the cheap/fast tier — see `effort.rs` and issue
+//!   #746 for why this deliberately never falls to Haiku), and this module
+//!   stamps `resolved_by_rung = 2` on the attempt up front (before the
+//!   revision has actually run) so the later default-to-rung-3 stamp is a
+//!   no-op `COALESCE`. The prompt is the same tight, diagnosis-inline
+//!   conflict-resolution fragment rung 3 already uses
+//!   (`compose_conflict_resolution_fragment` in `runner.rs`) — it is
+//!   already scoped to "resolve only these conflicted hunks," which is what
+//!   makes it suitable for a smaller/cheaper model. A residue above the
+//!   bound is treated as a large/architectural conflict and declines rung 2
+//!   up front, climbing straight to rung 3 (per the design's rung-3 decline
+//!   condition).
+//!
+//!   Deferred from this task: literally handing the *already-leased,
+//!   already-rebased* workspace to the rung-2 execution (so the agent never
+//!   pays a second lease/goto/rebase) is NOT wired — the coordinator's
+//!   dispatch invariant unconditionally re-runs `cube workspace goto` for
+//!   every `revision_implementation` dispatch (`coordinator.rs`, "positioning
+//!   is never skipped for revisions"), so a second lease+goto+rebase still
+//!   happens for rung 2 today. Skipping that safely needs a new explicit
+//!   "already positioned" signal threaded through that invariant, which is
+//!   a deliberate dispatch-safety change deserving its own review rather
+//!   than a silent bypass here. Rung 2 as implemented still gets the
+//!   cost/safety win of a small, cheap, bounded-scope agent — it just
+//!   doesn't yet skip the re-lease.
 //!
 //! - **Rung 0 — deterministic resolvers.** When rung 1 leaves residual
 //!   conflicts, [`attempt_rung0`] feeds the residual files to the T2
@@ -56,7 +87,11 @@ use crate::merge_poller::parse_pr_number;
 use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
 
 /// The escalation-ladder rung a resolution was produced at, recorded in
-/// `conflict_resolutions.resolved_by_rung` for telemetry (T1).
+/// `conflict_resolutions.resolved_by_rung` for telemetry (T1). Rung 0
+/// (deterministic resolvers) and rung 1 (engine-direct rebase) are produced
+/// by this harness; rung 2 (T6, the small focused resolution agent) is
+/// stamped by [`rung2_eligible`]'s caller before it spawns the revision;
+/// rung 3 (full worker) is stamped by the existing retire paths.
 const RUNG_DETERMINISTIC_RESOLVER: i64 = 0;
 const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 
@@ -79,6 +114,23 @@ const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 /// decision.
 const RUNG0_APPLY_LIVE: bool = false;
 
+/// Rung 2 (T6): the escalation-ladder rung a resolution was produced at when
+/// a small, focused, pre-staged agent — not a cold full worker — resolved
+/// it. Recorded in `conflict_resolutions.resolved_by_rung` by
+/// [`crate::conflict_watch`] via [`crate::work::WorkDb::stamp_conflict_resolution_rung`]
+/// at spawn time, before the revision has actually run, so the later
+/// default-to-rung-3 stamp (`mark_conflict_resolution_succeeded`) is a
+/// no-op `COALESCE`.
+pub(crate) const RUNG_SMALL_RESOLUTION_AGENT: i64 = 2;
+
+/// Upper bound on residual conflicted files rung 2 will accept. Above this,
+/// the conflict is treated as large/architectural (design's rung-3 decline
+/// condition) and climbs straight to the full worker. Conservative default
+/// (single-file only) pending the open design question ("should rung 2 be
+/// capped to single-file semantic conflicts in v1?",
+/// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.attentions.json`)
+/// — easy to raise once the small-agent profile has telemetry behind it.
+pub(crate) const RUNG2_MAX_RESIDUAL_FILES: usize = 1;
 /// Result of running the mechanical rungs against a fresh conflict attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LadderOutcome {
@@ -88,9 +140,26 @@ pub(crate) enum LadderOutcome {
     Retired,
     /// No mechanical rung produced a resolution (rung 1 unavailable, the
     /// rebase errored, or residual conflicts remain). The caller falls
-    /// through to the existing worker-spawn path (rung 3). Any leased
-    /// workspace has already been released.
-    FellThrough,
+    /// through to the existing worker-spawn path. Any leased workspace has
+    /// already been released.
+    ///
+    /// `residual_conflict_files` is the number of files rung 1's rebase
+    /// left conflicted, when known — `None` when the harness never got far
+    /// enough to run the rebase (ensure_repo/lease/goto/rebase-transport
+    /// failures) or the rebase was clean-but-unpushed. The caller passes
+    /// this to [`rung2_eligible`] to decide whether the next worker spawn
+    /// should use rung 2's small-agent profile or climb straight to rung 3.
+    FellThrough { residual_conflict_files: Option<usize> },
+}
+
+/// Rung 2 (T6) eligibility: a bounded set of residual conflicted files is
+/// "genuine semantic overlap" a small focused agent may attempt; zero files
+/// means rung 1 never actually left a residue to hand off (a lease/goto/
+/// rebase-transport failure, or a clean-but-unpushed rebase) and more than
+/// [`RUNG2_MAX_RESIDUAL_FILES`] is treated as a large/architectural conflict
+/// that declines rung 2 up front, per the design's rung-3 decline condition.
+pub(crate) fn rung2_eligible(residual_conflict_files: Option<usize>) -> bool {
+    matches!(residual_conflict_files, Some(n) if n > 0 && n <= RUNG2_MAX_RESIDUAL_FILES)
 }
 
 /// Attempt the mechanical rungs (rung 1 today) for a freshly-detected,
@@ -114,7 +183,9 @@ pub(crate) async fn try_mechanical_rungs(
             pr_url = %candidate.pr_url,
             "conflict_ladder: could not parse PR number; skipping rung 1",
         );
-        return LadderOutcome::FellThrough;
+        return LadderOutcome::FellThrough {
+            residual_conflict_files: None,
+        };
     };
     let pr_number = pr_number as u64;
 
@@ -128,7 +199,9 @@ pub(crate) async fn try_mechanical_rungs(
                 work_item_id = %candidate.work_item_id,
                 "conflict_ladder: no repo_remote_url resolves for work item; skipping rung 1",
             );
-            return LadderOutcome::FellThrough;
+            return LadderOutcome::FellThrough {
+                residual_conflict_files: None,
+            };
         }
         Err(err) => {
             tracing::warn!(
@@ -136,7 +209,9 @@ pub(crate) async fn try_mechanical_rungs(
                 ?err,
                 "conflict_ladder: failed to resolve repo_remote_url; skipping rung 1",
             );
-            return LadderOutcome::FellThrough;
+            return LadderOutcome::FellThrough {
+                residual_conflict_files: None,
+            };
         }
     };
 
@@ -149,7 +224,9 @@ pub(crate) async fn try_mechanical_rungs(
                 error = %format!("{err:#}"),
                 "conflict_ladder: ensure_repo failed; skipping rung 1",
             );
-            return LadderOutcome::FellThrough;
+            return LadderOutcome::FellThrough {
+                residual_conflict_files: None,
+            };
         }
     };
 
@@ -166,7 +243,9 @@ pub(crate) async fn try_mechanical_rungs(
                 error = %format!("{err:#}"),
                 "conflict_ladder: could not lease a workspace for rung 1; falling through to worker",
             );
-            return LadderOutcome::FellThrough;
+            return LadderOutcome::FellThrough {
+                residual_conflict_files: None,
+            };
         }
     };
 
@@ -203,7 +282,9 @@ async fn run_rung1_in_lease(
             error = %format!("{err:#}"),
             "conflict_ladder: goto_workspace failed; falling through to worker",
         );
-        return LadderOutcome::FellThrough;
+        return LadderOutcome::FellThrough {
+            residual_conflict_files: None,
+        };
     }
 
     let rebase = match cube_client.rebase_workspace(&lease.workspace_path, pr_number).await {
@@ -215,7 +296,9 @@ async fn run_rung1_in_lease(
                 error = %format!("{err:#}"),
                 "conflict_ladder: engine-direct rebase failed; falling through to worker",
             );
-            return LadderOutcome::FellThrough;
+            return LadderOutcome::FellThrough {
+                residual_conflict_files: None,
+            };
         }
     };
 
@@ -240,14 +323,19 @@ async fn run_rung1_in_lease(
             pr = pr_number,
             "conflict_ladder: rung 1 rebased clean but reported unpushed; falling through to worker",
         );
-        return LadderOutcome::FellThrough;
+        return LadderOutcome::FellThrough {
+            residual_conflict_files: None,
+        };
     }
 
-    // Residual conflicts after the structural rebase are genuine overlap that
-    // rung 0 (deterministic resolvers) or rung 3 (worker) must handle. Try
-    // rung 0 first — gated off live by RUNG0_APPLY_LIVE (see its doc comment)
-    // until T2562's result-gate lands; `attempt_rung0` itself decides whether
-    // every residual file actually resolves.
+    // Residual conflicts after the structural rebase are genuine overlap.
+    // Try rung 0 (deterministic resolvers) first — gated off live by
+    // RUNG0_APPLY_LIVE (see its doc comment) until T2562's result-gate
+    // lands; `attempt_rung0` itself decides whether every residual file
+    // actually resolves. If rung 0 is gated off or declines, the caller
+    // uses the residual file count to decide between rung 2 (a small
+    // focused agent, when the residue is bounded — see `rung2_eligible`)
+    // and rung 3 (full worker, for a large/architectural conflict).
     if RUNG0_APPLY_LIVE
         && attempt_rung0(
             work_db,
@@ -264,14 +352,17 @@ async fn run_rung1_in_lease(
         return LadderOutcome::Retired;
     }
 
+    let residual_conflict_files = rebase.conflicted_files.len();
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr = pr_number,
         attempt_id = %attempt.id,
-        residual_conflicts = rebase.conflicted_files.len(),
-        "conflict_ladder: rung 1 left residual conflicts; climbing to worker (rung 3)",
+        residual_conflicts = residual_conflict_files,
+        "conflict_ladder: rung 1 left residual conflicts; falling through to rung 2/3",
     );
-    LadderOutcome::FellThrough
+    LadderOutcome::FellThrough {
+        residual_conflict_files: Some(residual_conflict_files),
+    }
 }
 
 /// Rung 0: feed rung-1's residual conflicted files to the deterministic-

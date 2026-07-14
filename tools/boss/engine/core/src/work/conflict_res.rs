@@ -375,6 +375,29 @@ impl WorkDb {
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
+    /// Stamp `resolved_by_rung` on a still-live attempt *before* the
+    /// resolution has actually completed — used by the escalation-ladder
+    /// harness (T6) when it hands the conflict to a rung-2 small focused
+    /// agent, so that whichever path later calls
+    /// [`Self::mark_conflict_resolution_succeeded`] (which defaults to rung
+    /// 3, the full-worker rung) finds `resolved_by_rung` already set and
+    /// the `COALESCE` in that method preserves `2` instead of overwriting
+    /// it. Does not touch `status` — the attempt stays `pending`/`running`
+    /// until the spawned revision actually finishes. Idempotent no-op
+    /// (`Ok(None)`) once the row is terminal.
+    pub fn stamp_conflict_resolution_rung(&self, attempt_id: &str, rung: i64) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET resolved_by_rung = COALESCE(resolved_by_rung, ?2)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, rung],
+        )?;
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+    }
+
     /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
     /// with the provided reason. Used for "we stepped away on purpose"
     /// terminations (parent PR closed, parent merged externally,

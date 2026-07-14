@@ -185,6 +185,136 @@ async fn conflict_without_cube_client_spawns_worker_as_before() {
     );
 }
 
+/// A [`CubeClient`] double whose engine-direct rebase leaves a fixed set of
+/// residual conflicted files — drives rung 2's (T6) small-agent-profile
+/// decision in `on_conflict_detected`.
+struct ConflictsCube {
+    conflicted_files: Vec<String>,
+}
+
+crate::stub_cube_client! { ConflictsCube {
+    async fn ensure_repo(&self, _origin: &str) -> anyhow::Result<CubeRepoHandle> {
+        Ok(CubeRepoHandle { repo_id: "repo-1".to_owned() })
+    }
+    async fn lease_workspace(
+        &self,
+        _repo_id: &str,
+        _task: &str,
+        _prefer: Option<&str>,
+        _allow_dirty: bool,
+        _exclude: &[&str],
+    ) -> anyhow::Result<CubeWorkspaceLease> {
+        Ok(CubeWorkspaceLease {
+            lease_id: "L2".to_owned(),
+            workspace_id: "W2".to_owned(),
+            workspace_path: std::path::PathBuf::from("/tmp/rung2-ws"),
+        })
+    }
+    async fn goto_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn rebase_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<RebaseOutcome> {
+        Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: self.conflicted_files.clone() })
+    }
+    async fn release_workspace(&self, _lease_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+} }
+
+/// Escalation ladder rung 2 (T6): a single residual conflicted file after
+/// rung 1's rebase is bounded — `on_conflict_detected` spawns the revision
+/// with the small-agent profile (`effort_level = small`) and stamps the
+/// attempt `resolved_by_rung = 2` up front.
+#[tokio::test]
+async fn conflict_with_bounded_residue_spawns_rung2_small_agent_revision() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/79";
+    let (product, chore) = make_in_review(&db, "C-rung2", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ConflictsCube {
+        conflicted_files: vec!["src/lib.rs".to_owned()],
+    };
+
+    let transitioned = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        Some(&cube),
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+
+    assert!(transitioned);
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("an active attempt with a spawned rung-2 revision");
+    assert_eq!(active.status, "pending");
+    assert_eq!(
+        active.resolved_by_rung,
+        Some(2),
+        "rung 2 must stamp resolved_by_rung up front, before the revision has run"
+    );
+    let revision_id = active.revision_task_id.expect("rung 2 must spawn a worker revision");
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(
+                t.effort_level,
+                Some(boss_protocol::EffortLevel::Small),
+                "rung 2's revision must use the small-agent profile"
+            );
+        }
+        other => panic!("expected a task-shaped revision, got {other:?}"),
+    }
+}
+
+/// Escalation ladder rung 2 (T6) decline: a residue beyond the bound is
+/// treated as a large/architectural conflict — the revision spawns with the
+/// default (rung 3, full-worker) profile, not the small-agent one.
+#[tokio::test]
+async fn conflict_with_unbounded_residue_declines_rung2() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/80";
+    let (product, chore) = make_in_review(&db, "C-rung2-decline", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ConflictsCube {
+        conflicted_files: vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()],
+    };
+
+    let transitioned = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        Some(&cube),
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+
+    assert!(transitioned);
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("an active attempt with a spawned revision");
+    // The real discriminator between "rung 2 spawned this" and "rung 3's
+    // default path spawned this" is `resolved_by_rung`, stamped up front only
+    // on the rung-2 branch — `effort_level` alone doesn't distinguish them
+    // here because a plain chore parent's un-overridden default is already
+    // `small` (see `default_revision_effort_level`), same as rung 2's
+    // explicit override.
+    assert_eq!(
+        active.resolved_by_rung, None,
+        "a declined rung 2 must not stamp resolved_by_rung (defaults to 3 at actual completion)"
+    );
+    assert!(
+        active.revision_task_id.is_some(),
+        "rung 3 must still spawn a worker revision"
+    );
+}
+
 /// New-model acceptance: when a revision fix vehicle is successfully spawned,
 /// the parent stays in `in_review` (Review column). The blocked state is only
 /// reached when there is no tractable fix vehicle (churn cap, create_revision
