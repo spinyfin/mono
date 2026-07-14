@@ -403,17 +403,10 @@ pub async fn on_conflict_detected(
                     }
                 }
                 Ok(None) => {
-                    // No active crz. Check the most recent crz status to
-                    // decide whether to re-arm.
-                    let latest_status = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id)
-                    {
-                        Ok(Some(crz)) => crz.status,
-                        Ok(None) => {
-                            // No crz at all — this is a fresh block, not
-                            // a stale-base scenario. The insert path will
-                            // handle it.
-                            "pending".to_owned()
-                        }
+                    // No active crz. Check the most recent crz to decide
+                    // whether to re-arm.
+                    let latest = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                        Ok(latest) => latest,
                         Err(err) => {
                             tracing::warn!(
                                 work_item_id = %candidate.work_item_id,
@@ -423,15 +416,14 @@ pub async fn on_conflict_detected(
                             return false;
                         }
                     };
-                    match latest_status.as_str() {
+                    // No crz at all → a fresh block, not a stale-base scenario;
+                    // the insert path handles it (treated as "pending").
+                    let latest_status = latest.as_ref().map(|c| c.status.as_str()).unwrap_or("pending");
+                    match latest_status {
                         "succeeded" => {
-                            // Previous worker succeeded but the PR is CONFLICTING
-                            // again (main moved further). Fall through to the
-                            // insert path, which creates a fresh row keyed on
-                            // (base, head) — see the UNIQUE-key note above the
-                            // insert call. If insert_conflict_resolution collides
-                            // (head hasn't actually moved since the succeeded
-                            // attempt), that path logs why no fresh attempt landed.
+                            // Previous attempt succeeded but the PR is CONFLICTING
+                            // again. Fall through to the insert path, which
+                            // creates a fresh row keyed on (base, head).
                             tracing::info!(
                                 work_item_id = %candidate.work_item_id,
                                 pr_url = %candidate.pr_url,
@@ -439,6 +431,54 @@ pub async fn on_conflict_detected(
                                 head_ref_oid = ?probe.head_ref_oid,
                                 "conflict_watch: stale-base re-arm: succeeded crz but PR still CONFLICTING; attempting fresh dispatch",
                             );
+                            // Wedge fix (mono#1398/#1764): when the succeeded
+                            // attempt's UNIQUE key still equals the current
+                            // probe's (base + head unchanged since it "succeeded"
+                            // — the resolution never advanced the head, yet the
+                            // PR is CONFLICTING again), the fall-through INSERT
+                            // below would collide and no fresh attempt could ever
+                            // land, so `on_conflict_detected` would re-detect this
+                            // exact state every ~6s forever. Invalidate the stale
+                            // succeeded row (freeing its UNIQUE slot) so exactly
+                            // one churn-guarded fresh attempt proceeds; once the
+                            // churn guard trips, the parent rests `blocked` for
+                            // human attention instead of hot-looping.
+                            //
+                            // Only when the INSERT would genuinely collide: both
+                            // key columns are non-NULL (NULL is distinct in the
+                            // UNIQUE index, so a NULL base/head never collides)
+                            // and equal to the succeeded row's. When the head has
+                            // advanced (the healthy re-arm — see
+                            // `rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base`),
+                            // the keys differ and we leave the succeeded row alone.
+                            if let Some(succeeded) = latest.as_ref() {
+                                let would_collide = probe.base_ref_oid.is_some()
+                                    && probe.head_ref_oid.is_some()
+                                    && probe.base_ref_oid.as_deref() == succeeded.base_sha_at_trigger.as_deref()
+                                    && probe.head_ref_oid.as_deref() == succeeded.head_sha_before.as_deref();
+                                if would_collide {
+                                    tracing::warn!(
+                                        work_item_id = %candidate.work_item_id,
+                                        pr_url = %candidate.pr_url,
+                                        attempt_id = %succeeded.id,
+                                        base_ref_oid = ?probe.base_ref_oid,
+                                        head_ref_oid = ?probe.head_ref_oid,
+                                        "conflict_watch: succeeded crz's UNIQUE key still matches the CONFLICTING probe (head never advanced); \
+                                         invalidating the stale success to free the slot for one churn-guarded fresh attempt",
+                                    );
+                                    if let Err(err) = work_db.invalidate_stale_succeeded_conflict_resolution(
+                                        &succeeded.id,
+                                        "stale_success_still_conflicting",
+                                    ) {
+                                        tracing::warn!(
+                                            work_item_id = %candidate.work_item_id,
+                                            attempt_id = %succeeded.id,
+                                            ?err,
+                                            "conflict_watch: failed to invalidate stale succeeded crz; fresh insert may still collide",
+                                        );
+                                    }
+                                }
+                            }
                         }
                         "pending" => {
                             // No previous crz (or brand-new pending one) — fall
@@ -617,6 +657,17 @@ pub async fn on_conflict_detected(
                         use_small_agent_profile = conflict_ladder::rung2_eligible(residual_conflict_files);
                     }
                 }
+            } else {
+                // No cube client → the mechanical-rebase flag is off, so the
+                // escalation ladder (rungs 0/1) is not attempted this dispatch.
+                // Log it so "why no rung activity?" is answerable from the trace
+                // (mono#1398/#1764): this is the worker-only path, by config.
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %a.id,
+                    "conflict_watch: mechanical rebase ladder disabled (no cube client); spawning worker directly (rung 3)",
+                );
             }
             // Fresh attempt — try to spawn a revision.
             let spawned = maybe_spawn_conflict_revision(

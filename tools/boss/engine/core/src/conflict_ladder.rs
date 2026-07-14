@@ -229,6 +229,17 @@ pub(crate) async fn try_mechanical_rungs(
     };
     let pr_number = pr_number as u64;
 
+    // One INFO line at ladder entry so "was any mechanical rung invoked for
+    // this conflict?" is answerable from the engine trace (mono#1398/#1764:
+    // the ladder was running silently / never reached). Escalation and
+    // outcome lines follow from `run_rung1_in_lease` / `attempt_rung0`.
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr = pr_number,
+        attempt_id = %attempt.id,
+        "conflict_ladder: entering mechanical rungs (rung 1 engine-direct rebase)",
+    );
+
     // The engine-direct rebase needs a workspace positioned on the PR. Resolve
     // the task's effective repo (per-task override beats the product default)
     // to lease against.
@@ -394,6 +405,13 @@ async fn run_rung1_in_lease(
     // `rung2_eligible`) and rung 3 (full worker, for a large/architectural
     // conflict).
     if RUNG0_APPLY_LIVE {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr = pr_number,
+            attempt_id = %attempt.id,
+            residual_conflicts = rebase.conflicted_files.len(),
+            "conflict_ladder: escalating to rung 0 (deterministic resolvers) for rung-1 residue",
+        );
         let rung0_outcome = attempt_rung0(
             work_db,
             publisher,
@@ -407,6 +425,19 @@ async fn run_rung1_in_lease(
         if !matches!(rung0_outcome, LadderOutcome::FellThrough { .. }) {
             return rung0_outcome;
         }
+    } else {
+        // Rung 0 is compile-time gated off (see `RUNG0_APPLY_LIVE`). Emit one
+        // line so the engine trace records *why* the deterministic resolvers
+        // show zero activity — a config fact, not a dispatch/logging bug
+        // (mono#1398/#1764).
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr = pr_number,
+            attempt_id = %attempt.id,
+            residual_conflicts = rebase.conflicted_files.len(),
+            rung0_apply_live = RUNG0_APPLY_LIVE,
+            "conflict_ladder: rung 0 (deterministic resolvers) gated off; not attempted — climbing to rung 2/3",
+        );
     }
 
     let residual_conflict_files = rebase.conflicted_files.len();

@@ -767,6 +767,132 @@ async fn rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base
     assert!(reason.is_none());
 }
 
+/// Regression test for the mono#1398/#1764 wedge: a `succeeded` crz whose
+/// head NEVER advanced (a false success — e.g. the signal-cleared gate
+/// retired on `mergeable=UNKNOWN`, or `main` re-conflicted the PR at the
+/// same head) permanently occupies the `UNIQUE (work_item_id,
+/// base_sha_at_trigger, head_sha_before)` slot. The stale-base re-arm then
+/// fell through to a colliding INSERT every ~6s forever ("succeeded crz but
+/// PR still CONFLICTING" → UNIQUE collision → no fresh attempt). The fix
+/// invalidates the stale success (freeing the slot) so exactly one
+/// churn-guarded fresh attempt lands and the loop breaks.
+#[tokio::test]
+async fn rearm_invalidates_stale_success_when_head_unchanged_and_breaks_wedge() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1398";
+    let (product, chore) = make_in_review(&db, "C-wedge", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    // First conflict at head "head-stuck". Revision spawns, parent in_review.
+    assert!(
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            None,
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-stuck"),
+        )
+        .await
+    );
+    let first_attempt = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("first attempt must exist");
+    assert_eq!(first_attempt.head_sha_before.as_deref(), Some("head-stuck"));
+
+    // Simulate a FALSE success: the attempt is marked succeeded WITHOUT the
+    // head advancing (head_sha_after stays NULL) — exactly the premature
+    // retire the signal-cleared gate used to record on mergeable=UNKNOWN.
+    db.mark_conflict_resolution_succeeded(&first_attempt.id, None).unwrap();
+    db.clear_merge_conflict_signal_only(&chore).unwrap();
+    let succeeded = db.get_conflict_resolution(&first_attempt.id).unwrap().unwrap();
+    assert_eq!(succeeded.status, "succeeded");
+    assert!(succeeded.head_sha_after.is_none(), "head must not have advanced");
+
+    // Parent comes to rest `blocked: merge_conflict` (routes the next
+    // detection through the re-arm branch, not the primary flip).
+    db.update_work_item(
+        &chore,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some("merge_conflict".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    // Second conflict at the SAME head "head-stuck" and SAME base "abc123":
+    // the succeeded row's UNIQUE key still matches. Before the fix this
+    // collided and returned false (the permanent ~6s no-op loop). After the
+    // fix it invalidates the stale success and lands one fresh attempt.
+    let second = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-stuck"),
+    )
+    .await;
+    assert!(second, "re-arm must break the wedge and report a state change");
+
+    // The stale success was invalidated: flipped to `failed` with the wedge
+    // reason and its UNIQUE slot freed (base_sha_at_trigger NULLed).
+    let invalidated = db.get_conflict_resolution(&first_attempt.id).unwrap().unwrap();
+    assert_eq!(invalidated.status, "failed");
+    assert_eq!(
+        invalidated.failure_reason.as_deref(),
+        Some("stale_success_still_conflicting"),
+    );
+    assert!(
+        invalidated.base_sha_at_trigger.is_none(),
+        "invalidation must free the UNIQUE slot",
+    );
+
+    // A second, distinct attempt row exists — a genuine fresh resolution.
+    let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(attempts.len(), 2, "one fresh attempt must be created, got {attempts:?}");
+    let fresh = attempts
+        .iter()
+        .find(|a| a.id != first_attempt.id)
+        .expect("a second, distinct attempt row must exist");
+    assert_eq!(fresh.status, "pending");
+    assert!(fresh.revision_task_id.is_some(), "fresh attempt must spawn a revision");
+    assert_eq!(fresh.base_sha_at_trigger.as_deref(), Some("abc123"));
+    assert_eq!(fresh.head_sha_before.as_deref(), Some("head-stuck"));
+
+    // Parent is back in_review — the fresh revision is the fix vehicle.
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview);
+    assert!(reason.is_none());
+
+    // The wedge is broken: a THIRD probe at the same state is now the
+    // idempotent no-op (active revision in flight), NOT another invalidate +
+    // insert — no third attempt row is created.
+    let third = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-stuck"),
+    )
+    .await;
+    assert!(
+        !third,
+        "with a fresh attempt in flight, re-detection is an idempotent no-op"
+    );
+    assert_eq!(
+        db.list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap()
+            .len(),
+        2,
+        "no further attempts once one is in flight",
+    );
+}
+
 #[tokio::test]
 async fn detection_skipped_when_human_moved_row_off_in_review() {
     let dir = tempdir().unwrap();
