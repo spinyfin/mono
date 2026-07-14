@@ -353,7 +353,7 @@ pub async fn run_one_pass(
         // Grace-period guard: skip executions whose `started_at` is
         // within DEAD_PID_GRACE_SECS or not yet recorded. A missing
         // `started_at` means the pane hasn't fully exec'd yet.
-        let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
+        let started_epoch = execution.started_epoch();
         let started_epoch = match started_epoch {
             None => {
                 outcome.grace_skipped += 1;

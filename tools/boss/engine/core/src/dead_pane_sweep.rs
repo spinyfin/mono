@@ -202,7 +202,7 @@ pub async fn reconcile_if_pane_dead(
 
     // Grace guard: skip executions dispatched too recently (or with no
     // `started_at`) so a worker whose pid is still settling is never raced.
-    let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
+    let started_epoch = execution.started_epoch();
     match started_epoch {
         Some(t) if now_epoch_secs - t >= PANE_DEATH_GRACE_SECS => {}
         _ => return false,

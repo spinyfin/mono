@@ -3803,6 +3803,31 @@ pub struct WorkExecution {
     pub workspace_path: Option<String>,
 }
 
+impl WorkExecution {
+    /// `started_at` parsed as Unix epoch seconds. The column stores the
+    /// epoch as a string; this encapsulates the
+    /// `as_deref().and_then(parse::<i64>)` dance shared by every sweep that
+    /// applies a grace window against the worker's start time. `None` when
+    /// `started_at` is unset or unparseable.
+    pub fn started_epoch(&self) -> Option<i64> {
+        self.started_at.as_deref().and_then(|s| s.parse::<i64>().ok())
+    }
+
+    /// `finished_at` parsed as Unix epoch seconds, mirroring
+    /// [`Self::started_epoch`]. `None` when `finished_at` is unset or
+    /// unparseable.
+    pub fn finished_epoch(&self) -> Option<i64> {
+        self.finished_at.as_deref().and_then(|s| s.parse::<i64>().ok())
+    }
+
+    /// `created_at` parsed as Unix epoch seconds. Unlike `started_at` /
+    /// `finished_at`, `created_at` is a non-optional column, so this is
+    /// `None` only when the stored value is unparseable.
+    pub fn created_epoch(&self) -> Option<i64> {
+        self.created_at.parse::<i64>().ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "item_type", rename_all = "snake_case")]
 pub enum WorkItem {
@@ -5483,5 +5508,44 @@ mod tests {
                 "{status} rename divergence did not match expectation"
             );
         }
+    }
+
+    fn sample_work_execution() -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_1")
+            .work_item_id("wi_1")
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@example.com:foo.git")
+            .created_at("1747000000")
+            .build()
+    }
+
+    #[test]
+    fn work_execution_epoch_accessors_parse_stored_strings() {
+        let mut exec = sample_work_execution();
+        exec.started_at = Some("1747000010".into());
+        exec.finished_at = Some("1747000100".into());
+        assert_eq!(exec.started_epoch(), Some(1747000010));
+        assert_eq!(exec.finished_epoch(), Some(1747000100));
+        assert_eq!(exec.created_epoch(), Some(1747000000));
+    }
+
+    #[test]
+    fn work_execution_epoch_accessors_none_when_unset_or_unparseable() {
+        let mut exec = sample_work_execution();
+        // Unset optional timestamps.
+        assert!(exec.started_at.is_none());
+        assert!(exec.finished_at.is_none());
+        assert_eq!(exec.started_epoch(), None);
+        assert_eq!(exec.finished_epoch(), None);
+
+        // Unparseable values yield None rather than panicking.
+        exec.started_at = Some("not-a-number".into());
+        exec.finished_at = Some("".into());
+        exec.created_at = "2026-05-11T00:00:00Z".into();
+        assert_eq!(exec.started_epoch(), None);
+        assert_eq!(exec.finished_epoch(), None);
+        assert_eq!(exec.created_epoch(), None);
     }
 }

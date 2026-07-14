@@ -296,7 +296,7 @@ pub async fn run_one_pass(
         }
 
         // Grace guard: don't act on a worker that only just started.
-        let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
+        let started_epoch = execution.started_epoch();
         match started_epoch {
             Some(t) if t < grace_cutoff => {}
             _ => {

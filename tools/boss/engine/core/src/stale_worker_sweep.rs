@@ -246,7 +246,7 @@ pub async fn run_one_pass(
 
         // Grace-period guard: skip executions whose `started_at` is
         // within STALE_GRACE_SECS or not yet recorded.
-        let Some(started_epoch) = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+        let Some(started_epoch) = execution.started_epoch() else {
             outcome.grace_skipped += 1;
             continue;
         };
