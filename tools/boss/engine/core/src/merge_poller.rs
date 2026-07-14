@@ -2473,6 +2473,10 @@ async fn sweep_pending_pr(handler: &WorkerCompletionHandler, execution_id: &str,
         // EscalationPending is only reachable via `nudge_or_park` on the
         // on-Stop path, never from a PR-detection recheck.
         | StopOutcome::EscalationPending { .. }
+        // BuildWaitPending is only reachable via `nudge_or_park` on the
+        // on-Stop path (it reads the worker's Stop-boundary transcript for
+        // the build-wait heuristic), never from a PR-detection recheck.
+        | StopOutcome::BuildWaitPending { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -2541,6 +2545,9 @@ async fn sweep_late_pr(handler: &WorkerCompletionHandler, candidate: &LatePrCand
         // EscalationPending is only reachable via `nudge_or_park` on the
         // on-Stop path, never from a late-PR recheck.
         | StopOutcome::EscalationPending { .. }
+        // BuildWaitPending is only reachable via `nudge_or_park` on the
+        // on-Stop path, never from a late-PR recheck.
+        | StopOutcome::BuildWaitPending { .. }
         | StopOutcome::DbError => {}
     }
 }
