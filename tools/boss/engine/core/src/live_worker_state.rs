@@ -5,7 +5,8 @@
 //! whenever any slot changes so UI subscribers can push to the kanban
 //! Doing icon and the pane titlebar pill in near-real-time.
 //!
-//! Keyed by slot id (1..=8), not run id — run records finalise
+//! Keyed by slot id (the interactive pool spans 1..=16 across two pages,
+//! with automation/review above it), not run id — run records finalise
 //! quickly after spawn (they model the spawn act, not the worker's
 //! life). Two consecutive runs in the same slot reuse the slot key.
 

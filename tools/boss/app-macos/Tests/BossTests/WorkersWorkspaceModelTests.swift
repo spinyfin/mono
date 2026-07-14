@@ -139,7 +139,7 @@ final class GhosttyTerminalHostSurfaceFailureDiagnosticTests: XCTestCase {
 final class WorkersWorkspaceModelFocusTests: XCTestCase {
     func testFocusUnknownSlotReturnsUnknownSlot() {
         let model = WorkersWorkspaceModel()
-        // Workers grid is 1...8; 99 has no slot at all.
+        // Interactive grid is 1...16 (Bridge Crew + Lower Decks); 99 has no slot at all.
         let result = model.focusWorkerPane(slotId: 99)
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for nonexistent slot, got \(result)")
@@ -324,14 +324,14 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
     }
 
     func testReleaseUnknownSlotReturnsUnknownSlot() {
-        // Engine asked the app to release slot 99 but the workers
-        // grid is 1...8 — there's nothing to release. Mirrors the
+        // Engine asked the app to release slot 99 but the interactive
+        // grid is 1...16 — there's nothing to release. Mirrors the
         // `sendToPane` / `focusWorkerPane` shape so the engine's
         // failure-handling stays uniform across pane verbs.
         let model = WorkersWorkspaceModel()
         let result = model.releaseWorkerPane(slotId: 99, killGraceSeconds: 0)
         guard case .failure(.unknownSlot) = result else {
-            XCTFail("expected .unknownSlot for slot outside 1...8, got \(result)")
+            XCTFail("expected .unknownSlot for slot outside 1...16, got \(result)")
             return
         }
     }
@@ -381,5 +381,68 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
             model.slots.first(where: { $0.slotId == 4 })?.runId,
             "runId must be cleared so the kanban stops attributing the slot to the run"
         )
+    }
+}
+
+@MainActor
+final class WorkersWorkspaceModelPageTests: XCTestCase {
+    private func makeRequest(slot: Int, runId: String = "run-page") -> EngineSpawnRequest {
+        EngineSpawnRequest(
+            runId: runId,
+            workspacePath: "/tmp/ws",
+            slotId: slot,
+            initialInput: "claude\n",
+            env: [],
+            summary: nil,
+            taskTitle: nil
+        )
+    }
+
+    func testInteractivePoolIsSixteenSlotsSplitIntoTwoPages() {
+        // The interactive pool is now two pages of 8: Bridge Crew (slots
+        // 1...8) and Lower Decks (slots 9...16). Both are drawn from the flat
+        // `slots` array; the pages must be disjoint and cover it exactly.
+        let model = WorkersWorkspaceModel()
+        XCTAssertEqual(model.slots.count, 16, "main pool must span both pages")
+        XCTAssertEqual(model.bridgeCrewSlots.map(\.slotId), Array(1...8))
+        XCTAssertEqual(model.lowerDecksSlots.map(\.slotId), Array(9...16))
+        // Namespace agreement with the engine: automation floats immediately
+        // above the interactive pool (worker 16 → automation base 17).
+        XCTAssertEqual(WorkersWorkspaceModel.automationSlotBase, 17)
+    }
+
+    func testSpawnIntoLowerDecksSlotSucceedsAndRoutesToMainPool() {
+        // Slot 9 is Lower Decks slot 1 — the first spillover slot. Before the
+        // second page existed it was the automation pool and would not host a
+        // main worker; now it must spawn into the main `slots` array and show
+        // up under `lowerDecksSlots`, indistinguishable from a Bridge Crew pane.
+        let model = WorkersWorkspaceModel()
+        let result = model.spawnWorkerPane(makeRequest(slot: 9, runId: "run-ld1"))
+        guard case .success(let slotId, _) = result else {
+            XCTFail("expected .success spawning Lower Decks slot 9, got \(result)")
+            return
+        }
+        XCTAssertEqual(slotId, 9)
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 9 })?.session)
+        XCTAssertNotNil(
+            model.lowerDecksSlots.first(where: { $0.slotId == 9 })?.session,
+            "the spawned pane must appear on the Lower Decks page"
+        )
+        XCTAssertTrue(
+            model.bridgeCrewSlots.allSatisfy { $0.session == nil },
+            "spawning Lower Decks must not touch any Bridge Crew slot"
+        )
+    }
+
+    func testSpawnIntoTopLowerDecksSlotSucceeds() {
+        // Slot 16 is the last interactive slot. It must be a valid spawn
+        // target (it was out of range when the pool capped at 8).
+        let model = WorkersWorkspaceModel()
+        let result = model.spawnWorkerPane(makeRequest(slot: 16, runId: "run-ld8"))
+        guard case .success(let slotId, _) = result else {
+            XCTFail("expected .success spawning Lower Decks slot 16, got \(result)")
+            return
+        }
+        XCTAssertEqual(slotId, 16)
     }
 }

@@ -1877,7 +1877,7 @@ struct WorkDependencyRow: Identifiable, Hashable {
 }
 
 /// Live runtime state for one allocated worker slot, mirroring the
-/// engine's `LiveWorkerState`. Keyed by `slotId` (1..=8) — survives
+/// engine's `LiveWorkerState`. Keyed by `slotId` (1..=16) — survives
 /// run-record finalisation, which happens within a second of spawn.
 struct WorkerLiveState: Hashable {
     let slotId: Int

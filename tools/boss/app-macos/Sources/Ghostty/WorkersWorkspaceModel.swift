@@ -4,12 +4,27 @@ import GhosttyKit
 
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
-    static let workerSlotCount = 8
-    /// Automation pool occupies slot IDs immediately above the main pool.
+    /// Interactive worker slots shown on one page (one "Pool" tab). Mirrors
+    /// WORKER_PAGE_SIZE in coordinator.rs.
+    static let workerPageSize = 8
+    /// Number of interactive pages: page 0 "Bridge Crew", page 1 "Lower Decks".
+    /// Mirrors WORKER_PAGE_COUNT in coordinator.rs.
+    static let workerPageCount = 2
+    /// Total interactive/main pool capacity = pages × page size (currently 16).
+    /// Mirrors MAX_WORKER_POOL_SIZE in coordinator.rs; every derived base below
+    /// keys off it so engine and app agree on the slot namespace across pages.
+    static let workerSlotCount = workerPageSize * workerPageCount
+    /// Bridge Crew occupies the first page of slot IDs (1...8); Lower Decks the
+    /// second (9...16). Dispatch fills Bridge Crew before spilling into Lower
+    /// Decks, but both are the same engine pool — indistinguishable except for
+    /// claim-time scheduling priority.
+    static let bridgeCrewSlotRange = 1...workerPageSize                              // 1...8
+    static let lowerDecksSlotRange = (workerPageSize + 1)...workerSlotCount          // 9...16
+    /// Automation pool occupies slot IDs immediately above the interactive pool.
     /// Matches MAX_AUTOMATION_POOL_SIZE in coordinator.rs.
     static let automationSlotCount = 6
-    static let automationSlotBase = workerSlotCount + 1   // 9
-    static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 9...11
+    static let automationSlotBase = workerSlotCount + 1   // 17
+    static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 17...22
     /// Review pool occupies slot IDs immediately above the automation pool.
     /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
     /// when the engine pushes EnginePoolConfig on RegisterAppSession, so the
@@ -18,7 +33,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// and ensures the slot grid renders correctly before the first pool-config
     /// push arrives (covering the unlikely race of a SpawnWorkerPane before
     /// EnginePoolConfig, and preventing an empty grid on first launch).
-    static let reviewSlotBase = automationSlotBase + automationSlotCount   // 12
+    static let reviewSlotBase = automationSlotBase + automationSlotCount   // 23
 
     /// Instance-level review slot count, kept in sync with the engine's live
     /// pool config. Published so the pool-picker header re-renders whenever
@@ -38,6 +53,16 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// Review-pool slots. Mirror the automation pool layout; always idle
     /// until the engine routes a `pr_review` execution to this pool.
     @Published private(set) var reviewSlots: [WorkerSlot]
+
+    /// The interactive pool split into its two display pages. Both are drawn
+    /// from `slots` (the single main-pool array) so spawn/release routing stays
+    /// keyed on the flat slot id — the pages are a pure display grouping.
+    var bridgeCrewSlots: [WorkerSlot] {
+        slots.filter { Self.bridgeCrewSlotRange.contains($0.slotId) }
+    }
+    var lowerDecksSlots: [WorkerSlot] {
+        slots.filter { Self.lowerDecksSlotRange.contains($0.slotId) }
+    }
 
     init() {
         self.runtime = GhosttyRuntime.shared
