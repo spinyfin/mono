@@ -54,4 +54,6 @@ pub fn init_all(registry: &Registry) {
     crate::external_tracker::reconcile::register_metrics(registry);
     // Layer 4 / T10: speculative conflict-prediction sweep counters.
     crate::speculative_conflict::init(registry);
+    // Layer 4 / T11: stacked-PR auto-structuring offer counters.
+    crate::stacked_pr_structuring::init(registry);
 }
