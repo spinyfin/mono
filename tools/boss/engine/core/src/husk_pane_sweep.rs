@@ -47,12 +47,17 @@
 //!
 //! A slot the app just started hosting (a fresh `SpawnWorkerPane` whose
 //! `register_spawn` call hasn't landed in `LiveWorkerStateRegistry` yet) can
-//! transiently look like a husk. Requiring the SAME slot to appear on two
-//! consecutive passes (mirroring [`crate::terminal_work_sweep`]) gives any
-//! in-flight registration or teardown a full interval to resolve before this
-//! sweep acts, and a slot that stops looking like a husk between passes
-//! (registration landed, or the pane was cleared by something else) simply
-//! drops out of the confirmed set.
+//! transiently look like a husk. Requiring the SAME `(slot_id, run_id)` pair
+//! to appear on two consecutive passes (mirroring
+//! [`crate::terminal_work_sweep`]) gives any in-flight registration or
+//! teardown a full interval to resolve before this sweep acts, and a slot
+//! that stops looking like a husk between passes (registration landed, or
+//! the pane was cleared by something else) simply drops out of the
+//! confirmed set. Keying on the pair (not slot id alone) means a slot whose
+//! husk run changes between passes — the original husk cleared and a
+//! different leaked run took the same slot — resets the confirmation clock
+//! for the new run instead of being mistaken for the same husk observed
+//! twice.
 //!
 //! ## Cadence
 //!
@@ -127,7 +132,7 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    let seen_husks: Arc<tokio::sync::Mutex<HashSet<u8>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let seen_husks: Arc<tokio::sync::Mutex<HashSet<(u8, String)>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let source = Arc::clone(&source);
         let dispatch_events = Arc::clone(&dispatch_events);
@@ -140,13 +145,15 @@ pub fn spawn_loop(
 }
 
 /// Run a single husk-pane reconciliation pass. `seen_husks` carries the set
-/// of slot ids observed as husks on the *previous* pass; on return it holds
-/// this pass's candidates so the next pass can confirm them. Returns a
-/// summary; callers may log it.
+/// of `(slot_id, run_id)` pairs observed as husks on the *previous* pass; on
+/// return it holds this pass's candidates so the next pass can confirm them.
+/// Keying on the pair (not slot id alone) means a slot whose husk run
+/// changes between passes never inherits a prior run's confirmation.
+/// Returns a summary; callers may log it.
 pub async fn run_one_pass(
     source: &dyn HuskPaneSweepSource,
     dispatch_events: &dyn DispatchEventSink,
-    seen_husks: &mut HashSet<u8>,
+    seen_husks: &mut HashSet<(u8, String)>,
 ) -> HuskPaneSweepOutcome {
     let mut outcome = HuskPaneSweepOutcome::default();
 
@@ -162,12 +169,13 @@ pub async fn run_one_pass(
         }
     };
 
-    let mut current_candidates: HashSet<u8> = HashSet::new();
+    let mut current_candidates: HashSet<(u8, String)> = HashSet::new();
 
     for pane in candidates {
-        current_candidates.insert(pane.slot_id);
+        let key = (pane.slot_id, pane.run_id.clone());
+        current_candidates.insert(key.clone());
 
-        if !seen_husks.contains(&pane.slot_id) {
+        if !seen_husks.contains(&key) {
             outcome.pending_confirmation += 1;
             tracing::debug!(
                 slot_id = pane.slot_id,
@@ -354,5 +362,45 @@ mod tests {
         retired.sort_unstable();
         assert_eq!(retired, vec![1, 2]);
         assert_eq!(sink.events().await.len(), 2);
+    }
+
+    /// A slot whose husk run changes between passes (the first husk cleared
+    /// and a different leaked run took the same slot before the next pass)
+    /// must NOT inherit the first run's confirmation — the swap resets the
+    /// two-pass wait for the new run.
+    #[tokio::test]
+    async fn run_id_swap_on_same_slot_resets_confirmation() {
+        let source = ScriptedSource::new(vec![
+            Some(vec![husk(9, "exec-first")]),
+            Some(vec![husk(9, "exec-second")]),
+            Some(vec![husk(9, "exec-second")]),
+        ]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut seen = HashSet::new();
+
+        let first = run_one_pass(&source, &sink, &mut seen).await;
+        assert_eq!(first.pending_confirmation, 1);
+
+        let second = run_one_pass(&source, &sink, &mut seen).await;
+        assert_eq!(
+            second.retired, 0,
+            "a different run on the same slot must not be treated as the same confirmed husk"
+        );
+        assert_eq!(
+            second.pending_confirmation, 1,
+            "the new run starts its own confirmation clock"
+        );
+        assert!(source.retired().is_empty());
+
+        let third = run_one_pass(&source, &sink, &mut seen).await;
+        assert_eq!(
+            third.retired, 1,
+            "the new run is retired once it, too, is confirmed across two passes"
+        );
+        assert_eq!(source.retired(), vec![9]);
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].execution_id, "exec-second");
     }
 }
