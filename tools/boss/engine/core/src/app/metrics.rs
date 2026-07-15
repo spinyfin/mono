@@ -92,7 +92,7 @@ pub(super) async fn handle_metrics_reset(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        let now = crate::metrics::registry::now_ms();
+        let now = crate::metrics::now_ms();
         let (counters_reset, gauges_reset) = match &name {
             Some(n) => {
                 let (c, g) = server_state.metrics.reset_one(n);

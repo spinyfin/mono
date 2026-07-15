@@ -1,0 +1,8 @@
+[package]
+name = "boss-engine-metrics-registry"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-engine-utils = { path = "../utils" }

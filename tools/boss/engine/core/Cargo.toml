@@ -20,6 +20,7 @@ boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-editorial = { path = "../editorial" }
 boss-engine-driver = { path = "../driver" }
 boss-feature-flags = { path = "../feature-flags" }
+boss-engine-metrics-registry = { path = "../metrics-registry" }
 boss-log-files = { path = "../../log-files" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
