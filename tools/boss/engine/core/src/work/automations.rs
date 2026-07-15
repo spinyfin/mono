@@ -756,6 +756,56 @@ impl WorkDb {
         Ok(rows_changed > 0)
     }
 
+    /// Re-arm a triage occurrence for immediate retry after its execution's
+    /// pane spawn was rejected `SlotBusy` (an engine/app slot-occupancy
+    /// desync, not a genuine triage failure — see
+    /// `ExecutionCoordinator::run_execution`'s pane-spawn-failure branch).
+    ///
+    /// Re-points the `automation_runs` row's `triage_execution_id` at the
+    /// freshly created retry execution and resets `outcome` back to the
+    /// pessimistic `failed_will_retry` default the scheduler itself writes
+    /// at fire time, so the retry is indistinguishable from a fresh
+    /// dispatch to both the Automations tab and the Stop-based outcome
+    /// detector. Matched on the OLD `triage_execution_id` (not the
+    /// occurrence) so a concurrent legitimate finalisation can't be
+    /// clobbered. Returns `true` when a row was updated.
+    pub fn requeue_automation_run_after_transient_spawn_failure(
+        &self,
+        old_triage_execution_id: &str,
+        new_triage_execution_id: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows_changed = tx.execute(
+            "UPDATE automation_runs
+                SET triage_execution_id = ?2,
+                    outcome = ?3,
+                    detail = ?4
+              WHERE triage_execution_id = ?1",
+            params![
+                old_triage_execution_id,
+                new_triage_execution_id,
+                boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                detail,
+            ],
+        )?;
+        if rows_changed > 0 {
+            tx.execute(
+                "UPDATE automations
+                    SET last_outcome = ?2
+                  WHERE id = (SELECT automation_id FROM automation_runs
+                               WHERE triage_execution_id = ?1 LIMIT 1)",
+                params![
+                    new_triage_execution_id,
+                    boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows_changed > 0)
+    }
+
     /// Mark a triage execution's `automation_runs` row as `triage_running` —
     /// a pool slot was claimed and the triage agent is now active. Also
     /// updates `automations.last_outcome`. Transitions from `pool_throttled`

@@ -458,7 +458,7 @@ pub async fn run_one_pass(
                     stall_reason,
                     "transient-recovery: worker stalled; auto-resuming on same workspace",
                 );
-                release_slot(&coordinator, state.slot_id).await;
+                release_slot(&coordinator, live_states, state.slot_id).await;
                 crate::reconcile_audit::append_reconcile_audit_best_effort(
                     work_db,
                     &work_item_id,
@@ -547,7 +547,7 @@ pub async fn run_one_pass(
                     error = %clipped,
                     "transient-recovery: escalating worker for human attention (not auto-retried)",
                 );
-                release_slot(&coordinator, state.slot_id).await;
+                release_slot(&coordinator, live_states, state.slot_id).await;
                 dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::TransientRecoveryExhausted, Outcome::Error, &execution_id)
@@ -579,7 +579,15 @@ fn should_inspect(activity: WorkerActivity) -> bool {
     )
 }
 
-async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, slot_id: u8) {
+async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, live_states: &LiveWorkerStateRegistry, slot_id: u8) {
+    // Drop the live-state entry before releasing the pool claim — see the
+    // matching comment in `dead_pid_sweep::reap_dead_execution`. Leaving it
+    // behind desyncs the pool's "free" bookkeeping from the engine's own
+    // live-worker view (masking the slot from `husk_pane_sweep` and
+    // reporting a stalled-and-abandoned run as still live), which is
+    // exactly the divergence that lets a later dispatch re-claim this slot
+    // and get rejected `SlotBusy` by an app that still hosts a pane here.
+    live_states.release_slot(slot_id);
     // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
     // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
     // "auto-worker-N" prefix and release_worker_and_kick routes to

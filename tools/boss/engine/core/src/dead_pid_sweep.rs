@@ -423,6 +423,7 @@ pub async fn run_one_pass(
         );
         let reaped = reap_dead_execution(
             work_db,
+            live_states,
             coordinator.clone(),
             dispatch_events,
             &state,
@@ -544,6 +545,7 @@ pub async fn reap_reported_pane_death(
     let reason = format!("worker-pane-died: {detail}");
     reap_dead_execution(
         work_db,
+        live_states,
         coordinator,
         dispatch_events,
         &state,
@@ -649,6 +651,7 @@ struct ReapOptions<'a> {
 /// execution orphaned fails.
 async fn reap_dead_execution(
     work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     state: &LiveWorkerState,
@@ -712,6 +715,22 @@ async fn reap_dead_execution(
             "dead-pid reconcile: failed to append audit line to description (non-fatal)",
         );
     }
+
+    // Drop the live-state entry BEFORE releasing the pool slot. The pool
+    // claim and the live-state entry are two independent pieces of
+    // engine-side bookkeeping for the same slot; releasing only the pool
+    // claim here (as this reap used to) leaves `LiveWorkerStateRegistry`
+    // reporting the reaped run as still live on this slot. That desync is
+    // exactly what let a slot the engine considers free get re-claimed and
+    // rejected `SlotBusy` by an app that still hosts the old pane — the
+    // stale live-state entry also hides the slot from `husk_pane_sweep`
+    // (which only ever treats a slot as a husk when the engine has NO
+    // live-tracked run there), so the underlying stray pane was never
+    // detected and retired either. Clearing it here restores both
+    // invariants: `bossctl agents list` stops reporting a dead run as
+    // live, and any real app-hosted pane on this slot becomes visible to
+    // the husk-pane sweep for automatic retirement.
+    live_states.release_slot(state.slot_id);
 
     // Release the worker pool slot so the orphan sweep detects
     // the chore and creates a fresh ready execution for redispatch.
