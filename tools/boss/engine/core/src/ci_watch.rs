@@ -1674,11 +1674,15 @@ pub async fn on_ci_resolved(
     true
 }
 
-/// Verdict of validating an agent's "no CI to fix — it's already
-/// green" claim against a LIVE probe of the PR's current head SHA.
-/// This is the decision half of the `boss engine ci mark-noop`
-/// validation gate; the engine handler runs the (impure) probe, then
-/// calls this to decide whether to honor or reject.
+/// Verdict of validating a worker's "CI is green" claim against a LIVE
+/// probe of the PR's current head SHA. This is the decision half of
+/// the verify-at-call-time gate shared by two verbs — `boss engine ci
+/// mark-noop` ("nothing to fix, it's already green") and `boss engine
+/// ci mark-succeeded-via-rebase` ("I rebased and pushed, CI came back
+/// green"; T2764 postmortem, PR spinyfin/mono#2023) — since both are
+/// exactly the same claim: "the PR's current head SHA is green,
+/// verify it before honoring." The engine handler runs the (impure)
+/// probe, then calls this to decide whether to honor or reject.
 ///
 /// The verdict is always derived from the probe's CURRENT head SHA
 /// (`PrLifecycleProbe::head_ref_oid`) and CURRENT CI rollup — never a
@@ -1699,8 +1703,11 @@ pub enum NoopValidation {
     Rejected { head_sha: Option<String>, status: String },
 }
 
-/// Decide whether to honor a "no CI to fix" claim from a LIVE probe of
-/// the PR. Pure so the validation rule is unit-testable without `gh`.
+/// Decide whether to honor a "CI is green on the current head" claim
+/// from a LIVE probe of the PR — shared by the `mark-noop` and
+/// `mark-succeeded-via-rebase` verbs (see the `NoopValidation` doc
+/// comment). Pure so the validation rule is unit-testable without
+/// `gh`.
 ///
 /// "Green" reuses the merge-poller's [`OpenPrCiStatus::Clean`] notion
 /// — every required check is `SUCCESS`/`NEUTRAL`/`SKIPPED` and the

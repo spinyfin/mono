@@ -1099,12 +1099,26 @@ pub enum FrontendRequest {
         new_id: String,
     },
 
-    /// Worker → engine marker (Phase 9 #30, reconciled 2026-05-17 layered
-    /// design call): the worker rebased onto base HEAD, force-pushed,
-    /// and CI came back green without changing any code. Flip the
-    /// attempt to `succeeded` with `consumes_budget = 0` and refund
-    /// the detection-side `ci_attempts_used` bump. Idempotent — a
-    /// second call on the already-`succeeded` row is a no-op.
+    /// Worker → engine, *validated* terminal signal (Phase 9 #30,
+    /// reconciled 2026-05-17 layered design call; re-validated per the
+    /// T2764 postmortem, PR spinyfin/mono#2023): the worker claims it
+    /// rebased onto base HEAD, force-pushed, and CI came back green
+    /// without changing any code. Unlike a trust-the-worker marker, the
+    /// engine does NOT honor this claim on say-so: it independently
+    /// re-probes LIVE CI for the PR's CURRENT head SHA (the same gate
+    /// [`Self::MarkCiRemediationNoop`] uses) and only flips the attempt
+    /// to `succeeded` — with `consumes_budget = 0`, refunding the
+    /// detection-side `ci_attempts_used` bump, and publishing
+    /// `CiRemediationSucceeded` — when every required check is verified
+    /// passing on that exact SHA
+    /// ([`FrontendEvent::CiRemediationSucceededViaRebase`]). A claim made
+    /// before the re-run has settled (still pending) or on a head that is
+    /// actually red is rejected with the live status and the row stays
+    /// actionable — no budget refund, no auto-merge re-arm, no
+    /// `CiRemediationSucceeded` event
+    /// ([`FrontendEvent::CiRemediationSucceededViaRebaseRejected`]).
+    /// Idempotent — a second call on the already-`succeeded` row echoes
+    /// the existing receipt without re-probing.
     MarkCiRemediationSucceededViaRebase {
         attempt_id: String,
     },

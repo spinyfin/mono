@@ -1531,6 +1531,133 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
     Ok(())
 }
 
+/// `MarkCiRemediationSucceededViaRebase` shares the exact verify-before-honor
+/// gate (T2764 postmortem, PR spinyfin/mono#2023) as `MarkCiRemediationNoop`:
+/// the engine no longer takes the worker's "rebase fixed it" claim on
+/// say-so — it re-probes live CI for the PR's current head SHA and only
+/// honors a verified-green claim. The pre-probe guards are deterministic
+/// without `gh`: a forged id errors, a terminal-but-not-`succeeded` row is
+/// rejected outright (the live probe is never reached), and an
+/// already-`succeeded` row echoes a HONORED receipt without double-refunding
+/// the budget counter. These exercise the full request → dispatch → handler
+/// → response wire; the green/pending/red live-CI classification itself is
+/// the shared `classify_noop_validation` decision function, already covered
+/// by its unit tests in `ci_watch_tests.rs`.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_pre_probe_guards() -> Result<()> {
+    let engine = spawn_engine().await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+        design_repo: None,
+        docs_repo: None,
+        worker_branch_prefix: None,
+    })?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr = "https://github.com/foo/bar/pull/88";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+
+    let seed = |head_sha: &str| {
+        work_db
+            .insert_ci_remediation(boss_engine::work::CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr.to_owned(),
+                pr_number: 88,
+                head_branch: "feature".to_owned(),
+                head_sha_at_trigger: head_sha.to_owned(),
+                attempt_kind: "fix".to_owned(),
+                consumes_budget: 1,
+                failed_checks: "[]".to_owned(),
+                failure_kind: "pr_branch_ci".to_owned(),
+                before_commit_sha: None,
+            })
+            .map(|opt| opt.expect("insert should succeed on a fresh row"))
+    };
+
+    // (a) already-succeeded → echoed as a HONORED receipt, no double refund.
+    let succeeded = seed("sha-a")?;
+    work_db
+        .mark_ci_remediation_succeeded_via_rebase(&succeeded.id)?
+        .expect("flip to succeeded_via_rebase");
+    // (b) terminal failed → rejected as already terminal; the live-CI probe
+    //     is never reached for a row that isn't the worker's live attempt.
+    let failed = seed("sha-b")?;
+    work_db
+        .mark_ci_remediation_failed(&failed.id, "unfixable")?
+        .expect("flip to failed");
+
+    drop(work_db);
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // (a) already-succeeded → honored echo; budget_refunded=false since it
+    //     was already refunded by the original, verified call.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: succeeded.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebase {
+            attempt,
+            budget_refunded,
+        } => {
+            assert_eq!(attempt.id, succeeded.id);
+            assert_eq!(attempt.status, "succeeded");
+            assert!(
+                !budget_refunded,
+                "idempotent echo must not re-refund the budget counter"
+            );
+        }
+        other => return Err(anyhow!("expected SucceededViaRebase echo, got: {other:?}")),
+    }
+
+    // (b) terminal failed → WorkError naming "already terminal".
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: failed.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("already terminal"), "got: {message}");
+        }
+        other => return Err(anyhow!("expected WorkError for terminal attempt, got: {other:?}")),
+    }
+
+    // (c) unknown id → WorkError naming the bogus id.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: "cir_does_not_exist".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("cir_does_not_exist"), "got: {message}");
+        }
+        other => return Err(anyhow!("expected WorkError for unknown id, got: {other:?}")),
+    }
+
+    Ok(())
+}
+
 /// Phase 5 #13 happy paths for the read-only `list` and `show` verbs:
 /// seed two attempts under one product, query the freshest-first list,
 /// then fetch one by id.
