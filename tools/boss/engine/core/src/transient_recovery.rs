@@ -728,7 +728,7 @@ mod tests {
             db.force_transient_failure_count_for_test(&execution.id, prior_transient_failures)
                 .unwrap();
         }
-        let old_started = crate::epoch_time::now_epoch_secs().saturating_sub(600);
+        let old_started = boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(600);
         db.force_started_at_for_test(&execution.id, old_started).unwrap();
         execution.id
     }

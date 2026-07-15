@@ -614,7 +614,7 @@ mod tests {
         // in the same wall-clock second, and `updated_at < now` (strict)
         // flakes depending on which side of the second boundary each lands
         // on.
-        let one_second_ago = crate::epoch_time::now_epoch_secs().saturating_sub(1);
+        let one_second_ago = boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(1);
         db.force_updated_at_for_test(&wi, one_second_ago).unwrap();
 
         // The freed work item is now an orphan-active redispatch candidate
@@ -669,8 +669,8 @@ mod tests {
 
         // Age the item past ORPHAN_MIN_AGE_SECS so the real sweep's DB query
         // (not a min-age-0 test bypass) picks it up as a candidate.
-        let old_epoch =
-            crate::epoch_time::now_epoch_secs().saturating_sub(crate::orphan_sweep::ORPHAN_MIN_AGE_SECS + 60);
+        let old_epoch = boss_engine_utils::epoch_time::now_epoch_secs()
+            .saturating_sub(crate::orphan_sweep::ORPHAN_MIN_AGE_SECS + 60);
         db.force_updated_at_for_test(&wi, old_epoch).unwrap();
 
         db.set_host_enabled("anaplian", false).unwrap();
@@ -726,13 +726,13 @@ mod tests {
         let wi = create_test_chore(&db, &product, "t2213-already-churning").id;
         let stuck = running_execution_on_host(&db, &wi, "lease-churn", "anaplian");
 
-        let old_epoch =
-            crate::epoch_time::now_epoch_secs().saturating_sub(crate::orphan_sweep::ORPHAN_MIN_AGE_SECS + 60);
+        let old_epoch = boss_engine_utils::epoch_time::now_epoch_secs()
+            .saturating_sub(crate::orphan_sweep::ORPHAN_MIN_AGE_SECS + 60);
         db.force_updated_at_for_test(&wi, old_epoch).unwrap();
 
         // Simulate prior phantom reaps during the incident: enough recent
         // terminal executions to be one away from tripping the guard.
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..(crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1) {
             db.insert_terminal_execution_for_test(&wi, "orphaned", now_epoch - i)
                 .unwrap();

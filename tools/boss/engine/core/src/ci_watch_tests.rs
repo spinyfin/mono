@@ -800,7 +800,7 @@ async fn detection_clears_inflight_observation() {
 }
 
 fn current_unix_secs() -> i64 {
-    crate::epoch_time::now_epoch_secs()
+    boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
 /// Rewrite the `first_observed_at` timestamp on a

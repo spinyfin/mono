@@ -68,13 +68,13 @@ pub(crate) fn record_design_doc_audit(
 }
 
 pub(crate) fn next_id(prefix: &str) -> String {
-    let nanos = crate::epoch_time::now_epoch_nanos();
+    let nanos = boss_engine_utils::epoch_time::now_epoch_nanos();
     let counter = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}_{nanos:x}_{counter:x}")
 }
 
 pub(crate) fn now_string() -> String {
-    crate::epoch_time::now_epoch_secs().to_string()
+    boss_engine_utils::epoch_time::now_epoch_secs().to_string()
 }
 
 pub(crate) fn normalize_optional_text(value: Option<String>) -> Option<String> {

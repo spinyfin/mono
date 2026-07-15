@@ -176,7 +176,9 @@ pub fn create_execution_started_secs_ago(db: &WorkDb, work_item_id: &str, secs_a
     let execution = db
         .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
         .unwrap();
-    let started_at = (crate::epoch_time::now_epoch_secs() as u64).saturating_sub(secs_ago) as i64;
+    let started_at = boss_engine_utils::epoch_time::now_epoch_secs()
+        .saturating_sub(secs_ago as i64)
+        .max(0);
     db.force_started_at_for_test(&execution.id, started_at).unwrap();
     execution.id
 }
