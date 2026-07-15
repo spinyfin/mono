@@ -421,11 +421,33 @@ impl WorkDb {
     /// have its own execution, independent of the parent's) knows the
     /// full set to check, not just the top-level id.
     pub fn delete_work_item(&self, id: &str) -> Result<Vec<String>> {
+        self.delete_work_item_as_actor(id, LAST_STATUS_ACTOR_HUMAN)
+    }
+
+    /// Like [`Self::delete_work_item`] but attributes the soft-delete to
+    /// `actor`. When that actor is Boothby the tombstone is captured as a
+    /// `boothby_actions` row (pre/post image of `deleted_at`) inside the
+    /// same transaction, so closing a stale task is undoable.
+    ///
+    /// Only the parent's tombstone is audited, not the cascade-deleted
+    /// revisions: [`Self::restore_work_item`] restores that whole cascade
+    /// from the parent's `deleted_at` timestamp, so the parent's action
+    /// row is already sufficient to undo the entire operation. Emitting an
+    /// action per revision would imply each is separately undoable, which
+    /// is not how restore works.
+    pub fn delete_work_item_as_actor(&self, id: &str, actor: &str) -> Result<Vec<String>> {
         match classify_id(id)? {
             ItemKind::Task => {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction()?;
                 let now = now_string();
+                // Pre-image, before the tombstone lands. Only read when the
+                // actor is Boothby — every other caller pays nothing.
+                let before = if boothby::is_boothby_actor(actor) {
+                    query_task(&tx, id)?
+                } else {
+                    None
+                };
                 let rows = tx.execute(
                     "UPDATE tasks SET deleted_at = ?2, updated_at = ?2
                      WHERE id = ?1 AND deleted_at IS NULL",
@@ -458,6 +480,10 @@ impl WorkDb {
                      WHERE dependent_id = ?1 OR prerequisite_id = ?1",
                     params![id],
                 )?;
+                if let Some(before) = before {
+                    let after = query_task(&tx, id).require("task", id)?;
+                    boothby::capture_task_update(&tx, self, actor, &before, &after, &now)?;
+                }
                 tx.commit()?;
                 let mut tombstoned_ids = vec![id.to_owned()];
                 tombstoned_ids.extend(revision_ids);
@@ -487,6 +513,14 @@ impl WorkDb {
     /// restored task comes back with no dependency edges. The operator
     /// must re-add any that still matter.
     pub fn restore_work_item(&self, id: &str) -> Result<WorkItem> {
+        self.restore_work_item_as_actor(id, LAST_STATUS_ACTOR_HUMAN)
+    }
+
+    /// Like [`Self::restore_work_item`] but attributes the restore to
+    /// `actor`, auditing it as a `boothby_actions` row when that actor is
+    /// Boothby. See [`Self::delete_work_item_as_actor`] for why only the
+    /// parent — not each cascade-restored revision — is audited.
+    pub fn restore_work_item_as_actor(&self, id: &str, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let canonical = resolve_friendly_work_item_id_inner(&conn, id, true)?.unwrap_or_else(|| id.to_owned());
         match classify_id(&canonical)? {
@@ -517,6 +551,13 @@ impl WorkDb {
                 let now = now_string();
                 {
                     let tx = conn.transaction()?;
+                    // Pre-image, while the tombstone is still on the row.
+                    // Only read for Boothby; every other caller pays nothing.
+                    let before = if boothby::is_boothby_actor(actor) {
+                        query_task(&tx, &canonical)?
+                    } else {
+                        None
+                    };
                     tx.execute(
                         "UPDATE tasks SET deleted_at = NULL, updated_at = ?2
                          WHERE id = ?1 AND deleted_at IS NOT NULL",
@@ -554,6 +595,10 @@ impl WorkDb {
                             }
                             frontier = next;
                         }
+                    }
+                    if let Some(before) = before {
+                        let after = query_task(&tx, &canonical).require("task", &canonical)?;
+                        boothby::capture_task_update(&tx, self, actor, &before, &after, &now)?;
                     }
                     tx.commit()?;
                 }

@@ -373,15 +373,33 @@ pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &s
     // last_status_actor = 'engine'` as a fallback for rows that were
     // auto-blocked before the blocked_reason column existed.
     // For projects (no blocked_reason column), fall back to the actor check.
+    //
+    // The actor test goes through `StatusActor::is_engine_cascade` rather
+    // than a bare `== "engine"` so the rule lives in one place and adding a
+    // fifth actor fails to compile there until someone decides which side
+    // it belongs on. `'boothby'` deliberately answers `false`, alongside
+    // `'human'` / `'boss'`: a Boothby block is a per-row judgement, not
+    // cascade bookkeeping, so this sweep must leave it alone exactly as it
+    // leaves a human's alone. (In practice the branch is unreachable for
+    // Boothby anyway — `write_engine_status` is the only auto-blocker and
+    // it hardcodes `'engine'`.)
+    //
+    // An actor outside the known vocabulary fails to parse and is treated
+    // as not-engine-owned, preserving the exact behaviour of the `==
+    // "engine"` compare this replaced.
     let actor = lookup_last_status_actor(conn, dependent_id)?;
+    let engine_owned = actor
+        .as_deref()
+        .and_then(|a| a.parse::<StatusActor>().ok())
+        .is_some_and(StatusActor::is_engine_cascade);
     let eligible = if dependent_id.starts_with("task_") {
         match lookup_blocked_reason(conn, dependent_id)?.as_deref() {
             Some("dependency") => true,
-            None => actor.as_deref() == Some("engine"),
+            None => engine_owned,
             _ => false, // merge_conflict, ci_failure, etc. — different cascade owners
         }
     } else {
-        actor.as_deref() == Some("engine")
+        engine_owned
     };
     if !eligible {
         return Ok(false);

@@ -585,7 +585,21 @@ impl WorkDb {
     /// Dismiss without producing anything. `atg_…` / `A<n>` dismisses the
     /// whole group (terminal); `atn_…` dismisses a single member. `reason`
     /// has no column in the store and is accepted only for wire/CLI parity.
-    pub fn dismiss_attention(&self, id: &str, _reason: Option<String>) -> Result<AttentionGroup> {
+    pub fn dismiss_attention(&self, id: &str, reason: Option<String>) -> Result<AttentionGroup> {
+        self.dismiss_attention_as_actor(id, reason, LAST_STATUS_ACTOR_HUMAN)
+    }
+
+    /// Like [`Self::dismiss_attention`] but attributes the dismissal to
+    /// `actor`, auditing it as a `boothby_actions` row when that actor is
+    /// Boothby — this is the path Boothby's attention-tidying takes, and
+    /// the pre-image is what lets a human put a wrongly-dismissed group
+    /// back.
+    ///
+    /// Only the group path is audited. An `atn_…` member dismissal routes
+    /// to `set_member_answer_state`, which mutates `attentions` rather
+    /// than `attention_groups`; auditing that needs a member-level image
+    /// and target kind, and Boothby merges/dismisses whole groups.
+    pub fn dismiss_attention_as_actor(&self, id: &str, _reason: Option<String>, actor: &str) -> Result<AttentionGroup> {
         if id.starts_with("atn_") {
             return self.set_member_answer_state(id, "dismissed", None);
         }
@@ -593,6 +607,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let group = resolve_group(&tx, id).require("attention group", id)?;
+        let before = group.clone();
         match group.state.as_str() {
             // Idempotent: dismissing an already-dismissed group is a no-op.
             "dismissed" => {
@@ -612,6 +627,10 @@ impl WorkDb {
         )?;
         let group = query_attention_group(&tx, &group.id)?
             .with_context(|| format!("missing attention group after dismiss: {}", group.id))?;
+        // Audit inside `tx`. Inert unless `actor` is Boothby. Note the
+        // idempotent already-dismissed arm above returns before reaching
+        // here, so a re-dismiss appends no second action row.
+        boothby::capture_attention_group_update(&tx, self, actor, &before, &group, &now)?;
         tx.commit()?;
         Ok(group)
     }

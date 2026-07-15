@@ -471,6 +471,14 @@ impl WorkDb {
         // forward) — snaps stale queue positions back to 1..N immediately
         // after deploy instead of leaving dead rows in `queued` state forever.
         migrate_clear_merge_queue_state_on_terminal_tasks(&conn)?;
+        // Boothby, the autonomous groundskeeper: boothby_passes /
+        // _actions / _findings / _cursors. Independent of every other
+        // table and additive-only (`CREATE TABLE IF NOT EXISTS`), so
+        // ordering against its neighbours is irrelevant. Ships dark —
+        // the tables exist but nothing writes them until the Boothby
+        // agent lands; the actor-boothby capture in the mutation layer
+        // is inert until a caller passes `LAST_STATUS_ACTOR_BOOTHBY`.
+        migrate_boothby_tables(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
