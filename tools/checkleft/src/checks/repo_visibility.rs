@@ -5,8 +5,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tree_sitter::{Node, Parser};
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -30,11 +30,7 @@ impl Check for RepoVisibilityCheck {
 #[async_trait]
 impl ConfiguredCheck for RepoVisibilityCheck {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_build_file(&f.path))
-            .count()
+        count_applicable(changeset, is_build_file)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -47,47 +43,31 @@ impl ConfiguredCheck for RepoVisibilityCheck {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
-
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if !is_build_file(&changed_file.path) {
-                continue;
-            }
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = std::str::from_utf8(&contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            for location in find_public_default_visibility_locations(contents) {
-                findings.push(Finding {
-                    fixable: false,
-                    severity: Severity::Error,
-                    message: "package default_visibility must not be `//visibility:public`".to_owned(),
-                    location: Some(Location {
-                        path: changed_file.path.clone(),
-                        line: Some(location.line),
-                        column: Some(location.column),
-                    }),
-                    remediations: vec![
-                        "Remove the package default_visibility or narrow visibility on individual targets.".to_owned(),
-                    ],
-                    suggested_fix: None,
-                });
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            is_build_file,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                for location in find_public_default_visibility_locations(contents) {
+                    findings.push(Finding {
+                        fixable: false,
+                        severity: Severity::Error,
+                        message: "package default_visibility must not be `//visibility:public`".to_owned(),
+                        location: Some(Location {
+                            path: changed_file.path.clone(),
+                            line: Some(location.line),
+                            column: Some(location.column),
+                        }),
+                        remediations: vec![
+                            "Remove the package default_visibility or narrow visibility on individual targets."
+                                .to_owned(),
+                        ],
+                        suggested_fix: None,
+                    });
+                }
+            },
+        );
 
         Ok(CheckResult {
             check_id: self.id().to_owned(),

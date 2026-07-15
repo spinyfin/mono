@@ -6,8 +6,8 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
-use crate::input::{ChangeSet, SourceTree};
-use crate::output::CheckResult;
+use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+use crate::output::{CheckResult, Finding};
 
 #[async_trait]
 pub trait ConfiguredCheck: Send + Sync {
@@ -63,6 +63,54 @@ pub trait ConfiguredCheck: Send + Sync {
     }
 }
 
+/// Count the non-deleted files in `changeset` that `predicate` accepts.
+///
+/// This is the [`ConfiguredCheck::applicable_file_count`] shape for checks that scan
+/// changed files by path. Pass the same `predicate` here and to [`run_per_text_file`] so
+/// the reported denominator always matches the number of progress ticks the run emits.
+pub fn count_applicable(changeset: &ChangeSet, predicate: impl Fn(&Path) -> bool) -> usize {
+    changeset
+        .changed_files
+        .iter()
+        .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && predicate(&f.path))
+        .count()
+}
+
+/// Read every non-deleted changed file matching `predicate` and hand its decoded text to
+/// `per_file`, which pushes any [`Finding`]s it produces.
+///
+/// A file whose contents cannot be read, or which is not valid UTF-8, is skipped silently:
+/// `per_file` never sees it, but it still counts toward progress. Every file the predicate
+/// accepts ticks `on_file_processed` exactly once, with the cumulative count — so the final
+/// tick equals [`count_applicable`] over the same predicate.
+pub fn run_per_text_file(
+    changeset: &ChangeSet,
+    tree: &dyn SourceTree,
+    predicate: impl Fn(&Path) -> bool,
+    on_file_processed: &dyn Fn(usize),
+    mut per_file: impl FnMut(&ChangedFile, &str, &mut Vec<Finding>),
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut processed = 0usize;
+
+    for changed_file in &changeset.changed_files {
+        if matches!(changed_file.kind, ChangeKind::Deleted) || !predicate(&changed_file.path) {
+            continue;
+        }
+
+        if let Ok(contents) = tree.read_file(&changed_file.path)
+            && let Ok(contents) = std::str::from_utf8(&contents)
+        {
+            per_file(changed_file, contents, &mut findings);
+        }
+
+        processed += 1;
+        on_file_processed(processed);
+    }
+
+    findings
+}
+
 #[async_trait]
 pub trait Check: Send + Sync {
     fn id(&self) -> &str;
@@ -115,5 +163,140 @@ impl CheckRegistry {
 
     pub fn list(&self) -> Vec<Arc<dyn Check>> {
         self.checks.values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Result, anyhow, bail};
+
+    use super::{count_applicable, run_per_text_file};
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+    use crate::output::{Finding, Severity};
+
+    /// Serves `contents` verbatim per path. A path mapped to `Err` reads as unreadable;
+    /// an unmapped path is never requested by these tests.
+    struct StubTree {
+        contents: Vec<(&'static str, Result<Vec<u8>>)>,
+    }
+
+    impl SourceTree for StubTree {
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+            match self.contents.iter().find(|(p, _)| Path::new(p) == path) {
+                Some((_, Ok(bytes))) => Ok(bytes.clone()),
+                Some((_, Err(error))) => bail!("{error}"),
+                None => bail!("unexpected read of {}", path.display()),
+            }
+        }
+
+        fn exists(&self, _path: &Path) -> bool {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn list_dir(&self, _path: &Path) -> Result<Vec<PathBuf>> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn glob(&self, _pattern: &str) -> Result<Vec<PathBuf>> {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    fn changed(path: &str, kind: ChangeKind) -> ChangedFile {
+        ChangedFile {
+            path: PathBuf::from(path),
+            kind,
+            old_path: None,
+        }
+    }
+
+    fn finding(message: &str) -> Finding {
+        Finding {
+            fixable: false,
+            severity: Severity::Error,
+            message: message.to_owned(),
+            location: None,
+            remediations: Vec::new(),
+            suggested_fix: None,
+        }
+    }
+
+    #[test]
+    fn skips_deleted_and_unmatched_files_without_counting_them() {
+        let changeset = ChangeSet::new(vec![
+            changed("keep.txt", ChangeKind::Modified),
+            changed("keep.skip", ChangeKind::Modified),
+            changed("gone.txt", ChangeKind::Deleted),
+        ]);
+        let tree = StubTree {
+            contents: vec![("keep.txt", Ok(b"body".to_vec()))],
+        };
+
+        let predicate = |path: &Path| path.extension().is_some_and(|ext| ext == "txt");
+        let ticks = RefCell::new(Vec::new());
+        let seen = RefCell::new(Vec::new());
+
+        let findings = run_per_text_file(
+            &changeset,
+            &tree,
+            predicate,
+            &|n| ticks.borrow_mut().push(n),
+            |changed_file, contents, findings| {
+                seen.borrow_mut().push((changed_file.path.clone(), contents.to_owned()));
+                findings.push(finding("hit"));
+            },
+        );
+
+        assert_eq!(seen.into_inner(), vec![(PathBuf::from("keep.txt"), "body".to_owned())]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(ticks.into_inner(), vec![1]);
+        assert_eq!(count_applicable(&changeset, predicate), 1);
+    }
+
+    #[test]
+    fn counts_unreadable_and_non_utf8_files_without_invoking_the_callback() {
+        let changeset = ChangeSet::new(vec![
+            changed("unreadable.txt", ChangeKind::Modified),
+            changed("binary.txt", ChangeKind::Modified),
+            changed("text.txt", ChangeKind::Added),
+        ]);
+        let tree = StubTree {
+            contents: vec![
+                ("unreadable.txt", Err(anyhow!("permission denied"))),
+                // A lone 0xff byte is never valid UTF-8.
+                ("binary.txt", Ok(vec![0xff, 0xfe])),
+                ("text.txt", Ok(b"body".to_vec())),
+            ],
+        };
+
+        let ticks = RefCell::new(Vec::new());
+        let seen = RefCell::new(Vec::new());
+
+        let findings = run_per_text_file(
+            &changeset,
+            &tree,
+            |_| true,
+            &|n| ticks.borrow_mut().push(n),
+            |changed_file, _contents, findings| {
+                seen.borrow_mut().push(changed_file.path.clone());
+                findings.push(finding("hit"));
+            },
+        );
+
+        assert_eq!(
+            seen.into_inner(),
+            vec![PathBuf::from("text.txt")],
+            "unreadable and non-UTF-8 files must be skipped silently"
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            ticks.into_inner(),
+            vec![1, 2, 3],
+            "every applicable file ticks once, even when it cannot be decoded"
+        );
+        assert_eq!(count_applicable(&changeset, |_| true), 3);
     }
 }

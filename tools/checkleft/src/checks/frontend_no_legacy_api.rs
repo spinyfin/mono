@@ -4,8 +4,8 @@ use regex::Regex;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -29,11 +29,7 @@ impl Check for FrontendNoLegacyApiCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledFrontendNoLegacyApiConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_frontend_source_file(&f.path))
-            .count()
+        count_applicable(changeset, is_frontend_source_file)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -47,61 +43,44 @@ impl ConfiguredCheck for CompiledFrontendNoLegacyApiConfig {
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
         let import_re = Regex::new(r#"^\s*import\b[^;]*\bfrom\s*["']([^"']+)["']"#).expect("valid regex");
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            is_frontend_source_file,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                for (line_index, line) in contents.lines().enumerate() {
+                    let Some(captures) = import_re.captures(line) else {
+                        continue;
+                    };
+                    let Some(module) = captures.get(1).map(|capture| capture.as_str()) else {
+                        continue;
+                    };
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if !is_frontend_source_file(&changed_file.path) {
-                continue;
-            }
+                    let normalized = normalize_import_module(module);
+                    let Some(legacy_match) = self
+                        .legacy_modules
+                        .iter()
+                        .find(|legacy| normalized.ends_with(legacy.as_str()))
+                    else {
+                        continue;
+                    };
 
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = String::from_utf8(contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            for (line_index, line) in contents.lines().enumerate() {
-                let Some(captures) = import_re.captures(line) else {
-                    continue;
-                };
-                let Some(module) = captures.get(1).map(|capture| capture.as_str()) else {
-                    continue;
-                };
-
-                let normalized = normalize_import_module(module);
-                let Some(legacy_match) = self
-                    .legacy_modules
-                    .iter()
-                    .find(|legacy| normalized.ends_with(legacy.as_str()))
-                else {
-                    continue;
-                };
-
-                findings.push(Finding {
-                    fixable: false,
-                    severity: self.severity,
-                    message: format!("import from deprecated frontend API module `{legacy_match}`"),
-                    location: Some(Location {
-                        path: changed_file.path.clone(),
-                        line: Some((line_index + 1) as u32),
-                        column: Some(1),
-                    }),
-                    remediations: vec![self.remediation.clone()],
-                    suggested_fix: None,
-                });
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+                    findings.push(Finding {
+                        fixable: false,
+                        severity: self.severity,
+                        message: format!("import from deprecated frontend API module `{legacy_match}`"),
+                        location: Some(Location {
+                            path: changed_file.path.clone(),
+                            line: Some((line_index + 1) as u32),
+                            column: Some(1),
+                        }),
+                        remediations: vec![self.remediation.clone()],
+                        suggested_fix: None,
+                    });
+                }
+            },
+        );
 
         Ok(CheckResult {
             check_id: "frontend-no-legacy-api".to_owned(),

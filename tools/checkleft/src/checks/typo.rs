@@ -4,8 +4,8 @@ use regex::Regex;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -98,57 +98,43 @@ fn run_typo_check(
     on_file_processed: &dyn Fn(usize),
 ) -> Result<CheckResult> {
     let compiled_rules = compile_rules(rules)?;
-    let mut findings = Vec::new();
-    let mut processed = 0usize;
+    let findings = run_per_text_file(
+        changeset,
+        tree,
+        |_| true,
+        on_file_processed,
+        |changed_file, contents, findings| {
+            for (index, line) in contents.lines().enumerate() {
+                for compiled_rule in &compiled_rules {
+                    let Some(column) = find_column(line, compiled_rule) else {
+                        continue;
+                    };
 
-    for changed_file in &changeset.changed_files {
-        if matches!(changed_file.kind, ChangeKind::Deleted) {
-            continue;
-        }
+                    findings.push(Finding {
+                        fixable: false,
+                        severity: Severity::Error,
+                        message: format!(
+                            "Found typo `{}`; use `{}` instead.",
+                            compiled_rule.rule.typo, compiled_rule.rule.canonical
+                        ),
+                        location: Some(Location {
+                            path: changed_file.path.clone(),
+                            line: Some((index + 1) as u32),
+                            column: Some(column as u32),
+                        }),
+                        remediations: vec![format!(
+                            "Replace `{}` with `{}`. {}",
+                            compiled_rule.rule.typo, compiled_rule.rule.canonical, compiled_rule.rule.guidance
+                        )],
+                        suggested_fix: None,
+                    });
 
-        let Ok(contents) = tree.read_file(&changed_file.path) else {
-            processed += 1;
-            on_file_processed(processed);
-            continue;
-        };
-        let Ok(contents) = String::from_utf8(contents) else {
-            processed += 1;
-            on_file_processed(processed);
-            continue;
-        };
-
-        for (index, line) in contents.lines().enumerate() {
-            for compiled_rule in &compiled_rules {
-                let Some(column) = find_column(line, compiled_rule) else {
-                    continue;
-                };
-
-                findings.push(Finding {
-                    fixable: false,
-                    severity: Severity::Error,
-                    message: format!(
-                        "Found typo `{}`; use `{}` instead.",
-                        compiled_rule.rule.typo, compiled_rule.rule.canonical
-                    ),
-                    location: Some(Location {
-                        path: changed_file.path.clone(),
-                        line: Some((index + 1) as u32),
-                        column: Some(column as u32),
-                    }),
-                    remediations: vec![format!(
-                        "Replace `{}` with `{}`. {}",
-                        compiled_rule.rule.typo, compiled_rule.rule.canonical, compiled_rule.rule.guidance
-                    )],
-                    suggested_fix: None,
-                });
-
-                // Avoid duplicate findings on the same line for overlapping rules.
-                break;
+                    // Avoid duplicate findings on the same line for overlapping rules.
+                    break;
+                }
             }
-        }
-        processed += 1;
-        on_file_processed(processed);
-    }
+        },
+    );
 
     Ok(CheckResult {
         check_id: check_id.to_owned(),

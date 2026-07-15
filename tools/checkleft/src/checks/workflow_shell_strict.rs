@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_yaml::{Mapping, Value};
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 const STRICT_MODE_PREFIX: &str = "set -euo pipefail";
@@ -32,11 +32,7 @@ impl Check for WorkflowShellStrictCheck {
 #[async_trait]
 impl ConfiguredCheck for WorkflowShellStrictCheck {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_github_workflow_file(&f.path))
-            .count()
+        count_applicable(changeset, is_github_workflow_file)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -49,71 +45,57 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            is_github_workflow_file,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                let workflow = match parse_workflow(contents) {
+                    Ok(workflow) => workflow,
+                    Err(error) => {
+                        findings.push(Finding {
+                            fixable: false,
+                            severity: Severity::Error,
+                            message: format!(
+                                "failed to parse workflow YAML while enforcing strict shell mode: {error}"
+                            ),
+                            location: Some(Location {
+                                path: changed_file.path.clone(),
+                                line: None,
+                                column: None,
+                            }),
+                            remediations: vec![
+                                "Fix YAML syntax so checks can validate `run:` script blocks.".to_owned(),
+                            ],
+                            suggested_fix: None,
+                        });
+                        return;
+                    }
+                };
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if !is_github_workflow_file(&changed_file.path) {
-                continue;
-            }
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = String::from_utf8(contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            let workflow = match parse_workflow(&contents) {
-                Ok(workflow) => workflow,
-                Err(error) => {
+                for violation in find_non_strict_run_scripts(&workflow) {
                     findings.push(Finding {
                         fixable: false,
                         severity: Severity::Error,
-                        message: format!("failed to parse workflow YAML while enforcing strict shell mode: {error}"),
+                        message: format!(
+                            "GitHub Actions run script in job `{}` step {} must start with `set -euo pipefail`.",
+                            violation.job_name, violation.step_index
+                        ),
                         location: Some(Location {
                             path: changed_file.path.clone(),
                             line: None,
                             column: None,
                         }),
-                        remediations: vec!["Fix YAML syntax so checks can validate `run:` script blocks.".to_owned()],
+                        remediations: vec![
+                            "Add `set -euo pipefail` as the first non-comment line in each `run:` script block."
+                                .to_owned(),
+                        ],
                         suggested_fix: None,
                     });
-                    processed += 1;
-                    on_file_processed(processed);
-                    continue;
                 }
-            };
-
-            for violation in find_non_strict_run_scripts(&workflow) {
-                findings.push(Finding {
-                    fixable: false,
-                    severity: Severity::Error,
-                    message: format!(
-                        "GitHub Actions run script in job `{}` step {} must start with `set -euo pipefail`.",
-                        violation.job_name, violation.step_index
-                    ),
-                    location: Some(Location {
-                        path: changed_file.path.clone(),
-                        line: None,
-                        column: None,
-                    }),
-                    remediations: vec![
-                        "Add `set -euo pipefail` as the first non-comment line in each `run:` script block.".to_owned(),
-                    ],
-                    suggested_fix: None,
-                });
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+            },
+        );
 
         Ok(CheckResult {
             check_id: self.id().to_owned(),

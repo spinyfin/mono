@@ -4,8 +4,8 @@ use regex::Regex;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -38,48 +38,35 @@ impl ConfiguredCheck for CompiledTodoExpiryConfig {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            |_| true,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                for (line_index, line) in contents.lines().enumerate() {
+                    if !self.todo_detector.is_match(line) {
+                        continue;
+                    }
+                    if self.required_format.is_match(line) {
+                        continue;
+                    }
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = String::from_utf8(contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            for (line_index, line) in contents.lines().enumerate() {
-                if !self.todo_detector.is_match(line) {
-                    continue;
+                    findings.push(Finding {
+                        fixable: false,
+                        severity: self.severity,
+                        message: "TODO/FIXME must include `(@owner,YYYY-MM-DD)` metadata".to_owned(),
+                        location: Some(Location {
+                            path: changed_file.path.clone(),
+                            line: Some((line_index + 1) as u32),
+                            column: Some(1),
+                        }),
+                        remediations: vec![self.remediation.clone()],
+                        suggested_fix: None,
+                    });
                 }
-                if self.required_format.is_match(line) {
-                    continue;
-                }
-
-                findings.push(Finding {
-                    fixable: false,
-                    severity: self.severity,
-                    message: "TODO/FIXME must include `(@owner,YYYY-MM-DD)` metadata".to_owned(),
-                    location: Some(Location {
-                        path: changed_file.path.clone(),
-                        line: Some((line_index + 1) as u32),
-                        column: Some(1),
-                    }),
-                    remediations: vec![self.remediation.clone()],
-                    suggested_fix: None,
-                });
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+            },
+        );
 
         Ok(CheckResult {
             check_id: "todo-expiry".to_owned(),
