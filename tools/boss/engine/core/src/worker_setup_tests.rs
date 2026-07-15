@@ -834,111 +834,16 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
 
     // The redirected HOME now has a ~/.claude.json marking this
     // workspace as trusted, so the worker's claude session skips the
-    // folder-trust dialog.
-    let config_path = claude_global_config_path().unwrap();
+    // folder-trust dialog. Resolved via the driver's own accessor (HomeGuard
+    // above redirects HOME), so this stays correct if the driver ever moves
+    // where it seeds trust.
+    let config_path = crate::driver::claude::claude_global_config_path().unwrap();
     let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     let key = dir.path().display().to_string();
     assert_eq!(
         config["projects"][&key]["hasTrustDialogAccepted"],
         serde_json::Value::Bool(true),
     );
-}
-
-#[test]
-fn pre_trust_creates_config_when_absent() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path().join(".claude.json");
-    let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-001");
-
-    pre_trust_workspace_in(&config, &workspace).unwrap();
-
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-    let key = workspace.display().to_string();
-    assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
-    // The onboarding counter is seeded so onboarding doesn't re-prompt.
-    assert_eq!(value["projects"][&key]["projectOnboardingSeenCount"], 0);
-}
-
-#[test]
-fn pre_trust_preserves_other_projects_and_top_level_keys() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path().join(".claude.json");
-    // A realistic config: a top-level key plus another project with
-    // its own state. Pre-trust must leave both untouched.
-    let existing = serde_json::json!({
-        "numStartups": 42,
-        "projects": {
-            "/some/other/project": {
-                "hasTrustDialogAccepted": true,
-                "lastCost": 1.23,
-            },
-        },
-    });
-    std::fs::write(&config, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-
-    let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-002");
-    pre_trust_workspace_in(&config, &workspace).unwrap();
-
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-    // Top-level key and the pre-existing project survive verbatim.
-    assert_eq!(value["numStartups"], 42);
-    assert_eq!(value["projects"]["/some/other/project"]["lastCost"], 1.23);
-    assert_eq!(value["projects"]["/some/other/project"]["hasTrustDialogAccepted"], true);
-    // The new workspace is now trusted.
-    let key = workspace.display().to_string();
-    assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
-}
-
-#[test]
-fn pre_trust_is_a_noop_when_already_trusted() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path().join(".claude.json");
-    let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-003");
-    let key = workspace.display().to_string();
-    // Existing entry already trusted, with an extra field a live
-    // claude session would have written.
-    let existing = serde_json::json!({
-        "projects": {
-            &key: { "hasTrustDialogAccepted": true, "lastSessionId": "abc" },
-        },
-    });
-    let serialized = serde_json::to_string_pretty(&existing).unwrap();
-    std::fs::write(&config, &serialized).unwrap();
-
-    pre_trust_workspace_in(&config, &workspace).unwrap();
-
-    // The file is left byte-for-byte unchanged: no rewrite of the
-    // shared config when the workspace is already trusted.
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), serialized);
-}
-
-#[test]
-fn pre_trust_leaves_corrupt_config_untouched() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path().join(".claude.json");
-    let garbage = "{ this is not valid json";
-    std::fs::write(&config, garbage).unwrap();
-
-    let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-004");
-    let err = pre_trust_workspace_in(&config, &workspace).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    // The corrupt file must NOT be clobbered — we'd rather skip
-    // pre-trust than destroy the user's config.
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), garbage);
-}
-
-#[test]
-fn pre_trust_treats_empty_config_as_fresh() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path().join(".claude.json");
-    std::fs::write(&config, "   \n").unwrap();
-
-    let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-005");
-    pre_trust_workspace_in(&config, &workspace).unwrap();
-
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-    let key = workspace.display().to_string();
-    assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
 }
 
 /// A leaked settings file holding a `boss-event` Stop hook with a

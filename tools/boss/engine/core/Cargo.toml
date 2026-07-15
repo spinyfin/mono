@@ -18,11 +18,13 @@ git-utils = { path = "../../../../lib/rust/git_utils" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-editorial = { path = "../editorial" }
+boss-engine-driver = { path = "../driver" }
 boss-feature-flags = { path = "../feature-flags" }
 boss-log-files = { path = "../../log-files" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
+boss-engine-transient-error = { path = "../transient-error" }
 boss-engine-utils = { path = "../utils" }
 boss-transcript-tail = { path = "../transcript-tail" }
 clap = { workspace = true, features = ["derive"] }

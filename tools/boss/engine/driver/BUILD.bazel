@@ -4,29 +4,36 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "ssh-transport",
+    name = "driver",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_ssh_transport",
+    crate_name = "boss_engine_driver",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/driver:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/transient-error",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "ssh-transport_test",
+    name = "driver_test",
     size = "small",
-    crate = ":ssh-transport",
+    crate = ":driver",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/transient-error",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

@@ -62,6 +62,7 @@ use serde_json;
 
 use boss_protocol::ExecutionKind;
 
+use crate::driver::claude::{CLAUDE_DIR_GITIGNORE, pre_trust_workspace};
 use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig, ToolUseInterceptionConfig};
 use crate::ssh_transport::shell_quote;
 
@@ -850,13 +851,6 @@ fn publish_deny_rules() -> Vec<String> {
     ]
 }
 
-/// Single-pattern gitignore body. `*` matches every entry in
-/// the driver's config dir — including dotfiles and the `.gitignore`
-/// itself, since gitignore globs apply to leading-dot names. Both git
-/// and jj (with a git backend) honor this in-tree gitignore, so worker
-/// setup files stop appearing in `jj status` / `git status`.
-pub(crate) const CLAUDE_DIR_GITIGNORE: &str = "*\n";
-
 /// Subdirectory (under the per-user system temp dir) that holds the
 /// worker settings files. Lives outside every workspace so the
 /// worker's `jj`/`git` never sees these files — see the module docs.
@@ -1428,127 +1422,6 @@ fn hook_group_is_leaked(group: &serde_json::Value) -> bool {
     })
 }
 
-/// Absolute path to Claude Code's user-global config file
-/// (`~/.claude.json`). This is the store Claude consults for the
-/// first-run folder-trust dialog (the per-project `hasTrustDialogAccepted`
-/// flag); it is *separate* from the `--settings` file the engine passes.
-///
-/// Resolved from `$HOME` (the convention used elsewhere in the engine,
-/// e.g. [`crate::config`]). Returns `None` if `HOME` is unset, in which
-/// case pre-trust is skipped and the worker falls back to today's
-/// behaviour (it may block on the dialog).
-fn claude_global_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude.json"))
-}
-
-/// Pre-accept Claude Code's first-run folder-trust dialog for
-/// `workspace_path` so a headless Boss worker never blocks on it.
-///
-/// Boss/cube materialises the workspace itself, specifically for the
-/// agent to work in, so it is trusted by construction — there is no
-/// untrusted third-party content. But the folder-trust dialog ("Is this
-/// a project you created or one you trust?") is a *separate* first-run
-/// gate that `--permission-mode auto` and the `--settings` file do not
-/// cover: it is keyed off the per-project `hasTrustDialogAccepted` flag
-/// in Claude's user-global `~/.claude.json`, and is evaluated before any
-/// repo- or `--settings`-supplied config. A headless worker has no human
-/// to press "1", so it wedges here. We carry the trust intent through by
-/// seeding that flag for the workspace path before `claude` launches.
-///
-/// Best-effort: failure to pre-trust is logged and swallowed (it only
-/// costs the worker today's behaviour, not correctness), so it never
-/// aborts worker setup.
-pub fn pre_trust_workspace(workspace_path: &Path) {
-    let Some(config_path) = claude_global_config_path() else {
-        tracing::warn!(
-            workspace = %workspace_path.display(),
-            "worker setup: HOME unset, cannot pre-trust workspace in ~/.claude.json; worker may block on the folder-trust dialog",
-        );
-        return;
-    };
-    if let Err(err) = pre_trust_workspace_in(&config_path, workspace_path) {
-        tracing::warn!(
-            config = %config_path.display(),
-            workspace = %workspace_path.display(),
-            ?err,
-            "worker setup: failed to pre-trust workspace in ~/.claude.json; worker may block on the folder-trust dialog",
-        );
-    }
-}
-
-/// Set `projects[<workspace_path>].hasTrustDialogAccepted = true` in the
-/// Claude config at `config_path`, preserving every other key.
-///
-/// - A missing or empty config file is treated as an empty object (fresh
-///   install) and created.
-/// - A config that already records this workspace as trusted is a no-op:
-///   we do not rewrite the file. This matters because `~/.claude.json` is
-///   a *shared* file that live `claude` sessions in other workspaces
-///   rewrite frequently; cube re-uses a fixed pool of workspaces, so
-///   after each is trusted once the engine never touches the file again,
-///   keeping the read-modify-write race window to first-spawn-per-workspace.
-/// - A config that exists but does not parse as JSON is left **untouched**
-///   (we return the parse error rather than clobber the user's file).
-/// - The write is atomic (temp file in the same dir + rename) so a
-///   concurrent reader never observes a half-written config.
-fn pre_trust_workspace_in(config_path: &Path, workspace_path: &Path) -> io::Result<()> {
-    let key = workspace_path.display().to_string();
-
-    let mut root: serde_json::Value = match std::fs::read_to_string(config_path) {
-        Ok(s) if s.trim().is_empty() => serde_json::json!({}),
-        Ok(s) => serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e),
-    };
-
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json is not a JSON object"))?;
-    let projects = obj
-        .entry("projects")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json `projects` is not an object"))?;
-    let entry = projects
-        .entry(key)
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "~/.claude.json project entry is not an object",
-            )
-        })?;
-
-    // Already trusted → no-op. Don't rewrite the shared file.
-    if entry.get("hasTrustDialogAccepted").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Ok(());
-    }
-    entry.insert("hasTrustDialogAccepted".to_owned(), serde_json::Value::Bool(true));
-    // Claude pairs the trust flag with this counter; seed it if absent so
-    // the onboarding flow doesn't re-prompt either. Leave any existing
-    // value untouched.
-    entry
-        .entry("projectOnboardingSeenCount")
-        .or_insert_with(|| serde_json::Value::from(0));
-
-    let serialized = serde_json::to_string_pretty(&root).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    write_atomic(config_path, serialized.as_bytes())
-}
-
-/// Write `contents` to `path` atomically: write a sibling temp file and
-/// rename it over `path`. The rename is atomic on POSIX, so a concurrent
-/// reader sees either the old or the new file, never a partial write.
-fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    // Tag the temp name with the pid so concurrent engine writes (should
-    // not happen — one engine — but cheap insurance) don't collide.
-    let tmp = dir.join(format!(".claude.json.boss-tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Write `CLAUDE.md` and a self-excluding `.gitignore` under
 /// `<workspace>/.claude/`, and the worker settings file *outside* the
 /// workspace at [`worker_settings_path`]. Creates parent directories as
@@ -1582,7 +1455,7 @@ pub fn write_workspace_files(
     // workspace. Boss/cube created the workspace for the agent, so it is
     // trusted by construction; without this the headless worker wedges on
     // the dialog (no human to press "1"). Best-effort — see
-    // [`pre_trust_workspace`].
+    // [`crate::driver::claude::pre_trust_workspace`].
     pre_trust_workspace(&input.workspace_path);
 
     let agent_rules_path = config_dir.join(descriptor.agent_rules_filename);
