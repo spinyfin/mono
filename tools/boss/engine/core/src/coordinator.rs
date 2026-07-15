@@ -118,6 +118,20 @@ pub const MAX_REVIEW_POOL_SIZE: usize = 8;
 /// contention when many PRs land simultaneously.
 pub const DEFAULT_REVIEW_POOL_SIZE: usize = 8;
 
+/// TEMPORARY hard cap on concurrently-live INTERACTIVE ("normal") pool
+/// workers — the automation and review pools are governed by their own sizes
+/// and are NOT counted against this. The interactive pool has 16 slots
+/// across two pages (Bridge Crew + Lower Decks), but the 2026-07-15
+/// full-fleet saturation experiment (22 live workers, load average ~152)
+/// pushed individual task times past an hour and broke pane spawn acks, so
+/// dispatch is held to one page's worth — the pre-Lower-Decks size — even
+/// though all 16 slots exist. Deliberately hardcoded per operator directive
+/// until remote workers / the dynamic pane-budget model land (see
+/// docs/designs/fleet-scaling-dynamic-panes-and-team-semantics.md); enforced
+/// in `drain_ready_queue`, deliberately NOT in `claim_worker_force` (an
+/// explicit operator `bossctl agents launch` may exceed the cap).
+pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
+
 /// Worker ID prefix for automation-pool slots. Distinct from the main-pool
 /// `"worker-"` prefix so `pool_for_worker_id` can route releases to the
 /// correct pool without an extra DB round-trip.
@@ -1032,6 +1046,18 @@ impl WorkerPool {
     /// being stable so `worker-{N}` and slot N stay 1:1.
     pub fn worker_id_for_slot(slot_id: u8) -> String {
         format!("worker-{}", slot_id)
+    }
+
+    /// Number of slots currently claimed by an execution. Used by the
+    /// dispatcher's interactive-pool concurrency gate
+    /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]).
+    pub(crate) async fn busy_count(&self) -> usize {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .iter()
+            .filter(|worker| worker.execution_id.is_some())
+            .count()
     }
 
     #[cfg(test)]
@@ -2392,6 +2418,39 @@ impl ExecutionCoordinator {
             }
             if is_main && main_pool_exhausted {
                 continue;
+            }
+
+            // TEMPORARY interactive-pool concurrency cap (operator directive,
+            // 2026-07-15): hold main-pool rows once the interactive pool's
+            // live workers reach [`MAX_CONCURRENT_INTERACTIVE_WORKERS`], even
+            // though the pool has 16 slots. Automation and review rows are
+            // NOT gated here — their pools' own sizes govern them. Checked
+            // per row (not once per pass) so claims made earlier in this same
+            // pass count; checked BEFORE `request_recorded` so a capped row
+            // never enters the dispatch pipeline — it stays `ready` and
+            // re-attempts on the next kick (`release_worker_and_kick` fires
+            // one whenever a worker frees). See the constant's doc for
+            // rationale and removal criteria.
+            if is_main {
+                let live_workers = self.worker_pool.busy_count().await;
+                if live_workers >= MAX_CONCURRENT_INTERACTIVE_WORKERS {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        pool = pool_label,
+                        live_workers,
+                        cap = MAX_CONCURRENT_INTERACTIVE_WORKERS,
+                        "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
+                    );
+                    self.record_dispatch_wait_reason(
+                        &execution.id,
+                        &format!(
+                            "Held by the interactive concurrency cap ({live_workers}/{MAX_CONCURRENT_INTERACTIVE_WORKERS} \
+                             workers live) — dispatches as workers finish"
+                        ),
+                    );
+                    continue;
+                }
             }
 
             // Dispatch-class + "why it won" bookkeeping (operator directive:
@@ -6411,6 +6470,66 @@ mod tests {
             db.run_host(&run_ids[0]).unwrap().as_deref(),
             Some("zakalwe"),
             "work_runs.host_id must record the selected host",
+        );
+    }
+
+    /// The temporary interactive-pool concurrency cap
+    /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]): when the interactive pool
+    /// already carries the capped number of live workers, a drain pass holds
+    /// every main-pool `ready` row — no run starts, no cube work happens, the
+    /// row stays `ready`, and an operator-facing wait reason is recorded —
+    /// even though idle slots exist beyond the cap.
+    #[tokio::test]
+    async fn interactive_concurrency_cap_holds_ready_rows() {
+        use crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Held by cap");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        // Pool has idle slots beyond the cap — the cap, not slot
+        // availability, must be what holds the row.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(MAX_CONCURRENT_INTERACTIVE_WORKERS + 4),
+                cube.clone(),
+                runner.clone(),
+            )
+            .with_pre_start_retry_delays(Vec::new()),
+        );
+        for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
+            coordinator
+                .worker_pool()
+                .claim_worker(&format!("exec-busy-{i}"), None)
+                .await
+                .expect("idle slot below the cap");
+        }
+
+        coordinator.drain_ready_queue().await;
+
+        // Never dispatched: no run, no cube activity, still `ready`.
+        assert!(db.active_run_ids_for_execution(&execution.id).unwrap().is_empty());
+        assert_eq!(cube.ensure_calls.lock().await.len(), 0);
+        let held = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        assert_eq!(held.status, ExecutionStatus::Ready);
+        let reason = held.dispatch_wait_reason.unwrap_or_default();
+        assert!(
+            reason.contains("interactive concurrency cap"),
+            "wait reason should name the cap, got: {reason}",
+        );
+
+        // One worker frees → the next drain dispatches the held row.
+        coordinator.worker_pool().release_worker("worker-1", None).await;
+        coordinator.drain_ready_queue().await;
+        assert!(
+            !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
+            "row must dispatch once the pool drops below the cap",
         );
     }
 
