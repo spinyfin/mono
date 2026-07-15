@@ -560,6 +560,71 @@ fn boothby_repeat_attention_dismiss_journals_once() {
     assert_eq!(actions(&db).len(), 1, "the idempotent re-dismiss must not re-journal");
 }
 
+/// The `atn_…` member path is a distinct target kind from the `atg_…` group
+/// path above — it must journal `answer_state`/`answer`/`answered_at` on the
+/// member row itself, not the group.
+#[test]
+fn boothby_attention_member_dismiss_journals_the_answer_state_move() {
+    let db = WorkDb::open(temp_db_path("boothby-attention-member")).unwrap();
+    let (_product, project) = seed_project_for_design_doc(&db);
+    let (attention, group) = db
+        .create_attention(
+            CreateAttentionInput::builder()
+                .kind("question")
+                .source_kind("design_doc")
+                .association_project_id(&project.id)
+                .source_doc_path("docs/d.md")
+                .question_type("prompt")
+                .prompt_text("which way?")
+                .build(),
+        )
+        .unwrap();
+    open_pass(&db, "bp_1");
+
+    let _guard = db.arm_boothby_action(ctx("dismiss_attention")).unwrap();
+    db.dismiss_attention_as_actor(&attention.id, None, LAST_STATUS_ACTOR_BOOTHBY)
+        .unwrap();
+
+    let row = only_action(&db);
+    assert_eq!(row.verb, "dismiss_attention");
+    assert_eq!(row.target_kind, BOOTHBY_TARGET_ATTENTION_ITEM);
+    assert_eq!(row.target_id, attention.id);
+    let (pre, post) = row.images();
+    assert_eq!(pre["answer_state"], "open");
+    assert_eq!(post["answer_state"], "dismissed");
+
+    // The group itself is not journalled by the member path.
+    assert_ne!(group.id, attention.id);
+}
+
+/// With no armed context, a Boothby member dismissal must refuse rather
+/// than silently mutate — the same fail-closed guarantee the group path
+/// already had.
+#[test]
+fn boothby_attention_member_dismiss_refuses_without_an_armed_context() {
+    let db = WorkDb::open(temp_db_path("boothby-attention-member-unarmed")).unwrap();
+    let (_product, project) = seed_project_for_design_doc(&db);
+    let (attention, _group) = db
+        .create_attention(
+            CreateAttentionInput::builder()
+                .kind("question")
+                .source_kind("design_doc")
+                .association_project_id(&project.id)
+                .source_doc_path("docs/d.md")
+                .question_type("prompt")
+                .prompt_text("which way?")
+                .build(),
+        )
+        .unwrap();
+    open_pass(&db, "bp_1");
+
+    let err = db
+        .dismiss_attention_as_actor(&attention.id, None, LAST_STATUS_ACTOR_BOOTHBY)
+        .unwrap_err();
+    assert!(err.to_string().contains("no action context is armed"));
+    assert!(actions(&db).is_empty());
+}
+
 #[test]
 fn seq_increments_across_actions_in_a_pass() {
     let db = WorkDb::open(temp_db_path("boothby-seq-inc")).unwrap();

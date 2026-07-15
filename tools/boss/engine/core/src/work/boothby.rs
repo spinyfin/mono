@@ -72,17 +72,20 @@ pub struct BoothbyActionContext {
     pub params: Option<String>,
 }
 
-/// Disarms the action context on drop, so a panicking or early-returning
-/// executor cannot leave a stale verb armed for the next mutation to
-/// mislabel itself with.
+/// Restores the *previous* action context on drop (rather than clobbering
+/// the slot to `None`), so a panicking or early-returning executor cannot
+/// leave a stale verb armed for the next mutation to mislabel itself with —
+/// while nested arm/disarm on the shared, process-wide slot still composes
+/// correctly instead of the inner guard silently disarming an outer one.
 pub struct BoothbyActionGuard<'a> {
     db: &'a WorkDb,
+    previous: Option<BoothbyActionContext>,
 }
 
 impl Drop for BoothbyActionGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut slot) = self.db.boothby_action.lock() {
-            *slot = None;
+            *slot = self.previous.take();
         }
     }
 }
@@ -99,9 +102,9 @@ impl WorkDb {
             .boothby_action
             .lock()
             .map_err(|_| anyhow::anyhow!("boothby action context lock poisoned"))?;
-        *slot = Some(context);
+        let previous = slot.replace(context);
         drop(slot);
-        Ok(BoothbyActionGuard { db: self })
+        Ok(BoothbyActionGuard { db: self, previous })
     }
 
     fn armed_boothby_action(&self) -> Result<Option<BoothbyActionContext>> {
@@ -176,6 +179,17 @@ pub(crate) fn attention_group_image(group: &AttentionGroup) -> ColumnImage {
         ("actioned_at", group.actioned_at.clone()),
         ("dismissed_at", group.dismissed_at.clone()),
         ("state", Some(group.state.clone())),
+    ])
+}
+
+/// The columns of `attentions` that a journalled Boothby mutation can move.
+/// Covers member-level dismissal ([`BOOTHBY_TARGET_ATTENTION_ITEM`]) — the
+/// group-level path uses [`attention_group_image`] instead.
+pub(crate) fn attention_image(attention: &Attention) -> ColumnImage {
+    ColumnImage::from([
+        ("answer", attention.answer.clone()),
+        ("answer_state", Some(attention.answer_state.clone())),
+        ("answered_at", attention.answered_at.clone()),
     ])
 }
 
@@ -283,6 +297,11 @@ fn record_action_in_tx(
     let pre_image = (context.reversibility != BOOTHBY_REVERSIBILITY_IRREVERSIBLE).then_some(pre_image);
 
     let id = next_id("ba");
+    // `undo_state` is deliberately left off this INSERT and lands on the DDL
+    // default 'none': promoting it to 'undoable' is task 2's job (the undo
+    // engine owns the `undo_state` lifecycle), not this pre/post-image
+    // capture layer. See `boothby_action_records_rationale_and_reversibility_from_the_context`,
+    // which asserts this.
     conn.execute(
         "INSERT INTO boothby_actions
             (id, pass_id, seq, verb, target_kind, target_id, params, rationale,
@@ -387,6 +406,35 @@ pub(crate) fn capture_attention_group_update(
         &after.id,
         &attention_group_image(before),
         &attention_group_image(after),
+        now,
+    )?;
+    Ok(())
+}
+
+/// Journal an `attentions` (member) mutation iff `actor` is Boothby. Inert
+/// otherwise. This is the member-level counterpart to
+/// [`capture_attention_group_update`] — used for `atn_…` dismissal, which
+/// mutates the member row (and, via `recompute_group_state`, potentially the
+/// owning group's `state` as a side effect that this journal does not
+/// separately capture).
+pub(crate) fn capture_attention_member_update(
+    conn: &Connection,
+    db: &WorkDb,
+    actor: &str,
+    before: &Attention,
+    after: &Attention,
+    now: &str,
+) -> Result<()> {
+    if !is_boothby_actor(actor) {
+        return Ok(());
+    }
+    record_action_in_tx(
+        conn,
+        db,
+        BOOTHBY_TARGET_ATTENTION_ITEM,
+        &after.id,
+        &attention_image(before),
+        &attention_image(after),
         now,
     )?;
     Ok(())
