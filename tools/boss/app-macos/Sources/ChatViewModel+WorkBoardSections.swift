@@ -170,6 +170,94 @@ extension ChatViewModel {
         return nil
     }
 
+    /// The board column's items, memoized in `cachedItemsByColumn` until the
+    /// next `invalidateWorkCache()`.
+    func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
+        if let cached = cachedItemsByColumn[column] {
+            return cached
+        }
+        // The Review column gets a dedicated ordering: newest by creation
+        // time at the top, so the column is predictable and scannable (the
+        // generic board sort keys on `ordinal`, which review-phase tasks
+        // rarely carry, leaving them in an apparently-random order). See
+        // boss issue #1250.
+        let sort = column == .review ? reviewBoardSort : boardTaskSort
+        var items = visibleWorkItems
+            .filter { effectiveBoardColumn(for: $0) == column }
+            .sorted(by: sort)
+        // Revisions don't appear as standalone cards in Review or Done — they
+        // roll up as single lines on the parent task's card in both lanes.
+        // They are still visible in Backlog/Doing as distinct cards. An
+        // `in_review` revision normally routes to Review, but one whose own
+        // PR is in the merge queue / Merge When Ready
+        // (`isInMergingSection`) routes to Done instead (`boardColumn`), so
+        // the Done-column filter excludes `in_review` revisions too, not
+        // just `done` ones.
+        if column == .review {
+            items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
+        }
+        if column == .done {
+            items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }
+        }
+        cachedItemsByColumn[column] = items
+        return items
+    }
+
+    /// The board column's sections, memoized in `cachedSectionsByColumn`
+    /// until the next `invalidateWorkCache()`.
+    func workSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
+        if let cached = cachedSectionsByColumn[column] {
+            return cached
+        }
+        let sections = computeWorkSections(in: column)
+        cachedSectionsByColumn[column] = sections
+        return sections
+    }
+
+    private func computeWorkSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
+        let items = workItems(in: column)
+        if column == .done {
+            // `isInMergingSection` in_review tasks route into `.done` via
+            // `boardColumn` so they render in the Merging section; split
+            // them out here so `doneSections`'s recency bucketing only ever
+            // sees genuinely completed (`status == "done"`) tasks.
+            let merging = items.filter(\.isInMergingSection)
+            let completed = items.filter { !$0.isInMergingSection }
+            var sections: [WorkBoardSection] = []
+            if let mergingSection = Self.mergingSection(items: merging) {
+                sections.append(mergingSection)
+            }
+            sections.append(contentsOf: Self.doneSections(items: completed))
+            return sections
+        }
+        guard workBoardGrouping == .project else {
+            return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
+        }
+
+        let grouped = Dictionary(grouping: items) { task in
+            if task.isChore { return "Chores" }
+            // Chore-parented revisions inherit nil projectID from the chain
+            // root (a chore). Group them with chores so they don't land in
+            // a confusing "No Project" section — they are logically part of
+            // the chore world.
+            if task.kind == "revision", task.projectID == nil { return "Chores" }
+            return projectName(for: task.projectID) ?? "No Project"
+        }
+
+        return grouped.keys.sorted().compactMap { key in
+            guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
+            let projectID = sectionItems.first(where: { !$0.isChore })?.projectID
+            return WorkBoardSection(
+                id: "\(column.rawValue)-\(key)",
+                title: key,
+                items: sectionItems,
+                isCollapsible: true,
+                defaultExpanded: true,
+                projectID: projectID
+            )
+        }
+    }
+
     func isTaskVisible(_ task: WorkTask) -> Bool {
         workItems(in: effectiveBoardColumn(for: task)).contains(where: { $0.id == task.id })
     }

@@ -432,18 +432,18 @@ final class ChatViewModel: ObservableObject {
     /// Work item IDs for which `open_review_terminal` has been sent but
     /// `review_terminal_ready` (or `work_error`) has not yet arrived.
     /// Guards against a second click while the engine is still leasing.
-    private var openingReviewTerminalIDs: Set<String> = []
+    var openingReviewTerminalIDs: Set<String> = []
 
     /// Work item IDs for which `open_live_workspace_terminal` has been
     /// sent but `live_workspace_terminal_ready` (or `work_error`) has not
     /// yet arrived. Guards against a second click while the engine looks
     /// up the live execution's workspace.
-    private var openingLiveWorkspaceTerminalIDs: Set<String> = []
+    var openingLiveWorkspaceTerminalIDs: Set<String> = []
 
     /// Work item IDs for which `merge_when_ready` has been sent but
     /// `merge_when_ready_accepted` (or `work_error`) has not yet arrived.
     /// Guards against a duplicate tap while the engine is running the merge.
-    private var mergingWhenReadyIDs: Set<String> = []
+    var mergingWhenReadyIDs: Set<String> = []
 
     /// Ask the engine to merge (or queue for merging) the PR for the given
     /// Review-column task. Guards against a duplicate tap while the RPC is
@@ -830,12 +830,12 @@ final class ChatViewModel: ObservableObject {
     @Published var showConnectionLostBanner = false // see ChatViewModel+Connection.swift
     static let connectionLostBannerDelay: TimeInterval = 2.0 // grace period before a disconnect may raise the banner
     var connectionGeneration = 0 // bumped on connect/disconnect; supersedes a stale banner-reveal
-    private var subscribedWorkTopics: Set<String> = []
+    var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
     /// Notification manager for Review-lane transitions. Fires a system
     /// banner when a task reaches `in_review` while the app is backgrounded.
-    private let reviewNotifier = ReviewNotificationCenter()
+    let reviewNotifier = ReviewNotificationCenter()
     #if canImport(AppKit)
     private var appActivationObserver: NSObjectProtocol?
     #endif
@@ -917,9 +917,7 @@ final class ChatViewModel: ObservableObject {
             self?.appendSystemMessage(line)
         }
 
-        engine.onEvent = { [weak self] event in
-            self?.handle(event)
-        }
+        bindEngineEventStream()
 
         reviewNotifier.configure()
         reviewNotifier.onSelectWorkItem = { [weak self] taskID in
@@ -1002,7 +1000,7 @@ final class ChatViewModel: ObservableObject {
         selectedProjectFilterIDs = []
         selectedWorkCardID = nil
         workErrorMessage = nil
-        defaults.set(productID, forKey: selectedWorkProductDefaultsKey)
+        persistSelectedProductID(productID)
         persistProjectFilterIDs()
         refreshWorkSubscriptions()
         if isConnected {
@@ -1067,6 +1065,16 @@ final class ChatViewModel: ObservableObject {
         guard showArchivedProjects != value else { return }
         showArchivedProjects = value
         defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
+    }
+
+    /// Persist (or clear, when `nil`) the selected product so the next
+    /// launch restores the board the operator left open.
+    func persistSelectedProductID(_ productID: String?) {
+        if let productID {
+            defaults.set(productID, forKey: selectedWorkProductDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
+        }
     }
 
     func persistProjectFilterIDs() {
@@ -1150,7 +1158,7 @@ final class ChatViewModel: ObservableObject {
         includeChores = true
     }
 
-    private func triggerRevealScroll(_ taskID: String) {
+    func triggerRevealScroll(_ taskID: String) {
         revealScrollTarget = taskID
         let capturedID = taskID
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -1794,6 +1802,25 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// Apply a resolve response and close out the in-flight batch's timing
+    /// summary once its last project reports. Stray responses for projects
+    /// outside the current batch (a refresh that landed mid-flight) still
+    /// update state — they just don't drive timing. Called from the
+    /// `.projectDesignDocResolved` arm in [[ChatViewModel+EventHandling.swift]].
+    func applyResolvedProjectDesignDoc(_ output: ResolveProjectDesignDocOutput) {
+        if var batch = currentDesignDocResolveBatch,
+           batch.pendingProjectIDs.remove(output.projectID) != nil {
+            if batch.pendingProjectIDs.isEmpty {
+                let ms = Int(Date().timeIntervalSince(batch.startDate) * 1000)
+                designDocTimingLog.info("phase=resolve project=batch count=\(batch.initialCount, privacy: .public) duration_ms=\(ms, privacy: .public)")
+                currentDesignDocResolveBatch = nil
+            } else {
+                currentDesignDocResolveBatch = batch
+            }
+        }
+        designDocStateByProjectID[output.projectID] = output.state
+    }
+
     /// Kanban open-affordance fast-path predicate: a `ResolvedDesignDocKind`
     /// is editor-eligible exactly when the doc lives in a repo Boss
     /// tracks as a Product (same- or other-product). External pointers
@@ -1808,61 +1835,12 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Boss Session Registration
+    // MARK: - Pane bridge
 
-    /// Called by ContentView when the Boss pane's libghostty surface attaches
-    /// (initial creation or after a restart). Sends RegisterBossSession if the
-    /// app session is already confirmed; otherwise the registration fires when
-    /// appSessionRegistered arrives.
-    func bossPaneShellPidAvailable() {
-        maybeRegisterBossSession()
-    }
-
-    private func maybeRegisterBossSession() {
-        guard isAppSessionRegistered else { return }
-        guard let pid = bossPaneShellPidProvider?(), pid > 0 else { return }
-        engine.sendRegisterBossSession(shellPid: pid)
-    }
-
-    /// Called by ContentView when a worker pane's libghostty surface attaches
-    /// and the shell pid becomes available. Forwards the real pid to the engine
-    /// so process tracking, dead-pid sweep, and `bossctl agents stop` work for
-    /// reviewer and other shell_pid-0 spawns.
-    func workerPaneShellPidAvailable(runId: String, shellPid: Int32) {
-        guard isAppSessionRegistered else { return }
-        engine.sendUpdateWorkerShellPid(runId: runId, shellPid: shellPid)
-    }
-
-    /// Called by ContentView when a worker pane's surface fails to attach
-    /// or its child process exits. Reports the death to the engine so it
-    /// can reap the backing execution immediately rather than waiting for
-    /// the next dead-pid sweep pass or an app restart.
-    func workerPaneDied(runId: String) {
-        guard isAppSessionRegistered else { return }
-        engine.sendWorkerPaneDied(runId: runId)
-    }
-
-    /// Called by ContentView when `GhosttyRuntime` observes the system's
-    /// displays waking from sleep. Reports it to the engine so a
-    /// worker-pane spawn stranded by the sleep is redispatched
-    /// immediately rather than waiting for the next periodic sweep.
-    func spawnCapabilityRestored() {
-        guard isAppSessionRegistered else { return }
-        engine.sendSpawnCapabilityRestored()
-    }
-
-    /// Called by ContentView when a worker pane's libghostty surface fails to
-    /// create so no shell ever comes up (the post-sleep "no active display"
-    /// condition). NACKs the engine so it reaps the execution immediately and
-    /// feeds its spawn-capability circuit breaker, instead of waiting out the
-    /// 60s spawn-ack timeout.
-    func workerPaneSpawnFailed(runId: String, reason: String) {
-        guard isAppSessionRegistered else { return }
-        engine.sendReportWorkerSpawnFailed(runId: runId, reason: reason)
-    }
-
-    // MARK: - Event Handling
-
+    /// Handlers ContentView installs so the engine can drive libghostty panes
+    /// through this model. The `engine_request` arms that call them live in
+    /// [[ChatViewModel+EventHandling.swift]]; a build without GhosttyKit
+    /// leaves them `nil` and those arms answer with a failure.
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
     var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
@@ -1880,631 +1858,15 @@ final class ChatViewModel: ObservableObject {
     var panePoolConfigHandler: ((Int, Int, Int, String) -> Void)?
 
     /// Whether the engine has confirmed this client is the registered app session.
-    /// Reset on disconnect; set when `appSessionRegistered` is received.
-    private var isAppSessionRegistered = false
+    /// Reset on disconnect (see [[ChatViewModel+EventHandling.swift]]); set when
+    /// `appSessionRegistered` is received.
+    var isAppSessionRegistered = false
     /// Returns the Boss pane's current shell pid from
     /// `ghostty_surface_foreground_pid`. Injected by ContentView (GhosttyKit
     /// build only). Returns 0 when the surface is not yet live.
     var bossPaneShellPidProvider: (() -> Int32)?
 
-    private func handle(_ event: EngineEvent) {
-        switch event {
-        case .connected:
-            isConnected = true
-            hasConnectedOnce = true
-            resetConnectionLostBanner()
-            engine.sendRegisterAppSession()
-            refreshWorkSubscriptions()
-            // Re-subscribe any open markdown viewers' comment topics and reload
-            // them; the engine dropped every subscription on the disconnect.
-            commentBridge.handleReconnected()
-            engine.sendListProducts()
-            engine.sendListWorkerLiveStates()
-            engine.sendListLiveStatusDisabledSlots()
-            // Pull the engine's configuration health on every (re)connect
-            // so the top-of-window banner reflects the *current* engine,
-            // not the one we attached to before a restart (#699).
-            engine.sendGetEngineHealth()
-            // Pull the current GitHub OAuth auth state so the "GitHub
-            // account" settings subsection reflects a token persisted by a
-            // prior session (the engine restores it from the keychain at
-            // boot) without waiting for a device-flow transition.
-            engine.sendGitHubAuthStatus()
-            if let productID = currentSelectedProductID {
-                // Cold-start population of the restored product. NOTE: the
-                // `.productsList` handler below fetches this same product a
-                // SECOND time (the confirmed cold-start double-fetch, T2101
-                // R2) — the per-product fetch counter makes both visible.
-                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
-                engine.sendListAttentionGroups(productId: productID)
-            }
-        case .resyncRequired:
-            handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
-        case .appSessionRegistered:
-            isAppSessionRegistered = true
-            maybeRegisterBossSession()
-            engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
-        case .bossSessionRegistered:
-            break
-        case .engineRequest(let requestId, let request):
-            switch request {
-            case .spawnWorkerPane(let spawn):
-                let result: EngineSpawnResult
-                if let handler = paneSpawnHandler {
-                    result = handler(spawn)
-                } else {
-                    result = .failure(.internalFailure(
-                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
-                    ))
-                }
-                engine.sendSpawnWorkerPaneResponse(requestId: requestId, result: result)
-            case .releaseWorkerPane(let slotId, let killGrace):
-                let result: EngineReleaseResult
-                if let handler = paneReleaseHandler {
-                    result = handler(slotId, killGrace)
-                } else {
-                    result = .failure(.internalFailure(
-                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
-                    ))
-                }
-                engine.sendReleaseWorkerPaneResponse(requestId: requestId, result: result)
-            case .sendToPane(let slotId, let text):
-                let result: EngineSendResult
-                if let handler = paneSendHandler {
-                    result = handler(slotId, text)
-                } else {
-                    result = .failure(.internalFailure(
-                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
-                    ))
-                }
-                engine.sendSendToPaneResponse(requestId: requestId, result: result)
-            case .focusWorkerPane(let slotId):
-                let result: EngineFocusResult
-                if let handler = paneFocusHandler {
-                    result = handler(slotId)
-                } else {
-                    result = .failure(.internalFailure(
-                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
-                    ))
-                }
-                engine.sendFocusWorkerPaneResponse(requestId: requestId, result: result)
-            case .interruptWorkerPane(let slotId):
-                let result: EngineInterruptResult
-                if let handler = paneInterruptHandler {
-                    result = handler(slotId)
-                } else {
-                    result = .failure(.internalFailure(
-                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
-                    ))
-                }
-                engine.sendInterruptWorkerPaneResponse(requestId: requestId, result: result)
-            case .revealWorkItem(let workItemId, let productId):
-                switch revealWorkCard(workItemId, productID: productId) {
-                case .revealed, .deferred:
-                    engine.sendRevealWorkItemResponse(requestId: requestId, result: .success)
-                case .unreachable(let reason):
-                    engine.sendRevealWorkItemResponse(
-                        requestId: requestId,
-                        result: .failure(.internalFailure(reason))
-                    )
-                }
-            case .listHostedPanes:
-                let panes = paneListHostedHandler?() ?? []
-                engine.sendListHostedPanesResponse(requestId: requestId, panes: panes)
-            }
-        case .disconnected:
-            isConnected = false
-            isAppSessionRegistered = false
-            subscribedWorkTopics.removeAll()
-            for (productID, state) in automationsFetchStateByProductID {
-                if case .loading = state {
-                    automationsFetchStateByProductID[productID] = .failed("Connection lost")
-                }
-            }
-            scheduleConnectionLostBannerCheck()
-        case .workInvalidated(let topic, let productId, _):
-            if CommentEngineBridge.isCommentTopic(topic) {
-                // A comment row on an open viewer's artifact changed elsewhere;
-                // the bridge reloads the bound layer(s). Invalidation-not-patch.
-                commentBridge.handleCommentInvalidation(topic: topic)
-            }
-            if topic == "work.products" {
-                engine.sendListProducts()
-            }
-            if let selectedProductID = currentSelectedProductID,
-               topic == workTopic(forProductID: selectedProductID)
-            {
-                engine.sendGetWorkTree(productId: selectedProductID, flow: .invalidationRefetch)
-                engine.sendListAttentionItemsForWorkItem(workItemID: selectedProductID)
-                engine.sendListAttentionGroups(productId: selectedProductID)
-                engine.sendListDeferredScopeAttentions(productId: selectedProductID)
-                refreshPlannerRuns(forProductID: selectedProductID)
-            } else if let productId,
-                      productId == currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productId, flow: .invalidationRefetch)
-                engine.sendListAttentionItemsForWorkItem(workItemID: productId)
-                engine.sendListAttentionGroups(productId: productId)
-                engine.sendListDeferredScopeAttentions(productId: productId)
-                refreshPlannerRuns(forProductID: productId)
-            }
-        case .productsList(let products):
-            self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
-            let activeIDs = Set(activeProducts.map(\.id))
-            if let selectedWorkProductID,
-               !activeIDs.contains(selectedWorkProductID) {
-                let archivedName = self.products.first(where: { $0.id == selectedWorkProductID })?.name
-                self.selectedWorkProductID = nil
-                self.selectedProjectFilterIDs = []
-                self.selectedWorkCardID = nil
-                defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
-                persistProjectFilterIDs()
-                if let archivedName {
-                    workErrorMessage = "Product \"\(archivedName)\" was archived elsewhere; switching to the next active product."
-                }
-            }
-            if currentSelectedProductID == nil, let first = activeProducts.first {
-                self.selectedWorkProductID = first.id
-                defaults.set(first.id, forKey: selectedWorkProductDefaultsKey)
-                engine.sendGetWorkTree(productId: first.id, flow: .coldStart)
-            } else if let productID = currentSelectedProductID {
-                // On cold start this is the redundant SECOND fetch of the
-                // already-restored product (see `.connected` above); it also
-                // fires on later `products_list` refreshes. Tagged cold_start
-                // because the double-fetch is the case worth spotting; the
-                // per-product fetch counter disambiguates either way.
-                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
-            }
-            refreshWorkSubscriptions()
-        case .projectsList(let productId, let projects):
-            projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies):
-            // Population-timing (T2101 R1): time this @MainActor apply burst
-            // and its two hot sub-steps. `popCtx` carries the flow/seq tag
-            // decoded off-main so every segment of one fetch reads together.
-            let popCtx = PopulationTiming.shared.takeContextForApply(productId: product.id)
-            let popApplyStartNanos = PopulationTiming.now()
-            upsertProduct(product)
-            if currentSelectedProductID == nil {
-                selectedWorkProductID = product.id
-            }
-            projectsByProductID[product.id] = projects.sorted(by: projectSort)
-            let popBucketStartNanos = PopulationTiming.now()
-            tasksByProjectID = tasksByProjectID.filter { _, existingTasks in
-                existingTasks.first?.productID != product.id
-            }
-            var productLevelRevisions: [WorkTask] = []
-            var productLevelTasks: [WorkTask] = []
-            for task in tasks {
-                guard let projectID = task.projectID else {
-                    // Product-level rows (`project_id IS NULL`) have no project
-                    // lane to live under. Route every one of them into a bucket
-                    // rather than dropping the ones we don't special-case — a
-                    // chore-parented revision rolls up under its parent (issue
-                    // #789), and everything else (investigations, any future
-                    // product-level kind) renders as a first-class card (issue
-                    // #886). The `else` is a catch-all on purpose: nothing the
-                    // engine sends should silently disappear here.
-                    if task.kind == "revision" {
-                        productLevelRevisions.append(task)
-                    } else {
-                        productLevelTasks.append(task)
-                    }
-                    continue
-                }
-                tasksByProjectID[projectID, default: []].append(task)
-            }
-            let popBucketEndNanos = PopulationTiming.now()
-            for (projectID, projectTasks) in tasksByProjectID where
-                projectTasks.first?.productID == product.id {
-                tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
-            }
-            choresByProductID[product.id] = chores.sorted(by: taskSort)
-            productLevelRevisionsByProductID[product.id] = productLevelRevisions.sorted(by: taskSort)
-            productLevelTasksByProductID[product.id] = productLevelTasks.sorted(by: taskSort)
-            let popSortEndNanos = PopulationTiming.now()
-            mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
-            dependenciesByProductID[product.id] = dependencies
-            seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
-            // After tasksByProjectID reflects real engine state, clear optimistic
-            // overrides for cards whose true column now matches the target.
-            // Done before the @Published assignments take effect in the view so
-            // the next render uses real boardColumn values — no visible flicker.
-            reconcileOptimisticOverrides(from: tasks + chores)
-            reconcileWorkSelection()
-            refreshWorkSubscriptions()
-            refreshDesignDocStates(for: projects)
-            engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
-            engine.sendListAttentionGroups(productId: product.id)
-            workErrorMessage = nil
-            if let pending = pendingRevealScrollID {
-                let allIDs = Set(tasks.map(\.id) + chores.map(\.id))
-                if allIDs.contains(pending) {
-                    pendingRevealScrollID = nil
-                    triggerRevealScroll(pending)
-                }
-            }
-            recordPopulationApplyBurst(
-                context: popCtx,
-                applyStartNanos: popApplyStartNanos,
-                bucketStartNanos: popBucketStartNanos,
-                bucketEndNanos: popBucketEndNanos,
-                sortEndNanos: popSortEndNanos
-            )
-        case .workItemCreated(let item):
-            handleCreatedWorkItem(item)
-        case .workItemsCreated(let items):
-            handleCreatedWorkItemsBatch(items)
-        case .workItemUpdated(let item):
-            handleUpdatedWorkItem(item)
-        case .projectTasksReordered(let projectId, _):
-            if let productID = productID(forProjectID: projectId) {
-                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-            }
-        case .workItemDeleted(let id):
-            let deletedTask = task(withID: id)
-            if selectedTask?.id == id {
-                selectedWorkCardID = nil
-            }
-            if let productID = deletedTask?.productID ?? currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-            }
-        case .workError(let message):
-            // Allow the user to retry any in-flight review terminal or
-            // merge-when-ready request that failed.
-            if case .loading = editorialEvaluationState {
-                editorialEvaluationState = .failed(message)
-            }
-            openingReviewTerminalIDs.removeAll()
-            openingLiveWorkspaceTerminalIDs.removeAll()
-            mergingWhenReadyIDs.removeAll()
-            plannerActionInFlightProjectIDs.removeAll()
-            if case .loading = reviewTerminalVM.state {
-                reviewTerminalVM.state = .idle
-            }
-            if !pendingMoveOriginByTaskID.isEmpty {
-                // Error is likely from an in-flight kanban move: bounce the
-                // card(s) back and show an inline non-blocking notice instead
-                // of interrupting with a modal dialog.
-                bounceBackOptimisticMoves(message: message)
-            } else {
-                workErrorMessage = message
-            }
-        case .error(let message):
-            if isSocketTransportError(message) {
-                // Transport errors fire continuously while the engine
-                // is unreachable (every reconnect attempt re-emits a
-                // `socket waiting:` line). Routing them through the
-                // work-error modal makes the app unusable: dismissing
-                // re-opens it on the next retry. The disconnected
-                // banner in the main chrome is the user-facing signal
-                // for this state — see `showConnectionLostBanner` in
-                // ContentView.
-                appendSystemMessage(message)
-                return
-            }
-            workErrorMessage = message
-        case .workerLiveStatesList(let states):
-            liveWorkerStates.update(states: states)
-        case .liveStatusDisabledSlotsList(let slotIds):
-            liveStatusDisabledSlotIDs = Set(slotIds)
-        case .liveStatusEnabledSet(let slotId, let enabled):
-            if enabled {
-                liveStatusDisabledSlotIDs.remove(slotId)
-            } else {
-                liveStatusDisabledSlotIDs.insert(slotId)
-            }
-        case .featureFlagsList(let flags):
-            featureFlags = flags
-        case .featureFlagSet(let name, let enabled):
-            // Patch the cached snapshot so the toggle commits without
-            // a second round-trip. The engine has already persisted
-            // the value at this point — the patch is a UI mirror.
-            if let idx = featureFlags.firstIndex(where: { $0.name == name }) {
-                let prior = featureFlags[idx]
-                featureFlags[idx] = FeatureFlag(
-                    name: prior.name,
-                    description: prior.description,
-                    category: prior.category,
-                    defaultEnabled: prior.defaultEnabled,
-                    enabled: enabled,
-                    capabilityPresent: prior.capabilityPresent
-                )
-            }
-        case .engineHealthResult(let apiKeyPresent, let issues):
-            engineAnthropicApiKeyPresent = apiKeyPresent
-            engineHealthIssues = issues
-        case .enginePoolConfig(let workerSlots, let automationSlots, let reviewSlots, let coordinatorModel):
-            panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots, coordinatorModel)
-        case .settingsList(let settings):
-            engineSettings = settings
-        case .settingSet(let key, let enabled):
-            if let idx = engineSettings.firstIndex(where: { $0.key == key }) {
-                let prior = engineSettings[idx]
-                engineSettings[idx] = EngineSetting(
-                    key: prior.key,
-                    description: prior.description,
-                    defaultEnabled: prior.defaultEnabled,
-                    enabled: enabled
-                )
-            }
-        case .hostsList(let hosts):
-            registeredHosts = hosts
-        case .hostResult(let host):
-            if let idx = registeredHosts.firstIndex(where: { $0.hostId == host.hostId }) {
-                registeredHosts[idx] = host
-            } else {
-                registeredHosts.append(host)
-            }
-        case .hostUpdated(let host):
-            if let idx = registeredHosts.firstIndex(where: { $0.hostId == host.hostId }) {
-                registeredHosts[idx] = host
-            }
-        case .hostRemoved(let id):
-            registeredHosts.removeAll { $0.hostId == id }
-        case .metricsListLiveResult(let entries):
-            engineMetrics = entries
-        case .projectDesignDocResolved(let output):
-            if var batch = currentDesignDocResolveBatch,
-               batch.pendingProjectIDs.remove(output.projectID) != nil {
-                if batch.pendingProjectIDs.isEmpty {
-                    let ms = Int(Date().timeIntervalSince(batch.startDate) * 1000)
-                    designDocTimingLog.info("phase=resolve project=batch count=\(batch.initialCount, privacy: .public) duration_ms=\(ms, privacy: .public)")
-                    currentDesignDocResolveBatch = nil
-                } else {
-                    currentDesignDocResolveBatch = batch
-                }
-            }
-            designDocStateByProjectID[output.projectID] = output.state
-        case .conflictResolutionsList(let attempts):
-            conflictResolutions = attempts
-        case .conflictResolutionStarted(_, _, _, let prURL):
-            // A (re)dispatch of the conflict resolver means the PR is
-            // conflicting again — the prior "conflict cleared" badge is
-            // stale and must be removed (T778). Mirrors the ciRemediationStarted
-            // arm that clears recentlyClearedCIPRs for the same reason.
-            recentlyClearedConflictPRs.removeValue(forKey: prURL)
-            engine.sendListConflictResolutions(limit: 200)
-        case .conflictResolutionFailed, .conflictResolutionAbandoned:
-            // Refreshes the engine-tab list so the status column re-renders.
-            // These don't touch the badge: failure/abandon don't un-clear a
-            // previously cleared conflict — only a new start signals re-conflict.
-            engine.sendListConflictResolutions(limit: 200)
-        case .conflictResolutionSucceeded(_, _, _, let prURL):
-            // Stamp the PR url so the kanban card shows the
-            // "🔧 conflict cleared" chip for the next 24h (#15). The
-            // engine doesn't carry a finished_at on the push, so we
-            // record the wall-clock observation time — close enough
-            // for an ageing window measured in hours.
-            recentlyClearedConflictPRs[prURL] = Date()
-            engine.sendListConflictResolutions(limit: 200)
-        case .ciRemediationsList(let attempts):
-            ciRemediations = attempts
-            // Reconcile the in-flight chip set with the row list: for
-            // every PR whose latest attempt is non-terminal, mark
-            // `in_flight` if no chip already exists. Exhausted chips
-            // are sticky until the user clears them via retry — they
-            // are not derivable from the row list alone (the engine
-            // tracks them via `task_blocked_signals`), so we leave
-            // pre-existing exhausted chips alone.
-            var seenPRs = Set<String>()
-            for row in attempts where row.status == "pending" || row.status == "running" {
-                guard seenPRs.insert(row.prURL).inserted else { continue }
-                if ciFailureBadges[row.prURL] == nil {
-                    ciFailureBadges[row.prURL] = CiFailureBadge(
-                        state: .inFlight,
-                        attemptsUsed: 0,
-                        budget: 0,
-                    )
-                }
-            }
-        case .ciRemediationStarted(_, _, _, let prURL, _):
-            // A fresh CI attempt was created (detect path or `retry`).
-            // The card stays in `blocked: ci_failure` — the in-flight
-            // chip lives until the next probe either reports clean or
-            // hits the budget. We don't know used/budget here; the
-            // exhausted arm carries those. Show a stub chip with
-            // (0, 0) so the card surfaces the in-flight state until
-            // the next list refresh fills in real numbers.
-            // A new failure makes any prior "ci auto-fixed" claim stale:
-            // if the auto-fix didn't stick, the badge is misleading (T606).
-            recentlyClearedCIPRs.removeValue(forKey: prURL)
-            if ciFailureBadges[prURL] == nil {
-                ciFailureBadges[prURL] = CiFailureBadge(state: .inFlight, attemptsUsed: 0, budget: 0)
-            } else if var existing = ciFailureBadges[prURL] {
-                existing.state = .inFlight
-                ciFailureBadges[prURL] = existing
-            }
-            engine.sendListCiRemediations(limit: 200)
-        case .ciRemediationSucceeded(_, _, _, let prURL):
-            // Engine observed CI back at clean and retired the attempt.
-            // Drop the failure chip and stamp the "✅ ci auto-fixed"
-            // chip for the next 24h (per design Q11).
-            ciFailureBadges.removeValue(forKey: prURL)
-            recentlyClearedCIPRs[prURL] = Date()
-            engine.sendListCiRemediations(limit: 200)
-        case .ciFailureCleared(_, _, let prURL):
-            // Engine cleared `blocked: ci_failure` but found no active
-            // remediation attempt (the prior attempt was already terminal).
-            // Clear the failure badge only — do NOT set the auto-fixed badge
-            // because the clearance was not driven by an auto-fix (T606).
-            ciFailureBadges.removeValue(forKey: prURL)
-        case .ciRemediationFailed(_, _, _, _, _),
-             .ciRemediationAbandoned(_, _, _, _, _):
-            // Terminal failures keep the parent `blocked: ci_failure`
-            // until the engine either retries or exhausts. The list
-            // refresh keeps the engine tab consistent.
-            engine.sendListCiRemediations(limit: 200)
-        case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
-            // Budget exhausted means CI is still failing and auto-fix
-            // cannot help further. Any prior "ci auto-fixed" claim is now
-            // stale (T606).
-            recentlyClearedCIPRs.removeValue(forKey: prURL)
-            ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
-            engine.sendListCiRemediations(limit: 200)
-        case .attentionItemsForWorkItemList(let workItemID, let items):
-            attentionItemsByWorkItemID[workItemID] = items
-        case .attentionItemCreated, .attentionItemUpdated, .attentionItemConverted, .deferredScopeAttentionsList:
-            handleDeferredScopeEvent(event)
-        case .plannerRunsList(let projectID, let runs):
-            plannerRunsByProjectID[projectID] = runs
-        case .releaseProjectResult(let projectID, _, _):
-            plannerActionInFlightProjectIDs.remove(projectID)
-            engine.sendListPlannerRuns(projectId: projectID)
-            if let productID = project(withID: projectID)?.productID {
-                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-            }
-        case .unpopulateProjectResult(let projectID, _, _, _):
-            plannerActionInFlightProjectIDs.remove(projectID)
-            engine.sendListPlannerRuns(projectId: projectID)
-            if let productID = project(withID: projectID)?.productID {
-                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-            }
-        case .attentionGroupsList(let productID, let groups, let members):
-            applyAttentionGroupsList(productID: productID, groups: groups, members: members)
-        case .attentionGroupResult(let group, let members):
-            upsertAttentionGroup(group)
-            attentionMembersByGroupID[group.id] = members
-        case .attentionCreated(let attention, let group):
-            upsertAttentionGroup(group)
-            upsertAttentionMember(attention)
-        case .attentionGroupUpdated(let group, let members):
-            upsertAttentionGroup(group)
-            attentionMembersByGroupID[group.id] = members
-        case .attentionGroupActioned(let group, let members):
-            upsertAttentionGroup(group)
-            attentionMembersByGroupID[group.id] = members
-        case .attentionMergesList(let attentionID, let merges):
-            attentionMergesByAttentionID[attentionID] = merges
-        case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
-            openingReviewTerminalIDs.remove(workItemID)
-            let resolved = task(withID: workItemID)
-            let content = ReviewTerminalContent(
-                workItemID: workItemID,
-                workspacePath: workspacePath,
-                leaseID: leaseID,
-                taskName: resolved?.name,
-                taskShortID: resolved?.shortID
-            )
-            if reviewTerminalVM.windowIsOpen {
-                reviewTerminalVM.state = .ready(content)
-            } else {
-                // Window was closed while the engine was still setting up.
-                // Release the lease immediately since nobody will consume it.
-                engine.sendReleaseReviewTerminal(leaseID: leaseID)
-            }
-        case .liveWorkspaceTerminalReady(let workItemID, let workspacePath):
-            openingLiveWorkspaceTerminalIDs.remove(workItemID)
-            let resolved = task(withID: workItemID)
-            let content = ReviewTerminalContent(
-                workItemID: workItemID,
-                workspacePath: workspacePath,
-                leaseID: nil,
-                taskName: resolved?.name,
-                taskShortID: resolved?.shortID
-            )
-            // No lease was created for this path, so unlike the review-
-            // terminal case above there is nothing to release if the
-            // window already closed — just drop the content.
-            if reviewTerminalVM.windowIsOpen {
-                reviewTerminalVM.state = .ready(content)
-            }
-        case .mergeWhenReadyAccepted(let workItemID, _, _):
-            // Engine successfully initiated the merge. Clear the in-flight
-            // guard so the button re-enables if the user wants to retry.
-            // The PR-reconciler was kicked on the engine side, so a
-            // WorkItemUpdated event carrying the new merge-queue / merged
-            // state will arrive shortly.
-            mergingWhenReadyIDs.remove(workItemID)
-        case .gitHubAuthState(let state):
-            // The engine pushes this on every device-flow transition (and
-            // as the reply to a `git_hub_auth_*` request). The settings
-            // subsection observes `gitHubAuthState` and re-renders.
-            gitHubAuthState = state
-        case .executionsList(let taskId, let executions):
-            executionsByTaskID[taskId] = executions
-        case .executionTranscriptResult(let executionId, let segments, let isLive, let complete):
-            transcriptsByExecutionID[executionId] = .loaded(
-                TranscriptDoc(
-                    executionId: executionId,
-                    segments: segments,
-                    isLive: isLive,
-                    complete: complete
-                )
-            )
-        case .executionTranscriptUnavailable(let executionId, let reason):
-            transcriptsByExecutionID[executionId] = .unavailable(reason: reason)
-        // MARK: Automation events
-        case .automationsList(let productID, let automations, let openTaskCounts):
-            automationsByProductID[productID] = automations
-            automationsFetchStateByProductID[productID] = .loaded
-            for (id, count) in openTaskCounts {
-                openTaskCountByAutomationID[id] = count
-            }
-            for automation in automations {
-                engine.sendListAutomationRuns(automationId: automation.id)
-            }
-        case .automationCreated(let automation):
-            upsertAutomation(automation)
-            selectedAutomationID = automation.id
-            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationResult(let automation):
-            upsertAutomation(automation)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationUpdated(let automation):
-            upsertAutomation(automation)
-            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
-            engine.sendListAutomationRuns(automationId: automation.id)
-        case .automationDeleted(let automationID):
-            for productID in automationsByProductID.keys {
-                automationsByProductID[productID]?.removeAll { $0.id == automationID }
-            }
-            openTaskCountByAutomationID.removeValue(forKey: automationID)
-            automationRunsByID.removeValue(forKey: automationID)
-        case .automationOpenTaskCount(let automationID, let count):
-            openTaskCountByAutomationID[automationID] = count
-        case .automationRunsList(let automationID, let runs):
-            automationRunsByID[automationID] = runs
-        // MARK: Editorial controls events
-        case .editorialActionsList(let productID, let actions):
-            editorialActionsByProductID[productID] = actions
-            editorialActionsFetchStateByProductID[productID] = .loaded
-        case .editorialRulesEvaluated(let productID, let decision, let findings, let rewrittenBody):
-            guard productID == editorialControlsProductID else { break }
-            editorialEvaluationState = .result(
-                decision: decision,
-                findings: findings,
-                rewrittenBody: rewrittenBody
-            )
-        // MARK: Comments (P529 Phase 2)
-        case .commentsList(let artifactKind, let artifactId, let comments):
-            commentBridge.handleCommentsList(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
-        case .commentsResolved(let artifactKind, let artifactId, let comments):
-            commentBridge.handleCommentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
-        case .commentResult(let comment):
-            commentBridge.handleCommentResult(comment)
-        case .commentsBannerState(let artifactKind, let artifactId, let state):
-            commentBridge.handleCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId, state: state)
-        case .commentsReviseDocResult(let outcome):
-            commentBridge.handleCommentsReviseDocResult(outcome)
-        }
-    }
-
-    private func upsertAutomation(_ automation: AppAutomation) {
-        let productID = automation.productID
-        if var list = automationsByProductID[productID] {
-            if let idx = list.firstIndex(where: { $0.id == automation.id }) {
-                list[idx] = automation
-            } else {
-                list.append(automation)
-            }
-            automationsByProductID[productID] = list
-        } else {
-            automationsByProductID[productID] = [automation]
-        }
-    }
-
-    // MARK: - Private Helpers
+    // MARK: - Lookups and shared helpers
 
     var currentSelectedProductID: String? {
         selectedWorkProductID
@@ -2520,7 +1882,7 @@ final class ChatViewModel: ObservableObject {
         return nil
     }
 
-    private func workTopic(forProductID productID: String) -> String {
+    func workTopic(forProductID productID: String) -> String {
         "work.product.\(productID)"
     }
 
@@ -2539,7 +1901,15 @@ final class ChatViewModel: ObservableObject {
         return topics
     }
 
-    private func refreshWorkSubscriptions() {
+    /// Records a successful (re)connect. Exists so `hasConnectedOnce` can stay
+    /// `private(set)` — `private` is file-scoped in Swift, and the `.connected`
+    /// arm that flips it lives in [[ChatViewModel+EventHandling.swift]].
+    func markConnected() {
+        isConnected = true
+        hasConnectedOnce = true
+    }
+
+    func refreshWorkSubscriptions() {
         guard isConnected else { return }
         let desired = desiredWorkTopics
         let toSubscribe = desired.subtracting(subscribedWorkTopics)
@@ -2561,19 +1931,8 @@ final class ChatViewModel: ObservableObject {
         engine.start()
     }
 
-    /// Whether an `.error` message is a transport-level signal from
-    /// `EngineClient` rather than a real engine-reported error.
-    /// Transport errors are emitted on every reconnect attempt while
-    /// the socket can't be opened, so they must not drive any modal
-    /// UI — see the `.error` arm of `handle(_:)` for context.
-    private func isSocketTransportError(_ message: String) -> Bool {
-        return message.hasPrefix("socket failed:")
-            || message.hasPrefix("socket waiting:")
-            || message.hasPrefix("socket send failed:")
-            || message.hasPrefix("socket receive failed:")
-    }
 
-    private func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
+    func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
         guard alwaysShow || showSystemMessages else { return }
         FileHandle.standardError.write(Data("\(text)\n".utf8))
     }
@@ -2608,114 +1967,13 @@ final class ChatViewModel: ObservableObject {
         task(withID: id)
     }
 
-    private func productID(for nodeID: WorkNodeID?) -> String? {
-        switch nodeID {
-        case .product(let productID):
-            return productID
-        case .project(let projectID):
-            return project(withID: projectID)?.productID
-        case .task(let taskID), .chore(let taskID):
-            return task(withID: taskID)?.productID
-        case nil:
-            return nil
-        }
-    }
-
-    private func productID(forProjectID projectID: String) -> String? {
-        project(withID: projectID)?.productID
-    }
-
-    func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
-        if let cached = cachedItemsByColumn[column] {
-            return cached
-        }
-        // The Review column gets a dedicated ordering: newest by creation
-        // time at the top, so the column is predictable and scannable (the
-        // generic board sort keys on `ordinal`, which review-phase tasks
-        // rarely carry, leaving them in an apparently-random order). See
-        // boss issue #1250.
-        let sort = column == .review ? reviewBoardSort : boardTaskSort
-        var items = visibleWorkItems
-            .filter { effectiveBoardColumn(for: $0) == column }
-            .sorted(by: sort)
-        // Revisions don't appear as standalone cards in Review or Done — they
-        // roll up as single lines on the parent task's card in both lanes.
-        // They are still visible in Backlog/Doing as distinct cards. An
-        // `in_review` revision normally routes to Review, but one whose own
-        // PR is in the merge queue / Merge When Ready
-        // (`isInMergingSection`) routes to Done instead (`boardColumn`), so
-        // the Done-column filter excludes `in_review` revisions too, not
-        // just `done` ones.
-        if column == .review {
-            items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
-        }
-        if column == .done {
-            items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }
-        }
-        cachedItemsByColumn[column] = items
-        return items
-    }
-
-    func workSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
-        if let cached = cachedSectionsByColumn[column] {
-            return cached
-        }
-        let sections = computeWorkSections(in: column)
-        cachedSectionsByColumn[column] = sections
-        return sections
-    }
-
-    private func computeWorkSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
-        let items = workItems(in: column)
-        if column == .done {
-            // `isInMergingSection` in_review tasks route into `.done` via
-            // `boardColumn` so they render in the Merging section; split
-            // them out here so `doneSections`'s recency bucketing only ever
-            // sees genuinely completed (`status == "done"`) tasks.
-            let merging = items.filter(\.isInMergingSection)
-            let completed = items.filter { !$0.isInMergingSection }
-            var sections: [WorkBoardSection] = []
-            if let mergingSection = Self.mergingSection(items: merging) {
-                sections.append(mergingSection)
-            }
-            sections.append(contentsOf: Self.doneSections(items: completed))
-            return sections
-        }
-        guard workBoardGrouping == .project else {
-            return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
-        }
-
-        let grouped = Dictionary(grouping: items) { task in
-            if task.isChore { return "Chores" }
-            // Chore-parented revisions inherit nil projectID from the chain
-            // root (a chore). Group them with chores so they don't land in
-            // a confusing "No Project" section — they are logically part of
-            // the chore world.
-            if task.kind == "revision", task.projectID == nil { return "Chores" }
-            return projectName(for: task.projectID) ?? "No Project"
-        }
-
-        return grouped.keys.sorted().compactMap { key in
-            guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
-            let projectID = sectionItems.first(where: { !$0.isChore })?.projectID
-            return WorkBoardSection(
-                id: "\(column.rawValue)-\(key)",
-                title: key,
-                items: sectionItems,
-                isCollapsible: true,
-                defaultExpanded: true,
-                projectID: projectID
-            )
-        }
-    }
-
     /// Cached output of `visibleWorkItems`. Filled lazily on read; reset to
     /// `nil` whenever a published input changes (see `invalidateWorkCache`).
     /// Keeps engine pushes that don't touch the work tree (e.g.
     /// `worker.live_states`) from re-walking the projects/tasks/chores trees.
     private var cachedVisibleItems: [WorkTask]?
-    private var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
-    private var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
+    var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
+    var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
     private var cachedAmbiguousRepoNames: Set<String>?
     /// O(1) id → work-item index over every task/chore/revision bucket.
     /// Built lazily on first lookup after any change (see `rebuildTaskIndex`);
@@ -2760,7 +2018,7 @@ final class ChatViewModel: ObservableObject {
     /// arrives while entries remain here, the card bounces back.
     var pendingMoveOriginByTaskID: [String: WorkBoardColumnKey] = [:]
 
-
+    // MARK: - Live worker state
 
     /// Resolve a task to its current LiveWorkerState by joining
     /// `task → execution_id → run_id`. Returns `nil` when the task
@@ -2773,228 +2031,5 @@ final class ChatViewModel: ObservableObject {
             return nil
         }
         return liveWorkerStates.byRunID[executionID]
-    }
-
-    private func upsertProduct(_ product: WorkProduct) {
-        if let index = products.firstIndex(where: { $0.id == product.id }) {
-            products[index] = product
-        } else {
-            products.append(product)
-            products.sort(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
-        }
-    }
-
-    private func handleCreatedWorkItem(_ item: WorkItemPayload) {
-        workErrorMessage = nil
-        switch item {
-        case .product(let product):
-            upsertProduct(product)
-            selectedWorkProductID = product.id
-            selectedProjectFilterIDs = []
-            selectedWorkCardID = nil
-            defaults.set(product.id, forKey: selectedWorkProductDefaultsKey)
-            persistProjectFilterIDs()
-            engine.sendGetWorkTree(productId: product.id, flow: .itemRefetch)
-        case .project(let project):
-            selectedWorkProductID = project.productID
-            selectedProjectFilterIDs = [project.id]
-            selectedWorkCardID = nil
-            defaults.set(project.productID, forKey: selectedWorkProductDefaultsKey)
-            persistProjectFilterIDs()
-            engine.sendGetWorkTree(productId: project.productID, flow: .itemRefetch)
-        case .task(let task):
-            selectedWorkProductID = task.productID
-            if let projectID = task.projectID {
-                selectedProjectFilterIDs = [projectID]
-            } else {
-                selectedProjectFilterIDs = []
-            }
-            selectedWorkCardID = task.id
-            defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
-            persistProjectFilterIDs()
-            engine.sendGetWorkTree(productId: task.productID, flow: .itemRefetch)
-        case .chore(let task):
-            selectedWorkProductID = task.productID
-            selectedWorkCardID = task.id
-            includeChores = true
-            defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
-            defaults.set(true, forKey: includeChoresDefaultsKey)
-            engine.sendGetWorkTree(productId: task.productID, flow: .itemRefetch)
-        }
-        refreshWorkSubscriptions()
-    }
-
-    /// Passive counterpart of `handleCreatedWorkItem` for a background batch
-    /// push (e.g. the auto-populate Populator staging a project's task
-    /// breakdown while the operator is looking at something else). Unlike
-    /// the single-item path, this must never hijack the operator's current
-    /// selection/filters — it only refreshes the affected product's board
-    /// and, for any touched projects, their planner-run audit trail so a
-    /// [[PlannerRunAffordance]] icon that hasn't appeared yet surfaces
-    /// without a view remount.
-    private func handleCreatedWorkItemsBatch(_ items: [WorkItemPayload]) {
-        var productIDs: Set<String> = []
-        var projectIDs: Set<String> = []
-        for item in items {
-            switch item {
-            case .product(let product):
-                productIDs.insert(product.id)
-            case .project(let project):
-                productIDs.insert(project.productID)
-                projectIDs.insert(project.id)
-            case .task(let task), .chore(let task):
-                productIDs.insert(task.productID)
-                if let projectID = task.projectID {
-                    projectIDs.insert(projectID)
-                }
-            }
-        }
-        for productID in productIDs where productID == currentSelectedProductID {
-            engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
-        }
-        for projectID in projectIDs {
-            refreshPlannerRuns(projectID: projectID)
-        }
-    }
-
-    private func handleUpdatedWorkItem(_ item: WorkItemPayload) {
-        switch item {
-        case .product(let product):
-            let wasSelected = selectedWorkProductID == product.id
-            upsertProduct(product)
-            if wasSelected && product.status == "archived" {
-                workErrorMessage = "Product \"\(product.name)\" was archived; switching to the next active product."
-                reconcileWorkSelection()
-                if let nextID = selectedWorkProductID {
-                    engine.sendGetWorkTree(productId: nextID, flow: .productSwitch)
-                }
-                refreshWorkSubscriptions()
-                return
-            }
-        case .project(let project):
-            engine.sendGetWorkTree(productId: project.productID, flow: .itemRefetch)
-        case .task(let updatedTask), .chore(let updatedTask):
-            // When the engine confirms an optimistic move, drop the origin record
-            // so a subsequent work_error from an unrelated operation won't bounce
-            // a card that is already confirmed.
-            if let targetColumn = optimisticColumnByTaskID[updatedTask.id],
-               updatedTask.boardColumn == targetColumn {
-                pendingMoveOriginByTaskID.removeValue(forKey: updatedTask.id)
-            } else if optimisticColumnByTaskID[updatedTask.id] != nil {
-                // Engine returned a different status — move silently rejected.
-                bounceBackOptimisticMoves(message: nil)
-            }
-            maybeFireReviewNotification(for: updatedTask)
-            // Apply the update directly to the in-memory store instead of
-            // fetching the full work tree. The payload already carries the
-            // updated task, so a second round-trip is unnecessary.
-            let isChore: Bool
-            if case .chore = item { isChore = true } else { isChore = false }
-            applyIncrementalTaskUpdate(updatedTask, isChore: isChore)
-            // Reconcile optimistic overrides now that the local store reflects
-            // the confirmed state — the update above already wrote the new
-            // status, so the real column matches the optimistic target.
-            reconcileOptimisticOverrides(from: [updatedTask])
-        }
-        workErrorMessage = nil
-    }
-
-    /// Apply a single task or chore update to the in-memory store without
-    /// fetching the full work tree. Routes the task into the correct bucket
-    /// based on its current `projectID` and `kind`, removing any stale entry
-    /// from other buckets first (handles the rare case where these change).
-    private func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
-        let productID = updatedTask.productID
-        if isChore {
-            var chores = choresByProductID[productID] ?? []
-            chores.removeAll { $0.id == updatedTask.id }
-            chores.append(updatedTask)
-            choresByProductID[productID] = chores.sorted(by: taskSort)
-        } else {
-            // Remove from all task buckets so a rare projectID/kind change
-            // doesn't leave a stale entry behind.
-            for key in Array(tasksByProjectID.keys) {
-                tasksByProjectID[key]?.removeAll { $0.id == updatedTask.id }
-            }
-            var revisions = productLevelRevisionsByProductID[productID] ?? []
-            revisions.removeAll { $0.id == updatedTask.id }
-            var productLevelItems = productLevelTasksByProductID[productID] ?? []
-            productLevelItems.removeAll { $0.id == updatedTask.id }
-
-            if let projectID = updatedTask.projectID {
-                var tasks = tasksByProjectID[projectID] ?? []
-                tasks.append(updatedTask)
-                tasksByProjectID[projectID] = tasks.sorted(by: taskSort)
-            } else if updatedTask.kind == "revision" {
-                revisions.append(updatedTask)
-                productLevelRevisionsByProductID[productID] = revisions.sorted(by: taskSort)
-            } else {
-                productLevelItems.append(updatedTask)
-                productLevelTasksByProductID[productID] = productLevelItems.sorted(by: taskSort)
-            }
-        }
-    }
-
-    /// Fire a review notification when `updatedTask` enters `in_review`
-    /// for the first time (not already in [[knownReviewTaskIDs]]).
-    /// Clears the task from the set when it leaves `in_review` so a
-    /// subsequent re-entry (e.g. worker re-opens a revised PR) fires again.
-    private func maybeFireReviewNotification(for updatedTask: WorkTask) {
-        if updatedTask.status == "in_review" {
-            guard !knownReviewTaskIDs.contains(updatedTask.id) else { return }
-            knownReviewTaskIDs.insert(updatedTask.id)
-            reviewNotifier.notifyReadyForReview(task: updatedTask)
-        } else {
-            knownReviewTaskIDs.remove(updatedTask.id)
-        }
-    }
-
-    /// Sync [[knownReviewTaskIDs]] from a full product work-tree snapshot
-    /// without firing notifications. Called on initial load and reconnect
-    /// so tasks already in Review at startup don't trigger spurious banners.
-    private func seedReviewTaskIDs(tasks: [WorkTask], chores: [WorkTask], productID: String) {
-        // Remove all IDs belonging to this product, then re-add the current in-review ones.
-        // Avoids stale entries when a task leaves review between two tree snapshots.
-        let productItemIDs = Set(tasks.map(\.id) + chores.map(\.id))
-        knownReviewTaskIDs.subtract(productItemIDs)
-        for item in tasks + chores where item.status == "in_review" {
-            knownReviewTaskIDs.insert(item.id)
-        }
-    }
-
-    private func reconcileWorkSelection() {
-        guard let selectedWorkProductID else { return }
-
-        let activeIDs = Set(activeProducts.map(\.id))
-        if !activeIDs.contains(selectedWorkProductID) {
-            self.selectedWorkProductID = activeProducts.first?.id
-            if let firstProductID = activeProducts.first?.id {
-                defaults.set(firstProductID, forKey: selectedWorkProductDefaultsKey)
-            } else {
-                defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
-            }
-        }
-
-        let validProjectIDs = selectedProjectFilterIDs.filter { projectID in
-            project(withID: projectID)?.productID == selectedWorkProductID
-        }
-        if validProjectIDs != selectedProjectFilterIDs {
-            selectedProjectFilterIDs = validProjectIDs
-            persistProjectFilterIDs()
-        }
-
-        if let selectedTask, !isTaskVisible(selectedTask) {
-            selectedWorkCardID = nil
-        }
-
-        refreshWorkSubscriptions()
-    }
-
-    /// Test-only entry point that funnels a synthetic engine event
-    /// through the same `handle` dispatch the live socket uses, so
-    /// picker-side reactions (selection fallback, archived-product
-    /// fan-out) can be asserted without booting a real engine.
-    func applyEventForTest(_ event: EngineEvent) {
-        handle(event)
     }
 }
