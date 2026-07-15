@@ -303,6 +303,18 @@ impl crate::spawn_ack_sweep::SpawnAckReaper for ServerState {
     }
 }
 
+#[async_trait]
+impl crate::spawn_health::EngineHealthBroadcaster for ServerState {
+    // Delegates to the inherent `ServerState::broadcast_engine_health`
+    // (not a recursive trait call — inherent methods always take priority
+    // over trait methods of the same name in Rust's method resolution),
+    // so `trip_spawn_capability_circuit` can push a live banner update
+    // without depending on `ServerState` directly.
+    async fn broadcast_engine_health(&self) {
+        ServerState::broadcast_engine_health(self).await;
+    }
+}
+
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
 /// Late-bound via `set_server_state` to break the ownership cycle:
 /// ServerState owns the completion handler, which owns the releaser,
@@ -1642,7 +1654,7 @@ impl ServerState {
     /// Called whenever health-affecting state changes (dispatch pause/resume,
     /// etc.) so subscribed frontends update the health banner without polling
     /// or restarting.
-    pub async fn broadcast_engine_health(self: &Arc<Self>) {
+    pub async fn broadcast_engine_health(&self) {
         let report = build_engine_health_report(self);
         let envelope = FrontendEventEnvelope::push(FrontendEvent::EngineHealthResult { report });
         self.topic_broker.publish(TOPIC_ENGINE_HEALTH, envelope).await;

@@ -424,6 +424,7 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
         dispatch_events: server_state.dispatch_events.as_ref(),
         reaper: server_state.as_ref(),
         spawn_health: server_state.spawn_health.as_ref(),
+        health_broadcaster: server_state.as_ref(),
     };
     crate::spawn_ack_sweep::reap_never_started_spawn(
         &reap_ctx,

@@ -2179,6 +2179,32 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Operator-facing `dispatch_wait_reason` text for a `ready` row held
+    /// back by a global dispatch pause. Reuses `dispatch_pause_exempts_reviews`
+    /// to tell operator- from breaker-originated pauses apart — the same
+    /// signal the `dispatch_paused` health-banner issue keys off in
+    /// `build_engine_health_report` — so the per-card label and the banner
+    /// describe the same cause. Prefixed with the stable `dispatch_paused: `
+    /// marker so the app's `dispatchWaitReasonLabel` can render "Dispatch
+    /// paused — …" instead of the generic "Waiting — …" wrapping.
+    ///
+    /// Before this, a row held by a pause simply kept whatever
+    /// `dispatch_wait_reason` (often none) it had before the pause began —
+    /// `drain_ready_queue` returned or skipped without ever touching it. The
+    /// 2026-07-15 incident: a `ready` row with zero dispatch events read
+    /// "Waiting for a slot" for 40+ minutes with 16 slots free while the
+    /// spawn-capability breaker held dispatch paused.
+    fn dispatch_pause_wait_reason(&self) -> String {
+        if self.dispatch_pause_exempts_reviews.load(Ordering::Acquire) {
+            "dispatch_paused: operator paused dispatch — resume with `bossctl dispatch resume`".to_owned()
+        } else {
+            "dispatch_paused: spawn-capability breaker tripped (app worker-pane spawning is \
+             unhealthy) — resume with `bossctl dispatch resume` once the app's spawn path is \
+             confirmed healthy"
+                .to_owned()
+        }
+    }
+
     fn chain_serialized_wait_reason(&self, sibling: &WorkExecution, review_held: bool, queue_len: usize) -> String {
         let sibling_task = self
             .resolve_execution_work_item(sibling)
@@ -2292,6 +2318,11 @@ impl ExecutionCoordinator {
         // attempt against the same dead path.
         let paused = self.dispatch_paused.load(Ordering::Acquire);
         let reviews_exempt_from_pause = paused && self.dispatch_pause_exempts_reviews.load(Ordering::Acquire);
+        // Computed once per drain pass (not per row) — stamped on every
+        // `ready` row this pause holds back so the kanban card can render
+        // "Dispatch paused — …" instead of falling through to the generic
+        // "Waiting for a slot" text. See `dispatch_pause_wait_reason`.
+        let pause_wait_reason = paused.then(|| self.dispatch_pause_wait_reason());
 
         let executions = match self.work_db.list_ready_executions() {
             Ok(e) => e,
@@ -2324,6 +2355,11 @@ impl ExecutionCoordinator {
                     review_exempt_count = 0,
                     "drain_ready_queue: dispatch is globally paused — skipping (breaker pause, no exemptions)",
                 );
+                if let Some(reason) = pause_wait_reason.as_deref() {
+                    for execution in &executions {
+                        self.record_dispatch_wait_reason(&execution.id, reason);
+                    }
+                }
                 return DrainOutcome::QueueEmpty;
             }
         }
@@ -2379,6 +2415,9 @@ impl ExecutionCoordinator {
             // returned above), so this holds every non-review row while
             // review rows fall through to normal dispatch below.
             if paused && !is_review {
+                if let Some(reason) = pause_wait_reason.as_deref() {
+                    self.record_dispatch_wait_reason(&execution.id, reason);
+                }
                 continue;
             }
 
@@ -11266,6 +11305,100 @@ mod tests {
         coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Operator);
         coordinator.kick();
         wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
+    }
+
+    /// A row held by a global pause must be stamped with an operator-facing
+    /// `dispatch_wait_reason` — not left with none (or a stale prior
+    /// reason) — so the kanban card can render "Dispatch paused — …"
+    /// instead of falling through to the generic "Waiting for a slot"
+    /// text. Closes the 2026-07-15 incident: a `ready` row with zero
+    /// dispatch events read "Waiting for a slot" for 40+ minutes with 16
+    /// slots free because `drain_ready_queue` returned early without ever
+    /// touching the row's `dispatch_wait_reason`.
+    #[tokio::test]
+    async fn operator_pause_stamps_dispatch_wait_reason_on_held_row() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+        coordinator.kick();
+        sleep(Duration::from_millis(100)).await;
+
+        let reason = db
+            .get_execution(&execution_id)
+            .unwrap()
+            .dispatch_wait_reason
+            .expect("a row held by a global pause must have dispatch_wait_reason stamped");
+        assert!(
+            reason.starts_with("dispatch_paused: "),
+            "wait reason must carry the stable `dispatch_paused: ` marker the app matches on: {reason}"
+        );
+        assert!(
+            reason.contains("operator"),
+            "an operator-originated pause's reason must say so: {reason}"
+        );
+    }
+
+    /// Same as above but for a breaker-originated pause — the reason text
+    /// must name the breaker, not the operator, so the per-card label and
+    /// the health-banner text tell a consistent story.
+    #[tokio::test]
+    async fn breaker_pause_stamps_dispatch_wait_reason_on_held_row() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_review_pool(WorkerPool::new_review(1));
+        let coordinator = Arc::new(coord);
+
+        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Breaker);
+        coordinator.kick();
+        sleep(Duration::from_millis(100)).await;
+
+        let reason = db
+            .get_execution(&execution.id)
+            .unwrap()
+            .dispatch_wait_reason
+            .expect("a review row held by a breaker pause must have dispatch_wait_reason stamped");
+        assert!(
+            reason.starts_with("dispatch_paused: "),
+            "wait reason must carry the stable `dispatch_paused: ` marker the app matches on: {reason}"
+        );
+        assert!(
+            reason.contains("breaker"),
+            "a breaker-originated pause's reason must say so: {reason}"
+        );
     }
 
     /// A breaker-originated pause (the spawn-capability circuit breaker —
