@@ -412,10 +412,12 @@ pub(crate) async fn reap_never_started_spawn(
             ctx.coordinator.as_ref(),
             ctx.dispatch_events,
             ctx.spawn_health,
-            execution_id,
-            work_item_id,
-            distinct,
-            now_epoch_secs,
+            crate::spawn_health::TripSignal {
+                tripping_execution_id: execution_id,
+                tripping_work_item_id: work_item_id,
+                distinct_work_items: distinct,
+                now_epoch_secs,
+            },
         )
         .await;
     }
@@ -786,8 +788,10 @@ mod tests {
         assert!(!coordinator.is_dispatch_paused(), "precondition: dispatch running");
 
         // Threshold of 3 distinct work items; the 4th slot exercises
-        // idempotency (already paused → no second signal).
-        let spawn_health = SpawnHealthTracker::with_config(3, 300);
+        // idempotency (already paused → no second signal). This test exercises
+        // the pause path, so it must opt in explicitly — `with_config`'s
+        // default is now the config-driven `false`.
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(
@@ -875,7 +879,9 @@ mod tests {
             "precondition: operator pause exempts reviews"
         );
 
-        let spawn_health = SpawnHealthTracker::with_config(3, 300);
+        // This test exercises the pause-escalation path, so it must opt in
+        // explicitly — `with_config`'s default is now the config-driven `false`.
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(

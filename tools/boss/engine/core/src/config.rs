@@ -612,7 +612,10 @@ mod tests {
             _ => None,
         })
         .expect("config loads");
-        assert_eq!(config.enable_spawn_capability_breaker, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
+        assert_eq!(
+            config.enable_spawn_capability_breaker,
+            DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER
+        );
         assert!(!config.enable_spawn_capability_breaker, "breaker defaults off");
 
         // Explicit "true" opts in.

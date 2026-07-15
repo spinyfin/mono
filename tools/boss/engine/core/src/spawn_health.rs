@@ -77,7 +77,7 @@
 //! [`resume_dispatch_after_breaker_recovery`].
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use boss_protocol::CreateAttentionItemInput;
@@ -85,6 +85,7 @@ use boss_protocol::CreateAttentionItemInput;
 use crate::app::handler_helpers::{
     METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
 };
+use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
 use crate::coordinator::{DispatchPauseOrigin, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
@@ -114,6 +115,34 @@ pub const SPAWN_HEALTH_PROBE_BACKOFF_BASE_SECS: i64 = 60;
 /// attempt at least this often, rather than backing off forever.
 pub const SPAWN_HEALTH_PROBE_BACKOFF_MAX_SECS: i64 = 900;
 
+/// Deadline (seconds since [`SpawnHealthTracker::mark_probe_dispatched`])
+/// after which an in-flight probe that never resolved through
+/// [`SpawnHealthTracker::record_probe_success`] or
+/// [`SpawnHealthTracker::record_probe_failure`] is treated as failed by
+/// [`SpawnHealthTracker::try_admit_probe`] itself.
+///
+/// Both of those normal resolution paths assume the canary either reports a
+/// shell pid or gets reaped by [`crate::spawn_ack_sweep::reap_never_started_spawn`].
+/// But `force_dispatch` returns as soon as scheduling completes, and the
+/// actual pane spawn happens later in a detached task — if that task's
+/// `adapter.spawn_worker` call itself errors, the execution goes straight to
+/// terminal `failed` with no live slot, which both reap paths skip (a
+/// terminal execution isn't `Spawning` and isn't reap-eligible). Without this
+/// deadline that leaves `in_flight` set forever, so `try_admit_probe` would
+/// refuse to admit a next canary and dispatch would stay Breaker-paused
+/// until a human ran `bossctl dispatch resume` — the exact latch this module
+/// exists to eliminate. Twice
+/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] gives the normal reap
+/// path a full chance to resolve the probe first; this is strictly a
+/// last-resort backstop for the terminal-without-reap case.
+pub const SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS: i64 = 120;
+
+/// Sentinel for [`SpawnHealthTracker::last_disabled_signal_at`] meaning "no
+/// disabled-mode signal has fired yet" — distinct from a real epoch-seconds
+/// timestamp of `0`, so a fresh tracker always signals on its first trip
+/// regardless of what `now_epoch_secs` happens to be (e.g. in tests).
+const NO_DISABLED_SIGNAL_YET: i64 = i64::MIN;
+
 /// Exponential backoff (capped) for the half-open probe after
 /// `consecutive_failures` consecutive failed attempts.
 fn probe_backoff_secs(consecutive_failures: u32) -> i64 {
@@ -133,13 +162,28 @@ fn probe_backoff_secs(consecutive_failures: u32) -> i64 {
 struct ProbeState {
     /// Execution id of the canary currently admitted through the pause, if
     /// any. `try_admit_probe` refuses to admit a second one while this is
-    /// `Some`.
+    /// `Some` — unless it has gone stale, see
+    /// [`SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS`].
     in_flight: Option<String>,
+    /// Epoch seconds at which `in_flight` was set by
+    /// [`SpawnHealthTracker::mark_probe_dispatched`]. Meaningless while
+    /// `in_flight` is `None`.
+    dispatched_at: i64,
     /// Epoch seconds before which no new probe may be admitted.
     next_attempt_at: i64,
     /// Consecutive probe failures since the last success; drives the
     /// exponential backoff in [`probe_backoff_secs`].
     consecutive_failures: u32,
+}
+
+/// Tuning for [`SpawnHealthTracker`]'s failure-window trip: how many
+/// **distinct** work items must fail within how many seconds. Grouped into
+/// its own struct (rather than two more top-level `SpawnHealthTracker`
+/// fields) to keep that struct's field count small.
+#[derive(Debug, Clone, Copy)]
+struct FailureWindowConfig {
+    threshold: usize,
+    window_secs: i64,
 }
 
 /// Cross-work-item failure aggregator for the app spawn path.
@@ -153,24 +197,27 @@ pub struct SpawnHealthTracker {
     /// `(work_item_id, epoch_secs)` of recent spawn failures, pruned to the
     /// window on every `record_failure`.
     recent: Mutex<Vec<(String, i64)>>,
-    threshold: usize,
-    window_secs: i64,
+    window: FailureWindowConfig,
     /// Half-open recovery probe state — see [`ProbeState`].
     probe: Mutex<ProbeState>,
     /// Whether a trip is allowed to actually pause dispatch — see
     /// [`WorkConfig::enable_spawn_capability_breaker`](crate::config::WorkConfig::enable_spawn_capability_breaker)
-    /// and [`Self::with_breaker_enabled`]. Defaults to `true` on the raw
-    /// constructors below so existing (pre-flag) tests keep exercising the
-    /// pause path unchanged; production wiring in `app.rs` always calls
-    /// [`Self::with_breaker_enabled`] with the config value, whose own
-    /// default is `false`.
+    /// and [`Self::with_breaker_enabled`]. Defaults to
+    /// [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] (`false`) on the raw
+    /// constructors below, matching the config default, so a tracker built
+    /// without an explicit [`Self::with_breaker_enabled`] call can never
+    /// silently pause dispatch fleet-wide; production wiring in `app.rs`
+    /// always calls [`Self::with_breaker_enabled`] with the config value.
     breaker_enabled: bool,
-    /// `true` once the disabled-mode "would have tripped" signal has fired
-    /// for the current outage — see [`Self::mark_disabled_trip_signaled`].
-    /// Reset by [`Self::record_success`], mirroring how the enabled path's
-    /// idempotency (`coordinator.is_dispatch_paused()`) clears once dispatch
-    /// recovers.
-    disabled_trip_signaled: AtomicBool,
+    /// Epoch seconds of the last disabled-mode "would have tripped" signal
+    /// for the current outage, or `0` if none has fired yet — see
+    /// [`Self::mark_disabled_trip_signaled`]. Time-windowed (not a one-shot
+    /// latch cleared by [`Self::record_success`]) because in disabled mode
+    /// dispatch never pauses, so spawns keep flowing and `record_success`
+    /// fires on every real shell pid throughout the outage; a flapping spawn
+    /// path would otherwise re-signal (and raise a fresh durable attention
+    /// item) on every single success/failure cycle.
+    last_disabled_signal_at: AtomicI64,
 }
 
 impl Default for SpawnHealthTracker {
@@ -184,15 +231,23 @@ impl SpawnHealthTracker {
         Self::default()
     }
 
-    /// Construct with explicit tuning (tests use tight values).
+    /// Construct with explicit tuning (tests use tight values). Defaults
+    /// `breaker_enabled` to [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`]
+    /// (`false`) — the same safe default as
+    /// [`crate::config::WorkConfig::enable_spawn_capability_breaker`] — so a
+    /// tracker built without an explicit [`Self::with_breaker_enabled`] call
+    /// can never silently pause dispatch fleet-wide. Tests that exercise the
+    /// pause path must opt in explicitly via `.with_breaker_enabled(true)`.
     pub fn with_config(threshold: usize, window_secs: i64) -> Self {
         Self {
             recent: Mutex::new(Vec::new()),
-            threshold: threshold.max(1),
-            window_secs: window_secs.max(1),
+            window: FailureWindowConfig {
+                threshold: threshold.max(1),
+                window_secs: window_secs.max(1),
+            },
             probe: Mutex::new(ProbeState::default()),
-            breaker_enabled: true,
-            disabled_trip_signaled: AtomicBool::new(false),
+            breaker_enabled: DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
+            last_disabled_signal_at: AtomicI64::new(NO_DISABLED_SIGNAL_YET),
         }
     }
 
@@ -210,13 +265,30 @@ impl SpawnHealthTracker {
         self.breaker_enabled
     }
 
-    /// `true` the first time this is called since the last
-    /// [`Self::record_success`] (or construction) — the disabled-mode
-    /// equivalent of the enabled path's `coordinator.is_dispatch_paused()`
-    /// idempotency check, so a sustained outage logs/raises attention once
-    /// per outage instead of on every subsequent failure.
-    fn mark_disabled_trip_signaled(&self) -> bool {
-        !self.disabled_trip_signaled.swap(true, Ordering::AcqRel)
+    /// `true` the first time this is called in [`SPAWN_HEALTH_WINDOW_SECS`]
+    /// of `now_epoch_secs` — the disabled-mode equivalent of the enabled
+    /// path's `coordinator.is_dispatch_paused()` idempotency check, so a
+    /// sustained outage logs/raises attention at most once per window
+    /// instead of on every subsequent failure.
+    ///
+    /// Time-windowed rather than a one-shot latch cleared by
+    /// [`Self::record_success`]: disabled mode never pauses dispatch, so
+    /// spawns keep flowing throughout an outage and `record_success` fires
+    /// on every real shell pid reported in between failures. A flapping
+    /// spawn path (some spawns succeed, some don't) would otherwise clear
+    /// the one-shot latch on every intervening success and raise a fresh
+    /// durable attention item on every subsequent failure burst — several
+    /// per hour is plausible with a multi-worker pool. Windowing instead of
+    /// clearing on success caps it at one signal per window even while the
+    /// outage keeps flapping, while a genuinely separate outage — one that
+    /// starts more than a window after the last signal — still gets its own.
+    fn mark_disabled_trip_signaled(&self, now_epoch_secs: i64) -> bool {
+        let last = self.last_disabled_signal_at.load(Ordering::Acquire);
+        if last != NO_DISABLED_SIGNAL_YET && now_epoch_secs.saturating_sub(last) < self.window.window_secs {
+            return false;
+        }
+        self.last_disabled_signal_at.store(now_epoch_secs, Ordering::Release);
+        true
     }
 
     /// Record one never-started spawn for `work_item_id` at `now_epoch_secs`.
@@ -232,27 +304,32 @@ impl SpawnHealthTracker {
     /// already paused), so the loud signal fires exactly once per outage.
     pub fn record_failure(&self, work_item_id: &str, now_epoch_secs: i64) -> Option<usize> {
         let mut recent = self.recent.lock().unwrap();
-        let cutoff = now_epoch_secs - self.window_secs;
+        let cutoff = now_epoch_secs - self.window.window_secs;
         recent.retain(|(_, ts)| *ts >= cutoff);
         recent.push((work_item_id.to_owned(), now_epoch_secs));
         let distinct: HashSet<&str> = recent.iter().map(|(w, _)| w.as_str()).collect();
         let distinct = distinct.len();
-        (distinct >= self.threshold).then_some(distinct)
+        (distinct >= self.window.threshold).then_some(distinct)
     }
 
     /// Reset the breaker. Called when a spawn provably worked (a real shell
     /// pid was reported) or a fresh app session registered, so stale
-    /// pre-recovery failures no longer count toward a trip. Also clears the
-    /// disabled-mode trip signal, so the next outage gets a fresh "would
-    /// have tripped" log/attention rather than staying silent forever.
+    /// pre-recovery failures no longer count toward a trip.
+    ///
+    /// Deliberately does NOT clear the disabled-mode signal window
+    /// ([`Self::mark_disabled_trip_signaled`]): in disabled mode dispatch
+    /// never pauses, so this fires on every real shell pid throughout an
+    /// outage, including in between bursts of a flapping spawn path. Letting
+    /// a success reset the window would re-arm the signal on every flap and
+    /// raise a fresh durable attention item per burst; a genuinely new
+    /// outage still gets its own signal once the window elapses.
     pub fn record_success(&self) {
         self.recent.lock().unwrap().clear();
-        self.disabled_trip_signaled.store(false, Ordering::Release);
     }
 
     /// Window length in seconds (for the trip event's `details`).
     pub fn window_secs(&self) -> i64 {
-        self.window_secs
+        self.window.window_secs
     }
 
     /// `true` if the half-open recovery probe may be admitted right now: no
@@ -260,17 +337,40 @@ impl SpawnHealthTracker {
     /// has elapsed. Peek-only — does not itself claim anything. The caller
     /// still has to find a ready execution and dispatch it, then call
     /// [`Self::mark_probe_dispatched`] once that actually succeeds.
+    ///
+    /// Also the backstop for a canary that never resolves through either
+    /// normal path (see [`SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS`]): a probe
+    /// still `in_flight` after the stall deadline is treated as failed right
+    /// here — cleared and backed off exactly like
+    /// [`Self::record_probe_failure`] would — so the probe cycle can never
+    /// wedge open forever.
     pub fn try_admit_probe(&self, now_epoch_secs: i64) -> bool {
-        let probe = self.probe.lock().unwrap();
+        let mut probe = self.probe.lock().unwrap();
+        if probe.in_flight.is_some()
+            && now_epoch_secs.saturating_sub(probe.dispatched_at) >= SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS
+        {
+            tracing::warn!(
+                stalled_execution_id = probe.in_flight.as_deref().unwrap_or_default(),
+                "spawn-capability breaker: in-flight recovery probe went stale without resolving; \
+                 treating as failed so the probe cycle does not wedge open",
+            );
+            probe.in_flight = None;
+            probe.consecutive_failures = probe.consecutive_failures.saturating_add(1);
+            probe.next_attempt_at = now_epoch_secs + probe_backoff_secs(probe.consecutive_failures);
+        }
         probe.in_flight.is_none() && now_epoch_secs >= probe.next_attempt_at
     }
 
     /// Record that `execution_id` is the canary admitted through the
-    /// Breaker pause. Until it resolves (success or
-    /// [`Self::record_probe_failure`]), [`Self::try_admit_probe`] returns
-    /// `false` — only one probe is ever in flight at a time.
-    pub fn mark_probe_dispatched(&self, execution_id: &str) {
-        self.probe.lock().unwrap().in_flight = Some(execution_id.to_owned());
+    /// Breaker pause at `now_epoch_secs`. Until it resolves (success,
+    /// [`Self::record_probe_failure`], or the
+    /// [`SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS`] backstop in
+    /// [`Self::try_admit_probe`]), further admission is refused — only one
+    /// probe is ever in flight at a time.
+    pub fn mark_probe_dispatched(&self, execution_id: &str, now_epoch_secs: i64) {
+        let mut probe = self.probe.lock().unwrap();
+        probe.in_flight = Some(execution_id.to_owned());
+        probe.dispatched_at = now_epoch_secs;
     }
 
     /// `true` if `execution_id` is the currently in-flight recovery probe.
@@ -353,7 +453,13 @@ pub async fn maybe_admit_recovery_probe(
             return;
         }
     };
-    let Some(candidate) = ready.first() else {
+    // `list_ready_executions` orders by dispatch class then FIFO, so
+    // `.first()` would be the fleet's single most urgent row (typically a
+    // merge-conflict revision) — sacrificing it repeatedly to a sustained
+    // outage's probes would burn the highest-priority work first. `.last()`
+    // proves the same thing about the spawn path while spending the least
+    // urgent ready row instead.
+    let Some(candidate) = ready.last() else {
         // Nothing to probe with yet; try again on the next sweep tick.
         return;
     };
@@ -364,7 +470,7 @@ pub async fn maybe_admit_recovery_probe(
     );
     match coordinator.force_dispatch(&candidate.id).await {
         Ok(worker_id) => {
-            spawn_health.mark_probe_dispatched(&candidate.id);
+            spawn_health.mark_probe_dispatched(&candidate.id, now_epoch_secs);
             tracing::info!(
                 execution_id = %candidate.id,
                 worker_id,
@@ -424,11 +530,25 @@ pub async fn resume_dispatch_after_breaker_recovery(
     tracing::warn!(reason, "spawn-capability breaker: auto-resuming dispatch");
     dispatch_events
         .emit(
-            DispatchEvent::new(Stage::SpawnCapabilityRecovered, Outcome::Ok, execution_id.unwrap_or("engine"))
-                .with_details(serde_json::json!({ "reason": reason })),
+            DispatchEvent::new(
+                Stage::SpawnCapabilityRecovered,
+                Outcome::Ok,
+                execution_id.unwrap_or("engine"),
+            )
+            .with_details(serde_json::json!({ "reason": reason })),
         )
         .await;
     true
+}
+
+/// The failure that tripped the breaker, bundled so
+/// [`trip_spawn_capability_circuit`] stays under the clippy argument-count
+/// limit.
+pub struct TripSignal<'a> {
+    pub tripping_execution_id: &'a str,
+    pub tripping_work_item_id: &'a str,
+    pub distinct_work_items: usize,
+    pub now_epoch_secs: i64,
 }
 
 /// Act on a tripped spawn-capability breaker: always log loudly and raise
@@ -453,8 +573,11 @@ pub async fn resume_dispatch_after_breaker_recovery(
 /// **Disabled:** idempotency instead comes from
 /// [`SpawnHealthTracker::mark_disabled_trip_signaled`] (dispatch is never
 /// paused in this mode, so `coordinator.is_dispatch_paused()` can't serve as
-/// the dedup signal) — one log line and one attention item per outage, reset
-/// by the next [`SpawnHealthTracker::record_success`].
+/// the dedup signal) — at most one log line and one attention item per
+/// [`SPAWN_HEALTH_WINDOW_SECS`] window, deliberately NOT reset by
+/// [`SpawnHealthTracker::record_success`] (see that method's docs) so a
+/// flapping spawn path can't spam a fresh attention item on every
+/// success/failure cycle.
 ///
 /// ## Persistence (enabled mode only)
 ///
@@ -469,11 +592,14 @@ pub async fn trip_spawn_capability_circuit(
     coordinator: &ExecutionCoordinator,
     dispatch_events: &dyn DispatchEventSink,
     spawn_health: &SpawnHealthTracker,
-    tripping_execution_id: &str,
-    tripping_work_item_id: &str,
-    distinct_work_items: usize,
-    now_epoch_secs: i64,
+    trip: TripSignal<'_>,
 ) {
+    let TripSignal {
+        tripping_execution_id,
+        tripping_work_item_id,
+        distinct_work_items,
+        now_epoch_secs,
+    } = trip;
     let breaker_enabled = spawn_health.breaker_enabled();
 
     if breaker_enabled {
@@ -502,7 +628,7 @@ pub async fn trip_spawn_capability_circuit(
                  applied in-memory but will revert on engine restart",
             );
         }
-    } else if !spawn_health.mark_disabled_trip_signaled() {
+    } else if !spawn_health.mark_disabled_trip_signaled(now_epoch_secs) {
         tracing::debug!(
             tripping_execution_id,
             "spawn-capability breaker: disabled by config; already signaled this outage, skipping duplicate",
@@ -773,18 +899,45 @@ mod tests {
     fn mark_probe_dispatched_blocks_further_admission() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
         assert!(tracker.try_admit_probe(1000));
-        tracker.mark_probe_dispatched("exec-1");
-        // Only one probe in flight at a time, regardless of how much later.
+        tracker.mark_probe_dispatched("exec-1", 1000);
+        // Only one probe in flight at a time, within the stall deadline.
         assert!(!tracker.try_admit_probe(1000));
-        assert!(!tracker.try_admit_probe(50_000));
+        assert!(!tracker.try_admit_probe(1000 + SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS - 1));
         assert!(tracker.is_probe_execution("exec-1"));
         assert!(!tracker.is_probe_execution("exec-2"));
     }
 
     #[test]
+    fn stalled_probe_is_treated_as_failed_after_the_deadline() {
+        // Regression: a canary that terminates by some route other than
+        // record_probe_success/record_probe_failure (e.g. the detached spawn
+        // task's adapter.spawn_worker erroring, which flips the execution
+        // straight to terminal `failed` with no live slot for either reap
+        // path to catch) must not leak `in_flight` forever and permanently
+        // re-latch dispatch. try_admit_probe itself is the backstop.
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        tracker.mark_probe_dispatched("exec-1", 1000);
+        assert!(!tracker.try_admit_probe(1000 + SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS - 1));
+
+        // At the deadline the stalled probe is cleared and treated exactly
+        // like a normal `record_probe_failure` — including the base backoff —
+        // so admission isn't immediate; it lands one base-backoff later.
+        let stall_hit_at = 1000 + SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS;
+        assert!(
+            !tracker.try_admit_probe(stall_hit_at),
+            "the normal post-failure backoff still applies once the stalled probe is cleared",
+        );
+        assert!(!tracker.is_probe_execution("exec-1"), "the stalled probe was cleared");
+        assert!(
+            tracker.try_admit_probe(stall_hit_at + SPAWN_HEALTH_PROBE_BACKOFF_BASE_SECS),
+            "a probe stuck in-flight past the stall deadline must eventually admit a new one",
+        );
+    }
+
+    #[test]
     fn probe_failure_clears_in_flight_and_backs_off() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.mark_probe_dispatched("exec-1");
+        tracker.mark_probe_dispatched("exec-1", 1000);
         assert!(!tracker.try_admit_probe(1000));
 
         tracker.record_probe_failure("exec-1", 1000);
@@ -803,9 +956,12 @@ mod tests {
         let mut now = 0i64;
         let expected_backoffs = [60, 120, 240, 480, 900, 900];
         for &backoff in &expected_backoffs {
-            tracker.mark_probe_dispatched("exec-1");
+            tracker.mark_probe_dispatched("exec-1", now);
             tracker.record_probe_failure("exec-1", now);
-            assert!(!tracker.try_admit_probe(now + backoff - 1), "backoff={backoff} at now={now}");
+            assert!(
+                !tracker.try_admit_probe(now + backoff - 1),
+                "backoff={backoff} at now={now}"
+            );
             assert!(tracker.try_admit_probe(now + backoff), "backoff={backoff} at now={now}");
             now += backoff;
         }
@@ -814,18 +970,24 @@ mod tests {
     #[test]
     fn probe_failure_for_a_different_execution_is_a_no_op() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.mark_probe_dispatched("exec-1");
+        tracker.mark_probe_dispatched("exec-1", 1000);
         // An unrelated reap (e.g. a normal orphaned execution during the
         // same outage) must not disturb this probe's own schedule.
         tracker.record_probe_failure("exec-unrelated", 1000);
-        assert!(tracker.is_probe_execution("exec-1"), "unrelated failure left the real probe untouched");
-        assert!(!tracker.try_admit_probe(1000), "no backoff was applied by the unrelated call");
+        assert!(
+            tracker.is_probe_execution("exec-1"),
+            "unrelated failure left the real probe untouched"
+        );
+        assert!(
+            !tracker.try_admit_probe(1000),
+            "no backoff was applied by the unrelated call"
+        );
     }
 
     #[test]
     fn probe_success_resets_state_and_only_for_the_matching_execution() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.mark_probe_dispatched("exec-1");
+        tracker.mark_probe_dispatched("exec-1", 1000);
         assert!(
             !tracker.record_probe_success("exec-other"),
             "success report for a non-probe execution does not complete the probe"
@@ -834,17 +996,20 @@ mod tests {
 
         assert!(tracker.record_probe_success("exec-1"));
         assert!(!tracker.is_probe_execution("exec-1"));
-        assert!(tracker.try_admit_probe(0), "a completed probe cycle starts the next one fresh");
+        assert!(
+            tracker.try_admit_probe(0),
+            "a completed probe cycle starts the next one fresh"
+        );
     }
 
     #[test]
     fn probe_success_clears_accumulated_backoff() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.mark_probe_dispatched("exec-1");
+        tracker.mark_probe_dispatched("exec-1", 1000);
         tracker.record_probe_failure("exec-1", 1000);
         assert!(!tracker.try_admit_probe(1000), "backed off after a failure");
 
-        tracker.mark_probe_dispatched("exec-2");
+        tracker.mark_probe_dispatched("exec-2", 1000);
         assert!(tracker.record_probe_success("exec-2"));
         // No leftover backoff from the prior failed attempt.
         assert!(tracker.try_admit_probe(1000));
@@ -853,9 +1018,9 @@ mod tests {
     #[test]
     fn reset_probe_clears_in_flight_and_backoff_unconditionally() {
         let tracker = SpawnHealthTracker::with_config(3, 300);
-        tracker.mark_probe_dispatched("exec-1");
+        tracker.mark_probe_dispatched("exec-1", 1000);
         tracker.record_probe_failure("exec-1", 1000);
-        tracker.mark_probe_dispatched("exec-2");
+        tracker.mark_probe_dispatched("exec-2", 1000);
         assert!(!tracker.try_admit_probe(1000));
 
         tracker.reset_probe();
@@ -864,7 +1029,6 @@ mod tests {
     }
 
     // ─── maybe_admit_recovery_probe / resume_dispatch_after_breaker_recovery ──
-
 
     use crate::dispatch_events::{NoopDispatchEventSink, RecordingDispatchEventSink};
     use crate::test_support::*;
@@ -915,7 +1079,11 @@ mod tests {
 
         assert!(!spawn_health.is_probe_execution(&execution.id));
         let reloaded = db.get_execution(&execution.id).unwrap();
-        assert_eq!(reloaded.status, ExecutionStatus::Ready, "untouched — normal dispatch owns this row");
+        assert_eq!(
+            reloaded.status,
+            ExecutionStatus::Ready,
+            "untouched — normal dispatch owns this row"
+        );
     }
 
     #[tokio::test]
@@ -952,16 +1120,24 @@ mod tests {
         let coordinator = make_dispatchable_coordinator(db.clone(), 4);
         coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Breaker);
 
+        // The canary is picked from the *least* urgent ready row (`.last()`)
+        // so a sustained outage's probes don't repeatedly burn the fleet's
+        // highest-priority work — `second` (created later, so ordered last
+        // by the FIFO tiebreak) is the one admitted, not `first`.
         let spawn_health = SpawnHealthTracker::new();
         maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
-        assert!(spawn_health.is_probe_execution(&first.id));
+        assert!(spawn_health.is_probe_execution(&second.id));
 
         // A second tick while the first probe is unresolved must not admit
         // the other ready execution too.
         maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1001).await;
-        assert!(spawn_health.is_probe_execution(&first.id), "still the original probe");
-        let second_reloaded = db.get_execution(&second.id).unwrap();
-        assert_eq!(second_reloaded.status, ExecutionStatus::Ready, "held — only one probe at a time");
+        assert!(spawn_health.is_probe_execution(&second.id), "still the original probe");
+        let first_reloaded = db.get_execution(&first.id).unwrap();
+        assert_eq!(
+            first_reloaded.status,
+            ExecutionStatus::Ready,
+            "held — only one probe at a time"
+        );
     }
 
     #[tokio::test]
@@ -1017,20 +1193,35 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         assert!(!coordinator.is_dispatch_paused(), "precondition");
 
-        // `with_config` defaults to enabled=true; explicitly disable to
-        // exercise the flag-off path production wiring uses by default.
+        // `with_config` now defaults to disabled (matching production), but
+        // set it explicitly here since this test is specifically about the
+        // flag-off path.
         let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(false);
         let sink = RecordingDispatchEventSink::new();
 
-        trip_spawn_capability_circuit(&db, &coordinator, &sink, &spawn_health, &execution.id, &work_item_id, 3, 1000)
-            .await;
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
 
         assert!(
             !coordinator.is_dispatch_paused(),
             "a disabled breaker must never pause dispatch"
         );
         let events = sink.events().await;
-        let unhealthy: Vec<_> = events.iter().filter(|e| e.stage == "spawn_capability_unhealthy").collect();
+        let unhealthy: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "spawn_capability_unhealthy")
+            .collect();
         assert_eq!(unhealthy.len(), 1, "observability event still fires");
         assert_eq!(unhealthy[0].details["breaker_enabled"], serde_json::json!(false));
         assert_eq!(unhealthy[0].details["dispatch_paused"], serde_json::json!(false));
@@ -1043,7 +1234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_breaker_signals_once_per_outage_then_resets_on_success() {
+    async fn disabled_breaker_signals_once_per_window_and_ignores_intervening_success() {
         let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1053,27 +1244,95 @@ mod tests {
         let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(false);
         let sink = RecordingDispatchEventSink::new();
 
-        trip_spawn_capability_circuit(&db, &coordinator, &sink, &spawn_health, &execution.id, &work_item_id, 3, 1000)
-            .await;
-        trip_spawn_capability_circuit(&db, &coordinator, &sink, &spawn_health, &execution.id, &work_item_id, 4, 1001)
-            .await;
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 4,
+                now_epoch_secs: 1001,
+            },
+        )
+        .await;
         let events = sink.events().await;
         assert_eq!(
-            events.iter().filter(|e| e.stage == "spawn_capability_unhealthy").count(),
+            events
+                .iter()
+                .filter(|e| e.stage == "spawn_capability_unhealthy")
+                .count(),
             1,
             "still-tripped repeats within the same outage must not spam the signal",
         );
 
-        // Recovery (a real shell pid, or a fresh app session) clears the
-        // signal, so a fresh outage gets its own attention item.
+        // Regression: in disabled mode dispatch never pauses, so spawns keep
+        // flowing and `record_success` can fire in between failure bursts of
+        // a flapping outage. That success must NOT re-arm the signal window —
+        // a re-trip 1s later (still inside the 300s window) must stay
+        // suppressed, or a flapping spawn path would raise a fresh durable
+        // attention item on every burst.
         spawn_health.record_success();
-        trip_spawn_capability_circuit(&db, &coordinator, &sink, &spawn_health, &execution.id, &work_item_id, 3, 2000)
-            .await;
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1002,
+            },
+        )
+        .await;
         let events = sink.events().await;
         assert_eq!(
-            events.iter().filter(|e| e.stage == "spawn_capability_unhealthy").count(),
+            events
+                .iter()
+                .filter(|e| e.stage == "spawn_capability_unhealthy")
+                .count(),
+            1,
+            "an intervening success must not re-arm the signal window while still inside it",
+        );
+
+        // Once the window has genuinely elapsed, a fresh outage gets its own
+        // attention item regardless of whether `record_success` fired.
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 2000,
+            },
+        )
+        .await;
+        let events = sink.events().await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.stage == "spawn_capability_unhealthy")
+                .count(),
             2,
-            "a fresh outage after recovery gets its own signal",
+            "a new outage after the window elapses gets its own signal",
         );
     }
 
@@ -1085,14 +1344,27 @@ mod tests {
         let execution = create_ready_chore_execution(&db, &work_item_id);
         let coordinator = make_coordinator(db.clone(), 1);
 
-        let spawn_health = SpawnHealthTracker::with_config(3, 300);
-        assert!(spawn_health.breaker_enabled(), "with_config defaults enabled");
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
         let sink = RecordingDispatchEventSink::new();
 
-        trip_spawn_capability_circuit(&db, &coordinator, &sink, &spawn_health, &execution.id, &work_item_id, 3, 1000)
-            .await;
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
 
-        assert!(coordinator.is_dispatch_paused(), "enabled mode still pauses dispatch on trip");
+        assert!(
+            coordinator.is_dispatch_paused(),
+            "enabled mode still pauses dispatch on trip"
+        );
         let events = sink.events().await;
         let unhealthy = &events[0];
         assert_eq!(unhealthy.details["breaker_enabled"], serde_json::json!(true));
