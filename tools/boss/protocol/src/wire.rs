@@ -1818,6 +1818,15 @@ pub enum TopicEventPayload {
     /// Emitted to the `"editorial_actions.<product_id>"` topic so the UI
     /// can badge product cards when actions accumulate.
     WorkEditorialAction { action: EditorialAction },
+    /// The engine dropped one or more pending invalidations for this
+    /// session's outbound queue while riding out a publish burst (a
+    /// merge-poller sweep across many products/executions, for example)
+    /// rather than disconnecting a client that was draining fine, just not
+    /// fast enough for an instant. The app should treat this the same way
+    /// it treats reconnecting — refetch its subscribed topics — without
+    /// tearing down or reporting the connection as lost, since it never
+    /// was.
+    ResyncRequired,
 }
 
 #[cfg(test)]

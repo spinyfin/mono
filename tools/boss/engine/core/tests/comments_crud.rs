@@ -206,6 +206,9 @@ async fn comment_topic_invalidation_reaches_subscriber() -> Result<()> {
         TopicEventPayload::WorkEditorialAction { .. } => {
             panic!("unexpected editorial action on comment topic")
         }
+        TopicEventPayload::ResyncRequired => {
+            panic!("unexpected resync marker on comment topic")
+        }
     }
 
     Ok(())

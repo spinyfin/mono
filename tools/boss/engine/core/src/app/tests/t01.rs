@@ -122,16 +122,85 @@ fn coalescing_indices_survive_pops_of_other_topics() {
     assert_eq!(q.pop_front().unwrap().revision, Some(3));
 }
 
+/// A client that's actively draining (the head-of-line entry is young) must
+/// not be disconnected just because a burst outran the cap for an instant —
+/// incident 2026-07-14, where sessions were torn down with `oldest_age_ms`
+/// of only ~1.3-1.8s. Overflow instead drops the oldest pending entry (plus
+/// a second, to make room for a resync marker admitted alongside it — see
+/// `admit_under_pressure`), admits the new envelope, and leaves the client
+/// connected.
 #[test]
-fn enqueue_marks_slow_when_queue_is_full() {
+fn enqueue_degrades_gracefully_when_queue_is_full_but_client_is_draining() {
     let mut q = SessionQueue::new();
-    // Fill with non-coalescing responses up to the cap.
+    // Fill with non-coalescing responses up to the cap. Enqueued back to
+    // back like this, the head-of-line entry is always well under
+    // `STUCK_CLIENT_AGE_MS`.
     for i in 0..MAX_SESSION_QUEUE {
         assert_eq!(
             q.enqueue(response_envelope(&format!("r-{i}"))),
             EnqueueOutcome::Enqueued
         );
     }
+    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Degraded);
+    assert!(!q.slow, "a draining client must not latch the disconnect flag");
+    assert_eq!(q.items.len(), MAX_SESSION_QUEUE, "depth stays bounded at the cap");
+    assert!(
+        q.pending_topics.contains_key(RESYNC_TOPIC),
+        "a resync marker must be pending"
+    );
+    // r-0 was dropped to make room for the new envelope, and r-1 was
+    // dropped to make room for the resync marker admitted alongside it.
+    assert_eq!(q.items.front().unwrap().1.request_id.as_deref(), Some("r-2"));
+    assert_eq!(q.items.back().unwrap().1.request_id.as_deref(), Some("overflow"));
+    // Subsequent enqueues keep degrading rather than disconnecting. The
+    // resync marker is already pending, so this overflow drops only one
+    // more entry.
+    assert_eq!(q.enqueue(response_envelope("after-overflow")), EnqueueOutcome::Degraded);
+    assert_eq!(q.items.front().unwrap().1.request_id.as_deref(), Some("r-3"));
+}
+
+/// The resync marker must actually reach the client — dropping entries
+/// silently would violate "no event loss without a resync".
+#[test]
+fn degraded_admission_delivers_a_resync_marker() {
+    let mut q = SessionQueue::new();
+    for i in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            q.enqueue(response_envelope(&format!("r-{i}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Degraded);
+
+    let mut saw_marker = false;
+    while let Some(env) = q.pop_front() {
+        if let FrontendEvent::TopicEvent { topic, event, .. } = &env.payload
+            && topic == RESYNC_TOPIC
+        {
+            assert!(matches!(event, TopicEventPayload::ResyncRequired));
+            saw_marker = true;
+        }
+    }
+    assert!(
+        saw_marker,
+        "resync marker must actually be delivered, not just tracked internally"
+    );
+}
+
+/// The mirror case: a head-of-line entry that's genuinely old (the client
+/// isn't draining at all, not just momentarily behind a burst) still
+/// disconnects — dropping entries indefinitely for a truly wedged client
+/// would balloon engine memory forever.
+#[test]
+fn enqueue_marks_slow_when_client_is_genuinely_stuck() {
+    let mut q = SessionQueue::new();
+    for i in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            q.enqueue(response_envelope(&format!("r-{i}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
     assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Slow);
     assert!(q.slow);
     // Subsequent enqueues continue to report Slow.
@@ -158,6 +227,10 @@ fn enqueue_recovers_from_slow_after_draining_to_empty() {
             EnqueueOutcome::Enqueued
         );
     }
+    // Back-date the head-of-line entry to simulate a genuinely stuck
+    // client — a merely bursty one degrades gracefully instead of
+    // latching `slow` (see `enqueue_degrades_gracefully_...`).
+    q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
     // One past the cap latches the slow flag.
     assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Slow);
     assert!(q.slow);
@@ -193,10 +266,15 @@ fn queue_stats_reports_depth_and_backpressure_flags() {
     assert_eq!(s.depth, 2);
     assert!(!s.slow);
 
-    // Fill past the cap to latch slow; depth saturates at the cap.
-    for i in 0..MAX_SESSION_QUEUE {
+    // Fill to exactly the cap, then back-date the head-of-line entry and
+    // push one more to latch `slow` (a merely bursty client would instead
+    // degrade gracefully — see `enqueue_degrades_gracefully_...`). Depth
+    // saturates at the cap either way.
+    for i in 0..(MAX_SESSION_QUEUE - 2) {
         q.enqueue(response_envelope(&format!("f-{i}")));
     }
+    q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
+    q.enqueue(response_envelope("overflow"));
     let full = q.stats();
     assert!(full.slow);
     assert_eq!(full.depth, MAX_SESSION_QUEUE);
@@ -218,6 +296,11 @@ fn priority_event_jumps_ahead_of_saturated_bulk_lane() {
             EnqueueOutcome::Enqueued
         );
     }
+    // Simulate a genuinely stuck client so the bulk lane latches `slow`
+    // (a merely bursty-but-draining client would instead degrade
+    // gracefully without ever latching — see
+    // `enqueue_degrades_gracefully_...`).
+    q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
     // The bulk lane is full and latched slow — a further *bulk* enqueue is
     // rejected...
     assert_eq!(q.enqueue(response_envelope("bulk-overflow")), EnqueueOutcome::Slow);
@@ -309,13 +392,17 @@ async fn broker_publish_disconnects_slow_subscriber() {
     let sink = Arc::new(SessionSink::new(tx));
 
     // Pre-fill the sink past capacity by injecting non-coalescing entries
-    // (responses are not coalesced) without ever draining.
+    // (responses are not coalesced) without ever draining, then back-date
+    // the head-of-line entry so the next overflow reads as a genuinely
+    // stuck client rather than a graceful degrade (see
+    // `enqueue_degrades_gracefully_...`).
     {
         let mut q = sink.queue.lock().unwrap();
         for i in 0..MAX_SESSION_QUEUE {
             let outcome = q.enqueue(response_envelope(&format!("r-{i}")));
             assert_eq!(outcome, EnqueueOutcome::Enqueued);
         }
+        q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
     }
 
     let broker = TopicBroker::default();
@@ -336,6 +423,39 @@ async fn broker_publish_disconnects_slow_subscriber() {
     let inner = broker.inner.lock().await;
     assert!(!inner.sinks.contains_key("session-1"));
     assert!(!inner.sessions_by_topic.contains_key("work.products"));
+}
+
+/// The 2026-07-14 incident: a session whose queue is full but whose
+/// head-of-line entry is fresh (a burst, not a wedge) must stay connected.
+/// `TopicBroker::publish` is the exact call site that used to disconnect it.
+#[tokio::test]
+async fn broker_publish_degrades_bursty_subscriber_without_disconnecting() {
+    let (tx, mut rx) = oneshot::channel::<()>();
+    let sink = Arc::new(SessionSink::new(tx));
+
+    // Pre-fill the sink past capacity with fresh, back-to-back entries —
+    // the "bursty but draining" case, deliberately not back-dated.
+    {
+        let mut q = sink.queue.lock().unwrap();
+        for i in 0..MAX_SESSION_QUEUE {
+            let outcome = q.enqueue(response_envelope(&format!("r-{i}")));
+            assert_eq!(outcome, EnqueueOutcome::Enqueued);
+        }
+    }
+
+    let broker = TopicBroker::default();
+    broker.register_session("session-1", sink.clone()).await;
+    broker.subscribe("session-1", &["work.products".to_owned()]).await;
+
+    broker
+        .publish("work.products", topic_envelope("work.products", 99))
+        .await;
+
+    // No shutdown fires — the session stays connected and registered.
+    let shutdown = tokio::time::timeout(std::time::Duration::from_millis(200), &mut rx).await;
+    assert!(shutdown.is_err(), "a draining session must not be disconnected");
+    let inner = broker.inner.lock().await;
+    assert!(inner.sinks.contains_key("session-1"));
 }
 
 /// The engine-health helper must surface a
@@ -790,6 +910,9 @@ async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
                 EnqueueOutcome::Enqueued
             );
         }
+        // Back-date the head-of-line entry so overflow latches `slow`
+        // (a genuine stuck-client signal) instead of degrading gracefully.
+        q.backdate_oldest_bulk_entry(STUCK_CLIENT_AGE_MS + 100);
         // One past the cap latches the bulk-lane `slow` backpressure flag.
         assert_eq!(q.enqueue(response_envelope("bulk-overflow")), EnqueueOutcome::Slow);
         assert!(q.slow, "bulk lane must have latched slow past the cap");
