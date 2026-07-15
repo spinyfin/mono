@@ -18,6 +18,8 @@ pub mod awaiting_input_status;
 pub mod background_children;
 pub mod background_work;
 pub mod blocking_signal;
+pub mod boothby_events;
+pub mod boothby_scheduler;
 pub mod boss_construct_scan;
 pub mod build_info;
 pub mod build_wait;

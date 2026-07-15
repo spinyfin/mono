@@ -42,9 +42,9 @@ use crate::protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
     HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
-    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH,
-    TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
-    editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_BOOTHBY_ACTIVITY,
+    TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload,
+    comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::runner::ExecutionRunner;
@@ -77,6 +77,7 @@ mod app_session;
 pub(crate) mod attachments;
 mod attentions;
 mod automations;
+mod boothby;
 mod broadcasts;
 mod ci_remediation;
 mod comments;
@@ -1052,6 +1053,17 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
+    /// Boothby's event-trigger queue (`boothby.md` §"Activation model").
+    /// Armed by [`crate::dispatch_events::BoothbyEventSink`] (dispatch-stage
+    /// triggers) and by `WorkDb::create_attention_item` (attention-kind
+    /// triggers); consulted by [`crate::boothby_scheduler::spawn_loop`].
+    boothby_events: Arc<crate::boothby_events::BoothbyEventQueue>,
+    /// Wakes the Boothby scheduler loop for reasons unrelated to an event
+    /// trigger — a manual `RunBoothbyPass`, or `SetBoothbyMode` flipping the
+    /// mode off `off`. The same `Notify` `boothby_events` arms internally
+    /// (`BoothbyEventQueue::kick_handle`), so either path wakes the same
+    /// sleeping loop.
+    boothby_kick: Arc<Notify>,
     /// Secret token written to the control-token file at startup. A
     /// frontend `Shutdown { token }` RPC must match this value to
     /// trigger graceful exit. `None` only in tests / in-process
@@ -1074,6 +1086,19 @@ struct ServerState {
     /// wheel's background task.
     #[builder(default)]
     timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
+}
+
+/// Lets [`crate::boothby_scheduler::spawn_loop`] push pass-lifecycle changes
+/// onto the `boothby.activity` topic without depending on `ServerState`
+/// directly (the scheduler module only knows `WorkDb` and trait objects — see
+/// its module doc). `Arc<ServerState>` coerces to
+/// `Arc<dyn BoothbyActivitySink>` at the `spawn_loop` call site in
+/// `app::server::serve`.
+#[async_trait]
+impl crate::boothby_scheduler::BoothbyActivitySink for ServerState {
+    async fn pass_changed(&self, pass: &boss_protocol::BoothbyPass) {
+        self.broadcast_boothby_activity(pass.clone()).await;
+    }
 }
 
 impl ServerState {
@@ -1532,6 +1557,28 @@ impl ServerState {
         // The evidence blob store lands under the same root, next to
         // `state.db`, so an install's data is one directory.
         let attachment_state_root: PathBuf = state_root.clone();
+
+        // Dispatch-event JSONL stream lands next to state.db /
+        // events.sock under the same `state_root` resolved above.
+        let dispatch_event_root: PathBuf = state_root.clone();
+
+        // Boothby's event-trigger queue (`boothby.md` §"Activation model"):
+        // armed either by a dispatch-stage sink (below, fanned out alongside
+        // the production JSONL sink) or by the attention-creation hook
+        // registered on `work_db` just below. `boothby_kick` doubles as the
+        // scheduler's wake signal for reasons unrelated to an event trigger
+        // (manual run, mode change) — see `app::server::serve`.
+        let boothby_kick = Arc::new(Notify::new());
+        let boothby_events = crate::boothby_events::BoothbyEventQueue::new(boothby_kick.clone());
+        work_db.set_boothby_event_queue(boothby_events.clone());
+        let boothby_events_for_state = boothby_events.clone();
+        let boothby_kick_for_state = boothby_kick.clone();
+
+        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
+            Arc::new(crate::dispatch_events::FanOutDispatchEventSink::new(vec![
+                Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
+                Arc::new(crate::dispatch_events::BoothbyEventSink::new(boothby_events.clone())),
+            ]));
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
@@ -1678,6 +1725,8 @@ impl ServerState {
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
                 .pr_reconciler_kick(pr_reconciler_kick_for_state)
+                .boothby_events(boothby_events_for_state)
+                .boothby_kick(boothby_kick_for_state)
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)
@@ -2320,6 +2369,16 @@ impl ServerState {
         signal_shell_pids(&pids, kill_grace);
     }
 
+    /// Push a `boothby_passes` row on the `boothby.activity` topic. Called
+    /// whenever a pass opens or closes (via
+    /// [`crate::boothby_scheduler::BoothbyActivitySink`], implemented below
+    /// for `ServerState`) so the Boothby tab's pass history and audit feed
+    /// update without polling.
+    pub async fn broadcast_boothby_activity(&self, pass: boss_protocol::BoothbyPass) {
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::BoothbyActivity { pass });
+        self.topic_broker.publish(TOPIC_BOOTHBY_ACTIVITY, envelope).await;
+    }
+
     fn current_work_revision(&self) -> u64 {
         self.work_revision.load(Ordering::SeqCst)
     }
@@ -2710,6 +2769,7 @@ async fn handle_frontend_connection(
                     automations::handle_get_automation_open_task_count(ctx, r).await
                 }
                 r @ FrontendRequest::GetAutomationState => engine_meta::handle_get_automation_state(ctx, r).await,
+                r @ FrontendRequest::GetBoothbyState => boothby::handle_get_boothby_state(ctx, r).await,
                 r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
                 r @ FrontendRequest::GetDriverQuotaUsage { .. } => {
                     engine_meta::handle_get_driver_quota_usage(ctx, r).await
@@ -2791,6 +2851,7 @@ async fn handle_frontend_connection(
                 r @ FrontendRequest::ListAutomationTasks { .. } => {
                     automations::handle_list_automation_tasks(ctx, r).await
                 }
+                r @ FrontendRequest::ListBoothbyPasses { .. } => boothby::handle_list_boothby_passes(ctx, r).await,
                 r @ FrontendRequest::ListChores { .. } => work_items::handle_list_chores(ctx, r).await,
                 r @ FrontendRequest::ListCiRemediations { .. } => {
                     ci_remediation::handle_list_ci_remediations(ctx, r).await
@@ -2897,10 +2958,12 @@ async fn handle_frontend_connection(
                 r @ FrontendRequest::RevealWorkItem { .. } => work_items::handle_reveal_work_item(ctx, r).await,
                 r @ FrontendRequest::RevokeDecision { .. } => decisions::handle_revoke_decision(ctx, r).await,
                 r @ FrontendRequest::RunAutomation { .. } => automations::handle_run_automation(ctx, r).await,
+                r @ FrontendRequest::RunBoothbyPass => boothby::handle_run_boothby_pass(ctx, r).await,
                 r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
                 r @ FrontendRequest::SetAutomationPaused { .. } => {
                     engine_meta::handle_set_automation_paused(ctx, r).await
                 }
+                r @ FrontendRequest::SetBoothbyMode { .. } => boothby::handle_set_boothby_mode(ctx, r).await,
                 r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
                 r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
                     engine_meta::handle_set_driver_traffic_split(ctx, r).await
