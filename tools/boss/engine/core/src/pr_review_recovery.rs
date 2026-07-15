@@ -126,7 +126,7 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let churn_cutoff = now_epoch_secs - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
 
     for candidate in candidates {
@@ -380,7 +380,7 @@ mod tests {
         let (work_item_id, _dead_execution_id) =
             create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/3");
 
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
                 .unwrap();
@@ -438,7 +438,7 @@ mod tests {
         let (work_item_id, _dead_execution_id) =
             create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/5");
 
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
                 .unwrap();

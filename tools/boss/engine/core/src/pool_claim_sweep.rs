@@ -176,7 +176,7 @@ pub async fn run_one_pass(
 ) -> PoolClaimSweepOutcome {
     let mut outcome = PoolClaimSweepOutcome::default();
 
-    let now_epoch_secs = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - LEAK_GRACE_SECS;
 
     // Executions that currently have a live worker pane. `run_id` on a

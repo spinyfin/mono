@@ -177,7 +177,7 @@ pub fn spawn_loop(
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         async move {
-            let now = crate::epoch_time::now_epoch_secs();
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
             run_one_pass(work_db.as_ref(), live_states.as_ref(), &thresholds, now)
         }
     })
@@ -372,7 +372,7 @@ mod tests {
     use crate::work::WorkDb;
 
     fn now() -> i64 {
-        crate::epoch_time::now_epoch_secs()
+        boss_engine_utils::epoch_time::now_epoch_secs()
     }
 
     /// Create an execution for `work_item_id` whose `started_at` is

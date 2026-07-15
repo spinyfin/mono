@@ -603,7 +603,7 @@ fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Ve
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn now_epoch_string() -> String {
-    crate::epoch_time::now_epoch_secs().to_string()
+    boss_engine_utils::epoch_time::now_epoch_secs().to_string()
 }
 
 fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {

@@ -510,7 +510,7 @@ fn non_empty(stderr: &str, status: i32) -> String {
 /// Mirrors `wrapper_distribution`'s staging pattern.
 fn stage_local_file(label: &str, contents: &str) -> Result<StagedFile> {
     let dir = std::env::temp_dir();
-    let nonce = crate::epoch_time::now_epoch_nanos();
+    let nonce = boss_engine_utils::epoch_time::now_epoch_nanos();
     let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
     std::fs::write(&path, contents).with_context(|| format!("writing staging file {path:?}"))?;
     Ok(StagedFile(path))

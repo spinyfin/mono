@@ -18,7 +18,7 @@ use std::time::Duration;
 /// `default` when the variable is unset, empty, or does not parse.
 ///
 /// The raw value is trimmed before parsing.
-pub(crate) fn env_parsed_or<T: FromStr>(key: &str, default: T) -> T {
+pub fn env_parsed_or<T: FromStr>(key: &str, default: T) -> T {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<T>().ok())
@@ -27,7 +27,7 @@ pub(crate) fn env_parsed_or<T: FromStr>(key: &str, default: T) -> T {
 
 /// Read `key` as a whole number of seconds and return it as a [`Duration`],
 /// falling back to `default` when unset/unparseable.
-pub(crate) fn env_duration_secs(key: &str, default: Duration) -> Duration {
+pub fn env_duration_secs(key: &str, default: Duration) -> Duration {
     env_duration_secs_min(key, default, 0)
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn env_duration_secs(key: &str, default: Duration) -> Duration {
 /// below `min_secs`, falling back to `default`. Used where a too-small
 /// interval would be harmful (e.g. a `0` heartbeat interval would busy-loop),
 /// so such a value must fall back to the safe default rather than be honoured.
-pub(crate) fn env_duration_secs_min(key: &str, default: Duration, min_secs: u64) -> Duration {
+pub fn env_duration_secs_min(key: &str, default: Duration, min_secs: u64) -> Duration {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())

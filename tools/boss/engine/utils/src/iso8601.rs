@@ -1,5 +1,5 @@
 //! Small ISO-8601 / epoch conversion helpers shared across
-//! boss-engine-core. All date arithmetic delegates to `chrono` (already
+//! boss-engine. All date arithmetic delegates to `chrono` (already
 //! a crate dependency); these functions only add the thin, call-site
 //! specific acceptance rules chrono doesn't provide out of the box.
 //!
@@ -23,7 +23,7 @@
 /// Negative epochs (pre-1970) format correctly. Panics only for an
 /// epoch outside chrono's supported range (roughly ±262,000 years),
 /// which no real system/DB timestamp can reach.
-pub(crate) fn format_epoch_iso8601(epoch_secs: i64) -> String {
+pub fn format_epoch_iso8601(epoch_secs: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(epoch_secs, 0)
         .expect("epoch within chrono's supported range")
         .format("%Y-%m-%dT%H:%M:%SZ")
@@ -41,7 +41,7 @@ pub(crate) fn format_epoch_iso8601(epoch_secs: i64) -> String {
 /// parser would accept `+00:00` offsets, which this call site must
 /// reject); chrono does the field parsing and date arithmetic. Fractional
 /// seconds are truncated to whole seconds.
-pub(crate) fn parse_iso8601_to_epoch(value: &str) -> Option<i64> {
+pub fn parse_iso8601_to_epoch(value: &str) -> Option<i64> {
     // Require an explicit trailing `Z`: this rejects numeric strings and
     // offset forms like `+00:00` before chrono ever sees the value.
     let body = value.trim().strip_suffix('Z')?;
@@ -58,7 +58,7 @@ pub(crate) fn parse_iso8601_to_epoch(value: &str) -> Option<i64> {
 /// timestamps. Unlike [`parse_iso8601_to_epoch`] it accepts any RFC 3339
 /// offset (including `Z` and `+HH:MM`), matching what the GitHub API can
 /// return. Fractional seconds are truncated to whole seconds.
-pub(crate) fn parse_iso8601_lenient(s: &str) -> Option<i64> {
+pub fn parse_iso8601_lenient(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 

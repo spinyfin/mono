@@ -206,7 +206,7 @@ pub fn spawn_loop(health: Arc<SyspolicydHealth>, interval: Duration) -> tokio::t
         loop {
             match sample_via_ps().await {
                 Some(sample) => {
-                    let status = health.record_sample(sample, crate::epoch_time::now_epoch_secs());
+                    let status = health.record_sample(sample, boss_engine_utils::epoch_time::now_epoch_secs());
                     if status.wedged && !was_wedged {
                         tracing::error!(
                             pid = status.pid,

@@ -155,7 +155,7 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     for execution in candidates {
         if reconcile_if_pane_dead(work_db, dispatch_events, &execution, now_epoch_secs).await {
             outcome.reaped += 1;
@@ -299,7 +299,7 @@ mod tests {
 
     /// Test-local alias for the shared epoch helper the production code uses.
     fn now_epoch_secs() -> i64 {
-        crate::epoch_time::now_epoch_secs()
+        boss_engine_utils::epoch_time::now_epoch_secs()
     }
 
     fn create_automation(db: &WorkDb, product_id: &str) -> String {

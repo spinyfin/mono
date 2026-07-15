@@ -370,7 +370,7 @@ impl WorkDb {
     /// pre-spawn side of the reconciliation story.
     pub fn list_dispatch_failed_recovery_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let now_secs: i64 = crate::epoch_time::now_epoch_secs();
+        let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
         let cutoff = now_secs - min_age_secs;
         let mut stmt = conn.prepare(
             "SELECT id FROM tasks
@@ -689,7 +689,7 @@ impl WorkDb {
     /// the correct `pr_review` execution kind.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let now_secs: i64 = crate::epoch_time::now_epoch_secs();
+        let now_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
         let cutoff = now_secs - min_age_secs;
         // The recovery-escalation exclusion: once the transient-recovery
         // sweep has raised an open attention item because a worker's API
@@ -1135,7 +1135,7 @@ impl WorkDb {
             Some(Some(_)) => return Ok(None), // already deferred once
             None => return Ok(None),          // not a ready row (raced away)
         }
-        let not_before = crate::epoch_time::now_epoch_secs() + stagger_secs as i64;
+        let not_before = boss_engine_utils::epoch_time::now_epoch_secs() + stagger_secs as i64;
         let updated = conn.execute(
             "UPDATE work_executions
              SET dispatch_not_before = ?2

@@ -503,7 +503,7 @@ pub struct DispatchEvent {
 
 impl DispatchEvent {
     pub fn new(stage: Stage, outcome: Outcome, execution_id: impl Into<String>) -> Self {
-        let ts_epoch_ms = crate::epoch_time::now_epoch_ms();
+        let ts_epoch_ms = boss_engine_utils::epoch_time::now_epoch_ms();
         Self {
             ts_epoch_ms,
             stage: stage.as_str().to_owned(),

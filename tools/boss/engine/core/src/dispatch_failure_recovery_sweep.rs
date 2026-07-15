@@ -117,7 +117,7 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let churn_cutoff = now_epoch_secs - DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS;
 
     // Snapshot of claimed execution ids across every pool, same shape
@@ -230,7 +230,7 @@ mod tests {
     /// Stamp `dispatch_failed_at` to `age_secs` in the past so the
     /// cooldown gate passes (or not, for the "too recent" test).
     fn make_failure_old(db: &WorkDb, work_item_id: &str, age_secs: i64) {
-        let old_epoch = crate::epoch_time::now_epoch_secs() - age_secs;
+        let old_epoch = boss_engine_utils::epoch_time::now_epoch_secs() - age_secs;
         let conn = db.connect().unwrap();
         conn.execute(
             "UPDATE tasks SET dispatch_failed_at = ?2 WHERE id = ?1",
@@ -339,7 +339,7 @@ mod tests {
         let work_item_id = create_bounced_chore(&db, &product_id);
         make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
 
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD {
             db.insert_terminal_execution_for_test(&work_item_id, "failed", now_epoch - i)
                 .unwrap();

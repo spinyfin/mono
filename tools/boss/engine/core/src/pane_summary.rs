@@ -283,7 +283,7 @@ pub async fn claude_short_summary(api_key: &str, name: &str, description: &str) 
 /// fixed in v2 (a coherent phrase chopped mid-thought becomes
 /// incoherent).
 fn clean_summary(raw: &str) -> String {
-    let stripped = crate::json_extract::strip_wrapping_quotes(raw);
+    let stripped = boss_engine_utils::json_extract::strip_wrapping_quotes(raw);
     let words: Vec<&str> = stripped.split_whitespace().take(7).collect();
     if words.is_empty() {
         return String::new();

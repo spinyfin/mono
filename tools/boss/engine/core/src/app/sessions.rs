@@ -417,7 +417,7 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
         "app reported worker-pane spawn failure (no shell); reaping execution immediately",
     );
 
-    let now_epoch_secs = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let reap_ctx = crate::spawn_ack_sweep::SpawnReapCtx {
         work_db: server_state.work_db.as_ref(),
         coordinator: server_state.execution_coordinator.clone(),

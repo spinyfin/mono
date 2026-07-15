@@ -134,7 +134,7 @@ impl LiveStatusDebugStore {
 }
 
 fn epoch_now() -> i64 {
-    crate::epoch_time::now_epoch_secs()
+    boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
 // Phase-4 counter handles for DispatcherStats. Registered via

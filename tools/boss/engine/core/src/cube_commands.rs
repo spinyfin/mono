@@ -74,7 +74,7 @@ impl CubeCliError {
     /// the JSONL when a remote step dumps a large trace.
     pub fn clipped_stderr(&self, max: usize) -> String {
         let stderr = self.stderr.trim();
-        crate::string_clip::clip_to_bytes_with_suffix(stderr, max, "… (clipped)")
+        boss_engine_utils::string_clip::clip_to_bytes_with_suffix(stderr, max, "… (clipped)")
     }
 }
 

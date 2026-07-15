@@ -478,14 +478,14 @@ fn extract_assistant_text(jsonl: &str) -> String {
 
 /// Parse the `FOLLOWUPS:` block out of assistant text: locate the last
 /// `FOLLOWUPS:` sentinel and the first balanced JSON array after it (fenced
-/// or not, via the shared [`crate::json_extract::find_first_balanced_array`]).
+/// or not, via the shared [`boss_engine_utils::json_extract::find_first_balanced_array`]).
 /// Returns an empty `Vec` when no parseable block is present.
 fn parse_followups_block(text: &str) -> Vec<FollowupEntry> {
     let Some(idx) = text.rfind("FOLLOWUPS:") else {
         return Vec::new();
     };
     let tail = &text[idx..];
-    let Some(array) = crate::json_extract::find_first_balanced_array(tail) else {
+    let Some(array) = boss_engine_utils::json_extract::find_first_balanced_array(tail) else {
         return Vec::new();
     };
     match serde_json::from_str::<Vec<FollowupEntry>>(array) {

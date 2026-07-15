@@ -82,7 +82,9 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
-        guard.spawned_at.insert(slot_id, crate::epoch_time::now_epoch_secs());
+        guard
+            .spawned_at
+            .insert(slot_id, boss_engine_utils::epoch_time::now_epoch_secs());
     }
 
     /// Drop the entry for `slot_id`. Called when the engine releases
@@ -431,8 +433,8 @@ impl LiveWorkerStateRegistry {
 }
 
 fn current_iso8601() -> String {
-    let secs = crate::epoch_time::now_epoch_secs();
-    crate::iso8601::format_epoch_iso8601(secs)
+    let secs = boss_engine_utils::epoch_time::now_epoch_secs();
+    boss_engine_utils::iso8601::format_epoch_iso8601(secs)
 }
 
 /// Format `epoch_secs` as the same fixed-width ISO-8601 UTC string
@@ -442,7 +444,7 @@ fn current_iso8601() -> String {
 /// cutoff timestamp with this and compares `last_event_at < cutoff`
 /// directly, with no date parsing.
 pub fn iso8601_utc(epoch_secs: i64) -> String {
-    crate::iso8601::format_epoch_iso8601(epoch_secs)
+    boss_engine_utils::iso8601::format_epoch_iso8601(epoch_secs)
 }
 
 #[cfg(test)]

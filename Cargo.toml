@@ -20,6 +20,7 @@ members = [
   "tools/boss/protocol",
   "tools/boss/engine/ssh-transport",
   "tools/boss/engine/transcript-tail",
+  "tools/boss/engine/utils",
   "tools/hood",
   "tools/checkleft",
   "tools/checkleft/sdk",

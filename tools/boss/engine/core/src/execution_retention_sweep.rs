@@ -52,7 +52,7 @@ pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::Join
 /// Run a single retention pass with the default policy. Returns a summary;
 /// callers may log it.
 pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
-    let now_epoch = crate::epoch_time::now_epoch_secs();
+    let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
     match work_db.prune_terminal_executions(ExecutionRetentionPolicy::default(), now_epoch, false) {
         Ok(outcome) => ExecutionRetentionSweepOutcome {
@@ -85,7 +85,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let now_epoch = crate::epoch_time::now_epoch_secs();
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         let very_old = now_epoch - 400 * 24 * 60 * 60;
         for _ in 0..10 {
             let execution = db

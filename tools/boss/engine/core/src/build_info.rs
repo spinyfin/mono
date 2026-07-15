@@ -76,7 +76,7 @@ fn binary_mtime_iso8601() -> Option<String> {
     let metadata = std::fs::metadata(&path).ok()?;
     let mtime = metadata.modified().ok()?;
     let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-    Some(crate::iso8601::format_epoch_iso8601(dur.as_secs() as i64))
+    Some(boss_engine_utils::iso8601::format_epoch_iso8601(dur.as_secs() as i64))
 }
 
 /// Short SHA-256 fingerprint of the engine binary's on-disk bytes.
@@ -203,8 +203,8 @@ fn compute_binary_fingerprint() -> Option<String> {
 pub fn process_started_at() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| {
-        let secs = crate::epoch_time::now_epoch_secs();
-        crate::iso8601::format_epoch_iso8601(secs)
+        let secs = boss_engine_utils::epoch_time::now_epoch_secs();
+        boss_engine_utils::iso8601::format_epoch_iso8601(secs)
     })
     .as_str()
 }

@@ -916,7 +916,7 @@ fn merge_org_state(acc: OrgAuthState, next: OrgAuthState) -> OrgAuthState {
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 fn unix_now() -> i64 {
-    crate::epoch_time::now_epoch_secs()
+    boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
 // ── KeychainTokenStore ────────────────────────────────────────────────────────

@@ -186,7 +186,7 @@ pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Val
             // Redact the body before logging so an error response
             // containing the key (some Anthropic 401 bodies echo
             // headers) can't leak into engine stderr.
-            let snippet = live_status_redact::redact_text(&crate::string_clip::clip_to_bytes(&body, 120));
+            let snippet = live_status_redact::redact_text(&boss_engine_utils::string_clip::clip_to_bytes(&body, 120));
             tracing::error!(
                 status,
                 snippet = %snippet,
@@ -273,7 +273,7 @@ fn render_assistant(line: &Value) -> String {
                         let one_line = t.trim().replace('\n', " ");
                         parts.push(format!(
                             "assistant: {}",
-                            crate::string_clip::clip_to_bytes(&one_line, 200)
+                            boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200)
                         ));
                     }
                 }
@@ -287,12 +287,12 @@ fn render_assistant(line: &Value) -> String {
                         obj.get("input")
                             .and_then(|i| i.get("command"))
                             .and_then(Value::as_str)
-                            .map(|c| crate::string_clip::clip_to_bytes(c, 80))
+                            .map(|c| boss_engine_utils::string_clip::clip_to_bytes(c, 80))
                     } else {
                         obj.get("input")
                             .and_then(|i| i.get("file_path"))
                             .and_then(Value::as_str)
-                            .map(|c| crate::string_clip::clip_to_bytes(c, 80))
+                            .map(|c| boss_engine_utils::string_clip::clip_to_bytes(c, 80))
                     };
                     if let Some(arg) = arg {
                         parts.push(format!("tool: {name}({arg})"));
@@ -305,7 +305,7 @@ fn render_assistant(line: &Value) -> String {
                         let one_line = t.trim().replace('\n', " ");
                         parts.push(format!(
                             "thinking: {}",
-                            crate::string_clip::clip_to_bytes(&one_line, 200)
+                            boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200)
                         ));
                     }
                 }
@@ -313,7 +313,10 @@ fn render_assistant(line: &Value) -> String {
             }
         }
     } else if let Some(t) = message.get("text").and_then(Value::as_str) {
-        parts.push(format!("assistant: {}", crate::string_clip::clip_to_bytes(t, 200)));
+        parts.push(format!(
+            "assistant: {}",
+            boss_engine_utils::string_clip::clip_to_bytes(t, 200)
+        ));
     }
     parts.join(" | ")
 }
@@ -400,7 +403,7 @@ pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<Clau
 /// Returns an empty string on rejection so the caller can fall back
 /// to "keep prior".
 pub fn clean_summary(raw: &str) -> String {
-    let stripped = crate::json_extract::strip_wrapping_quotes(raw);
+    let stripped = boss_engine_utils::json_extract::strip_wrapping_quotes(raw);
     let redacted = live_status_redact::redact_text(stripped);
     if live_status_redact::is_mostly_redacted(&redacted) {
         return String::new();
@@ -408,7 +411,7 @@ pub fn clean_summary(raw: &str) -> String {
     // Single-line shape. The UI renders this on a single line; any
     // model-injected newline becomes a space.
     let one_line = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
-    crate::string_clip::clip_to_bytes(&one_line, MAX_LIVE_STATUS_LEN)
+    boss_engine_utils::string_clip::clip_to_bytes(&one_line, MAX_LIVE_STATUS_LEN)
 }
 
 #[cfg(test)]

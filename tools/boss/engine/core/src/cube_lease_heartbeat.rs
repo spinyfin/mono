@@ -241,7 +241,7 @@ pub const HEARTBEAT_CUBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn heartbeat_interval() -> Duration {
     // A zero interval would busy-loop, so require ≥ 1 s; anything below the
     // guard (including a `0`) falls back to the default.
-    crate::env_parse::env_duration_secs_min(HEARTBEAT_INTERVAL_SECS_ENV, DEFAULT_HEARTBEAT_INTERVAL, 1)
+    boss_engine_utils::env_parse::env_duration_secs_min(HEARTBEAT_INTERVAL_SECS_ENV, DEFAULT_HEARTBEAT_INTERVAL, 1)
 }
 
 /// Counts from one heartbeat pass; logged at `info` when activity occurs.
@@ -706,9 +706,12 @@ async fn auto_reap_dead_lease(
     let host_offline = ctx.work_db.execution_bound_host_offline(&execution.id).unwrap_or(false);
 
     if !host_offline {
-        let verdict =
-            run_reconcile::confirm_execution_dead(ctx.cube_client, execution, crate::epoch_time::now_epoch_secs())
-                .await;
+        let verdict = run_reconcile::confirm_execution_dead(
+            ctx.cube_client,
+            execution,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .await;
         if !matches!(verdict, RunReconcileVerdict::Dead) {
             // Sustained heartbeat failure alone is not proof of death — could be
             // a transient cube CLI error or a cube outage hitting every lease at

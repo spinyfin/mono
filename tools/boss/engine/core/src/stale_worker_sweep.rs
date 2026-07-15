@@ -182,7 +182,7 @@ pub async fn run_one_pass(
     let mut outcome = StaleWorkerSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
-    let now_epoch_secs: i64 = crate::epoch_time::now_epoch_secs();
+    let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - STALE_GRACE_SECS;
     // Build the staleness cutoff as a fixed-width ISO-8601 string so we
     // can compare `last_event_at < stale_cutoff` lexicographically — the
@@ -694,7 +694,7 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        let now_secs = crate::epoch_time::now_epoch_secs();
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
