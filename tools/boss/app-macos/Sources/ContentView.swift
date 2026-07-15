@@ -5204,7 +5204,7 @@ private struct MergeQueueBadge: View {
 
     private var parsed: MergeQueueDetail? { MergeQueueDetail.parse(detail) }
 
-    private enum Readiness {
+    private enum Readiness: Equatable {
         case mergeable
         case unmergeable
         case checksRunning
@@ -5278,6 +5278,7 @@ private struct MergeQueueBadge: View {
             }
             Image(systemName: readiness.systemImage)
                 .font(.caption2.weight(.semibold))
+                .foregroundStyle(readiness == .mergeable ? Color.green : Color.white)
         }
         .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
