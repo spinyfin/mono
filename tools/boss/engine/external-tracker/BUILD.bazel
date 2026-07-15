@@ -4,29 +4,38 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "utils",
+    name = "external-tracker",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_engine_utils",
+    # Fixture replayed by the github backend's fetch_items tests via
+    # include_str!. Moved here with github.rs; engine/core no longer
+    # compiles anything that reads it.
+    compile_data = glob(["src/testdata/**"]),
+    crate_name = "boss_external_tracker",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/external-tracker:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/utils",
+        "//tools/boss/github",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "utils_test",
+    name = "external-tracker_test",
     size = "small",
-    crate = ":utils",
+    crate = ":external-tracker",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/engine/utils",
+        "//tools/boss/github",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::process::Command;
 
-use super::TrackerCredential;
-use super::github_oauth::KeychainTokenStore;
+use crate::TrackerCredential;
+use crate::token_store::KeychainTokenStore;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -186,7 +186,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::external_tracker::github_oauth::{FakeStore, KeychainTokenStore, TokenRecord};
+    use crate::token_store::{FakeStore, KeychainTokenStore, TokenRecord};
 
     /// Write a shell script to a temp file, close the write fd, and make it executable.
     ///
