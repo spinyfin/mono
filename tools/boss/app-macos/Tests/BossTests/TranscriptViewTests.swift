@@ -212,6 +212,28 @@ final class TranscriptViewTests: XCTestCase {
         XCTAssertEqual(sends, 2)
     }
 
+    /// Refreshing an already-loaded live transcript must not bounce the
+    /// store through `.loading`: `TranscriptViewerView`'s detail switch
+    /// treats `.loaded` and `.loading` as distinct branches, so cycling
+    /// through `.loading` tears down and remounts `TranscriptView`,
+    /// resetting its scroll position and per-segment expansion state on
+    /// every 5s poll of a running execution. The doc must stay `.loaded`
+    /// (with its old segments) until the new segments actually arrive.
+    func testRefreshTranscriptKeepsLoadedStateInFlight() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.outboundRecorder = { _ in }
+
+        let doc = TranscriptDoc(executionId: "exec_9", segments: [], isLive: true, complete: false)
+        model.transcriptsByExecutionID["exec_9"] = .loaded(doc)
+
+        model.refreshTranscript(executionId: "exec_9")
+
+        guard case .loaded(let stillLoaded) = model.transcriptsByExecutionID["exec_9"] else {
+            return XCTFail("refreshTranscript must not clear an already-loaded doc to .loading")
+        }
+        XCTAssertEqual(stillLoaded.executionId, "exec_9")
+    }
+
     // MARK: - Helpers
 
     /// Host a view in an offscreen window and drive a layout pass + a short

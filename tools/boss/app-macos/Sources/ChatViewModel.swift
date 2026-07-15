@@ -521,9 +521,18 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// Force a re-fetch of `executionId`'s transcript — the "Refresh"
-    /// affordance on a still-running (live) execution.
+    /// affordance on a still-running (live) execution, and the periodic
+    /// poll while a live transcript's view is open. Deliberately leaves an
+    /// already-`.loaded` doc in place while the fetch is in flight instead
+    /// of flipping to `.loading`: swapping to the loading placeholder and
+    /// back tears down and remounts `TranscriptView`, which resets its
+    /// scroll position and per-segment expansion state on every refresh.
+    /// Only [[loadTranscript(executionId:)]]'s first fetch (nothing loaded
+    /// yet) needs the loading placeholder.
     func refreshTranscript(executionId: String) {
-        transcriptsByExecutionID[executionId] = .loading
+        if transcriptsByExecutionID[executionId] == nil {
+            transcriptsByExecutionID[executionId] = .loading
+        }
         engine.sendExecutionTranscript(executionId: executionId)
     }
 
