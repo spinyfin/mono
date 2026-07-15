@@ -47,6 +47,20 @@ pub const DEFAULT_MERGE_ORDER_STAGGER_SECS: u64 = 0;
 /// bounds the worst-case dispatch delay a misconfiguration can impose.
 pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
 
+/// Default value for [`WorkConfig::enable_spawn_capability_breaker`]. **OFF**
+/// by default (operator directive, 2026-07-15): the breaker
+/// (`engine/core/src/spawn_health.rs`, PR #1824) tripped for the first time
+/// ever that day on what self-healed as a transient blip, and latched the
+/// entire fleet's dispatch — reviews included — for ~40 minutes until a
+/// human manually resumed it. A single unusual outage should not disable
+/// dispatch fleet-wide; operators who want the breaker's protection (e.g.
+/// after repeated real spawn-capability outages) opt in explicitly via
+/// `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=true`. The failure-window tracking,
+/// logging, dispatch events, and attention item stay active either way —
+/// only the actual dispatch pause (and its automatic recovery machinery) are
+/// gated by this flag.
+pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = false;
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -121,6 +135,15 @@ pub struct WorkConfig {
     /// [`MAX_MERGE_ORDER_STAGGER_SECS`]. Design: Layer 3 / direction 2.
     #[builder(default = DEFAULT_MERGE_ORDER_STAGGER_SECS)]
     pub merge_order_stagger_secs: u64,
+    /// Whether the spawn-capability circuit breaker (`spawn_health.rs`) is
+    /// allowed to actually pause dispatch when it trips. OFF by default —
+    /// see [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] for the 2026-07-15
+    /// incident that motivated defaulting it off. Configured via
+    /// `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`. When `false`, the breaker
+    /// still tracks failures, logs, raises its attention item, and emits its
+    /// dispatch event on trip — it just never calls `set_dispatch_paused`.
+    #[builder(default = DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)]
+    pub enable_spawn_capability_breaker: bool,
 }
 
 impl WorkConfig {
@@ -158,6 +181,8 @@ impl WorkConfig {
         let merge_order_stagger_secs = lookup_u64(&lookup, "BOSS_MERGE_ORDER_STAGGER_SECS")?
             .unwrap_or(DEFAULT_MERGE_ORDER_STAGGER_SECS)
             .min(MAX_MERGE_ORDER_STAGGER_SECS);
+        let enable_spawn_capability_breaker = lookup_bool(&lookup, "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER")?
+            .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -169,6 +194,7 @@ impl WorkConfig {
             .max_review_embed_diff_lines(max_review_embed_diff_lines)
             .enable_revision_triggered_reviews(enable_revision_triggered_reviews)
             .merge_order_stagger_secs(merge_order_stagger_secs)
+            .enable_spawn_capability_breaker(enable_spawn_capability_breaker)
             .build())
     }
 }
@@ -350,9 +376,10 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES,
-        DEFAULT_MERGE_ORDER_STAGGER_SECS, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
-        MAX_AUTOMATION_POOL_SIZE, MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
+        DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
+        DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MERGE_ORDER_STAGGER_SECS,
+        DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE,
+        MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
     };
     use std::ffi::OsString;
 
@@ -571,6 +598,40 @@ mod tests {
         })
         .expect("config loads");
         assert_eq!(config.merge_order_stagger_secs, MAX_MERGE_ORDER_STAGGER_SECS);
+    }
+
+    #[test]
+    fn enable_spawn_capability_breaker_defaults_off_and_reads_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        // Absent → defaults OFF (2026-07-15 operator directive: a single
+        // transient outage must not latch fleet-wide dispatch by default).
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.enable_spawn_capability_breaker, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
+        assert!(!config.enable_spawn_capability_breaker, "breaker defaults off");
+
+        // Explicit "true" opts in.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER" => Some(OsString::from("true")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(config.enable_spawn_capability_breaker);
+
+        // Explicit "0" is also accepted as false.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER" => Some(OsString::from("0")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(!config.enable_spawn_capability_breaker);
     }
 
     #[test]
