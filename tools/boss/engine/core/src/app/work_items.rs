@@ -670,21 +670,31 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
     };
     match work_db.get_work_item(&id) {
         Ok(item) => match work_db.delete_work_item(&id) {
-            Ok(()) => {
-                // If the deleted task/chore had a live worker, deleting
-                // the row must also stop that worker — otherwise the
-                // agent keeps running (holding a slot, possibly editing
-                // files / opening a PR) for a task that no longer
-                // exists. Cancel its execution row so the orphan sweep
-                // and reconciler won't re-dispatch it, then release the
-                // pane and leased cube workspace. We use
+            Ok(tombstoned_ids) => {
+                // If the deleted task/chore (or any revision cascade-
+                // deleted alongside it — `delete_work_item` tombstones
+                // the whole chain in one transaction) had a live worker,
+                // deleting the row must also stop that worker —
+                // otherwise the agent keeps running (holding a slot,
+                // possibly editing files / opening a PR) for a task
+                // that no longer exists. A revision carries its own
+                // execution independent of the parent's, so the parent
+                // alone is not enough to check — this closes the gap
+                // where a live worker on a cascade-deleted revision was
+                // never reaped because only the top-level id was ever
+                // checked. Cancel each live execution's row so the
+                // orphan sweep and reconciler won't re-dispatch it, then
+                // release the pane and leased cube workspace. We use
                 // `cancel_and_release` rather than `force_stop_execution`
                 // because there is no task to demote back to `todo` —
                 // the row is already tombstoned. Idempotent: terminal
                 // executions return `None` and never reach this branch.
-                if let Some(execution_id) = live_execution_for_deleted_item(&work_db, &item) {
+                for tombstoned_id in &tombstoned_ids {
+                    let Some(execution_id) = live_execution_for_task_id(&work_db, tombstoned_id) else {
+                        continue;
+                    };
                     let handler = server_state.completion_handler.clone();
-                    let id_for_cancel = id.clone();
+                    let id_for_cancel = tombstoned_id.clone();
                     tokio::spawn(async move {
                         handler
                             .cancel_and_release(
@@ -695,6 +705,16 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                             .await;
                     });
                 }
+                let actor = transport_default_created_via(&server_state, &session_id).await;
+                crate::audit::record_event(
+                    "work_item_deleted",
+                    &serde_json::json!({
+                        "work_item_id": &id,
+                        "cascade_deleted_ids": tombstoned_ids.iter().filter(|tid| *tid != &id).collect::<Vec<_>>(),
+                        "actor": actor,
+                        "reason": "delete_work_item request",
+                    }),
+                );
                 let product_id = work_item_product_id(&item);
                 let revision = publish_work_invalidation(
                     &server_state,

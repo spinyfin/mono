@@ -31,6 +31,28 @@
 //! So nothing reaps a live worker whose reason for existing is already
 //! gone. This sweep closes that gap.
 //!
+//! ## The other zombie this closes (the "Seven" case: a deleted work item)
+//!
+//! A second, distinct gap: the bound work item's row can be deleted
+//! entirely (`delete_work_item`'s soft-delete, or a row that never
+//! existed) while its execution is still live. [`WorkDb::get_work_item`]
+//! collapses "row confirmed gone" and "DB lookup failed for some other
+//! reason" into the same generic error, and the old behaviour treated
+//! both as a conservative skip — which meant a genuinely deleted row's
+//! worker was *never* reaped, logging the same "failed to look up bound
+//! work item" WARN on every pass forever. The real incident: a review
+//! worker sat `waiting_for_input` on slot 25 for 2+ hours bound to a task
+//! id `boss task show` already reported as `unknown work item`, hit by
+//! this exact sweep every ~60s the whole time, and had to be stopped by
+//! hand. [`WorkDb::work_item_row_missing`] tells the two cases apart: a
+//! confirmed-missing row is treated as an orphan and reaped through the
+//! same two-pass path as the O'Brien case (`reason = "work_item_missing"`
+//! in the emitted [`DispatchEvent`]), while a lookup failure that can't be
+//! confirmed as "row gone" still falls back to the old conservative skip.
+//! Deletion is expected to tear its own live executions down synchronously
+//! (see `app::work_items::handle_delete_work_item`) — this sweep is the
+//! backstop for whatever path doesn't (or fails to).
+//!
 //! ## Why this is the safest possible reap signal
 //!
 //! The operator's primary constraint is: never reap a worker that is
@@ -237,31 +259,57 @@ pub async fn run_one_pass(
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / cancelled) even though the worker — and possibly its
         // execution — is still alive. A work-item lookup failure falls back
-        // to the execution signal alone rather than guessing.
+        // to the execution signal alone rather than guessing, UNLESS the
+        // failure is because the row itself is confirmed gone (deleted out
+        // from under this execution) — see `work_item_missing` below.
+        let mut work_item_missing = false;
         let work_item_terminal = if never_task_bound {
             false
         } else {
             match work_db.get_work_item(&execution.work_item_id) {
                 Ok(item) => work_item_is_terminal(&item),
-                Err(err) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        work_item_id = %execution.work_item_id,
-                        ?err,
-                        "terminal-work sweep: failed to look up bound work item; using execution status only",
-                    );
-                    false
-                }
+                Err(err) => match work_db.work_item_row_missing(&execution.work_item_id) {
+                    // The Deleting-a-work-item-orphans-its-worker case: the
+                    // row is confirmed gone (never existed, or soft-deleted
+                    // by `delete_work_item`), not merely unreachable. This is
+                    // an orphan, not a degraded-lookup skip — fall through to
+                    // the same two-pass reap path as a terminal work item.
+                    Ok(true) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "terminal-work sweep: bound work item row no longer exists; treating live worker as orphaned",
+                        );
+                        work_item_missing = true;
+                        false
+                    }
+                    // Either the row genuinely still exists (so the
+                    // `get_work_item` error was something else entirely) or
+                    // we couldn't confirm either way — stay conservative and
+                    // retry next pass, exactly as before this case existed.
+                    Ok(false) | Err(_) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "terminal-work sweep: failed to look up bound work item; using execution status only",
+                        );
+                        false
+                    }
+                },
             }
         };
 
-        if !work_item_terminal && !execution_terminal {
+        if !work_item_terminal && !execution_terminal && !work_item_missing {
             // Healthy: the worker still has live work to do. Leave it be.
             outcome.active_skipped += 1;
             continue;
         }
 
-        let reason = if work_item_terminal {
+        let reason = if work_item_missing {
+            "work_item_missing"
+        } else if work_item_terminal {
             "work_item_terminal"
         } else {
             "execution_terminal"
@@ -278,6 +326,7 @@ pub async fn run_one_pass(
                 .execution_status(execution.status)
                 .work_item_terminal(work_item_terminal)
                 .execution_terminal(execution_terminal)
+                .work_item_missing(work_item_missing)
                 .reason(reason)
                 .build(),
         ));
@@ -310,6 +359,25 @@ pub async fn run_one_pass(
             "terminal-work sweep: live worker pane outlived its terminal work; reaping and freeing slot",
         );
 
+        // The missing-work-item case has no other path that ever marks the
+        // execution terminal — a `work_item_terminal` or `execution_terminal`
+        // candidate's execution status is already settled by whatever made
+        // it terminal, but here the execution itself may still be `running`
+        // / `waiting_for_input` since nothing tore it down when the row
+        // vanished. Mark it `orphaned` before reaping the pane so the DB
+        // reflects reality and `bossctl agents transcript` still resolves
+        // the row. Best-effort: if the execution turns out already terminal
+        // (a race with some other teardown) this is a conservative no-op.
+        if candidate.work_item_missing
+            && let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
+        {
+            tracing::warn!(
+                run_id = %candidate.run_id,
+                ?err,
+                "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
+            );
+        }
+
         // Reap via the canonical, idempotent, run-id-keyed teardown. If the
         // slot was recycled to a different execution since the snapshot,
         // this is a no-op and the live worker now in the slot is untouched.
@@ -327,6 +395,7 @@ pub async fn run_one_pass(
                         "execution_status": candidate.execution_status,
                         "work_item_terminal": candidate.work_item_terminal,
                         "execution_terminal": candidate.execution_terminal,
+                        "work_item_missing": candidate.work_item_missing,
                     })),
             )
             .await;
@@ -349,6 +418,7 @@ struct ReapCandidate {
     execution_status: boss_protocol::ExecutionStatus,
     work_item_terminal: bool,
     execution_terminal: bool,
+    work_item_missing: bool,
     reason: &'static str,
 }
 
@@ -554,6 +624,108 @@ mod tests {
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].details["reason"], "execution_terminal");
+    }
+
+    /// The "Seven" regression: a live worker whose bound work item ROW WAS
+    /// DELETED (soft-deleted out from under it, e.g. by `boss task delete`)
+    /// is reaped after two-pass confirmation, its execution is marked
+    /// `orphaned` (not just torn down at the pane level), and the emitted
+    /// event carries `reason = "work_item_missing"` — distinct from the
+    /// O'Brien `work_item_terminal` case, since the row isn't merely
+    /// terminal, it no longer exists at all. Modelled on a review-kind
+    /// chore whose parent task already went `done` (its PR merged) before
+    /// the chore itself was deleted, matching the incident.
+    #[tokio::test]
+    async fn reaps_worker_whose_bound_work_item_row_was_deleted() {
+        let (_dir, db, product_id) = setup();
+        let parent_id = create_active_chore(&db, &product_id, "parent coding task");
+        set_work_item_status(&db, &parent_id, "done");
+        let work_item_id = create_active_chore(&db, &product_id, "Automated PR review found 4 finding(s)");
+        let execution_id = create_execution(&db, &work_item_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 25, &execution_id, &work_item_id);
+
+        // The row is deleted out from under the live execution — the exact
+        // failure mode the incident describes: `get_work_item` now returns
+        // "unknown work item" for a worker that is still alive.
+        db.delete_work_item(&work_item_id).unwrap();
+        assert!(
+            db.get_work_item(&work_item_id).is_err(),
+            "precondition: the deleted row must be unreachable via get_work_item"
+        );
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut seen = HashSet::new();
+
+        // Pass 1: candidate observed, not yet reaped — mirrors the O'Brien
+        // two-pass guard so a delete-then-immediately-torn-down-by-the-
+        // deletion-path race isn't double-reaped.
+        let first = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        assert_eq!(first.reaped, 0, "first pass must only record the candidate");
+        assert_eq!(first.pending_confirmation, 1);
+        assert!(reaper.reaped().is_empty());
+
+        // Pass 2: confirmed — reap the pane/slot AND mark the execution
+        // orphaned (there is no other path that would have done so, since
+        // the row is gone and no normal completion ever fired).
+        let second = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
+        assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            boss_protocol::ExecutionStatus::Orphaned,
+            "execution must be marked orphaned since deletion never tore it down",
+        );
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details["reason"], "work_item_missing");
+        assert_eq!(events[0].details["slot_id"], 25);
+        assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()));
+    }
+
+    /// A live worker whose execution row exists (so the outer
+    /// `get_execution` lookup succeeds) but whose `work_item_id` never
+    /// resolves at all (garbage id, not merely a soft-deleted row) hits a
+    /// `classify_id` failure inside `work_item_row_missing` too — this must
+    /// fall back to the same conservative skip as any other unconfirmable
+    /// lookup failure, not be treated as a confirmed-missing orphan.
+    #[tokio::test]
+    async fn lookup_failure_with_unclassifiable_work_item_id_is_conservative_skip() {
+        let (_dir, db, product_id) = setup();
+        let work_item_id = create_active_chore(&db, &product_id, "garbage-bound");
+        let execution_id = create_execution(&db, &work_item_id);
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET work_item_id = 'not-a-real-work-item-id' WHERE id = ?1",
+                rusqlite::params![execution_id],
+            )
+            .unwrap();
+        }
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 9, &execution_id, "not-a-real-work-item-id");
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut seen = HashSet::new();
+
+        for _ in 0..3 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+            assert_eq!(outcome.reaped, 0);
+            assert_eq!(outcome.active_skipped, 1);
+        }
+        assert!(reaper.reaped().is_empty());
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "execution must be left untouched, not orphaned, on an unconfirmable lookup failure",
+        );
     }
 
     /// The safety core: a live worker whose work item is `active` and whose

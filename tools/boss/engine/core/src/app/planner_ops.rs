@@ -299,7 +299,17 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
             continue;
         }
         match work_db.delete_work_item(task_id) {
-            Ok(()) => deleted.push(task_id.clone()),
+            Ok(_tombstoned_ids) => {
+                crate::audit::record_event(
+                    "work_item_deleted",
+                    &serde_json::json!({
+                        "work_item_id": task_id,
+                        "actor": "engine",
+                        "reason": "unpopulate_project",
+                    }),
+                );
+                deleted.push(task_id.clone());
+            }
             Err(err) => {
                 let name = task_name_for_id(&work_db, task_id);
                 tracing::warn!(task_id, ?err, "unpopulate_project: failed to delete task");

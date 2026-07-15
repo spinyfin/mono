@@ -414,7 +414,13 @@ impl WorkDb {
         }
     }
 
-    pub fn delete_work_item(&self, id: &str) -> Result<()> {
+    /// Soft-delete a task/chore (and cascade to its revision chain).
+    /// Returns every id this call tombstoned — `id` itself followed by
+    /// any cascade-deleted revision ids — so a caller that needs to
+    /// tear down live workers bound to the deleted rows (a revision can
+    /// have its own execution, independent of the parent's) knows the
+    /// full set to check, not just the top-level id.
+    pub fn delete_work_item(&self, id: &str) -> Result<Vec<String>> {
         match classify_id(id)? {
             ItemKind::Task => {
                 let mut conn = self.connect()?;
@@ -453,7 +459,9 @@ impl WorkDb {
                     params![id],
                 )?;
                 tx.commit()?;
-                Ok(())
+                let mut tombstoned_ids = vec![id.to_owned()];
+                tombstoned_ids.extend(revision_ids);
+                Ok(tombstoned_ids)
             }
             ItemKind::Product => bail!("product deletion is not supported; archive it instead"),
             ItemKind::Project => bail!("project deletion is not supported; archive it instead"),
@@ -761,6 +769,32 @@ impl WorkDb {
                 .filter(|task| task.deleted_at.is_none())
                 .map(task_to_item)
                 .with_context(|| format!("unknown task: {id}")),
+        }
+    }
+
+    /// Whether the row backing `id` is genuinely gone — either no such
+    /// row was ever inserted, or (for a task/chore) its `deleted_at`
+    /// tombstone is set by [`Self::delete_work_item`]'s soft-delete.
+    /// Products and projects can't be deleted (`delete_work_item`
+    /// rejects both), so this is always `Ok(false)` for them.
+    ///
+    /// [`get_work_item`] collapses "row never existed" and "DB query
+    /// failed" into the same generic `unknown …` error, which is fine
+    /// for most callers but not for a reconciler that must reap on
+    /// "confirmed gone" while staying conservative on "DB hiccuped".
+    /// The terminal-work sweep calls this after a `get_work_item`
+    /// failure to tell the two cases apart: `Ok(true)` means the
+    /// binding is a genuine orphan (the row was deleted out from under
+    /// a live execution); `Ok(false)` or `Err` means treat the failure
+    /// the old conservative way and retry next pass.
+    pub fn work_item_row_missing(&self, id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        match classify_id(id)? {
+            ItemKind::Task => Ok(match query_task(&conn, id)? {
+                None => true,
+                Some(task) => task.deleted_at.is_some(),
+            }),
+            ItemKind::Product | ItemKind::Project => Ok(false),
         }
     }
 
