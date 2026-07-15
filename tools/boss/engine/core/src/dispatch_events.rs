@@ -374,9 +374,10 @@ pub enum Stage {
     /// instead of independently churning each work item into its own churn
     /// guard — but whether it also **pauses dispatch** depends on
     /// [`crate::config::WorkConfig::enable_spawn_capability_breaker`]
-    /// (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`, OFF by default since
-    /// 2026-07-15 — a single transient outage must not latch fleet-wide
-    /// dispatch, including `pr_review`). When enabled, dispatch stays paused
+    /// (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`, ON by default — see
+    /// [`crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] for the
+    /// 2026-07-15 incident that briefly defaulted it off and why it is safe
+    /// to default on again). When enabled, dispatch stays paused
     /// until either the half-open recovery probe or a fresh app session
     /// registering auto-resumes it (see
     /// [`Stage::SpawnCapabilityRecovered`] and

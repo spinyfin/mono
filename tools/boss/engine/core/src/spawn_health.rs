@@ -26,29 +26,32 @@
 //! the single `app_spawn_capability_unhealthy` attention item, instead of
 //! independently churning each work item into its own churn guard.
 //!
-//! ## The breaker flag (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`, OFF by default)
+//! ## The breaker flag (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`, ON by default)
 //!
 //! Whether a trip *pauses dispatch* is a separate, config-gated decision —
 //! see [`SpawnHealthTracker::breaker_enabled`] /
-//! [`crate::config::WorkConfig::enable_spawn_capability_breaker`]. This
-//! flag defaults **off** (2026-07-15 operator directive): the breaker
-//! tripped for the first time ever that day on what self-healed as a
-//! transient blip, and latched the entire fleet's dispatch — `pr_review`
-//! included — for ~40 minutes until a human noticed and manually resumed
-//! it. A single unusual outage should not disable dispatch fleet-wide by
-//! default.
+//! [`crate::config::WorkConfig::enable_spawn_capability_breaker`]. The
+//! breaker tripped for the first time ever on 2026-07-15 on what turned out
+//! to be a benign cause — display sleep + App Nap throttling the app's
+//! MainActor, making spawn acks late — and latched the entire fleet's
+//! dispatch — `pr_review` included — for ~40 minutes until a human noticed
+//! and manually resumed it. That incident drove the flag to default off
+//! between PR #2041 and the fix below. Since then, the App Nap opt-out
+//! (display sleep no longer degrades spawn acks) and the half-open
+//! auto-recovery probe (a transient blip self-heals instead of latching)
+//! have landed, so the flag now defaults back **on** for the genuine
+//! app-dead/ghost-pane incident class it was designed for.
 //!
-//! - **Disabled (default):** the failure-window tracking, the `tracing::error!`,
+//! - **Enabled (default):** trip-side behavior pauses dispatch (review
+//!   exemption stripped), PLUS automatic recovery — see below. Operators can
+//!   still opt out via `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false`.
+//! - **Disabled:** the failure-window tracking, the `tracing::error!`,
 //!   the `app_spawn_capability_unhealthy` attention item, and the
 //!   `spawn_capability_unhealthy` dispatch event all still fire — full
 //!   observability of the condition is preserved — but
 //!   [`ExecutionCoordinator::set_dispatch_paused`] is never called. The
 //!   attention item and dispatch event both say plainly that the breaker
 //!   would have tripped and was disabled by config.
-//! - **Enabled:** unchanged trip-side behavior (dispatch pauses, review
-//!   exemption stripped), PLUS automatic recovery — see below. Operators
-//!   opt in via `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=true` once they've
-//!   seen enough real spawn-capability outages to want the pause back.
 //!
 //! ## Automatic recovery (half-open probe) — enabled mode only
 //!
@@ -203,11 +206,11 @@ pub struct SpawnHealthTracker {
     /// Whether a trip is allowed to actually pause dispatch — see
     /// [`WorkConfig::enable_spawn_capability_breaker`](crate::config::WorkConfig::enable_spawn_capability_breaker)
     /// and [`Self::with_breaker_enabled`]. Defaults to
-    /// [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] (`false`) on the raw
-    /// constructors below, matching the config default, so a tracker built
-    /// without an explicit [`Self::with_breaker_enabled`] call can never
-    /// silently pause dispatch fleet-wide; production wiring in `app.rs`
-    /// always calls [`Self::with_breaker_enabled`] with the config value.
+    /// [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] (`true`) on the raw
+    /// constructors below, matching the config default; production wiring
+    /// in `app.rs` always calls [`Self::with_breaker_enabled`] with the
+    /// config value, so an operator's `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false`
+    /// override still takes effect there.
     breaker_enabled: bool,
     /// Epoch seconds of the last disabled-mode "would have tripped" signal
     /// for the current outage, or `0` if none has fired yet — see
@@ -233,11 +236,10 @@ impl SpawnHealthTracker {
 
     /// Construct with explicit tuning (tests use tight values). Defaults
     /// `breaker_enabled` to [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`]
-    /// (`false`) — the same safe default as
-    /// [`crate::config::WorkConfig::enable_spawn_capability_breaker`] — so a
-    /// tracker built without an explicit [`Self::with_breaker_enabled`] call
-    /// can never silently pause dispatch fleet-wide. Tests that exercise the
-    /// pause path must opt in explicitly via `.with_breaker_enabled(true)`.
+    /// (`true`) — the same default as
+    /// [`crate::config::WorkConfig::enable_spawn_capability_breaker`]. Tests
+    /// that exercise the disabled (observability-only) path must opt out
+    /// explicitly via `.with_breaker_enabled(false)`.
     pub fn with_config(threshold: usize, window_secs: i64) -> Self {
         Self {
             recent: Mutex::new(Vec::new()),
@@ -1193,7 +1195,7 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         assert!(!coordinator.is_dispatch_paused(), "precondition");
 
-        // `with_config` now defaults to disabled (matching production), but
+        // `with_config` now defaults to enabled (matching production), so
         // set it explicitly here since this test is specifically about the
         // flag-off path.
         let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(false);

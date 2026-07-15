@@ -47,19 +47,25 @@ pub const DEFAULT_MERGE_ORDER_STAGGER_SECS: u64 = 0;
 /// bounds the worst-case dispatch delay a misconfiguration can impose.
 pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
 
-/// Default value for [`WorkConfig::enable_spawn_capability_breaker`]. **OFF**
-/// by default (operator directive, 2026-07-15): the breaker
-/// (`engine/core/src/spawn_health.rs`, PR #1824) tripped for the first time
-/// ever that day on what self-healed as a transient blip, and latched the
-/// entire fleet's dispatch — reviews included — for ~40 minutes until a
-/// human manually resumed it. A single unusual outage should not disable
-/// dispatch fleet-wide; operators who want the breaker's protection (e.g.
-/// after repeated real spawn-capability outages) opt in explicitly via
-/// `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=true`. The failure-window tracking,
-/// logging, dispatch events, and attention item stay active either way —
-/// only the actual dispatch pause (and its automatic recovery machinery) are
-/// gated by this flag.
-pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = false;
+/// Default value for [`WorkConfig::enable_spawn_capability_breaker`]. **ON**
+/// by default. History: the breaker (`engine/core/src/spawn_health.rs`, PR
+/// #1824) tripped for the first time ever on 2026-07-15 on what turned out
+/// to be a benign cause — display sleep + App Nap throttling the app's
+/// MainActor, making spawn acks 24-87s late — and latched the entire
+/// fleet's dispatch, reviews included, for ~40 minutes until a human
+/// manually resumed it. That incident (T2761) drove the flag to default off
+/// between PR #2041 and this change, via `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`
+/// opt-in only. Two fixes have since landed: the App Nap opt-out (display
+/// sleep no longer degrades spawn acks) and the enabled-mode half-open
+/// auto-recovery probe (a transient blip self-heals instead of latching), so
+/// the breaker's pause is safe to re-enable by default for the genuine
+/// app-dead/ghost-pane incident class it was designed for. Operators who
+/// need to disable it can still opt out via
+/// `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false`. The failure-window
+/// tracking, logging, dispatch events, and attention item stay active
+/// either way — only the actual dispatch pause (and its automatic recovery
+/// machinery) are gated by this flag.
+pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = true;
 
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
@@ -136,9 +142,10 @@ pub struct WorkConfig {
     #[builder(default = DEFAULT_MERGE_ORDER_STAGGER_SECS)]
     pub merge_order_stagger_secs: u64,
     /// Whether the spawn-capability circuit breaker (`spawn_health.rs`) is
-    /// allowed to actually pause dispatch when it trips. OFF by default —
+    /// allowed to actually pause dispatch when it trips. ON by default —
     /// see [`DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] for the 2026-07-15
-    /// incident that motivated defaulting it off. Configured via
+    /// incident that motivated defaulting it off between PR #2041 and this
+    /// change, and why it is safe to default on again now. Configured via
     /// `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`. When `false`, the breaker
     /// still tracks failures, logs, raises its attention item, and emits its
     /// dispatch event on trip — it just never calls `set_dispatch_paused`.
@@ -601,12 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn enable_spawn_capability_breaker_defaults_off_and_reads_env() {
+    fn enable_spawn_capability_breaker_defaults_on_and_reads_env() {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path_str = tempdir.path().join("state.db");
 
-        // Absent → defaults OFF (2026-07-15 operator directive: a single
-        // transient outage must not latch fleet-wide dispatch by default).
+        // Absent → defaults ON: the App Nap opt-out and half-open
+        // auto-recovery probe make the dispatch pause safe again for the
+        // genuine app-dead/ghost-pane incident class it was designed for.
         let config = WorkConfig::load_from(|k| match k {
             "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
             _ => None,
@@ -616,25 +624,25 @@ mod tests {
             config.enable_spawn_capability_breaker,
             DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER
         );
-        assert!(!config.enable_spawn_capability_breaker, "breaker defaults off");
+        assert!(config.enable_spawn_capability_breaker, "breaker defaults on");
 
-        // Explicit "true" opts in.
+        // Explicit "false" opts out.
         let config = WorkConfig::load_from(|k| match k {
-            "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER" => Some(OsString::from("true")),
-            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
-            _ => None,
-        })
-        .expect("config loads");
-        assert!(config.enable_spawn_capability_breaker);
-
-        // Explicit "0" is also accepted as false.
-        let config = WorkConfig::load_from(|k| match k {
-            "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER" => Some(OsString::from("0")),
+            "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER" => Some(OsString::from("false")),
             "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
             _ => None,
         })
         .expect("config loads");
         assert!(!config.enable_spawn_capability_breaker);
+
+        // Explicit "1" is also accepted as true.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER" => Some(OsString::from("1")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(config.enable_spawn_capability_breaker);
     }
 
     #[test]
