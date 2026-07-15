@@ -268,6 +268,7 @@ mod execution_retention;
 mod executions_runs;
 mod host_reconcile_queries;
 mod insert_helpers;
+mod list_filter;
 mod mappers;
 mod metrics_db;
 mod metrics_types;
@@ -295,6 +296,9 @@ pub(crate) use dispatch_helpers::*;
 pub(crate) use exec_status_helpers::*;
 pub(crate) use exec_tail::content_checksum;
 pub(crate) use insert_helpers::*;
+// Private on purpose: only the list-read submodules under `work` build
+// these queries, so it stays visible to `work` and its children only.
+use list_filter::ListFilterQuery;
 pub(crate) use mappers::*;
 pub(crate) use migrations_a::*;
 pub(crate) use migrations_b::*;

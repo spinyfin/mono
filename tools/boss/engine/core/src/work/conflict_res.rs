@@ -536,40 +536,15 @@ impl WorkDb {
         limit: Option<u32>,
     ) -> Result<Vec<ConflictResolution>> {
         let conn = self.connect()?;
-        let mut sql = format!("SELECT {CONFLICT_RESOLUTION_COLUMNS} FROM conflict_resolutions WHERE 1=1");
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(pid) = product_id {
-            sql.push_str(" AND product_id = ?");
-            params_vec.push(Box::new(pid.to_owned()));
-        }
-        if let Some(wid) = work_item_id {
-            sql.push_str(" AND work_item_id = ?");
-            params_vec.push(Box::new(wid.to_owned()));
-        }
-        if !statuses.is_empty() {
-            sql.push_str(" AND status IN (");
-            for (idx, status) in statuses.iter().enumerate() {
-                if idx > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-                params_vec.push(Box::new(status.clone()));
-            }
-            sql.push(')');
-        }
-        sql.push_str(" ORDER BY created_at DESC, id DESC");
-        if let Some(cap) = limit {
-            sql.push_str(" LIMIT ?");
-            params_vec.push(Box::new(cap as i64));
-        }
-        let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(refs.as_slice(), map_conflict_resolution)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        ListFilterQuery::new(format!(
+            "SELECT {CONFLICT_RESOLUTION_COLUMNS} FROM conflict_resolutions WHERE 1=1"
+        ))
+        .filter_product_id(product_id)
+        .filter_work_item_id(work_item_id)
+        .filter_status_in(statuses)
+        .order_by_created_desc()
+        .limit(limit)
+        .collect(&conn, map_conflict_resolution)
     }
 
     /// Aggregate `conflict_resolutions.conflict_diagnosis` for one
