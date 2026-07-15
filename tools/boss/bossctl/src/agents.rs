@@ -956,9 +956,17 @@ pub(crate) async fn agents_pools(socket_path: &Option<String>, json: bool) -> Re
                         let status = claim.execution_status.as_deref().unwrap_or("?");
                         let work_item = claim.work_item_id.as_deref().unwrap_or("-");
                         let flag = if claim.live { "" } else { "  <-- LEAKED?" };
+                        // A spilled claim sits in this pool's slot but is
+                        // someone else's work — say so, or the reader will
+                        // miscount per-pool load.
+                        let spilled = claim
+                            .spilled_from_pool
+                            .as_deref()
+                            .map(|from| format!("  (spilled from {from})"))
+                            .unwrap_or_default();
                         println!(
-                            "  {}  execution={}  status={}  work_item={}{}",
-                            claim.worker_id, claim.execution_id, status, work_item, flag,
+                            "  {}  execution={}  status={}  work_item={}{}{}",
+                            claim.worker_id, claim.execution_id, status, work_item, spilled, flag,
                         );
                     }
                 }

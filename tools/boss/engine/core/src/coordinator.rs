@@ -77,6 +77,86 @@ impl ExecutionStartedHook for NoopExecutionStartedHook {
     async fn on_execution_started(&self, _execution_id: &str) {}
 }
 
+/// What a preemption teardown actually did to the victim. Mirrors the
+/// subset of [`crate::completion::ForceReleaseOutcome`] the dispatcher
+/// needs to branch on, kept as its own type so the coordinator module
+/// doesn't take a hard dependency on the completion module's surface
+/// (same rationale as [`ExecutionStartedHook`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreemptOutcome {
+    /// The victim's pane was reaped and its cube lease released. Its
+    /// pool slot is free and its work is safe to requeue.
+    Released,
+    /// The victim had no live pane to reap — it is mid-spawn, and its
+    /// lease is deliberately still held (T981: releasing it now would
+    /// hand cube a workspace the in-flight spawn is about to occupy).
+    /// The caller MUST abandon the preemption: do not cancel, do not
+    /// requeue. The in-flight run releases the lease itself once its
+    /// spawn settles.
+    MidSpawn,
+    /// Teardown was attempted and failed. The victim may be in any
+    /// state; the caller abandons the preemption and leaves recovery to
+    /// the existing sweeps.
+    Failed,
+}
+
+/// Teardown path the dispatcher uses to preempt an in-progress spilled
+/// automation run when a mainline item is starved of interactive slots
+/// (see [`crate::dispatch_spillover`]).
+///
+/// Production wiring routes this into
+/// [`crate::completion::WorkerCompletionHandler::force_release`], which
+/// is the same incident-hardened teardown `bossctl agents stop` and the
+/// stale-worker sweep use: it tears down the libghostty pane, fires the
+/// `reap_worker_process_tree` SIGTERM/SIGKILL ladder at the worker's
+/// whole process group (so no orphaned `claude` survives holding build
+/// locks — the #975/#1006 leak class), releases the pool slot, and
+/// releases the cube lease. Reusing it — rather than open-coding a
+/// teardown here — is what keeps preemption's process-tree reap and its
+/// mid-spawn (T981) refusal correct by construction.
+#[async_trait]
+pub trait AutomationPreemptor: Send + Sync {
+    async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome;
+}
+
+/// No-op preemptor used as the default: reports every teardown as
+/// [`PreemptOutcome::Failed`], which disables preemption entirely (the
+/// dispatcher abandons the attempt and the mainline item waits for a
+/// slot exactly as it does today). Production swaps it out via
+/// [`ExecutionCoordinator::set_automation_preemptor`]. Keeping the
+/// default inert means the many test doubles that never exercise
+/// preemption need no changes.
+#[derive(Debug, Default)]
+pub struct NoopAutomationPreemptor;
+
+#[async_trait]
+impl AutomationPreemptor for NoopAutomationPreemptor {
+    async fn preempt_worker(&self, _execution_id: &str) -> PreemptOutcome {
+        PreemptOutcome::Failed
+    }
+}
+
+/// Result of one preemption attempt by the dispatcher.
+///
+/// The two axes are deliberately separate: *did we tear a run down* and
+/// *did we get a slot out of it*. They usually agree, but a freed slot can
+/// be taken by a concurrent out-of-band claimer before the preempting
+/// execution claims it. The once-per-pass cascade bound must key off the
+/// first axis — a teardown that happened still counts against the pass's
+/// single-preemption budget even if it bought this item nothing, or a
+/// burst of mainline arrivals racing one unlucky slot could tear down
+/// several automation runs in a single drain.
+#[derive(Debug)]
+enum PreemptionAttempt {
+    /// Nothing was torn down: no eligible victim, the victim was
+    /// mid-spawn, or teardown failed. No state changed.
+    NotPreempted,
+    /// A run was torn down and its work requeued. `claimed` is the slot
+    /// taken for the preempting execution, or `None` if a concurrent
+    /// claimer won the freed slot first.
+    Preempted { claimed: Option<String> },
+}
+
 /// Number of interactive-worker slots shown on a single page (one macOS
 /// tab). The main pool is partitioned into fixed-size pages so that
 /// capacity is expressed as `pages × page size` rather than a magic total —
@@ -88,6 +168,11 @@ pub const WORKER_PAGE_SIZE: usize = 8;
 /// 8 slots); page 1 is "Lower Decks", a strict spillover pool the dispatcher
 /// only claims into once every Bridge Crew slot is occupied. Bumping this is
 /// the single knob that adds another page of capacity.
+///
+/// Lower Decks is also the only page automation may spill into when the
+/// automation pool is full, and the only page a mainline item can reclaim
+/// a slot from by preempting such a spill — Bridge Crew is never touched
+/// by either mechanism. See [`crate::dispatch_spillover`].
 pub const WORKER_PAGE_COUNT: usize = 2;
 
 /// Hard cap on the interactive/main worker pool. The runtime config can
@@ -897,6 +982,59 @@ impl WorkerPool {
         Some(worker_id)
     }
 
+    /// Snapshot this pool's slots as the spillover policy's view type.
+    /// Read-only; the returned data is a copy, so the caller must not
+    /// assume it stays accurate once the lock is dropped (every decision
+    /// derived from it is re-validated by the atomic claim below).
+    pub(crate) async fn slot_views(&self) -> Vec<crate::dispatch_spillover::SlotView> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(index, w)| crate::dispatch_spillover::SlotView {
+                index,
+                occupied: w.execution_id.is_some(),
+                last_workspace_id: w.last_workspace_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Claim a **Lower Decks** slot for an automation execution spilling
+    /// out of a full automation pool. Returns `None` when page 1 has no
+    /// free slot.
+    ///
+    /// Unlike [`Self::claim_worker`], this never considers page 0: a
+    /// spilling automation may not take a Bridge Crew slot even when
+    /// Bridge Crew is entirely idle, so mainline always retains its 8
+    /// slots (see [`crate::dispatch_spillover`] for why). Selection and
+    /// the occupancy test happen under one lock hold, so two concurrent
+    /// spills can never land on the same slot.
+    pub(crate) async fn claim_worker_spill(
+        &self,
+        execution_id: &str,
+        preferred_workspace_id: Option<&str>,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        let views: Vec<crate::dispatch_spillover::SlotView> = inner
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(index, w)| crate::dispatch_spillover::SlotView {
+                index,
+                occupied: w.execution_id.is_some(),
+                last_workspace_id: w.last_workspace_id.clone(),
+            })
+            .collect();
+        let chosen_idx =
+            crate::dispatch_spillover::select_spill_claim_index(&views, preferred_workspace_id, WORKER_PAGE_SIZE)?;
+        let worker = &mut inner.workers[chosen_idx];
+        worker.execution_id = Some(execution_id.to_owned());
+        let worker_id = worker.worker_id.clone();
+        log_pool_claim(&worker_id, execution_id, "automation-spill");
+        Some(worker_id)
+    }
+
     /// Skip-the-queue claim used by `bossctl agents launch`. Same
     /// deterministic, page-aware selection as `claim_worker`, but if every
     /// configured slot is busy and the pool is still below the hard
@@ -1411,6 +1549,13 @@ pub struct ExecutionCoordinator {
     /// can snapshot the bound chore PR's head SHA at run start.
     #[builder(default = Arc::new(NoopExecutionStartedHook))]
     execution_started_hook: Arc<dyn ExecutionStartedHook>,
+    /// Teardown path used to preempt a spilled automation run when a
+    /// mainline item is starved of interactive slots. Defaults to
+    /// [`NoopAutomationPreemptor`], which disables preemption; production
+    /// installs the `WorkerCompletionHandler` via
+    /// [`Self::set_automation_preemptor`].
+    #[builder(default = Arc::new(NoopAutomationPreemptor))]
+    automation_preemptor: Arc<dyn AutomationPreemptor>,
     /// Global dispatch-pause flag. When `true`, `drain_ready_queue` exits
     /// immediately without claiming any slots. Seeded from the `dispatch_paused`
     /// metadata key at engine startup; persisted there on every toggle so the
@@ -1525,6 +1670,7 @@ impl ExecutionCoordinator {
             merge_order_stagger_secs: 0,
             metrics: local_metrics,
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
+            automation_preemptor: Arc::new(NoopAutomationPreemptor),
             dispatch_paused: AtomicBool::new(false),
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
             dispatch_pause_exempts_reviews: AtomicBool::new(false),
@@ -1668,6 +1814,16 @@ impl ExecutionCoordinator {
         self.execution_started_hook = hook;
     }
 
+    /// Wire the automation-preemption teardown. Production installs the
+    /// `WorkerCompletionHandler` here so a starved mainline item can
+    /// reclaim an interactive slot from a spilled automation run through
+    /// the same pane-reap + lease-release path `bossctl agents stop`
+    /// uses. Left unset (the [`NoopAutomationPreemptor`] default),
+    /// preemption is disabled and mainline simply waits for a slot.
+    pub fn set_automation_preemptor(&mut self, preemptor: Arc<dyn AutomationPreemptor>) {
+        self.automation_preemptor = preemptor;
+    }
+
     /// Wire the engine-global metrics registry into this coordinator.
     /// `app.rs` calls this once after `init_all` has registered the
     /// lease counter handles. Tests that omit this call use a pre-seeded
@@ -1751,6 +1907,29 @@ impl ExecutionCoordinator {
     pub fn dispatch_paused_since_epoch_s(&self) -> Option<u64> {
         let v = self.dispatch_paused_since_epoch_s.load(Ordering::Acquire);
         if v == 0 { None } else { Some(v) }
+    }
+
+    /// The pool `execution` is **attributed** to (`"main"`,
+    /// `"automation"`, or `"review"`), independent of which pool's slot it
+    /// physically occupies.
+    ///
+    /// These two normally agree, and for most of the engine's history the
+    /// worker-id prefix (`worker-` / `auto-worker-` / `review-`) was a
+    /// sound proxy for both. Spillover breaks that proxy: an automation
+    /// execution that spilled into Lower Decks holds an ordinary
+    /// `worker-N` slot, so anything keying attribution off the prefix
+    /// would silently report automation load as main-pool load. Diagnostic
+    /// surfaces that answer "what kind of work is this?" must use this;
+    /// code answering "which pool owns this slot?" (release routing) must
+    /// keep using [`Self::pool_for_worker_id`].
+    pub fn attributed_pool_label(&self, execution: &WorkExecution) -> &'static str {
+        if self.execution_targets_review_pool(execution) {
+            "review"
+        } else if self.execution_targets_automation_pool(execution) {
+            "automation"
+        } else {
+            "main"
+        }
     }
 
     /// Return the pool that should handle `execution`.
@@ -2308,6 +2487,40 @@ impl ExecutionCoordinator {
     /// Executions whose pool is already known to be exhausted are skipped
     /// for this pass; they remain `ready` and will be picked up on the
     /// next `kick()` triggered by `release_worker_and_kick`.
+    ///
+    /// # Priority order: mainline > review > spilled automation
+    ///
+    /// Each drain runs in **two passes** over one `ready` snapshot:
+    ///
+    /// 1. **Home pools.** Every row attempts a claim on the pool
+    ///    [`Self::pool_for_execution`] routes it to. Mainline and review
+    ///    rows that miss are deferred (`pool_exhausted`) as always. An
+    ///    automation row that misses its full automation pool is instead
+    ///    collected as a *spill candidate*.
+    /// 2. **Spillover.** Each spill candidate tries to claim a free
+    ///    **Lower Decks** slot (page 1 of the interactive pool, never
+    ///    Bridge Crew — see [`WorkerPool::claim_worker_spill`]).
+    ///
+    /// The pass boundary is the whole point: by the time any automation
+    /// row can touch an interactive slot, every ready mainline row in the
+    /// snapshot has already claimed or been rejected. So **any ready
+    /// mainline item beats any ready automation item for a
+    /// non-automation slot regardless of arrival order** — the guarantee
+    /// does not depend on `list_ready_executions`' sort order, which
+    /// interleaves the pools by dispatch class and can rank an automation
+    /// row ahead of a mainline one.
+    ///
+    /// # Preemption: mainline's last resort
+    ///
+    /// When a *mainline* row misses its claim and the interactive pool is
+    /// full on both pages, the drain may stop one in-progress spilled
+    /// automation run and requeue its work to free a slot — see
+    /// [`Self::try_preempt_automation_for`]. Never for a review or
+    /// automation row, never against a mainline or review victim, and at
+    /// most **one per drain pass** (`preempted_this_pass`), so a burst of
+    /// mainline arrivals cannot cascade into wiping out every spilled
+    /// automation run at once. See [`crate::dispatch_spillover`] for the
+    /// policy and its rationale.
     async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         // Global pause gate. `pr_review` executions are the lifecycle of a
         // change already in flight, not new work, so an operator-originated
@@ -2357,6 +2570,16 @@ impl ExecutionCoordinator {
         let mut main_pool_exhausted = false;
         let mut auto_pool_exhausted = false;
         let mut review_pool_exhausted = false;
+        // Automation rows whose home pool was full. Placed onto free Lower
+        // Decks slots in pass 2, after every mainline/review row has had
+        // its claim attempt. Queue order is preserved.
+        let mut spill_candidates: Vec<WorkExecution> = Vec::new();
+        // At most one automation run may be preempted per drain pass, so a
+        // burst of mainline arrivals never cascades into tearing down every
+        // spilled automation run at once. The next mainline item waits for
+        // the next pass, by which point the freed slot may already have
+        // absorbed it.
+        let mut preempted_this_pass = false;
 
         // Per-pool candidate counts for this drain pass, computed up front
         // so the `request_recorded` event below can report "how many other
@@ -2410,10 +2633,17 @@ impl ExecutionCoordinator {
 
             // Skip executions for pools we already know are full.
             // They remain `ready` and will be retried on the next kick.
+            //
+            // Automation is deliberately NOT short-circuited on
+            // `auto_pool_exhausted`: a full automation pool is now the
+            // precondition for spilling, not a dead end, so every
+            // automation row must still flow through the pipeline below
+            // and attempt its home claim in order to be queued as a spill
+            // candidate. Short-circuiting here would let only the FIRST
+            // automation row of the pass ever reach the spill queue and
+            // leave the rest of Lower Decks idle. The redundant home claim
+            // this costs is one in-memory mutex acquisition per row.
             if is_review && review_pool_exhausted {
-                continue;
-            }
-            if is_automation && auto_pool_exhausted {
                 continue;
             }
             if is_main && main_pool_exhausted {
@@ -2673,13 +2903,63 @@ impl ExecutionCoordinator {
             }
 
             let pool = self.pool_for_execution(&execution);
-            let Some(worker_id) = pool
+            let claimed = pool
                 .claim_worker(&execution.id, preferred_workspace_id.as_deref())
-                .await
-            else {
+                .await;
+
+            // A mainline row that missed its slot gets ONE chance to
+            // reclaim interactive capacity from a spilled automation run
+            // before it settles for waiting. Gated on `is_main` (never
+            // review, never automation — see `dispatch_spillover`) and on
+            // the once-per-pass latch, which is what bounds a single
+            // mainline arrival to at most one preemption.
+            let claimed = match claimed {
+                Some(worker_id) => Some(worker_id),
+                None if is_main && !preempted_this_pass => {
+                    match self.try_preempt_automation_for(&execution).await {
+                        // Latch on the teardown having happened, NOT on
+                        // having won the slot — see `PreemptionAttempt`.
+                        PreemptionAttempt::Preempted { claimed } => {
+                            preempted_this_pass = true;
+                            claimed
+                        }
+                        PreemptionAttempt::NotPreempted => None,
+                    }
+                }
+                None => None,
+            };
+
+            let Some(worker_id) = claimed else {
                 // This pool is fully claimed. Record exhaustion and continue
                 // so executions for the other pools can still be dispatched.
                 let pool_capacity = pool.capacity().await;
+
+                // An automation row that missed its home pool is NOT
+                // finished yet: it becomes a spill candidate, and pass 2
+                // below tries to place it on a free Lower Decks slot once
+                // every mainline/review row in this snapshot has already
+                // had its claim attempt. Deferring it that way — rather
+                // than spilling inline here — is what makes "mainline
+                // beats automation for an interactive slot regardless of
+                // arrival order" structural instead of a property of the
+                // `list_ready_executions` sort order.
+                //
+                // `auto_pool_exhausted` is still latched: the automation
+                // pool genuinely is full, so later automation rows in this
+                // pass skip their (certain to fail) home claim and join
+                // the spill queue via the same path.
+                if is_automation {
+                    auto_pool_exhausted = true;
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        pool_capacity,
+                        "automation pool exhausted — queued as a Lower Decks spill candidate"
+                    );
+                    spill_candidates.push(execution);
+                    continue;
+                }
+
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -2718,83 +2998,471 @@ impl ExecutionCoordinator {
 
                 if is_review {
                     review_pool_exhausted = true;
-                } else if is_automation {
-                    auto_pool_exhausted = true;
-                    // For automation triage executions, mark the automation_runs
-                    // row as `pool_throttled` (not `failed_will_retry`) so the UI
-                    // shows "Queued" rather than a failure badge.
-                    if execution.kind == ExecutionKind::AutomationTriage {
-                        let detail = format!(
-                            "automation pool exhausted ({pool_capacity}/{pool_capacity} busy); \
-                             triage queued, will dispatch when a slot frees"
-                        );
-                        if let Err(err) = self
-                            .work_db
-                            .update_automation_run_for_pool_throttle(&execution.id, &detail)
-                        {
-                            tracing::warn!(
-                                execution_id = %execution.id,
-                                ?err,
-                                "failed to record pool_throttled outcome on automation_runs row",
-                            );
-                        }
-                    }
                 } else {
                     main_pool_exhausted = true;
                 }
                 continue;
             };
 
-            // Record the physical slot + page the claim landed on so a later
-            // spawn failure on this slot is attributable to Bridge Crew vs
-            // Lower Decks in `bossctl dispatch diagnose` (the page is `null`
-            // for automation/review pools, which are single-page).
-            let claimed_slot = slot_id_from_worker_id(&worker_id);
-            let claimed_page = claimed_slot.and_then(worker_page_label);
-            self.dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(&worker_id)
-                        .with_details(serde_json::json!({
-                            "pool": pool_label,
-                            "slot_id": claimed_slot,
-                            "page": claimed_page,
-                        })),
-                )
+            self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false)
                 .await;
-            if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
-                tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
-            }
+        }
 
-            match self.schedule_execution(&execution, &worker_id).await {
-                Ok(()) => {
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        worker_id = %worker_id,
-                        "spawn_attempt status=ready -> spawned"
+        // ---- Pass 2: automation spillover into Lower Decks ----
+        //
+        // Reached only after every mainline and review row above has
+        // already claimed or been rejected, so any interactive slot still
+        // free here is capacity no mainline work in this snapshot wanted.
+        // Candidates keep their queue order, so automation priority among
+        // themselves is unchanged — they are simply all ranked below all
+        // mainline work.
+        for execution in spill_candidates {
+            let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            let Some(worker_id) = self
+                .worker_pool
+                .claim_worker_spill(&execution.id, preferred_workspace_id.as_deref())
+                .await
+            else {
+                // No free Lower Decks slot either: this automation row
+                // waits, exactly as it did before spillover existed.
+                let pool_capacity = self.automation_pool.capacity().await;
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool_capacity,
+                    pool = "automation",
+                    "spawn_attempt status=ready -> deferred reason=pool_exhausted (no Lower Decks slot to spill into)"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "pool_exhausted",
+                                "pool": "automation",
+                                "pool_capacity": pool_capacity,
+                                "spill_attempted": true,
+                            })),
+                    )
+                    .await;
+                self.record_dispatch_wait_reason(&execution.id, "pool_exhausted");
+
+                // Keep the Automations tab honest: "Queued", not a failure
+                // badge. Same treatment the pre-spillover exhaustion path
+                // gave this row.
+                if execution.kind == ExecutionKind::AutomationTriage {
+                    let detail = format!(
+                        "automation pool exhausted ({pool_capacity}/{pool_capacity} busy) and no free \
+                         Lower Decks slot to spill into; triage queued, will dispatch when a slot frees"
                     );
+                    if let Err(err) = self
+                        .work_db
+                        .update_automation_run_for_pool_throttle(&execution.id, &detail)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "failed to record pool_throttled outcome on automation_runs row",
+                        );
+                    }
                 }
-                Err(err) => {
-                    tracing::error!(
-                        ?err,
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        worker_id = %worker_id,
-                        "spawn_attempt status=ready -> failed reason=schedule_execution_error"
-                    );
-                    self.pool_for_worker_id(&worker_id)
-                        .release_worker(&worker_id, preferred_workspace_id.as_deref())
-                        .await;
-                }
-            }
+                continue;
+            };
+
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "automation spilled into Lower Decks — automation pool full, no mainline work wanted this slot"
+            );
+            self.dispatch_claimed_execution(&execution, &worker_id, "automation", true)
+                .await;
         }
 
         if main_pool_exhausted || auto_pool_exhausted || review_pool_exhausted {
             DrainOutcome::PoolExhausted
         } else {
             DrainOutcome::QueueEmpty
+        }
+    }
+
+    /// Last-resort attempt to free an interactive slot for a starved
+    /// mainline `execution` by preempting one in-progress **spilled**
+    /// automation run. See [`PreemptionAttempt`] for the return contract.
+    /// When nothing is preempted the caller falls through to the ordinary
+    /// `pool_exhausted` deferral and the mainline item waits for the next
+    /// drain — the pre-spillover behaviour.
+    ///
+    /// # Why only spilled runs are victims
+    ///
+    /// A victim must be occupying a slot the mainline item could actually
+    /// use. The automation pool is a *physically separate* slot range
+    /// (`auto-worker-N` → slots 17..=22); mainline work never runs there,
+    /// so preempting an automation run in its home pool would tear down a
+    /// worker and free a slot the starved item still cannot claim — all
+    /// cost, no benefit. Only automation that has spilled into an
+    /// interactive slot is a useful victim, so the candidate set is drawn
+    /// from the interactive pool's claims alone. That also makes "never
+    /// preempt mainline or review work" hold structurally: a review run
+    /// is in the review pool's own range and is never enumerated here,
+    /// and each interactive claim is classified before it is eligible.
+    ///
+    /// # Ordering: tear down, then requeue
+    ///
+    /// The teardown runs BEFORE any DB mutation. If it reports
+    /// [`PreemptOutcome::MidSpawn`] or [`PreemptOutcome::Failed`] we
+    /// abandon the whole preemption having changed nothing, leaving the
+    /// victim to run to completion normally. Cancelling first and
+    /// releasing second (the shape [`crate::completion::WorkerCompletionHandler::cancel_and_release`]
+    /// uses, where teardown failure is recoverable) would instead strand
+    /// a cancelled-but-still-alive worker here.
+    async fn try_preempt_automation_for(self: &Arc<Self>, execution: &WorkExecution) -> PreemptionAttempt {
+        // Re-check fullness under the current pool state. The claim that
+        // just failed is strong evidence, but a slot may have freed in
+        // between — and preemption is destructive enough to be worth
+        // proving the precondition rather than inferring it.
+        let views = self.worker_pool.slot_views().await;
+        if !crate::dispatch_spillover::interactive_pool_is_full(&views) {
+            return PreemptionAttempt::NotPreempted;
+        }
+
+        // Build the victim set: interactive-pool claims whose execution is
+        // automation-classified and still non-terminal.
+        let mut candidates: Vec<crate::dispatch_spillover::PreemptionCandidate> = Vec::new();
+        for claim in self.worker_pool.claims().await {
+            let Ok(claimed) = self.work_db.get_execution(&claim.execution_id) else {
+                continue;
+            };
+            if claimed.status.is_terminal() {
+                continue;
+            }
+            if self.execution_targets_review_pool(&claimed) || !self.execution_targets_automation_pool(&claimed) {
+                continue;
+            }
+            candidates.push(crate::dispatch_spillover::PreemptionCandidate {
+                execution_id: claimed.id.clone(),
+                work_item_id: claimed.work_item_id.clone(),
+                worker_id: claim.worker_id.clone(),
+                started_epoch: claimed.started_epoch(),
+            });
+        }
+
+        let Some(victim) = crate::dispatch_spillover::select_preemption_victim(&candidates) else {
+            // Every interactive slot holds mainline or review work (or a
+            // mid-spawn automation run with no start time). Nothing to
+            // preempt — mainline waits, as it did before this feature.
+            tracing::debug!(
+                execution_id = %execution.id,
+                interactive_claims = candidates.len(),
+                "preemption declined: no eligible spilled automation victim"
+            );
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Skipped, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_details(serde_json::json!({
+                            "reason": "no_eligible_victim",
+                            "automation_candidates": candidates.len(),
+                        })),
+                )
+                .await;
+            return PreemptionAttempt::NotPreempted;
+        };
+        let victim = victim.clone();
+
+        tracing::warn!(
+            preempting_execution_id = %execution.id,
+            preempting_work_item_id = %execution.work_item_id,
+            victim_execution_id = %victim.execution_id,
+            victim_work_item_id = %victim.work_item_id,
+            victim_worker_id = %victim.worker_id,
+            "preempting spilled automation run: mainline work is ready and every \
+             Bridge Crew and Lower Decks slot is occupied"
+        );
+
+        // Graceful teardown: pane reap (full process-tree SIGTERM/SIGKILL
+        // ladder), pool-slot release, cube lease release.
+        match self.automation_preemptor.preempt_worker(&victim.execution_id).await {
+            PreemptOutcome::Released => {}
+            PreemptOutcome::MidSpawn => {
+                // T981: the victim is still spawning and its lease is
+                // deliberately held. Nothing was torn down and nothing was
+                // requeued — abandon cleanly.
+                tracing::info!(
+                    victim_execution_id = %victim.execution_id,
+                    "preemption abandoned: victim is mid-spawn; leaving it to complete"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "victim_mid_spawn",
+                                "candidate_execution_id": victim.execution_id,
+                            })),
+                    )
+                    .await;
+                return PreemptionAttempt::NotPreempted;
+            }
+            PreemptOutcome::Failed => {
+                tracing::warn!(
+                    victim_execution_id = %victim.execution_id,
+                    "preemption abandoned: victim teardown failed"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "teardown_failed",
+                                "candidate_execution_id": victim.execution_id,
+                            })),
+                    )
+                    .await;
+                return PreemptionAttempt::NotPreempted;
+            }
+        }
+
+        // The victim's worker is gone. Retire its execution row and queue
+        // a fresh one for the same work, so the automation redispatches
+        // later exactly like a new arrival.
+        let requeued_as = self.requeue_preempted_automation(&victim).await;
+
+        // Both sides of the story, so `bossctl dispatch diagnose` reads
+        // correctly from either execution's timeline.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Ok, &victim.execution_id)
+                    .with_work_item(&victim.work_item_id)
+                    .with_worker(&victim.worker_id)
+                    .with_details(serde_json::json!({
+                        "reason": "mainline_starved_no_free_interactive_slot",
+                        "preempting_execution_id": execution.id,
+                        "preempting_work_item_id": execution.work_item_id,
+                        "requeued_as": requeued_as,
+                        "victim_selection": "most_recently_started",
+                    })),
+            )
+            .await;
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::AutomationPreempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_details(serde_json::json!({
+                        "reason": "mainline_starved_no_free_interactive_slot",
+                        "preempted_execution_id": victim.execution_id,
+                        "preempted_work_item_id": victim.work_item_id,
+                        "requeued_as": requeued_as,
+                        "victim_selection": "most_recently_started",
+                    })),
+            )
+            .await;
+
+        // Take the slot the teardown just freed. `release_worker_and_kick`
+        // inside the teardown also kicks the scheduler, but drains are
+        // serialized by `scheduling_active`, so that kick only latches
+        // `scheduling_pending` — this drain keeps the slot.
+        let worker_id = self
+            .worker_pool
+            .claim_worker(&execution.id, execution.preferred_workspace_id.as_deref())
+            .await;
+        if worker_id.is_none() {
+            // Lost the freed slot to a concurrent out-of-band claimer
+            // (`bossctl agents launch`'s `claim_worker_force`). Nothing is
+            // lost — the automation work is already safely requeued — but
+            // the preemption bought this item nothing, so say so plainly
+            // rather than leaving an unexplained teardown in the log.
+            tracing::warn!(
+                execution_id = %execution.id,
+                victim_execution_id = %victim.execution_id,
+                "preempted an automation run but the freed slot was taken before this \
+                 execution could claim it; the automation work is requeued and this item \
+                 waits for the next drain"
+            );
+        }
+        PreemptionAttempt::Preempted { claimed: worker_id }
+    }
+
+    /// Retire a preempted automation execution and queue a fresh one for
+    /// the same work. Returns the new execution id when one was created.
+    ///
+    /// Losslessness is the whole contract here: the work item must not be
+    /// lost, must not land in a terminal `failed` state, and must not
+    /// leak its pool claim. The victim row is marked `cancelled` (not
+    /// `failed`: it did nothing wrong, and a failure badge would be a lie
+    /// on the Automations tab), which also stops the orphan sweep and
+    /// reconciler from trying to resurrect it, and lets
+    /// `request_execution`'s live-execution guard see the item as free.
+    ///
+    /// The two requeue shapes mirror the ones the slot-busy path
+    /// established (T2685 / #2030):
+    ///
+    /// - `automation_triage` binds to an `automations.id` and has no
+    ///   `tasks` row, so it needs its own fresh triage execution and its
+    ///   `automation_runs` row re-pointed at the retry — which also flips
+    ///   the occurrence to `failed_will_retry` ("Queued") rather than
+    ///   leaving it reading as a terminal failure.
+    /// - An automation-*produced* task/chore goes through
+    ///   `request_execution` directly rather than
+    ///   `rescan_active_dispatch`, because that path honors `autostart`,
+    ///   which `start_execution_run_on_host` has already consumed by the
+    ///   time a run is in progress. Preemption is the engine deciding on
+    ///   the item's behalf that this attempt must be retried, so the
+    ///   autostart gate does not apply.
+    async fn requeue_preempted_automation(
+        self: &Arc<Self>,
+        victim: &crate::dispatch_spillover::PreemptionCandidate,
+    ) -> Option<String> {
+        let victim_execution = match self.work_db.get_execution(&victim.execution_id) {
+            Ok(execution) => execution,
+            Err(err) => {
+                tracing::error!(
+                    victim_execution_id = %victim.execution_id,
+                    ?err,
+                    "preemption: failed to re-read victim execution; cannot requeue its work",
+                );
+                return None;
+            }
+        };
+
+        if let Err(err) = self.work_db.cancel_running_execution(&victim.execution_id) {
+            tracing::warn!(
+                victim_execution_id = %victim.execution_id,
+                ?err,
+                "preemption: failed to cancel victim execution; requeueing anyway",
+            );
+        }
+
+        if victim_execution.kind == ExecutionKind::AutomationTriage {
+            match self
+                .work_db
+                .create_automation_triage_execution(&victim_execution.work_item_id, &victim_execution.repo_remote_url)
+            {
+                Ok(retry) => {
+                    let detail = format!(
+                        "preempted to free a Lower Decks slot for mainline work; requeued as {}",
+                        retry.id
+                    );
+                    if let Err(err) = self.work_db.requeue_automation_run_after_transient_spawn_failure(
+                        &victim.execution_id,
+                        &retry.id,
+                        &detail,
+                    ) {
+                        tracing::warn!(
+                            victim_execution_id = %victim.execution_id,
+                            retry_execution_id = %retry.id,
+                            ?err,
+                            "preemption: failed to re-point automation_runs row at the retry execution",
+                        );
+                    }
+                    tracing::info!(
+                        victim_execution_id = %victim.execution_id,
+                        retry_execution_id = %retry.id,
+                        "preemption: automation triage requeued",
+                    );
+                    return Some(retry.id);
+                }
+                Err(err) => {
+                    tracing::error!(
+                        victim_execution_id = %victim.execution_id,
+                        ?err,
+                        "preemption: failed to create a replacement triage execution — automation \
+                         occurrence will wait for its next scheduled fire",
+                    );
+                    return None;
+                }
+            }
+        }
+
+        match self.work_db.request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(victim_execution.work_item_id.clone())
+                .build(),
+        ) {
+            Ok(fresh) => {
+                tracing::info!(
+                    victim_execution_id = %victim.execution_id,
+                    work_item_id = %victim_execution.work_item_id,
+                    requeued_execution_id = %fresh.id,
+                    "preemption: automation-produced work requeued",
+                );
+                Some(fresh.id)
+            }
+            Err(err) => {
+                tracing::error!(
+                    victim_execution_id = %victim.execution_id,
+                    work_item_id = %victim_execution.work_item_id,
+                    ?err,
+                    "preemption: failed to requeue automation work after teardown",
+                );
+                None
+            }
+        }
+    }
+
+    /// Shared tail of a successful claim: record the landing slot, clear
+    /// the wait reason, and hand off to `schedule_execution`, releasing
+    /// the slot again if the handoff fails.
+    ///
+    /// `spilled` marks an automation execution that claimed an
+    /// interactive (Lower Decks) slot because its own pool was full. It
+    /// is threaded into the `worker_claimed` event rather than inferred
+    /// downstream, because a spilled run's `worker_id` is an ordinary
+    /// `worker-N` — indistinguishable by prefix from mainline work — and
+    /// per-pool dispatch diagnostics must not silently reattribute
+    /// automation load to the main pool.
+    async fn dispatch_claimed_execution(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        pool_label: &str,
+        spilled: bool,
+    ) {
+        // Record the physical slot + page the claim landed on so a later
+        // spawn failure on this slot is attributable to Bridge Crew vs
+        // Lower Decks in `bossctl dispatch diagnose` (the page is `null`
+        // for automation/review pools, which are single-page).
+        let claimed_slot = slot_id_from_worker_id(worker_id);
+        let claimed_page = claimed_slot.and_then(worker_page_label);
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_details(serde_json::json!({
+                        "pool": pool_label,
+                        "slot_id": claimed_slot,
+                        "page": claimed_page,
+                        "spilled": spilled,
+                    })),
+            )
+            .await;
+        if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
+            tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
+        }
+
+        match self.schedule_execution(execution, worker_id).await {
+            Ok(()) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id = %worker_id,
+                    spilled,
+                    "spawn_attempt status=ready -> spawned"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id = %worker_id,
+                    "spawn_attempt status=ready -> failed reason=schedule_execution_error"
+                );
+                self.pool_for_worker_id(worker_id)
+                    .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
+                    .await;
+            }
         }
     }
 
@@ -5838,13 +6506,13 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
-        AUTOMATION_WORKER_ID_PREFIX, CHAIN_SERIALIZED_STALL_ATTENTION_KIND, CHAIN_SERIALIZED_STALL_THRESHOLD_SECS,
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
-        DispatchPauseOrigin, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, Host, HostAdapter,
-        HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-        REVIEW_WORKER_ID_PREFIX, WORKER_PAGE_SIZE, WorkerPool, occupying_live_worker, pick_worst_failing_check,
-        pool_model_override_for_worker_id, slot_busy_occupant, slot_id_from_worker_id, worker_id_for_slot,
-        worker_page_label,
+        AUTOMATION_WORKER_ID_PREFIX, AutomationPreemptor, CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
+        CHAIN_SERIALIZED_STALL_THRESHOLD_SECS, CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary,
+        CubeWorkspaceLease, CubeWorkspaceStatus, DispatchPauseOrigin, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator,
+        ExecutionKind, Host, HostAdapter, HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
+        MAX_WORKER_POOL_SIZE, PreemptOutcome, REVIEW_WORKER_ID_PREFIX, WORKER_PAGE_SIZE, WorkerPool,
+        occupying_live_worker, pick_worst_failing_check, pool_model_override_for_worker_id, slot_busy_occupant,
+        slot_id_from_worker_id, worker_id_for_slot, worker_page_label,
     };
     use crate::spawn_flow::StartWorkerError;
     use boss_protocol::{EngineToAppError, ExecutionStatus};
@@ -10883,6 +11551,610 @@ mod tests {
         assert_eq!(
             ready, 1,
             "the second auto chore must be deferred (automation pool full); got {ready} ready"
+        );
+    }
+
+    // ---- Automation spillover + mainline preemption ----
+    //
+    // Geometry these tests rely on (see `dispatch_spillover`):
+    // `WORKER_PAGE_SIZE` is 8, so a main pool of N > 8 slots has Bridge
+    // Crew at indices 0..8 (`worker-1`..`worker-8`) and Lower Decks at
+    // indices 8.. (`worker-9`..). Automation may only ever spill into the
+    // Lower Decks page.
+
+    /// Create an automation plus `count` automation-produced chores whose
+    /// `source_automation_id` points at it (which is what routes their
+    /// executions to the automation pool). Returns the chore ids in
+    /// creation order.
+    fn create_automation_chores(db: &Arc<WorkDb>, product_id: &str, count: usize) -> Vec<String> {
+        use crate::work::CreateAutomationInput;
+
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product_id.to_owned(),
+                name: "Spillover test automation".to_owned(),
+                repo_remote_url: None,
+                trigger: boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * 1-5".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "do maintenance".to_owned(),
+                open_task_limit: 50,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+
+        (0..count)
+            .map(|n| {
+                let chore = create_test_chore(db, product_id.to_owned(), format!("Auto chore {n}"));
+                let conn = db.connect().unwrap();
+                conn.execute(
+                    "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+                    rusqlite::params![automation.id, chore.id],
+                )
+                .unwrap();
+                chore.id
+            })
+            .collect()
+    }
+
+    async fn wait_for_running_count(db: &Arc<WorkDb>, want: usize) {
+        for _ in 0..300 {
+            let running = db
+                .list_executions(None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.status == ExecutionStatus::Running)
+                .count();
+            if running >= want {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The `worker_id`s currently claimed in the main pool for the given
+    /// work items, resolved through the pool's claim table.
+    async fn claimed_worker_ids_for(
+        coordinator: &Arc<ExecutionCoordinator>,
+        db: &Arc<WorkDb>,
+        chore_id: &str,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for claim in coordinator.worker_pool().claims().await {
+            if let Ok(execution) = db.get_execution(&claim.execution_id)
+                && execution.work_item_id == chore_id
+            {
+                out.push(claim.worker_id.clone());
+            }
+        }
+        out
+    }
+
+    /// Test double for the preemption teardown. Mirrors the one
+    /// production-relevant side effect of `force_release` — the victim's
+    /// pool slot becomes free — so the dispatcher's "claim the slot the
+    /// teardown just freed" step exercises the real code path. Records
+    /// every call so tests can assert exactly how many preemptions fired.
+    struct FakePreemptor {
+        pool: WorkerPool,
+        outcome: PreemptOutcome,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakePreemptor {
+        fn new(pool: WorkerPool, outcome: PreemptOutcome) -> Self {
+            Self {
+                pool,
+                outcome,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn calls(&self) -> Vec<String> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl AutomationPreemptor for FakePreemptor {
+        async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome {
+            self.calls.lock().await.push(execution_id.to_owned());
+            if self.outcome == PreemptOutcome::Released {
+                for claim in self.pool.claims().await {
+                    if claim.execution_id == execution_id {
+                        self.pool.release_worker(&claim.worker_id, None).await;
+                    }
+                }
+            }
+            self.outcome.clone()
+        }
+    }
+
+    /// Spillover is a pressure valve, not a default: while the automation
+    /// pool still has room, automation runs there and never touches an
+    /// interactive slot — even though 16 of them are sitting idle.
+    #[tokio::test]
+    async fn automation_does_not_spill_while_its_own_pool_has_room() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        create_automation_chores(&db, &product.id, 2);
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(MAX_WORKER_POOL_SIZE),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(2));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        wait_for_running_count(&db, 2).await;
+
+        assert_eq!(
+            coordinator.automation_worker_pool().idle_count().await,
+            0,
+            "both automation chores must occupy their own pool"
+        );
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            MAX_WORKER_POOL_SIZE,
+            "no automation may spill into an interactive slot while its own pool has room"
+        );
+    }
+
+    /// Once the automation pool is full, the overflow spills — but into
+    /// Lower Decks (`worker-9`) only. Bridge Crew stays entirely free for
+    /// mainline even though `worker-1` is idle and would be the natural
+    /// lowest-index choice for an ordinary claim.
+    #[tokio::test]
+    async fn automation_spills_into_lower_decks_and_never_bridge_crew() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let auto_chores = create_automation_chores(&db, &product.id, 2);
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(MAX_WORKER_POOL_SIZE),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        wait_for_running_count(&db, 2).await;
+
+        assert_eq!(
+            coordinator.automation_worker_pool().idle_count().await,
+            0,
+            "the first automation chore takes the single automation slot"
+        );
+
+        let spilled: Vec<String> = {
+            let mut all = Vec::new();
+            for chore_id in &auto_chores {
+                all.extend(claimed_worker_ids_for(&coordinator, &db, chore_id).await);
+            }
+            all
+        };
+        assert_eq!(
+            spilled,
+            vec!["worker-9".to_owned()],
+            "the overflow automation chore must spill onto the first Lower Decks slot \
+             (worker-9), leaving all 8 Bridge Crew slots free; got {spilled:?}"
+        );
+    }
+
+    /// The core priority guarantee: mainline beats automation for an
+    /// interactive slot **regardless of arrival order**.
+    ///
+    /// The automation chores are created FIRST here, so they sort ahead of
+    /// every mainline row in `list_ready_executions` (same dispatch class
+    /// and priority → `created_at ASC` decides). A single-pass dispatcher
+    /// that simply walked that order would hand the lone Lower Decks slot
+    /// to the earlier-arriving automation. The two-pass drain must not:
+    /// every mainline row claims before any automation row is allowed to
+    /// spill, so the later-arriving mainline chore takes the slot and the
+    /// automation stays queued.
+    #[tokio::test]
+    async fn mainline_beats_queued_spilled_automation_regardless_of_arrival_order() {
+        const MAIN_POOL: usize = WORKER_PAGE_SIZE + 1; // 8 Bridge Crew + 1 Lower Decks
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+
+        // Automation first → earlier `created_at` → sorts ahead.
+        let auto_chores = create_automation_chores(&db, &product.id, 2);
+        // Mainline second → later `created_at` → sorts behind, and there
+        // are exactly enough of them to want every interactive slot.
+        let main_chores: Vec<String> = (0..MAIN_POOL)
+            .map(|n| create_test_chore(&db, product.id.clone(), format!("Regular chore {n}")).id)
+            .collect();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(MAIN_POOL),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        // 9 mainline + 1 automation (in its own pool) = 10.
+        wait_for_running_count(&db, MAIN_POOL + 1).await;
+
+        // Every interactive slot went to mainline.
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            0,
+            "all interactive slots must be claimed"
+        );
+        for chore_id in &main_chores {
+            assert_eq!(
+                claimed_worker_ids_for(&coordinator, &db, chore_id).await.len(),
+                1,
+                "every mainline chore must hold an interactive slot, including the \
+                 Lower Decks one the earlier-arriving automation wanted"
+            );
+        }
+
+        // The overflow automation chore lost the Lower Decks slot despite
+        // arriving first, and is still queued (not failed, not lost).
+        let auto_executions: Vec<_> = auto_chores
+            .iter()
+            .flat_map(|id| db.list_executions(Some(id)).unwrap())
+            .collect();
+        let queued = auto_executions
+            .iter()
+            .filter(|e| e.status == ExecutionStatus::Ready)
+            .count();
+        assert_eq!(
+            queued, 1,
+            "the overflow automation chore must remain `ready` behind mainline; got {auto_executions:?}"
+        );
+    }
+
+    /// Preemption is a last resort: while any interactive slot is free,
+    /// a mainline arrival claims it normally and no automation is touched.
+    #[tokio::test]
+    async fn preemption_does_not_fire_while_an_interactive_slot_is_free() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        create_automation_chores(&db, &product.id, 2);
+        create_test_chore(&db, product.id.clone(), "Regular chore");
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
+        let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            pool,
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        coord.set_automation_preemptor(preemptor.clone());
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        // 1 mainline + 1 automation in-pool + 1 automation spilled.
+        wait_for_running_count(&db, 3).await;
+
+        assert!(
+            preemptor.calls().await.is_empty(),
+            "no preemption may fire while interactive slots remain free; got {:?}",
+            preemptor.calls().await
+        );
+    }
+
+    /// When mainline is ready and every Bridge Crew AND Lower Decks slot
+    /// is occupied, the dispatcher preempts a spilled automation run —
+    /// and the preempted work is requeued losslessly: its execution goes
+    /// `cancelled` (never `failed`), a fresh execution is queued for the
+    /// same work item, and the item itself is untouched.
+    #[tokio::test]
+    async fn mainline_preempts_spilled_automation_when_every_interactive_slot_is_busy() {
+        const MAIN_POOL: usize = WORKER_PAGE_SIZE + 1; // 8 Bridge Crew + 1 Lower Decks
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let auto_chores = create_automation_chores(&db, &product.id, 2);
+        for n in 0..WORKER_PAGE_SIZE {
+            create_test_chore(&db, product.id.clone(), format!("Bridge chore {n}"));
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let pool = WorkerPool::new(MAIN_POOL);
+        let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            pool,
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        coord.set_automation_preemptor(preemptor.clone());
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        // 8 Bridge Crew mainline + 1 automation in-pool + 1 spilled = 10.
+        wait_for_running_count(&db, WORKER_PAGE_SIZE + 2).await;
+
+        // Precondition: the interactive pool is full, with the Lower Decks
+        // slot held by spilled automation.
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            0,
+            "test precondition: every interactive slot must be busy"
+        );
+        let spilled_execution_id = coordinator
+            .worker_pool()
+            .claims()
+            .await
+            .into_iter()
+            .find(|c| c.worker_id == "worker-9")
+            .expect("test precondition: an automation run must hold the Lower Decks slot")
+            .execution_id;
+        let spilled_work_item = db.get_execution(&spilled_execution_id).unwrap().work_item_id;
+        assert!(
+            auto_chores.contains(&spilled_work_item),
+            "test precondition: worker-9 must hold automation work"
+        );
+        assert!(preemptor.calls().await.is_empty(), "nothing preempted yet");
+
+        // A mainline chore arrives with nowhere to go.
+        let late = create_test_chore(&db, product.id.clone(), "Late mainline chore");
+        db.request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(late.id.clone())
+                .build(),
+        )
+        .unwrap();
+        coordinator.kick();
+
+        for _ in 0..300 {
+            if !preemptor.calls().await.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            preemptor.calls().await,
+            vec![spilled_execution_id.clone()],
+            "the spilled automation run must be the preemption victim"
+        );
+
+        // The late mainline chore got the freed slot.
+        for _ in 0..300 {
+            if !claimed_worker_ids_for(&coordinator, &db, &late.id).await.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            claimed_worker_ids_for(&coordinator, &db, &late.id).await,
+            vec!["worker-9".to_owned()],
+            "the preempting mainline chore must claim the slot the victim vacated"
+        );
+
+        // Lossless requeue: cancelled, not failed; work re-queued; item intact.
+        let victim = db.get_execution(&spilled_execution_id).unwrap();
+        assert_eq!(
+            victim.status,
+            ExecutionStatus::Cancelled,
+            "a preempted execution must be cancelled, never failed — it did nothing wrong"
+        );
+        let replacements: Vec<_> = db
+            .list_executions(Some(&spilled_work_item))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.id != spilled_execution_id && !e.status.is_terminal())
+            .collect();
+        assert_eq!(
+            replacements.len(),
+            1,
+            "the preempted automation work must be requeued as exactly one fresh \
+             non-terminal execution; got {replacements:?}"
+        );
+    }
+
+    /// No preemption cascade: a single starved mainline arrival takes out
+    /// at most ONE automation run, even when several spilled runs are
+    /// available to preempt. The second spilled run keeps going.
+    #[tokio::test]
+    async fn single_mainline_arrival_preempts_at_most_one_automation_run() {
+        const MAIN_POOL: usize = WORKER_PAGE_SIZE + 2; // 8 Bridge Crew + 2 Lower Decks
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        create_automation_chores(&db, &product.id, 3);
+        for n in 0..WORKER_PAGE_SIZE {
+            create_test_chore(&db, product.id.clone(), format!("Bridge chore {n}"));
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let pool = WorkerPool::new(MAIN_POOL);
+        let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            pool,
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        coord.set_automation_preemptor(preemptor.clone());
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        // 8 Bridge Crew + 1 automation in-pool + 2 spilled = 11.
+        wait_for_running_count(&db, WORKER_PAGE_SIZE + 3).await;
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            0,
+            "test precondition: every interactive slot must be busy, two by spilled automation. \
+             claims={:?} executions={:?}",
+            coordinator.worker_pool().claims().await,
+            db.list_executions(None)
+                .unwrap()
+                .iter()
+                .map(|e| (e.id.clone(), e.status.to_string()))
+                .collect::<Vec<_>>(),
+        );
+
+        let late = create_test_chore(&db, product.id.clone(), "Late mainline chore");
+        db.request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(late.id.clone())
+                .build(),
+        )
+        .unwrap();
+        coordinator.kick();
+
+        for _ in 0..300 {
+            if !claimed_worker_ids_for(&coordinator, &db, &late.id).await.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Settle: give any (incorrect) follow-on drain a chance to preempt
+        // again, so this assertion is meaningful rather than merely early.
+        sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            preemptor.calls().await.len(),
+            1,
+            "one mainline arrival must preempt exactly one automation run; got {:?}",
+            preemptor.calls().await
+        );
+    }
+
+    /// A preempted automation item is not dropped: once interactive
+    /// capacity frees up, its requeued execution dispatches normally, as
+    /// if it had just arrived.
+    #[tokio::test]
+    async fn preempted_automation_work_redispatches_once_capacity_frees() {
+        const MAIN_POOL: usize = WORKER_PAGE_SIZE + 1;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        create_automation_chores(&db, &product.id, 2);
+        for n in 0..WORKER_PAGE_SIZE {
+            create_test_chore(&db, product.id.clone(), format!("Bridge chore {n}"));
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let pool = WorkerPool::new(MAIN_POOL);
+        let preemptor = Arc::new(FakePreemptor::new(pool.clone(), PreemptOutcome::Released));
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            pool.clone(),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        coord.set_automation_preemptor(preemptor.clone());
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        wait_for_running_count(&db, WORKER_PAGE_SIZE + 2).await;
+
+        let spilled_execution_id = coordinator
+            .worker_pool()
+            .claims()
+            .await
+            .into_iter()
+            .find(|c| c.worker_id == "worker-9")
+            .expect("test precondition: automation must hold the Lower Decks slot")
+            .execution_id;
+        let spilled_work_item = db.get_execution(&spilled_execution_id).unwrap().work_item_id;
+
+        let late = create_test_chore(&db, product.id.clone(), "Late mainline chore");
+        db.request_execution(
+            boss_protocol::RequestExecutionInput::builder()
+                .work_item_id(late.id.clone())
+                .build(),
+        )
+        .unwrap();
+        coordinator.kick();
+        for _ in 0..300 {
+            if !preemptor.calls().await.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(preemptor.calls().await.len(), 1, "the spilled automation was preempted");
+
+        // Free the automation pool's own slot, as a finishing automation
+        // worker would, and kick. The requeued work must dispatch onto it.
+        //
+        // Note it must be an automation-pool slot (or a Lower Decks one) —
+        // freeing a Bridge Crew slot deliberately would NOT help, since
+        // automation may never claim page 0. That asymmetry is the feature,
+        // not an oversight.
+        coordinator
+            .automation_worker_pool()
+            .release_worker("auto-worker-1", None)
+            .await;
+        coordinator.kick();
+
+        let mut redispatched = None;
+        for _ in 0..300 {
+            let running: Vec<_> = db
+                .list_executions(Some(&spilled_work_item))
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.id != spilled_execution_id && e.status == ExecutionStatus::Running)
+                .collect();
+            if let Some(execution) = running.first() {
+                redispatched = Some(execution.clone());
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let redispatched = redispatched.expect(
+            "the preempted automation work must redispatch on a later pass once a slot frees — \
+             it must not be lost, failed, or left queued forever",
+        );
+        assert_ne!(
+            redispatched.id, spilled_execution_id,
+            "redispatch must be a fresh execution, not the cancelled victim"
         );
     }
 

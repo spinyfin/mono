@@ -1152,6 +1152,14 @@ impl ServerState {
             // handler captures the bound chore PR's head SHA into
             // `work_executions.pr_head_before`.
             execution_coordinator_inner.set_execution_started_hook(completion_handler_for_coordinator.clone());
+            // Wire automation preemption: when mainline work is ready and
+            // every Bridge Crew and Lower Decks slot is occupied, the
+            // dispatcher reclaims a slot from a spilled automation run
+            // through the completion handler's `force_release` — the same
+            // pane-reap + cube-lease-release teardown `bossctl agents
+            // stop` performs. Without this the coordinator keeps its inert
+            // default and preemption never fires.
+            execution_coordinator_inner.set_automation_preemptor(completion_handler_for_coordinator.clone());
             // Install the SSH-capable provider so the dispatch loop can
             // build a per-host adapter (local vs SSH-remote) for whichever
             // host the scheduler selects. `local` returns the coordinator's

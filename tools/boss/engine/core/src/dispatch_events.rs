@@ -465,6 +465,30 @@ pub enum Stage {
     /// `pause_duration_secs` (how long the episode this closes actually
     /// lasted), and a human-readable `reason`.
     DispatchResumed,
+    /// A ready mainline item preempted an in-progress spilled automation
+    /// run to obtain an interactive slot (see
+    /// [`crate::dispatch_spillover`]). Fires only when every Bridge Crew
+    /// and Lower Decks slot is occupied; never for a review or automation
+    /// item, and never against a mainline or review victim.
+    ///
+    /// Emitted TWICE per preemption — once bound to the victim execution
+    /// and once to the preempting execution — so `bossctl dispatch
+    /// diagnose` tells the story from either side without a cross-stream
+    /// join. The victim's copy carries `preempting_execution_id` /
+    /// `preempting_work_item_id`; the preemptor's carries
+    /// `preempted_execution_id` / `preempted_work_item_id`. Both carry
+    /// `reason` and the `requeued_as` execution id, so a reader of the
+    /// victim's timeline can follow the automation work to the fresh
+    /// execution that will redispatch it rather than concluding it was
+    /// dropped.
+    ///
+    /// `outcome=ok` means the victim was torn down and its work requeued.
+    /// `outcome=skipped` means preemption was considered and declined
+    /// (`reason` names why: `no_eligible_victim`, `victim_mid_spawn`, …) —
+    /// the mainline item simply waits for the next drain, exactly as it
+    /// does on ordinary pool exhaustion. `outcome=error` means teardown
+    /// or requeue failed.
+    AutomationPreempted,
 }
 
 impl Stage {
@@ -511,6 +535,7 @@ impl Stage {
             Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
             Stage::DispatchPaused => "dispatch_paused",
             Stage::DispatchResumed => "dispatch_resumed",
+            Stage::AutomationPreempted => "automation_preempted",
         }
     }
 }

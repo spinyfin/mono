@@ -55,7 +55,7 @@ use crate::attentions_detector;
 use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
-use crate::coordinator::{CubeClient, ExecutionPublisher};
+use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
 use crate::gh_invocation::run_gh;
 use crate::merge_poller::{
@@ -6128,6 +6128,42 @@ impl crate::coordinator::ExecutionStartedHook for WorkerCompletionHandler {
         // Inherent method already does the work; this just satisfies
         // the trait the coordinator depends on.
         WorkerCompletionHandler::on_execution_started(self, execution_id).await
+    }
+}
+
+#[async_trait]
+impl crate::coordinator::AutomationPreemptor for WorkerCompletionHandler {
+    /// Route dispatcher-initiated preemption through the exact teardown
+    /// `bossctl agents stop` and the stale-worker sweep use: pane
+    /// release + `reap_worker_process_tree` SIGTERM/SIGKILL ladder over
+    /// the worker's whole process group, pool-slot release, then cube
+    /// lease release.
+    ///
+    /// The `HeldForInFlightSpawn` → [`PreemptOutcome::MidSpawn`] mapping
+    /// is the load-bearing one: `force_release` refuses to release a
+    /// mid-spawn worker's lease (T981 — cube would re-lease a workspace
+    /// the in-flight spawn is about to occupy), so the dispatcher must
+    /// learn that nothing was torn down and abandon the preemption rather
+    /// than requeue work whose worker is still very much alive.
+    ///
+    /// `NoLeaseHeld` counts as released: the pane was found and reaped
+    /// (a `NoLiveWorker` pane short-circuits to `HeldForInFlightSpawn`
+    /// above it), so the slot is free and the victim holds no cube
+    /// resources to leak.
+    async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome {
+        match self.force_release(execution_id).await {
+            ForceReleaseOutcome::Released { .. } | ForceReleaseOutcome::NoLeaseHeld => PreemptOutcome::Released,
+            ForceReleaseOutcome::HeldForInFlightSpawn => PreemptOutcome::MidSpawn,
+            outcome @ (ForceReleaseOutcome::LeaseReleaseFailed { .. }
+            | ForceReleaseOutcome::WorkspaceColumnClearFailed) => {
+                tracing::warn!(
+                    execution_id,
+                    outcome = outcome.label(),
+                    "preemption teardown did not complete cleanly",
+                );
+                PreemptOutcome::Failed
+            }
+        }
     }
 }
 
