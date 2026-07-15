@@ -121,7 +121,7 @@ impl Message {
 /// body (e.g. the planner's forced tool call) can bypass this type entirely
 /// and use [`send_messages_raw`].
 ///
-/// Uses `#[derive(bon::Builder)]` per the repo's 8-plus-field convention so an
+/// Uses `#[derive(bon::Builder)]` per the repo's more-than-5-field convention so an
 /// additive field never forces every construction site to change.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[builder(on(String, into))]

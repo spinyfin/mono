@@ -116,7 +116,7 @@ CHECK: exactly one of `association_project_id` / `association_task_id` is non-nu
 | `rationale`            | TEXT NULL        | why the agent suggested it                                                                |
 | `confidence_source`    | TEXT NOT NULL    | `structured` \| `extracted` (provenance / trust flag)                                     |
 
-The Rust `Attention` and `AttentionGroup` structs follow the repo's builder convention — `#[derive(bon::Builder)]` with `#[builder(on(String, into))]` once they cross the 8-field threshold (both do), `Option<T>` fields auto-optional, `#[builder(default = …)]` for `state`/`answer_state`/`generation`. The production DB mapper functions (`map_attention`, `map_attention_group`) use struct literals so a new column is a compile error until mapped, per the repo convention.
+The Rust `Attention` and `AttentionGroup` structs follow the repo's builder convention — `#[derive(bon::Builder)]` with `#[builder(on(String, into))]` once they cross the 5-field threshold (both do), `Option<T>` fields auto-optional, `#[builder(default = …)]` for `state`/`answer_state`/`generation`. The production DB mapper functions (`map_attention`, `map_attention_group`) use struct literals so a new column is a compile error until mapped, per the repo convention.
 
 ### Grouping model and partial-answer semantics
 

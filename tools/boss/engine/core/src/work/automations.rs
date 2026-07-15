@@ -4,7 +4,7 @@ use super::*;
 /// [`WorkDb::record_automation_run_and_advance`]. All timestamps are UTC
 /// epoch seconds (stored as strings, matching the rest of the schema).
 ///
-/// Uses the repo builder convention (`bon`) since it carries 8+ fields;
+/// Uses the repo builder convention (`bon`) since it carries more than 5 fields;
 /// `Option` fields default to `None`, so a caller only sets what applies to
 /// the decision it is recording.
 #[derive(Debug, Clone, bon::Builder)]
