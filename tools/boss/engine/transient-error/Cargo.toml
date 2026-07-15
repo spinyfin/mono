@@ -1,0 +1,8 @@
+[package]
+name = "boss-engine-transient-error"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+serde_json = { workspace = true }

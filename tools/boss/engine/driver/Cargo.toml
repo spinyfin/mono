@@ -1,0 +1,19 @@
+[package]
+name = "boss-engine-driver"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-engine-transient-error = { path = "../transient-error" }
+boss-protocol = { path = "../../protocol" }
+boss-ssh-transport = { path = "../ssh-transport" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

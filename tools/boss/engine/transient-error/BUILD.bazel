@@ -4,9 +4,9 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "ssh-transport",
+    name = "transient-error",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_ssh_transport",
+    crate_name = "boss_engine_transient_error",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -18,9 +18,9 @@ rust_library(
 )
 
 rust_test(
-    name = "ssh-transport_test",
+    name = "transient-error_test",
     size = "small",
-    crate = ":ssh-transport",
+    crate = ":transient-error",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

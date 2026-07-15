@@ -3,7 +3,13 @@
 //! whether to auto-resume a stalled/dead worker or escalate it for
 //! human attention.
 //!
-//! ## Why this lives in the engine
+//! Consumed by both `boss_engine` (which re-exports it as
+//! `boss_engine::transient_error`) and `boss_engine_driver`, whose
+//! `ClaudeDriver` delegates its `classify_error` /
+//! `extract_error_from_transcript` capability methods here. It sits
+//! below both so that edge stays one-directional.
+//!
+//! ## Why Boss owns this rather than the agent
 //!
 //! A Boss worker is an interactive `claude` session in a libghostty
 //! pane (`runner.rs` launches `claude … "$(cat initial-prompt.txt)"`
@@ -14,8 +20,8 @@
 //! actually being wedged. Neither the dead-PID sweep (PID is alive)
 //! nor the completion path (no PR, no clean finish) recovers it; a
 //! human has to notice. This module is the classification half of the
-//! engine-owned reconciler ([`crate::transient_recovery`]) that closes
-//! that gap.
+//! engine-owned reconciler (`boss_engine::transient_recovery`) that
+//! closes that gap.
 //!
 //! ## Ground truth
 //!

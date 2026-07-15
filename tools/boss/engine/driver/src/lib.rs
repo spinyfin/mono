@@ -3,6 +3,9 @@
 //!
 //! See `tools/boss/docs/designs/agent-driver-abstraction-*.md` for the full
 //! design (§Chosen approach, §Capabilities, §The absence-policy model).
+//!
+//! `boss_engine` re-exports this crate as `boss_engine::driver`, so engine
+//! call sites continue to reach these items via `crate::driver::…`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -539,7 +542,7 @@ pub trait AgentDriver: Send + Sync {
     // ── Spawn capability ────────────────────────────────────────────────────
 
     /// Build the worker invocation string written into the pane as the
-    /// spawn command. Replaces [`crate::effort::SpawnConfig::claude_invocation`]
+    /// spawn command. Replaces `boss_engine::effort::SpawnConfig::claude_invocation`
     /// for the Claude driver.
     ///
     /// `permission_mode_override`, when `Some`, forces `--permission-mode
@@ -614,7 +617,7 @@ pub trait AgentDriver: Send + Sync {
     // ── TranscriptAccess capability ──────────────────────────────────────────
 
     /// Normalise a raw transcript JSONL entry to the canonical redactable
-    /// field shape that [`crate::live_status_redact`] and the live-status
+    /// field shape that `boss_engine::live_status_redact` and the live-status
     /// summariser expect: `tool_name` / `tool_input` / `tool_response` at the
     /// top level, and `content[].type == "tool_use"` blocks with `name` +
     /// `input` sub-fields.

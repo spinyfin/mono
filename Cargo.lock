@@ -337,6 +337,8 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-deterministic-resolvers",
  "boss-editorial",
+ "boss-engine-driver",
+ "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-feature-flags",
  "boss-github",
@@ -368,6 +370,29 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "boss-engine-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-engine-transient-error",
+ "boss-protocol",
+ "boss-ssh-transport",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-transient-error"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

@@ -3,17 +3,19 @@
 //! capabilities are live; remaining behavioural methods are `unimplemented!()`
 //! pending their per-capability extraction tasks (Depth 1–2 in the design).
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use boss_engine_transient_error::ErrorClass;
 use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_event};
+use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
     ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
 };
-use crate::ssh_transport::shell_quote;
 
 // ---------------------------------------------------------------------------
 // Claude model / effort menu (design §1.4 / §Mix-and-match)
@@ -139,7 +141,7 @@ const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
 /// Applies to ALL `WorkerKind::Standard` workers (local and remote). The
 /// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
 /// revision workers and adds additional blocks.
-pub(crate) const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
+pub const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
     "python3 -c \"\n",
     "import json,os,sys,re,shlex\n",
     "inp=json.load(sys.stdin)\n",
@@ -188,7 +190,7 @@ pub(crate) const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
 /// Uses `shlex.split()` to tokenise the Bash command so PR-creation phrases
 /// inside quoted arguments do NOT trigger the block. Blocks `gh pr create`,
 /// `cube pr create`, and the deprecated `cube pr ensure`; allows `cube pr update`.
-pub(crate) const REVISION_PR_GUARD_COMMAND: &str = concat!(
+pub const REVISION_PR_GUARD_COMMAND: &str = concat!(
     "python3 -c \"\n",
     "import json,sys,re,shlex\n",
     "inp=json.load(sys.stdin)\n",
@@ -242,7 +244,7 @@ pub(crate) const REVISION_PR_GUARD_COMMAND: &str = concat!(
 
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
-/// [`render_claude_md`][crate::worker_setup::render_claude_md].
+/// `boss_engine::worker_setup::render_claude_md`.
 const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.";
@@ -250,8 +252,9 @@ const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
 /// Declares all capabilities (Claude is the full-fidelity reference driver).
-/// Behavioural methods are extracted from [`crate::effort`],
-/// [`crate::worker_setup`], [`crate::runner`], and [`crate::transient_error`].
+/// Behavioural methods are extracted from `boss_engine`'s `effort`,
+/// `worker_setup`, and `runner` modules, and from
+/// [`boss_engine_transient_error`].
 pub struct ClaudeDriver;
 
 #[async_trait]
@@ -339,13 +342,13 @@ impl AgentDriver for ClaudeDriver {
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
 
         let gitignore_path = config_dir.join(".gitignore");
-        std::fs::write(&gitignore_path, crate::worker_setup::CLAUDE_DIR_GITIGNORE)
+        std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)
             .with_context(|| format!("writing gitignore to {}", gitignore_path.display()))?;
 
         // Pre-seed the Claude global config so the folder-trust dialog does
         // not block the headless worker. Best-effort: failure is logged and
         // swallowed by pre_trust_workspace.
-        crate::worker_setup::pre_trust_workspace(workspace);
+        pre_trust_workspace(workspace);
 
         Ok(())
     }
@@ -488,22 +491,164 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
-        crate::transient_error::extract_worker_error(lines)
+        boss_engine_transient_error::extract_worker_error(lines)
     }
 
     fn classify_error(&self, raw_output: &str) -> WorkerErrorClass {
-        match crate::transient_error::classify_claude_error(raw_output) {
-            crate::transient_error::ErrorClass::Transient => WorkerErrorClass::Transient,
-            crate::transient_error::ErrorClass::Permanent => WorkerErrorClass::Permanent,
-            crate::transient_error::ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
+        match boss_engine_transient_error::classify_claude_error(raw_output) {
+            ErrorClass::Transient => WorkerErrorClass::Transient,
+            ErrorClass::Permanent => WorkerErrorClass::Permanent,
+            ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// WorkspaceProvisioning helpers (Claude-specific)
+// ---------------------------------------------------------------------------
+//
+// These moved here from `boss_engine::worker_setup` when the driver became its
+// own crate: they are all Claude-specific workspace provisioning (the `.claude`
+// gitignore body and the `~/.claude.json` folder-trust pre-seed), which is
+// exactly what the `WorkspaceProvisioning` capability owns. Leaving them in
+// `worker_setup` would have made the engine -> driver edge circular, since
+// `provision_workspace` below calls them.
+
+/// Single-pattern gitignore body. `*` matches every entry in
+/// the driver's config dir — including dotfiles and the `.gitignore`
+/// itself, since gitignore globs apply to leading-dot names. Both git
+/// and jj (with a git backend) honor this in-tree gitignore, so worker
+/// setup files stop appearing in `jj status` / `git status`.
+pub const CLAUDE_DIR_GITIGNORE: &str = "*\n";
+
+/// Absolute path to Claude Code's user-global config file
+/// (`~/.claude.json`). This is the store Claude consults for the
+/// first-run folder-trust dialog (the per-project `hasTrustDialogAccepted`
+/// flag); it is *separate* from the `--settings` file the engine passes.
+///
+/// Resolved from `$HOME` (the convention used elsewhere in the engine,
+/// e.g. `boss_engine::config`). Returns `None` if `HOME` is unset, in which
+/// case pre-trust is skipped and the worker falls back to today's
+/// behaviour (it may block on the dialog).
+///
+/// Public so callers that assert on the pre-trust side effect (e.g.
+/// `boss_engine::worker_setup`'s tests) resolve the config through this
+/// single source of truth rather than re-deriving `$HOME/.claude.json`.
+pub fn claude_global_config_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude.json"))
+}
+
+/// Pre-accept Claude Code's first-run folder-trust dialog for
+/// `workspace_path` so a headless Boss worker never blocks on it.
+///
+/// Boss/cube materialises the workspace itself, specifically for the
+/// agent to work in, so it is trusted by construction — there is no
+/// untrusted third-party content. But the folder-trust dialog ("Is this
+/// a project you created or one you trust?") is a *separate* first-run
+/// gate that `--permission-mode auto` and the `--settings` file do not
+/// cover: it is keyed off the per-project `hasTrustDialogAccepted` flag
+/// in Claude's user-global `~/.claude.json`, and is evaluated before any
+/// repo- or `--settings`-supplied config. A headless worker has no human
+/// to press "1", so it wedges here. We carry the trust intent through by
+/// seeding that flag for the workspace path before `claude` launches.
+///
+/// Best-effort: failure to pre-trust is logged and swallowed (it only
+/// costs the worker today's behaviour, not correctness), so it never
+/// aborts worker setup.
+pub fn pre_trust_workspace(workspace_path: &Path) {
+    let Some(config_path) = claude_global_config_path() else {
+        tracing::warn!(
+            workspace = %workspace_path.display(),
+            "worker setup: HOME unset, cannot pre-trust workspace in ~/.claude.json; worker may block on the folder-trust dialog",
+        );
+        return;
+    };
+    if let Err(err) = pre_trust_workspace_in(&config_path, workspace_path) {
+        tracing::warn!(
+            config = %config_path.display(),
+            workspace = %workspace_path.display(),
+            ?err,
+            "worker setup: failed to pre-trust workspace in ~/.claude.json; worker may block on the folder-trust dialog",
+        );
+    }
+}
+
+/// Set `projects[<workspace_path>].hasTrustDialogAccepted = true` in the
+/// Claude config at `config_path`, preserving every other key.
+///
+/// - A missing or empty config file is treated as an empty object (fresh
+///   install) and created.
+/// - A config that already records this workspace as trusted is a no-op:
+///   we do not rewrite the file. This matters because `~/.claude.json` is
+///   a *shared* file that live `claude` sessions in other workspaces
+///   rewrite frequently; cube re-uses a fixed pool of workspaces, so
+///   after each is trusted once the engine never touches the file again,
+///   keeping the read-modify-write race window to first-spawn-per-workspace.
+/// - A config that exists but does not parse as JSON is left **untouched**
+///   (we return the parse error rather than clobber the user's file).
+/// - The write is atomic (temp file in the same dir + rename) so a
+///   concurrent reader never observes a half-written config.
+fn pre_trust_workspace_in(config_path: &Path, workspace_path: &Path) -> io::Result<()> {
+    let key = workspace_path.display().to_string();
+
+    let mut root: serde_json::Value = match std::fs::read_to_string(config_path) {
+        Ok(s) if s.trim().is_empty() => serde_json::json!({}),
+        Ok(s) => serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e),
+    };
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json is not a JSON object"))?;
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json `projects` is not an object"))?;
+    let entry = projects
+        .entry(key)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "~/.claude.json project entry is not an object",
+            )
+        })?;
+
+    // Already trusted → no-op. Don't rewrite the shared file.
+    if entry.get("hasTrustDialogAccepted").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    entry.insert("hasTrustDialogAccepted".to_owned(), serde_json::Value::Bool(true));
+    // Claude pairs the trust flag with this counter; seed it if absent so
+    // the onboarding flow doesn't re-prompt either. Leave any existing
+    // value untouched.
+    entry
+        .entry("projectOnboardingSeenCount")
+        .or_insert_with(|| serde_json::Value::from(0));
+
+    let serialized = serde_json::to_string_pretty(&root).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_atomic(config_path, serialized.as_bytes())
+}
+
+/// Write `contents` to `path` atomically: write a sibling temp file and
+/// rename it over `path`. The rename is atomic on POSIX, so a concurrent
+/// reader sees either the old or the new file, never a partial write.
+fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // Tag the temp name with the pid so concurrent engine writes (should
+    // not happen — one engine — but cheap insurance) don't collide.
+    let tmp = dir.join(format!(".claude.json.boss-tmp-{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::Capability;
+    use crate::Capability;
     use tempfile::TempDir;
 
     #[test]
@@ -826,7 +971,7 @@ mod tests {
 
     #[test]
     fn classify_error_maps_transient_errors() {
-        use crate::driver::WorkerErrorClass;
+        use crate::WorkerErrorClass;
         assert_eq!(
             ClaudeDriver.classify_error("API Error: The socket connection was closed unexpectedly."),
             WorkerErrorClass::Transient,
@@ -847,7 +992,7 @@ mod tests {
 
     #[test]
     fn classify_error_maps_permanent_errors() {
-        use crate::driver::WorkerErrorClass;
+        use crate::WorkerErrorClass;
         assert_eq!(
             ClaudeDriver.classify_error("authentication_error: invalid x-api-key"),
             WorkerErrorClass::Permanent,
@@ -864,7 +1009,7 @@ mod tests {
 
     #[test]
     fn classify_error_maps_unknown_errors_to_indeterminate() {
-        use crate::driver::WorkerErrorClass;
+        use crate::WorkerErrorClass;
         assert_eq!(
             ClaudeDriver.classify_error("something we have never seen before"),
             WorkerErrorClass::Indeterminate,
@@ -874,7 +1019,7 @@ mod tests {
 
     #[test]
     fn classify_error_permanent_wins_over_transient_on_overlap() {
-        use crate::driver::WorkerErrorClass;
+        use crate::WorkerErrorClass;
         assert_eq!(
             ClaudeDriver.classify_error("authentication_error after request timed out"),
             WorkerErrorClass::Permanent,
@@ -985,5 +1130,106 @@ mod tests {
             default_cmd.contains("--dangerously-skip-permissions"),
             "got: {default_cmd}"
         );
+    }
+
+    // ── pre-trust (~/.claude.json folder-trust seeding) ────────────────────
+    //
+    // Moved here with `pre_trust_workspace_in` from `worker_setup_tests.rs`.
+
+    #[test]
+    fn pre_trust_creates_config_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join(".claude.json");
+        let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-001");
+
+        pre_trust_workspace_in(&config, &workspace).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let key = workspace.display().to_string();
+        assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
+        // The onboarding counter is seeded so onboarding doesn't re-prompt.
+        assert_eq!(value["projects"][&key]["projectOnboardingSeenCount"], 0);
+    }
+
+    #[test]
+    fn pre_trust_preserves_other_projects_and_top_level_keys() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join(".claude.json");
+        // A realistic config: a top-level key plus another project with
+        // its own state. Pre-trust must leave both untouched.
+        let existing = serde_json::json!({
+            "numStartups": 42,
+            "projects": {
+                "/some/other/project": {
+                    "hasTrustDialogAccepted": true,
+                    "lastCost": 1.23,
+                },
+            },
+        });
+        std::fs::write(&config, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-002");
+        pre_trust_workspace_in(&config, &workspace).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        // Top-level key and the pre-existing project survive verbatim.
+        assert_eq!(value["numStartups"], 42);
+        assert_eq!(value["projects"]["/some/other/project"]["lastCost"], 1.23);
+        assert_eq!(value["projects"]["/some/other/project"]["hasTrustDialogAccepted"], true);
+        // The new workspace is now trusted.
+        let key = workspace.display().to_string();
+        assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
+    }
+
+    #[test]
+    fn pre_trust_is_a_noop_when_already_trusted() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join(".claude.json");
+        let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-003");
+        let key = workspace.display().to_string();
+        // Existing entry already trusted, with an extra field a live
+        // claude session would have written.
+        let existing = serde_json::json!({
+            "projects": {
+                &key: { "hasTrustDialogAccepted": true, "lastSessionId": "abc" },
+            },
+        });
+        let serialized = serde_json::to_string_pretty(&existing).unwrap();
+        std::fs::write(&config, &serialized).unwrap();
+
+        pre_trust_workspace_in(&config, &workspace).unwrap();
+
+        // The file is left byte-for-byte unchanged: no rewrite of the
+        // shared config when the workspace is already trusted.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), serialized);
+    }
+
+    #[test]
+    fn pre_trust_leaves_corrupt_config_untouched() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join(".claude.json");
+        let garbage = "{ this is not valid json";
+        std::fs::write(&config, garbage).unwrap();
+
+        let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-004");
+        let err = pre_trust_workspace_in(&config, &workspace).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // The corrupt file must NOT be clobbered — we'd rather skip
+        // pre-trust than destroy the user's config.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), garbage);
+    }
+
+    #[test]
+    fn pre_trust_treats_empty_config_as_fresh() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join(".claude.json");
+        std::fs::write(&config, "   \n").unwrap();
+
+        let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-005");
+        pre_trust_workspace_in(&config, &workspace).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let key = workspace.display().to_string();
+        assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
     }
 }
