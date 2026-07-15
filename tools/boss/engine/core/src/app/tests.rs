@@ -52,7 +52,7 @@ pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
             .build(),
         None,
     ));
-    let state = ServerState::new_arc_with_app_pid(cfg, None, None).unwrap();
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None).unwrap();
     (state, temp)
 }
 

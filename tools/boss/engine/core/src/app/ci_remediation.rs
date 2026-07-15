@@ -242,15 +242,42 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
             return;
         }
 
-        // 3. THE VALIDATION GATE. Independently re-probe LIVE CI for the
+        // 3. A merge-queue rebounce failure is NOT validated by the PR's
+        //    head-branch CI (which is always green for a rebounce — the
+        //    failure was on the synthetic merge commit, not the PR head;
+        //    see runner.rs's rebounce directive). Honoring a rebase claim
+        //    off a green head-branch probe would be exactly the bypass
+        //    the operator forbade — the same guard `mark_ci_remediation_noop`
+        //    enforces. Reject; keep the row actionable.
+        if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce") {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                work_item_id = %attempt.work_item_id,
+                "mark_ci_remediation_succeeded_via_rebase: rejected — rebounce attempt not validatable via head-branch CI",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::CiRemediationSucceededViaRebaseRejected {
+                    attempt_id: attempt.id.clone(),
+                    work_item_id: attempt.work_item_id.clone(),
+                    pr_url: attempt.pr_url.clone(),
+                    status: "merge_queue_rebounce attempts cannot be validated via head-branch CI: the failure is \
+                             on the synthetic merge commit, not the PR head. Fix the rebounce and re-enqueue, or use \
+                             `boss engine ci mark-failed`."
+                        .to_owned(),
+                    live_sha: None,
+                },
+            );
+            return;
+        }
+
+        // 4. THE VALIDATION GATE. Independently re-probe LIVE CI for the
         //    PR's CURRENT head SHA — the same `gh pr view …
         //    statusCheckRollup` source the merge-poller uses. We never
         //    trust the worker's assertion or a cached status. A probe
         //    failure means we cannot verify → reject (do not honor).
-        let probe = match crate::merge_poller::CommandMergeProbe::new()
-            .probe(&attempt.pr_url)
-            .await
-        {
+        let probe = match server_state.merge_probe.probe(&attempt.pr_url).await {
             Ok(p) => p,
             Err(err) => {
                 tracing::warn!(
@@ -275,18 +302,19 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
         };
 
         match crate::ci_watch::classify_noop_validation(&probe) {
-            crate::ci_watch::NoopValidation::Green { .. } => {
+            crate::ci_watch::NoopValidation::Green { head_sha } => {
                 // Snapshot taken before the write so `budget_refunded`
                 // reflects whether this attempt actually consumed a slot
                 // (only fix-kind attempts with `consumes_budget = 1` get
                 // a counter decrement).
                 let budget_refunded = attempt.consumes_budget != 0;
-                match work_db.mark_ci_remediation_succeeded_via_rebase(&attempt_id) {
+                match work_db.mark_ci_remediation_succeeded_via_rebase(&attempt_id, head_sha.as_deref()) {
                     Ok(Some(updated)) => {
                         tracing::info!(
                             attempt_id = %updated.id,
                             work_item_id = %updated.work_item_id,
                             budget_refunded,
+                            verified_sha = ?head_sha,
                             "mark_ci_remediation_succeeded_via_rebase: VERIFIED GREEN — rebase-only success recorded",
                         );
                         server_state
@@ -311,10 +339,14 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                         );
                     }
                     // Raced to terminal between the lookup and the write
-                    // (another path retired it). Re-fetch and echo so the
-                    // receipt stays honest.
+                    // (another path retired it — could be `mark-failed`,
+                    // a merge-poller retire, or a duplicate winning call).
+                    // Only echo a HONORED receipt if the row actually
+                    // landed on `succeeded`; any other terminal status is
+                    // a real rejection, not a success, so the CLI must
+                    // exit non-zero rather than print a false receipt.
                     Ok(None) => match work_db.get_ci_remediation(&attempt_id) {
-                        Ok(Some(current)) => send_response(
+                        Ok(Some(current)) if current.status == "succeeded" => send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::CiRemediationSucceededViaRebase {
@@ -322,13 +354,25 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                                 budget_refunded: false,
                             },
                         ),
-                        _ => send_response(
+                        Ok(Some(current)) => send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "ci_remediation attempt {attempt_id:?} is already terminal ({status}); \
+                                     nothing to validate.",
+                                    status = current.status,
+                                ),
+                            },
+                        ),
+                        Ok(None) => send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: format!("ci_remediation attempt {attempt_id:?} vanished mid-retire"),
                             },
                         ),
+                        Err(err) => send_work_error(&sink, &request_id, &err),
                     },
                     Err(err) => send_work_error(&sink, &request_id, &err),
                 }
@@ -471,10 +515,7 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
         //    statusCheckRollup` source the merge-poller uses. We never
         //    trust the worker's assertion or a cached status. A probe
         //    failure means we cannot verify → reject (do not honor).
-        let probe = match crate::merge_poller::CommandMergeProbe::new()
-            .probe(&attempt.pr_url)
-            .await
-        {
+        let probe = match server_state.merge_probe.probe(&attempt.pr_url).await {
             Ok(p) => p,
             Err(err) => {
                 tracing::warn!(

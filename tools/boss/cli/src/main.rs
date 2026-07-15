@@ -5722,9 +5722,10 @@ async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunContext) -> Re
                             } else {
                                 "no budget change"
                             };
+                            let sha = attempt.head_sha_after.as_deref().unwrap_or("<unknown>");
                             println!(
-                                "ci_remediation {} verified green — marked succeeded_via_rebase ({}).",
-                                attempt.id, refund,
+                                "ci_remediation {} verified green on {} — marked succeeded_via_rebase ({}).",
+                                attempt.id, sha, refund,
                             );
                         }
                     },

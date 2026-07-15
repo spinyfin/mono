@@ -505,7 +505,7 @@ async fn engine_health_report_is_empty_when_api_key_present() {
         cwd: work.cwd.clone(),
     };
     let cfg = Arc::new(RuntimeConfig::from_parts(work, Some(agent)));
-    let state = ServerState::new_arc_with_app_pid(cfg, None, None).unwrap();
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None).unwrap();
 
     let report = build_engine_health_report(&state);
     assert!(report.anthropic_api_key_present);
@@ -1786,7 +1786,7 @@ fn server_state_with_app_pid(app_pid: libc::pid_t) -> (Arc<ServerState>, tempfil
             .build(),
         None,
     ));
-    let state = ServerState::new_arc_with_app_pid(cfg, Some(app_pid), None).unwrap();
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, Some(app_pid), None, None).unwrap();
     (state, temp)
 }
 

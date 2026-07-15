@@ -27,6 +27,7 @@ async fn shutdown_with_correct_token_is_accepted() -> Result<()> {
     let engine = TestEngine::spawn_with(TestEngineOptions {
         on_disk_db: true,
         with_control_token: true,
+        ..Default::default()
     })
     .await?;
 
@@ -74,6 +75,7 @@ async fn shutdown_with_wrong_token_is_rejected() -> Result<()> {
     let engine = TestEngine::spawn_with(TestEngineOptions {
         on_disk_db: true,
         with_control_token: true,
+        ..Default::default()
     })
     .await?;
 
