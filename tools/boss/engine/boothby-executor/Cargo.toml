@@ -1,0 +1,14 @@
+[package]
+name = "boss-engine-boothby-executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+bon = { workspace = true }
+boss-protocol = { path = "../../protocol" }
+boss-work-db = { path = "../work-db" }
+
+[dev-dependencies]
+boss-work-db = { path = "../work-db", features = ["test-support"] }
+rusqlite = { workspace = true }

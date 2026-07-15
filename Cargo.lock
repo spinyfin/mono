@@ -620,6 +620,7 @@ dependencies = [
  "boss-editorial",
  "boss-engine-attachments",
  "boss-engine-board-gesture",
+ "boss-engine-boothby-executor",
  "boss-engine-comment-classifier",
  "boss-engine-completion",
  "boss-engine-design-docs",
@@ -715,6 +716,17 @@ name = "boss-engine-board-gesture"
 version = "0.1.0"
 dependencies = [
  "boss-protocol",
+]
+
+[[package]]
+name = "boss-engine-boothby-executor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "boss-protocol",
+ "boss-work-db",
+ "rusqlite",
 ]
 
 [[package]]

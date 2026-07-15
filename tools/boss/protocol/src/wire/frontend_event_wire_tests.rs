@@ -2495,6 +2495,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AutomationRunsList { .. }
         | FrontendEvent::AutomationDedupSuppressionsList { .. }
         | FrontendEvent::AutomationTasksList { .. }
+        | FrontendEvent::BoothbyActed { .. }
         | FrontendEvent::AutomationRunEnqueued { .. }
         | FrontendEvent::AutomationStateResult { .. }
         | FrontendEvent::DecisionCreated { .. }

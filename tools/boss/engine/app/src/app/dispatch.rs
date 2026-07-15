@@ -75,6 +75,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         | r @ FrontendRequest::ListOperatorQuestions { .. } => Box::pin(work_items::handle_operator_question(ctx, r)),
         r @ FrontendRequest::ListTaskFieldAudit { .. } => Box::pin(work_items::handle_list_task_field_audit(ctx, r)),
         r @ FrontendRequest::AuditProductEffort { .. } => Box::pin(effort::handle_audit_product_effort(ctx, r)),
+        r @ FrontendRequest::BoothbyAct { .. } => Box::pin(boothby::handle_boothby_act(ctx, r)),
         r @ FrontendRequest::CancelExecution { .. } => Box::pin(executions::handle_cancel_execution(ctx, r)),
         r @ FrontendRequest::ClassifyCiRemediation { .. } => {
             Box::pin(ci_remediation::handle_classify_ci_remediation(ctx, r))

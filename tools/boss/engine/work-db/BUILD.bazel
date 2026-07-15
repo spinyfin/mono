@@ -12,6 +12,7 @@ rust_library(
     proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/boothby-executor:__pkg__",
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
@@ -66,6 +67,7 @@ rust_library(
     proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/app:__pkg__",
+        "//tools/boss/engine/boothby-executor:__pkg__",
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch:__pkg__",
