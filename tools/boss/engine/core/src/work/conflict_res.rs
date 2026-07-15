@@ -1,13 +1,15 @@
 use super::*;
 
 /// The full-worker fallback rung (design's rung 3). Rung 1 (engine-direct
-/// mechanical rebase) is live on the `conflict_watch` path; rung 0
-/// (deterministic resolvers, `crate::conflict_ladder::attempt_rung0`) is
-/// implemented but gated off (`RUNG0_APPLY_LIVE`) pending T2562's
-/// result-gate; rung 2 (the small pre-staged agent) is not yet built (T6 of
-/// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
-/// Every conflict not resolved by a live mechanical rung still falls
-/// through to a full worker doing the whole job by hand.
+/// mechanical rebase) and rung 0 (deterministic resolvers,
+/// `crate::conflict_ladder::attempt_rung0`, live by default as of
+/// `RUNG0_APPLY_LIVE`) are both live on the `conflict_watch` path when the
+/// `conflict_ladder_mechanical_rebase` feature flag is enabled; rung 2 (the
+/// small pre-staged agent) is also live, bounded to a single residual file
+/// (T6 of `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+/// Every conflict not resolved by a mechanical rung — or evaluated while the
+/// ladder itself is disabled — still falls through to a full worker doing
+/// the whole job by hand.
 const RUNG_FULL_WORKER: i64 = 3;
 
 impl WorkDb {

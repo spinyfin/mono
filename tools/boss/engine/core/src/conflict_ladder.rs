@@ -58,11 +58,9 @@
 //!   via [`CubeClient::push_resolution`] (`cube workspace push`, the "no
 //!   clean verb today" gap this closes) — and retires the attempt at rung
 //!   0. If any file declines, or the push fails, it falls through to rung
-//!   3 exactly as an all-declined rung 1 does today. **Gated OFF** by
-//!   [`RUNG0_APPLY_LIVE`] — see that constant's doc comment for why. The
-//!   mechanism is fully implemented and unit-tested (`conflict_ladder_tests.rs`
-//!   calls [`attempt_rung0`] directly, bypassing the gate) so a follow-up
-//!   only needs to flip the constant once it's safe to.
+//!   3 exactly as an all-declined rung 1 does today. Live by default — see
+//!   [`RUNG0_APPLY_LIVE`]'s doc comment for the incident that triggered
+//!   flipping it and how to kill it again if needed.
 //!
 //! ## T9 (T2562) result-gate: the deletion tripwire on rungs 0/1
 //!
@@ -130,19 +128,28 @@ const RUNG_DETERMINISTIC_RESOLVER: i64 = 0;
 const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 
 /// Rung 0 (deterministic-resolver apply/commit/push, [`attempt_rung0`]) is
-/// fully implemented and unit-tested but **must not run on the live
-/// `conflict_watch` path** yet. T2562 (T9, "T2253 safety integration for
-/// the ladder") has now landed the result-gate: both rungs 0 and 1 route
-/// their pushed output through [`CubeClient::verify_deletion_tripwire`]
-/// before auto-retiring (see the module doc comment). What remains is a
-/// separate, deliberate decision, not a technical gap: this constant is
-/// **not** flipped as part of that landing.
+/// fully implemented and unit-tested. T2562 (T9, "T2253 safety integration
+/// for the ladder") landed the result-gate: both rungs 0 and 1 route their
+/// pushed output through [`CubeClient::verify_deletion_tripwire`] before
+/// auto-retiring (see the module doc comment) — the safety net this
+/// constant was waiting on.
 ///
-/// Deliberately a compile-time constant, not a `feature_flags`
-/// debug-pane toggle: flipping this to `true` is a reviewed follow-up PR
-/// that gets its own scrutiny of the now-wired result-gate, not a runtime
-/// decision.
-const RUNG0_APPLY_LIVE: bool = false;
+/// Flipped live by the reviewed follow-up PR that constant's prior doc
+/// comment called for, triggered by spinyfin/mono#2032 (chore T2680):
+/// with rung 0 gated off, a PR whose *re*-conflict was lockfile-only
+/// (`MODULE.bazel.lock` regenerated from a `bzlmod` dependency bump on
+/// `main`, "no source files required resolution this round" per the
+/// resolving revision's own PR comment) still spawned a full LLM
+/// "resolve merge conflict" revision instead of retiring for free —
+/// exactly the recurring case rung 0 exists to absorb cheaply. See
+/// `rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_conflict`
+/// in `conflict_ladder_tests.rs`.
+///
+/// Deliberately still a compile-time constant, not a `feature_flags`
+/// debug-pane toggle: kept as a one-line kill switch (set back to `false`)
+/// in case live rung-0 activity misbehaves, without touching runtime
+/// config.
+const RUNG0_APPLY_LIVE: bool = true;
 
 /// Rung 2 (T6): the escalation-ladder rung a resolution was produced at when
 /// a small, focused, pre-staged agent — not a cold full worker — resolved
@@ -192,6 +199,37 @@ pub(crate) enum LadderOutcome {
     FellThrough { residual_conflict_files: Option<usize> },
 }
 
+/// Emits the single canonical decision line for a conflicted-PR
+/// evaluation, so "did the deterministic path fire, and why (not)?" is
+/// always answerable from the engine trace by grepping this one event
+/// name — instead of reconstructing it from scattered debug-level branch
+/// logging or, worse, finding nothing at all (mono#1398/#1764,
+/// spinyfin/mono#2032: this decision has previously been silent).
+///
+/// `verdict` is one of:
+/// - `"deterministic"` — a mechanical rung (0 or 1) produced or halted a
+///   resolution; no worker revision was spawned.
+/// - `"generic"` — no mechanical rung applied; a full (or small-agent,
+///   rung 2) worker revision will be spawned.
+/// - `"skip"` — the ladder was never attempted at all (e.g. the
+///   `conflict_ladder_mechanical_rebase` feature flag is off).
+pub(crate) fn log_routing_verdict(
+    work_item_id: &str,
+    pr: Option<u64>,
+    conflicted_files: &[String],
+    verdict: &str,
+    reason: &str,
+) {
+    tracing::info!(
+        work_item_id,
+        pr,
+        conflicted_files = ?conflicted_files,
+        verdict,
+        reason,
+        "conflict_ladder: routing verdict",
+    );
+}
+
 /// Rung 2 (T6) eligibility: a bounded set of residual conflicted files is
 /// "genuine semantic overlap" a small focused agent may attempt; zero files
 /// means rung 1 never actually left a residue to hand off (a lease/goto/
@@ -223,6 +261,13 @@ pub(crate) async fn try_mechanical_rungs(
             pr_url = %candidate.pr_url,
             "conflict_ladder: could not parse PR number; skipping rung 1",
         );
+        log_routing_verdict(
+            &candidate.work_item_id,
+            None,
+            &[],
+            "generic",
+            "could not parse a PR number from pr_url; mechanical rungs skipped",
+        );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
         };
@@ -250,6 +295,13 @@ pub(crate) async fn try_mechanical_rungs(
                 work_item_id = %candidate.work_item_id,
                 "conflict_ladder: no repo_remote_url resolves for work item; skipping rung 1",
             );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "generic",
+                "no repo_remote_url resolves for this work item; mechanical rungs skipped",
+            );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
             };
@@ -259,6 +311,13 @@ pub(crate) async fn try_mechanical_rungs(
                 work_item_id = %candidate.work_item_id,
                 ?err,
                 "conflict_ladder: failed to resolve repo_remote_url; skipping rung 1",
+            );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "generic",
+                "failed to resolve repo_remote_url; mechanical rungs skipped",
             );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
@@ -274,6 +333,13 @@ pub(crate) async fn try_mechanical_rungs(
                 repo_remote = %repo_remote,
                 error = %format!("{err:#}"),
                 "conflict_ladder: ensure_repo failed; skipping rung 1",
+            );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "generic",
+                "ensure_repo failed; mechanical rungs skipped",
             );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
@@ -293,6 +359,13 @@ pub(crate) async fn try_mechanical_rungs(
                 repo_id = %repo.repo_id,
                 error = %format!("{err:#}"),
                 "conflict_ladder: could not lease a workspace for rung 1; falling through to worker",
+            );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "generic",
+                "could not lease a workspace for rung 1; mechanical rungs skipped",
             );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
@@ -333,6 +406,13 @@ async fn run_rung1_in_lease(
             error = %format!("{err:#}"),
             "conflict_ladder: goto_workspace failed; falling through to worker",
         );
+        log_routing_verdict(
+            &candidate.work_item_id,
+            Some(pr_number),
+            &[],
+            "generic",
+            "goto_workspace failed; mechanical rungs unavailable",
+        );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
         };
@@ -346,6 +426,13 @@ async fn run_rung1_in_lease(
                 pr = pr_number,
                 error = %format!("{err:#}"),
                 "conflict_ladder: engine-direct rebase failed; falling through to worker",
+            );
+            log_routing_verdict(
+                &candidate.work_item_id,
+                Some(pr_number),
+                &[],
+                "generic",
+                "engine-direct rebase (rung 1) failed; mechanical rungs unavailable",
             );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
@@ -365,6 +452,7 @@ async fn run_rung1_in_lease(
                     candidate,
                     attempt,
                     RUNG_ENGINE_DIRECT_REBASE,
+                    &[],
                     &deletions,
                 )
                 .await;
@@ -372,7 +460,7 @@ async fn run_rung1_in_lease(
             }
             // Rung 1 rebased cleanly and pushed the updated branch — the PR is
             // resolved with no agent. Retire the attempt at rung 1.
-            retire_attempt_at_rung(work_db, publisher, candidate, attempt, RUNG_ENGINE_DIRECT_REBASE).await;
+            retire_attempt_at_rung(work_db, publisher, candidate, attempt, RUNG_ENGINE_DIRECT_REBASE, &[]).await;
             tracing::info!(
                 work_item_id = %candidate.work_item_id,
                 pr = pr_number,
@@ -388,6 +476,13 @@ async fn run_rung1_in_lease(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,
             "conflict_ladder: rung 1 rebased clean but reported unpushed; falling through to worker",
+        );
+        log_routing_verdict(
+            &candidate.work_item_id,
+            Some(pr_number),
+            &[],
+            "generic",
+            "rung 1 rebased clean but the push was skipped upstream; mechanical resolution not landed",
         );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
@@ -447,6 +542,17 @@ async fn run_rung1_in_lease(
         attempt_id = %attempt.id,
         residual_conflicts = residual_conflict_files,
         "conflict_ladder: rung 1 left residual conflicts; falling through to rung 2/3",
+    );
+    log_routing_verdict(
+        &candidate.work_item_id,
+        Some(pr_number),
+        &rebase.conflicted_files,
+        "generic",
+        if RUNG0_APPLY_LIVE {
+            "rung 0 did not resolve every residual file; falling through to rung 2/3"
+        } else {
+            "rung 0 compile-gated off (RUNG0_APPLY_LIVE=false); falling through to rung 2/3"
+        },
     );
     LadderOutcome::FellThrough {
         residual_conflict_files: Some(residual_conflict_files),
@@ -548,13 +654,22 @@ pub(crate) async fn attempt_rung0(
             candidate,
             attempt,
             RUNG_DETERMINISTIC_RESOLVER,
+            residual_paths,
             &deletions,
         )
         .await;
         return LadderOutcome::HaltedForSignoff;
     }
 
-    retire_attempt_at_rung(work_db, publisher, candidate, attempt, RUNG_DETERMINISTIC_RESOLVER).await;
+    retire_attempt_at_rung(
+        work_db,
+        publisher,
+        candidate,
+        attempt,
+        RUNG_DETERMINISTIC_RESOLVER,
+        residual_paths,
+    )
+    .await;
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr = pr_number,
@@ -578,7 +693,16 @@ async fn retire_attempt_at_rung(
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
     rung: i64,
+    conflicted_files: &[String],
 ) {
+    log_routing_verdict(
+        &candidate.work_item_id,
+        parse_pr_number(&candidate.pr_url).map(|n| n as u64),
+        conflicted_files,
+        "deterministic",
+        &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
+    );
+
     // The parent was flipped to `blocked: merge_conflict` upfront by
     // `on_conflict_detected`; clear it back to `in_review`. The WHERE guard
     // only clears engine-owned rows, so a human-moved row is left alone.
@@ -714,8 +838,19 @@ async fn halt_attempt_for_deletion_signoff(
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
     rung: i64,
+    conflicted_files: &[String],
     deletions: &[String],
 ) {
+    log_routing_verdict(
+        &candidate.work_item_id,
+        parse_pr_number(&candidate.pr_url).map(|n| n as u64),
+        conflicted_files,
+        "deterministic",
+        &format!(
+            "mechanical rung {rung} resolved every conflicted file but the deletion tripwire halted it pending sign-off"
+        ),
+    );
+
     if let Err(err) = work_db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, rung) {
         tracing::warn!(
             attempt_id = %attempt.id,

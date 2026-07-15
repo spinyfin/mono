@@ -659,14 +659,25 @@ pub async fn on_conflict_detected(
                 }
             } else {
                 // No cube client → the mechanical-rebase flag is off, so the
-                // escalation ladder (rungs 0/1) is not attempted this dispatch.
-                // Log it so "why no rung activity?" is answerable from the trace
-                // (mono#1398/#1764): this is the worker-only path, by config.
-                tracing::debug!(
+                // escalation ladder (rungs 0/1, including the deterministic
+                // lockfile resolver) is not attempted this dispatch at all.
+                // This used to be a debug-only line, invisible in the
+                // production trace and therefore unfalsifiable from the
+                // outside (spinyfin/mono#2032, chore T2680): promote to INFO
+                // with the canonical routing-verdict line so "why no rung
+                // activity for this PR?" is always answerable.
+                tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
                     attempt_id = %a.id,
                     "conflict_watch: mechanical rebase ladder disabled (no cube client); spawning worker directly (rung 3)",
+                );
+                conflict_ladder::log_routing_verdict(
+                    &candidate.work_item_id,
+                    parse_pr_number(&candidate.pr_url).map(|n| n as u64),
+                    &[],
+                    "skip",
+                    "conflict_ladder_mechanical_rebase feature flag is off; ladder (rungs 0/1) never attempted",
                 );
             }
             // Fresh attempt — try to spawn a revision.
