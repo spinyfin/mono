@@ -38,10 +38,6 @@ impl ConfiguredCheck for CompiledBazelrcPoliciesConfig {
         count_applicable(changeset, is_bazelrc_root_candidate)
     }
 
-    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
-    }
-
     async fn run_with_progress(
         &self,
         changeset: &ChangeSet,

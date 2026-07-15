@@ -73,7 +73,12 @@ mod tests {
 
     #[async_trait]
     impl ConfiguredCheck for DummyCheck {
-        async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+        async fn run_with_progress(
+            &self,
+            _changeset: &ChangeSet,
+            _tree: &dyn SourceTree,
+            _on_file_processed: std::sync::Arc<dyn Fn(usize) + Send + Sync>,
+        ) -> Result<CheckResult> {
             Ok(CheckResult {
                 check_id: self.id().to_owned(),
                 findings: Vec::new(),

@@ -33,10 +33,6 @@ impl ConfiguredCheck for RepoVisibilityCheck {
         count_applicable(changeset, is_build_file)
     }
 
-    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
-    }
-
     async fn run_with_progress(
         &self,
         changeset: &ChangeSet,

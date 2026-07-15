@@ -22,7 +22,12 @@ impl Check for StaticFindingCheck {
 
 #[async_trait]
 impl ConfiguredCheck for StaticFindingCheck {
-    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        _tree: &dyn SourceTree,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         let path = changeset
             .changed_files
             .first()
