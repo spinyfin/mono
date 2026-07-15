@@ -2346,9 +2346,13 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::SelectedProductResult { .. }
         | FrontendEvent::SelectedProductReported { .. }
         | FrontendEvent::AttachmentStored { .. }
-        | FrontendEvent::AttachmentsList { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
-        | FrontendEvent::OperatorQuestionError { .. } => {}
+        | FrontendEvent::OperatorQuestionError { .. }
+        | FrontendEvent::AttachmentsList { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. } => {}
     }
 }
 
