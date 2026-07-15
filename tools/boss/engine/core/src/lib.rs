@@ -12,6 +12,7 @@ pub mod automation_scheduler;
 pub mod automation_triage;
 pub mod background_children;
 pub mod blocking_signal;
+pub mod boothby;
 pub mod boss_construct_scan;
 pub mod build_info;
 pub mod build_wait;

@@ -425,6 +425,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DisableAutomation { .. }
         | FrontendRequest::EnableAutomation { .. }
         | FrontendRequest::EvaluateEditorialRules { .. }
+        | FrontendRequest::BoothbyAct { .. }
         | FrontendRequest::GetAutomation { .. }
         | FrontendRequest::RevokeDecision { .. }
         | FrontendRequest::SupersedeDecision { .. }

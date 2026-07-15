@@ -338,6 +338,244 @@ fn record_action_in_tx(
     Ok(Some(id))
 }
 
+impl WorkDb {
+    /// Journal an effect that is **not** a WorkDb column delta, and return
+    /// the new `boothby_actions` id.
+    ///
+    /// The capture helpers below journal a mutation by diffing a row before
+    /// and after. That covers the taxonomy verbs and nothing else: reaping a
+    /// process, force-releasing a cube lease, deleting a recovery patch, or
+    /// filing a GitHub issue moves no column this database owns, so there is
+    /// no delta to notice and those effects would leave no trace at all. The
+    /// executor calls this instead, after the effect has succeeded.
+    ///
+    /// Ordering is deliberate and is the one real difference from the
+    /// capture path. A column delta is journalled *inside* the mutation's own
+    /// transaction, so the row and its audit row commit together or not at
+    /// all. An external effect has no such transaction to join — a killed
+    /// process cannot be rolled back if the INSERT then fails. So the
+    /// executor performs the effect first and journals second, which trades
+    /// the atomicity that is unavailable here for the failure mode that is
+    /// merely bad (an effect that happened without a journal row) over the
+    /// one that is worse (a journal claiming an effect that never ran, which
+    /// undo would then try to reverse).
+    ///
+    /// `pre_image` is the caller's to supply and must be `None` for I-class
+    /// verbs — the design gives those `params` + evidence instead, and the
+    /// executor enforces it.
+    pub fn record_boothby_effect(
+        &self,
+        verb: &str,
+        target_kind: &str,
+        target_id: &str,
+        pre_image: Option<&str>,
+        post_image: Option<&str>,
+    ) -> Result<String> {
+        let mut conn = self.connect()?;
+        let context = self.armed_boothby_action()?.with_context(|| {
+            format!(
+                "refusing to journal Boothby effect {verb} on {target_kind} {target_id}: \
+                 no action context is armed"
+            )
+        })?;
+        // One transaction for the read of `seq` and both writes. The capture
+        // path gets this for free by joining the mutation's transaction; this
+        // path has to open its own, and needs it for two reasons: `seq` is
+        // read-then-inserted against a `(pass_id, seq)` UNIQUE index, and the
+        // row plus the pass's denormalised `actions_count` must not be able
+        // to disagree — a journalled action the counter never saw would make
+        // the pane's summary contradict the feed under it.
+        //
+        // `Immediate` takes the write lock up front rather than on the first
+        // write, so a concurrent journal write loses the race at `begin`
+        // instead of half-way through.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pass_id = open_pass_id(&tx)?.with_context(|| {
+            format!(
+                "refusing to journal Boothby effect {verb} on {target_kind} {target_id}: \
+                 no Boothby pass is open, and every action belongs to a pass."
+            )
+        })?;
+        let seq = next_seq(&tx, &pass_id)?;
+        let id = next_id("ba");
+        let now = now_string();
+
+        tx.execute(
+            "INSERT INTO boothby_actions
+                (id, pass_id, seq, verb, target_kind, target_id, params, rationale,
+                 pre_image, post_image, reversibility, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id,
+                pass_id,
+                seq,
+                verb,
+                target_kind,
+                target_id,
+                context.params,
+                context.rationale,
+                pre_image,
+                post_image,
+                context.reversibility,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE boothby_passes SET actions_count = actions_count + 1 WHERE id = ?1",
+            params![pass_id],
+        )?;
+        tx.commit()?;
+
+        tracing::debug!(
+            action_id = %id,
+            verb,
+            target_id,
+            pass_id = %pass_id,
+            seq,
+            "boothby: journalled non-WorkDb effect",
+        );
+        Ok(id)
+    }
+
+    /// The id of the pass currently in flight, or `None` when no pass is
+    /// open.
+    ///
+    /// The public view of [`open_pass_id`], for callers outside this module
+    /// (the `boothby.act` RPC, which hands the executor the same pass the
+    /// journal will independently resolve in-transaction). Well-defined
+    /// because `boothby_passes_single_open_idx` makes a second concurrent
+    /// open pass impossible.
+    pub fn open_boothby_pass_id(&self) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        open_pass_id(&conn)
+    }
+
+    /// The highest `seq` journalled in the open pass so far, or 0 when the
+    /// pass has journalled nothing (or no pass is open).
+    ///
+    /// Paired with [`WorkDb::boothby_action_after_seq`] to identify the row a
+    /// single mutation wrote: read this before the mutation, ask for the row
+    /// past it after.
+    pub fn boothby_pass_high_seq(&self) -> Result<i64> {
+        let conn = self.connect()?;
+        let Some(pass_id) = open_pass_id(&conn)? else {
+            return Ok(0);
+        };
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM boothby_actions WHERE pass_id = ?1",
+            [&pass_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// The `boothby_actions` id journalled in the open pass with `seq`
+    /// greater than `after_seq`, or `None` if the mutation wrote no row.
+    ///
+    /// A `WorkDbCapture` verb's row is appended by [`record_action_in_tx`]
+    /// deep inside the mutation's transaction, which cannot hand an id back
+    /// up through `update_work_item_as_actor`'s signature — so the executor
+    /// reads it back instead.
+    ///
+    /// Keying on `seq > after_seq` rather than on `(verb, target_id)` is what
+    /// makes the read-back describe *this* call. The obvious version — newest
+    /// row matching the verb and target — silently returns an *earlier* call's
+    /// row when the same verb runs twice on the same target in one pass: the
+    /// second run's mutation is then a no-op (the row is already archived),
+    /// the capture layer journals nothing because no column moved, and the
+    /// lookup happily finds run one's row. The executor would report
+    /// `Executed` with a stale action id for a call that changed nothing.
+    /// With this shape that case correctly yields `None`.
+    pub fn boothby_action_after_seq(&self, after_seq: i64) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(pass_id) = open_pass_id(&conn)? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT id FROM boothby_actions
+             WHERE pass_id = ?1 AND seq > ?2
+             ORDER BY seq DESC LIMIT 1",
+            params![pass_id, after_seq],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// What this pass has already spent, per verb — the input to the
+    /// executor's blast-radius caps.
+    ///
+    /// Counted from `boothby_actions` rather than from a running tally, so
+    /// the budget and the audit trail cannot disagree: the journal *is* the
+    /// record of what was spent. It also makes the caps survive an engine
+    /// restart mid-pass, which an in-memory counter would silently reset —
+    /// handing Boothby a fresh budget precisely when something has already
+    /// gone wrong.
+    ///
+    /// Counts **every** action in the pass, including ones a human has since
+    /// undone. Refunding an undone action's budget would be exactly the wrong
+    /// response to the signal it carries: a human reversing Boothby's work
+    /// mid-pass is the strongest available evidence that this pass is going
+    /// badly, and it must not be what buys Boothby room to do more.
+    ///
+    /// Returns an empty tally when no pass is open; the executor refuses the
+    /// call for that reason separately.
+    pub fn boothby_pass_spend(&self) -> Result<BTreeMap<String, u32>> {
+        let conn = self.connect()?;
+        let Some(pass_id) = open_pass_id(&conn)? else {
+            return Ok(BTreeMap::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT verb, count(*) FROM boothby_actions
+             WHERE pass_id = ?1
+             GROUP BY verb",
+        )?;
+        let rows = stmt.query_map([&pass_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
+        let mut spend = BTreeMap::new();
+        for row in rows {
+            let (verb, count) = row?;
+            spend.insert(verb, count);
+        }
+        Ok(spend)
+    }
+
+    /// Whether Boothby has already acted on `(verb, target_kind, target_id)`
+    /// in a way a human then reversed — an `undone` action, or one left
+    /// `conflicted` because the row moved before undo could restore it.
+    ///
+    /// This is the memory behind the design's "human veto is permanent" rail.
+    /// A human undoing a close is a judgement about the decision, not just
+    /// the row, so Boothby re-making it next pass would be the close→reopen→
+    /// close flap the design set out to make structurally impossible.
+    ///
+    /// Served by the `boothby_actions_by_target` index.
+    pub fn boothby_action_was_reversed(&self, verb: &str, target_kind: &str, target_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM boothby_actions
+             WHERE target_kind = ?1 AND target_id = ?2 AND verb = ?3
+               AND undo_state IN ('undone', 'conflicted')",
+            params![target_kind, target_id, verb],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Whether `fingerprint` carries an active suppression in the findings
+    /// ledger — the operator-clearable half of the veto rail
+    /// (`boss boothby suppressions clear <id>`).
+    pub fn boothby_fingerprint_is_suppressed(&self, fingerprint: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM boothby_findings
+             WHERE fingerprint = ?1 AND status = ?2",
+            params![fingerprint, BOOTHBY_FINDING_STATUS_SUPPRESSED],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+}
+
 /// Journal a `tasks` mutation iff `actor` is Boothby. Inert otherwise.
 pub(crate) fn capture_task_update(
     conn: &Connection,
