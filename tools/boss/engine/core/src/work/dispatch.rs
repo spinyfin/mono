@@ -985,23 +985,27 @@ impl WorkDb {
         current_execution_id: &str,
     ) -> Result<Option<WorkExecution>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
-             FROM work_executions
-             WHERE work_item_id = ?1
-               AND id != ?2
-               AND status = 'orphaned'
-               AND pr_url IS NULL
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-            rusqlite::params![work_item_id, current_execution_id],
-            map_execution,
-        )
-        .optional()
-        .map_err(Into::into)
+        // Find the single *latest* orphan regardless of `pr_url`, not the
+        // latest pr-less one — if that latest orphan already has a `pr_url`,
+        // the search stops there (the `task.pr_url` resume path owns it) and
+        // must not fall through to an older, superseded pr-less orphan.
+        let latest_orphan: Option<WorkExecution> = conn
+            .query_row(
+                "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                        cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                        created_at, started_at, finished_at,
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                 FROM work_executions
+                 WHERE work_item_id = ?1
+                   AND id != ?2
+                   AND status = 'orphaned'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![work_item_id, current_execution_id],
+                map_execution,
+            )
+            .optional()?;
+        Ok(latest_orphan.filter(|orphan| orphan.pr_url.is_none()))
     }
 
     /// Return the most recent `running` or `waiting_human` execution for
