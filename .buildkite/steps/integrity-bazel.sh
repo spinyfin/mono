@@ -17,7 +17,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [integrity-bazel] verifying"
 echo "[integrity-bazel] agent: $(uname -a)"
-echo "[integrity-bazel] bazelisk: $(bazelisk version 2>&1 | head -1)"
+echo "[integrity-bazel] bazel: $(command bazel --version)"
 
 XCFW="tools/boss/app-macos/ThirdParty/GhosttyKit.xcframework"
 if [[ ! -f "${XCFW}/Info.plist" ]]; then

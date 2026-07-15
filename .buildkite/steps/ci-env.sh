@@ -47,7 +47,7 @@ if [[ "$OS_TYPE" == "darwin" ]]; then
     LAST_XCODE_VERSION=$(cat "$XCODE_VERSION_FILE")
     if [[ "$CURRENT_XCODE_VERSION" != "$LAST_XCODE_VERSION" ]]; then
       echo "--- [ci-env] Xcode changed ('$LAST_XCODE_VERSION' → '$CURRENT_XCODE_VERSION'); expunging stale Bazel output base"
-      command bazel clean --expunge
+      command bazel $BAZEL_STARTUP_FLAGS clean --expunge
     fi
   fi
   mkdir -p "$(dirname "$XCODE_VERSION_FILE")"

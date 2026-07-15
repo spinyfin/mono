@@ -8,7 +8,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [mac-app-build] building"
-echo "[mac-app-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
+echo "[mac-app-build] bazel: $(command bazel --version)"
 
 # rules_swift_package_manager's swift_deps module extension runs
 # `swift package describe` during every Bazel analysis.  The Package.swift

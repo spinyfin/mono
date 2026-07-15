@@ -23,7 +23,7 @@ log() { echo "--- $*"; }
 
 log "[boss-release] releasing"
 echo "[boss-release] agent: $(uname -a)"
-echo "[boss-release] bazelisk: $(bazelisk version 2>&1 | head -1)"
+echo "[boss-release] bazel: $(command bazel --version)"
 
 # ── resolve last released tag (all trigger paths) ────────────────────────────
 # Always resolve the last boss-v* tag and its commit SHA.  Both the
