@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use boss_github::gh_runner::{CommandGhRunner, GhRunner, GhRunnerError};
 use serde_json::Value;
 
-use super::{
+use crate::{
     CloseReason, ClosedReason, ExternalTracker, Result, TrackerConfigError, TrackerContext, TrackerError, UpstreamItem,
     UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
 };
@@ -853,7 +853,7 @@ mod tests {
                 "repo": "mono",
                 "project_number": 1
             }),
-            credential: super::super::TrackerCredential::ambient(),
+            credential: crate::TrackerCredential::ambient(),
         }
     }
 
@@ -866,7 +866,7 @@ mod tests {
                 "project_number": 1,
                 "label_filter": labels
             }),
-            credential: super::super::TrackerCredential::ambient(),
+            credential: crate::TrackerCredential::ambient(),
         }
     }
 
@@ -1005,7 +1005,7 @@ mod tests {
                 "repo": "mono",
                 "project_number": 1
             }),
-            credential: super::super::TrackerCredential {
+            credential: crate::TrackerCredential {
                 token: token.to_owned(),
             },
         }
@@ -1496,7 +1496,7 @@ mod tests {
                 "project_number": 1,
                 "in_progress_column": "Doing"
             }),
-            credential: super::super::TrackerCredential::ambient(),
+            credential: crate::TrackerCredential::ambient(),
         };
         let mut fake = FakeGhRunner::new();
         fake.push_graphql_ok(project_metadata_response(

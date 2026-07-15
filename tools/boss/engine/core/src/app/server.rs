@@ -185,7 +185,8 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
             } = &state
             {
                 let token = record.token.clone();
-                let resolved = probe_and_record_org_state(work_db.as_ref(), flow.as_ref(), &token).await;
+                let org_sink = WorkDbOrgStateSink::new(work_db.as_ref());
+                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &token).await;
                 controller.update_org_state(resolved);
             }
 

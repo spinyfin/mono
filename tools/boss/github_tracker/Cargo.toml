@@ -1,0 +1,30 @@
+[package]
+name = "boss-github-tracker"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-engine-utils = { path = "../engine/utils" }
+boss-github = { path = "../github" }
+boss-protocol = { path = "../protocol" }
+keyring = { workspace = true, features = ["apple-native"] }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+[dev-dependencies]
+rustls = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }

@@ -8,6 +8,7 @@ members = [
   "tools/boss/cli",
   "tools/boss/client",
   "tools/boss/github",
+  "tools/boss/github_tracker",
   "tools/boss/engine/conflict-diagnosis",
   "tools/boss/engine/deterministic-resolvers",
   "tools/boss/engine/core",

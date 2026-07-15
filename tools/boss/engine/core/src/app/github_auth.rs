@@ -109,7 +109,8 @@ pub(super) async fn handle_git_hub_auth_status(ctx: Dispatch, req: FrontendReque
             tokio::spawn(async move {
                 let controller = server_state.github_auth.clone();
                 let flow = controller.device_flow();
-                let resolved = probe_and_record_org_state(server_state.work_db.as_ref(), flow.as_ref(), &token).await;
+                let org_sink = WorkDbOrgStateSink::new(server_state.work_db.as_ref());
+                let resolved = probe_and_record_org_state(&org_sink, flow.as_ref(), &token).await;
                 controller.update_org_state(resolved);
             });
         }

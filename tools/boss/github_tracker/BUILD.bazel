@@ -1,0 +1,50 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "github_tracker",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["src/testdata/**"]),
+    crate_name = "boss_github_tracker",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    # Minimal visibility: the engine is the only consumer. Reconciliation
+    # policy in //tools/boss/engine/core depends on this crate; nothing else
+    # should reach into the tracker transport directly.
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/engine/utils",
+        "//tools/boss/github",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "github_tracker_test",
+    size = "small",
+    # These tests came from //tools/boss/engine/core:engine_lib_test_b, which
+    # sets timeout = "moderate" (300s) because linux-amd64 CI runners run
+    # ~6-7x slower than macOS dev boxes and the 60s size="small" default is
+    # too tight. The device-flow poll tests sleep on real backoff intervals,
+    # so keep that budget rather than inherit the default.
+    timeout = "moderate",
+    crate = ":github_tracker",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/utils",
+        "//tools/boss/github",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
