@@ -495,23 +495,17 @@ impl BranchVerifier for CommandBranchVerifier {
 /// in the comparison. Returns `0` when the diff is empty (pure rebase with no
 /// file-content changes). Used by the no-op skip gate (P992 design §8).
 async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
-    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
-    let stdout = run_gh(
-        &[
-            "api",
-            &endpoint,
-            "-H",
-            "Accept: application/vnd.github+json",
-            "--jq",
-            "(.files // []) | map(.additions + .deletions) | add // 0",
-        ],
-        &format!("gh api {endpoint}"),
+    let trimmed = crate::gh_invocation::gh_compare_jq(
+        repo_slug,
+        base,
+        head,
+        "(.files // []) | map(.additions + .deletions) | add // 0",
     )
     .await?;
-    let total: u64 = stdout
-        .trim()
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let total: u64 = trimmed
         .parse()
-        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim()))?;
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
     Ok(total)
 }
 
