@@ -4,9 +4,10 @@ import Foundation
 // Attentions (design: tools/boss/docs/designs/attentions.md). Swift mirrors of
 // `boss_protocol::AttentionGroup` and `boss_protocol::Attention` — the
 // agent-authored, human-actionable notification feature surfaced in the
-// Notifications toolbar window. Distinct from `WorkAttentionItem` (Models.swift),
-// which is the legacy engine-raised *operational* alert store. Split out of
-// Models.swift to keep that file under the repo's file-size check.
+// Notifications toolbar window. Distinct from `WorkAttentionItem`
+// (Models+AttentionItems.swift), which is the legacy engine-raised
+// *operational* alert store. Split out of Models.swift to keep that file under
+// the repo's file-size check.
 // ===========================================================================
 
 /// Swift mirror of `boss_protocol::AttentionGroup`. The human-actionable
