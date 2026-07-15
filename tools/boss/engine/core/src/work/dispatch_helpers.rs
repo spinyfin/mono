@@ -596,9 +596,11 @@ pub(crate) fn reconcile_revision_execution(
     };
 
     // Dispatch-time catch-up gate: if the chain root is already `done` or
-    // `archived` the parent PR has merged.  Apply the same three-branch logic
-    // as `block_pending_revisions_on_parent_close` for revisions that slipped
-    // through (engine restart, creation-after-merge edge cases).
+    // `archived` the parent PR has merged.  Revisions that slipped past the
+    // merge-poller sweep (engine restart, creation-after-merge edge cases)
+    // are resolved here through the same shared
+    // `resolve_revision_on_parent_close` the sweep itself uses, so both paths
+    // reach an identical verdict.
     if chain_root_task.status == TaskStatus::Done || chain_root_task.status == TaskStatus::Archived {
         // Skip revisions already in a terminal state.  `block_pending_revisions_on_parent_close`
         // may have processed this revision already; the task struct we hold here was
@@ -620,102 +622,9 @@ pub(crate) fn reconcile_revision_execution(
         }
 
         let now = now_string();
-        // Drop any not-yet-live execution row before archiving the task:
-        // without this, a `ready` row created earlier (e.g. by the
-        // dependency-unblock cascade, which is not chain-root-aware) is
-        // stranded on a now-archived work item — it can never be dispatched
-        // and `bossctl work start` on the row just mints another orphan.
-        // A live (`running`/`waiting_human`) execution is left alone; it
-        // self-retires when its worker stops.
-        conn.execute(
-            "UPDATE work_executions
-             SET status = 'abandoned',
-                 finished_at = COALESCE(finished_at, ?2)
-             WHERE work_item_id = ?1
-               AND status IN ('queued', 'ready', 'waiting_dependency')",
-            params![task.id, now],
-        )?;
-        if is_moot_revision_kind(&task.created_via) {
-            let archived_reason = format!("parent PR merged: revision moot (created_via={})", task.created_via);
-            let rows_changed = conn.execute(
-                "UPDATE tasks
-                 SET status            = 'archived',
-                     archived_reason   = ?3,
-                     last_status_actor = 'engine',
-                     updated_at        = ?2,
-                     completed_at      = COALESCE(completed_at, ?2),
-                     deleted_at        = ?2,
-                     merge_queue_state  = NULL,
-                     merge_queue_detail = NULL
-                 WHERE id = ?1
-                   AND kind = 'revision'
-                   AND deleted_at IS NULL",
-                params![task.id, now, archived_reason],
-            )?;
-            if rows_changed > 0 {
-                tracing::info!(
-                    task_id = %task.id,
-                    chain_root_id = %chain_root_task.id,
-                    created_via = %task.created_via,
-                    "reconcile_revision: moot revision archived at dispatch-time \
-                     (merge-conflict/CI-fix; parent PR merged)",
-                );
-                record_revision_archived_attention(
-                    conn,
-                    &task.id,
-                    "parent PR merged, revision moot",
-                    &format!(
-                        "The parent PR for chain root `{}` merged or closed. This revision \
-                         (`created_via={}`) could not have merged unresolved (a conflicting/CI-failing \
-                         PR can't merge), so the engine archived it silently rather than leaving a \
-                         dangling task. No action needed unless the underlying work is still outstanding.",
-                        chain_root_task.id, task.created_via,
-                    ),
-                )?;
-            }
-        } else {
-            let is_wip = task.status == TaskStatus::Active;
-            let new_chore = insert_chore_in_tx(
-                conn,
-                CreateChoreInput::builder()
-                    .product_id(task.product_id.clone())
-                    .autostart(is_wip)
-                    .force_duplicate(true)
-                    .name(task.name.clone())
-                    .maybe_created_via(Some(CREATED_VIA_ENGINE_AUTO.to_owned()))
-                    .maybe_description(Some(task.description.clone()))
-                    .maybe_effort_level(task.effort_level)
-                    .maybe_model_override(task.model_override.clone())
-                    .maybe_priority(Some(task.priority.clone()))
-                    .maybe_repo_remote_url(task.repo_remote_url.clone())
-                    .build(),
-            )?;
-            let archived_reason = format!("parent PR merged: superseded by chore {}", new_chore.id);
-            conn.execute(
-                "UPDATE tasks
-                 SET status            = 'archived',
-                     archived_reason   = ?3,
-                     last_status_actor = 'engine',
-                     updated_at        = ?2,
-                     completed_at      = COALESCE(completed_at, ?2),
-                     deleted_at        = ?2,
-                     merge_queue_state  = NULL,
-                     merge_queue_detail = NULL
-                 WHERE id = ?1
-                   AND kind = 'revision'
-                   AND deleted_at IS NULL",
-                params![task.id, now, archived_reason],
-            )?;
-            tracing::info!(
-                task_id = %task.id,
-                new_chore_id = %new_chore.id,
-                chain_root_id = %chain_root_task.id,
-                is_wip,
-                "reconcile_revision: revision converted to standalone chore at dispatch-time \
-                 (parent PR merged; chore will {})",
-                if is_wip { "auto-dispatch" } else { "stay in backlog" },
-            );
-        }
+        // Drop any not-yet-live execution row before archiving the task.
+        abandon_pending_executions(conn, &task.id, &now)?;
+        resolve_revision_on_parent_close(conn, task, &chain_root_task.id, &now, "reconcile_revision")?;
         return Ok(());
     }
 
@@ -740,14 +649,7 @@ pub(crate) fn reconcile_revision_execution(
     // alone; it self-retires on Stop.
     if let Some(attempt_status) = retired_spawning_attempt_status(conn, task)? {
         let now = now_string();
-        conn.execute(
-            "UPDATE work_executions
-             SET status = 'abandoned',
-                 finished_at = COALESCE(finished_at, ?2)
-             WHERE work_item_id = ?1
-               AND status IN ('queued', 'ready', 'waiting_dependency')",
-            params![task.id, now],
-        )?;
+        abandon_pending_executions(conn, &task.id, &now)?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
             let settled = conn.execute(
                 "UPDATE tasks
@@ -2028,6 +1930,107 @@ mod tests {
         assert!(
             merge_queue_detail.is_none(),
             "moot-revision archive at dispatch-time catch-up must clear merge_queue_detail"
+        );
+    }
+
+    /// A `pr_review:` revision that slips past the merge-poller sweep and is
+    /// resolved by the dispatch-time catch-up gate instead must produce the
+    /// same `followup` (with origin provenance and the rewritten description)
+    /// that `block_pending_revisions_on_parent_close` produces — see the
+    /// `t09.rs` followup suite for the sweep-path equivalents.
+    ///
+    /// Before both paths shared `resolve_revision_on_parent_close`, this gate
+    /// carried its own copy of the moot-vs-convert branch that predated the
+    /// followup kind, so a revision reaching merge via this path silently
+    /// degraded to a plain `chore` with no origin back-reference — the same
+    /// work item classified differently purely by which path observed the
+    /// merge first.
+    #[test]
+    fn reconcile_revision_execution_converts_pr_review_revision_to_followup_at_dispatch_time_catch_up() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+
+        // Parent chore already merged before this reconcile tick observed it.
+        // `short_id` is what the followup must carry as `origin_task_short_id`.
+        let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', short_id = 42, \
+                 pr_url = 'https://github.com/spinyfin/mono/pull/1537' WHERE id = ?1",
+                params![chore_id],
+            )
+            .unwrap();
+
+        // A PR-review revision that slipped through, still sitting in `todo`.
+        let revision_id = next_id("task");
+        let now = now_string();
+        let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_slipped");
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+                 created_at, updated_at, parent_task_id, autostart, priority, created_via) \
+                 VALUES (?1, ?2, 'revision', 'Rev', \
+                 'Address all findings before finalising this revision.', 'todo', ?3, ?3, ?4, 1, 'medium', ?5)",
+                params![revision_id, product, now, chore_id, created_via],
+            )
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        let revision_task = query_task(&conn, &revision_id)
+            .unwrap()
+            .expect("revision task must exist");
+        let mut result = ExecutionReconcileResult::default();
+        {
+            let mut conn2 = db.connect().unwrap();
+            let tx = conn2.transaction().unwrap();
+            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let chores = db.list_chores(&product, None, false).unwrap();
+        let followup = chores
+            .iter()
+            .find(|c| c.id != chore_id && c.kind == TaskKind::Followup)
+            .unwrap_or_else(|| {
+                panic!("dispatch-time catch-up must convert a pr_review revision to a followup; chores: {chores:?}")
+            });
+        assert!(
+            !chores.iter().any(|c| c.id != chore_id && c.kind == TaskKind::Chore),
+            "no plain chore may be minted alongside the followup; chores: {chores:?}",
+        );
+        assert_eq!(
+            followup.origin_task_short_id,
+            Some(42),
+            "followup must carry the chain root's short_id as origin_task_short_id",
+        );
+        assert_eq!(
+            followup.origin_pr_number,
+            Some(1537),
+            "followup must carry the PR number parsed from the chain root's pr_url",
+        );
+        assert!(
+            followup.description.contains("closing this follow-up"),
+            "followup description must be rewritten off the revision wording; got {:?}",
+            followup.description,
+        );
+
+        // The revision itself is archived, tombstoned, and its archived_reason
+        // names the followup that superseded it (not a "chore").
+        let (status, deleted_at, archived_reason): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, deleted_at, archived_reason FROM tasks WHERE id = ?1",
+                params![revision_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "archived");
+        assert!(deleted_at.is_some(), "archived revision must be tombstoned");
+        assert_eq!(
+            archived_reason,
+            Some(format!("parent PR merged: superseded by followup {}", followup.id)),
+            "archived_reason must name the followup that superseded the revision",
         );
     }
 
