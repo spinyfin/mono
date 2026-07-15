@@ -104,22 +104,25 @@ pub const CI_CHURN_LIMIT: i64 = 5;
 pub use boss_protocol::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING,
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation, AutomationPatch,
-    AutomationRun, AutomationTrigger, BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERED,
+    AutomationRun, AutomationTrigger, BOOTHBY_REVERSIBILITY_IRREVERSIBLE, BOOTHBY_TARGET_ATTENTION,
+    BOOTHBY_TARGET_ATTENTION_ITEM, BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK, BlockedSignal, BoothbyAction,
+    BoothbyCursor, BoothbyFinding, BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERED,
     COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_IN_REVISION,
-    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX,
-    CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor,
-    CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictClassCount,
-    ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution, CreateAttentionInput,
-    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter,
-    DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE,
-    INTENT_QUESTION, ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_BOOTHBY_PREFIX,
+    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
+    CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState,
+    ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution,
+    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
+    CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRevisionInput, CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyDirection, DependencyEdge,
+    DependencyFilter, DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel,
+    EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput,
+    INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN,
+    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus,
     RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput,
-    ReviseDocOutcome, SetProjectDesignDocInput, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER,
+    ReviseDocOutcome, SetProjectDesignDocInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER,
     THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
     WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
     WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
@@ -235,6 +238,16 @@ pub struct WorkDb {
     path: PathBuf,
     /// Present only when the database is in-memory (path == ":memory:").
     memory: Option<InMemoryAnchor>,
+    /// The Boothby action the executor is currently performing, if any.
+    /// Set by [`WorkDb::arm_boothby_action`] and read by the mutation layer
+    /// when a write arrives with `actor = "boothby"`, which is how the
+    /// executor's `verb` / `rationale` / `reversibility` reach the journal
+    /// without threading them through every mutation signature.
+    ///
+    /// `Arc` so it is shared across clones rather than copied: `WorkDb` is
+    /// cloned freely across the engine, and an arm on one handle must be
+    /// visible to the mutation that runs through another.
+    boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
 }
 
 impl Clone for WorkDb {
@@ -242,6 +255,7 @@ impl Clone for WorkDb {
         Self {
             path: self.path.clone(),
             memory: self.memory.clone(),
+            boothby_action: Arc::clone(&self.boothby_action),
         }
     }
 }
@@ -252,6 +266,7 @@ mod attentions;
 mod audit_misc;
 mod automations;
 mod blocking;
+mod boothby;
 mod chain_helpers;
 mod comment_thread_entries;
 mod comments;
@@ -273,6 +288,7 @@ mod metrics_db;
 mod metrics_types;
 mod migrations_a;
 mod migrations_b;
+mod migrations_boothby;
 mod output_types;
 mod planner_runs;
 mod pr_flow;
@@ -298,6 +314,7 @@ pub(crate) use insert_helpers::*;
 pub(crate) use mappers::*;
 pub(crate) use migrations_a::*;
 pub(crate) use migrations_b::*;
+pub(crate) use migrations_boothby::*;
 pub(crate) use products_design::{parse_pr_doc_artifact_id, resolve_task_doc_pointer};
 pub(crate) use query_ensure::*;
 pub(crate) use revision_helpers::*;
@@ -309,6 +326,7 @@ pub use audit_misc::ProjectPropertyAuditEntry;
 pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
+pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,

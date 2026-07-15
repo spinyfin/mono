@@ -579,20 +579,34 @@ impl WorkDb {
         } else {
             None
         };
-        self.set_member_answer_state(id, new_state, answer)
+        self.set_member_answer_state(id, new_state, answer, LAST_STATUS_ACTOR_HUMAN)
     }
 
     /// Dismiss without producing anything. `atg_…` / `A<n>` dismisses the
     /// whole group (terminal); `atn_…` dismisses a single member. `reason`
     /// has no column in the store and is accepted only for wire/CLI parity.
-    pub fn dismiss_attention(&self, id: &str, _reason: Option<String>) -> Result<AttentionGroup> {
+    pub fn dismiss_attention(&self, id: &str, reason: Option<String>) -> Result<AttentionGroup> {
+        self.dismiss_attention_as_actor(id, reason, LAST_STATUS_ACTOR_HUMAN)
+    }
+
+    /// Like [`Self::dismiss_attention`] but attributes the dismissal to
+    /// `actor`, auditing it as a `boothby_actions` row when that actor is
+    /// Boothby — this is the path Boothby's attention-tidying takes, and
+    /// the pre-image is what lets a human put a wrongly-dismissed group
+    /// (or member) back.
+    ///
+    /// Both the group path and the `atn_…` member path (via
+    /// [`Self::set_member_answer_state`], journalled under
+    /// [`boss_protocol::BOOTHBY_TARGET_ATTENTION_ITEM`]) are audited.
+    pub fn dismiss_attention_as_actor(&self, id: &str, _reason: Option<String>, actor: &str) -> Result<AttentionGroup> {
         if id.starts_with("atn_") {
-            return self.set_member_answer_state(id, "dismissed", None);
+            return self.set_member_answer_state(id, "dismissed", None, actor);
         }
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let group = resolve_group(&tx, id).require("attention group", id)?;
+        let before = group.clone();
         match group.state.as_str() {
             // Idempotent: dismissing an already-dismissed group is a no-op.
             "dismissed" => {
@@ -612,23 +626,30 @@ impl WorkDb {
         )?;
         let group = query_attention_group(&tx, &group.id)?
             .with_context(|| format!("missing attention group after dismiss: {}", group.id))?;
+        // Audit inside `tx`. Inert unless `actor` is Boothby. Note the
+        // idempotent already-dismissed arm above returns before reaching
+        // here, so a re-dismiss appends no second action row.
+        boothby::capture_attention_group_update(&tx, self, actor, &before, &group, &now)?;
         tx.commit()?;
         Ok(group)
     }
 
     /// Shared member-state transition for `answer_attention` /
     /// `dismiss_attention`. Refuses to mutate a member whose group is
-    /// terminal, then recomputes and returns the group.
+    /// terminal, then recomputes and returns the group. Audits the member
+    /// mutation in-transaction when `actor` is Boothby (inert otherwise) —
+    /// see [`boothby::capture_attention_member_update`].
     fn set_member_answer_state(
         &self,
         member_id: &str,
         new_state: &str,
         answer: Option<String>,
+        actor: &str,
     ) -> Result<AttentionGroup> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let member = query_attention(&tx, member_id).require("attention", member_id)?;
-        let group = query_attention_group(&tx, &member.group_id)?
+        let before = query_attention(&tx, member_id).require("attention", member_id)?;
+        let group = query_attention_group(&tx, &before.group_id)?
             .with_context(|| format!("attention {member_id} references a missing group"))?;
         if group_is_terminal(&group.state) {
             bail!(
@@ -645,12 +666,18 @@ impl WorkDb {
         } else {
             None
         };
+        let now = answered_at.clone().unwrap_or_else(now_string);
         tx.execute(
             "UPDATE attentions
                 SET answer_state = ?2, answer = ?3, answered_at = ?4
               WHERE id = ?1",
             params![member_id, new_state, answer, answered_at],
         )?;
+        let after = query_attention(&tx, member_id)
+            .require("attention", member_id)
+            .with_context(|| format!("missing attention after update: {member_id}"))?;
+        // Audit inside `tx`. Inert unless `actor` is Boothby.
+        boothby::capture_attention_member_update(&tx, self, actor, &before, &after, &now)?;
         recompute_group_state(&tx, &group.id)?;
         let group = query_attention_group(&tx, &group.id)?
             .with_context(|| format!("missing attention group after update: {}", group.id))?;

@@ -53,6 +53,12 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut project = query_project(&tx, id).require("project", id)?;
+        // Pre-image for the Boothby audit trail. Cloned unconditionally
+        // rather than behind the actor gate: `project` is mutated in place
+        // by the patch application below, so by the time the gate is
+        // consulted the original is gone. One clone of a small struct on a
+        // path that already does several SQL round-trips.
+        let before = project.clone();
         let previous_status = project.status;
         let status_changed = patch.status.is_some();
 
@@ -98,6 +104,9 @@ impl WorkDb {
         }
 
         let updated = query_project(&tx, id).require("project", id)?;
+        // Audit inside `tx`: the action row and the write it describes
+        // commit together or not at all. Inert unless `actor` is Boothby.
+        boothby::capture_project_update(&tx, self, actor, &before, &updated, &project.updated_at)?;
         tx.commit()?;
         Ok(WorkItem::Project(updated))
     }
@@ -120,6 +129,10 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             bail!("cannot update a deleted task: {id}");
         }
+        // Pre-image for the Boothby audit trail — see the note in
+        // `update_project`. Taken after the two refusal checks above so a
+        // rejected patch never reaches the audit path at all.
+        let before = task.clone();
         let previous_blocked_reason = task.blocked_reason.clone();
         let status_changed = patch.status.is_some();
 
@@ -258,6 +271,9 @@ impl WorkDb {
         }
 
         let updated = query_task(&tx, id).require("task", id)?;
+        // Audit inside `tx`: the action row and the write it describes
+        // commit together or not at all. Inert unless `actor` is Boothby.
+        boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
         tx.commit()?;
         Ok(task_to_item(updated))
     }

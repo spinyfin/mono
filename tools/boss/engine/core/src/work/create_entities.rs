@@ -11,7 +11,11 @@ impl WorkDb {
                 .with_context(|| format!("failed to create work db directory {}", parent.display()))?;
         }
 
-        let db = Self { path, memory: None };
+        let db = Self {
+            path,
+            memory: None,
+            boothby_action: Arc::default(),
+        };
         db.init()?;
         Ok(db)
     }
@@ -35,6 +39,7 @@ impl WorkDb {
                 uri,
                 _conn: Arc::new(Mutex::new(anchor)),
             }),
+            boothby_action: Arc::default(),
         };
         db.init()?;
         Ok(db)

@@ -2504,7 +2504,8 @@ pub struct Project {
     pub created_at: String,
     pub description: String,
     pub goal: String,
-    /// Who made the most recent status change. Three values:
+    /// Who made the most recent status change. Four values, parseable as
+    /// [`StatusActor`]:
     /// - `'human'` (default) — a CLI / app caller with no registered
     ///   Boss-session ancestry, or a drag-drop gesture in the macOS app.
     /// - `'boss'` — the caller's process ancestry traces back to the
@@ -2512,9 +2513,15 @@ pub struct Project {
     ///   where Claude Code runs as coordinator).
     /// - `'engine'` — the engine wrote the status itself (dependency
     ///   auto-block/unblock, merge poller, CI watch, etc.).
+    /// - `'boothby'` — the autonomous groundskeeper decided this row was
+    ///   stale / empty / wedged during a maintenance pass. Audited with
+    ///   pre/post images in `boothby_actions`, and undoable from there.
     ///
     /// The auto-unblock path only flips a `blocked` row back to `todo`
-    /// when this is `'engine'` — manual and Boss-driven blocks stick.
+    /// when this is `'engine'` — manual, Boss-driven and Boothby blocks
+    /// all stick, because each is a deliberate decision about this row
+    /// rather than cascade bookkeeping the engine owns reversing. See
+    /// [`StatusActor::is_engine_cascade`], which states that rule once.
     #[serde(default = "default_human_actor")]
     #[builder(default = default_human_actor())]
     pub last_status_actor: String,
@@ -2912,6 +2919,103 @@ pub const LAST_STATUS_ACTOR_BOSS: &str = "boss";
 /// A status change made directly by the engine (auto-block, dep-unblock,
 /// merge poller, CI watch, etc.) — never comes from a peer RPC call.
 pub const LAST_STATUS_ACTOR_ENGINE: &str = "engine";
+/// A status change made by Boothby, the autonomous groundskeeper, during
+/// a maintenance pass (closing a stale task, archiving an empty project,
+/// unwedging stuck work). Like `'human'` and `'boss'` — and unlike
+/// `'engine'` — a Boothby status change is a *deliberate* decision about
+/// one row, not a cascade the engine may silently reverse. See
+/// [`StatusActor::is_engine_cascade`] for the consumer-facing rule.
+///
+/// Boothby never arrives over the peer-RPC path (`resolve_status_actor`
+/// only ever resolves `'boss'` or `'human'`); it is engine-internal and
+/// passes this literal to `update_work_item_as_actor` directly.
+pub const LAST_STATUS_ACTOR_BOOTHBY: &str = "boothby";
+
+/// The `last_status_actor` vocabulary as a closed set.
+///
+/// The column is TEXT and every write path stamps one of the
+/// `LAST_STATUS_ACTOR_*` literals, so this enum is a *view* over that
+/// vocabulary rather than the storage type. Consumers that have to make
+/// a real decision about who touched a row should [`FromStr`]-parse the
+/// stored value and `match` exhaustively, so that adding a fifth actor
+/// is a compile error at each such site instead of silently falling into
+/// whichever branch happened to be the default.
+///
+/// There is deliberately no `Unknown` variant: a value outside this set
+/// means a write site invented an actor, which is a bug to fix there and
+/// not a case every consumer should be forced to branch on. `from_str`
+/// returns `Err` for those, and callers decide — today the only decision
+/// site treats an unparseable actor exactly as the pre-enum `== "engine"`
+/// string compare did (not engine-owned, so hands off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusActor {
+    Human,
+    Boss,
+    Engine,
+    Boothby,
+}
+
+impl StatusActor {
+    pub const ALL: &'static [StatusActor] = &[
+        StatusActor::Human,
+        StatusActor::Boss,
+        StatusActor::Engine,
+        StatusActor::Boothby,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusActor::Human => LAST_STATUS_ACTOR_HUMAN,
+            StatusActor::Boss => LAST_STATUS_ACTOR_BOSS,
+            StatusActor::Engine => LAST_STATUS_ACTOR_ENGINE,
+            StatusActor::Boothby => LAST_STATUS_ACTOR_BOOTHBY,
+        }
+    }
+
+    /// True only for `'engine'`: the row's current status was written by
+    /// one of the engine's own cascades (dependency auto-block, merge
+    /// poller, CI watch), which therefore also owns reversing it.
+    ///
+    /// This is the single rule behind every actor check in the engine and
+    /// the macOS app, stated once so the next actor added has to answer
+    /// the question explicitly rather than inherit an answer.
+    ///
+    /// `Boothby` sits on the `false` side with `Human` and `Boss`. Boothby
+    /// is autonomous, but its writes are per-row judgements ("this task is
+    /// stale, close it"), not cascade bookkeeping — so the dep-unblock
+    /// sweep must leave a Boothby-touched row alone exactly as it leaves a
+    /// human's alone. Note this branch is unreachable for the auto-block
+    /// path regardless: `write_engine_status` hardcodes `'engine'`, so a
+    /// cascade-owned block can never carry any other actor.
+    pub fn is_engine_cascade(self) -> bool {
+        match self {
+            StatusActor::Engine => true,
+            StatusActor::Human | StatusActor::Boss | StatusActor::Boothby => false,
+        }
+    }
+}
+
+impl std::fmt::Display for StatusActor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StatusActor {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            LAST_STATUS_ACTOR_HUMAN => Ok(StatusActor::Human),
+            LAST_STATUS_ACTOR_BOSS => Ok(StatusActor::Boss),
+            LAST_STATUS_ACTOR_ENGINE => Ok(StatusActor::Engine),
+            LAST_STATUS_ACTOR_BOOTHBY => Ok(StatusActor::Boothby),
+            other => Err(format!(
+                "unknown status actor `{other}`; expected one of: human, boss, engine, boothby"
+            )),
+        }
+    }
+}
 
 /// Canonical "I don't know where this came from" stamp. Applied by
 /// the migration to existing rows and by the engine's last-resort
@@ -2949,6 +3053,11 @@ pub const CREATED_VIA_ATTENTION: &str = "attention";
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 /// §"Association model".
 pub const CREATED_VIA_DOC_COMMENT_PREFIX: &str = "doc-comment:";
+/// Prefix for work Boothby files during a maintenance pass:
+/// `boothby:<boothby_passes.id>`. The pass id is the back-pointer — every
+/// row Boothby touched in that pass is recoverable from `boothby_actions`,
+/// which carries the pre/post images needed to undo it.
+pub const CREATED_VIA_BOOTHBY_PREFIX: &str = "boothby:";
 
 /// Documented `created_via` values. The engine canonicalises caller-
 /// supplied strings against this set; values outside it are stored
@@ -2965,14 +3074,15 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
 
 /// `true` when `value` is one of the documented `created_via` strings
 /// or matches a documented prefix pattern (`merge-conflict:*`,
-/// `ci-fix:*`, `pr-comment:*`). Engine writes for unknown values still
-/// go through, but a warning is logged at the insert site.
+/// `ci-fix:*`, `pr-comment:*`, `boothby:*`). Engine writes for unknown
+/// values still go through, but a warning is logged at the insert site.
 pub fn is_known_created_via(value: &str) -> bool {
     KNOWN_CREATED_VIA.contains(&value)
         || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
         || value.starts_with(CREATED_VIA_DOC_COMMENT_PREFIX)
+        || value.starts_with(CREATED_VIA_BOOTHBY_PREFIX)
         || value.starts_with("pr-comment:")
 }
 
@@ -3160,7 +3270,8 @@ pub struct Task {
 
     pub kind: TaskKind,
     /// Who made the most recent status change — `'human'`, `'boss'`,
-    /// or `'engine'`. See `Project.last_status_actor` for full semantics.
+    /// `'engine'`, or `'boothby'`. See `Project.last_status_actor` for
+    /// full semantics and [`StatusActor`] for the parsed vocabulary.
     #[serde(default = "default_human_actor")]
     #[builder(default = default_human_actor())]
     pub last_status_actor: String,
