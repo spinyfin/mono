@@ -127,12 +127,13 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let coordinator = Arc::clone(&coordinator);
-        let dispatch_events = Arc::clone(&dispatch_events);
-        async move { run_one_pass(work_db.as_ref(), Arc::clone(&coordinator), dispatch_events.as_ref()).await }
-    })
+    crate::sweep_loop::spawn_work_sweep_loop(
+        work_db,
+        coordinator,
+        dispatch_events,
+        interval,
+        |work_db, coordinator, dispatch_events| Box::pin(run_one_pass(work_db, coordinator, dispatch_events)),
+    )
 }
 
 /// Run a single pane-death reconciliation pass over every non-terminal

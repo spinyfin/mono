@@ -25,10 +25,14 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::hash::Hash;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use boss_protocol::WorkExecution;
 
+use crate::coordinator::ExecutionCoordinator;
+use crate::dispatch_events::DispatchEventSink;
 use crate::work::WorkDb;
 
 /// Partition produced by [`confirm_two_pass`]: this pass's candidates split
@@ -147,6 +151,53 @@ where
             }
             tokio::time::sleep(interval).await;
         }
+    })
+}
+
+/// The future a [`spawn_work_sweep_loop`] pass returns. Boxed because the
+/// pass borrows the `&WorkDb` / `&dyn DispatchEventSink` the helper hands
+/// it, and a higher-ranked closure cannot name that borrow's lifetime in a
+/// generic future parameter. Costs one allocation per pass — once per
+/// sweep interval, against a pass that hits the DB.
+type SweepPassFuture<'a, O> = Pin<Box<dyn Future<Output = O> + Send + 'a>>;
+
+/// Spawn a sweep loop over the engine's three standard sweep collaborators.
+///
+/// The `work_db` / `coordinator` / `dispatch_events` sweeps (dead-pane,
+/// dispatch-failure recovery, orphan, PR-review recovery) all captured the
+/// same `Arc` triple and re-cloned it per pass by hand. This owns that
+/// capture: it clones the triple each pass and hands `pass_fn` the exact
+/// shape `run_one_pass` already takes, so a call site is just
+/// `Box::pin(run_one_pass(work_db, coordinator, dispatch_events))`.
+///
+/// `coordinator` arrives as an owned `Arc` because the kick path needs
+/// `Arc<ExecutionCoordinator>`; the other two are borrows for the pass's
+/// duration. A sweep needing extra per-pass collaborators (a PR-state
+/// checker, a reaper) closes over them at the call site rather than
+/// widening this signature.
+///
+/// Inherits [`spawn_sweep_loop`]'s fire-immediately-on-spawn contract.
+pub(crate) fn spawn_work_sweep_loop<O, F>(
+    work_db: Arc<WorkDb>,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: Arc<dyn DispatchEventSink>,
+    interval: Duration,
+    pass_fn: F,
+) -> tokio::task::JoinHandle<()>
+where
+    O: SweepOutcome + Send,
+    F: for<'a> Fn(&'a WorkDb, Arc<ExecutionCoordinator>, &'a dyn DispatchEventSink) -> SweepPassFuture<'a, O>
+        + Send
+        + Sync
+        + 'static,
+{
+    let pass_fn = Arc::new(pass_fn);
+    spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let pass_fn = Arc::clone(&pass_fn);
+        async move { pass_fn(work_db.as_ref(), coordinator, dispatch_events.as_ref()).await }
     })
 }
 
