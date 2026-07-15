@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -177,11 +176,9 @@ pub fn create_execution_started_secs_ago(db: &WorkDb, work_item_id: &str, secs_a
     let execution = db
         .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
         .unwrap();
-    let started_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .saturating_sub(secs_ago) as i64;
+    let started_at = boss_engine_utils::epoch_time::now_epoch_secs()
+        .saturating_sub(secs_ago as i64)
+        .max(0);
     db.force_started_at_for_test(&execution.id, started_at).unwrap();
     execution.id
 }

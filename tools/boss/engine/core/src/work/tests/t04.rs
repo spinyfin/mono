@@ -1521,12 +1521,7 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
     // created_at on every existing row to two hours ago and the
     // guard should drop back to off.
     let conn = rusqlite::Connection::open(&path).unwrap();
-    let two_hours_ago = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        - 2 * CI_CHURN_WINDOW_SECS)
-        .to_string();
+    let two_hours_ago = (boss_engine_utils::epoch_time::now_epoch_secs() - 2 * CI_CHURN_WINDOW_SECS).to_string();
     conn.execute(
         "UPDATE ci_remediations SET created_at = ?1 WHERE work_item_id = ?2",
         rusqlite::params![two_hours_ago, &chore.id],

@@ -800,10 +800,7 @@ async fn detection_clears_inflight_observation() {
 }
 
 fn current_unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    boss_engine_utils::epoch_time::now_epoch_secs()
 }
 
 /// Rewrite the `first_observed_at` timestamp on a

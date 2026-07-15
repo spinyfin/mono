@@ -653,7 +653,6 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Write;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -729,11 +728,7 @@ mod tests {
             db.force_transient_failure_count_for_test(&execution.id, prior_transient_failures)
                 .unwrap();
         }
-        let old_started = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(600) as i64;
+        let old_started = boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(600);
         db.force_started_at_for_test(&execution.id, old_started).unwrap();
         execution.id
     }

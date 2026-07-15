@@ -313,11 +313,7 @@ mod tests {
     /// leak-grace guard treats the claim as genuinely stuck (the terminal
     /// paths stamp `finished_at = now`, which is inside the grace).
     fn age_finished_at(db: &WorkDb, execution_id: &str, secs_ago: i64) {
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - secs_ago;
+        let epoch = boss_engine_utils::epoch_time::now_epoch_secs() - secs_ago;
         let conn = db.connect().unwrap();
         conn.execute(
             "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
