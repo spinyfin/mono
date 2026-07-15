@@ -338,6 +338,7 @@ dependencies = [
  "boss-deterministic-resolvers",
  "boss-editorial",
  "boss-engine-utils",
+ "boss-external-tracker",
  "boss-feature-flags",
  "boss-github",
  "boss-log-files",
@@ -349,18 +350,13 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
- "core-foundation 0.10.1",
- "core-foundation-sys",
  "fastrand 2.4.1",
  "git-utils",
- "keyring",
  "libc",
  "regex",
  "reqwest",
  "rusqlite",
  "rustls",
- "security-framework 3.7.0",
- "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -389,6 +385,27 @@ dependencies = [
  "fs4",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "boss-external-tracker"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "boss-engine-utils",
+ "boss-github",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "keyring",
+ "security-framework 3.7.0",
+ "security-framework-sys",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
