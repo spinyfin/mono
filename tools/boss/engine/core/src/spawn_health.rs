@@ -81,6 +81,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use boss_protocol::CreateAttentionItemInput;
+use serde::Serialize;
 
 use crate::app::handler_helpers::{
     METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
@@ -186,6 +187,39 @@ struct FailureWindowConfig {
     window_secs: i64,
 }
 
+/// One concrete never-started-spawn failure, carrying enough detail (which
+/// execution, which slot, what shell pid was observed) to serve as durable
+/// trigger evidence for the breaker's trip audit record — see
+/// [`Stage::DispatchPaused`](crate::dispatch_events::Stage::DispatchPaused).
+/// Kept separate from the `(work_item_id, epoch_secs)` pairs
+/// [`SpawnHealthTracker::record_failure`] tracks for the trip-threshold
+/// decision itself, so that method's existing contract and test suite stay
+/// untouched.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpawnFailureEvidence {
+    pub execution_id: String,
+    pub work_item_id: String,
+    pub slot_id: String,
+    pub shell_pid: i32,
+    pub epoch_secs: i64,
+}
+
+/// The two parallel logs of in-window spawn failures — bundled into one
+/// struct (rather than two more top-level [`SpawnHealthTracker`] fields, same
+/// rationale as [`FailureWindowConfig`]) so the tracker stays under
+/// checkleft's named-field limit for structs without a builder.
+#[derive(Debug, Default)]
+struct FailureLog {
+    /// `(work_item_id, epoch_secs)` of recent spawn failures, pruned to the
+    /// window on every `record_failure`.
+    recent: Mutex<Vec<(String, i64)>>,
+    /// Full evidence for the same in-window failures `recent` tracks by
+    /// `(work_item_id, epoch_secs)` alone — see [`SpawnFailureEvidence`].
+    /// Pruned to the same window on every [`SpawnHealthTracker::record_evidence`]
+    /// call.
+    evidence: Mutex<Vec<SpawnFailureEvidence>>,
+}
+
 /// Cross-work-item failure aggregator for the app spawn path.
 ///
 /// Holds a bounded sliding window of `(work_item_id, epoch_secs)` failures and
@@ -194,9 +228,8 @@ struct FailureWindowConfig {
 /// `.await`.
 #[derive(Debug)]
 pub struct SpawnHealthTracker {
-    /// `(work_item_id, epoch_secs)` of recent spawn failures, pruned to the
-    /// window on every `record_failure`.
-    recent: Mutex<Vec<(String, i64)>>,
+    /// In-window failures — see [`FailureLog`].
+    failures: FailureLog,
     window: FailureWindowConfig,
     /// Half-open recovery probe state — see [`ProbeState`].
     probe: Mutex<ProbeState>,
@@ -240,7 +273,7 @@ impl SpawnHealthTracker {
     /// pause path must opt in explicitly via `.with_breaker_enabled(true)`.
     pub fn with_config(threshold: usize, window_secs: i64) -> Self {
         Self {
-            recent: Mutex::new(Vec::new()),
+            failures: FailureLog::default(),
             window: FailureWindowConfig {
                 threshold: threshold.max(1),
                 window_secs: window_secs.max(1),
@@ -303,13 +336,39 @@ impl SpawnHealthTracker {
     /// in [`trip_spawn_capability_circuit`] (which no-ops when dispatch is
     /// already paused), so the loud signal fires exactly once per outage.
     pub fn record_failure(&self, work_item_id: &str, now_epoch_secs: i64) -> Option<usize> {
-        let mut recent = self.recent.lock().unwrap();
+        let mut recent = self.failures.recent.lock().unwrap();
         let cutoff = now_epoch_secs - self.window.window_secs;
         recent.retain(|(_, ts)| *ts >= cutoff);
         recent.push((work_item_id.to_owned(), now_epoch_secs));
         let distinct: HashSet<&str> = recent.iter().map(|(w, _)| w.as_str()).collect();
         let distinct = distinct.len();
         (distinct >= self.window.threshold).then_some(distinct)
+    }
+
+    /// Record the full evidence for one never-started spawn failure, for the
+    /// durable trip-audit record — see [`SpawnFailureEvidence`]. Prunes
+    /// entries older than the window first, same as [`Self::record_failure`],
+    /// but keeps a separate list so that method's `(work_item_id,
+    /// epoch_secs)`-only contract is unaffected.
+    pub fn record_evidence(&self, evidence: SpawnFailureEvidence) {
+        let mut recent = self.failures.evidence.lock().unwrap();
+        let cutoff = evidence.epoch_secs - self.window.window_secs;
+        recent.retain(|e| e.epoch_secs >= cutoff);
+        recent.push(evidence);
+    }
+
+    /// All evidence entries still in-window as of `now_epoch_secs`, oldest
+    /// first — the concrete triggering events for a trip's audit record.
+    pub fn evidence_in_window(&self, now_epoch_secs: i64) -> Vec<SpawnFailureEvidence> {
+        let cutoff = now_epoch_secs - self.window.window_secs;
+        self.failures
+            .evidence
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.epoch_secs >= cutoff)
+            .cloned()
+            .collect()
     }
 
     /// Reset the breaker. Called when a spawn provably worked (a real shell
@@ -324,7 +383,8 @@ impl SpawnHealthTracker {
     /// raise a fresh durable attention item per burst; a genuinely new
     /// outage still gets its own signal once the window elapses.
     pub fn record_success(&self) {
-        self.recent.lock().unwrap().clear();
+        self.failures.recent.lock().unwrap().clear();
+        self.failures.evidence.lock().unwrap().clear();
     }
 
     /// Window length in seconds (for the trip event's `details`).
@@ -515,6 +575,11 @@ pub async fn resume_dispatch_after_breaker_recovery(
     if !coordinator.is_dispatch_paused() || coordinator.dispatch_pause_exempts_reviews() {
         return false;
     }
+    // Snapshot the pause start before `set_dispatch_paused` zeroes it, so the
+    // resume's audit record can carry how long the episode actually lasted.
+    let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
+    let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
+    let pause_duration_secs = paused_since_epoch_s.map(|since| now_epoch_s.saturating_sub(since));
     coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Breaker);
     if let Err(err) = work_db
         .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
@@ -528,14 +593,24 @@ pub async fn resume_dispatch_after_breaker_recovery(
         );
     }
     tracing::warn!(reason, "spawn-capability breaker: auto-resuming dispatch");
+    let resume_execution_id = execution_id.unwrap_or("engine");
     dispatch_events
         .emit(
-            DispatchEvent::new(
-                Stage::SpawnCapabilityRecovered,
-                Outcome::Ok,
-                execution_id.unwrap_or("engine"),
-            )
-            .with_details(serde_json::json!({ "reason": reason })),
+            DispatchEvent::new(Stage::SpawnCapabilityRecovered, Outcome::Ok, resume_execution_id)
+                .with_details(serde_json::json!({ "reason": reason })),
+        )
+        .await;
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::DispatchResumed, Outcome::Ok, resume_execution_id).with_details(
+                serde_json::json!({
+                    "origin": "breaker",
+                    "actor": "automatic",
+                    "resumed_at_epoch_s": now_epoch_s,
+                    "pause_duration_secs": pause_duration_secs,
+                    "reason": reason,
+                }),
+            ),
         )
         .await;
     true
@@ -708,6 +783,14 @@ pub async fn trip_spawn_capability_circuit(
         );
     }
 
+    // The concrete failures that fed the trip — execution/work-item/slot ids,
+    // shell pids, and timestamps — so the trip is diagnosable without
+    // separately grepping `spawn_nack` / `spawn_ack_timeout` events out of
+    // the stream by hand.
+    let triggering_events = spawn_health.evidence_in_window(now_epoch_secs);
+    let threshold = SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD;
+    let rule = format!("{threshold} distinct work items failed to spawn a worker shell within {window_secs}s");
+
     dispatch_events
         .emit(
             DispatchEvent::new(Stage::SpawnCapabilityUnhealthy, Outcome::Error, tripping_execution_id)
@@ -717,9 +800,40 @@ pub async fn trip_spawn_capability_circuit(
                     "window_secs": window_secs,
                     "breaker_enabled": breaker_enabled,
                     "dispatch_paused": breaker_enabled,
+                    "rule": rule,
+                    "threshold": threshold,
+                    "triggering_events": triggering_events,
                 })),
         )
         .await;
+
+    // The durable pause-audit record: only emitted when this trip actually
+    // paused dispatch (the disabled-mode branch above returns early on
+    // every trip after the first, and doesn't pause at all — see the module
+    // docs' "breaker flag" section — so there is no pause episode to record
+    // in that mode).
+    if breaker_enabled {
+        dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::DispatchPaused, Outcome::Ok, tripping_execution_id)
+                    .with_work_item(tripping_work_item_id)
+                    .with_details(serde_json::json!({
+                        "origin": "breaker",
+                        "actor": "breaker",
+                        "paused_since_epoch_s": now_epoch_secs.max(0) as u64,
+                        "reviews_held": true,
+                        "scope": ["dispatch", "reviews"],
+                        "trigger": {
+                            "rule": rule,
+                            "threshold": threshold,
+                            "window_secs": window_secs,
+                            "distinct_work_items": distinct_work_items,
+                            "triggering_events": triggering_events,
+                        },
+                    })),
+            )
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -1153,9 +1267,15 @@ mod tests {
         assert!(resumed);
         assert!(!coordinator.is_dispatch_paused());
         let events = sink.events().await;
-        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.len(),
+            2,
+            "one spawn_capability_recovered event plus one dispatch_resumed audit event"
+        );
         assert_eq!(events[0].stage, "spawn_capability_recovered");
         assert_eq!(events[0].execution_id, "exec-1");
+        assert_eq!(events[1].stage, "dispatch_resumed");
+        assert_eq!(events[1].execution_id, "exec-1");
     }
 
     #[tokio::test]
@@ -1369,5 +1489,139 @@ mod tests {
         let unhealthy = &events[0];
         assert_eq!(unhealthy.details["breaker_enabled"], serde_json::json!(true));
         assert_eq!(unhealthy.details["dispatch_paused"], serde_json::json!(true));
+    }
+
+    // ─── evidence tracking (audit trail) ───────────────────────────────────
+
+    #[test]
+    fn record_evidence_prunes_outside_window_and_is_cleared_by_success() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        tracker.record_evidence(SpawnFailureEvidence {
+            execution_id: "exec-1".to_owned(),
+            work_item_id: "wi-1".to_owned(),
+            slot_id: "0".to_owned(),
+            shell_pid: 0,
+            epoch_secs: 0,
+        });
+        tracker.record_evidence(SpawnFailureEvidence {
+            execution_id: "exec-2".to_owned(),
+            work_item_id: "wi-2".to_owned(),
+            slot_id: "1".to_owned(),
+            shell_pid: 0,
+            epoch_secs: 301,
+        });
+        // The t=0 entry is now outside the 300s window as of t=301.
+        let in_window = tracker.evidence_in_window(301);
+        assert_eq!(in_window.len(), 1);
+        assert_eq!(in_window[0].execution_id, "exec-2");
+
+        tracker.record_success();
+        assert!(
+            tracker.evidence_in_window(301).is_empty(),
+            "a success clears accumulated evidence just like it clears the failure window",
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_emits_dispatch_paused_with_trigger_evidence_when_enabled() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution = create_ready_chore_execution(&db, &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
+        spawn_health.record_evidence(SpawnFailureEvidence {
+            execution_id: execution.id.clone(),
+            work_item_id: work_item_id.clone(),
+            slot_id: "0".to_owned(),
+            shell_pid: 0,
+            epoch_secs: 1000,
+        });
+        let sink = RecordingDispatchEventSink::new();
+
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
+
+        let events = sink.events().await;
+        let paused: Vec<_> = events.iter().filter(|e| e.stage == "dispatch_paused").collect();
+        assert_eq!(paused.len(), 1, "exactly one pause episode is recorded");
+        let details = &paused[0].details;
+        assert_eq!(details["origin"], serde_json::json!("breaker"));
+        assert_eq!(details["actor"], serde_json::json!("breaker"));
+        assert_eq!(details["reviews_held"], serde_json::json!(true));
+        let triggering = details["trigger"]["triggering_events"].as_array().unwrap();
+        assert_eq!(triggering.len(), 1);
+        assert_eq!(triggering[0]["execution_id"], serde_json::json!(execution.id));
+
+        let unhealthy = events.iter().find(|e| e.stage == "spawn_capability_unhealthy").unwrap();
+        assert!(
+            unhealthy.details["triggering_events"].as_array().unwrap().len() == 1,
+            "the observability event also carries the same evidence",
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_breaker_trip_never_emits_dispatch_paused() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution = create_ready_chore_execution(&db, &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(false);
+        let sink = RecordingDispatchEventSink::new();
+
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
+
+        let events = sink.events().await;
+        assert!(
+            events.iter().all(|e| e.stage != "dispatch_paused"),
+            "a disabled breaker must never emit a pause episode — it never actually pauses",
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_after_breaker_recovery_emits_dispatch_resumed_with_duration() {
+        let (_dir, db) = open_db_arc();
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.set_dispatch_paused(true, 1000, DispatchPauseOrigin::Breaker);
+
+        let sink = RecordingDispatchEventSink::new();
+        let resumed =
+            resume_dispatch_after_breaker_recovery(&db, &coordinator, &sink, Some("exec-1"), "test recovery").await;
+
+        assert!(resumed);
+        let events = sink.events().await;
+        let resumed_event = events.iter().find(|e| e.stage == "dispatch_resumed").unwrap();
+        assert_eq!(resumed_event.details["origin"], serde_json::json!("breaker"));
+        assert_eq!(resumed_event.details["actor"], serde_json::json!("automatic"));
+        assert!(
+            resumed_event.details["pause_duration_secs"].as_u64().is_some(),
+            "duration must be computed from the pause start captured before it was cleared",
+        );
     }
 }

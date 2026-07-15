@@ -434,6 +434,37 @@ pub enum Stage {
     /// attributable from `bossctl dispatch tail` in one read; see
     /// `crate::execution_liveness::classify_pane_liveness`.
     ExecutionLivenessReconcile,
+    /// Dispatch (and, when `details.reviews_held` is `true`, `pr_review`)
+    /// was paused — either an operator toggled `bossctl dispatch pause` /
+    /// the app's pause switch, or the spawn-capability circuit breaker
+    /// tripped in enabled mode (see [`Stage::SpawnCapabilityUnhealthy`]).
+    /// This is the durable audit record `bossctl dispatch state --history`
+    /// reads: before this existed, an operator pause left only a one-line
+    /// `tracing::info!`, and a breaker pause's full evidence (which
+    /// executions/work items/slots failed to spawn, over what window,
+    /// against which threshold) lived only in the `spawn_capability_unhealthy`
+    /// event's `details` — nothing correlated "dispatch is paused right now"
+    /// back to *why*, retrievable after the fact (2026-07-15 incident: the
+    /// only surviving explanation of a ~40-minute fleet-wide pause was the
+    /// one-line `bossctl dispatch state` reason string). The `details`
+    /// object always carries `origin` (`"operator"` / `"breaker"`), `actor`
+    /// (`"operator"` / `"breaker"`), `paused_since_epoch_s`, `reviews_held`,
+    /// and `scope` (the pause targets, e.g. `["dispatch", "reviews"]`); a
+    /// breaker-origin pause additionally carries `trigger` — the rule that
+    /// fired (`threshold`, `window_secs`, `distinct_work_items`) and the
+    /// concrete `triggering_events` (execution id, work item id, slot id,
+    /// shell pid, timestamp) that tripped it.
+    DispatchPaused,
+    /// Dispatch resumed after a [`Stage::DispatchPaused`] — either an
+    /// operator toggled dispatch back on, or the spawn-capability breaker's
+    /// half-open recovery probe / a fresh app session cleared a
+    /// Breaker-origin pause (see
+    /// [`crate::spawn_health::resume_dispatch_after_breaker_recovery`]). The
+    /// `details` object carries `origin`, `actor` (`"operator"` for a human
+    /// toggle, `"automatic"` for breaker auto-recovery), `resumed_at_epoch_s`,
+    /// `pause_duration_secs` (how long the episode this closes actually
+    /// lasted), and a human-readable `reason`.
+    DispatchResumed,
 }
 
 impl Stage {
@@ -478,6 +509,8 @@ impl Stage {
             Stage::SpawnCapabilityRecovered => "spawn_capability_recovered",
             Stage::HuskPaneReconcile => "husk_pane_reconcile",
             Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
+            Stage::DispatchPaused => "dispatch_paused",
+            Stage::DispatchResumed => "dispatch_resumed",
         }
     }
 }
@@ -992,6 +1025,8 @@ mod tests {
             Stage::ExecutionLivenessReconcile.as_str(),
             "execution_liveness_reconcile"
         );
+        assert_eq!(Stage::DispatchPaused.as_str(), "dispatch_paused");
+        assert_eq!(Stage::DispatchResumed.as_str(), "dispatch_resumed");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
