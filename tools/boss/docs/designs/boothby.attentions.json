@@ -1,0 +1,24 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Default timer cadence for Boothby passes? The doc proposes every 2 hours (with a pre-spawn nothing_to_do short-circuit to bound cost).",
+    "choices": ["30 minutes", "1 hour", "2 hours", "4 hours"],
+    "anchor": "activation-model"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Actor identity for Boothby's mutations: add a fourth last_status_actor value 'boothby' (exact attribution, needs an exhaustive-match audit of consumers), or reuse 'engine' and rely on the boothby_actions journal for attribution (cheaper, but human-veto detection gets weaker)?",
+    "choices": ["new 'boothby' actor value", "reuse 'engine' + journal attribution"],
+    "anchor": "audit--undo-data-model"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should coordinator-transcript mining be enabled by default once Boothby is enabled (vs gated behind a separate opt-in setting)?",
+    "anchor": "privilege-model"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Accept best-effort undo for attention merges (conflicted fallback when a group was since actioned), rather than demoting merge to propose-only?",
+    "anchor": "action-catalogue-with-reversibility-classification"
+  }
+]
