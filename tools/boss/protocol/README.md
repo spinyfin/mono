@@ -45,7 +45,7 @@ keep in lock-step.
 
 ## The builder convention
 
-Domain structs with eight or more fields (`Task`, `WorkExecution`,
+Domain structs with more than five fields (`Task`, `WorkExecution`,
 `Product`, `Project`) derive `bon::Builder` with `on(String, into)`.
 This is a deliberate source-stability measure: adding a new optional
 field to one of these structs should not force every construction site

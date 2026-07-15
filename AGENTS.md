@@ -22,7 +22,7 @@ Required behavior: fix the real problem — split the oversized file, fix the li
 
 ## Builder pattern convention
 
-Structs with **8 or more fields** in `boss-protocol` (and in `boss-engine`'s internal types) use `#[derive(bon::Builder)]` with `#[builder(on(String, into))]`. This prevents additive-change PRs from touching every construction site across the repo.
+Structs with **more than 5 fields** in `boss-protocol` (and in `boss-engine`'s internal types) use `#[derive(bon::Builder)]` with `#[builder(on(String, into))]`. This prevents additive-change PRs from touching every construction site across the repo.
 
 Rules:
 
