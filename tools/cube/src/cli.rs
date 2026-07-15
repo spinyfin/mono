@@ -535,6 +535,12 @@ pub struct PrUpdateArgs {
     /// Defaults to the first bookmark on the current jj commit.
     #[arg(long)]
     pub branch: Option<String>,
+    /// Skip the check that the working copy (`@`) matches the branch head
+    /// being pushed. Only for legitimate push-without-checkout flows — the
+    /// default is to refuse, since a mismatch means any local build/test
+    /// gate validated the wrong tree.
+    #[arg(long)]
+    pub allow_detached_push: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1313,9 +1319,14 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Update(PrUpdateArgs { branch }),
+                command:
+                    PrCommand::Update(PrUpdateArgs {
+                        branch,
+                        allow_detached_push,
+                    }),
             } => {
                 assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
+                assert!(!allow_detached_push);
             }
             _ => panic!("expected pr update command"),
         }
@@ -1327,7 +1338,7 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Update(PrUpdateArgs { branch }),
+                command: PrCommand::Update(PrUpdateArgs { branch, .. }),
             } => {
                 assert!(branch.is_none());
             }
