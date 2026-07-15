@@ -264,22 +264,46 @@ extension ChatViewModel {
             engine.sendListConflictResolutions(limit: 200)
         case .ciRemediationsList(let attempts):
             ciRemediations = attempts
-            // Reconcile the in-flight chip set with the row list: for
-            // every PR whose latest attempt is non-terminal, mark
-            // `in_flight` if no chip already exists. Exhausted chips
-            // are sticky until the user clears them via retry — they
-            // are not derivable from the row list alone (the engine
-            // tracks them via `task_blocked_signals`), so we leave
+            // Reconcile both PR-card chips against the row list, which is
+            // freshest-first (`created_at DESC, id DESC`) — so the first
+            // row seen per PR is that PR's latest attempt:
+            //  - latest non-terminal (pending/running): mark the failure
+            //    chip `in_flight` if none exists yet, and drop any stale
+            //    "ci auto-fixed" chip — a fresh attempt means the prior
+            //    auto-fix claim no longer holds even if the
+            //    `ciRemediationStarted` push that would normally clear it
+            //    was missed (T2764: the push is the only other writer of
+            //    `recentlyClearedCIPRs`, so a dropped push stranded the
+            //    badge for up to the full freshness window).
+            //  - latest succeeded and still fresh: (re)stamp the
+            //    "ci auto-fixed" chip using the engine's own timestamp
+            //    rather than local observation time, so a missed
+            //    `ciRemediationSucceeded` push self-heals on the next
+            //    list refresh instead of never showing the chip at all.
+            // Exhausted chips are sticky until the user clears them via
+            // retry — they are not derivable from the row list alone (the
+            // engine tracks them via `task_blocked_signals`), so we leave
             // pre-existing exhausted chips alone.
             var seenPRs = Set<String>()
-            for row in attempts where row.status == "pending" || row.status == "running" {
+            for row in attempts {
                 guard seenPRs.insert(row.prURL).inserted else { continue }
-                if ciFailureBadges[row.prURL] == nil {
-                    ciFailureBadges[row.prURL] = CiFailureBadge(
-                        state: .inFlight,
-                        attemptsUsed: 0,
-                        budget: 0,
-                    )
+                switch row.status {
+                case "pending", "running":
+                    if ciFailureBadges[row.prURL] == nil {
+                        ciFailureBadges[row.prURL] = CiFailureBadge(
+                            state: .inFlight,
+                            attemptsUsed: 0,
+                            budget: 0,
+                        )
+                    }
+                    recentlyClearedCIPRs.removeValue(forKey: row.prURL)
+                case "succeeded":
+                    if let observedAt = Self.parseCiRemediationTimestamp(row.finishedAt ?? row.createdAt),
+                       Date().timeIntervalSince(observedAt) < badgeFreshnessWindow {
+                        recentlyClearedCIPRs[row.prURL] = observedAt
+                    }
+                default:
+                    break
                 }
             }
         case .ciRemediationStarted(_, _, _, let prURL, _):
@@ -570,6 +594,27 @@ extension ChatViewModel {
             || message.hasPrefix("socket send failed:")
             || message.hasPrefix("socket receive failed:")
     }
+
+    /// Parses a `ci_remediations` row timestamp for the "ci auto-fixed"
+    /// badge reconciliation above. The engine stamps plain
+    /// `YYYY-MM-DDTHH:MM:SSZ`, but fractional seconds are accepted too in
+    /// case a different surface ever feeds this. `ISO8601DateFormatter`'s
+    /// `date(from:)` is documented thread-safe, so the formatters are
+    /// shared.
+    private static func parseCiRemediationTimestamp(_ string: String) -> Date? {
+        for formatter in ciRemediationTimestampFormatters {
+            if let date = formatter.date(from: string) { return date }
+        }
+        return nil
+    }
+
+    private nonisolated(unsafe) static let ciRemediationTimestampFormatters: [ISO8601DateFormatter] = {
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return [plain, fractional]
+    }()
 
     // MARK: - Test entry point
 

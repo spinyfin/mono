@@ -489,6 +489,9 @@ impl TopicBroker {
                 added.push(topic.to_owned());
             }
         }
+        if !added.is_empty() {
+            tracing::debug!(session_id, topics = ?added, "topic broker: session subscribed");
+        }
         added
     }
 
@@ -524,6 +527,9 @@ impl TopicBroker {
             inner.topics_by_session.remove(session_id);
         }
 
+        if !removed.is_empty() {
+            tracing::debug!(session_id, topics = ?removed, "topic broker: session unsubscribed");
+        }
         removed
     }
 
@@ -550,6 +556,18 @@ impl TopicBroker {
                 })
                 .collect::<Vec<_>>()
         };
+
+        // A push with zero recipients means the topic currently has no
+        // subscribed session — the event is silently dropped rather than
+        // queued, so this is the one line that turns a "missed frontend
+        // push" report from forensics into a grep (see T2764: a
+        // `CiRemediationStarted` push vanished during an unsubscribed
+        // window and stranded a stale badge for up to 24h).
+        if sinks.is_empty() {
+            tracing::debug!(topic, "topic broker: publish had no subscribed sessions");
+        } else {
+            tracing::debug!(topic, recipient_count = sinks.len(), "topic broker: publish delivered");
+        }
 
         let mut slow = Vec::new();
         for (session_id, sink) in sinks {
