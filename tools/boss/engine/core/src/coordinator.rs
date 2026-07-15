@@ -7709,7 +7709,14 @@ mod tests {
         assert_eq!(execution.status, ExecutionStatus::Ready);
 
         let cube = Arc::new(FakeCubeClient::default());
-        let runner = Arc::new(FakeExecutionRunner::default());
+        // `pending: true` keeps the run parked in `Running` so the
+        // post-cap-release assertion below has a stable status to wait
+        // for — the default fake runner completes instantly to
+        // `WaitingHuman`, which would race straight past `Running`.
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
         // Pool has idle slots beyond the cap — the cap, not slot
         // availability, must be what holds the row.
         let coordinator = Arc::new(
@@ -7745,6 +7752,7 @@ mod tests {
         // One worker frees → the next drain dispatches the held row.
         coordinator.worker_pool().release_worker("worker-1", None).await;
         coordinator.drain_ready_queue().await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
         assert!(
             !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
             "row must dispatch once the pool drops below the cap",
