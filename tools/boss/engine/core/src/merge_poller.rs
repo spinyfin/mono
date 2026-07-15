@@ -45,6 +45,9 @@ use async_trait::async_trait;
 use serde_json;
 use tokio::sync::Notify;
 
+pub use boss_github::{CiProvider, RequiredCheckFailure};
+use boss_github::{fetch_failing_checks_for_commit, parse_provider_job_id, provider_for_url};
+
 use crate::blocking_signal::SignalKind;
 use crate::ci_watch;
 use crate::completion::{StopOutcome, WorkerCompletionHandler};
@@ -463,36 +466,6 @@ fn poll_tier_for_probe(probe: &PrLifecycleProbe) -> PollTier {
     }
 }
 
-/// One required check that failed at probe time. Captured pre-spawn so
-/// the `ci_remediations.failed_checks` JSON is faithful to what the
-/// engine saw and the worker prompt embeds the same data.
-///
-/// `conclusion` is GitHub's value (`FAILURE`, `TIMED_OUT`, `CANCELLED`,
-/// `STARTUP_FAILURE`, `ACTION_REQUIRED`, `STALE`). `target_url` points
-/// at the provider's job page; `provider` is inferred from its host;
-/// `provider_job_id` is parsed from the URL when possible and `None`
-/// when the format is unrecognised.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequiredCheckFailure {
-    pub name: String,
-    pub conclusion: String,
-    pub target_url: String,
-    pub provider: CiProvider,
-    pub provider_job_id: Option<String>,
-}
-
-/// CI provider inferred from a check's `targetUrl` host. The CI-watch
-/// `CiLogReader` impls (Buildkite + GitHub Actions) dispatch on this
-/// when they ship; the `Other` variant captures anything we don't
-/// know how to read (status contexts from third-party services like
-/// Codecov, Sonar, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CiProvider {
-    Buildkite,
-    GithubActions,
-    Other,
-}
-
 /// Closed set of conclusion strings that count as "failure" for the
 /// required-check predicate (design §Q1). `ACTION_REQUIRED` is a
 /// special case: the worker can't approve manual workflows, so we
@@ -513,37 +486,6 @@ fn is_failure_conclusion(c: &str) -> bool {
 /// the happy path.
 fn is_pass_conclusion(c: &str) -> bool {
     matches!(c.to_ascii_uppercase().as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED",)
-}
-
-/// Infer the CI provider from a check's `targetUrl` host.
-fn provider_for_url(url: &str) -> CiProvider {
-    if url.is_empty() {
-        return CiProvider::Other;
-    }
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("buildkite.com") {
-        return CiProvider::Buildkite;
-    }
-    // GitHub Actions URLs look like:
-    //   https://github.com/<owner>/<repo>/actions/runs/<run-id>/job/<job-id>
-    // (or the older /check-runs/ form). Either format → GHA.
-    if lower.contains("github.com") && (lower.contains("/actions/") || lower.contains("/check-runs/")) {
-        return CiProvider::GithubActions;
-    }
-    CiProvider::Other
-}
-
-/// Extract the provider's job id from a `targetUrl`. Buildkite job
-/// ids ride in the URL fragment (`…/builds/<n>#<job-uuid>`); GitHub
-/// Actions job ids are the last path segment after `/job/`. Returns
-/// `None` for URLs that don't match either pattern — the worker
-/// prompt then shows the raw URL and the worker shells out manually.
-fn parse_provider_job_id(provider: CiProvider, url: &str) -> Option<String> {
-    match provider {
-        CiProvider::Buildkite => crate::ci_log_reader::parse_buildkite_job_id(url),
-        CiProvider::GithubActions => crate::ci_log_reader::parse_gha_job_id(url),
-        CiProvider::Other => None,
-    }
 }
 
 /// Probe the lifecycle state of a single PR. Implemented for
@@ -2576,14 +2518,28 @@ async fn check_merge_queue_rebounce(
             );
             continue;
         };
+        // Fetch the failing CI checks for the synthetic merge commit so the
+        // worker revision directive can show the exact build URL, job id,
+        // and a log excerpt — without the worker having to rediscover them.
+        // Best-effort: an empty result falls back to generic instructions.
+        let failures = match repo_from_pr_url(&candidate.pr_url) {
+            Some(owner_repo) => fetch_failing_checks_for_commit(owner_repo, before_commit_sha).await,
+            None => Vec::new(),
+        };
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            before_commit_sha,
+            failing_checks = failures.len(),
+            "merge poller: fetched failing checks for merge-queue commit",
+        );
         if ci_watch::on_merge_queue_rebounce_detected(
             work_db,
             publisher,
             candidate,
             None, // head_ref_name not available without a probe round-trip
-            None, // head_ref_oid not needed for rebounce (before_commit_sha is the key)
             before_commit_sha,
             &[], // labels not available here; opt-out check uses product flag only
+            &failures,
         )
         .await
         {
@@ -8286,8 +8242,8 @@ mod tests {
             publisher.as_ref(),
             &rebounce_candidate,
             Some("feature-branch"),
-            None,
             "synthetic-merge-sha",
+            &[],
             &[],
         )
         .await;
@@ -9153,105 +9109,6 @@ mod tests {
             "pending ci_remediations row must be abandoned on PR merge; \
              badge would persist on app restart otherwise",
         );
-    }
-
-    // ---- Direct unit tests for the pure CI-classification helpers --------
-    //
-    // These back the CI verdict surfacing (#1216) and terminal-rollup gating
-    // (#1203). The `parse_probe_*` matrix tests above exercise them only
-    // indirectly through `parse_probe_json`; the tests below call each
-    // private fn via `super::` so a regression in one helper points straight
-    // at the offending function rather than surfacing as a confusing
-    // integration failure.
-
-    /// `provider_for_url` infers the CI provider purely from the host /
-    /// path of the check's `targetUrl`. Buildkite is host-only; GitHub
-    /// Actions additionally requires an `/actions/` or `/check-runs/`
-    /// segment; everything else (including a bare github.com URL and the
-    /// empty string) is `Other`. Matching is case-insensitive.
-    #[test]
-    fn provider_for_url_classifies_hosts() {
-        use super::CiProvider::*;
-        let cases: &[(&str, super::CiProvider)] = &[
-            // Buildkite — host match is sufficient.
-            ("https://buildkite.com/acme/mono/builds/42", Buildkite),
-            ("https://buildkite.com/acme/mono/builds/42#01h-job-uuid", Buildkite),
-            // GitHub Actions — github.com host PLUS an /actions/ or
-            // /check-runs/ segment.
-            (
-                "https://github.com/anthropic/mono/actions/runs/123/job/456",
-                GithubActions,
-            ),
-            ("https://github.com/anthropic/mono/check-runs/789", GithubActions),
-            // Bare github.com without either segment → Other (e.g. a PR
-            // or status URL we can't read logs from).
-            ("https://github.com/anthropic/mono/pull/7", Other),
-            // Empty string and unrelated third-party hosts → Other.
-            ("", Other),
-            ("https://app.codecov.io/gh/anthropic/mono", Other),
-            ("https://sonarcloud.io/dashboard?id=mono", Other),
-            // Case-insensitivity: an upper/mixed-case host still matches.
-            ("HTTPS://BuildKite.COM/Acme/Mono/Builds/42", Buildkite),
-            ("https://GITHUB.com/anthropic/mono/ACTIONS/runs/1/job/2", GithubActions),
-        ];
-        for (url, expected) in cases {
-            assert_eq!(super::provider_for_url(url), *expected, "provider_for_url({url:?})",);
-        }
-    }
-
-    /// `parse_provider_job_id` extracts the provider-native job id from the
-    /// `targetUrl`. Buildkite ids ride in the URL fragment (after `#`);
-    /// GitHub Actions ids are the last path segment after `/job/` (with any
-    /// `?query` stripped and a trailing `/` trimmed). Anything that doesn't
-    /// match — or `CiProvider::Other` — yields `None`.
-    #[test]
-    fn parse_provider_job_id_extracts_or_none() {
-        use super::CiProvider::*;
-        // Buildkite: fragment after '#'.
-        assert_eq!(
-            super::parse_provider_job_id(Buildkite, "https://buildkite.com/acme/mono/builds/123#job-uuid",),
-            Some("job-uuid".to_owned()),
-        );
-        // Buildkite with no fragment → None.
-        assert_eq!(
-            super::parse_provider_job_id(Buildkite, "https://buildkite.com/acme/mono/builds/123"),
-            None,
-        );
-        // GitHub Actions: last segment after '/job/'.
-        assert_eq!(
-            super::parse_provider_job_id(
-                GithubActions,
-                "https://github.com/anthropic/mono/actions/runs/12345/job/67890",
-            ),
-            Some("67890".to_owned()),
-        );
-        // GitHub Actions: '?query' is stripped before extracting.
-        assert_eq!(
-            super::parse_provider_job_id(
-                GithubActions,
-                "https://github.com/anthropic/mono/actions/runs/12345/job/67890?check_suite_focus=true",
-            ),
-            Some("67890".to_owned()),
-        );
-        // GitHub Actions: trailing '/' is trimmed.
-        assert_eq!(
-            super::parse_provider_job_id(
-                GithubActions,
-                "https://github.com/anthropic/mono/actions/runs/12345/job/67890/",
-            ),
-            Some("67890".to_owned()),
-        );
-        // GitHub Actions URL with no '/job/' segment → None.
-        assert_eq!(
-            super::parse_provider_job_id(GithubActions, "https://github.com/anthropic/mono/actions/runs/12345",),
-            None,
-        );
-        // CiProvider::Other never parses a job id, regardless of the URL.
-        assert_eq!(
-            super::parse_provider_job_id(Other, "https://buildkite.com/acme/mono/builds/1#x"),
-            None,
-        );
-        assert_eq!(super::parse_provider_job_id(Other, ""), None);
     }
 
     /// `is_failure_conclusion` / `is_pass_conclusion` partition GitHub's

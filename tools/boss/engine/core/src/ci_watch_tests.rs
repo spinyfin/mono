@@ -1258,8 +1258,8 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature-branch"),
-        None,
         "synthetic-merge-sha-abc",
+        &[],
         &[],
     )
     .await;
@@ -1316,6 +1316,63 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
     );
 }
 
+/// When reconciliation detects a merge-queue rebounce and is supplied with
+/// the failing check data (from `fetch_failing_checks_for_commit`), those
+/// checks must be stored on the `ci_remediations` row so the revision
+/// directive can show the worker the exact build URL and job id — not just
+/// generic "look for a failing build" instructions.
+#[tokio::test]
+async fn rebounce_stores_failing_checks_from_failures_slice() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/999";
+    let (product, chore) = make_in_review(&db, "C-rebounce-checks", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let failures = vec![RequiredCheckFailure {
+        name: "ci/build".into(),
+        conclusion: "failure".into(),
+        target_url: "https://buildkite.com/org/mono/builds/1666#job-abc-uuid".into(),
+        provider: CiProvider::Buildkite,
+        provider_job_id: Some("job-abc-uuid".into()),
+    }];
+
+    let flipped = on_merge_queue_rebounce_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature-branch"),
+        "synthetic-merge-sha-xyz",
+        &[],
+        &failures,
+    )
+    .await;
+    assert!(flipped, "rebounce detection must flip chore to ci_failure");
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("active attempt row");
+
+    // The failed_checks JSON must carry the Buildkite check so the revision
+    // directive can show the worker a pre-filled `bk job log` command.
+    let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks).expect("valid JSON");
+    assert!(
+        !checks.is_empty(),
+        "failed_checks must not be empty when failures were supplied"
+    );
+    assert_eq!(checks[0]["name"].as_str(), Some("ci/build"));
+    assert_eq!(checks[0]["provider"].as_str(), Some("buildkite"));
+    assert_eq!(checks[0]["provider_job_id"].as_str(), Some("job-abc-uuid"));
+    assert!(
+        checks[0]["target_url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("builds/1666"),
+        "target_url must contain the build number"
+    );
+}
+
 /// THE REGRESSION (T604 / PR #690 04:44Z miss): a clean head-branch CI
 /// probe must NOT clear a `merge_queue_rebounce` block.
 ///
@@ -1338,8 +1395,8 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature-branch"),
-        None,
         "synthetic-sha-xyz",
+        &[],
         &[],
     )
     .await;
@@ -1393,8 +1450,8 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature-branch"),
-        None,
         "synthetic-sha-inflight",
+        &[],
         &[],
     )
     .await;
@@ -1455,7 +1512,7 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
     let mut bounce_count = 0;
     for cycle in 0..5 {
         // The rebounce pass re-sees the same dequeue event on every sweep.
-        if on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), None, sha, &[]).await {
+        if on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), sha, &[], &[]).await {
             bounce_count += 1;
         }
         // The per-PR probe alternates between InFlight (supersede) and Clean
@@ -1500,8 +1557,8 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature"),
-        None,
         "sha-A",
+        &[],
         &[],
     )
     .await;
@@ -1512,8 +1569,8 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature"),
-        None,
         "sha-A",
+        &[],
         &[],
     )
     .await;
@@ -1567,8 +1624,8 @@ async fn rebounce_block_clears_after_worker_succeeds() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature"),
-        None,
         "sha-Q",
+        &[],
         &[],
     )
     .await;
@@ -1635,8 +1692,8 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature"),
-        None,
         "sha-merge-1",
+        &[],
         &[],
     )
     .await;
@@ -1696,8 +1753,8 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature"),
-        None,
         "sha-merge-1",
+        &[],
         &[],
     )
     .await;
@@ -1733,8 +1790,8 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         Some("feature"),
-        None,
         "sha-merge-2",
+        &[],
         &[],
     )
     .await;
