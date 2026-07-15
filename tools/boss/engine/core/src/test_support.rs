@@ -313,6 +313,17 @@ impl ExecutionRunner for NoopRunner {
     }
 }
 
+/// An [`EngineHealthBroadcaster`](crate::spawn_health::EngineHealthBroadcaster)
+/// test double that does nothing. The sweep/coordinator test modules drive
+/// the spawn-capability breaker without a real `ServerState` to push
+/// through, so this replaces a hand-rolled no-op at each call site.
+pub struct NoopEngineHealthBroadcaster;
+
+#[async_trait]
+impl crate::spawn_health::EngineHealthBroadcaster for NoopEngineHealthBroadcaster {
+    async fn broadcast_engine_health(&self) {}
+}
+
 /// Implement [`CubeClient`](crate::coordinator::CubeClient) for a test
 /// double, spelling out only the methods a given test actually drives.
 /// Every trait method left unlisted is filled in with `unimplemented!()`,

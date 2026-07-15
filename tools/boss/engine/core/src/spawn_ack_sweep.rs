@@ -134,6 +134,7 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     reaper: Arc<dyn SpawnAckReaper>,
     spawn_health: Arc<SpawnHealthTracker>,
+    health_broadcaster: Arc<dyn crate::spawn_health::EngineHealthBroadcaster>,
     interval: Duration,
     grace_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
@@ -144,6 +145,7 @@ pub fn spawn_loop(
         let dispatch_events = Arc::clone(&dispatch_events);
         let reaper = Arc::clone(&reaper);
         let spawn_health = Arc::clone(&spawn_health);
+        let health_broadcaster = Arc::clone(&health_broadcaster);
         async move {
             run_one_pass(
                 work_db.as_ref(),
@@ -152,6 +154,7 @@ pub fn spawn_loop(
                 dispatch_events.as_ref(),
                 reaper.as_ref(),
                 spawn_health.as_ref(),
+                health_broadcaster.as_ref(),
                 grace_secs,
             )
             .await
@@ -173,6 +176,7 @@ pub async fn run_one_pass(
     dispatch_events: &dyn DispatchEventSink,
     reaper: &dyn SpawnAckReaper,
     spawn_health: &SpawnHealthTracker,
+    health_broadcaster: &dyn crate::spawn_health::EngineHealthBroadcaster,
     grace_secs: i64,
 ) -> SpawnAckSweepOutcome {
     let mut outcome = SpawnAckSweepOutcome::default();
@@ -186,6 +190,7 @@ pub async fn run_one_pass(
         dispatch_events,
         reaper,
         spawn_health,
+        health_broadcaster,
     };
 
     for state in snapshot {
@@ -270,6 +275,7 @@ pub async fn run_one_pass(
 /// [`reap_never_started_spawn`] stays under the argument-count lint and both
 /// callers (the periodic sweep and the `ReportWorkerSpawnFailed` NACK handler)
 /// construct it the same way.
+#[derive(bon::Builder)]
 pub(crate) struct SpawnReapCtx<'a> {
     pub work_db: &'a WorkDb,
     /// `Arc` because `release_worker_and_kick` spawns a task that holds a
@@ -278,6 +284,7 @@ pub(crate) struct SpawnReapCtx<'a> {
     pub dispatch_events: &'a dyn DispatchEventSink,
     pub reaper: &'a dyn SpawnAckReaper,
     pub spawn_health: &'a SpawnHealthTracker,
+    pub health_broadcaster: &'a dyn crate::spawn_health::EngineHealthBroadcaster,
 }
 
 /// Why a never-started spawn is being reaped. Selects the orphan reason text,
@@ -404,6 +411,7 @@ pub(crate) async fn reap_never_started_spawn(
             ctx.work_db,
             ctx.coordinator.as_ref(),
             ctx.dispatch_events,
+            ctx.health_broadcaster,
             execution_id,
             work_item_id,
             distinct,
@@ -529,6 +537,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -595,6 +604,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -642,6 +652,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -688,6 +699,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -729,6 +741,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -776,6 +789,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -806,6 +820,77 @@ mod tests {
             attn.iter()
                 .any(|a| a.kind == crate::spawn_health::SPAWN_CAPABILITY_ATTENTION_KIND),
             "a loud app_spawn_capability_unhealthy attention item must be raised",
+        );
+    }
+
+    /// Records every `broadcast_engine_health` call so a test can assert
+    /// the breaker trip actually pushes a live update — the 2026-07-15
+    /// incident: `trip_spawn_capability_circuit` paused dispatch correctly
+    /// but never pushed, so an already-connected app session's pause
+    /// banner never appeared.
+    #[derive(Default)]
+    struct RecordingEngineHealthBroadcaster {
+        calls: StdMutex<usize>,
+    }
+
+    #[async_trait]
+    impl crate::spawn_health::EngineHealthBroadcaster for RecordingEngineHealthBroadcaster {
+        async fn broadcast_engine_health(&self) {
+            *self.calls.lock().unwrap() += 1;
+        }
+    }
+
+    /// The breaker trip must push a live `EngineHealthResult` update, not
+    /// just flip the in-memory/DB pause state — otherwise an
+    /// already-connected app session's `engine.health` subscription never
+    /// re-renders the pause banner until its next explicit poll (an app
+    /// relaunch/reconnect). This is the root cause of the 2026-07-15
+    /// incident: the operator pause path already broadcasts
+    /// (`handle_set_dispatch_paused` → `broadcast_engine_health`), but the
+    /// breaker path did not.
+    #[tokio::test]
+    async fn breaker_trip_broadcasts_engine_health() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let db = Arc::new(db);
+
+        let mut execution_ids = Vec::new();
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        for slot in 1u8..=3 {
+            let work_item_id = create_active_chore(&db, &product_id, &format!("chore {slot}"));
+            let execution_id = create_old_execution(&db, &work_item_id);
+            register_slot_zero_pid(&live_states, slot, &execution_id, &work_item_id);
+            execution_ids.push(execution_id);
+        }
+
+        let coordinator = make_coordinator(db.clone(), 3);
+        for execution_id in &execution_ids {
+            coordinator.worker_pool().claim_worker(execution_id, None).await;
+        }
+
+        let spawn_health = SpawnHealthTracker::with_config(3, 300);
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let health_broadcaster = Arc::new(RecordingEngineHealthBroadcaster::default());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &spawn_health,
+            health_broadcaster.as_ref(),
+            SPAWN_ACK_GRACE_SECS,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 3, "every silent spawn is reaped");
+        assert!(coordinator.is_dispatch_paused(), "breaker must pause dispatch");
+        assert_eq!(
+            *health_broadcaster.calls.lock().unwrap(),
+            1,
+            "the breaker trip must push a live engine-health update so an already-connected \
+             app session's pause banner appears without waiting for a reconnect/poll",
         );
     }
 
@@ -861,6 +946,7 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopEngineHealthBroadcaster,
             SPAWN_ACK_GRACE_SECS,
         )
         .await;
@@ -912,6 +998,7 @@ mod tests {
             dispatch_events: sink.as_ref(),
             reaper: reaper.as_ref(),
             spawn_health: &spawn_health,
+            health_broadcaster: &NoopEngineHealthBroadcaster,
         };
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let reason = "ghostty_surface_new returned NULL (no active display)";

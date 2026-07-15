@@ -1572,6 +1572,19 @@ struct SidebarProductPicker: View {
 /// "blocked behind a live PR sibling" copy named neither the blocking task
 /// nor the PR, and used engine-internal "sibling" vocabulary).
 private func dispatchWaitReasonLabel(_ reason: String) -> String {
+    // A global dispatch pause (operator- or breaker-originated — see
+    // `ExecutionCoordinator::dispatch_pause_wait_reason`) is a distinct
+    // state from a capacity wait: the row isn't waiting on a slot at all,
+    // dispatch itself is halted. Rendering it as "Waiting — …" sent an
+    // operator hunting for free capacity during the 2026-07-15 incident,
+    // where a `ready` row read "Waiting for a slot" for 40+ minutes with
+    // 16 slots free while the spawn-capability breaker held dispatch
+    // paused. The engine prefixes this reason with a stable marker so it
+    // can be told apart from every other (free-text) wait reason here.
+    let pausePrefix = "dispatch_paused: "
+    if reason.hasPrefix(pausePrefix) {
+        return "Dispatch paused — \(reason.dropFirst(pausePrefix.count))"
+    }
     switch reason {
     case "pool_exhausted":
         return "Waiting — worker pool full"

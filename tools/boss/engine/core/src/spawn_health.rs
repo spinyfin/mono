@@ -36,6 +36,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use boss_protocol::CreateAttentionItemInput;
 
 use crate::app::handler_helpers::{
@@ -44,6 +45,26 @@ use crate::app::handler_helpers::{
 use crate::coordinator::{DispatchPauseOrigin, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
+
+/// Narrow trait for pushing a fresh `EngineHealthResult` to every connected
+/// app client. Exists so [`trip_spawn_capability_circuit`] can trigger a
+/// live pause-banner update without depending on `crate::app::ServerState`
+/// directly — mirrors [`DispatchEventSink`]'s shape. `ServerState`
+/// implements this by delegating to its inherent `broadcast_engine_health`.
+///
+/// This closes the 2026-07-15 incident: the operator pause path
+/// (`handle_set_dispatch_paused`) calls `broadcast_engine_health` after
+/// flipping the flag, so an already-connected app session's `engine.health`
+/// subscription re-renders the banner live. The breaker path only ever
+/// flipped the in-memory/DB state — it never pushed, so a session that was
+/// already open when the breaker tripped never saw the banner appear; only
+/// a fresh `GetEngineHealth` poll (an app relaunch/reconnect) would have
+/// picked it up. Dispatch stayed paused with zero UI signal for 40+
+/// minutes even though the pause itself worked correctly.
+#[async_trait]
+pub trait EngineHealthBroadcaster: Send + Sync {
+    async fn broadcast_engine_health(&self);
+}
 
 /// Number of **distinct** work items whose spawn must fail inside the window
 /// before the breaker trips. Set above the noise of a single flaky spawn but
@@ -150,10 +171,12 @@ impl SpawnHealthTracker {
 /// pause — does NOT exempt `pr_review` executions: the app's spawn path
 /// itself is broken here, so dispatching a review would just burn another
 /// attempt against the same dead path.
+#[allow(clippy::too_many_arguments)]
 pub async fn trip_spawn_capability_circuit(
     work_db: &WorkDb,
     coordinator: &ExecutionCoordinator,
     dispatch_events: &dyn DispatchEventSink,
+    health_broadcaster: &dyn EngineHealthBroadcaster,
     tripping_execution_id: &str,
     tripping_work_item_id: &str,
     distinct_work_items: usize,
@@ -185,6 +208,12 @@ pub async fn trip_spawn_capability_circuit(
              applied in-memory but will revert on engine restart",
         );
     }
+    // Push the new health report to every connected app client so the
+    // pause banner appears immediately, mirroring what the operator-pause
+    // path (`handle_set_dispatch_paused`) already does. Without this an
+    // already-open app session never learns dispatch paused until its next
+    // `GetEngineHealth` poll (relaunch/reconnect) — see the trait doc.
+    health_broadcaster.broadcast_engine_health().await;
 
     let window_secs = SPAWN_HEALTH_WINDOW_SECS;
     tracing::error!(

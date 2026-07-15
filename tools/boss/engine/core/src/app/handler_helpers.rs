@@ -77,7 +77,7 @@ pub(super) fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u
 /// the shape is the list-of-issues form the chore brief asked for so
 /// subsequent missing-config surfaces (engine socket, cube binary,
 /// etc.) can be added without bumping the wire format.
-pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> boss_protocol::EngineHealthReport {
+pub(super) fn build_engine_health_report(server_state: &ServerState) -> boss_protocol::EngineHealthReport {
     use boss_protocol::{EngineHealthIssue, EngineHealthReport};
 
     let anthropic_api_key_present = server_state.anthropic_api_key.is_some();
