@@ -3066,6 +3066,70 @@ fn resolve_pr_context(branch_arg: Option<String>, runner: &dyn CommandRunner) ->
     })
 }
 
+/// Refuse to push when the workspace's working-copy commit doesn't match the
+/// bookmark head being pushed.
+///
+/// A rebase/edit slip (e.g. `jj rebase -d main -b <bookmark>` without a
+/// following `jj edit <bookmark>`) leaves the bookmark on the rebased commit
+/// while `@` stays on the old tree. Any local build/test gate then runs
+/// against the wrong tree, and a push ships a commit that was never actually
+/// verified locally (T2764 postmortem, spinyfin/mono#2023). Accepts the two
+/// shapes a clean workflow leaves `@` in: `@` IS the bookmark head, or `@` is
+/// an empty working-copy child of it.
+fn assert_working_copy_matches_branch(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<()> {
+    let branch_commit = jj_commit_id(runner, &ctx.cwd, &ctx.branch)?;
+    let at_commit = jj_commit_id(runner, &ctx.cwd, "@")?;
+
+    if at_commit == branch_commit {
+        return Ok(());
+    }
+
+    let at_parent_commit = jj_commit_id(runner, &ctx.cwd, "@-")?;
+    if at_parent_commit == branch_commit && jj_is_empty(runner, &ctx.cwd, "@")? {
+        return Ok(());
+    }
+
+    Err(CubeError::InvalidArgument(format!(
+        "refusing to push: working copy does not match branch `{branch}`. `{branch}` is at \
+         {branch_commit}, but `@` is at {at_commit} (parent {at_parent_commit}). A local \
+         build/test gate run against `@` would have validated the wrong tree. Run `jj edit \
+         {branch}`, re-run your gate, then retry the push. Pass --allow-detached-push to bypass \
+         this check for a legitimate push-without-checkout flow.",
+        branch = ctx.branch,
+    )))
+}
+
+/// Resolve a jj revision expression to its commit id.
+fn jj_commit_id(runner: &dyn CommandRunner, cwd: &Path, revision: &str) -> Result<String> {
+    let out = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["log", "-r", revision, "--no-graph", "-T", "commit_id"],
+        ))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve `{revision}`: {e}")))?;
+    Ok(out.trim().to_string())
+}
+
+/// Check whether a jj revision is an empty commit.
+fn jj_is_empty(runner: &dyn CommandRunner, cwd: &Path, revision: &str) -> Result<bool> {
+    let out = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                revision,
+                "--no-graph",
+                "-T",
+                "if(empty, \"true\", \"false\")",
+            ],
+        ))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to check emptiness of `{revision}`: {e}")))?;
+    Ok(out.trim() == "true")
+}
+
 /// Push the branch to the github.com remote and verify the push reached
 /// GitHub (not just a local mirror).
 fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<()> {
@@ -3262,6 +3326,10 @@ fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Result<RunResult
 /// `cube pr create`. Never creates a PR.
 fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
     let ctx = resolve_pr_context(args.branch, runner)?;
+
+    if !args.allow_detached_push {
+        assert_working_copy_matches_branch(&ctx, runner)?;
+    }
 
     let Some(url) = list_open_pr(&ctx, runner)? else {
         return Err(CubeError::InvalidArgument(format!(
@@ -16013,6 +16081,18 @@ steps:
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
                 "gh",
                 &[
                     "pr",
@@ -16082,6 +16162,18 @@ steps:
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
                 "gh",
                 &[
                     "pr",
@@ -16108,6 +16200,222 @@ steps:
             msg.contains("no open PR") && msg.contains("cube pr create") && msg.contains("my-feature"),
             "error should say no PR and point at `cube pr create`: {msg}"
         );
+    }
+
+    #[test]
+    fn pr_update_refuses_when_working_copy_is_stale() {
+        // T2764 postmortem: a worker rebased the bookmark onto main but never
+        // `jj edit`ed into it, so `@` stayed on the old tree while the
+        // bookmark advanced. `cube pr update` must refuse before pushing —
+        // and before even checking whether a PR exists — rather than ship a
+        // commit that was never actually gated.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "5bad2f0\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "main000\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+                "mainparent\n",
+            ),
+            // No gh pr list, no push — the working-copy check short-circuits first.
+        ]);
+
+        let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("pr update must refuse a stale working copy");
+        runner.assert_exhausted();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-feature")
+                && msg.contains("5bad2f0")
+                && msg.contains("main000")
+                && msg.contains("jj edit my-feature")
+                && msg.contains("--allow-detached-push"),
+            "error should name both commits and the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
+        // The common shape after `jj new <bookmark>`: `@` is a fresh empty
+        // commit whose parent (`@-`) is the bookmark head. This must be
+        // treated as equivalent to being checked out on the branch itself.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "def456\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "if(empty, \"true\", \"false\")"],
+                "true\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
+                ],
+                r#"[{"url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ]);
+
+        let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "my-feature"]);
+        let result = run_with_dependencies(cli, None, &runner)
+            .expect("pr update must proceed when @ is an empty child of the branch head");
+        runner.assert_exhausted();
+
+        assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
+        assert_eq!(result.payload["action"], "updated");
+    }
+
+    #[test]
+    fn pr_update_allow_detached_push_skips_working_copy_check() {
+        // The escape hatch: with --allow-detached-push, no working-copy
+        // check commands run at all before the push proceeds.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
+                ],
+                r#"[{"url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube",
+            "pr",
+            "update",
+            "--branch",
+            "my-feature",
+            "--allow-detached-push",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("pr update with --allow-detached-push");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["action"], "updated");
     }
 
     // --- pr_push tests ---
