@@ -605,7 +605,14 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
         // explicitly: glob `**` doesn't match the directory itself in
         // every harness, and we want a `Read("…/Boss")` ls attempt to
         // be denied just like a `Read("…/Boss/state.db")`.
-        for prefix in ["Read", "Edit", "Write"] {
+        //
+        // Only `Read` and `Edit` are listed — `Write(path)` is inert in
+        // Claude Code's permission engine: file-editing tool calls (Edit AND
+        // Write) are matched only against `Edit(path)` rules, so a
+        // `Write(path)` deny rule matches nothing and was silently dead
+        // weight (surfaced as a startup warning). `Edit(path)` alone covers
+        // both tools.
+        for prefix in ["Read", "Edit"] {
             rules.push(format!("{prefix}({dir})"));
             rules.push(format!("{prefix}({dir}/**)"));
         }
@@ -670,9 +677,9 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 /// The reviewer's mandate is to never change *the PR or its branch*. It must
 /// still write exactly one engine-owned artifact: its `ReviewResult` JSON
 /// (see [`crate::structured_output`]), which lives **outside** the checkout in
-/// an engine scratch dir (the system temp dir). A blanket `Write(**)`/
-/// `Edit(**)` would block that (deny rules take precedence over allow rules in
-/// claude-code, so the path cannot be carved back out with an allow).
+/// an engine scratch dir (the system temp dir). A blanket `Edit(**)` would
+/// block that (deny rules take precedence over allow rules in claude-code, so
+/// the path cannot be carved back out with an allow).
 ///
 /// Instead the file-write deny is scoped to the **worker-workspaces root** —
 /// the parent of `workspace_path`, under which every per-worker checkout lives
@@ -685,6 +692,11 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 /// data-dir globs in [`deny_rules`]. If `workspace_path` has no parent
 /// (degenerate), the deny falls back to the workspace itself.
 ///
+/// Only an `Edit(...)` rule is emitted (not `Write(...)`) — see the
+/// `Read`/`Edit` note in [`deny_rules`]: Claude Code matches both the `Edit`
+/// and `Write` tools against `Edit(path)` rules, so a parallel `Write(path)`
+/// rule matches nothing and is dead weight.
+///
 /// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
 /// operations are intentionally not denied. They touch only the local
 /// repo state and can never publish commits or PR changes to GitHub, so
@@ -692,7 +704,7 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 /// history for context).
 pub fn reviewer_deny_rules(workspace_path: &Path) -> Vec<String> {
     let fence = workspace_path.parent().unwrap_or(workspace_path).display();
-    let mut rules = vec![format!("Edit({fence}/**)"), format!("Write({fence}/**)")];
+    let mut rules = vec![format!("Edit({fence}/**)")];
     rules.extend(publish_deny_rules());
     rules
 }
@@ -713,12 +725,16 @@ pub fn reviewer_deny_rules(workspace_path: &Path) -> Vec<String> {
 ///
 /// Unlike the reviewer (which writes one out-of-tree artifact and so gets a
 /// workspace-scoped file-write deny), a triage worker writes no file at all,
-/// so its file-write deny stays the blanket `Write(**)`/`Edit(**)`.
+/// so its file-write deny stays the blanket `Edit(**)`.
+///
+/// Only `Edit(**)` is emitted, not `Write(**)` — Claude Code matches both the
+/// `Edit` and `Write` tools against `Edit(path)` rules (see the note in
+/// [`deny_rules`]), so a parallel `Write(**)` rule matches nothing.
 pub fn triage_deny_rules() -> Vec<String> {
     let mut rules = vec![
-        // File-write tools — deny all edits and writes regardless of path.
+        // File-write tools (Edit AND Write, both matched via `Edit(...)`) —
+        // deny all edits and writes regardless of path.
         "Edit(**)".to_owned(),
-        "Write(**)".to_owned(),
     ];
     rules.extend(publish_deny_rules());
     rules
@@ -764,20 +780,19 @@ pub fn answer_agent_allow_rules() -> Vec<String> {
 /// allow, and they still bite under any other permission mode). They cover the
 /// known-catastrophic mutating surfaces:
 ///
-/// - File writes — blanket `Edit`/`Write`/`NotebookEdit`. Unlike the reviewer,
-///   the answer agent writes NO out-of-tree artifact (its reply is posted via
-///   the allowlisted [`crate::answer_agent::THREAD_REPLY_COMMAND`], not a
-///   `Write`), so the deny is unscoped.
+/// - File writes — blanket `Edit`/`NotebookEdit`. Unlike the reviewer, the
+///   answer agent writes NO out-of-tree artifact (its reply is posted via the
+///   allowlisted [`crate::answer_agent::THREAD_REPLY_COMMAND`], not a file
+///   write), so the deny is unscoped. Only `Edit(**)` is listed, not
+///   `Write(**)` — Claude Code matches both the `Edit` and `Write` tools
+///   against `Edit(path)` rules (see the note in [`deny_rules`]), so a
+///   parallel `Write(**)` rule matches nothing.
 /// - Branch push / PR / GitHub-write / `cube pr` — via [`publish_deny_rules`].
 /// - All of `cube` — the engine hands the agent an already-leased read-only
 ///   checkout; it must not lease, release, or otherwise mutate cube state
 ///   itself (design capability table: "Release/mutate cube lease state … No").
 pub fn answer_agent_deny_rules() -> Vec<String> {
-    let mut rules = vec![
-        "Edit(**)".to_owned(),
-        "Write(**)".to_owned(),
-        "NotebookEdit(**)".to_owned(),
-    ];
+    let mut rules = vec!["Edit(**)".to_owned(), "NotebookEdit(**)".to_owned()];
     rules.extend(publish_deny_rules());
     // `publish_deny_rules` already denies `cube pr`; deny the rest of `cube`
     // (workspace lease/release, config, …) so the agent cannot touch cube state.

@@ -285,12 +285,19 @@ fn settings_json_denies_boss_state_dir_reads_writes_and_edits() {
     // list must name the dir and the `**` subtree for each tool
     // so a `Read("…/Boss")` ls and a `Read("…/Boss/state.db")`
     // both deny.
+    //
+    // Only `Read` and `Edit` rules are emitted, not `Write` — Claude Code's
+    // permission engine matches both the Edit and Write *tools* against
+    // `Edit(path)` rules, so a `Write(path)` deny rule matches nothing and is
+    // dead weight (previously surfaced as a startup warning:
+    // "Write(...) is not matched by file permission checks — only Edit(path)
+    // rules are").
     let input = sample_input();
     let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let deny = parsed["permissions"]["deny"].as_array().expect("deny array present");
     let deny_set: Vec<&str> = deny.iter().filter_map(|v| v.as_str()).collect();
     let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
-    for tool in ["Read", "Edit", "Write"] {
+    for tool in ["Read", "Edit"] {
         let bare = format!("{tool}({boss_dir})");
         let glob = format!("{tool}({boss_dir}/**)");
         assert!(
@@ -302,6 +309,10 @@ fn settings_json_denies_boss_state_dir_reads_writes_and_edits() {
             "expected deny rule {glob} in {deny_set:?}",
         );
     }
+    assert!(
+        !deny_set.iter().any(|r| r.starts_with(&format!("Write({boss_dir}"))),
+        "expected no Write(...) deny rule for the Boss state dir (inert in Claude Code's permission engine): {deny_set:?}",
+    );
 }
 
 #[test]
@@ -384,20 +395,24 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         .parent()
         .unwrap_or(&rev_input.workspace_path)
         .display();
-    for critical in [format!("Edit({fence}/**)"), format!("Write({fence}/**)")] {
-        assert!(
-            rev_deny.contains(&critical.as_str()),
-            "reviewer must deny workspaces-root-scoped {critical} (got {rev_deny:?})",
-        );
-    }
-    // And it must NOT carry the blanket file-write denies — that would block
+    let critical = format!("Edit({fence}/**)");
+    assert!(
+        rev_deny.contains(&critical.as_str()),
+        "reviewer must deny workspaces-root-scoped {critical} (got {rev_deny:?})",
+    );
+    // Write(...) rules are never emitted: Claude Code matches both the Edit
+    // and Write tools against Edit(path) rules, so a parallel Write(path)
+    // rule would be inert.
+    assert!(
+        !rev_deny.iter().any(|r| r.starts_with("Write(")),
+        "reviewer must NOT carry any Write(...) rule — inert in Claude Code's permission engine (got {rev_deny:?})",
+    );
+    // And it must NOT carry the blanket file-write deny — that would block
     // the artifact write outside the checkout.
-    for blanket in ["Edit(**)", "Write(**)"] {
-        assert!(
-            !rev_deny.contains(&blanket),
-            "reviewer must NOT carry blanket {blanket} (got {rev_deny:?})",
-        );
-    }
+    assert!(
+        !rev_deny.contains(&"Edit(**)"),
+        "reviewer must NOT carry blanket Edit(**) (got {rev_deny:?})",
+    );
 }
 
 #[test]
@@ -453,7 +468,6 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
         .collect();
     for critical in [
         "Edit(**)",
-        "Write(**)",
         "Bash(jj git push:*)",
         "Bash(git push:*)",
         "Bash(gh pr create:*)",
@@ -464,6 +478,12 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
             "triage worker must deny {critical} (got {triage_deny:?})",
         );
     }
+    // Write(...) rules are never emitted — see the note on the reviewer test
+    // above; Edit(**) alone covers both the Edit and Write tools.
+    assert!(
+        !triage_deny.iter().any(|r| r.starts_with("Write(")),
+        "triage worker must NOT carry any Write(...) rule — inert in Claude Code's permission engine (got {triage_deny:?})",
+    );
     // `boss task create` is the triage worker's sole write action and must
     // NOT be denied (none of the no-publish rules touch it).
     assert!(
@@ -680,7 +700,6 @@ fn answer_agent_deny_belt_blocks_every_mutating_surface() {
     // Spot-check the load-bearing categories: file writes, push/PR, and cube.
     for expected in [
         "Edit(**)",
-        "Write(**)",
         "NotebookEdit(**)",
         "Bash(git push)",
         "Bash(cube pr)",
@@ -691,6 +710,14 @@ fn answer_agent_deny_belt_blocks_every_mutating_surface() {
             "expected deny to include {expected:?}; got: {deny:?}"
         );
     }
+    // Write(...) rules are never emitted — Claude Code matches both the Edit
+    // and Write tools against Edit(path) rules, so a parallel Write(path)
+    // rule would be inert (this was the bug: the generator used to emit
+    // dead Write(...) deny rules that Claude Code warned about at startup).
+    assert!(
+        !deny.iter().any(|r| r.starts_with("Write(")),
+        "answer agent must NOT carry any Write(...) rule — inert in Claude Code's permission engine (got {deny:?})",
+    );
 }
 
 #[test]
