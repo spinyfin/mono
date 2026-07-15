@@ -783,10 +783,11 @@ async fn maybe_spawn_ci_revision(
         "ci_watch: spawned engine-triggered revision for CI failure",
     );
 
-    // Pre-spawn log fetch: capture the tail of the first known-failing job
-    // and store it so the revision directive can show a concrete excerpt to
-    // the worker. Best-effort — a failure here is logged at debug and does
-    // not prevent the revision from running.
+    // Post-spawn, pre-dispatch log fetch: capture the tail of the first
+    // known-failing job and store it before `kick_scheduler()` below
+    // dispatches the revision, so the revision directive can show a
+    // concrete excerpt to the worker. Best-effort — a failure here is
+    // logged at debug and does not prevent the revision from running.
     fetch_and_store_log_excerpt(work_db, attempt, failures).await;
 
     // Nudge the scheduler so the reconcile loop dispatches the revision's
@@ -800,10 +801,10 @@ async fn maybe_spawn_ci_revision(
 /// a concrete excerpt. Skips silently when no job id is available or the
 /// log fetch fails — the worker can always fetch the full log manually.
 async fn fetch_and_store_log_excerpt(work_db: &WorkDb, attempt: &CiRemediation, failures: &[RequiredCheckFailure]) {
-    let Some(first_with_job) = failures.iter().find(|f| f.provider_job_id.is_some()) else {
-        return;
-    };
-    let Some(job_id) = first_with_job.provider_job_id.as_deref() else {
+    let Some((first_with_job, job_id)) = failures
+        .iter()
+        .find_map(|f| f.provider_job_id.as_deref().map(|id| (f, id)))
+    else {
         return;
     };
     let reader = crate::ci_log_reader::reader_for(first_with_job.provider);

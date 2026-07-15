@@ -235,9 +235,13 @@ pub fn parse_buildkite_pipeline_slug(url: &str) -> Option<String> {
 
 /// Extract the Buildkite job UUID from a `targetUrl`. Job UUIDs ride
 /// in the URL fragment (`…/builds/<n>#<job-uuid>`).
+///
+/// Delegates to [`boss_github::parse_provider_job_id`] — the canonical
+/// implementation lives there since `boss-github` cannot depend back on
+/// this crate. Kept here (rather than switched over at call sites) so
+/// existing callers/tests in this module are unaffected.
 pub fn parse_buildkite_job_id(url: &str) -> Option<String> {
-    let (_, frag) = url.split_once('#')?;
-    if frag.is_empty() { None } else { Some(frag.to_owned()) }
+    boss_github::parse_provider_job_id(CiProvider::Buildkite, url)
 }
 
 /// Extract the GitHub Actions run id from a `targetUrl`. Run id is
@@ -259,12 +263,11 @@ fn path_segment_after(url: &str, marker: &str) -> Option<String> {
 
 /// Extract the GitHub Actions job id from a `targetUrl`. Job id is
 /// the path segment after `/job/`.
+///
+/// Delegates to [`boss_github::parse_provider_job_id`] — see
+/// [`parse_buildkite_job_id`] for why.
 pub fn parse_gha_job_id(url: &str) -> Option<String> {
-    let stripped = url.split('?').next().unwrap_or(url);
-    let stripped = stripped.split('#').next().unwrap_or(stripped);
-    let (_, tail) = stripped.rsplit_once("/job/")?;
-    let id = tail.trim_end_matches('/');
-    if id.is_empty() { None } else { Some(id.to_owned()) }
+    boss_github::parse_provider_job_id(CiProvider::GithubActions, url)
 }
 
 /// Trim `s` to its last `n` lines (preserving order). Used by the

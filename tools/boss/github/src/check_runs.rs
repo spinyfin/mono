@@ -2,9 +2,7 @@
 //! the REST `/commits/{sha}/check-runs` fetcher used by the merge-queue
 //! rebounce detector.
 
-use std::process::Stdio;
-
-use tokio::process::Command;
+use crate::gh_runner::gh_output;
 
 /// CI provider inferred from a check's `targetUrl` host. The CI-watch
 /// `CiLogReader` impls (Buildkite + GitHub Actions) dispatch on this;
@@ -21,8 +19,10 @@ pub enum CiProvider {
 /// the `ci_remediations.failed_checks` JSON is faithful to what the
 /// engine saw and the worker prompt embeds the same data.
 ///
-/// `conclusion` is GitHub's value (`FAILURE`, `TIMED_OUT`, `CANCELLED`,
-/// `STARTUP_FAILURE`, `ACTION_REQUIRED`, `STALE`). `target_url` points
+/// `conclusion` is GitHub's value, lowercased as returned by the REST
+/// API (`failure`, `timed_out`, `action_required`, `startup_failure` —
+/// see [`parse_check_runs_for_failures`] for why `cancelled`/`stale`
+/// are excluded on this merge-queue path). `target_url` points
 /// at the provider's job page; `provider` is inferred from its host;
 /// `provider_job_id` is parsed from the URL when possible and `None`
 /// when the format is unrecognised.
@@ -58,15 +58,24 @@ pub fn provider_for_url(url: &str) -> CiProvider {
 /// Actions job ids are the last path segment after `/job/`. Returns
 /// `None` for URLs that don't match either pattern — the worker
 /// prompt then shows the raw URL and the worker shells out manually.
+///
+/// This is the single canonical implementation — `ci_log_reader`'s
+/// `parse_buildkite_job_id`/`parse_gha_job_id` delegate here rather than
+/// duplicating the logic, so the empty-id guard and fragment stripping
+/// below can't drift between the two call sites again.
 pub fn parse_provider_job_id(provider: CiProvider, url: &str) -> Option<String> {
     match provider {
-        CiProvider::Buildkite => url.split_once('#').map(|(_, frag)| frag.to_owned()),
+        CiProvider::Buildkite => {
+            let (_, frag) = url.split_once('#')?;
+            if frag.is_empty() { None } else { Some(frag.to_owned()) }
+        }
         CiProvider::GithubActions => {
-            // …/actions/runs/<run-id>/job/<job-id>[?…]
+            // …/actions/runs/<run-id>/job/<job-id>[?…][#…]
             let stripped = url.split('?').next().unwrap_or(url);
-            stripped
-                .rsplit_once("/job/")
-                .map(|(_, tail)| tail.trim_end_matches('/').to_owned())
+            let stripped = stripped.split('#').next().unwrap_or(stripped);
+            let (_, tail) = stripped.rsplit_once("/job/")?;
+            let id = tail.trim_end_matches('/');
+            if id.is_empty() { None } else { Some(id.to_owned()) }
         }
         CiProvider::Other => None,
     }
@@ -87,14 +96,7 @@ pub fn parse_provider_job_id(provider: CiProvider, url: &str) -> Option<String> 
 /// can attempt manual discovery.
 pub async fn fetch_failing_checks_for_commit(owner_repo: &str, commit_sha: &str) -> Vec<RequiredCheckFailure> {
     let api_path = format!("repos/{owner_repo}/commits/{commit_sha}/check-runs");
-    let output = Command::new("gh")
-        .args(["api", &api_path])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let output = gh_output(&["api", &api_path]).await;
     let output = match output {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
@@ -140,6 +142,13 @@ pub fn parse_check_runs_for_failures(body: &[u8]) -> Vec<RequiredCheckFailure> {
             Some(c) => c,
             None => continue,
         };
+        // `cancelled` is deliberately excluded here (unlike
+        // `merge_poller::is_failure_conclusion`, which does treat it as a
+        // failure): the merge queue cancels sibling checks on dequeue, so
+        // counting a cancellation as a "required check failure" on this
+        // rebounce-detection path would misreport queue churn as a real CI
+        // failure. `stale` is excluded for the same reason — GitHub marks a
+        // check `stale` when a newer commit supersedes it mid-run.
         if !matches!(
             conclusion,
             "failure" | "timed_out" | "action_required" | "startup_failure"
@@ -316,6 +325,14 @@ mod tests {
             super::parse_provider_job_id(Buildkite, "https://buildkite.com/acme/mono/builds/123"),
             None,
         );
+        // Buildkite with an empty fragment (trailing '#' and nothing after)
+        // → None, not `Some("")`. A `Some("")` job id would satisfy
+        // `provider_job_id.is_some()` in `ci_watch::fetch_and_store_log_excerpt`
+        // and get picked over a sibling check with a real job id.
+        assert_eq!(
+            super::parse_provider_job_id(Buildkite, "https://buildkite.com/acme/mono/builds/42#"),
+            None,
+        );
         // GitHub Actions: last segment after '/job/'.
         assert_eq!(
             super::parse_provider_job_id(
@@ -343,6 +360,23 @@ mod tests {
         // GitHub Actions URL with no '/job/' segment → None.
         assert_eq!(
             super::parse_provider_job_id(GithubActions, "https://github.com/anthropic/mono/actions/runs/12345",),
+            None,
+        );
+        // GitHub Actions: a '#step:' fragment (routinely present on job
+        // URLs) is stripped, not appended to the id.
+        assert_eq!(
+            super::parse_provider_job_id(
+                GithubActions,
+                "https://github.com/anthropic/mono/actions/runs/12345/job/67890#step:5:1",
+            ),
+            Some("67890".to_owned()),
+        );
+        // GitHub Actions: an empty id after '/job/' → None.
+        assert_eq!(
+            super::parse_provider_job_id(
+                GithubActions,
+                "https://github.com/anthropic/mono/actions/runs/12345/job/",
+            ),
             None,
         );
         // CiProvider::Other never parses a job id, regardless of the URL.
