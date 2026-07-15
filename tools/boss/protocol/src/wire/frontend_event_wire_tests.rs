@@ -2030,7 +2030,11 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProbeRefused { .. }
         | FrontendEvent::ProbeStatusResult { .. }
         | FrontendEvent::SelectedProductResult { .. }
-        | FrontendEvent::SelectedProductReported { .. } => {}
+        | FrontendEvent::SelectedProductReported { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. } => {}
     }
 }
 
