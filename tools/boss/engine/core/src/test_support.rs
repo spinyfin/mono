@@ -6,7 +6,7 @@
 //! here means a new field on [`CreateProductInput`] touches one site
 //! instead of ~250, and keeps the setup readable at each call site.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +20,7 @@ use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
     ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
-use crate::runner::{ExecutionRunner, RunOutcome};
+use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 use boss_protocol::{
     Automation, AutomationTrigger, CreateAutomationInput, CreateExecutionInput, CreateProductInput, ExecutionKind,
@@ -310,6 +310,99 @@ impl ExecutionRunner for NoopRunner {
         _cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
         unimplemented!()
+    }
+}
+
+/// A [`CubeClient`] test double that always succeeds with fixed canned
+/// values. Pairs with [`AlwaysSucceedsRunner`] so `ExecutionCoordinator::
+/// force_dispatch` / `schedule_execution` can complete end-to-end in a
+/// test — unlike [`NoopCube`], which panics on the first real call and is
+/// only safe for tests that never actually dispatch anything.
+///
+/// Added for the spawn-capability breaker's half-open recovery probe
+/// (`spawn_health::maybe_admit_recovery_probe`): a probe genuinely
+/// force-dispatches a real ready execution, so any sweep test whose setup
+/// happens to leave one behind (e.g. the steady-state active-work rescan
+/// that fires after a reap — see `ExecutionCoordinator::
+/// rescan_active_dispatch_after_release`) now needs a coordinator that can
+/// actually carry a dispatch through, not just claim a pool slot.
+pub struct AlwaysSucceedsCube;
+
+crate::stub_cube_client! { AlwaysSucceedsCube {
+    async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
+        Ok(CubeRepoHandle { repo_id: "test-repo".to_owned() })
+    }
+    async fn lease_workspace(
+        &self,
+        _repo_id: &str,
+        _task: &str,
+        prefer_workspace_id: Option<&str>,
+        _allow_dirty: bool,
+        _exclude_workspace_ids: &[&str],
+    ) -> Result<CubeWorkspaceLease> {
+        let workspace_id = prefer_workspace_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| "test-workspace-001".to_owned());
+        Ok(CubeWorkspaceLease {
+            lease_id: "test-lease-1".to_owned(),
+            workspace_path: PathBuf::from(format!("/tmp/{workspace_id}")),
+            workspace_id,
+        })
+    }
+    async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
+        Ok(CubeChangeHandle { change_id: "test-change-1".to_owned() })
+    }
+    async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
+        Ok(CubeWorkspaceStatus::builder()
+            .workspace_id("test-workspace-001")
+            .workspace_path(workspace_path.to_path_buf())
+            .state("leased")
+            .lease_id("test-lease-1")
+            .holder("boss/0")
+            .task("test task")
+            .leased_at_epoch_s(1_700_000_000)
+            .lease_expires_at_epoch_s(1_700_001_800)
+            .build())
+    }
+    async fn heartbeat_lease(&self, _lease_id: &str, _ttl_seconds: Option<u64>) -> Result<()> {
+        Ok(())
+    }
+    async fn force_release_lease(&self, _lease_id: &str, _reason: Option<&str>) -> Result<()> {
+        Ok(())
+    }
+    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+        Ok(vec![])
+    }
+    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+        Ok(vec![])
+    }
+} }
+
+/// An [`ExecutionRunner`] test double that always reports a benign
+/// `WaitingHuman` outcome instead of panicking. Pairs with
+/// [`AlwaysSucceedsCube`] — see its doc comment for why this pair exists.
+pub struct AlwaysSucceedsRunner;
+
+#[async_trait]
+impl ExecutionRunner for AlwaysSucceedsRunner {
+    async fn run_execution(
+        &self,
+        _worker_id: &str,
+        execution: &WorkExecution,
+        _work_item: &crate::work::WorkItem,
+        _workspace_path: &Path,
+        _cube_change_id: Option<&str>,
+    ) -> Result<RunOutcome> {
+        Ok(RunOutcome {
+            wait_state: RunWaitState::WaitingHuman,
+            result_summary: Some(format!("test run finished for {}", execution.id)),
+            attention: None,
+            slot_id: None,
+            spawn_config: None,
+        })
     }
 }
 
@@ -686,6 +779,21 @@ pub fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoord
         WorkerPool::new(pool_size),
         Arc::new(NoopCube),
         Arc::new(NoopRunner),
+    ))
+}
+
+/// Like [`make_coordinator`], but backed by [`AlwaysSucceedsCube`] /
+/// [`AlwaysSucceedsRunner`] instead of the panic-on-any-call `Noop*`
+/// doubles, so `force_dispatch` / `schedule_execution` can actually carry a
+/// dispatch through end-to-end. Use this whenever a test's coordinator
+/// might realistically get a real dispatch attempt — e.g. anything that
+/// exercises the spawn-capability breaker's half-open recovery probe.
+pub fn make_dispatchable_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
+    Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(pool_size),
+        Arc::new(AlwaysSucceedsCube),
+        Arc::new(AlwaysSucceedsRunner),
     ))
 }
 

@@ -113,6 +113,27 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
             .await;
         tracing::info!(session_id = %session_id, "app session registered");
         send_response(&sink, &request_id, FrontendEvent::AppSessionRegistered);
+        // A fresh app session is the operator's natural recovery action
+        // (e.g. relaunching the app after waking the display) — clear the
+        // spawn-capability breaker's failure window and any half-open probe
+        // state left over from before, and auto-resume dispatch if it's
+        // currently Breaker-paused. Never touches an operator pause:
+        // `resume_dispatch_after_breaker_recovery` no-ops unless the
+        // current pause is Breaker-origin.
+        server_state.spawn_health.record_success();
+        server_state.spawn_health.reset_probe();
+        if crate::spawn_health::resume_dispatch_after_breaker_recovery(
+            &server_state.work_db,
+            &server_state.execution_coordinator,
+            server_state.dispatch_events.as_ref(),
+            None,
+            "fresh app session registered",
+        )
+        .await
+        {
+            server_state.execution_coordinator.kick();
+            server_state.broadcast_engine_health().await;
+        }
         // Push pool sizes immediately after registration so the app's
         // WorkersWorkspaceModel can configure its slot ranges before the
         // engine dispatches any SpawnWorkerPane. This is the single source
@@ -210,9 +231,26 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
     }
     // A real shell pid is proof the app's spawn path is working again — reset
     // the spawn-capability breaker so its failure window doesn't carry stale
-    // pre-recovery failures into the next outage. (Does not auto-resume a
-    // human-paused dispatch; the operator unpauses after confirming recovery.)
+    // pre-recovery failures into the next outage.
     server_state.spawn_health.record_success();
+    // If this run was the half-open recovery probe's canary (see
+    // `maybe_admit_recovery_probe`), this is proof the breaker's trip has
+    // resolved — auto-resume dispatch. Never auto-resumes an operator pause:
+    // `resume_dispatch_after_breaker_recovery` no-ops unless the current
+    // pause is Breaker-origin.
+    if server_state.spawn_health.record_probe_success(&run_id)
+        && crate::spawn_health::resume_dispatch_after_breaker_recovery(
+            &server_state.work_db,
+            &server_state.execution_coordinator,
+            server_state.dispatch_events.as_ref(),
+            Some(&run_id),
+            "recovery probe reported a real shell pid",
+        )
+        .await
+    {
+        server_state.execution_coordinator.kick();
+        server_state.broadcast_engine_health().await;
+    }
     // Persist the pid to the DB FIRST, keyed by run_id (the execution id).
     // The `work_runs` row always exists by now (inserted synchronously at
     // dispatch, before the pane was spawned), so unlike the in-memory slot

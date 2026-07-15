@@ -369,15 +369,33 @@ pub enum Stage {
     /// broken. This is the fix for the 2026-07-05 post-wake wedge, where
     /// every pane spawn silently produced no shell for 1.5+ hours and the
     /// per-work-item churn guard could not catch it because the failures
-    /// were spread across many items. The engine pauses dispatch (so it
-    /// stops burning spawn attempts against a dead app path) and raises a
-    /// single `app_spawn_capability_unhealthy` attention item as ONE loud
-    /// signal, instead of independently churning each work item into its own
-    /// churn guard. Dispatch stays paused until a human resolves the app
-    /// (e.g. wakes the display) and unpauses; a subsequent successful spawn
-    /// resets the breaker. The `details` object carries the
-    /// `distinct_work_items` count that tripped it and the `window_secs`.
+    /// were spread across many items. The engine always raises a single
+    /// `app_spawn_capability_unhealthy` attention item as ONE loud signal,
+    /// instead of independently churning each work item into its own churn
+    /// guard — but whether it also **pauses dispatch** depends on
+    /// [`crate::config::WorkConfig::enable_spawn_capability_breaker`]
+    /// (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`, OFF by default since
+    /// 2026-07-15 — a single transient outage must not latch fleet-wide
+    /// dispatch, including `pr_review`). When enabled, dispatch stays paused
+    /// until either the half-open recovery probe or a fresh app session
+    /// registering auto-resumes it (see
+    /// [`Stage::SpawnCapabilityRecovered`] and
+    /// [`crate::spawn_health::maybe_admit_recovery_probe`]); when disabled,
+    /// this event fires as observability only. The `details` object carries
+    /// `distinct_work_items`, `window_secs`, `breaker_enabled`, and
+    /// `dispatch_paused` (mirrors `breaker_enabled`).
     SpawnCapabilityUnhealthy,
+    /// Dispatch auto-resumed after Breaker-origin evidence that the app's
+    /// spawn path recovered — either the half-open recovery probe's canary
+    /// (see [`crate::spawn_health::maybe_admit_recovery_probe`]) reported a
+    /// real shell pid, or a fresh app session registered (an app relaunch,
+    /// the operator's natural recovery action). Never fired for an
+    /// operator-originated pause, which stays manual-resume-only. The
+    /// `details` object carries the human-readable `reason`; the event's
+    /// `execution_id` is the canary's id when the probe succeeded, or the
+    /// sentinel `"engine"` for a fresh-session recovery with no specific
+    /// execution behind it.
+    SpawnCapabilityRecovered,
     /// The periodic husk-pane sweep ([`crate::husk_pane_sweep`]) found a
     /// worker pane the macOS app is STILL hosting for a slot the engine has
     /// no live-tracked run for at all, confirmed across two consecutive
@@ -457,6 +475,7 @@ impl Stage {
             Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
             Stage::SpawnNack => "spawn_nack",
             Stage::SpawnCapabilityUnhealthy => "spawn_capability_unhealthy",
+            Stage::SpawnCapabilityRecovered => "spawn_capability_recovered",
             Stage::HuskPaneReconcile => "husk_pane_reconcile",
             Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
         }
@@ -967,6 +986,7 @@ mod tests {
         );
         assert_eq!(Stage::SpawnNack.as_str(), "spawn_nack");
         assert_eq!(Stage::SpawnCapabilityUnhealthy.as_str(), "spawn_capability_unhealthy");
+        assert_eq!(Stage::SpawnCapabilityRecovered.as_str(), "spawn_capability_recovered");
         assert_eq!(Stage::HuskPaneReconcile.as_str(), "husk_pane_reconcile");
         assert_eq!(
             Stage::ExecutionLivenessReconcile.as_str(),

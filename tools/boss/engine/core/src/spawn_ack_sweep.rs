@@ -67,7 +67,7 @@ use boss_protocol::{WorkExecution, WorkerActivity};
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::spawn_health::{SpawnHealthTracker, trip_spawn_capability_circuit};
+use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe, trip_spawn_capability_circuit};
 use crate::work::WorkDb;
 
 /// Grace period after `started_at` (epoch seconds) during which a
@@ -263,6 +263,13 @@ pub async fn run_one_pass(
         }
     }
 
+    // Breaker half-open recovery: while dispatch is Breaker-paused, this is
+    // the tick that periodically admits a single canary execution through
+    // the pause. Runs every pass regardless of whether this pass reaped
+    // anything — the breaker may have tripped from an app NACK (a different
+    // code path) rather than from a timeout seen above.
+    maybe_admit_recovery_probe(work_db, &coordinator, spawn_health, now_epoch_secs).await;
+
     outcome
 }
 
@@ -404,13 +411,21 @@ pub(crate) async fn reap_never_started_spawn(
             ctx.work_db,
             ctx.coordinator.as_ref(),
             ctx.dispatch_events,
-            execution_id,
-            work_item_id,
-            distinct,
-            now_epoch_secs,
+            ctx.spawn_health,
+            crate::spawn_health::TripSignal {
+                tripping_execution_id: execution_id,
+                tripping_work_item_id: work_item_id,
+                distinct_work_items: distinct,
+                now_epoch_secs,
+            },
         )
         .await;
     }
+
+    // If this reap was the in-flight half-open recovery probe (see
+    // `maybe_admit_recovery_probe`), the canary failed — back off before the
+    // next attempt. No-op for any other execution.
+    ctx.spawn_health.record_probe_failure(execution_id, now_epoch_secs);
 
     true
 }
@@ -758,15 +773,25 @@ mod tests {
             execution_ids.push(execution_id);
         }
 
-        let coordinator = make_coordinator(db.clone(), 4);
+        // `AlwaysSucceedsCube`/`AlwaysSucceedsRunner`, not the panic-on-any-call
+        // `Noop*` doubles: once the breaker trips and pauses dispatch, the
+        // reap's steady-state rescan (`rescan_active_dispatch_after_release`)
+        // immediately re-queues each reaped active chore as `ready`, and the
+        // half-open recovery probe (`maybe_admit_recovery_probe`, run at the
+        // end of this same sweep pass) force-dispatches one of them as a
+        // canary — a real dispatch attempt this coordinator must be able to
+        // carry through.
+        let coordinator = make_dispatchable_coordinator(db.clone(), 4);
         for execution_id in &execution_ids {
             coordinator.worker_pool().claim_worker(execution_id, None).await;
         }
         assert!(!coordinator.is_dispatch_paused(), "precondition: dispatch running");
 
         // Threshold of 3 distinct work items; the 4th slot exercises
-        // idempotency (already paused → no second signal).
-        let spawn_health = SpawnHealthTracker::with_config(3, 300);
+        // idempotency (already paused → no second signal). This test exercises
+        // the pause path, so it must opt in explicitly — `with_config`'s
+        // default is now the config-driven `false`.
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(
@@ -833,7 +858,10 @@ mod tests {
             execution_ids.push(execution_id);
         }
 
-        let coordinator = make_coordinator(db.clone(), 3);
+        // See the comment in `systemic_spawn_failure_trips_capability_breaker_once`
+        // for why this needs a coordinator that can actually carry a dispatch
+        // through (the recovery probe force-dispatches a real ready row).
+        let coordinator = make_dispatchable_coordinator(db.clone(), 3);
         for execution_id in &execution_ids {
             coordinator.worker_pool().claim_worker(execution_id, None).await;
         }
@@ -851,7 +879,9 @@ mod tests {
             "precondition: operator pause exempts reviews"
         );
 
-        let spawn_health = SpawnHealthTracker::with_config(3, 300);
+        // This test exercises the pause-escalation path, so it must opt in
+        // explicitly — `with_config`'s default is now the config-driven `false`.
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(

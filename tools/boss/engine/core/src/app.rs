@@ -1184,7 +1184,10 @@ impl ServerState {
                 .topic_broker(topic_broker)
                 .worker_registry(WorkerRegistry::new())
                 .live_worker_states(live_worker_states)
-                .spawn_health(Arc::new(crate::spawn_health::SpawnHealthTracker::new()))
+                .spawn_health(Arc::new(
+                    crate::spawn_health::SpawnHealthTracker::new()
+                        .with_breaker_enabled(cfg.work.enable_spawn_capability_breaker),
+                ))
                 .live_status_manager(Arc::new(LiveStatusManager::new()))
                 .dispatcher_stats(Arc::new(crate::live_status_loop::DispatcherStats::new(
                     metrics_for_dispatcher,
