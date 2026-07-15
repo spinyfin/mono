@@ -4769,6 +4769,18 @@ impl ExecutionCoordinator {
             Ok(outcome) if outcome.slot_id.is_some()
         );
 
+        // Set inside the `Err(err)` arm below once a `SlotBusy` pane-spawn
+        // rejection has actually been recorded as a terminal `failed`
+        // execution (i.e. `finish_execution_run` itself succeeded).
+        // Hoisted above the match so the tail of this function (worker-pool
+        // release decision) can see it after `run_outcome` is consumed.
+        // Deliberately left `false` if `finish_execution_run` errors: in
+        // that rare double-fault the execution may still be non-terminal
+        // in the DB, and holding the slot for a row `pool_claim_sweep`
+        // will never consider terminal would leak it forever — releasing
+        // normally is the safe fallback there.
+        let mut hold_slot_busy = false;
+
         match run_outcome {
             // Mid-spawn cancel (T981): the worker was cancelled while it
             // was still spawning. The runner has already reaped the
@@ -4932,6 +4944,20 @@ impl ExecutionCoordinator {
                 };
                 let error_text = err.to_string();
 
+                // A `SlotBusy` app rejection means the engine and the app
+                // disagree about this specific slot's occupancy — the app
+                // itself documents this as "the engine should reconcile
+                // rather than retry blindly" (see
+                // `WorkersWorkspaceModel.spawnWorkerPane`'s doc comment).
+                // It is an engine/app desync, not a genuine task or
+                // automation failure, so it is handled differently below:
+                // the work stays queued instead of bouncing to a terminal
+                // state, and the offending slot is held out of rotation
+                // (rather than freed) so the very next dispatch pass
+                // doesn't just re-select the same bad slot and repeat the
+                // rejection — see the tail of this function.
+                let is_slot_busy = slot_busy_occupant(&err).is_some();
+
                 // Historical silent-release path: a pane-spawn
                 // failure (libghostty IPC drop, slot busy, prompt
                 // composition error) inside `run_execution` marked
@@ -4976,6 +5002,12 @@ impl ExecutionCoordinator {
                         .build(),
                 ) {
                     Ok((execution, _run, _)) => {
+                        // The execution is now durably `failed` in the DB —
+                        // safe to have `pool_claim_sweep` own reclaiming this
+                        // slot instead of releasing it immediately (see the
+                        // `hold_slot_busy` declaration above and the tail of
+                        // this function).
+                        hold_slot_busy = is_slot_busy;
                         tracing::warn!(
                             execution_id = %execution.id,
                             run_id = %run.id,
@@ -5033,7 +5065,18 @@ impl ExecutionCoordinator {
                         // To-Do, erasing the review context. Leave the
                         // task in place — the attention item already
                         // surfaces the failure for the operator.
-                        if execution.kind != ExecutionKind::PrReview {
+                        //
+                        // Exception: a `SlotBusy` rejection is likewise an
+                        // engine-side infrastructure issue (see `is_slot_busy`
+                        // above), not a real dispatch failure of the task
+                        // itself — demoting to To-Do would require a human to
+                        // notice and manually re-drag the card. Leaving the
+                        // item `active` lets the tail of this function's
+                        // rescan (`rescan_active_dispatch_after_release`)
+                        // queue a fresh execution automatically, so the item
+                        // stays in Doing and dispatches onto the next free
+                        // slot exactly like a plain pool-exhaustion wait.
+                        if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
                             match self.work_db.demote_active_work_item_to_todo(&execution.work_item_id) {
                                 Ok(true) => tracing::info!(
                                     execution_id = %execution.id,
@@ -5051,7 +5094,8 @@ impl ExecutionCoordinator {
                             tracing::info!(
                                 execution_id = %execution.id,
                                 work_item_id = %execution.work_item_id,
-                                "skipping demote for pr_review spawn failure — engine infrastructure issue, not a task regression",
+                                is_slot_busy,
+                                "skipping demote for pr_review or slot-busy spawn failure — engine infrastructure issue, not a task regression",
                             );
                         }
                         self.publisher
@@ -5077,24 +5121,81 @@ impl ExecutionCoordinator {
                         // `automation_runs` row is still sitting at the
                         // pessimistic `failed_will_retry` that the scheduler
                         // stamped when it dispatched the triage execution.
-                        // Flip it to `failed_gave_up` so the Automations tab
+                        //
+                        // A genuine spawn failure (bad config, IPC down, …)
+                        // flips it to `failed_gave_up` so the Automations tab
                         // shows an accurate terminal state instead of implying
-                        // a self-healing retry is pending (it is not: a
-                        // pane-spawn failure like an invalid worker_id format
-                        // will not recover on its own).
-                        if execution.kind == ExecutionKind::AutomationTriage
-                            && let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                        // a self-healing retry is pending — it will not
+                        // recover on its own. A `SlotBusy` rejection is the
+                        // opposite: it self-heals as soon as the offending
+                        // slot is reconciled (see the tail of this function),
+                        // so instead of giving up we fire a fresh triage
+                        // execution immediately — same automation, same repo
+                        // — and re-point this occurrence's `automation_runs`
+                        // row at it, mirroring `EngineTriageDispatcher::fire`
+                        // rather than waiting for the automation's next
+                        // scheduled occurrence.
+                        if execution.kind == ExecutionKind::AutomationTriage {
+                            if is_slot_busy {
+                                match self.work_db.create_automation_triage_execution(
+                                    &execution.work_item_id,
+                                    &execution.repo_remote_url,
+                                ) {
+                                    Ok(retry_execution) => {
+                                        if let Err(err) =
+                                            self.work_db.requeue_automation_run_after_transient_spawn_failure(
+                                                &execution.id,
+                                                &retry_execution.id,
+                                                &format!("slot busy at spawn; requeued as {}", retry_execution.id),
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                execution_id = %execution.id,
+                                                retry_execution_id = %retry_execution.id,
+                                                ?err,
+                                                "failed to re-point automation run at retry execution after slot-busy spawn failure",
+                                            );
+                                        }
+                                        tracing::info!(
+                                            execution_id = %execution.id,
+                                            retry_execution_id = %retry_execution.id,
+                                            "requeued automation triage after slot-busy pane-spawn failure",
+                                        );
+                                    }
+                                    Err(create_err) => {
+                                        tracing::error!(
+                                            execution_id = %execution.id,
+                                            ?create_err,
+                                            "failed to create retry triage execution after slot-busy spawn failure; giving up",
+                                        );
+                                        if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                                            &execution.id,
+                                            boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                            None,
+                                            Some(&format!(
+                                                "pane spawn failed: {error_text}; retry creation also failed: {create_err:#}"
+                                            )),
+                                        ) {
+                                            tracing::warn!(
+                                                execution_id = %execution.id,
+                                                ?finalize_err,
+                                                "failed to mark automation run failed_gave_up after retry-creation failure",
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
                                 &execution.id,
                                 boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
                                 None,
                                 Some(&format!("pane spawn failed: {error_text}")),
-                            )
-                        {
-                            tracing::warn!(
-                                execution_id = %execution.id,
-                                ?finalize_err,
-                                "failed to mark automation run failed_gave_up after pane-spawn failure",
-                            );
+                            ) {
+                                tracing::warn!(
+                                    execution_id = %execution.id,
+                                    ?finalize_err,
+                                    "failed to mark automation run failed_gave_up after pane-spawn failure",
+                                );
+                            }
                         }
                     }
                     Err(record_err) => {
@@ -5111,8 +5212,60 @@ impl ExecutionCoordinator {
         }
 
         if !defer_pool_slot_release {
-            self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
-                .await;
+            if hold_slot_busy {
+                // Do NOT hand the slot back to `select_claim_index` — the
+                // app just told us it's still hosting a real pane there, so
+                // freeing it now would let the very next dispatch pass
+                // re-select the same slot and repeat the rejection (an
+                // effective blind retry loop). Instead leave the claim
+                // attributed to this (now terminal) execution: the existing
+                // pool-claim reconciler (`pool_claim_sweep::run_one_pass`)
+                // already frees exactly this shape of stuck claim — terminal
+                // execution, no live worker pane backing it — once its
+                // `LEAK_GRACE_SECS` grace period has passed, by which point
+                // the app side has normally torn the stray pane down itself
+                // or the husk-pane sweep has retired it. Still rescan + kick
+                // so OTHER free slots pick up the work this failure just
+                // requeued.
+                self.rescan_active_dispatch_after_release();
+                // `rescan_active_dispatch` only requeues items with
+                // `autostart = 1` — but `start_execution_run_on_host`
+                // consumes (clears) `autostart` the moment a run first
+                // starts (deliberate single-shot semantics: an item that
+                // already got its automatic shot doesn't respawn forever
+                // unattended). A `SlotBusy` desync isn't that case at
+                // all — it's the engine deciding, on the work item's
+                // behalf, that THIS dispatch attempt needs to be retried
+                // because it never really ran on the merits — so route
+                // around the autostart gate entirely for the ordinary
+                // task/chore/revision family by requesting a fresh
+                // execution directly. Excluded: `PrReview` (needs the
+                // dedicated re-fire path, not a plain `request_execution`,
+                // to land the right kind) and `AutomationTriage` /
+                // `AnswerAgent` (synthetic work items with no `tasks` row
+                // — `AutomationTriage` already got its own fresh execution
+                // above; `AnswerAgent` is unhandled here, matching its
+                // pre-existing scope).
+                if !matches!(
+                    execution.kind,
+                    ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+                ) && let Err(err) = self.work_db.request_execution(
+                    boss_protocol::RequestExecutionInput::builder()
+                        .work_item_id(execution.work_item_id.clone())
+                        .build(),
+                ) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "failed to queue a fresh execution after slot-busy pane-spawn failure",
+                    );
+                }
+                self.kick();
+            } else {
+                self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
+                    .await;
+            }
         }
     }
 
@@ -5942,6 +6095,12 @@ mod tests {
     struct FakeExecutionRunner {
         calls: Mutex<Vec<RunnerCall>>,
         fail: bool,
+        /// When `true`, `run_execution` fails with a `SlotBusy` app
+        /// rejection (wrapped the same way `spawn_flow` wraps it) instead
+        /// of the generic `fail` error, so tests can exercise the
+        /// hold-slot / requeue-instead-of-fail path distinctly from a
+        /// genuine spawn failure. Takes priority over `fail`.
+        slot_busy: bool,
         pending: bool,
         /// If `Some`, the runner reports this slot id back to the
         /// coordinator in the `RunOutcome`, simulating a successful
@@ -5980,6 +6139,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 fail: false,
+                slot_busy: false,
                 pending: false,
                 slot_id: None,
                 spawn_config: None,
@@ -6008,6 +6168,12 @@ mod tests {
             ));
             if self.pending {
                 pending::<()>().await;
+            }
+            if self.slot_busy {
+                let root = StartWorkerError::AppError(EngineToAppError::SlotBusy {
+                    occupying_run_id: Some("exec_other_occupant".to_owned()),
+                });
+                return Err(anyhow::Error::new(root).context("failed to spawn worker pane"));
             }
             if self.fail {
                 return Err(anyhow!("worker prompt failed"));
@@ -7242,6 +7408,203 @@ mod tests {
             TaskStatus::Todo,
             "pr_review spawn failure must not demote the work item to `todo`; \
              got `{status}` — the skip-demote guard for pr_review is absent or broken",
+        );
+    }
+
+    /// The automation-dispatch consistency fix (T410 field incident,
+    /// 2026-07-15): a `SlotBusy` app rejection means the engine and the
+    /// app disagree about a slot's occupancy — it is an engine-side
+    /// infrastructure issue, not a genuine dispatch failure of the task
+    /// itself. On `SlotBusy` the coordinator must NOT demote the work
+    /// item back to `todo` (which would require a human to notice and
+    /// manually re-drag the card) and must NOT hand the offending slot
+    /// straight back to the free pool (which would just let the very
+    /// next dispatch pass re-select it and repeat the rejection). Instead
+    /// the item stays `active`, a fresh `ready` execution is queued via
+    /// the ordinary `rescan_active_dispatch_after_release` path, and the
+    /// bad slot is left claimed (for `pool_claim_sweep` to reclaim once
+    /// its grace period passes) — exactly the "stays in Doing, dispatches
+    /// on the next free slot" behavior a plain pool-exhaustion wait gets.
+    #[tokio::test]
+    async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let first_execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            slot_busy: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &first_execution_id, ExecutionStatus::Failed).await;
+
+        // Give the requeue's own kick a moment to land — the fresh `ready`
+        // execution is created synchronously inside `run_execution`'s tail,
+        // but dispatch of it happens on a follow-up scheduler pass.
+        for _ in 0..50 {
+            if db
+                .list_executions(Some(&chore.id))
+                .unwrap()
+                .iter()
+                .any(|e| e.id != first_execution_id)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let item = db.get_work_item(&chore.id).unwrap();
+        let status = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t.status,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_ne!(
+            status,
+            TaskStatus::Todo,
+            "slot-busy spawn failure must not demote the work item to `todo`; got `{status}`",
+        );
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert!(
+            executions.iter().any(|e| e.id != first_execution_id),
+            "slot-busy spawn failure must queue a fresh execution for redispatch; got {executions:#?}",
+        );
+
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            0,
+            "the slot-busy slot must be held (not freed) so the next dispatch pass doesn't \
+             immediately re-select and repeat the rejection — pool_claim_sweep reclaims it later",
+        );
+    }
+
+    /// Sibling of the above for the `automation_triage` execution kind,
+    /// whose synthetic "work item" is the automation itself (no `tasks`
+    /// row, so `rescan_active_dispatch` cannot requeue it). On `SlotBusy`
+    /// the coordinator must fire a fresh triage execution immediately —
+    /// mirroring `EngineTriageDispatcher::fire` — and re-point the
+    /// occurrence's `automation_runs` row at it with the scheduler's own
+    /// pessimistic `failed_will_retry` outcome, rather than giving up with
+    /// the terminal `failed_gave_up` a genuine (non-desync) spawn failure
+    /// gets (see `pane_spawn_failure_finalises_automation_run_to_failed_gave_up`).
+    #[tokio::test]
+    async fn slot_busy_pane_spawn_failure_requeues_automation_triage_instead_of_giving_up() {
+        use crate::work::{AutomationFireRecord, CreateAutomationInput};
+        use boss_protocol::AutomationTrigger;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Nightly check".to_owned(),
+                repo_remote_url: None,
+                trigger: AutomationTrigger::Schedule {
+                    cron: "0 2 * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "audit the repo".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+
+        let triage_exec = db
+            .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+
+        let scheduled_for: i64 = 1_000_000;
+        db.record_automation_run_and_advance(
+            AutomationFireRecord::builder()
+                .automation_id(automation.id.clone())
+                .scheduled_for(scheduled_for)
+                .started_at(scheduled_for)
+                .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                .triage_execution_id(triage_exec.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            slot_busy: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &triage_exec.id, ExecutionStatus::Failed).await;
+
+        // The automation run must now point at a NEW triage execution,
+        // still `failed_will_retry` (not `failed_gave_up`) — a fresh
+        // attempt was queued rather than the occurrence being abandoned.
+        // The re-point happens in `run_execution`'s tail, after the DB
+        // commit `wait_for_execution_status` observes, so poll briefly
+        // for it to land instead of racing a single read.
+        let mut run_after = db.list_automation_runs(&automation.id).unwrap().into_iter().next();
+        for _ in 0..50 {
+            if run_after
+                .as_ref()
+                .is_some_and(|r| r.triage_execution_id.as_deref() != Some(triage_exec.id.as_str()))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+            run_after = db.list_automation_runs(&automation.id).unwrap().into_iter().next();
+        }
+        let run_after = run_after.expect("automation run must still exist");
+        assert_ne!(
+            run_after.triage_execution_id.as_deref(),
+            Some(triage_exec.id.as_str()),
+            "slot-busy failure must re-point the run at a fresh triage execution, not leave it on the failed one",
+        );
+        // With a 1-slot automation pool held busy by the just-failed
+        // execution, the fresh retry execution this requeue created has
+        // nowhere to dispatch yet — the drain correctly reports pool
+        // exhaustion and marks it `pool_throttled` (the SAME "queued,
+        // will dispatch when a slot frees" state a genuine full pool
+        // gets). Either that or the scheduler's own initial
+        // `failed_will_retry` stamp is acceptable here; what must NEVER
+        // happen is the terminal `failed_gave_up` a real (non-desync)
+        // spawn failure gets.
+        assert_ne!(
+            run_after.outcome,
+            boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+            "slot-busy failure must requeue, not give up; got {:?}",
+            run_after.outcome,
+        );
+        assert!(
+            matches!(run_after.outcome.as_str(), "failed_will_retry" | "pool_throttled"),
+            "slot-busy failure must leave the run in a retryable (non-terminal) state; got {:?}",
+            run_after.outcome,
+        );
+
+        // The new triage execution must actually exist and be dispatchable
+        // (not itself already terminal).
+        let new_execution_id = run_after
+            .triage_execution_id
+            .clone()
+            .expect("requeued run must carry a triage_execution_id");
+        assert_ne!(new_execution_id, triage_exec.id);
+        let new_execution = db.get_execution(&new_execution_id).unwrap();
+        assert_ne!(
+            new_execution.status,
+            ExecutionStatus::Failed,
+            "the requeued triage execution must not itself be pre-failed",
         );
     }
 
