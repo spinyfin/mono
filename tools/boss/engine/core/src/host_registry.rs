@@ -628,6 +628,7 @@ fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::insert_host_capability;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -668,18 +669,6 @@ mod tests {
             "INSERT INTO work_capability_requirements (subject_kind, subject_id, capability)
              VALUES ('chore', ?1, ?2)",
             params![subject_id, capability],
-        )
-        .unwrap();
-    }
-
-    /// Plant a capability row directly with an explicit `source` (used to set
-    /// up `auto`-sourced rows, which have no public insert path).
-    fn insert_capability(db: &WorkDb, host_id: &str, capability: &str, source: &str) {
-        let conn = db.connect().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
-             VALUES (?1, ?2, ?3)",
-            params![host_id, capability, source],
         )
         .unwrap();
     }
@@ -959,7 +948,7 @@ mod tests {
     fn add_user_capability_replaces_auto_source_with_user() {
         let db = open_db();
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
-        insert_capability(&db, "zakalwe", "os=macos", "auto");
+        insert_host_capability(&db, "zakalwe", "os=macos", "auto");
 
         db.add_user_host_capability("zakalwe", "os=macos").unwrap();
 
@@ -995,7 +984,7 @@ mod tests {
     fn remove_user_capability_rejects_auto_sourced() {
         let db = open_db();
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
-        insert_capability(&db, "zakalwe", "arch=arm64", "auto");
+        insert_host_capability(&db, "zakalwe", "arch=arm64", "auto");
 
         let err = db.remove_user_host_capability("zakalwe", "arch=arm64").unwrap_err();
         assert!(err.to_string().contains("auto-discovered"), "got: {err}");
@@ -1027,10 +1016,10 @@ mod tests {
     fn list_host_capabilities_orders_by_source_then_capability() {
         let db = open_db();
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
-        insert_capability(&db, "zakalwe", "zzz", "user");
-        insert_capability(&db, "zakalwe", "os=linux", "auto");
-        insert_capability(&db, "zakalwe", "arch=x86", "auto");
-        insert_capability(&db, "zakalwe", "aaa", "user");
+        insert_host_capability(&db, "zakalwe", "zzz", "user");
+        insert_host_capability(&db, "zakalwe", "os=linux", "auto");
+        insert_host_capability(&db, "zakalwe", "arch=x86", "auto");
+        insert_host_capability(&db, "zakalwe", "aaa", "user");
 
         let ordered: Vec<(String, String)> = db
             .list_host_capabilities("zakalwe")
@@ -1148,7 +1137,7 @@ mod tests {
         let db = open_db();
         // A user cap and a stale auto cap on the local host.
         db.add_user_host_capability("local", "team=infra").unwrap();
-        insert_capability(&db, "local", "stale=auto", "auto");
+        insert_host_capability(&db, "local", "stale=auto", "auto");
 
         let conn = db.connect().unwrap();
         refresh_local_host_auto_capabilities(&conn).unwrap();

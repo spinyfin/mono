@@ -3,7 +3,7 @@
 //!
 //! Disabling a host (operator `bossctl hosts disable`, the dispatch-health
 //! circuit breaker in [`WorkDb::record_host_dispatch_failure`], or an
-//! `eager_push_wrapper_rpc` failure) removes it only from *future*
+//! eager registration-time provisioning failure) removes it only from *future*
 //! [`crate::host_scheduling::select_host`] picks. **Nothing reconciles the
 //! executions already routed to it.** That night, when the operator
 //! disabled anaplian, its in-flight `pr_review` executions stayed stuck:
