@@ -437,7 +437,11 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::TrunkSetToken { .. }
         | FrontendRequest::TrunkStatus
         | FrontendRequest::UnpopulateProject { .. }
-        | FrontendRequest::UpdateAutomation { .. } => coordinator(variant_name(request)),
+        | FrontendRequest::UpdateAutomation { .. }
+        | FrontendRequest::GetBoothbyState
+        | FrontendRequest::ListBoothbyPasses { .. }
+        | FrontendRequest::RunBoothbyPass
+        | FrontendRequest::SetBoothbyMode { .. } => coordinator(variant_name(request)),
     }
 }
 

@@ -158,12 +158,15 @@ pub const CI_CHURN_LIMIT: i64 = 5;
 pub use boss_protocol::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING,
     ANSWER_AGENT_RUN_STATUS_SUPERSEDED, AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge,
-    Automation, AutomationPatch, AutomationRun, AutomationTrigger, BOOTHBY_REVERSIBILITY_IRREVERSIBLE,
-    BOOTHBY_TARGET_ATTENTION, BOOTHBY_TARGET_ATTENTION_ITEM, BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK,
-    BlockedSignal, BoothbyAction, BoothbyCursor, BoothbyFinding, BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE,
-    COMMENT_STATUS_ANSWERED, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED,
-    COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION,
-    CREATED_VIA_BOOTHBY_PREFIX, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
+    Automation, AutomationPatch, AutomationRun, AutomationTrigger, BOOTHBY_OUTCOME_CAPPED, BOOTHBY_OUTCOME_COMPLETED,
+    BOOTHBY_OUTCOME_FAILED, BOOTHBY_OUTCOME_NOTHING_TO_DO, BOOTHBY_OUTCOME_TIMED_OUT,
+    BOOTHBY_REVERSIBILITY_IRREVERSIBLE, BOOTHBY_TARGET_ATTENTION, BOOTHBY_TARGET_ATTENTION_ITEM,
+    BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK, BOOTHBY_TRIGGER_EVENT_PREFIX, BOOTHBY_TRIGGER_MANUAL,
+    BOOTHBY_TRIGGER_SCHEDULE, BlockedSignal, BoothbyAction, BoothbyCursor, BoothbyFinding, BoothbyPass, BranchNaming,
+    COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERED, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP,
+    COMMENT_STATUS_DISMISSED, COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED,
+    CREATED_VIA_ATTENTION, CREATED_VIA_BOOTHBY_PREFIX, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX,
+    CREATED_VIA_ENGINE_AUTO,
     CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
     CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState,
     ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution,
@@ -391,6 +394,13 @@ pub struct WorkDb {
     /// cloned freely across the engine, and an arm on one handle must be
     /// visible to the mutation that runs through another.
     boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
+    /// Registered once at boot via [`WorkDb::set_boothby_event_queue`]. Armed
+    /// by [`WorkDb::create_attention_item`] when a new legacy attention item
+    /// is created with a kind in
+    /// [`crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS`]. `None` in
+    /// every test `WorkDb` and any boot path that never registers one — a
+    /// missing queue means "no one is listening," not an error.
+    boothby_event_queue: Arc<Mutex<Option<Arc<crate::boothby_events::BoothbyEventQueue>>>>,
 }
 
 impl Clone for WorkDb {
@@ -400,6 +410,7 @@ impl Clone for WorkDb {
             memory: self.memory.clone(),
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
+            boothby_event_queue: Arc::clone(&self.boothby_event_queue),
         }
     }
 }
@@ -411,6 +422,7 @@ mod audit_misc;
 mod automations;
 mod blocking;
 mod boothby;
+mod boothby_passes;
 mod chain_helpers;
 mod comment_thread_entries;
 mod comments;

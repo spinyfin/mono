@@ -1790,7 +1790,11 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AutomationDedupSuppressionsList { .. }
         | FrontendEvent::AutomationTasksList { .. }
         | FrontendEvent::AutomationRunEnqueued { .. }
-        | FrontendEvent::AutomationStateResult { .. } => {}
+        | FrontendEvent::AutomationStateResult { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. } => {}
     }
 }
 

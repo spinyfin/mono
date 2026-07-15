@@ -110,6 +110,12 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let item = insert_attention_item_row(&tx, &input)?;
         tx.commit()?;
+        // Boothby event trigger (design §"Activation model"): a handful of
+        // attention kinds each represent a state a sweep flagged but could
+        // not fully resolve, and are worth a prompt Boothby visit rather than
+        // waiting for the next scheduled pass. Inert unless a queue is
+        // registered and `item.kind` is one of the trigger kinds.
+        self.maybe_arm_boothby_for_attention_kind(&item.kind);
         Ok(item)
     }
 
