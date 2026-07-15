@@ -401,19 +401,19 @@ pub enum Stage {
     /// carries the retired `slot_id` and, when known, the work item's title.
     HuskPaneReconcile,
     /// The execution-liveness reconciler finalized a non-terminal LOCAL
-    /// execution whose worker pane is provably gone by a *restart-robust*
-    /// signal — either its recorded `work_runs.worker_shell_pid` is dead
-    /// (`kill(pid, 0)` → `ESRCH`), or it never reported a pane pid and has
-    /// been running past the pane-attach deadline (a spawn that stalled before
-    /// `pane_spawned`). This is the gap `lost_workspace_reconcile` (workspace
-    /// dir still on disk), `dead_pid_reconcile` / the app-reattach reconcile
-    /// (in-memory registry empty after a restart), and `cube_lease_auto_reap`
-    /// (the engine's own DB-fallback heartbeat kept the lease alive, so it
-    /// never failed) all miss — the 2026-07-03 zombies that survived the T2168
-    /// fix. The `details` object carries `reason`
-    /// (`pane_pid_dead` / `pane_never_attached`), `prior_status`,
-    /// `age_in_status_secs`, and the probed `worker_shell_pid` so a recurrence
-    /// is attributable from `bossctl dispatch tail` in one read; see
+    /// execution whose worker pane never reported a shell pid and has been
+    /// running past the pane-attach deadline (a spawn that stalled before
+    /// `pane_spawned`) — see `crate::lost_workspace_sweep`. This is the gap
+    /// `lost_workspace_reconcile` (workspace dir still on disk),
+    /// `dead_pane_sweep` (only ever probes a pid that was actually reported),
+    /// and `cube_lease_auto_reap` (the engine's own DB-fallback heartbeat kept
+    /// the lease alive, so it never failed) all miss — the 2026-07-03 zombies
+    /// that survived the T2168 fix. A recorded pid that is now dead is a
+    /// separate signal owned exclusively by `dead_pane_sweep`, which emits
+    /// `Stage::PaneDeathReconcile` instead. The `details` object carries
+    /// `reason` (`pane_never_attached`), `prior_status`, `age_in_status_secs`,
+    /// and the observed `shell_pid` (always absent) so a recurrence is
+    /// attributable from `bossctl dispatch tail` in one read; see
     /// `crate::execution_liveness::classify_pane_liveness`.
     ExecutionLivenessReconcile,
 }

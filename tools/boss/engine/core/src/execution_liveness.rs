@@ -31,7 +31,6 @@ use std::path::Path;
 
 use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_PRODUCED_TASK, WorkExecution};
 
-use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::work::WorkDb;
 
 /// How long after `started_at` a LOCAL execution may go without its worker
@@ -48,82 +47,77 @@ use crate::work::WorkDb;
 /// next fire re-hits the redundant-spawn guard.
 pub const PANE_ATTACH_DEADLINE_SECS: i64 = 300;
 
-/// Restart-robust verdict on whether a LOCAL execution's worker pane is still
-/// alive, derived purely from the durable `(worker_shell_pid, started_at)`
+/// Restart-robust verdict on whether a LOCAL execution's worker pane has ever
+/// attached, derived purely from the durable `(shell_pid, started_at)`
 /// signals — no dependency on the in-memory `LiveWorkerStateRegistry` (which
-/// is wiped by an engine restart, blinding the registry-driven
-/// [`crate::dead_pid_sweep`] to any pre-restart zombie).
+/// is wiped by an engine restart).
+///
+/// This verdict deliberately says nothing about whether an *already-reported*
+/// pid is still alive — that positive-evidence probe (`kill(pid, 0)`) is
+/// [`crate::dead_pane_sweep::reconcile_if_pane_dead`]'s exclusive
+/// responsibility (it owns the `work_runs.shell_pid` probe), so there is
+/// exactly one reaper per death signal.
 ///
 /// Callers MUST have already established the execution is LOCAL (its latest
-/// run ran on `host_id == "local"`): a `kill(pid, 0)` probe on the engine host
-/// is meaningless for a remote worker whose pid lives on another machine.
+/// run ran on `host_id == "local"`): a pid recorded on a remote host is
+/// meaningless to age-based reasoning on the engine host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLivenessVerdict {
-    /// A recorded pane pid that `kill(pid, 0)` reports gone (`ESRCH`) —
-    /// positive evidence the worker process died (e.g. the macOS app that
-    /// parented it was killed/relaunched, taking every child pane with it).
-    PidDead,
     /// No pane pid was ever recorded and the execution started longer than
     /// [`PANE_ATTACH_DEADLINE_SECS`] ago — the pane never attached. This is
     /// the shape the incident zombies took: a run that reached `run_started`
     /// then stalled before `pane_spawned` ever fired, so no pid was reported,
-    /// so the pid-driven reapers ([`crate::dead_pid_sweep`]) skip it forever.
+    /// so the pid-driven reapers ([`crate::dead_pid_sweep`],
+    /// [`crate::dead_pane_sweep`]) skip it forever (they only ever act on a
+    /// pid that was actually reported).
     NeverAttached,
-    /// The pane pid is alive (or alive-but-not-ours, `EPERM`), OR we lack the
-    /// evidence to declare death (no pid yet but still within the attach
-    /// deadline, an unexpected probe error, or no `started_at` to age from).
-    /// Callers MUST treat this as "keep" — we only ever reap on positive
-    /// evidence of death.
+    /// A pid has already been reported (its liveness is
+    /// [`crate::dead_pane_sweep`]'s job, not this classifier's), OR no pid
+    /// yet but still within the attach deadline, OR no `started_at` to age
+    /// from. Callers MUST treat this as "keep" — we only ever reap on
+    /// positive evidence of death.
     LiveOrIndeterminate,
 }
 
 impl PaneLivenessVerdict {
-    /// `true` for the two verdicts that are positive evidence of death.
+    /// `true` for the one verdict that is positive evidence of death.
     pub fn is_dead(self) -> bool {
-        matches!(self, PaneLivenessVerdict::PidDead | PaneLivenessVerdict::NeverAttached)
+        matches!(self, PaneLivenessVerdict::NeverAttached)
     }
 
     /// Stable identifier folded into the reconcile trace event's `reason`
     /// field so a recurrence is attributable in one read.
     pub fn reason(self) -> &'static str {
         match self {
-            PaneLivenessVerdict::PidDead => "pane_pid_dead",
             PaneLivenessVerdict::NeverAttached => "pane_never_attached",
             PaneLivenessVerdict::LiveOrIndeterminate => "pane_live_or_indeterminate",
         }
     }
 }
 
-/// Classify a LOCAL execution's pane liveness from its durable signals.
+/// Classify whether a LOCAL execution's pane has ever attached, from its
+/// durable signals.
 ///
-/// `shell_pid` is the latest run's `work_runs.worker_shell_pid` (the pane pid
-/// the app reported, or `None` if it never did). `started_at_epoch` is the
+/// `shell_pid` is the latest run's `work_runs.shell_pid` (the pane pid the
+/// app reported, or `None` if it never did). `started_at_epoch` is the
 /// execution's `started_at` parsed as epoch-seconds (`None` if it never
 /// started a run). `now_epoch` is the current wall clock (injected for
 /// deterministic tests).
 ///
-/// Pure and restart-robust: it reads only these values plus a `kill(pid, 0)`
-/// probe, so it returns the same verdict whether called at engine startup, on
-/// a periodic sweep, or inline from the redundant-spawn guard. It errs
-/// exclusively toward [`PaneLivenessVerdict::LiveOrIndeterminate`] on any
-/// ambiguity — a live worker's pid is always alive, so this can never
-/// misclassify a live worker as dead (a recycled-pid false *negative* only
-/// misses a zombie, which is the safe direction).
+/// Pure: it reads only these three values, so it returns the same verdict
+/// whether called at engine startup, on a periodic sweep, or inline from the
+/// redundant-spawn guard. It errs exclusively toward
+/// [`PaneLivenessVerdict::LiveOrIndeterminate`] on any ambiguity — a reported
+/// pid, live or not, is never this classifier's business to reap.
 pub fn classify_pane_liveness(
     shell_pid: Option<i64>,
     started_at_epoch: Option<i64>,
     now_epoch: i64,
 ) -> PaneLivenessVerdict {
     match shell_pid {
-        Some(pid) if pid > 0 => match probe_pid(pid as i32) {
-            PidStatus::Dead => PaneLivenessVerdict::PidDead,
-            // Alive, alive-but-not-ours (EPERM), or an unexpected probe error
-            // → keep. Extending a maybe-dead row one more sweep costs nothing;
-            // reaping a live worker steals its working copy.
-            PidStatus::Alive | PidStatus::PermissionDenied | PidStatus::Unknown(_) => {
-                PaneLivenessVerdict::LiveOrIndeterminate
-            }
-        },
+        // A pid has already been reported — whether it is still alive is
+        // `dead_pane_sweep`'s job, not this classifier's.
+        Some(pid) if pid > 0 => PaneLivenessVerdict::LiveOrIndeterminate,
         // No pid ever recorded. Only positive evidence of death is age: a
         // healthy local pane reports its pid within seconds, so no pid past
         // the attach deadline means it never came up.
@@ -583,29 +577,11 @@ mod tests {
 
     // ── classify_pane_liveness ────────────────────────────────────────────────
 
-    /// A PID guaranteed not to exist: spawn `true`, wait for it to exit,
-    /// reuse its released pid. (Same trick the dead-PID sweep tests use.)
-    fn dead_pid() -> i64 {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id() as i64;
-        let _ = child.wait();
-        pid
-    }
-
     #[test]
-    fn pane_pid_dead_when_recorded_pid_is_gone() {
-        // A recorded pane pid whose process has exited is positive evidence
-        // the worker (and the pane that parented it) is gone — the
-        // spawned-then-parked-then-died-on-restart shape.
-        let verdict = classify_pane_liveness(Some(dead_pid()), Some(1_700_000_000), 1_700_009_999);
-        assert_eq!(verdict, PaneLivenessVerdict::PidDead);
-        assert!(verdict.is_dead());
-        assert_eq!(verdict.reason(), "pane_pid_dead");
-    }
-
-    #[test]
-    fn pane_alive_when_recorded_pid_is_running() {
-        // Our own process pid is guaranteed alive — must never be reaped.
+    fn pane_indeterminate_once_any_pid_has_been_reported() {
+        // Once a pid has been reported, its liveness is `dead_pane_sweep`'s
+        // job — this classifier never claims death for a reported pid, dead
+        // or alive.
         let alive = std::process::id() as i64;
         let verdict = classify_pane_liveness(Some(alive), Some(1_700_000_000), 1_700_009_999);
         assert_eq!(verdict, PaneLivenessVerdict::LiveOrIndeterminate);

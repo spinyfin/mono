@@ -239,30 +239,6 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
     }
     // Update the pid→run_id registry so hook-event ancestor walk works.
     server_state.worker_registry.register(shell_pid, run_id.clone());
-    // Durably persist the pane pid onto the run row so a DB-driven reconciler
-    // can probe pane liveness AFTER an engine/app restart (the in-memory
-    // registries above are wiped by a restart, so the restart-robust
-    // reconcilers can't read them). Best-effort: a persist failure only costs
-    // us the restart-robust probe for this one pane; the live registry above
-    // still drives the in-process dead-pid sweep. (`run_id` is the execution
-    // id, the same key the live registry uses.)
-    match server_state
-        .work_db
-        .set_run_worker_shell_pid_for_execution(&run_id, shell_pid as i64)
-    {
-        Ok(true) => {}
-        Ok(false) => tracing::debug!(
-            run_id = %run_id,
-            shell_pid,
-            "update_worker_shell_pid: no run row yet to persist pane pid onto (pid still tracked in-memory)",
-        ),
-        Err(err) => tracing::warn!(
-            run_id = %run_id,
-            shell_pid,
-            error = %format!("{err:#}"),
-            "update_worker_shell_pid: failed to persist pane pid to work_runs (restart-robust probe unavailable for this pane)",
-        ),
-    }
     // Update the live-state registry so dead-pid sweep and bossctl reaping
     // can signal the process when needed. A miss here (the concurrent-spawn
     // race where the app's pid push outran the engine's `register_spawn`, or a

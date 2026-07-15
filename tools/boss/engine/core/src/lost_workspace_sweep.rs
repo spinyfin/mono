@@ -1,17 +1,26 @@
 //! Restart-robust reconciler for non-terminal LOCAL executions whose worker
 //! is provably gone. Named for its original signal (a vanished cube workspace
-//! directory — the 2026-06-14 "waiting_human zombie"), it now reaps on any of
-//! three durable death signals; see [`reconcile_if_execution_dead`]:
+//! directory — the 2026-06-14 "waiting_human zombie"), it now reaps on either
+//! of two durable death signals; see [`reconcile_if_execution_dead`]:
 //!
 //! 1. the cube workspace directory has vanished from disk (original signal);
-//! 2. the recorded pane pid (`work_runs.worker_shell_pid`) is dead; or
-//! 3. no pane pid was ever reported and the run has been live past the
+//!    or
+//! 2. no pane pid was ever reported and the run has been live past the
 //!    pane-attach deadline (a spawn that stalled before `pane_spawned`).
 //!
-//! Signals 2 and 3 close the 2026-07-03 gap where a pane died on an app
-//! restart while its workspace dir survived and its cube lease stayed alive
-//! (kept beating by the engine's own DB-fallback heartbeat), so no existing
-//! reconciler reaped it.
+//! Signal 2 closes the 2026-07-03 gap where a pane died before ever reporting
+//! a pid (so [`crate::dead_pane_sweep`], which only ever probes a pid that
+//! was actually reported, can never see it) while its workspace dir survived
+//! and its cube lease stayed alive (kept beating by the engine's own
+//! DB-fallback heartbeat), so no existing reconciler reaped it.
+//!
+//! A THIRD death signal — a recorded pane pid that is now dead
+//! (`kill(pid, 0)` → `ESRCH`) — is deliberately NOT reimplemented here: it is
+//! [`crate::dead_pane_sweep::reconcile_if_pane_dead`]'s exclusive
+//! responsibility (it owns `work_runs.shell_pid` end to end), so there is
+//! exactly one reaper per death signal. `run_one_pass` here and
+//! `dead_pane_sweep::run_one_pass` both sweep the same candidate set every 60s
+//! from `server.rs`, so that signal is covered without duplicating it.
 //!
 //! ## Why this exists
 //!
@@ -64,6 +73,16 @@
 //! ONLY on executions whose latest run ran on `host_id == "local"`. Remote
 //! workers are never reaped here.
 //!
+//! ## Status gate
+//!
+//! Only `is_live()` executions (`running` / `waiting_human`) are eligible —
+//! mirrors [`crate::dead_pane_sweep::reconcile_if_pane_dead`]'s identical
+//! gate. `waiting_review`, `waiting_merge`, `queued`, `ready`, and
+//! `waiting_dependency` are all normal park states whose worker has already
+//! finished and exited BY DESIGN (or hasn't started one yet); reaping those
+//! on an incidentally-missing pid or workspace signal would falsely orphan
+//! work correctly parked awaiting a human, a merge, or a dependency.
+//!
 //! ## Cadence
 //!
 //! Runs every 60 seconds and fires once immediately on boot (same pattern as
@@ -77,7 +96,7 @@ use boss_protocol::WorkExecution;
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEventSink, Stage};
-use crate::execution_liveness::{PaneLivenessVerdict, classify_pane_liveness, execution_workspace_dir_missing};
+use crate::execution_liveness::{classify_pane_liveness, execution_workspace_dir_missing};
 use crate::work::WorkDb;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
@@ -188,71 +207,47 @@ pub async fn run_one_pass(
     outcome
 }
 
-/// Transition `execution` to `orphaned` and finalize its automation-run
-/// bookkeeping and dispatch event — shared by every death signal in
-/// [`reconcile_if_execution_dead`], funneled through
-/// [`crate::execution_liveness::finalize_gone_execution`] (the single place
-/// this orphan → triage-bookkeeping → dispatch-event flow lives, shared with
-/// `dead_pane_sweep`) so it is written once.
-///
-/// `reason` is stamped on the row; `triage_death_reason` is a human-readable
-/// clause (e.g. "its cube workspace `…` is gone") folded into the triage
-/// `automation_runs` bookkeeping for `AutomationTriage` executions. `stage`
-/// and `details` identify which signal fired on the emitted dispatch event.
-///
-/// Returns `true` when the row was (or already had been) reconciled to a
-/// terminal status; `false` when the orphan failed and the row is still live
-/// (a later pass retries).
-async fn finalize_dead_execution(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
-    execution: &WorkExecution,
-    reason: &str,
-    triage_death_reason: &str,
-    stage: Stage,
-    details: serde_json::Value,
-) -> bool {
-    crate::execution_liveness::finalize_gone_execution(
-        work_db,
-        dispatch_events,
-        execution,
-        reason,
-        triage_death_reason,
-        stage,
-        details,
-    )
-    .await
-}
-
 /// Finalize `execution` iff it is a non-terminal LOCAL execution whose worker
 /// pane is provably gone by a *restart-robust* signal. Returns `true` when the
 /// row was (or already had been) reconciled to a terminal status; `false` when
 /// there is no positive evidence of death and callers should keep treating it
 /// as live.
 ///
-/// Three independent death signals, each derived from durable state (the DB
-/// row + the filesystem/`kill(pid,0)`) so the verdict survives an engine
-/// restart that empties the in-memory `LiveWorkerStateRegistry`:
+/// Two independent death signals, each derived from durable state (the DB row
+/// and the filesystem) so the verdict survives an engine restart that empties
+/// the in-memory `LiveWorkerStateRegistry`:
 ///
 /// 1. **workspace dir gone** — the worker's cwd vanished (the 2026-06-14
 ///    workspace-root migration). Emits [`Stage::LostWorkspaceReconcile`].
-/// 2. **pane pid dead** — the recorded `work_runs.worker_shell_pid` is gone
-///    (`kill(pid, 0)` → `ESRCH`); the pane the app parented died with it (an
-///    app relaunch). Emits [`Stage::ExecutionLivenessReconcile`].
-/// 3. **pane never attached** — no pid was ever reported and the run has been
+/// 2. **pane never attached** — no pid was ever reported and the run has been
 ///    live past the pane-attach deadline (stalled before `pane_spawned`).
 ///    Emits [`Stage::ExecutionLivenessReconcile`].
 ///
-/// Signals 2 and 3 close the exact gap that let the 2026-07-03 zombies survive
-/// the T2168 fix: their workspace dirs were still on disk (so signal 1 never
-/// fired), their cube leases were kept alive by the engine's own DB-fallback
-/// heartbeat (so `cube_lease_auto_reap` never fired), and the in-memory
-/// registry was empty after the restart (so `dead_pid_reconcile` never saw
-/// them). See [`classify_pane_liveness`].
+/// A dead *recorded* pid (`kill(pid, 0)` → `ESRCH`) is a THIRD, separate
+/// signal that this function deliberately does not probe — that is
+/// [`crate::dead_pane_sweep::reconcile_if_pane_dead`]'s exclusive
+/// responsibility, so there is exactly one reaper per signal. See the module
+/// docs.
 ///
-/// DB + filesystem + a `kill(pid,0)` probe, plus a trace event — no
-/// cube/coordinator dependency — so it can be called both from the periodic
-/// [`run_one_pass`] and inline from the coordinator's redundant-spawn guard.
+/// Only states where a live worker is expected to still be holding the
+/// workspace (`running` / `waiting_human`, i.e. [`boss_protocol::ExecutionStatus::is_live`])
+/// are eligible — mirrors `reconcile_if_pane_dead`'s identical gate. A
+/// `waiting_review`/`waiting_merge`/etc. execution's worker has already
+/// finished its job and exited by design (it may have a gone pid, or a
+/// workspace whose contents changed since), so reaping those would falsely
+/// orphan work correctly parked awaiting a human.
+///
+/// Signal 2 closes the exact gap that let the 2026-07-03 zombies survive the
+/// T2168 fix: their workspace dirs were still on disk (so signal 1 never
+/// fired), their cube leases were kept alive by the engine's own DB-fallback
+/// heartbeat (so `cube_lease_auto_reap` never fired), and no pid was ever
+/// reported (so neither `dead_pid_sweep` nor `dead_pane_sweep`, which only
+/// ever probe a pid that was actually reported, ever saw them). See
+/// [`classify_pane_liveness`].
+///
+/// DB + filesystem, plus a trace event — no cube/coordinator dependency — so
+/// it can be called both from the periodic [`run_one_pass`] and inline from
+/// the coordinator's redundant-spawn guard.
 pub async fn reconcile_if_execution_dead(
     work_db: &WorkDb,
     dispatch_events: &dyn DispatchEventSink,
@@ -275,21 +270,27 @@ async fn reconcile_if_execution_dead_at(
         return false;
     }
 
-    // Host safety + the pane pid in one read. A local filesystem/`kill`
-    // probe only means anything for a local worker, so only reconcile when
-    // the latest run ran on `host_id == "local"`. Anything else (remote host,
-    // or no run recorded to judge from) is left alone so a live remote worker
-    // is never falsely reaped.
-    let (shell_pid, prior_status) = match work_db.latest_run_host_and_shell_pid_for_execution(&execution.id) {
-        Ok(Some((host, pid))) if host == "local" => (pid, execution.status.as_str()),
-        Ok(Some((host, _))) => {
-            tracing::trace!(
-                execution_id = %execution.id,
-                %host,
-                "execution-liveness reconcile: skipping non-local execution",
-            );
-            return false;
-        }
+    // Only reconcile states where a live worker is expected to still be
+    // holding the workspace — exactly `is_live()`, mirroring
+    // `dead_pane_sweep::reconcile_if_pane_dead`'s gate. Every other
+    // non-terminal state (`waiting_review`, `waiting_merge`, `queued`,
+    // `ready`, `waiting_dependency`, ...) is a normal park state whose worker
+    // has already finished and exited BY DESIGN — its workspace dir or pane
+    // pid looking "gone" there is expected, not a zombie, and reaping it
+    // would orphan work correctly parked awaiting a human or a dependency.
+    if !execution.status.is_live() {
+        return false;
+    }
+
+    let prior_status = execution.status.as_str();
+
+    // Host safety: a local filesystem/pid probe only means anything for a
+    // local worker, so only reconcile when the latest run ran on
+    // `host_id == "local"`. Anything else (remote host, or no run recorded to
+    // judge from) is left alone so a live remote worker is never falsely
+    // reaped.
+    let host = match work_db.latest_run_host_for_execution(&execution.id) {
+        Ok(Some(host)) => host,
         Ok(None) => return false,
         Err(err) => {
             tracing::debug!(
@@ -300,18 +301,26 @@ async fn reconcile_if_execution_dead_at(
             return false;
         }
     };
+    if host != "local" {
+        tracing::trace!(
+            execution_id = %execution.id,
+            %host,
+            "execution-liveness reconcile: skipping non-local execution",
+        );
+        return false;
+    }
 
     // Signal 1 — the worker's cwd is gone (workspace-root migration). Kept as
     // a distinct `lost_workspace_reconcile` event: it is a different failure
-    // mode (workspace relocation) than a dead pane, and existing tooling pins
-    // that stage.
+    // mode (workspace relocation) than a stalled spawn, and existing tooling
+    // pins that stage.
     if execution_workspace_dir_missing(execution) {
         let workspace_path = execution.workspace_path.clone().unwrap_or_default();
         let reason = format!(
             "lost-workspace reconcile: cube workspace directory `{workspace_path}` no longer exists on disk; \
              worker pane is gone (prior status `{prior_status}`)"
         );
-        let reconciled = finalize_dead_execution(
+        let reconciled = crate::execution_liveness::finalize_gone_execution(
             work_db,
             dispatch_events,
             execution,
@@ -340,32 +349,43 @@ async fn reconcile_if_execution_dead_at(
         return reconciled;
     }
 
-    // Signals 2 & 3 — the pane process is gone (restart-robust). The workspace
-    // dir still exists (else signal 1 would have fired), so this is the
-    // survived-the-T2168-fix shape.
-    let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
+    // Signal 2 — the pane never attached (restart-robust). The workspace dir
+    // still exists (else signal 1 would have fired), so read the durable pid
+    // `dead_pane_sweep` also reads (`work_runs.shell_pid`) — a `None` here
+    // means no pid was ever reported, which is this signal's precondition.
+    let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
+        Ok(pid) => pid,
+        Err(err) => {
+            tracing::debug!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "execution-liveness reconcile: could not read durable shell pid; skipping conservatively",
+            );
+            return false;
+        }
+    };
+    let started_epoch = execution.started_epoch();
     let verdict = classify_pane_liveness(shell_pid, started_epoch, now_epoch);
     if !verdict.is_dead() {
         return false;
     }
 
     let age_in_status_secs = started_epoch.map(|s| now_epoch.saturating_sub(s));
-    let pane_clause = match verdict {
-        PaneLivenessVerdict::PidDead => format!(
-            "its worker pane pid {} is gone (kill(pid,0) → ESRCH)",
-            shell_pid.unwrap_or_default()
-        ),
-        PaneLivenessVerdict::NeverAttached => format!(
-            "its worker pane never reported a shell pid within {}s of starting; it never attached",
-            crate::execution_liveness::PANE_ATTACH_DEADLINE_SECS
-        ),
-        PaneLivenessVerdict::LiveOrIndeterminate => unreachable!("guarded by is_dead()"),
-    };
+    let pane_clause = format!(
+        "its worker pane never reported a shell pid within {}s of starting; it never attached",
+        crate::execution_liveness::PANE_ATTACH_DEADLINE_SECS
+    );
     let reason = format!(
         "execution-liveness reconcile: {pane_clause} (prior status `{prior_status}`, age {age_in_status_secs:?}s)"
     );
 
-    let reconciled = finalize_dead_execution(
+    // The workspace dir exists (signal 1 didn't fire) and may hold
+    // uncommitted work from a prior run on a resumed execution — snapshot it
+    // before the row becomes eligible for resume/reset, mirroring
+    // `dead_pane_sweep::reconcile_if_pane_dead`'s backup-before-orphan.
+    let recovery_patch = crate::recovery_backup::backup_dead_execution(execution);
+
+    let reconciled = crate::execution_liveness::finalize_gone_execution(
         work_db,
         dispatch_events,
         execution,
@@ -376,8 +396,9 @@ async fn reconcile_if_execution_dead_at(
             "reason": verdict.reason(),
             "prior_status": prior_status,
             "age_in_status_secs": age_in_status_secs,
-            "worker_shell_pid": shell_pid,
+            "shell_pid": shell_pid,
             "kind": execution.kind.as_str(),
+            "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
         }),
     )
     .await;
@@ -388,9 +409,9 @@ async fn reconcile_if_execution_dead_at(
             work_item_id = %execution.work_item_id,
             prior_status,
             verdict = verdict.reason(),
-            worker_shell_pid = ?shell_pid,
+            shell_pid = ?shell_pid,
             age_in_status_secs = ?age_in_status_secs,
-            "execution-liveness reconcile: finalized execution whose worker pane is gone",
+            "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
     }
 
@@ -561,48 +582,6 @@ mod tests {
         assert_eq!(after.status, ExecutionStatus::WaitingHuman, "row must be left live");
     }
 
-    /// The core 2026-07-03 fix: a zombie whose workspace dir STILL EXISTS (so
-    /// the lost-workspace signal never fires) but whose recorded pane pid is
-    /// dead — the pane died on an app restart, its dir + cube lease survived —
-    /// is reconciled via the restart-robust pid probe and emits an
-    /// `execution_liveness_reconcile` event naming the signal.
-    #[tokio::test]
-    async fn reconciles_zombie_whose_pane_pid_is_dead() {
-        let (_d, db) = open_db();
-        let product = create_product(&db);
-        let automation = create_automation(&db, &product);
-        // Workspace dir exists → the lost-workspace signal is silent.
-        let real_dir = TempDir::new().unwrap();
-        let exec = parked_triage_execution(&db, &automation, real_dir.path().to_str().unwrap(), "local");
-        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
-        // The app reported a pane pid before the pane died; persist it as a pid
-        // that no longer exists.
-        assert!(db.set_run_worker_shell_pid_for_execution(&exec.id, dead_pid()).unwrap());
-
-        let sink = RecordingDispatchEventSink::new();
-        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec).await;
-        assert!(reconciled, "a zombie whose pane pid is dead must be reconciled");
-
-        let after = db.get_execution(&exec.id).unwrap();
-        assert_eq!(after.status, ExecutionStatus::Orphaned);
-
-        let events = sink.events_for(&exec.id).await;
-        let ev = events
-            .iter()
-            .find(|e| e.stage == "execution_liveness_reconcile")
-            .unwrap_or_else(|| panic!("expected execution_liveness_reconcile event; got {events:#?}"));
-        assert_eq!(ev.details.get("reason").and_then(|v| v.as_str()), Some("pane_pid_dead"));
-        assert_eq!(
-            ev.details.get("prior_status").and_then(|v| v.as_str()),
-            Some("waiting_human")
-        );
-
-        // Triage bookkeeping is finalized off the pessimistic placeholder.
-        let runs = db.list_automation_runs(&automation).unwrap();
-        assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
-        assert!(runs[0].finished_at.is_some());
-    }
-
     /// The stalled-at-run_started shape: no pane pid was ever reported and the
     /// run has been live past the pane-attach deadline — the pane never came
     /// up. Reconciled via the age signal (the case every pid-driven reaper
@@ -634,28 +613,130 @@ mod tests {
         );
     }
 
-    /// A live pane (its recorded pid is our own, guaranteed-alive process) is
-    /// NEVER reaped, even long past the attach deadline. The cardinal safety
-    /// property: this reconciler must never steal a live worker's workspace.
+    /// Once ANY pid has been reported — dead or alive — this reconciler must
+    /// never claim "never attached": that pid's liveness is exclusively
+    /// `dead_pane_sweep::reconcile_if_pane_dead`'s job (see the module docs),
+    /// so a reported-but-now-dead pid must be left for it, not double-reaped
+    /// here.
     #[tokio::test]
-    async fn leaves_execution_whose_pane_pid_is_alive() {
+    async fn leaves_execution_once_any_pid_has_been_reported() {
         let (_d, db) = open_db();
         let product = create_product(&db);
         let automation = create_automation(&db, &product);
         let real_dir = TempDir::new().unwrap();
         let exec = parked_triage_execution(&db, &automation, real_dir.path().to_str().unwrap(), "local");
-        assert!(
-            db.set_run_worker_shell_pid_for_execution(&exec.id, std::process::id() as i64)
-                .unwrap()
-        );
+        // A pid was reported (dead-by-now) — `dead_pane_sweep` owns reaping it,
+        // not this reconciler.
+        assert!(db.set_run_shell_pid_for_execution(&exec.id, dead_pid()).unwrap());
         let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS + 10_000;
 
         let sink = NoopDispatchEventSink;
         let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now).await;
-        assert!(!reconciled, "a live-pane execution must never be reaped");
+        assert!(
+            !reconciled,
+            "an execution with a reported pid must never be reaped as 'never attached'"
+        );
         assert_eq!(
             db.get_execution(&exec.id).unwrap().status,
             ExecutionStatus::WaitingHuman
+        );
+    }
+
+    /// The dropped `is_live()` gate this fixes: a `waiting_review` execution
+    /// whose worker has already finished its job and exited BY DESIGN (so its
+    /// pid is correctly gone and no *new* pid was ever reported) must NOT be
+    /// reconciled as "never attached" just because it is old and pid-less —
+    /// mirrors `dead_pane_sweep`'s `non_live_status_with_dead_pid_is_skipped`.
+    #[tokio::test]
+    async fn leaves_waiting_review_execution_even_when_pane_never_attached_shape_matches() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let real_dir = TempDir::new().unwrap();
+        let exec = db
+            .create_automation_triage_execution(&automation, "https://github.com/test/repo")
+            .unwrap();
+        let (_e, run) = db
+            .start_execution_run_on_host(
+                &exec.id,
+                "auto-worker-1",
+                "repo-1",
+                "lease-1",
+                "mono-agent-028",
+                real_dir.path().to_str().unwrap(),
+                "local",
+            )
+            .unwrap();
+        // Park in waiting_review — the worker finished and exited by design;
+        // no pid was ever reported for this state transition.
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingReview)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+        let exec = db.get_execution(&exec.id).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::WaitingReview);
+        let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS + 10_000;
+
+        let sink = NoopDispatchEventSink;
+        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now).await;
+        assert!(
+            !reconciled,
+            "a waiting_review execution (worker exited by design) must not be reaped"
+        );
+        assert_eq!(
+            db.get_execution(&exec.id).unwrap().status,
+            ExecutionStatus::WaitingReview
+        );
+    }
+
+    /// Same non-live gate, `waiting_merge` shape: also a normal park state
+    /// whose worker has already exited by design, and must not be reaped even
+    /// with a missing workspace directory (signal 1's own trigger condition).
+    #[tokio::test]
+    async fn leaves_waiting_merge_execution_even_when_workspace_is_gone() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = db
+            .create_automation_triage_execution(&automation, "https://github.com/test/repo")
+            .unwrap();
+        let (_e, run) = db
+            .start_execution_run_on_host(
+                &exec.id,
+                "auto-worker-1",
+                "repo-1",
+                "lease-1",
+                "mono-agent-028",
+                "/nonexistent/old-root/mono-agent-040",
+                "local",
+            )
+            .unwrap();
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingMerge)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+        let exec = db.get_execution(&exec.id).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::WaitingMerge);
+
+        let sink = NoopDispatchEventSink;
+        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec).await;
+        assert!(
+            !reconciled,
+            "a waiting_merge execution must not be reaped even with a missing workspace dir"
+        );
+        assert_eq!(
+            db.get_execution(&exec.id).unwrap().status,
+            ExecutionStatus::WaitingMerge
         );
     }
 
