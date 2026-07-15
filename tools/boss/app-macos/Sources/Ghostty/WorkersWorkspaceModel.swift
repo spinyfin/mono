@@ -22,9 +22,9 @@ final class WorkersWorkspaceModel: ObservableObject {
     static let lowerDecksSlotRange = (workerPageSize + 1)...workerSlotCount          // 9...16
     /// Automation pool occupies slot IDs immediately above the interactive pool.
     /// Matches MAX_AUTOMATION_POOL_SIZE in coordinator.rs.
-    static let automationSlotCount = 6
+    static let automationSlotCount = 8
     static let automationSlotBase = workerSlotCount + 1   // 17
-    static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 17...22
+    static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 17...24
     /// Review pool occupies slot IDs immediately above the automation pool.
     /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
     /// when the engine pushes EnginePoolConfig on RegisterAppSession, so the
@@ -33,7 +33,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// and ensures the slot grid renders correctly before the first pool-config
     /// push arrives (covering the unlikely race of a SpawnWorkerPane before
     /// EnginePoolConfig, and preventing an empty grid on first launch).
-    static let reviewSlotBase = automationSlotBase + automationSlotCount   // 23
+    static let reviewSlotBase = automationSlotBase + automationSlotCount   // 25
 
     /// Instance-level review slot count, kept in sync with the engine's live
     /// pool config. Published so the pool-picker header re-renders whenever

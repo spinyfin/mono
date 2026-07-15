@@ -102,9 +102,9 @@ pub const MAX_WORKER_POOL_SIZE: usize = WORKER_PAGE_SIZE * WORKER_PAGE_COUNT;
 
 /// Hard cap on the automation worker pool. The runtime config can request a
 /// smaller pool via `BOSS_AUTOMATION_POOL_SIZE`, but values above this are
-/// clamped. Raised from 3 to 6 (two rows of three in the Automations pane)
-/// per operator request.
-pub const MAX_AUTOMATION_POOL_SIZE: usize = 6;
+/// clamped. Raised from 6 to 8 per operator request (2026-07-15): automation
+/// demand regularly exceeds the pool.
+pub const MAX_AUTOMATION_POOL_SIZE: usize = 8;
 
 /// Hard cap on the review worker pool. The runtime config can request a
 /// smaller pool via `BOSS_REVIEW_POOL_SIZE`, but values above this are
@@ -1062,8 +1062,8 @@ impl WorkerPool {
 /// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE` so the
 /// three pools occupy disjoint slot ranges. With the current geometry
 /// (`MAX_WORKER_POOL_SIZE = 16`) that is `1..=16` interactive (Bridge
-/// Crew 1..=8, Lower Decks 9..=16), `17..=22` automation, `23..=30`
-/// review — so "auto-worker-1" → slot 17, "review-1" → slot 23, never
+/// Crew 1..=8, Lower Decks 9..=16), `17..=24` automation, `25..=32`
+/// review — so "auto-worker-1" → slot 17, "review-1" → slot 25, never
 /// colliding with another pool's range. Every boundary is derived from
 /// the pool-size constants, so bumping [`WORKER_PAGE_COUNT`] shifts the
 /// automation/review ranges up in lock-step on both the engine and app.
@@ -8863,7 +8863,7 @@ mod tests {
     #[test]
     fn slot_id_from_worker_id_accepts_automation_pool_format() {
         // Automation-pool ordinals are offset by MAX_WORKER_POOL_SIZE (16) so the
-        // two pools occupy disjoint slot ranges: interactive 1..=16, automation 17..=22.
+        // two pools occupy disjoint slot ranges: interactive 1..=16, automation 17..=24.
         for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
             let auto_worker_id = format!("auto-worker-{ordinal}");
             let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8;
@@ -8886,7 +8886,7 @@ mod tests {
             assert_eq!(wid, format!("worker-{slot}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
-        // Automation pool: slots 17..=22 → "auto-worker-M" → back to the same slot.
+        // Automation pool: slots 17..=24 → "auto-worker-M" → back to the same slot.
         let automation_end = MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
         for slot in (MAX_WORKER_POOL_SIZE as u8 + 1)..=automation_end {
             let wid = worker_id_for_slot(slot);
@@ -8894,7 +8894,7 @@ mod tests {
             assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
-        // Review pool: slots 23..=30 → "review-M" → back to the same slot.
+        // Review pool: slots 25..=32 → "review-M" → back to the same slot.
         for slot in (automation_end + 1)..=(automation_end + MAX_REVIEW_POOL_SIZE as u8) {
             let wid = worker_id_for_slot(slot);
             let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
@@ -8906,7 +8906,7 @@ mod tests {
     #[test]
     fn slot_id_from_worker_id_accepts_review_pool_format() {
         // Review-pool ordinals are offset past both the interactive (16) and
-        // automation (6) ranges, so they occupy slots 23..=30 — disjoint
+        // automation (8) ranges, so they occupy slots 25..=32 — disjoint
         // from every other pool.
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_worker_id = format!("review-{ordinal}");
@@ -8924,8 +8924,8 @@ mod tests {
 
     #[test]
     fn review_pool_slots_are_disjoint_from_other_pools() {
-        // The slot IDs produced by review-N (23..=30) must not overlap
-        // with any interactive-pool (1..=16) or automation-pool (17..=22) slot.
+        // The slot IDs produced by review-N (25..=32) must not overlap
+        // with any interactive-pool (1..=16) or automation-pool (17..=24) slot.
         let automation_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE;
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_wid = format!("review-{ordinal}");
@@ -8969,7 +8969,7 @@ mod tests {
 
     #[test]
     fn automation_pool_slots_are_disjoint_from_regular_pool() {
-        // The slot IDs produced by auto-worker-N (17..=22) must not
+        // The slot IDs produced by auto-worker-N (17..=24) must not
         // overlap with any interactive-pool slot (1..=16).
         for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
             let auto_wid = format!("auto-worker-{ordinal}");
