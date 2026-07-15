@@ -253,7 +253,13 @@ pub async fn reconcile_if_execution_dead(
     dispatch_events: &dyn DispatchEventSink,
     execution: &WorkExecution,
 ) -> bool {
-    reconcile_if_execution_dead_at(work_db, dispatch_events, execution, crate::epoch_time::now_epoch_secs()).await
+    reconcile_if_execution_dead_at(
+        work_db,
+        dispatch_events,
+        execution,
+        boss_engine_utils::epoch_time::now_epoch_secs(),
+    )
+    .await
 }
 
 /// [`reconcile_if_execution_dead`] with the wall clock injected, so the

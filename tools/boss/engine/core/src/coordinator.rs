@@ -2986,7 +2986,7 @@ impl ExecutionCoordinator {
                         .started_at
                         .as_deref()
                         .and_then(|s| s.parse::<i64>().ok())
-                        .map(|s| crate::epoch_time::now_epoch_secs().saturating_sub(s));
+                        .map(|s| boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(s));
                     tracing::info!(
                         execution_id = %execution.id,
                         live_execution_id = %live.id,
