@@ -204,9 +204,22 @@ pub const MAX_REVIEW_POOL_SIZE: usize = 8;
 pub const DEFAULT_REVIEW_POOL_SIZE: usize = 8;
 
 /// TEMPORARY hard cap on concurrently-live INTERACTIVE ("normal") pool
-/// workers — the automation and review pools are governed by their own sizes
-/// and are NOT counted against this. The interactive pool has 16 slots
-/// across two pages (Bridge Crew + Lower Decks), but the 2026-07-15
+/// workers — a *row dispatched from* the automation or review pool is never
+/// held by this gate; those pools' own sizes govern their own home-pool
+/// dispatch. That is NOT the same as saying automation never counts toward
+/// the number this cap compares against: `busy_count()` counts every claimed
+/// `worker_pool` slot, and a spilled automation run (one that overflowed its
+/// full home pool onto a Lower Decks interactive slot via `claim_worker_spill`)
+/// IS one of those slots, so it DOES count against this cap. That is a
+/// deliberate policy choice, not an oversight: counting spilled automation
+/// keeps the cap's load-bearing promise (never more than
+/// `MAX_CONCURRENT_INTERACTIVE_WORKERS` live interactive-pool workers, spilled
+/// automation included) intact, while the once-per-pass automation-preemption
+/// fallback in `drain_ready_queue` is what keeps mainline from starving behind
+/// spilled automation at the cap — a preemption is a trade (one live worker
+/// for another), so it can reclaim a slot from spilled automation without
+/// ever pushing the live count past the cap. The interactive pool has 16
+/// slots across two pages (Bridge Crew + Lower Decks), but the 2026-07-15
 /// full-fleet saturation experiment (22 live workers, load average ~152)
 /// pushed individual task times past an hour and broke pane spawn acks, so
 /// dispatch is held to one page's worth — the pre-Lower-Decks size — even
@@ -2674,8 +2687,13 @@ impl ExecutionCoordinator {
             // 2026-07-15): main-pool rows are held once the interactive
             // pool's live workers reach [`MAX_CONCURRENT_INTERACTIVE_WORKERS`],
             // even though the pool has 16 slots. Automation and review rows
-            // are NOT gated by it — their pools' own sizes govern them. The
-            // actual gate lives at the claim site below (search
+            // dispatched from their OWN home pools are never held by this
+            // gate — their pools' own sizes govern them. Spilled automation
+            // is a different story: it claims an interactive-pool slot (see
+            // `claim_worker_spill`), so it DOES count toward the live number
+            // this cap compares against — see the constant's doc for why
+            // that's intentional. The actual gate lives at the claim site
+            // below (search
             // `interactive_concurrency_cap`), not here: it must run AFTER
             // the once-per-pass automation-preemption fallback gets its
             // chance, because a preemption is a trade (one live worker for

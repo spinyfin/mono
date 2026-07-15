@@ -1052,6 +1052,7 @@ mod tests {
         );
         assert_eq!(Stage::DispatchPaused.as_str(), "dispatch_paused");
         assert_eq!(Stage::DispatchResumed.as_str(), "dispatch_resumed");
+        assert_eq!(Stage::AutomationPreempted.as_str(), "automation_preempted");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
