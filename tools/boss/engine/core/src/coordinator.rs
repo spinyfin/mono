@@ -1592,6 +1592,14 @@ pub struct ExecutionCoordinator {
     /// because at worst we refuse once more and re-populate the set.
     #[builder(default = Mutex::new(HashMap::new()))]
     refused_workspaces: Mutex<HashMap<String, Vec<String>>>,
+    /// Ceiling used by the interactive-pool concurrency cap in
+    /// `drain_ready_queue`. Defaults to [`MAX_CONCURRENT_INTERACTIVE_WORKERS`];
+    /// tests that exercise automation spillover/preemption in isolation from
+    /// that unrelated, temporary cap raise it via
+    /// [`Self::with_max_concurrent_interactive_workers`] so the two features
+    /// don't collide at small pool sizes.
+    #[builder(default = MAX_CONCURRENT_INTERACTIVE_WORKERS)]
+    max_concurrent_interactive_workers: usize,
 }
 
 /// Check out a leased cube workspace to the head commit of a PR, so a reviewer
@@ -1676,6 +1684,7 @@ impl ExecutionCoordinator {
             dispatch_pause_exempts_reviews: AtomicBool::new(false),
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
+            max_concurrent_interactive_workers: MAX_CONCURRENT_INTERACTIVE_WORKERS,
         }
     }
 
@@ -1847,6 +1856,17 @@ impl ExecutionCoordinator {
     /// short durations in tests to avoid real sleeps.
     pub fn with_pre_start_retry_delays(mut self, delays: Vec<Duration>) -> Self {
         self.pre_start_retry_delays = delays;
+        self
+    }
+
+    /// Override the interactive-pool concurrency cap ceiling (default
+    /// [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]). Tests that exercise
+    /// automation spillover/preemption at pool sizes at or near
+    /// [`WORKER_PAGE_SIZE`] raise this so the unrelated, temporary cap
+    /// doesn't hold mainline rows before they ever reach the spillover/
+    /// preemption path under test.
+    pub fn with_max_concurrent_interactive_workers(mut self, max: usize) -> Self {
+        self.max_concurrent_interactive_workers = max;
         self
     }
 
@@ -2651,37 +2671,21 @@ impl ExecutionCoordinator {
             }
 
             // TEMPORARY interactive-pool concurrency cap (operator directive,
-            // 2026-07-15): hold main-pool rows once the interactive pool's
-            // live workers reach [`MAX_CONCURRENT_INTERACTIVE_WORKERS`], even
-            // though the pool has 16 slots. Automation and review rows are
-            // NOT gated here — their pools' own sizes govern them. Checked
-            // per row (not once per pass) so claims made earlier in this same
-            // pass count; checked BEFORE `request_recorded` so a capped row
-            // never enters the dispatch pipeline — it stays `ready` and
-            // re-attempts on the next kick (`release_worker_and_kick` fires
-            // one whenever a worker frees). See the constant's doc for
-            // rationale and removal criteria.
-            if is_main {
-                let live_workers = self.worker_pool.busy_count().await;
-                if live_workers >= MAX_CONCURRENT_INTERACTIVE_WORKERS {
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        pool = pool_label,
-                        live_workers,
-                        cap = MAX_CONCURRENT_INTERACTIVE_WORKERS,
-                        "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
-                    );
-                    self.record_dispatch_wait_reason(
-                        &execution.id,
-                        &format!(
-                            "Held by the interactive concurrency cap ({live_workers}/{MAX_CONCURRENT_INTERACTIVE_WORKERS} \
-                             workers live) — dispatches as workers finish"
-                        ),
-                    );
-                    continue;
-                }
-            }
+            // 2026-07-15): main-pool rows are held once the interactive
+            // pool's live workers reach [`MAX_CONCURRENT_INTERACTIVE_WORKERS`],
+            // even though the pool has 16 slots. Automation and review rows
+            // are NOT gated by it — their pools' own sizes govern them. The
+            // actual gate lives at the claim site below (search
+            // `interactive_concurrency_cap`), not here: it must run AFTER
+            // the once-per-pass automation-preemption fallback gets its
+            // chance, because a preemption is a trade (one live worker for
+            // another), not growth in the live-worker count, so it can
+            // never itself push the pool over the cap. Gating here, before
+            // that fallback ever runs, would make every mainline row that
+            // arrives at the cap starve permanently — including in the
+            // "every interactive slot is full" case the preemption feature
+            // exists to resolve. See the constant's doc for rationale and
+            // removal criteria.
 
             // Dispatch-class + "why it won" bookkeeping (operator directive:
             // revisions before tasks/chores, ordered by revision kind).
@@ -2903,9 +2907,27 @@ impl ExecutionCoordinator {
             }
 
             let pool = self.pool_for_execution(&execution);
-            let claimed = pool
-                .claim_worker(&execution.id, preferred_workspace_id.as_deref())
-                .await;
+
+            // interactive_concurrency_cap: the TEMPORARY cap gate (see the
+            // comment above, near `is_main`/`is_automation` classification).
+            // A capped mainline row never gets to claim a genuinely idle
+            // slot outright — that would just grow the live-worker count
+            // past the cap — but it still falls through to the once-per-pass
+            // preemption fallback below, since a preemption trade leaves the
+            // live-worker count unchanged.
+            let live_workers_at_cap_check = if is_main {
+                Some(self.worker_pool.busy_count().await)
+            } else {
+                None
+            };
+            let capped = live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers);
+
+            let claimed = if capped {
+                None
+            } else {
+                pool.claim_worker(&execution.id, preferred_workspace_id.as_deref())
+                    .await
+            };
 
             // A mainline row that missed its slot gets ONE chance to
             // reclaim interactive capacity from a spilled automation run
@@ -2928,6 +2950,27 @@ impl ExecutionCoordinator {
                 }
                 None => None,
             };
+
+            if claimed.is_none() && capped {
+                let live_workers = live_workers_at_cap_check.unwrap_or_default();
+                let cap = self.max_concurrent_interactive_workers;
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool = pool_label,
+                    live_workers,
+                    cap,
+                    "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
+                );
+                self.record_dispatch_wait_reason(
+                    &execution.id,
+                    &format!(
+                        "Held by the interactive concurrency cap ({live_workers}/{cap} \
+                         workers live) — dispatches as workers finish"
+                    ),
+                );
+                continue;
+            }
 
             let Some(worker_id) = claimed else {
                 // This pool is fully claimed. Record exhaustion and continue
@@ -11796,7 +11839,8 @@ mod tests {
                 pending: true,
                 ..FakeExecutionRunner::default()
             }),
-        );
+        )
+        .with_max_concurrent_interactive_workers(MAIN_POOL);
         coord.set_automation_pool(WorkerPool::new_automation(1));
         let coordinator = Arc::new(coord);
         coordinator.kick();
@@ -11900,7 +11944,8 @@ mod tests {
                 pending: true,
                 ..FakeExecutionRunner::default()
             }),
-        );
+        )
+        .with_max_concurrent_interactive_workers(MAIN_POOL);
         coord.set_automation_pool(WorkerPool::new_automation(1));
         coord.set_automation_preemptor(preemptor.clone());
         let coordinator = Arc::new(coord);
@@ -12014,7 +12059,8 @@ mod tests {
                 pending: true,
                 ..FakeExecutionRunner::default()
             }),
-        );
+        )
+        .with_max_concurrent_interactive_workers(MAIN_POOL);
         coord.set_automation_pool(WorkerPool::new_automation(1));
         coord.set_automation_preemptor(preemptor.clone());
         let coordinator = Arc::new(coord);
@@ -12088,7 +12134,8 @@ mod tests {
                 pending: true,
                 ..FakeExecutionRunner::default()
             }),
-        );
+        )
+        .with_max_concurrent_interactive_workers(MAIN_POOL);
         coord.set_automation_pool(WorkerPool::new_automation(1));
         coord.set_automation_preemptor(preemptor.clone());
         let coordinator = Arc::new(coord);
