@@ -26,15 +26,28 @@ enum Script {
 /// Configurable [`CubeClient`] double for the rung-1 harness. Records the
 /// gotos it was asked for and the leases it released so tests can assert the
 /// workspace is always cleaned up.
+///
+/// Constructed via the `new`/`with_*` associated functions below rather than
+/// the generated builder — `#[derive(bon::Builder)]` is present solely to
+/// satisfy the project's giant-struct convention (7 named fields).
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct ScriptCube {
     script: Script,
     /// T9/T2562: what `verify_deletion_tripwire` should report. Empty
     /// (the default via [`Self::new`]) means "clean" — no network call is
     /// made since this is a scripted double, not `CommandCubeClient`.
     tripwire_findings: Vec<String>,
+    /// Workspace path handed back by `lease_workspace`. Defaults to a
+    /// non-existent fixed path (fine for tests that never reach rung 0's
+    /// real resolvers); tests exercising a *live* rung 0 through
+    /// `try_mechanical_rungs` point this at a real fixture directory via
+    /// [`Self::with_workspace_path`].
+    workspace_path: PathBuf,
     released: Mutex<Vec<String>>,
     gotos: Mutex<Vec<u64>>,
     rebases: Mutex<Vec<u64>>,
+    pushes: Mutex<Vec<u64>>,
 }
 
 impl ScriptCube {
@@ -42,15 +55,24 @@ impl ScriptCube {
         Self {
             script,
             tripwire_findings: Vec::new(),
+            workspace_path: PathBuf::from("/tmp/ladder-ws"),
             released: Mutex::new(Vec::new()),
             gotos: Mutex::new(Vec::new()),
             rebases: Mutex::new(Vec::new()),
+            pushes: Mutex::new(Vec::new()),
         }
     }
 
     fn with_tripwire_findings(script: Script, findings: Vec<String>) -> Self {
         Self {
             tripwire_findings: findings,
+            ..Self::new(script)
+        }
+    }
+
+    fn with_workspace_path(script: Script, workspace_path: PathBuf) -> Self {
+        Self {
+            workspace_path,
             ..Self::new(script)
         }
     }
@@ -74,7 +96,7 @@ crate::stub_cube_client! { ScriptCube {
         Ok(CubeWorkspaceLease {
             lease_id: "lease-1".to_owned(),
             workspace_id: "ws-1".to_owned(),
-            workspace_path: PathBuf::from("/tmp/ladder-ws"),
+            workspace_path: self.workspace_path.clone(),
         })
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<()> {
@@ -92,6 +114,10 @@ crate::stub_cube_client! { ScriptCube {
             Script::RebaseErrors => anyhow::bail!("rebase boom"),
             Script::EnsureRepoErrors => unreachable!("ensure_repo already errored"),
         }
+    }
+    async fn push_resolution(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<()> {
+        self.pushes.lock().await.push(pr);
+        Ok(())
     }
     async fn verify_deletion_tripwire(
         &self,
@@ -379,32 +405,107 @@ async fn rung1_ensure_repo_error_falls_through_without_lease() {
     assert_eq!(row.status, "pending");
 }
 
+/// Re-block a chore already retired by a prior mechanical-rung attempt and
+/// insert a fresh `conflict_resolutions` row for it, mirroring the
+/// stale-base re-arm path `on_conflict_detected` drives when `main` moves
+/// again and the PR re-conflicts after an earlier resolution succeeded.
+/// The UNIQUE key is `(work_item_id, base_sha_at_trigger, head_sha_before)`,
+/// so the second row needs a distinct `head_sha_before` to avoid colliding
+/// with the first attempt's (already-succeeded) row.
+fn second_conflict_attempt(db: &WorkDb, product_id: &str, chore_id: &str) -> (PendingMergeCheck, ConflictResolution) {
+    db.mark_chore_blocked_merge_conflict(chore_id, PR).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product_id.to_owned(),
+            work_item_id: chore_id.to_owned(),
+            pr_url: PR.to_owned(),
+            pr_number: 42,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("base111".to_owned()),
+            head_sha_before: Some("head333".to_owned()),
+        })
+        .unwrap()
+        .expect("fresh second-conflict attempt row");
+    let candidate = PendingMergeCheck {
+        work_item_id: chore_id.to_owned(),
+        product_id: product_id.to_owned(),
+        pr_url: PR.to_owned(),
+    };
+    (candidate, attempt)
+}
+
 #[tokio::test]
-async fn rung0_stays_off_even_for_a_resolvable_residual_file_hard_gate() {
-    // RUNG0_APPLY_LIVE is false (see its doc comment: gated on T2562's
-    // result-gate landing) — even though "Cargo.lock" has a registered
-    // resolver, try_mechanical_rungs must not attempt rung 0 today; a
-    // residual Cargo.lock conflict falls straight through to the worker
-    // path exactly like any other unresolvable residual conflict.
+async fn rung0_live_resolves_a_lockfile_only_residue_including_on_a_second_conflict() {
+    // Regression test for spinyfin/mono#2032 (chore T2680): with
+    // RUNG0_APPLY_LIVE now true, a residual conflict whose files are ones
+    // the deterministic-resolver registry recognizes (here: Cargo.lock —
+    // see `registry.rs`'s
+    // `cargo_lock_and_bazel_module_lock_both_resolve_deterministically_together`
+    // for the equivalent proof covering MODULE.bazel.lock, which needs a
+    // fake command runner rather than a real bazel toolchain to stay
+    // hermetic) must retire at rung 0 through the *live* `try_mechanical_rungs`
+    // call chain, with no worker spawned — and must do so again on a
+    // SECOND, independent conflict for the same PR (the "main churns fast,
+    // PR re-conflicts after a prior resolution" case from the operator
+    // report), not just the first time.
+    if which("cargo").is_none() {
+        eprintln!("skipping: cargo not on PATH");
+        return;
+    }
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore_id) = blocked_with_attempt(&db);
     let pub_ = Arc::new(RecordingPublisher::default());
-    let cube = ScriptCube::new(Script::Conflicts(vec!["Cargo.lock".to_owned()]));
 
+    let ws = tempdir().unwrap();
+    write_resolvable_cargo_lock_fixture(ws.path(), "fixture-r0-live");
+    let cube = ScriptCube::with_workspace_path(
+        Script::Conflicts(vec!["Cargo.lock".to_owned()]),
+        ws.path().to_path_buf(),
+    );
+
+    // First conflict.
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
-
     assert_eq!(
         outcome,
-        LadderOutcome::FellThrough {
-            residual_conflict_files: Some(1)
-        }
+        LadderOutcome::Retired,
+        "rung 0 must resolve live now that RUNG0_APPLY_LIVE is true"
     );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
-    assert_eq!(row.status, "pending");
-    assert_eq!(row.resolved_by_rung, None);
-    let (_status, reason) = chore_state(&db, &chore_id);
-    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none(), "block should be cleared, got {reason:?}");
+    assert_eq!(
+        *cube.pushes.lock().await,
+        vec![42],
+        "rung 0 must land via push_resolution"
+    );
+
+    // main churns again: a SECOND, independent conflict on the same PR.
+    // The re-arm path re-blocks the chore and inserts a fresh attempt row
+    // rather than ever reusing the first (already-succeeded) one.
+    let (candidate2, attempt2) = second_conflict_attempt(&db, &candidate.product_id, &chore_id);
+
+    let outcome2 = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate2, &attempt2).await;
+    assert_eq!(
+        outcome2,
+        LadderOutcome::Retired,
+        "rung 0 must also resolve deterministically on a re-conflict, not just the first time"
+    );
+    let row2 = db.get_conflict_resolution(&attempt2.id).unwrap().unwrap();
+    assert_eq!(row2.status, "succeeded");
+    assert_eq!(row2.resolved_by_rung, Some(0));
+    let (status2, reason2) = chore_state(&db, &chore_id);
+    assert_eq!(status2, "InReview");
+    assert!(reason2.is_none(), "block should be cleared again, got {reason2:?}");
+    assert_eq!(
+        *cube.pushes.lock().await,
+        vec![42, 42],
+        "second conflict must also land via push_resolution"
+    );
 }
 
 // ─────────────────────────── attempt_rung0 ────────────────────────────

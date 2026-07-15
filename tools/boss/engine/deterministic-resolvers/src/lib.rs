@@ -11,8 +11,10 @@
 //! resolution recipes", tracked as T13) — for user-configured formulas
 //! that don't warrant a compiled-in resolver. See [`recipe_config`] for
 //! the recipe format and its boss-side config file. This crate is
-//! standalone and unit-tested against fixture conflicts; it is not yet
-//! wired into `conflict_watch` (a later task).
+//! standalone and unit-tested against fixture conflicts; it is wired into
+//! `conflict_watch` via `boss_engine_core::conflict_ladder::attempt_rung0`,
+//! live by default (see that module's `RUNG0_APPLY_LIVE`) whenever the
+//! `conflict_ladder_mechanical_rebase` feature flag is enabled.
 
 mod command;
 mod lockfile;

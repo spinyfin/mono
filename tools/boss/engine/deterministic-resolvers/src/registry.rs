@@ -418,4 +418,60 @@ mod tests {
         assert!(registry.resolvers.iter().any(|r| r.applies_to(&file("mod.rs"))));
         assert!(!registry.resolvers.iter().any(|r| r.applies_to(&file("random.txt"))));
     }
+
+    #[tokio::test]
+    async fn cargo_lock_and_bazel_module_lock_both_resolve_deterministically_together() {
+        // Regression coverage for spinyfin/mono#2032 (chore T2680): a
+        // conflicted-file set that is exactly {Cargo.lock, MODULE.bazel.lock}
+        // must resolve as a single AllResolved batch — proving the two
+        // built-in resolvers dispatch independently and don't interfere
+        // with each other when both fire in the same evaluation. Uses fake
+        // command runners (real `bazel mod deps --lockfile_mode=update`
+        // needs a full bazel workspace with registries/toolchains — not
+        // hermetic in a bare temp dir, per `BazelModuleLockResolver`'s own
+        // doc comment) rather than `ResolverRegistry::with_builtins()`,
+        // which always shells out to the real tools.
+        //
+        // Runs the same batch twice, with fresh runners and a fresh
+        // workspace each round, to prove a SECOND, independent conflict —
+        // `main` churning again after a prior resolution already landed,
+        // exactly the incident's "re-conflict" shape — resolves exactly as
+        // deterministically as the first, i.e. nothing about the registry's
+        // dispatch is first-time-only.
+        for round in 0..2 {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+            std::fs::write(dir.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+
+            let cargo_runner = Arc::new(FakeCommandRunner::success_writing_file("Cargo.lock", "[[package]]\n"));
+            let bazel_runner = Arc::new(FakeCommandRunner::success_writing_file("MODULE.bazel.lock", "{}\n"));
+
+            let mut registry = ResolverRegistry::empty();
+            registry.register(Box::new(CargoLockResolver::with_runner(cargo_runner)));
+            registry.register(Box::new(BazelModuleLockResolver::with_runner(bazel_runner)));
+
+            let result = registry
+                .resolve_all(dir.path(), &[file("Cargo.lock"), file("MODULE.bazel.lock")])
+                .await;
+
+            match result {
+                RegistryResolution::AllResolved(resolved) => {
+                    assert_eq!(resolved.len(), 2, "round {round}: both lockfiles must resolve");
+                    assert!(
+                        resolved
+                            .iter()
+                            .any(|r| r.path == "Cargo.lock" && r.class == ConflictClass::CargoLock),
+                        "round {round}: Cargo.lock must resolve via CargoLockResolver"
+                    );
+                    assert!(
+                        resolved
+                            .iter()
+                            .any(|r| r.path == "MODULE.bazel.lock" && r.class == ConflictClass::BazelModuleLock),
+                        "round {round}: MODULE.bazel.lock must resolve via BazelModuleLockResolver"
+                    );
+                }
+                other => panic!("round {round}: expected AllResolved, got {other:?}"),
+            }
+        }
+    }
 }
