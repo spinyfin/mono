@@ -3285,8 +3285,29 @@ pub(crate) async fn update_pr_poll_state(
     let review_state = probe.review.as_db_str();
     let ci_detail = ci_detail_json(&open.ci);
     let review_detail = review_detail_json(probe.review.reviewers());
-    let merge_queue_state = merge_queue_state_str(probe.in_merge_queue, probe.auto_merge_enabled);
-    let merge_queue_detail = merge_queue_detail_json(probe);
+    let raw_merge_queue_state = merge_queue_state_str(probe.in_merge_queue, probe.auto_merge_enabled);
+    let raw_merge_queue_detail = merge_queue_detail_json(probe);
+
+    // mono#2023 / T2675: GitHub keeps auto-merge armed (and a merge-queue
+    // entry alive) while required checks are red — "merge when ready" just
+    // waits, it never disarms. Left alone, that strands the card in the
+    // macOS kanban's "Merging" section (`merge_queue_state != None` is what
+    // gates `isInMergingSection`) right next to a red CI chip, which reads
+    // as contradictory and hides that a fix revision may already be running
+    // (`ci_watch`'s `blocked: ci_failure` → revision flow keeps `status` at
+    // `in_review` the whole time, so nothing else would move the card).
+    //
+    // Demote the *lane* signal only — never GitHub's own arming, which must
+    // stay untouched to avoid churning notifications or racing the real
+    // merge queue — whenever this same poll observes failing required CI.
+    // Once CI recovers to success/in_progress, this override lifts and the
+    // next poll recomputes `merge_queue_state` from the untouched raw probe
+    // as usual, so the card returns to Merging with no separate re-arm path.
+    let (merge_queue_state, merge_queue_detail) = if ci_state == "fail" {
+        (None, None)
+    } else {
+        (raw_merge_queue_state, raw_merge_queue_detail)
+    };
 
     let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
@@ -3323,6 +3344,31 @@ pub(crate) async fn update_pr_poll_state(
             in_merge_queue = probe.in_merge_queue,
             "merge poller: PR poll state changed",
         );
+    }
+
+    // Lane-demotion trace (mono#2023 / T2675): one log line each way so a
+    // card bouncing between Merging and Review because CI is flapping
+    // (fail → success → fail) is diagnosable from the trace, mirroring the
+    // existing blocked↔in_review flap logging convention used elsewhere in
+    // this file and in ci_watch.rs.
+    if outcome.prior_merge_queue_state.as_deref() != merge_queue_state {
+        if merge_queue_state.is_none() && ci_state == "fail" && raw_merge_queue_state.is_some() {
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                prior_merge_queue_state = outcome.prior_merge_queue_state.as_deref(),
+                raw_merge_queue_state,
+                "merge poller: demoting card from Merging back to Review; required CI is failing while GitHub auto-merge/queue is still armed",
+            );
+        } else if merge_queue_state.is_some() && outcome.prior_merge_queue_state.is_none() {
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                merge_queue_state,
+                ci_state,
+                "merge poller: card entering Merging section; auto-merge/queue armed and required CI not failing",
+            );
+        }
     }
 
     // Whole-queue renumbering (mono#1997): this write only ever touched
@@ -9854,6 +9900,91 @@ mod tests {
             !renumbered.contains(&t1),
             "T1's position didn't change and must not generate a redundant event"
         );
+    }
+
+    /// Regression (mono#2023 / T2675): GitHub keeps auto-merge armed while
+    /// required checks are red, so a naive write of the raw probe would
+    /// leave `merge_queue_state = Some("auto_merge_enabled")` right next to
+    /// `ci_required_state = "fail"` — stranding the card in the macOS
+    /// kanban's Merging section with a contradictory red-CI chip. The row
+    /// poll must demote `merge_queue_state`/`merge_queue_detail` to `None`
+    /// whenever it observes failing required CI, even though GitHub's own
+    /// probe still reports auto-merge armed.
+    #[tokio::test]
+    async fn update_pr_poll_state_demotes_merging_when_required_ci_fails() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "CiDemote", Some("git@github.com:foo/bar.git"));
+        let t = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/1");
+
+        let mut probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
+        probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
+        let candidate = PendingMergeCheck {
+            work_item_id: t.clone(),
+            product_id: product.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
+        };
+        let publisher = RecordingPublisher::default();
+        update_pr_poll_state(&db, &publisher, &candidate, &probe).await;
+
+        let (state, detail) = merge_queue_columns(&db, &t);
+        assert!(
+            state.is_none(),
+            "merge_queue_state must be demoted to None while required CI is failing, even though GitHub auto-merge is still armed"
+        );
+        assert_eq!(detail, serde_json::Value::Null);
+
+        let conn = db.connect().unwrap();
+        let ci_required_state: Option<String> = conn
+            .query_row(
+                "SELECT ci_required_state FROM tasks WHERE id = ?1",
+                rusqlite::params![t],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ci_required_state.as_deref(),
+            Some("fail"),
+            "ci_required_state must still be stamped normally — only the lane signal is demoted"
+        );
+    }
+
+    /// Companion to the demotion regression above: once required CI recovers
+    /// to success on a later poll, the card must return to Merging on its
+    /// own — no separate re-arm path — because the demotion only ever
+    /// overrode the derived value each poll, never GitHub's own arming.
+    #[tokio::test]
+    async fn update_pr_poll_state_restores_merging_once_ci_recovers() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "CiRestore", Some("git@github.com:foo/bar.git"));
+        let t = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/1");
+        let candidate = PendingMergeCheck {
+            work_item_id: t.clone(),
+            product_id: product.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
+        };
+        let publisher = RecordingPublisher::default();
+
+        let mut failing_probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
+        failing_probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
+        update_pr_poll_state(&db, &publisher, &candidate, &failing_probe).await;
+        let (demoted_state, _) = merge_queue_columns(&db, &t);
+        assert!(
+            demoted_state.is_none(),
+            "sanity: card must be demoted while CI is failing"
+        );
+
+        // GitHub auto-merge is still armed on the next poll — same probe
+        // flags — but required CI now reads clean.
+        let recovered_probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
+        update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe).await;
+
+        let (state, detail) = merge_queue_columns(&db, &t);
+        assert_eq!(
+            state.as_deref(),
+            Some("auto_merge_enabled"),
+            "card must return to Merging once CI recovers, with no separate re-arm path"
+        );
+        assert_eq!(detail["section_order"], serde_json::json!(1_783_684_494i64));
     }
 
     #[test]
