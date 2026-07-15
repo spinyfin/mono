@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::CheckResult;
 
 mod config;
@@ -35,11 +35,7 @@ impl Check for CodePatternsCheck {
 #[async_trait]
 impl ConfiguredCheck for config::CompiledCodePatternsConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && matches_language_path(&f.path, self.language))
-            .count()
+        count_applicable(changeset, |path| matches_language_path(path, self.language))
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -52,32 +48,15 @@ impl ConfiguredCheck for config::CompiledCodePatternsConfig {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
-
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if !matches_language_path(&changed_file.path, self.language) {
-                continue;
-            }
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = std::str::from_utf8(&contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            findings.extend(analyze_java_file(&changed_file.path, contents, &self.rules));
-            processed += 1;
-            on_file_processed(processed);
-        }
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            |path| matches_language_path(path, self.language),
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                findings.extend(analyze_java_file(&changed_file.path, contents, &self.rules));
+            },
+        );
 
         Ok(CheckResult {
             check_id: "code-patterns".to_owned(),

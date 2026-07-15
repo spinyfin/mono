@@ -6,8 +6,8 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -41,11 +41,7 @@ impl Check for ForbiddenImportsDepsCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledForbiddenImportsDepsConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && self.rules.iter().any(|r| r.applies_to(&f.path)))
-            .count()
+        count_applicable(changeset, |path| self.applies_to(path))
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -58,54 +54,37 @@ impl ConfiguredCheck for CompiledForbiddenImportsDepsConfig {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            |path| self.applies_to(path),
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                for (line_index, line) in contents.lines().enumerate() {
+                    for rule in &self.rules {
+                        if !rule.applies_to(&changed_file.path) {
+                            continue;
+                        }
+                        if !rule.pattern.is_match(line) {
+                            continue;
+                        }
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if !self.rules.iter().any(|r| r.applies_to(&changed_file.path)) {
-                continue;
-            }
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = String::from_utf8(contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            for (line_index, line) in contents.lines().enumerate() {
-                for rule in &self.rules {
-                    if !rule.applies_to(&changed_file.path) {
-                        continue;
+                        findings.push(Finding {
+                            fixable: false,
+                            severity: rule.severity,
+                            message: rule.message.clone(),
+                            location: Some(Location {
+                                path: changed_file.path.clone(),
+                                line: Some((line_index + 1) as u32),
+                                column: Some(1),
+                            }),
+                            remediations: vec![rule.remediation.clone()],
+                            suggested_fix: None,
+                        });
                     }
-                    if !rule.pattern.is_match(line) {
-                        continue;
-                    }
-
-                    findings.push(Finding {
-                        fixable: false,
-                        severity: rule.severity,
-                        message: rule.message.clone(),
-                        location: Some(Location {
-                            path: changed_file.path.clone(),
-                            line: Some((line_index + 1) as u32),
-                            column: Some(1),
-                        }),
-                        remediations: vec![rule.remediation.clone()],
-                        suggested_fix: None,
-                    });
                 }
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+            },
+        );
 
         Ok(CheckResult {
             check_id: "forbidden-imports-deps".to_owned(),
@@ -140,6 +119,12 @@ struct ForbiddenImportsDepsRuleConfig {
 
 struct CompiledForbiddenImportsDepsConfig {
     rules: Vec<CompiledRule>,
+}
+
+impl CompiledForbiddenImportsDepsConfig {
+    fn applies_to(&self, path: &Path) -> bool {
+        self.rules.iter().any(|rule| rule.applies_to(path))
+    }
 }
 
 struct CompiledRule {

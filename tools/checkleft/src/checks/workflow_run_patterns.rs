@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use std::sync::Arc;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -32,11 +32,7 @@ impl Check for WorkflowRunPatternsCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_github_workflow_file(&f.path))
-            .count()
+        count_applicable(changeset, is_github_workflow_file)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -49,74 +45,57 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
-
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if !is_github_workflow_file(&changed_file.path) {
-                continue;
-            }
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = String::from_utf8(contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            let workflow = match parse_workflow(&contents) {
-                Ok(workflow) => workflow,
-                Err(error) => {
-                    findings.push(Finding {
-                        fixable: false,
-                        severity: Severity::Error,
-                        message: format!("failed to parse workflow YAML while checking run patterns: {error}"),
-                        location: Some(Location {
-                            path: changed_file.path.clone(),
-                            line: None,
-                            column: None,
-                        }),
-                        remediations: vec!["Fix YAML syntax so checks can validate workflow `run:` blocks.".to_owned()],
-                        suggested_fix: None,
-                    });
-                    processed += 1;
-                    on_file_processed(processed);
-                    continue;
-                }
-            };
-
-            for script in list_run_scripts(&workflow) {
-                for rule in &self.rules {
-                    if !script_violates_rule(script.script, rule) {
-                        continue;
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            is_github_workflow_file,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                let workflow = match parse_workflow(contents) {
+                    Ok(workflow) => workflow,
+                    Err(error) => {
+                        findings.push(Finding {
+                            fixable: false,
+                            severity: Severity::Error,
+                            message: format!("failed to parse workflow YAML while checking run patterns: {error}"),
+                            location: Some(Location {
+                                path: changed_file.path.clone(),
+                                line: None,
+                                column: None,
+                            }),
+                            remediations: vec![
+                                "Fix YAML syntax so checks can validate workflow `run:` blocks.".to_owned(),
+                            ],
+                            suggested_fix: None,
+                        });
+                        return;
                     }
-                    findings.push(Finding {
-                        fixable: false,
-                        severity: rule.severity,
-                        message: format!(
-                            "GitHub Actions run script in job `{}` step {}: {}",
-                            script.job_name, script.step_index, rule.message
-                        ),
-                        location: Some(Location {
-                            path: changed_file.path.clone(),
-                            line: None,
-                            column: None,
-                        }),
-                        remediations: vec![rule.remediation.clone()],
-                        suggested_fix: None,
-                    });
+                };
+
+                for script in list_run_scripts(&workflow) {
+                    for rule in &self.rules {
+                        if !script_violates_rule(script.script, rule) {
+                            continue;
+                        }
+                        findings.push(Finding {
+                            fixable: false,
+                            severity: rule.severity,
+                            message: format!(
+                                "GitHub Actions run script in job `{}` step {}: {}",
+                                script.job_name, script.step_index, rule.message
+                            ),
+                            location: Some(Location {
+                                path: changed_file.path.clone(),
+                                line: None,
+                                column: None,
+                            }),
+                            remediations: vec![rule.remediation.clone()],
+                            suggested_fix: None,
+                        });
+                    }
                 }
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+            },
+        );
 
         Ok(CheckResult {
             check_id: "workflow-run-patterns".to_owned(),

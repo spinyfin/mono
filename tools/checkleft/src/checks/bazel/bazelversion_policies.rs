@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -31,11 +31,7 @@ impl Check for BazelversionPoliciesCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledBazelversionPoliciesConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && f.path == Path::new(".bazelversion"))
-            .count()
+        count_applicable(changeset, is_bazelversion_file)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -48,43 +44,30 @@ impl ConfiguredCheck for CompiledBazelversionPoliciesConfig {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
-
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if changed_file.path != Path::new(".bazelversion") {
-                continue;
-            }
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = std::str::from_utf8(&contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            let version = contents.trim();
-            for rule in &self.rules {
-                if let Some(finding) = rule.evaluate(&changed_file.path, version) {
-                    findings.push(finding);
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            is_bazelversion_file,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                let version = contents.trim();
+                for rule in &self.rules {
+                    if let Some(finding) = rule.evaluate(&changed_file.path, version) {
+                        findings.push(finding);
+                    }
                 }
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+            },
+        );
 
         Ok(CheckResult {
             check_id: "bazelversion-policies".to_owned(),
             findings,
         })
     }
+}
+
+fn is_bazelversion_file(path: &Path) -> bool {
+    path == Path::new(".bazelversion")
 }
 
 #[derive(Debug, Deserialize)]

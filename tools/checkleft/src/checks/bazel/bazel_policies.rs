@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tree_sitter::Node;
 
-use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 use super::starlark::{
@@ -37,11 +37,7 @@ impl Check for BazelPoliciesCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledBazelPoliciesConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && starlark_file_kind(&f.path).is_some())
-            .count()
+        count_applicable(changeset, is_starlark_file)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
@@ -54,41 +50,24 @@ impl ConfiguredCheck for CompiledBazelPoliciesConfig {
         tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        let mut findings = Vec::new();
-        let mut processed = 0usize;
+        let findings = run_per_text_file(
+            changeset,
+            tree,
+            is_starlark_file,
+            &*on_file_processed,
+            |changed_file, contents, findings| {
+                let Some(file_kind) = starlark_file_kind(&changed_file.path) else {
+                    return;
+                };
+                let Some(parsed) = parse_starlark_file(contents) else {
+                    return;
+                };
 
-        for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-
-            let Some(file_kind) = starlark_file_kind(&changed_file.path) else {
-                continue;
-            };
-
-            let Ok(contents) = tree.read_file(&changed_file.path) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-            let Ok(contents) = std::str::from_utf8(&contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            let Some(parsed) = parse_starlark_file(contents) else {
-                processed += 1;
-                on_file_processed(processed);
-                continue;
-            };
-
-            for rule in &self.rules {
-                findings.extend(rule.evaluate(&changed_file.path, file_kind, &parsed));
-            }
-            processed += 1;
-            on_file_processed(processed);
-        }
+                for rule in &self.rules {
+                    findings.extend(rule.evaluate(&changed_file.path, file_kind, &parsed));
+                }
+            },
+        );
 
         Ok(CheckResult {
             check_id: "bazel-policies".to_owned(),
@@ -185,6 +164,10 @@ impl CompiledForbiddenPackageDefaultVisibilityRule {
         collect_findings_forbidden_default_visibility(parsed.root(), parsed.source, self, path, &mut findings);
         findings
     }
+}
+
+fn is_starlark_file(path: &Path) -> bool {
+    starlark_file_kind(path).is_some()
 }
 
 fn parse_config(config: &toml::Value) -> Result<CompiledBazelPoliciesConfig> {

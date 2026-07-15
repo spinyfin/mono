@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::check::{Check, ConfiguredCheck};
+use crate::check::{Check, ConfiguredCheck, count_applicable};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -35,11 +35,7 @@ impl Check for BazelrcPoliciesCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledBazelrcPoliciesConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        changeset
-            .changed_files
-            .iter()
-            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_bazelrc_root_candidate(&f.path))
-            .count()
+        count_applicable(changeset, is_bazelrc_root_candidate)
     }
 
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
