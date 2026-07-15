@@ -1,13 +1,5 @@
 pub use boss_transcript_markdown as transcript_markdown;
 
-// `register_counter!` / `register_gauge!` are defined in
-// `boss-engine-metrics-registry` but re-exported here so call sites keep
-// writing `crate::register_counter!`, matching the `crate::metrics::Registry`
-// they hand the resulting handle to. The macros expand to `$crate::`-qualified
-// paths that resolve against the defining crate, so this is a plain re-export —
-// nothing to keep in sync.
-pub use boss_engine_metrics_registry::{register_counter, register_gauge};
-
 pub mod answer_agent;
 pub mod app;
 pub mod attentions_detector;
@@ -72,7 +64,18 @@ pub mod materializer;
 pub mod merge_parent_deletion;
 pub mod merge_poller;
 pub mod merge_when_ready;
-pub mod metrics;
+// The metrics framework lives in its own crate; alias it under the
+// module path the engine has always used it by. `metrics_init` holds
+// the engine-specific startup registration that can't move down
+// (it names every engine module that declares a handle), and
+// `metrics_store` backs the framework's storage trait with `WorkDb`.
+pub use boss_metrics as metrics;
+// Re-exported so the declaration macros keep resolving as
+// `crate::register_counter!` at every engine call site; the macros
+// themselves are `#[macro_export]`ed from `boss_metrics`.
+pub use boss_metrics::{register_counter, register_gauge};
+pub mod metrics_init;
+pub mod metrics_store;
 pub mod no_op_signal;
 pub mod nudge_breaker;
 pub mod orphan_sweep;

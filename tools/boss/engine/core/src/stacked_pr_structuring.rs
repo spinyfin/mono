@@ -92,7 +92,7 @@ crate::register_counter!(
 );
 
 /// Register this module's counter handles. Called from
-/// [`crate::metrics::init_all`] at engine startup.
+/// [`crate::metrics_init::init_all`] at engine startup.
 pub fn init(registry: &Registry) {
     registry.register_counter(&STACK_PROPOSAL_OFFERED);
 }

@@ -1,13 +1,6 @@
 //! In-memory metrics registry: counter / gauge primitives and the
 //! `register_counter!` / `register_gauge!` declaration macros.
 //!
-//! This crate holds the storage and declaration half of the engine's
-//! metrics framework. Persisting snapshots to `state.db` and the
-//! `init_all` startup registration sweep stay in `boss-engine`: both
-//! reach into engine internals (`WorkDb`, every metric-declaring
-//! module), so they belong on the consumer side of this edge. The
-//! dependency runs one way — `boss-engine` -> `boss-engine-metrics-registry`.
-//!
 //! Counters are strictly monotonic `u64`s; the only mutator is
 //! `inc` / `inc_by`. Gauges are signed `i64`s overwritten by the
 //! producer on each publication.
@@ -49,7 +42,8 @@ impl CounterHandle {
 
     /// Add 1 to this counter in `registry`. Panics if the handle was
     /// not registered via [`Registry::register_counter`] (typically
-    /// fixed by adding the handle to `metrics::init_all`).
+    /// fixed by registering the handle at startup — for the engine,
+    /// in `boss_engine::metrics_init::init_all`).
     pub fn inc(&self, registry: &Registry) {
         registry.counter_inc_by(self.name, 1);
     }
@@ -93,21 +87,18 @@ impl GaugeHandle {
 
 /// Declare a static [`CounterHandle`].
 ///
-/// Engine modules reach this macro through the `boss_engine` crate-root
-/// re-export, so call sites use `crate::register_counter!`, not the
-/// fully-qualified path shown below:
-///
 /// ```ignore
-/// crate::register_counter!(
+/// register_counter!(
 ///     PR_URL_CAPTURE_PRIMARY_HIT,
 ///     "pr_url_capture.primary_path.hit",
 ///     "On-stop hook found a staged PR URL and skipped the detector.",
 /// );
 /// ```
 ///
-/// The handle must be added to `boss_engine::metrics::init_all` so
-/// registration runs at engine startup (design §"Risks / open
-/// questions" item 2).
+/// The handle must be added to the consumer's registration entry
+/// point (for the engine, `boss_engine::metrics_init::init_all`) so
+/// registration runs at startup (design §"Risks / open questions"
+/// item 2).
 #[macro_export]
 macro_rules! register_counter {
     ($static_name:ident, $name:literal, $description:literal $(,)?) => {
@@ -138,24 +129,24 @@ pub struct Registry {
     gauges: RwLock<HashMap<String, Arc<GaugeEntry>>>,
 }
 
-struct CounterEntry {
-    name: String,
-    description: String,
-    value: AtomicU64,
-    updated_at_ms: AtomicI64,
+pub(crate) struct CounterEntry {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) value: AtomicU64,
+    pub(crate) updated_at_ms: AtomicI64,
     /// True when this row was rehydrated from `state.db` but no
     /// `register_counter!` handle in the current engine binary
     /// matches its name. The design retains these so historical
     /// answers stay queryable (§"Risks / open questions" item 3).
-    stale: AtomicBool,
+    pub(crate) stale: AtomicBool,
 }
 
-struct GaugeEntry {
-    name: String,
-    description: String,
-    value: AtomicI64,
-    observed_at_ms: AtomicI64,
-    stale: AtomicBool,
+pub(crate) struct GaugeEntry {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) value: AtomicI64,
+    pub(crate) observed_at_ms: AtomicI64,
+    pub(crate) stale: AtomicBool,
 }
 
 /// Read-only snapshot of a counter row, suitable for serialising.
@@ -194,6 +185,10 @@ impl Registry {
     /// Register a [`CounterHandle`]. Panics on duplicate name or
     /// invalid name (lowercase ASCII letters, digits, dots,
     /// underscores only).
+    ///
+    /// A rehydrated row that no handle has claimed yet is adopted
+    /// rather than reset: the persisted value and timestamp survive,
+    /// the description is refreshed from the binary.
     pub fn register_counter(&self, handle: &CounterHandle) {
         validate_name(handle.name);
         let mut counters = self.counters.write().expect("metrics counters lock poisoned");
@@ -307,7 +302,7 @@ impl Registry {
     /// "stale: not registered by current engine" so the operator can
     /// still see historical values. If a handle later registers
     /// against this name, [`Self::register_counter`] adopts the row.
-    pub fn insert_stale_counter(&self, name: &str, description: &str, value: u64, updated_at_ms: i64) {
+    pub(crate) fn insert_stale_counter(&self, name: &str, description: &str, value: u64, updated_at_ms: i64) {
         let mut counters = self.counters.write().expect("metrics counters lock poisoned");
         counters.insert(
             name.to_owned(),
@@ -321,7 +316,7 @@ impl Registry {
         );
     }
 
-    pub fn insert_stale_gauge(&self, name: &str, description: &str, value: i64, observed_at_ms: i64) {
+    pub(crate) fn insert_stale_gauge(&self, name: &str, description: &str, value: i64, observed_at_ms: i64) {
         let mut gauges = self.gauges.write().expect("metrics gauges lock poisoned");
         gauges.insert(
             name.to_owned(),
@@ -339,7 +334,7 @@ impl Registry {
     /// Used after `register_counter` to load the persisted total
     /// without losing it across the restart boundary. Returns true
     /// if the counter was present.
-    pub fn seed_counter(&self, name: &str, value: u64, updated_at_ms: i64) -> bool {
+    pub(crate) fn seed_counter(&self, name: &str, value: u64, updated_at_ms: i64) -> bool {
         let counters = self.counters.read().expect("metrics counters lock poisoned");
         if let Some(entry) = counters.get(name) {
             entry.value.store(value, Ordering::Relaxed);
@@ -350,7 +345,7 @@ impl Registry {
         }
     }
 
-    pub fn seed_gauge(&self, name: &str, value: i64, observed_at_ms: i64) -> bool {
+    pub(crate) fn seed_gauge(&self, name: &str, value: i64, observed_at_ms: i64) -> bool {
         let gauges = self.gauges.read().expect("metrics gauges lock poisoned");
         if let Some(entry) = gauges.get(name) {
             entry.value.store(value, Ordering::Relaxed);
@@ -372,7 +367,7 @@ impl Registry {
             .unwrap_or_else(|| panic!("counter not registered: {name}"));
         if entry.stale.load(Ordering::Relaxed) {
             panic!(
-                "counter {name} is marked stale (rehydrated from state.db but no current handle); did you forget to add it to metrics::init_all?"
+                "counter {name} is marked stale (rehydrated from the store but no current handle); did you forget to register the handle at startup (boss_engine::metrics_init::init_all)?"
             );
         }
         entry.value.fetch_add(n, Ordering::Relaxed);
@@ -386,7 +381,7 @@ impl Registry {
             .unwrap_or_else(|| panic!("gauge not registered: {name}"));
         if entry.stale.load(Ordering::Relaxed) {
             panic!(
-                "gauge {name} is marked stale (rehydrated from state.db but no current handle); did you forget to add it to metrics::init_all?"
+                "gauge {name} is marked stale (rehydrated from the store but no current handle); did you forget to register the handle at startup (boss_engine::metrics_init::init_all)?"
             );
         }
         entry.value.store(value, Ordering::Relaxed);
@@ -537,6 +532,10 @@ fn validate_name(name: &str) {
     }
 }
 
+/// Wall-clock milliseconds, used to stamp every increment /
+/// observation. Public because consumers stamp their own store
+/// writes (e.g. the reset RPC path) and must agree with the
+/// timestamps the registry records.
 pub fn now_ms() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_ms() as i64
 }

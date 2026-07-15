@@ -1,8 +1,11 @@
 [package]
-name = "boss-engine-metrics-registry"
+name = "boss-metrics"
 version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+anyhow = { workspace = true }
 boss-engine-utils = { path = "../utils" }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }

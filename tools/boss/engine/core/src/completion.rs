@@ -98,7 +98,7 @@ crate::register_counter!(
 );
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
-/// [`crate::metrics::init_all`] at engine startup so duplicate-name panics
+/// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
 /// surface at boot rather than at the first counter increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);

@@ -340,13 +340,13 @@ dependencies = [
  "boss-engine-day-rotated-log",
  "boss-engine-driver",
  "boss-engine-live-status-redact",
- "boss-engine-metrics-registry",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-feature-flags",
  "boss-github",
  "boss-github-tracker",
  "boss-log-files",
+ "boss-metrics",
  "boss-pr-template",
  "boss-protocol",
  "boss-ssh-transport",
@@ -410,13 +410,6 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "serde_json",
-]
-
-[[package]]
-name = "boss-engine-metrics-registry"
-version = "0.1.0"
-dependencies = [
- "boss-engine-utils",
 ]
 
 [[package]]
@@ -504,6 +497,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "tempfile",
+]
+
+[[package]]
+name = "boss-metrics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine-utils",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

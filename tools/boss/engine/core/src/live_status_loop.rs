@@ -138,7 +138,7 @@ fn epoch_now() -> i64 {
 }
 
 // Phase-4 counter handles for DispatcherStats. Registered via
-// `register_metrics` which is called from `metrics::init_all` at
+// `register_metrics` which is called from `crate::metrics_init::init_all` at
 // engine startup.
 crate::register_counter!(
     DISPATCHER_HOOK_EVENTS_TOTAL,
@@ -193,7 +193,7 @@ crate::register_counter!(
 );
 
 /// Register every DispatcherStats counter handle with `registry`.
-/// Called once from `metrics::init_all` at engine startup so duplicate-name
+/// Called once from `crate::metrics_init::init_all` at engine startup so duplicate-name
 /// panics surface at boot rather than on the first increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DISPATCHER_HOOK_EVENTS_TOTAL);

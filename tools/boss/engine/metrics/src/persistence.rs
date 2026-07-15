@@ -1,8 +1,9 @@
-//! Persistence bridge between the in-memory [`Registry`] and the
-//! `metrics_counter` / `metrics_gauge` tables in `state.db`.
+//! Persistence bridge between the in-memory [`Registry`] and a
+//! durable [`MetricsStore`] (the engine backs this with the
+//! `metrics_counter` / `metrics_gauge` tables in `state.db`).
 //!
-//! - [`seed_from_db`] is called once on engine startup, after
-//!   `metrics::init_all` has registered every handle.
+//! - [`seed_from_db`] is called once on engine startup, after every
+//!   handle has been registered.
 //! - [`spawn_flush_task`] runs every 30 seconds and upserts every
 //!   registered counter / gauge snapshot in a single transaction.
 //! - [`flush_all`] is called from the graceful-shutdown path so the
@@ -16,12 +17,12 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::task::JoinHandle;
 
-use crate::work::{MetricsCounterRow, MetricsGaugeRow, WorkDb};
+use crate::store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
 
-use super::{Registry, now_ms};
+use super::registry::{Registry, now_ms};
 
 /// How often the periodic flush task wakes up and snapshots the
-/// registry into `state.db`. Picked for the
+/// registry into the store. Picked for the
 /// "did the reconstruction path fire?" use case: a 30 s window means
 /// at most ~30 s of increments are lost on crash, and the cost is
 /// one transaction every 30 s — negligible against the engine's
@@ -34,10 +35,10 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// inserted as "stale" so a future `bossctl metrics list` can still
 /// see them (design §"Risks / open questions" item 3).
 ///
-/// Call after `metrics::init_all` so every binary-known handle is
-/// registered before the rehydrate decides what counts as stale.
-pub fn seed_from_db(registry: &Registry, work_db: &WorkDb) -> Result<()> {
-    let (counters, gauges) = work_db.metrics_load_all()?;
+/// Call after every handle is registered so the rehydrate knows what
+/// counts as stale.
+pub fn seed_from_db<S: MetricsStore + ?Sized>(registry: &Registry, store: &S) -> Result<()> {
+    let (counters, gauges) = store.metrics_load_all()?;
     for row in counters {
         if !registry.seed_counter(&row.name, row.value, row.updated_at_ms) {
             registry.insert_stale_counter(&row.name, &row.description, row.value, row.updated_at_ms);
@@ -54,7 +55,7 @@ pub fn seed_from_db(registry: &Registry, work_db: &WorkDb) -> Result<()> {
 /// Spawn the periodic flush task on the current tokio runtime. The
 /// returned `JoinHandle` is held by `ServerState` until shutdown so
 /// the task is bound to the engine's lifetime.
-pub fn spawn_flush_task(registry: Arc<Registry>, work_db: Arc<WorkDb>) -> JoinHandle<()> {
+pub fn spawn_flush_task<S: MetricsStore + 'static>(registry: Arc<Registry>, store: Arc<S>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         // `Skip` keeps the task from firing many catch-up flushes
@@ -67,18 +68,18 @@ pub fn spawn_flush_task(registry: Arc<Registry>, work_db: Arc<WorkDb>) -> JoinHa
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(err) = flush_all(&registry, &work_db) {
+            if let Err(err) = flush_all(&registry, &*store) {
                 tracing::warn!(?err, "metrics flush failed; will retry on next tick");
             }
         }
     })
 }
 
-/// Snapshot every registered counter / gauge and upsert into
-/// `state.db`. Stale rows (rehydrated rows whose name no longer
-/// matches a registered handle) are skipped so we don't rewrite
-/// them on every flush; the persisted row stays untouched.
-pub fn flush_all(registry: &Registry, work_db: &WorkDb) -> Result<()> {
+/// Snapshot every registered counter / gauge and upsert into the
+/// store. Stale rows (rehydrated rows whose name no longer matches a
+/// registered handle) are skipped so we don't rewrite them on every
+/// flush; the persisted row stays untouched.
+pub fn flush_all<S: MetricsStore + ?Sized>(registry: &Registry, store: &S) -> Result<()> {
     let counter_snaps = registry.counter_snapshots();
     let gauge_snaps = registry.gauge_snapshots();
     let now = now_ms();
@@ -109,16 +110,15 @@ pub fn flush_all(registry: &Registry, work_db: &WorkDb) -> Result<()> {
         })
         .collect();
 
-    work_db.metrics_flush(&counters, &gauges)
+    store.metrics_flush(&counters, &gauges)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::CounterHandle;
-    use crate::register_counter;
-    use crate::register_gauge;
-    use std::path::PathBuf;
+    use crate::registry::CounterHandle;
+    use crate::store::testing::FakeStore;
+    use crate::{register_counter, register_gauge};
 
     register_counter!(
         TEST_PERSIST_COUNTER,
@@ -131,26 +131,22 @@ mod tests {
         "Gauge used by persistence round-trip tests."
     );
 
-    fn open_db() -> WorkDb {
-        WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory work db")
-    }
-
     #[test]
     fn round_trip_counter_value_across_simulated_restart() {
-        let db = open_db();
+        let store = FakeStore::default();
 
         // First "engine boot": register, increment, flush.
         let registry_one = Registry::new();
         registry_one.register_counter(&TEST_PERSIST_COUNTER);
         TEST_PERSIST_COUNTER.inc_by(&registry_one, 5);
-        flush_all(&registry_one, &db).expect("flush 1");
+        flush_all(&registry_one, &store).expect("flush 1");
         drop(registry_one);
 
-        // Second "engine boot": fresh registry, seed from db, value
-        // must come back as 5.
+        // Second "engine boot": fresh registry, seed from the store,
+        // value must come back as 5.
         let registry_two = Registry::new();
         registry_two.register_counter(&TEST_PERSIST_COUNTER);
-        seed_from_db(&registry_two, &db).expect("seed");
+        seed_from_db(&registry_two, &store).expect("seed");
         assert_eq!(registry_two.counter_value("test_persist.counter"), Some(5));
 
         // Additional increments accumulate on top of the seeded
@@ -158,8 +154,8 @@ mod tests {
         TEST_PERSIST_COUNTER.inc_by(&registry_two, 7);
         assert_eq!(registry_two.counter_value("test_persist.counter"), Some(12));
 
-        flush_all(&registry_two, &db).expect("flush 2");
-        let (counters, _) = db.metrics_load_all().expect("load");
+        flush_all(&registry_two, &store).expect("flush 2");
+        let (counters, _) = store.metrics_load_all().expect("load");
         let row = counters
             .iter()
             .find(|r| r.name == "test_persist.counter")
@@ -170,22 +166,22 @@ mod tests {
 
     #[test]
     fn round_trip_gauge_value_across_simulated_restart() {
-        let db = open_db();
+        let store = FakeStore::default();
 
         let registry_one = Registry::new();
         registry_one.register_gauge(&TEST_PERSIST_GAUGE);
         TEST_PERSIST_GAUGE.set(&registry_one, 999);
-        flush_all(&registry_one, &db).expect("flush 1");
+        flush_all(&registry_one, &store).expect("flush 1");
 
         let registry_two = Registry::new();
         registry_two.register_gauge(&TEST_PERSIST_GAUGE);
-        seed_from_db(&registry_two, &db).expect("seed");
+        seed_from_db(&registry_two, &store).expect("seed");
         assert_eq!(registry_two.gauge_value("test_persist.gauge"), Some(999));
     }
 
     #[test]
     fn unknown_persisted_row_is_kept_as_stale_not_dropped() {
-        let db = open_db();
+        let store = FakeStore::default();
 
         // Simulate a previous engine version's counter that no
         // longer matches any registered handle.
@@ -196,12 +192,12 @@ mod tests {
         );
         registry_one.register_counter(&OLD_HANDLE);
         OLD_HANDLE.inc_by(&registry_one, 42);
-        flush_all(&registry_one, &db).expect("flush 1");
+        flush_all(&registry_one, &store).expect("flush 1");
 
         // New engine boot: no register_counter call for the old
         // name. The row must come back as stale.
         let registry_two = Registry::new();
-        seed_from_db(&registry_two, &db).expect("seed");
+        seed_from_db(&registry_two, &store).expect("seed");
         let snaps = registry_two.counter_snapshots();
         let stale = snaps
             .iter()
@@ -210,10 +206,10 @@ mod tests {
         assert!(stale.stale, "rehydrated unknown counter should be marked stale");
         assert_eq!(stale.value, 42);
 
-        // And subsequent flushes must not drop it from the table —
+        // And subsequent flushes must not drop it from the store —
         // the row stays.
-        flush_all(&registry_two, &db).expect("flush 2");
-        let (counters, _) = db.metrics_load_all().expect("load");
+        flush_all(&registry_two, &store).expect("flush 2");
+        let (counters, _) = store.metrics_load_all().expect("load");
         assert!(
             counters.iter().any(|r| r.name == "test_persist.removed_counter"),
             "stale row must survive subsequent flushes",
@@ -222,19 +218,19 @@ mod tests {
 
     #[test]
     fn stale_row_is_adopted_after_handle_is_added_back() {
-        let db = open_db();
+        let store = FakeStore::default();
 
         // Persist a counter under a name first.
         let registry_one = Registry::new();
         registry_one.register_counter(&TEST_PERSIST_COUNTER);
         TEST_PERSIST_COUNTER.inc_by(&registry_one, 4);
-        flush_all(&registry_one, &db).expect("flush 1");
+        flush_all(&registry_one, &store).expect("flush 1");
 
         // Boot 2: registry is fresh, do NOT register first —
         // simulate the cold path where the rehydrate runs before
-        // init_all. The row is stale at first…
+        // registration. The row is stale at first…
         let registry_two = Registry::new();
-        seed_from_db(&registry_two, &db).expect("seed");
+        seed_from_db(&registry_two, &store).expect("seed");
         assert!(
             registry_two
                 .counter_snapshots()
@@ -258,53 +254,33 @@ mod tests {
 
     #[test]
     fn flush_is_a_no_op_when_registry_is_empty() {
-        let db = open_db();
+        let store = FakeStore::default();
         let registry = Registry::new();
-        flush_all(&registry, &db).expect("flush no-op");
-        let (counters, gauges) = db.metrics_load_all().expect("load");
+        flush_all(&registry, &store).expect("flush no-op");
+        let (counters, gauges) = store.metrics_load_all().expect("load");
         assert!(counters.is_empty());
         assert!(gauges.is_empty());
     }
 
+    /// The engine hands `flush_all` an `&Arc<WorkDb>` (and
+    /// `spawn_flush_task` an owned `Arc`), so the blanket `Arc<T>`
+    /// forwarding impl is load-bearing for the real call sites.
     #[test]
-    fn metrics_reset_one_zeros_counter_row_in_db() {
-        let db = open_db();
+    fn flush_all_accepts_an_arc_wrapped_store() {
+        let store = Arc::new(FakeStore::default());
         let registry = Registry::new();
         registry.register_counter(&TEST_PERSIST_COUNTER);
-        TEST_PERSIST_COUNTER.inc_by(&registry, 20);
-        flush_all(&registry, &db).expect("flush");
+        TEST_PERSIST_COUNTER.inc_by(&registry, 3);
 
-        db.metrics_reset_one("test_persist.counter", 9999).expect("reset one");
-        let (counters, _) = db.metrics_load_all().expect("load");
-        let row = counters.iter().find(|r| r.name == "test_persist.counter").unwrap();
-        assert_eq!(row.value, 0);
-        assert_eq!(row.updated_at_ms, 9999);
-    }
+        flush_all(&registry, &store).expect("flush through Arc");
 
-    #[test]
-    fn metrics_reset_one_returns_false_for_unknown_name() {
-        let db = open_db();
-        let (c, g) = db.metrics_reset_one("does.not.exist", 1234).expect("reset");
-        assert!(!c);
-        assert!(!g);
-    }
-
-    #[test]
-    fn metrics_reset_all_zeros_every_row() {
-        let db = open_db();
-        let registry = Registry::new();
-        registry.register_counter(&TEST_PERSIST_COUNTER);
-        registry.register_gauge(&TEST_PERSIST_GAUGE);
-        TEST_PERSIST_COUNTER.inc_by(&registry, 5);
-        TEST_PERSIST_GAUGE.set(&registry, 77);
-        flush_all(&registry, &db).expect("flush");
-
-        let (counter_count, gauge_count) = db.metrics_reset_all(8888).expect("reset all");
-        assert_eq!(counter_count, 1);
-        assert_eq!(gauge_count, 1);
-
-        let (counters, gauges) = db.metrics_load_all().expect("load");
-        assert_eq!(counters[0].value, 0);
-        assert_eq!(gauges[0].value, 0);
+        let (counters, _) = store.metrics_load_all().expect("load");
+        assert_eq!(
+            counters
+                .iter()
+                .find(|r| r.name == "test_persist.counter")
+                .map(|r| r.value),
+            Some(3),
+        );
     }
 }

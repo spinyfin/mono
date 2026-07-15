@@ -1,34 +1,12 @@
-//! Engine counter / gauge metrics framework (phase 1).
+//! Startup registration of every counter / gauge the engine declares.
 //!
-//! Declaring a new metric is a one- or two-line change at the call
-//! site via [`register_counter!`] / [`register_gauge!`]. Values are
-//! held in in-memory atomics for the hot path and flushed to
-//! `state.db` every 30 seconds (and on graceful shutdown). On engine
-//! startup the framework reads the persisted rows back so monotonic
-//! counter totals are continuous across restarts.
-//!
-//! Per the framework design (see
-//! `tools/boss/docs/designs/engine-counter-metrics-framework.md`,
-//! §"Risks / open questions" item 7) the [`Registry`] is plumbed
-//! explicitly as `Arc<Registry>` rather than stashed in a global —
-//! every call site takes a `&Registry` so unit tests can construct a
-//! local registry without leaking state across tests.
-//!
-//! Phase 1 ships the registry, the primitives, the `state.db`
-//! tables, the flush task and the startup-rehydrate path. Phase 4
-//! migrates `DispatcherStats` onto the framework. The `bossctl
-//! metrics` surfacing verbs land in a subsequent phase.
-//!
-//! The registry itself lives in the `boss-engine-metrics-registry`
-//! crate and is re-exported here, so declaring or touching a metric
-//! doesn't rebuild this crate. [`persistence`] and [`init_all`] stay
-//! on this side of the edge: the former needs `crate::work::WorkDb`,
-//! the latter reaches into every metric-declaring engine module.
+//! The metrics framework itself lives in the [`boss_metrics`] crate
+//! and knows nothing about the engine's modules. Naming them is this
+//! module's job — it is the one place that has to reach across the
+//! whole engine, which is exactly why it stays here rather than
+//! moving down into `boss_metrics`.
 
-pub mod persistence;
-
-pub use boss_engine_metrics_registry::{CounterHandle, GaugeHandle, Registry, now_ms};
-pub use persistence::{flush_all, seed_from_db, spawn_flush_task};
+use boss_metrics::Registry;
 
 /// Force registration of every counter / gauge handle the engine
 /// declares.

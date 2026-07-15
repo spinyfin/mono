@@ -1,10 +1,12 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
+exports_files(["Cargo.toml"])
+
 rust_library(
-    name = "metrics_registry",
+    name = "metrics",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_engine_metrics_registry",
+    crate_name = "boss_metrics",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -17,9 +19,9 @@ rust_library(
 )
 
 rust_test(
-    name = "metrics_registry_test",
+    name = "metrics_test",
     size = "small",
-    crate = ":metrics_registry",
+    crate = ":metrics",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

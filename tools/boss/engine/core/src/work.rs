@@ -286,7 +286,6 @@ mod insert_helpers;
 mod list_filter;
 mod mappers;
 mod metrics_db;
-mod metrics_types;
 mod migrations_a;
 mod migrations_b;
 mod migrations_boothby;
@@ -340,8 +339,11 @@ pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
 pub use mappers::ProducerConflictInsertInput;
 pub use mappers::SpeculativeConflictInsertInput;
-pub use metrics_types::MetricsCounterRow;
-pub use metrics_types::MetricsGaugeRow;
+// Metrics vocabulary, owned by the metrics framework rather than by
+// `work`. Re-exported here so the `WorkDb::metrics_*` signatures read
+// the same as every other row type in this module.
+pub use boss_metrics::MetricsCounterRow;
+pub use boss_metrics::MetricsGaugeRow;
 pub use output_types::HostBoundExecution;
 pub use output_types::IdleAbandonmentCompletion;
 pub use output_types::LatePrCandidate;

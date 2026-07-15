@@ -21,8 +21,8 @@ boss-editorial = { path = "../editorial" }
 boss-engine-driver = { path = "../driver" }
 boss-feature-flags = { path = "../feature-flags" }
 boss-engine-live-status-redact = { path = "../live-status-redact" }
-boss-engine-metrics-registry = { path = "../metrics-registry" }
 boss-log-files = { path = "../../log-files" }
+boss-metrics = { path = "../metrics" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
