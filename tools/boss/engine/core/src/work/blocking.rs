@@ -997,10 +997,12 @@ impl WorkDb {
     }
 
     /// Read-only list of `ci_remediations` rows for `boss engine ci
-    /// list` (design Phase 11 #35). Mirror of
-    /// [`Self::list_conflict_resolutions`]. Filters are AND-ed; an
-    /// empty `status` slice means "any status." Rows come back freshest
-    /// first (`created_at DESC, id DESC`); `limit = None` returns every
+    /// list` (design Phase 11 #35). Shares the `ListFilterQuery`
+    /// builder with [`Self::list_conflict_resolutions`], so the two
+    /// agree on filter semantics by construction: filters are AND-ed;
+    /// an empty
+    /// `status` slice means "any status." Rows come back freshest first
+    /// (`created_at DESC, id DESC`); `limit = None` returns every
     /// match — the CLI applies its own default cap.
     pub fn list_ci_remediations(
         &self,
@@ -1010,7 +1012,7 @@ impl WorkDb {
         limit: Option<u32>,
     ) -> Result<Vec<CiRemediation>> {
         let conn = self.connect()?;
-        let mut sql = String::from(
+        ListFilterQuery::new(
             "SELECT id, product_id, work_item_id, pr_url, pr_number,
                     head_branch, head_sha_at_trigger, head_sha_after,
                     attempt_kind, consumes_budget, failed_checks,
@@ -1019,40 +1021,13 @@ impl WorkDb {
                     created_at, started_at, finished_at,
                     failure_kind, before_commit_sha, revision_task_id
              FROM ci_remediations WHERE 1=1",
-        );
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(pid) = product_id {
-            sql.push_str(" AND product_id = ?");
-            params_vec.push(Box::new(pid.to_owned()));
-        }
-        if let Some(wid) = work_item_id {
-            sql.push_str(" AND work_item_id = ?");
-            params_vec.push(Box::new(wid.to_owned()));
-        }
-        if !statuses.is_empty() {
-            sql.push_str(" AND status IN (");
-            for (idx, status) in statuses.iter().enumerate() {
-                if idx > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-                params_vec.push(Box::new(status.clone()));
-            }
-            sql.push(')');
-        }
-        sql.push_str(" ORDER BY created_at DESC, id DESC");
-        if let Some(cap) = limit {
-            sql.push_str(" LIMIT ?");
-            params_vec.push(Box::new(cap as i64));
-        }
-        let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(refs.as_slice(), map_ci_remediation)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        )
+        .filter_product_id(product_id)
+        .filter_work_item_id(work_item_id)
+        .filter_status_in(statuses)
+        .order_by_created_desc()
+        .limit(limit)
+        .collect(&conn, map_ci_remediation)
     }
 
     /// User-facing `boss engine ci retry` action — design Phase 11
@@ -1324,7 +1299,7 @@ impl WorkDb {
                 // shim's DDL is in the tree (id / dependent_pr_url /
                 // status); the production table will add timestamps
                 // and product_id.
-                let mut sql = String::from(
+                let rows = ListFilterQuery::new(
                     "SELECT id,
                             COALESCE(product_id, '') AS product_id,
                             dependent_pr_url AS pr_url,
@@ -1334,30 +1309,11 @@ impl WorkDb {
                             started_at,
                             finished_at
                      FROM rebase_attempts WHERE 1=1",
-                );
-                let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-                if let Some(pid) = product_id {
-                    sql.push_str(" AND product_id = ?");
-                    params_vec.push(Box::new(pid.to_owned()));
-                }
-                if !statuses.is_empty() {
-                    sql.push_str(" AND status IN (");
-                    for (idx, status) in statuses.iter().enumerate() {
-                        if idx > 0 {
-                            sql.push(',');
-                        }
-                        sql.push('?');
-                        params_vec.push(Box::new(status.clone()));
-                    }
-                    sql.push(')');
-                }
-                sql.push_str(" ORDER BY created_at DESC, id DESC");
-                // Use a sub-scope so the prepared statement borrow
-                // ends before we move `conn` again.
-                let refs: Vec<&dyn rusqlite::ToSql> =
-                    params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
-                let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(refs.as_slice(), |row| {
+                )
+                .filter_product_id(product_id)
+                .filter_status_in(statuses)
+                .order_by_created_desc()
+                .collect(&conn, |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -1370,7 +1326,7 @@ impl WorkDb {
                     ))
                 })?;
                 for r in rows {
-                    let (id, pid, pr_url, status, fr, created_at, started_at, finished_at) = r?;
+                    let (id, pid, pr_url, status, fr, created_at, started_at, finished_at) = r;
                     out.push(EngineAttemptListEntry {
                         kind: "rebase".into(),
                         id,
