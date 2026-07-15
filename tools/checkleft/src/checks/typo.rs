@@ -76,10 +76,6 @@ struct ParsedTypoConfig {
 
 #[async_trait]
 impl ConfiguredCheck for ParsedTypoConfig {
-    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
-    }
-
     async fn run_with_progress(
         &self,
         changeset: &ChangeSet,

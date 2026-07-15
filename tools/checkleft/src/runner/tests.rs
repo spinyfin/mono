@@ -143,7 +143,12 @@ impl Check for CapturingCheck {
 
 #[async_trait]
 impl ConfiguredCheck for CapturingCheck {
-    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        _tree: &dyn SourceTree,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         let files: Vec<_> = changeset
             .changed_files
             .iter()
@@ -184,7 +189,12 @@ impl Check for MetadataCapturingCheck {
 
 #[async_trait]
 impl ConfiguredCheck for MetadataCapturingCheck {
-    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        _tree: &dyn SourceTree,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         *self.seen_bypass_reason.lock().expect("lock bypass reason") = changeset.bypass_reason(&self.directive_name);
         *self.seen_change_id.lock().expect("lock change id") = changeset.change_id.clone();
         *self.seen_repository.lock().expect("lock repository") = changeset.repository.clone();
@@ -222,7 +232,12 @@ impl Check for EmitsFixedPathCheck {
 
 #[async_trait]
 impl ConfiguredCheck for EmitsFixedPathCheck {
-    async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+    async fn run_with_progress(
+        &self,
+        _changeset: &ChangeSet,
+        _tree: &dyn SourceTree,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         Ok(CheckResult {
             check_id: self.id().to_owned(),
             findings: vec![Finding {
@@ -266,7 +281,12 @@ impl Check for EmitsSuggestedFixCheck {
 
 #[async_trait]
 impl ConfiguredCheck for EmitsSuggestedFixCheck {
-    async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+    async fn run_with_progress(
+        &self,
+        _changeset: &ChangeSet,
+        _tree: &dyn SourceTree,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         Ok(CheckResult {
             check_id: self.id().to_owned(),
             findings: vec![
@@ -770,7 +790,12 @@ async fn runner_reports_check_errors_in_output() {
 
     #[async_trait]
     impl ConfiguredCheck for FailingCheck {
-        async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+        async fn run_with_progress(
+            &self,
+            _changeset: &ChangeSet,
+            _tree: &dyn SourceTree,
+            _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+        ) -> Result<CheckResult> {
             anyhow::bail!("boom");
         }
     }

@@ -44,10 +44,6 @@ impl ConfiguredCheck for CompiledForbiddenImportsDepsConfig {
         count_applicable(changeset, |path| self.applies_to(path))
     }
 
-    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
-    }
-
     async fn run_with_progress(
         &self,
         changeset: &ChangeSet,
