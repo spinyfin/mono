@@ -320,7 +320,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp()
 
+    /// App Nap opt-out token (App Nap incident, 2026-07-15): held for the
+    /// process lifetime so `ProcessInfo`/`NSApp` never throttles the main
+    /// run loop while the display sleeps. Worker fleets run unattended
+    /// overnight with the display off, so scoping this narrower (e.g. to
+    /// "while an engine connection is registered") buys nothing — the app
+    /// needs to stay prompt for the whole session. `endActivity` is
+    /// intentionally never called: releasing the token would re-enable App
+    /// Nap, and the token itself is released implicitly when the process
+    /// exits. `.userInitiatedAllowingIdleSystemSleep` opts out of App Nap
+    /// *without* pinning the display or system awake — display/system idle
+    /// sleep must still be allowed (the incident was about RPC handling
+    /// staying prompt during sleep, not preventing sleep); do not swap in
+    /// `.idleDisplaySleepDisabled` or similar, which would do the latter.
+    private var appNapOptOutToken: NSObjectProtocol?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        appNapOptOutToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Keep engine RPC handling and diagnostics sampling prompt during display sleep"
+        )
+
         // When launched outside a regular .app bundle (e.g. `swift run`
         // for local dev), macOS does not auto-promote the process to a
         // foreground UI app — the window opens but never becomes key,
@@ -352,6 +372,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Surfaced via the "Terminal Loop" window (Cmd-Shift-T). See
         // [[TerminalLoopMonitor]].
         TerminalLoopMonitor.shared.start()
+
+        // Record display sleep/wake transitions into the same diagnostics
+        // JSONL mirror (App Nap incident, 2026-07-15) — see
+        // [[DisplayPowerMonitor]].
+        DisplayPowerMonitor.shared.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
