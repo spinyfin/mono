@@ -271,7 +271,21 @@ enum DispatchAction {
     Resume,
     /// Show the current dispatch-pause state (paused/running and, if paused,
     /// when it was paused).
-    State,
+    State {
+        /// Instead of the live engine RPC state, print recent pause/resume
+        /// episodes (operator- and breaker-originated) with their full audit
+        /// evidence — file-scan only over `dispatch-events/current.jsonl`,
+        /// so it works even when the engine is wedged.
+        #[arg(long)]
+        history: bool,
+        /// Maximum number of episodes to print (most recent first). Only
+        /// meaningful with `--history`.
+        #[arg(short = 'n', long = "n", default_value_t = 10)]
+        n: usize,
+        /// Override the Boss state root. Only meaningful with `--history`.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Aggregate how long ready work items wait for a worker slot,
     /// broken down by the defer reason that finally cleared
     /// (`chain_serialized`, `pool_exhausted`, ...), plus the current
@@ -797,8 +811,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DispatchAction::Resume,
         } => dispatch_set_paused(&cli.socket_path, cli.json, false).await,
         Command::Dispatch {
-            action: DispatchAction::State,
-        } => dispatch_state(&cli.socket_path, cli.json).await,
+            action: DispatchAction::State { history, n, state_root },
+        } => {
+            if history {
+                dispatch_pause_history(cli.json, state_root, n)
+            } else {
+                dispatch_state(&cli.socket_path, cli.json).await
+            }
+        }
         Command::Dispatch {
             action: DispatchAction::Stats { state_root, since, top },
         } => dispatch_stats::dispatch_stats(cli.json, state_root, since.as_deref(), top),
@@ -1088,6 +1108,90 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }
+}
+
+/// Print recent dispatch pause/resume episodes with their full audit
+/// evidence — file-scan only over `dispatch-events/current.jsonl` (same
+/// pattern as `dispatch tail`/`diagnose`), so it works even when the engine
+/// is wedged and doesn't depend on the live RPC state `dispatch state`
+/// reads. Surfaces both operator (`dispatch_paused`/`dispatch_resumed`,
+/// `origin: "operator"`) and breaker-originated (`origin: "breaker"`,
+/// carrying the full `trigger` evidence — which executions/work
+/// items/slots failed to spawn, over what window, against which
+/// threshold) episodes in one place.
+fn dispatch_pause_history(json: bool, state_root: Option<PathBuf>, n: usize) -> Result<()> {
+    let root = resolve_state_root(state_root)?;
+    let events = dispatch_reader::read_current(&root)?;
+    let mut episodes: Vec<&DispatchEvent> = events
+        .iter()
+        .filter(|e| e.stage == "dispatch_paused" || e.stage == "dispatch_resumed")
+        .collect();
+    episodes.reverse();
+    episodes.truncate(n);
+
+    if json {
+        let value: Vec<serde_json::Value> = episodes
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "ts_epoch_ms": e.ts_epoch_ms,
+                    "stage": e.stage,
+                    "execution_id": e.execution_id,
+                    "work_item_id": e.work_item_id,
+                    "details": e.details,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+
+    if episodes.is_empty() {
+        println!("no pause/resume episodes recorded");
+        return Ok(());
+    }
+
+    for event in episodes {
+        let kind = if event.stage == "dispatch_paused" {
+            "PAUSED"
+        } else {
+            "RESUMED"
+        };
+        let origin = event.details["origin"].as_str().unwrap_or("unknown");
+        let actor = event.details["actor"].as_str().unwrap_or("unknown");
+        println!(
+            "{kind}  ts_epoch_ms={} origin={origin} actor={actor}",
+            event.ts_epoch_ms
+        );
+        if let Some(reason) = event.details["reason"].as_str() {
+            println!("  reason: {reason}");
+        }
+        if let Some(scope) = event.details["scope"].as_array() {
+            let scope: Vec<&str> = scope.iter().filter_map(|v| v.as_str()).collect();
+            println!("  scope: {}", scope.join(","));
+        }
+        if let Some(duration) = event.details["pause_duration_secs"].as_u64() {
+            println!("  pause_duration_secs: {duration}");
+        }
+        let trigger = &event.details["trigger"];
+        if !trigger.is_null() {
+            println!("  trigger rule: {}", trigger["rule"].as_str().unwrap_or(""));
+            if let Some(triggering) = trigger["triggering_events"].as_array() {
+                println!("  triggering events ({}):", triggering.len());
+                for ev in triggering {
+                    println!(
+                        "    execution_id={} work_item_id={} slot_id={} shell_pid={} epoch_secs={}",
+                        ev["execution_id"].as_str().unwrap_or(""),
+                        ev["work_item_id"].as_str().unwrap_or(""),
+                        ev["slot_id"].as_str().unwrap_or(""),
+                        ev["shell_pid"].as_i64().unwrap_or(0),
+                        ev["epoch_secs"].as_i64().unwrap_or(0),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn filter_and_tail<'a>(

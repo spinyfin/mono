@@ -406,6 +406,10 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             );
             return;
         }
+        // Snapshot the pause start (if any) before `set_dispatch_paused`
+        // zeroes it on resume, so a resume's audit record can carry how
+        // long the episode actually lasted.
+        let paused_since_before = coordinator.dispatch_paused_since_epoch_s();
         let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         // A human toggling `bossctl dispatch pause` / the app's pause switch
         // is always an operator-originated pause, so PR-review executions —
@@ -434,11 +438,47 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         }
         if paused {
             tracing::info!("dispatch: globally paused (operator) — PR-review executions remain exempt");
+            server_state
+                .dispatch_events
+                .emit(
+                    crate::dispatch_events::DispatchEvent::new(
+                        crate::dispatch_events::Stage::DispatchPaused,
+                        crate::dispatch_events::Outcome::Ok,
+                        "engine",
+                    )
+                    .with_details(serde_json::json!({
+                        "origin": "operator",
+                        "actor": "operator",
+                        "paused_since_epoch_s": now_epoch_s,
+                        "reviews_held": false,
+                        "scope": ["dispatch"],
+                        "reason": "operator requested pause via bossctl dispatch pause / the app's dispatch toggle",
+                    })),
+                )
+                .await;
         } else {
             // Re-kick the scheduler so anything that queued while paused is
             // drained immediately without waiting for the next external event.
             coordinator.kick();
             tracing::info!("dispatch: resumed — scheduler kicked to drain queued executions");
+            let pause_duration_secs = paused_since_before.map(|since| now_epoch_s.saturating_sub(since));
+            server_state
+                .dispatch_events
+                .emit(
+                    crate::dispatch_events::DispatchEvent::new(
+                        crate::dispatch_events::Stage::DispatchResumed,
+                        crate::dispatch_events::Outcome::Ok,
+                        "engine",
+                    )
+                    .with_details(serde_json::json!({
+                        "origin": "operator",
+                        "actor": "operator",
+                        "resumed_at_epoch_s": now_epoch_s,
+                        "pause_duration_secs": pause_duration_secs,
+                        "reason": "operator requested resume via bossctl dispatch resume / the app's dispatch toggle",
+                    })),
+                )
+                .await;
         }
         let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
         send_response(

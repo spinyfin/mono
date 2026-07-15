@@ -406,6 +406,14 @@ pub(crate) async fn reap_never_started_spawn(
     // failure spreads across many work items, which the per-item churn guard
     // cannot catch; when enough DISTINCT items fail in the window the breaker
     // pauses dispatch and raises one loud attention item.
+    ctx.spawn_health
+        .record_evidence(crate::spawn_health::SpawnFailureEvidence {
+            execution_id: execution_id.to_owned(),
+            work_item_id: work_item_id.to_owned(),
+            slot_id: slot_id.to_string(),
+            shell_pid,
+            epoch_secs: now_epoch_secs,
+        });
     if let Some(distinct) = ctx.spawn_health.record_failure(work_item_id, now_epoch_secs) {
         trip_spawn_capability_circuit(
             ctx.work_db,
