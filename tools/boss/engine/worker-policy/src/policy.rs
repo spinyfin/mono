@@ -398,6 +398,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DisableAutomation { .. }
         | FrontendRequest::EnableAutomation { .. }
         | FrontendRequest::EvaluateEditorialRules { .. }
+        | FrontendRequest::BoothbyAct { .. }
         | FrontendRequest::GetAutomation { .. }
         // Automation *state* is coordinator configuration, not work
         // taxonomy: it is not in the design's exposed read set, and a triage

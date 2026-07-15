@@ -335,6 +335,68 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// The newest execution for `work_item_id` that is **not terminal**, as
+    /// `(execution_id, status)` — or `None` if every execution has finished.
+    ///
+    /// Backs Boothby's live-work guard, whose contract
+    /// (`boothby.md` §"Safety rails") is "rows with a non-terminal
+    /// execution". That is deliberately wider than
+    /// [`WorkDb::get_live_execution_for_work_item`], which answers a
+    /// different question — "is a *worker* running right now?" — and so
+    /// matches only `running` / `waiting_human`. A `queued` or `ready`
+    /// execution has no worker yet but is absolutely pending work, and
+    /// archiving its task would strand it.
+    ///
+    /// Terminal-status list inlined to match this module's existing
+    /// queries (`next_dispatchable`, the pool scans below) rather than
+    /// introducing a second spelling of the same set.
+    pub fn non_terminal_execution_for_work_item(&self, work_item_id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, status
+             FROM work_executions
+             WHERE work_item_id = ?1
+               AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            [work_item_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// The cube lease still recorded against `work_item_id`, as
+    /// `(execution_id, lease_id)` — or `None` if nothing holds one.
+    ///
+    /// Deliberately does **not** filter on execution status. Releasing a
+    /// lease NULLs the column (`release_execution_workspace`), so a
+    /// `cube_lease_id` that is still set means the lease was never
+    /// released — and on a *terminal* execution that is not provenance,
+    /// it is a stuck lease, which is precisely the state Boothby must not
+    /// mutate around (and which catalogue verb #15 exists to clean up).
+    /// Filtering to non-terminal rows would have made this guard a strict
+    /// subset of the live-work guard, i.e. dead code.
+    ///
+    /// Reads the engine's own record rather than shelling out to cube:
+    /// this sits in the mutation path, where a subprocess would be both
+    /// slow and a new failure mode.
+    pub fn held_lease_for_work_item(&self, work_item_id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, cube_lease_id
+             FROM work_executions
+             WHERE work_item_id = ?1
+               AND cube_lease_id IS NOT NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            [work_item_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Build a map from `cube_lease_id` → `execution_id` for every
     /// execution row that currently records a lease. Used by
     /// `WorkspacePoolSummary` to annotate cube's view of the pool with
