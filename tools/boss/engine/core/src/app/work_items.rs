@@ -663,6 +663,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
         sink,
         session_id,
         request_id,
+        peer_pid,
         ..
     } = ctx;
     let FrontendRequest::DeleteWorkItem { id } = req else {
@@ -712,6 +713,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                         "work_item_id": &id,
                         "cascade_deleted_ids": tombstoned_ids.iter().filter(|tid| *tid != &id).collect::<Vec<_>>(),
                         "actor": actor,
+                        "peer_pid": peer_pid,
                         "reason": "delete_work_item request",
                     }),
                 );

@@ -1554,6 +1554,35 @@ fn live_execution_for_task_id_returns_none_for_unknown_id() {
     );
 }
 
+/// Regression guard restoring the kind guard the old `WorkItem`-based
+/// `live_execution_for_deleted_item` enforced (matching `WorkItem::Task |
+/// WorkItem::Chore` and returning `None` otherwise): a product id must
+/// never resolve a live `ProductDesign` execution here, since this helper
+/// is only ever fed ids `delete_work_item` returned, and `delete_work_item`
+/// bails on `Product`/`Project` before returning any ids — a product-bound
+/// live design worker must not be mistaken for a task/chore worker.
+#[test]
+fn live_execution_for_task_id_returns_none_for_product() {
+    use crate::work::CreateExecutionInput;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path).unwrap());
+    let product = create_test_product_with_repo(&db, "Prod", Some("https://github.com/test/repo"));
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(product.id.clone())
+            .kind(boss_protocol::ExecutionKind::ProductDesign)
+            .status(boss_protocol::ExecutionStatus::Running)
+            .repo_remote_url("https://github.com/test/repo")
+            .build(),
+    )
+    .unwrap();
+    assert!(
+        live_execution_for_task_id(&db, &product.id).is_none(),
+        "a product id must never resolve a live design execution"
+    );
+}
+
 // --- chore-update notification helpers ---
 
 #[test]

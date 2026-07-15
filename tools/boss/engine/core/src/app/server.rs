@@ -788,6 +788,7 @@ pub async fn serve(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
         Arc::clone(&server_state) as Arc<dyn crate::terminal_work_sweep::WorkerReaper>,
+        server_state.cube_client.clone(),
         server_state.dispatch_events.clone(),
         crate::terminal_work_sweep::DEFAULT_INTERVAL,
     );

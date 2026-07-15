@@ -910,6 +910,18 @@ pub(super) fn active_to_todo_execution(
 /// independent execution) rather than only the top-level id it started
 /// from.
 pub(super) fn live_execution_for_task_id(work_db: &WorkDb, task_id: &str) -> Option<String> {
+    // Restore the task/chore kind guard the old `WorkItem`-based
+    // `live_execution_for_deleted_item` enforced (it matched
+    // `WorkItem::Task | WorkItem::Chore` and returned `None` for anything
+    // else). Tasks and chores are the only kinds sharing the `task_` id
+    // prefix — `ProductDesign` / `ProjectDesign` executions bind
+    // `work_item_id` to a `prod_` / `proj_` id, and `latest_execution_for_
+    // work_item` has no kind filter of its own, so without this a
+    // product/project id would resolve a live design worker's execution
+    // for teardown instead of correctly returning `None`.
+    if !task_id.starts_with("task_") {
+        return None;
+    }
     match work_db.latest_execution_for_work_item(task_id) {
         Ok(Some(execution))
             if !matches!(
