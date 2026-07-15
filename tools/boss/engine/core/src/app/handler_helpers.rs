@@ -891,27 +891,38 @@ pub(super) fn active_to_todo_execution(
     }
 }
 
-/// If `item` is a task or chore whose latest execution is still live
-/// (non-terminal), return that execution's id so a caller deleting the
-/// work item can tear down the worker. A live execution
+/// If the task/chore named by `task_id` has a latest execution that is
+/// still live (non-terminal), return that execution's id so a caller
+/// deleting the work item can tear down the worker. A live execution
 /// (`ready` / `running` / `waiting_*`) is still holding a worker pool
 /// slot and possibly a leased cube workspace; deleting the backing row
 /// must stop it, or the agent keeps running with no work item behind
 /// it. Terminal executions (`completed` / `failed` / `abandoned` /
 /// `cancelled` / `orphaned`) need no teardown.
 ///
-/// Note: this must be read *before* `delete_work_item` tombstones the
-/// task row — `latest_execution_for_work_item` queries the
-/// `work_executions` table by `work_item_id`, which the soft-delete
-/// does not touch, but loading the `WorkItem` itself goes through paths
-/// that filter out `deleted_at` rows. The delete handler captures the
-/// `WorkItem` before deleting and passes it here.
-pub(super) fn live_execution_for_deleted_item(work_db: &WorkDb, item: &WorkItem) -> Option<String> {
-    let task = match item {
-        WorkItem::Task(t) | WorkItem::Chore(t) => t,
-        _ => return None,
-    };
-    match work_db.latest_execution_for_work_item(&task.id) {
+/// Id-based rather than `WorkItem`-based so it also works for a row
+/// `delete_work_item` has already tombstoned — `latest_execution_for_work_item`
+/// queries the `work_executions` table by `work_item_id`, which the
+/// soft-delete does not touch, but loading a `WorkItem` for the id goes
+/// through paths that filter out `deleted_at` rows. This is what lets
+/// the delete handler check every id `delete_work_item` cascade-deletes
+/// (the parent AND each revision in its chain, each carrying its own
+/// independent execution) rather than only the top-level id it started
+/// from.
+pub(super) fn live_execution_for_task_id(work_db: &WorkDb, task_id: &str) -> Option<String> {
+    // Restore the task/chore kind guard the old `WorkItem`-based
+    // `live_execution_for_deleted_item` enforced (it matched
+    // `WorkItem::Task | WorkItem::Chore` and returned `None` for anything
+    // else). Tasks and chores are the only kinds sharing the `task_` id
+    // prefix — `ProductDesign` / `ProjectDesign` executions bind
+    // `work_item_id` to a `prod_` / `proj_` id, and `latest_execution_for_
+    // work_item` has no kind filter of its own, so without this a
+    // product/project id would resolve a live design worker's execution
+    // for teardown instead of correctly returning `None`.
+    if !task_id.starts_with("task_") {
+        return None;
+    }
+    match work_db.latest_execution_for_work_item(task_id) {
         Ok(Some(execution))
             if !matches!(
                 execution.status.as_str(),
@@ -923,9 +934,9 @@ pub(super) fn live_execution_for_deleted_item(work_db: &WorkDb, item: &WorkItem)
         Ok(_) => None,
         Err(err) => {
             tracing::warn!(
-                work_item_id = %task.id,
+                work_item_id = task_id,
                 ?err,
-                "live_execution_for_deleted_item: failed to look up latest execution",
+                "live_execution_for_task_id: failed to look up latest execution",
             );
             None
         }

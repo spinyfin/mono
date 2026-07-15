@@ -139,7 +139,18 @@ fn delete_parent_cascades_to_revisions_and_restore_brings_them_back() {
     assert!(db.get_work_item(&r1.id).is_ok());
     assert!(db.get_work_item(&r2.id).is_ok());
 
-    db.delete_work_item(&parent_id).unwrap();
+    let tombstoned_ids = db.delete_work_item(&parent_id).unwrap();
+
+    // The return value must name every id this call tombstoned — the
+    // parent AND both cascade-deleted revisions — so a caller that needs
+    // to tear down live workers bound to any of them (a revision can have
+    // its own execution, independent of the parent's) knows the full set
+    // to check, not just the parent id.
+    assert_eq!(
+        tombstoned_ids,
+        vec![parent_id.clone(), r1.id.clone(), r2.id.clone()],
+        "delete_work_item must return the parent id followed by every cascade-deleted revision id",
+    );
 
     // Parent and both revisions must now be tombstoned.
     assert!(db.get_work_item(&parent_id).is_err());

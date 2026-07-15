@@ -222,10 +222,11 @@ pub fn record_shutdown_rpc(outcome: &str, peer_pid: Option<i32>) {
     write_record(now, "shutdown_rpc", fields);
 }
 
-/// Record an arbitrary auxiliary event. Reserved for future expansion
-/// (e.g. socket teardown, accept errors). Keeps a single funnel into
-/// the file format.
-#[allow(dead_code)]
+/// Record an arbitrary auxiliary event. A single funnel into the file
+/// format for events that don't warrant their own `record_*` wrapper —
+/// e.g. `work_item_deleted`, so a deletion is attributable to an actor
+/// and reason even though the row itself is soft-deleted (and thus
+/// mostly invisible to normal queries).
 pub fn record_event<T: Serialize>(event: &str, payload: &T) {
     let value = match serde_json::to_value(payload) {
         Ok(Value::Object(m)) => m,

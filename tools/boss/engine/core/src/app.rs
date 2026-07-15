@@ -111,7 +111,7 @@ use handler_helpers::{
     METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
     TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
     build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
-    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_deleted_item,
+    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
     load_dispatch_paused_state, load_live_status_disabled_slots, open_review_terminal_async,
     persist_live_status_disabled_slots, publish_comment_invalidation, publish_work_invalidation, read_transcript_tail,
     resolve_transcript_for_tail, segment_to_wire, send_push, send_response, send_response_with_revision,

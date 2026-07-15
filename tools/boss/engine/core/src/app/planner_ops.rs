@@ -299,7 +299,42 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
             continue;
         }
         match work_db.delete_work_item(task_id) {
-            Ok(()) => deleted.push(task_id.clone()),
+            Ok(tombstoned_ids) => {
+                crate::audit::record_event(
+                    "work_item_deleted",
+                    &serde_json::json!({
+                        "work_item_id": task_id,
+                        "cascade_deleted_ids": tombstoned_ids.iter().filter(|tid| *tid != task_id).collect::<Vec<_>>(),
+                        "actor": "engine",
+                        "reason": "unpopulate_project",
+                    }),
+                );
+                // A revision cascade-deleted alongside `task_id` carries its
+                // own execution independent of the parent's, and the
+                // `has_executions` guard above only ever checked the
+                // top-level id — so a parent with no executions of its own
+                // but a revision that does have a live one would otherwise
+                // slip through undetected. Mirror `handle_delete_work_item`:
+                // tear down every cascade-deleted id's live worker, not just
+                // the one this loop started from.
+                for tombstoned_id in &tombstoned_ids {
+                    let Some(execution_id) = live_execution_for_task_id(&work_db, tombstoned_id) else {
+                        continue;
+                    };
+                    let handler = server_state.completion_handler.clone();
+                    let id_for_cancel = tombstoned_id.clone();
+                    tokio::spawn(async move {
+                        handler
+                            .cancel_and_release(
+                                &id_for_cancel,
+                                &execution_id,
+                                "work item deleted while a worker was active",
+                            )
+                            .await;
+                    });
+                }
+                deleted.push(task_id.clone());
+            }
             Err(err) => {
                 let name = task_name_for_id(&work_db, task_id);
                 tracing::warn!(task_id, ?err, "unpopulate_project: failed to delete task");

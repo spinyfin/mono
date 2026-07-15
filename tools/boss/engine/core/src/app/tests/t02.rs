@@ -1455,20 +1455,19 @@ fn active_to_todo_execution_returns_none_for_product() {
     );
 }
 
-// ---- live_execution_for_deleted_item ----
+// ---- live_execution_for_task_id ----
 
 #[test]
-fn live_execution_for_deleted_item_returns_none_when_no_execution() {
+fn live_execution_for_task_id_returns_none_when_no_execution() {
     let (_dir, db, _, chore_id) = make_work_db_with_chore();
-    let item = db.get_work_item(&chore_id).unwrap();
     assert!(
-        live_execution_for_deleted_item(&db, &item).is_none(),
+        live_execution_for_task_id(&db, &chore_id).is_none(),
         "must return None when the chore has no executions"
     );
 }
 
 #[test]
-fn live_execution_for_deleted_item_returns_execution_id_when_running() {
+fn live_execution_for_task_id_returns_execution_id_when_running() {
     use crate::work::CreateExecutionInput;
     let (_dir, db, _, chore_id) = make_work_db_with_chore();
     let execution = db
@@ -1480,16 +1479,15 @@ fn live_execution_for_deleted_item_returns_execution_id_when_running() {
                 .build(),
         )
         .unwrap();
-    let item = db.get_work_item(&chore_id).unwrap();
     assert_eq!(
-        live_execution_for_deleted_item(&db, &item).as_deref(),
+        live_execution_for_task_id(&db, &chore_id).as_deref(),
         Some(execution.id.as_str()),
         "must return the live execution id so the worker can be torn down"
     );
 }
 
 #[test]
-fn live_execution_for_deleted_item_returns_none_when_terminal() {
+fn live_execution_for_task_id_returns_none_when_terminal() {
     use crate::work::CreateExecutionInput;
     use boss_protocol::ExecutionStatus;
     for status in [
@@ -1508,24 +1506,80 @@ fn live_execution_for_deleted_item_returns_none_when_terminal() {
                 .build(),
         )
         .unwrap();
-        let item = db.get_work_item(&chore_id).unwrap();
         assert!(
-            live_execution_for_deleted_item(&db, &item).is_none(),
+            live_execution_for_task_id(&db, &chore_id).is_none(),
             "must return None for terminal execution status {status:?}"
         );
     }
 }
 
+/// Regression guard for the "revision worker never checked" gap: unlike a
+/// `WorkItem`-based lookup (which would need `get_work_item` to resolve
+/// the row, and thus fail the moment `delete_work_item` tombstones it),
+/// this id-based lookup must still find a live execution AFTER its row is
+/// soft-deleted — `work_executions` is untouched by the soft-delete. This
+/// is what lets `handle_delete_work_item` tear down a worker bound to a
+/// cascade-deleted revision, whose row is already tombstoned by the time
+/// the handler checks it.
 #[test]
-fn live_execution_for_deleted_item_returns_none_for_product() {
+fn live_execution_for_task_id_finds_execution_after_row_is_tombstoned() {
+    use crate::work::CreateExecutionInput;
+    let (_dir, db, _, chore_id) = make_work_db_with_chore();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+
+    db.delete_work_item(&chore_id).unwrap();
+    assert!(db.get_work_item(&chore_id).is_err());
+
+    assert_eq!(
+        live_execution_for_task_id(&db, &chore_id).as_deref(),
+        Some(execution.id.as_str()),
+        "must still find the live execution after the row is tombstoned"
+    );
+}
+
+#[test]
+fn live_execution_for_task_id_returns_none_for_unknown_id() {
+    let (_dir, db, _, _chore_id) = make_work_db_with_chore();
+    assert!(
+        live_execution_for_task_id(&db, "task_does_not_exist").is_none(),
+        "an id with no matching row must not be mistaken for a live execution"
+    );
+}
+
+/// Regression guard restoring the kind guard the old `WorkItem`-based
+/// `live_execution_for_deleted_item` enforced (matching `WorkItem::Task |
+/// WorkItem::Chore` and returning `None` otherwise): a product id must
+/// never resolve a live `ProductDesign` execution here, since this helper
+/// is only ever fed ids `delete_work_item` returned, and `delete_work_item`
+/// bails on `Product`/`Project` before returning any ids — a product-bound
+/// live design worker must not be mistaken for a task/chore worker.
+#[test]
+fn live_execution_for_task_id_returns_none_for_product() {
+    use crate::work::CreateExecutionInput;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let db = Arc::new(WorkDb::open(path).unwrap());
-    let product_item = create_test_product_with_repo(&db, "Prod", None);
-    let item = WorkItem::Product(product_item);
+    let product = create_test_product_with_repo(&db, "Prod", Some("https://github.com/test/repo"));
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(product.id.clone())
+            .kind(boss_protocol::ExecutionKind::ProductDesign)
+            .status(boss_protocol::ExecutionStatus::Running)
+            .repo_remote_url("https://github.com/test/repo")
+            .build(),
+    )
+    .unwrap();
     assert!(
-        live_execution_for_deleted_item(&db, &item).is_none(),
-        "must return None for non-task work items"
+        live_execution_for_task_id(&db, &product.id).is_none(),
+        "a product id must never resolve a live design execution"
     );
 }
 

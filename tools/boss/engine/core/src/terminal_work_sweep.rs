@@ -31,6 +31,28 @@
 //! So nothing reaps a live worker whose reason for existing is already
 //! gone. This sweep closes that gap.
 //!
+//! ## The other zombie this closes (the "Seven" case: a deleted work item)
+//!
+//! A second, distinct gap: the bound work item's row can be deleted
+//! entirely (`delete_work_item`'s soft-delete, or a row that never
+//! existed) while its execution is still live. [`WorkDb::get_work_item`]
+//! collapses "row confirmed gone" and "DB lookup failed for some other
+//! reason" into the same generic error, and the old behaviour treated
+//! both as a conservative skip — which meant a genuinely deleted row's
+//! worker was *never* reaped, logging the same "failed to look up bound
+//! work item" WARN on every pass forever. The real incident: a review
+//! worker sat `waiting_for_input` on slot 25 for 2+ hours bound to a task
+//! id `boss task show` already reported as `unknown work item`, hit by
+//! this exact sweep every ~60s the whole time, and had to be stopped by
+//! hand. [`WorkDb::work_item_row_missing`] tells the two cases apart: a
+//! confirmed-missing row is treated as an orphan and reaped through the
+//! same two-pass path as the O'Brien case (`reason = "work_item_missing"`
+//! in the emitted [`DispatchEvent`]), while a lookup failure that can't be
+//! confirmed as "row gone" still falls back to the old conservative skip.
+//! Deletion is expected to tear its own live executions down synchronously
+//! (see `app::work_items::handle_delete_work_item`) — this sweep is the
+//! backstop for whatever path doesn't (or fails to).
+//!
 //! ## Why this is the safest possible reap signal
 //!
 //! The operator's primary constraint is: never reap a worker that is
@@ -76,6 +98,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::coordinator::CubeClient;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
@@ -152,6 +175,7 @@ pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
     reaper: Arc<dyn WorkerReaper>,
+    cube_client: Arc<dyn CubeClient>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -166,6 +190,7 @@ pub fn spawn_loop(
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let reaper = Arc::clone(&reaper);
+        let cube_client = Arc::clone(&cube_client);
         let dispatch_events = Arc::clone(&dispatch_events);
         let seen_terminal = Arc::clone(&seen_terminal);
         async move {
@@ -174,6 +199,7 @@ pub fn spawn_loop(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 reaper.as_ref(),
+                cube_client.as_ref(),
                 dispatch_events.as_ref(),
                 &mut seen_terminal,
             )
@@ -191,6 +217,7 @@ pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     reaper: &dyn WorkerReaper,
+    cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
     seen_terminal: &mut HashSet<String>,
 ) -> TerminalWorkSweepOutcome {
@@ -237,31 +264,57 @@ pub async fn run_one_pass(
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / cancelled) even though the worker — and possibly its
         // execution — is still alive. A work-item lookup failure falls back
-        // to the execution signal alone rather than guessing.
+        // to the execution signal alone rather than guessing, UNLESS the
+        // failure is because the row itself is confirmed gone (deleted out
+        // from under this execution) — see `work_item_missing` below.
+        let mut work_item_missing = false;
         let work_item_terminal = if never_task_bound {
             false
         } else {
             match work_db.get_work_item(&execution.work_item_id) {
                 Ok(item) => work_item_is_terminal(&item),
-                Err(err) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        work_item_id = %execution.work_item_id,
-                        ?err,
-                        "terminal-work sweep: failed to look up bound work item; using execution status only",
-                    );
-                    false
-                }
+                Err(err) => match work_db.work_item_row_missing(&execution.work_item_id) {
+                    // The Deleting-a-work-item-orphans-its-worker case: the
+                    // row is confirmed gone (never existed, or soft-deleted
+                    // by `delete_work_item`), not merely unreachable. This is
+                    // an orphan, not a degraded-lookup skip — fall through to
+                    // the same two-pass reap path as a terminal work item.
+                    Ok(true) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "terminal-work sweep: bound work item row no longer exists; treating live worker as orphaned",
+                        );
+                        work_item_missing = true;
+                        false
+                    }
+                    // Either the row genuinely still exists (so the
+                    // `get_work_item` error was something else entirely) or
+                    // we couldn't confirm either way — stay conservative and
+                    // retry next pass, exactly as before this case existed.
+                    Ok(false) | Err(_) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            work_item_id = %execution.work_item_id,
+                            ?err,
+                            "terminal-work sweep: failed to look up bound work item; using execution status only",
+                        );
+                        false
+                    }
+                },
             }
         };
 
-        if !work_item_terminal && !execution_terminal {
+        if !work_item_terminal && !execution_terminal && !work_item_missing {
             // Healthy: the worker still has live work to do. Leave it be.
             outcome.active_skipped += 1;
             continue;
         }
 
-        let reason = if work_item_terminal {
+        let reason = if work_item_missing {
+            "work_item_missing"
+        } else if work_item_terminal {
             "work_item_terminal"
         } else {
             "execution_terminal"
@@ -278,7 +331,9 @@ pub async fn run_one_pass(
                 .execution_status(execution.status)
                 .work_item_terminal(work_item_terminal)
                 .execution_terminal(execution_terminal)
+                .work_item_missing(work_item_missing)
                 .reason(reason)
+                .maybe_cube_lease_id(execution.cube_lease_id.clone())
                 .build(),
         ));
     }
@@ -310,6 +365,48 @@ pub async fn run_one_pass(
             "terminal-work sweep: live worker pane outlived its terminal work; reaping and freeing slot",
         );
 
+        // The missing-work-item case has no other path that ever marks the
+        // execution terminal — a `work_item_terminal` or `execution_terminal`
+        // candidate's execution status is already settled by whatever made
+        // it terminal, but here the execution itself may still be `running`
+        // / `waiting_for_input` since nothing tore it down when the row
+        // vanished. Mark it `orphaned` before reaping the pane so the DB
+        // reflects reality and `bossctl agents transcript` still resolves
+        // the row. Best-effort: if the execution turns out already terminal
+        // (a race with some other teardown) this is a conservative no-op.
+        if candidate.work_item_missing {
+            if let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
+            {
+                tracing::warn!(
+                    run_id = %candidate.run_id,
+                    ?err,
+                    "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
+                );
+            }
+
+            // `mark_execution_orphaned` deliberately leaves the cube lease
+            // columns intact (see `lost_workspace_sweep`), and this sweep is
+            // the terminalizer for this candidate — nothing else will ever
+            // free the lease once the row drops out of every lease-reclaim
+            // path's non-terminal filter. Best-effort force-release it here,
+            // mirroring `lost_workspace_sweep::run_one_pass`.
+            if let Some(lease_id) = candidate.cube_lease_id.as_deref()
+                && let Err(err) = cube_client
+                    .force_release_lease(
+                        lease_id,
+                        Some("terminal-work sweep: bound work item row no longer exists"),
+                    )
+                    .await
+            {
+                tracing::debug!(
+                    run_id = %candidate.run_id,
+                    lease_id,
+                    ?err,
+                    "terminal-work sweep: best-effort lease force-release failed (likely already released)",
+                );
+            }
+        }
+
         // Reap via the canonical, idempotent, run-id-keyed teardown. If the
         // slot was recycled to a different execution since the snapshot,
         // this is a no-op and the live worker now in the slot is untouched.
@@ -327,6 +424,7 @@ pub async fn run_one_pass(
                         "execution_status": candidate.execution_status,
                         "work_item_terminal": candidate.work_item_terminal,
                         "execution_terminal": candidate.execution_terminal,
+                        "work_item_missing": candidate.work_item_missing,
                     })),
             )
             .await;
@@ -349,7 +447,14 @@ struct ReapCandidate {
     execution_status: boss_protocol::ExecutionStatus,
     work_item_terminal: bool,
     execution_terminal: bool,
+    work_item_missing: bool,
     reason: &'static str,
+    /// The execution's cube lease id, if any, captured at snapshot time so
+    /// the `work_item_missing` reap arm can force-release it — `mark_
+    /// execution_orphaned` deliberately leaves this column intact (see
+    /// `lost_workspace_sweep`), so nothing else frees it once the row goes
+    /// terminal here.
+    cube_lease_id: Option<String>,
 }
 
 /// Whether a bound work item is in a terminal status. Only task-shaped
@@ -377,7 +482,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
-    use crate::work::{WorkDb, WorkItemPatch};
+    use crate::work::{FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
 
     // ─── reaper stub ─────────────────────────────────────────────────────────
 
@@ -453,6 +558,35 @@ mod tests {
         .unwrap();
     }
 
+    /// Raw UPDATE to stamp a `cube_lease_id` on an execution without a full
+    /// `start_execution_run_on_host` setup — models a live worker still
+    /// holding its cube workspace lease.
+    fn force_cube_lease_id(db: &WorkDb, execution_id: &str, lease_id: &str) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET cube_lease_id = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, lease_id],
+        )
+        .unwrap();
+    }
+
+    /// Stub `CubeClient` that records every `force_release_lease` call;
+    /// every other method is unreachable in this module's tests.
+    #[derive(Default)]
+    struct RecordingCubeClient {
+        force_released: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    crate::stub_cube_client! { RecordingCubeClient {
+        async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
+            self.force_released
+                .lock()
+                .unwrap()
+                .push((lease_id.to_owned(), reason.map(str::to_owned)));
+            Ok(())
+        }
+    } }
+
     /// Register a live worker pane (activity `Spawning`, an alive PID) bound
     /// to `work_item_id` / `execution_id`.
     fn register_live_worker(
@@ -499,18 +633,19 @@ mod tests {
         set_work_item_status(&db, &work_item_id, "done");
 
         let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let mut seen = HashSet::new();
 
         // Pass 1: candidate observed, not yet reaped.
-        let first = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        let first = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
         assert_eq!(first.pending_confirmation, 1);
         assert!(reaper.reaped().is_empty());
         assert!(sink.events().await.is_empty());
 
         // Pass 2: candidate confirmed across two passes — reap.
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed strand");
         assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
 
@@ -523,7 +658,7 @@ mod tests {
         assert_eq!(events[0].details["slot_id"], 8);
 
         // Pass 3: the live state was torn down, so nothing remains to reap.
-        let third = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        let third = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
         assert_eq!(third.reaped, 0);
         assert_eq!(third.pending_confirmation, 0);
         assert_eq!(third.active_skipped, 0);
@@ -543,17 +678,163 @@ mod tests {
         force_execution_status(&db, &execution_id, "completed");
 
         let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let mut seen = HashSet::new();
 
-        run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
 
         assert_eq!(second.reaped, 1);
         assert_eq!(reaper.reaped(), vec![execution_id]);
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].details["reason"], "execution_terminal");
+    }
+
+    /// The "Seven" regression: a live worker whose bound work item ROW WAS
+    /// DELETED (soft-deleted out from under it, e.g. by `boss task delete`)
+    /// is reaped after two-pass confirmation, its execution is marked
+    /// `orphaned` (not just torn down at the pane level), and the emitted
+    /// event carries `reason = "work_item_missing"` — distinct from the
+    /// O'Brien `work_item_terminal` case, since the row isn't merely
+    /// terminal, it no longer exists at all. Modelled on a review-kind
+    /// chore whose parent task already went `done` (its PR merged) before
+    /// the chore itself was deleted, matching the incident. Modelled on a
+    /// review-kind chore whose parent task already went `done` (its PR
+    /// merged) before a revision CHILD of that parent — bound to the live
+    /// worker — was cascade-tombstoned by the parent's deletion, matching
+    /// `delete_parent_cascades_to_revisions_and_restore_brings_them_back`
+    /// (`work/tests/t01.rs`): the live worker is bound to the revision's id,
+    /// not the parent's, and the parent's delete is what tombstones it.
+    #[tokio::test]
+    async fn reaps_worker_whose_bound_work_item_row_was_deleted() {
+        let (_dir, db, product_id) = setup();
+        let pr_url = "https://github.com/spinyfin/mono/pull/9001";
+        let parent_id = create_active_chore(&db, &product_id, "parent coding task");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![parent_id, pr_url],
+            )
+            .unwrap();
+        }
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                boss_protocol::CreateRevisionInput::builder()
+                    .parent_task_id(&parent_id)
+                    .description("Automated PR review found 4 finding(s)")
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        let work_item_id = revision.id;
+        let execution_id = create_execution(&db, &work_item_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 25, &execution_id, &work_item_id);
+
+        // The PR merges (parent goes `done`), then the parent is deleted —
+        // cascade-tombstoning the revision the live worker is bound to. The
+        // exact failure mode the incident describes: `get_work_item` now
+        // returns "unknown work item" for a worker that is still alive.
+        set_work_item_status(&db, &parent_id, "done");
+        db.delete_work_item(&parent_id).unwrap();
+        assert!(
+            db.get_work_item(&work_item_id).is_err(),
+            "precondition: the cascade-deleted revision must be unreachable via get_work_item"
+        );
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let lease_id = "lease-25";
+        force_cube_lease_id(&db, &execution_id, lease_id);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut seen = HashSet::new();
+
+        // Pass 1: candidate observed, not yet reaped — mirrors the O'Brien
+        // two-pass guard so a delete-then-immediately-torn-down-by-the-
+        // deletion-path race isn't double-reaped.
+        let first = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        assert_eq!(first.reaped, 0, "first pass must only record the candidate");
+        assert_eq!(first.pending_confirmation, 1);
+        assert!(reaper.reaped().is_empty());
+
+        // Pass 2: confirmed — reap the pane/slot AND mark the execution
+        // orphaned (there is no other path that would have done so, since
+        // the row is gone and no normal completion ever fired).
+        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
+        assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            boss_protocol::ExecutionStatus::Orphaned,
+            "execution must be marked orphaned since deletion never tore it down",
+        );
+
+        // The cube lease must be force-released: `mark_execution_orphaned`
+        // deliberately leaves `cube_lease_id` intact, and orphaning the
+        // execution drops it out of every other lease-reclaim path's
+        // non-terminal filter — this sweep is the only remaining owner.
+        assert_eq!(
+            cube.force_released.lock().unwrap().as_slice(),
+            [(
+                lease_id.to_owned(),
+                Some("terminal-work sweep: bound work item row no longer exists".to_owned())
+            )],
+            "the stranded cube lease must be force-released when the sweep orphans the execution",
+        );
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details["reason"], "work_item_missing");
+        assert_eq!(events[0].details["slot_id"], 25);
+        assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()));
+    }
+
+    /// A live worker whose execution row exists (so the outer
+    /// `get_execution` lookup succeeds) but whose `work_item_id` never
+    /// resolves at all (garbage id, not merely a soft-deleted row) hits a
+    /// `classify_id` failure inside `work_item_row_missing` too — this must
+    /// fall back to the same conservative skip as any other unconfirmable
+    /// lookup failure, not be treated as a confirmed-missing orphan.
+    #[tokio::test]
+    async fn lookup_failure_with_unclassifiable_work_item_id_is_conservative_skip() {
+        let (_dir, db, product_id) = setup();
+        let work_item_id = create_active_chore(&db, &product_id, "garbage-bound");
+        let execution_id = create_execution(&db, &work_item_id);
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET work_item_id = 'not-a-real-work-item-id' WHERE id = ?1",
+                rusqlite::params![execution_id],
+            )
+            .unwrap();
+        }
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 9, &execution_id, "not-a-real-work-item-id");
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut seen = HashSet::new();
+
+        for _ in 0..3 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+            assert_eq!(outcome.reaped, 0);
+            assert_eq!(outcome.active_skipped, 1);
+        }
+        assert!(reaper.reaped().is_empty());
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Ready,
+            "execution must be left untouched, not orphaned, on an unconfirmable lookup failure",
+        );
     }
 
     /// The safety core: a live worker whose work item is `active` and whose
@@ -569,11 +850,12 @@ mod tests {
         register_live_worker(&live_states, 2, &execution_id, &work_item_id);
 
         let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let mut seen = HashSet::new();
 
         for _ in 0..5 {
-            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
             assert_eq!(outcome.reaped, 0, "active worker must never be reaped");
             assert_eq!(outcome.active_skipped, 1);
         }
@@ -596,17 +878,18 @@ mod tests {
         set_work_item_status(&db, &work_item_id, "done");
 
         let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let mut seen = HashSet::new();
 
         // Pass 1: candidate recorded.
-        let first = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        let first = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
         assert_eq!(first.pending_confirmation, 1);
 
         // Status reverts to active before the confirming pass.
         set_work_item_status(&db, &work_item_id, "active");
 
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
         assert_eq!(second.reaped, 0, "reverted candidate must not be reaped");
         assert_eq!(second.active_skipped, 1);
         assert!(reaper.reaped().is_empty());
@@ -623,11 +906,12 @@ mod tests {
         register_live_worker(&live_states, 1, "exec-does-not-exist", "wi-missing");
 
         let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let mut seen = HashSet::new();
 
         for _ in 0..3 {
-            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await;
+            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
             assert_eq!(outcome.reaped, 0);
             assert_eq!(outcome.lookup_failed_skipped, 1);
         }
@@ -650,12 +934,13 @@ mod tests {
         // tear_down = false: the reap is recorded but the live state is left
         // in place, modelling an app that did not actually release the pane.
         let reaper = RecordingReaper::new(live_states.clone(), false);
+        let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let mut seen = HashSet::new();
 
-        run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await; // record
-        let p2 = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await; // reap
-        let p3 = run_one_pass(db.as_ref(), &live_states, &reaper, sink.as_ref(), &mut seen).await; // retry
+        run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await; // record
+        let p2 = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await; // reap
+        let p3 = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await; // retry
 
         assert_eq!(p2.reaped, 1);
         assert_eq!(p3.reaped, 1, "an un-landed reap must be retried next pass");
