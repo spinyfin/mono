@@ -204,6 +204,7 @@ final class WorkersWorkspaceModel: ObservableObject {
             let pid = session?.shellPid ?? 0
             if pid > 0 {
                 SpawnDiagnosticsLog.shared.surfaceAttached(runId: capturedRunId, slotId: capturedSlotId, shellPid: pid)
+                WorkerProcessPriority.applyBackgroundPriority(toShellPid: pid, runId: capturedRunId)
                 self.onShellPidAvailable?(capturedRunId, pid)
             } else {
                 // Shell may not have called tcsetpgrp yet — retry after a
@@ -218,6 +219,7 @@ final class WorkersWorkspaceModel: ObservableObject {
                         slotId: capturedSlotId,
                         shellPid: retryPid
                     )
+                    WorkerProcessPriority.applyBackgroundPriority(toShellPid: retryPid, runId: capturedRunId)
                     self.onShellPidAvailable?(capturedRunId, retryPid)
                 }
             }
