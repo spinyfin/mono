@@ -400,6 +400,22 @@ pub enum Stage {
     /// live-state registration hasn't landed yet. The `details` object
     /// carries the retired `slot_id` and, when known, the work item's title.
     HuskPaneReconcile,
+    /// The execution-liveness reconciler finalized a non-terminal LOCAL
+    /// execution whose worker pane never reported a shell pid and has been
+    /// running past the pane-attach deadline (a spawn that stalled before
+    /// `pane_spawned`) — see `crate::lost_workspace_sweep`. This is the gap
+    /// `lost_workspace_reconcile` (workspace dir still on disk),
+    /// `dead_pane_sweep` (only ever probes a pid that was actually reported),
+    /// and `cube_lease_auto_reap` (the engine's own DB-fallback heartbeat kept
+    /// the lease alive, so it never failed) all miss — the 2026-07-03 zombies
+    /// that survived the T2168 fix. A recorded pid that is now dead is a
+    /// separate signal owned exclusively by `dead_pane_sweep`, which emits
+    /// `Stage::PaneDeathReconcile` instead. The `details` object carries
+    /// `reason` (`pane_never_attached`), `prior_status`, `age_in_status_secs`,
+    /// and the observed `shell_pid` (always absent) so a recurrence is
+    /// attributable from `bossctl dispatch tail` in one read; see
+    /// `crate::execution_liveness::classify_pane_liveness`.
+    ExecutionLivenessReconcile,
 }
 
 impl Stage {
@@ -442,6 +458,7 @@ impl Stage {
             Stage::SpawnNack => "spawn_nack",
             Stage::SpawnCapabilityUnhealthy => "spawn_capability_unhealthy",
             Stage::HuskPaneReconcile => "husk_pane_reconcile",
+            Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
         }
     }
 }
@@ -951,6 +968,10 @@ mod tests {
         assert_eq!(Stage::SpawnNack.as_str(), "spawn_nack");
         assert_eq!(Stage::SpawnCapabilityUnhealthy.as_str(), "spawn_capability_unhealthy");
         assert_eq!(Stage::HuskPaneReconcile.as_str(), "husk_pane_reconcile");
+        assert_eq!(
+            Stage::ExecutionLivenessReconcile.as_str(),
+            "execution_liveness_reconcile"
+        );
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

@@ -33,6 +33,103 @@ use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_PRODUC
 
 use crate::work::WorkDb;
 
+/// How long after `started_at` a LOCAL execution may go without its worker
+/// pane ever reporting a shell pid before the pane is presumed to have never
+/// attached (a wedged spawn that stalled before `pane_spawned`).
+///
+/// A healthy local worker reports its pid (`UpdateWorkerShellPid`) within
+/// seconds of the pane surface attaching — the whole pre-run dispatch
+/// (lease/repo-ensure/positioning) plus surface init is comfortably under a
+/// minute. 300 s is an order of magnitude beyond that, so a probe on an
+/// execution this old with NO recorded pid is positive evidence the pane
+/// never came up, not a race against a slow spawn. Deliberately far below the
+/// 15-minute automation retry cadence so a wedged spawn self-heals before the
+/// next fire re-hits the redundant-spawn guard.
+pub const PANE_ATTACH_DEADLINE_SECS: i64 = 300;
+
+/// Restart-robust verdict on whether a LOCAL execution's worker pane has ever
+/// attached, derived purely from the durable `(shell_pid, started_at)`
+/// signals — no dependency on the in-memory `LiveWorkerStateRegistry` (which
+/// is wiped by an engine restart).
+///
+/// This verdict deliberately says nothing about whether an *already-reported*
+/// pid is still alive — that positive-evidence probe (`kill(pid, 0)`) is
+/// [`crate::dead_pane_sweep::reconcile_if_pane_dead`]'s exclusive
+/// responsibility (it owns the `work_runs.shell_pid` probe), so there is
+/// exactly one reaper per death signal.
+///
+/// Callers MUST have already established the execution is LOCAL (its latest
+/// run ran on `host_id == "local"`): a pid recorded on a remote host is
+/// meaningless to age-based reasoning on the engine host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneLivenessVerdict {
+    /// No pane pid was ever recorded and the execution started longer than
+    /// [`PANE_ATTACH_DEADLINE_SECS`] ago — the pane never attached. This is
+    /// the shape the incident zombies took: a run that reached `run_started`
+    /// then stalled before `pane_spawned` ever fired, so no pid was reported,
+    /// so the pid-driven reapers ([`crate::dead_pid_sweep`],
+    /// [`crate::dead_pane_sweep`]) skip it forever (they only ever act on a
+    /// pid that was actually reported).
+    NeverAttached,
+    /// A pid has already been reported (its liveness is
+    /// [`crate::dead_pane_sweep`]'s job, not this classifier's), OR no pid
+    /// yet but still within the attach deadline, OR no `started_at` to age
+    /// from. Callers MUST treat this as "keep" — we only ever reap on
+    /// positive evidence of death.
+    LiveOrIndeterminate,
+}
+
+impl PaneLivenessVerdict {
+    /// `true` for the one verdict that is positive evidence of death.
+    pub fn is_dead(self) -> bool {
+        matches!(self, PaneLivenessVerdict::NeverAttached)
+    }
+
+    /// Stable identifier folded into the reconcile trace event's `reason`
+    /// field so a recurrence is attributable in one read.
+    pub fn reason(self) -> &'static str {
+        match self {
+            PaneLivenessVerdict::NeverAttached => "pane_never_attached",
+            PaneLivenessVerdict::LiveOrIndeterminate => "pane_live_or_indeterminate",
+        }
+    }
+}
+
+/// Classify whether a LOCAL execution's pane has ever attached, from its
+/// durable signals.
+///
+/// `shell_pid` is the latest run's `work_runs.shell_pid` (the pane pid the
+/// app reported, or `None` if it never did). `started_at_epoch` is the
+/// execution's `started_at` parsed as epoch-seconds (`None` if it never
+/// started a run). `now_epoch` is the current wall clock (injected for
+/// deterministic tests).
+///
+/// Pure: it reads only these three values, so it returns the same verdict
+/// whether called at engine startup, on a periodic sweep, or inline from the
+/// redundant-spawn guard. It errs exclusively toward
+/// [`PaneLivenessVerdict::LiveOrIndeterminate`] on any ambiguity — a reported
+/// pid, live or not, is never this classifier's business to reap.
+pub fn classify_pane_liveness(
+    shell_pid: Option<i64>,
+    started_at_epoch: Option<i64>,
+    now_epoch: i64,
+) -> PaneLivenessVerdict {
+    match shell_pid {
+        // A pid has already been reported — whether it is still alive is
+        // `dead_pane_sweep`'s job, not this classifier's.
+        Some(pid) if pid > 0 => PaneLivenessVerdict::LiveOrIndeterminate,
+        // No pid ever recorded. Only positive evidence of death is age: a
+        // healthy local pane reports its pid within seconds, so no pid past
+        // the attach deadline means it never came up.
+        _ => match started_at_epoch {
+            Some(started) if now_epoch.saturating_sub(started) >= PANE_ATTACH_DEADLINE_SECS => {
+                PaneLivenessVerdict::NeverAttached
+            }
+            _ => PaneLivenessVerdict::LiveOrIndeterminate,
+        },
+    }
+}
+
 /// `true` when `execution` records a non-empty `workspace_path` that no
 /// longer exists on the local filesystem — positive evidence that the
 /// worker's checkout (and therefore its pane) is gone.
@@ -475,6 +572,63 @@ mod tests {
         assert!(
             sink.events_for(&exec.id).await.is_empty(),
             "no dispatch event may be emitted when the row was not finalized"
+        );
+    }
+
+    // ── classify_pane_liveness ────────────────────────────────────────────────
+
+    #[test]
+    fn pane_indeterminate_once_any_pid_has_been_reported() {
+        // Once a pid has been reported, its liveness is `dead_pane_sweep`'s
+        // job — this classifier never claims death for a reported pid, dead
+        // or alive.
+        let alive = std::process::id() as i64;
+        let verdict = classify_pane_liveness(Some(alive), Some(1_700_000_000), 1_700_009_999);
+        assert_eq!(verdict, PaneLivenessVerdict::LiveOrIndeterminate);
+        assert!(!verdict.is_dead());
+    }
+
+    #[test]
+    fn pane_never_attached_when_no_pid_and_past_attach_deadline() {
+        // No pid ever reported and started well over the deadline ago — the
+        // pane never came up (the incident zombies' stalled-at-run_started
+        // shape). This is the case every pid-driven reaper skips.
+        let started = 1_700_000_000;
+        let now = started + PANE_ATTACH_DEADLINE_SECS + 1;
+        let verdict = classify_pane_liveness(None, Some(started), now);
+        assert_eq!(verdict, PaneLivenessVerdict::NeverAttached);
+        assert!(verdict.is_dead());
+        assert_eq!(verdict.reason(), "pane_never_attached");
+    }
+
+    #[test]
+    fn pane_indeterminate_when_no_pid_but_within_attach_deadline() {
+        // A just-started worker whose pid RPC is still in flight must NOT be
+        // reaped — give it the full attach deadline to report.
+        let started = 1_700_000_000;
+        let now = started + PANE_ATTACH_DEADLINE_SECS - 1;
+        let verdict = classify_pane_liveness(None, Some(started), now);
+        assert_eq!(verdict, PaneLivenessVerdict::LiveOrIndeterminate);
+        assert!(!verdict.is_dead());
+    }
+
+    #[test]
+    fn pane_indeterminate_when_no_pid_and_no_started_at() {
+        // No pid and no started_at (never ran) → we have no age to judge
+        // from, so we hold rather than reap.
+        assert_eq!(
+            classify_pane_liveness(None, None, 1_700_009_999),
+            PaneLivenessVerdict::LiveOrIndeterminate,
+        );
+    }
+
+    #[test]
+    fn pane_indeterminate_when_pid_zero_within_deadline() {
+        // A zero/negative pid is treated as "not reported", same as None.
+        let started = 1_700_000_000;
+        assert_eq!(
+            classify_pane_liveness(Some(0), Some(started), started + 10),
+            PaneLivenessVerdict::LiveOrIndeterminate,
         );
     }
 }
