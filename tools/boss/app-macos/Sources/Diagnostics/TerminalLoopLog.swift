@@ -178,6 +178,39 @@ struct TabSwitchSample: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
+/// One display sleep/wake transition, recorded by [[DisplayPowerMonitor]].
+///
+/// Added after the 2026-07-15 App Nap incident: with the display asleep,
+/// macOS throttled the main run loop and delayed engine→app RPC acks
+/// (`EngineClient.emit`'s `Task { @MainActor }` hop) by 24-87s, well past
+/// the engine's spawn-ack deadline, and diagnosing the window required
+/// external forensics (`pmset` logs, coordinator-side reconstruction)
+/// because the app kept no record of display power state. This record
+/// closes that gap — a future throttling incident is one grep over the
+/// same `terminal-loop-*.jsonl` mirror instead.
+struct DisplayPowerSample: Codable, Identifiable, Sendable, Equatable {
+    let kind: String
+    let id: UUID
+    let tsEpochMs: Int64
+    /// "sleep" or "wake" — `NSWorkspace.screensDidSleepNotification` /
+    /// `screensDidWakeNotification`.
+    let event: String
+
+    init(id: UUID = UUID(), tsEpochMs: Int64, event: String) {
+        self.kind = "display_power"
+        self.id = id
+        self.tsEpochMs = tsEpochMs
+        self.event = event
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case id
+        case tsEpochMs = "ts_epoch_ms"
+        case event
+    }
+}
+
 /// Pure rate arithmetic, factored out so the counter→rate conversion is
 /// unit-testable without standing up timers. Times are monotonic
 /// nanoseconds (`DispatchTime.uptimeNanoseconds`); counters are
@@ -266,6 +299,7 @@ final class TerminalLoopLog: @unchecked Sendable {
 
     private let loopRing = OSAllocatedUnfairLock(initialState: [LoopSample]())
     private let tabRing = OSAllocatedUnfairLock(initialState: [TabSwitchSample]())
+    private let displayPowerRing = OSAllocatedUnfairLock(initialState: [DisplayPowerSample]())
     private let capacity: Int
     private let retainDays: Int
 
@@ -317,6 +351,17 @@ final class TerminalLoopLog: @unchecked Sendable {
         writeLine(of: sample, at: sample.tsEpochMs)
     }
 
+    /// Append a display sleep/wake sample to its ring + on-disk mirror.
+    func record(_ sample: DisplayPowerSample) {
+        displayPowerRing.withLock { buf in
+            buf.append(sample)
+            if buf.count > capacity {
+                buf.removeFirst(buf.count - capacity)
+            }
+        }
+        writeLine(of: sample, at: sample.tsEpochMs)
+    }
+
     private func writeLine(of value: some Encodable, at tsEpochMs: Int64) {
         guard directory != nil,
               let json = try? Self.encoder.encode(value) else { return }
@@ -354,6 +399,11 @@ final class TerminalLoopLog: @unchecked Sendable {
     func recentTabSwitches(since: Date) -> [TabSwitchSample] {
         let cutoffMs = Int64(since.timeIntervalSince1970 * 1000)
         return tabRing.withLock { $0.filter { $0.tsEpochMs >= cutoffMs } }
+    }
+
+    /// Newest-last snapshot of the display sleep/wake ring.
+    func displayPowerSnapshot() -> [DisplayPowerSample] {
+        displayPowerRing.withLock { $0 }
     }
 
     /// Block until queued file writes have drained. Test-only helper.
