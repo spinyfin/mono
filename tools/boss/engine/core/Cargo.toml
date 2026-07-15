@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 boss-build-info = { path = "../../build-info" }
 boss-claude-client = { path = "../../claude_client" }
 boss-github = { path = "../../github" }
+boss-github-tracker = { path = "../../github_tracker" }
 boss-transcript-markdown = { path = "../transcript-markdown" }
 async-trait = { workspace = true }
 bon = { workspace = true }
@@ -36,17 +37,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 shlex = { workspace = true }
 rusqlite = { workspace = true }
 regex = { workspace = true }
-keyring = { workspace = true, features = ["apple-native"] }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { version = "3", features = ["OSX_10_15"] }
-security-framework-sys = "2"
-core-foundation = "0.10"
-core-foundation-sys = "0.8"
 
 [dev-dependencies]
 boss-client = { path = "../../client" }

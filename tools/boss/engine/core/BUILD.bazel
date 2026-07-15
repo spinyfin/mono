@@ -14,7 +14,7 @@ rust_library(
             "src/main.rs",
         ],
     ),
-    compile_data = glob(["src/external_tracker/testdata/**"]) + [
+    compile_data = [
         "remote/boss-remote-run.sh",
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
@@ -48,6 +48,7 @@ rust_library(
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/engine/utils",
         "//tools/boss/github",
+        "//tools/boss/github_tracker",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),

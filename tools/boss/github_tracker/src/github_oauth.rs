@@ -20,10 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
 
-use boss_protocol::{GitHubAuthStateDto, OrgAuthState};
+use boss_protocol::{GitHubAuthStateDto, OrgAuthState, Product};
 
-use crate::external_tracker::github::GitHubConfig;
-use crate::work::WorkDb;
+use crate::github::GitHubConfig;
 
 // ── Client-id + GitHub endpoint constants ────────────────────────────────────
 
@@ -276,7 +275,7 @@ impl DeviceFlow {
                 Err(e) => {
                     // Network error: transient; keep polling.
                     tracing::warn!(
-                        target: "boss_engine::external_tracker::github_oauth",
+                        target: "boss_github_tracker::github_oauth",
                         error = %e,
                         "device flow poll: network error; retrying on next interval"
                     );
@@ -287,7 +286,7 @@ impl DeviceFlow {
 
             if response.status().is_server_error() {
                 tracing::warn!(
-                    target: "boss_engine::external_tracker::github_oauth",
+                    target: "boss_github_tracker::github_oauth",
                     status = %response.status(),
                     "device flow poll: server error; retrying on next interval"
                 );
@@ -298,7 +297,7 @@ impl DeviceFlow {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(
-                        target: "boss_engine::external_tracker::github_oauth",
+                        target: "boss_github_tracker::github_oauth",
                         error = %e,
                         "device flow poll: unexpected response body; retrying"
                     );
@@ -323,7 +322,7 @@ impl DeviceFlow {
                     "access_denied" => return PollOutcome::Denied,
                     other => {
                         tracing::error!(
-                            target: "boss_engine::external_tracker::github_oauth",
+                            target: "boss_github_tracker::github_oauth",
                             error_code = other,
                             "device flow poll: non-recoverable GitHub error"
                         );
@@ -397,7 +396,7 @@ impl DeviceFlow {
         let response = match result {
             Err(e) => {
                 tracing::warn!(
-                    target: "boss_engine::external_tracker::github_oauth",
+                    target: "boss_github_tracker::github_oauth",
                     %org, error = %e,
                     "org/SSO probe: network error"
                 );
@@ -431,7 +430,7 @@ impl DeviceFlow {
 
         // Any other status (401, 404, etc.) — inconclusive.
         tracing::warn!(
-            target: "boss_engine::external_tracker::github_oauth",
+            target: "boss_github_tracker::github_oauth",
             %org, status = %response.status(),
             "org/SSO probe: unexpected status"
         );
@@ -598,7 +597,7 @@ impl GitHubAuthController {
             Ok(None) => false,
             Err(e) => {
                 tracing::warn!(
-                    target: "boss_engine::external_tracker::github_oauth",
+                    target: "boss_github_tracker::github_oauth",
                     error = %e,
                     "restore_from_store: keychain read failed; treating as disconnected"
                 );
@@ -644,7 +643,7 @@ impl GitHubAuthController {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::error!(
-                        target: "boss_engine::external_tracker::github_oauth",
+                        target: "boss_github_tracker::github_oauth",
                         error = %e,
                         "device flow: failed to request device code"
                     );
@@ -686,7 +685,7 @@ impl GitHubAuthController {
                         && let Err(e) = store.set(&record)
                     {
                         tracing::error!(
-                            target: "boss_engine::external_tracker::github_oauth",
+                            target: "boss_github_tracker::github_oauth",
                             error = %e,
                             "failed to persist OAuth token to keychain; \
                              token held in memory only"
@@ -725,7 +724,7 @@ impl GitHubAuthController {
             && let Err(e) = store.delete()
         {
             tracing::warn!(
-                target: "boss_engine::external_tracker::github_oauth",
+                target: "boss_github_tracker::github_oauth",
                 error = %e,
                 "disconnect: failed to delete OAuth token from keychain"
             );
@@ -758,10 +757,43 @@ impl GitHubAuthController {
 
 /// Attention-item kind raised when the OAuth App is not yet approved for a
 /// GitHub-bound product's org.
-pub(crate) const ATTN_ORG_UNAPPROVED: &str = "github_oauth_org_unapproved";
+pub const ATTN_ORG_UNAPPROVED: &str = "github_oauth_org_unapproved";
 /// Attention-item kind raised when the stored token needs SAML SSO
 /// authorization for a GitHub-bound product's org.
-pub(crate) const ATTN_SSO_REQUIRED: &str = "github_oauth_sso_required";
+pub const ATTN_SSO_REQUIRED: &str = "github_oauth_sso_required";
+
+/// The engine-state writes [`probe_and_record_org_state`] needs, expressed as
+/// a port so this crate stays transport-only.
+///
+/// The probe is pure GitHub I/O, but recording its outcome means reading the
+/// product list and raising/resolving attention items — engine state. Rather
+/// than reach up into `WorkDb` (which would invert the dependency edge), the
+/// probe takes this trait and the engine supplies the implementation backed by
+/// its work DB (`WorkDbOrgStateSink`).
+///
+/// Every method returns `Result<_, String>`: the caller only ever logs the
+/// error and carries on (an attention-item write failing must not abort the
+/// probe), so the port deliberately does not leak the engine's DB error type.
+pub trait OrgStateSink: Send + Sync {
+    /// Every product Boss knows about. The probe filters for GitHub-bound
+    /// ones itself, since deciding what "GitHub-bound" means (parsing
+    /// [`GitHubConfig`] out of the stored tracker config) is this crate's job.
+    fn list_products(&self) -> std::result::Result<Vec<Product>, String>;
+
+    /// Resolve any open attention item of `kind` on `product_id`. A no-op when
+    /// none is open.
+    fn resolve_external_tracker_attention(&self, product_id: &str, kind: &str) -> std::result::Result<(), String>;
+
+    /// Raise an attention item of `kind` on `product_id`. Idempotent: a no-op
+    /// when an open item of the same kind already exists.
+    fn upsert_external_tracker_attention(
+        &self,
+        product_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) -> std::result::Result<(), String>;
+}
 
 /// Run the org/SSO probe (design §7) for every GitHub-bound product and reflect
 /// the outcome as product attention items (design §8), returning the aggregate
@@ -782,12 +814,12 @@ pub(crate) const ATTN_SSO_REQUIRED: &str = "github_oauth_sso_required";
 /// (`NeedsSso` > `NeedsOrgApproval` > `Ok` > `Unknown`); the orchestrator
 /// records it on the controller via `update_org_state`. When no GitHub-bound
 /// product exists the result is `Unknown`.
-pub(crate) async fn probe_and_record_org_state(work_db: &WorkDb, flow: &DeviceFlow, token: &str) -> OrgAuthState {
-    let products = match work_db.list_products() {
+pub async fn probe_and_record_org_state(sink: &dyn OrgStateSink, flow: &DeviceFlow, token: &str) -> OrgAuthState {
+    let products = match sink.list_products() {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
-                target: "boss_engine::external_tracker::github_oauth",
+                target: "boss_github_tracker::github_oauth",
                 error = %e,
                 "probe_and_record_org_state: list_products failed"
             );
@@ -808,7 +840,7 @@ pub(crate) async fn probe_and_record_org_state(work_db: &WorkDb, flow: &DeviceFl
                 Ok(cfg) => cfg.org,
                 Err(e) => {
                     tracing::warn!(
-                        target: "boss_engine::external_tracker::github_oauth",
+                        target: "boss_github_tracker::github_oauth",
                         product_id = %product.id, error = %e,
                         "probe_and_record_org_state: invalid GitHub config; skipping product"
                     );
@@ -828,7 +860,7 @@ pub(crate) async fn probe_and_record_org_state(work_db: &WorkDb, flow: &DeviceFl
         };
 
         probed_any = true;
-        apply_org_attention(work_db, &product.id, &state);
+        apply_org_attention(sink, &product.id, &state);
         aggregate = merge_org_state(aggregate, state);
     }
 
@@ -842,20 +874,20 @@ pub(crate) async fn probe_and_record_org_state(work_db: &WorkDb, flow: &DeviceFl
 /// opposing auth-attention kind. Idempotent: `upsert_external_tracker_attention`
 /// is a no-op when an open item of the same kind already exists, so this can
 /// run every probe tick without piling up rows.
-fn apply_org_attention(work_db: &WorkDb, product_id: &str, state: &OrgAuthState) {
+fn apply_org_attention(sink: &dyn OrgStateSink, product_id: &str, state: &OrgAuthState) {
     let resolve = |kind: &str| {
-        if let Err(e) = work_db.resolve_external_tracker_attention(product_id, kind) {
+        if let Err(e) = sink.resolve_external_tracker_attention(product_id, kind) {
             tracing::warn!(
-                target: "boss_engine::external_tracker::github_oauth",
+                target: "boss_github_tracker::github_oauth",
                 %product_id, %kind, error = %e,
                 "resolve_external_tracker_attention (github oauth) failed"
             );
         }
     };
     let raise = |kind: &str, title: &str, body: &str| {
-        if let Err(e) = work_db.upsert_external_tracker_attention(product_id, kind, title, body) {
+        if let Err(e) = sink.upsert_external_tracker_attention(product_id, kind, title, body) {
             tracing::warn!(
-                target: "boss_engine::external_tracker::github_oauth",
+                target: "boss_github_tracker::github_oauth",
                 %product_id, %kind, error = %e,
                 "upsert_external_tracker_attention (github oauth) failed"
             );
@@ -1225,7 +1257,7 @@ impl KeychainTokenStore {
         {
             if macos_backends::data_protection_keychain_available() {
                 tracing::debug!(
-                    target: "boss_engine::external_tracker::github_oauth",
+                    target: "boss_github_tracker::github_oauth",
                     "github token store: data-protection keychain (release build)"
                 );
                 Self {
@@ -1233,7 +1265,7 @@ impl KeychainTokenStore {
                 }
             } else {
                 tracing::debug!(
-                    target: "boss_engine::external_tracker::github_oauth",
+                    target: "boss_github_tracker::github_oauth",
                     "github token store: file backend (dev build, no keychain-access-groups entitlement)"
                 );
                 Self {
@@ -1318,9 +1350,6 @@ impl KeystoreBackend for FakeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::test_support::*;
-    use std::path::PathBuf;
 
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1509,7 +1538,7 @@ mod tests {
         let flow = DeviceFlow::new(config_for(&server), test_client());
         // After slow_down, interval grows by SLOW_DOWN_BACKOFF_SECS (5s).
         // The test will sleep ~5s on the second iteration; this is acceptable
-        // under the "moderate" timeout assigned to this shard.
+        // under the "moderate" timeout set on the github_tracker_test target.
         let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(
@@ -2079,121 +2108,6 @@ mod tests {
 
         assert!(!ctrl.restore_from_store());
         assert!(matches!(ctrl.current_state(), GitHubAuthState::Disconnected));
-    }
-
-    // ── Org/SSO probe orchestration (T-4) tests ──────────────────────────────
-
-    fn github_product_db(org: &str) -> (WorkDb, String) {
-        let db = WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory WorkDb");
-        let product = create_test_product_named(&db, "Test Product");
-        let config = serde_json::json!({
-            "org": org,
-            "repo": "mono",
-            "project_number": 1
-        });
-        db.set_product_external_tracker(&product.id, Some("github"), Some(&config), false)
-            .expect("set external tracker");
-        (db, product.id)
-    }
-
-    fn open_attn_kinds(db: &WorkDb, product_id: &str) -> Vec<String> {
-        db.list_attention_items_for_work_item(product_id)
-            .expect("list attention items")
-            .into_iter()
-            .filter(|a| a.status == "open")
-            .map(|a| a.kind)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn probe_org_state_raises_org_approval_attention_on_403() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/orgs/spinyfin"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-
-        let (db, product_id) = github_product_db("spinyfin");
-        let flow = DeviceFlow::new(config_for(&server), test_client());
-
-        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
-
-        assert!(
-            matches!(state, OrgAuthState::NeedsOrgApproval { .. }),
-            "expected NeedsOrgApproval, got {state:?}"
-        );
-        let kinds = open_attn_kinds(&db, &product_id);
-        assert!(
-            kinds.contains(&ATTN_ORG_UNAPPROVED.to_owned()),
-            "expected org-unapproved attention item, got {kinds:?}"
-        );
-        assert!(!kinds.contains(&ATTN_SSO_REQUIRED.to_owned()));
-    }
-
-    #[tokio::test]
-    async fn probe_org_state_raises_sso_attention_on_sso_header() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/orgs/spinyfin"))
-            .respond_with(ResponseTemplate::new(403).append_header(
-                "X-GitHub-SSO",
-                "required; url=https://github.com/orgs/spinyfin/sso?token=abc",
-            ))
-            .mount(&server)
-            .await;
-
-        let (db, product_id) = github_product_db("spinyfin");
-        let flow = DeviceFlow::new(config_for(&server), test_client());
-
-        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
-
-        assert!(
-            matches!(state, OrgAuthState::NeedsSso { .. }),
-            "expected NeedsSso, got {state:?}"
-        );
-        let kinds = open_attn_kinds(&db, &product_id);
-        assert!(
-            kinds.contains(&ATTN_SSO_REQUIRED.to_owned()),
-            "expected sso-required attention item, got {kinds:?}"
-        );
-        assert!(!kinds.contains(&ATTN_ORG_UNAPPROVED.to_owned()));
-    }
-
-    #[tokio::test]
-    async fn probe_org_state_ok_resolves_stale_attention() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/orgs/spinyfin"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": "spinyfin" })))
-            .mount(&server)
-            .await;
-
-        let (db, product_id) = github_product_db("spinyfin");
-        // Seed a stale org-approval attention item; a successful probe must
-        // resolve it (design §7 "Re-check" recovery).
-        db.upsert_external_tracker_attention(&product_id, ATTN_ORG_UNAPPROVED, "stale", "stale")
-            .unwrap();
-        assert!(open_attn_kinds(&db, &product_id).contains(&ATTN_ORG_UNAPPROVED.to_owned()));
-
-        let flow = DeviceFlow::new(config_for(&server), test_client());
-        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
-
-        assert!(matches!(state, OrgAuthState::Ok), "expected Ok, got {state:?}");
-        assert!(
-            open_attn_kinds(&db, &product_id).is_empty(),
-            "Ok probe must resolve stale auth attention items"
-        );
-    }
-
-    #[tokio::test]
-    async fn probe_org_state_unknown_without_github_products() {
-        let server = MockServer::start().await;
-        let db = WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory WorkDb");
-        let flow = DeviceFlow::new(config_for(&server), test_client());
-
-        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
-        assert!(matches!(state, OrgAuthState::Unknown));
     }
 
     #[test]

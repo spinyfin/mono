@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::process::Command;
 
-use super::TrackerCredential;
-use super::github_oauth::KeychainTokenStore;
+use crate::TrackerCredential;
+use crate::github_oauth::KeychainTokenStore;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ impl TrackerCredentialResolver for GhAuthStatusResolver {
                 let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                 // Structured log marker; T11's attention-item hook watches this target.
                 tracing::warn!(
-                    target: "boss_engine::external_tracker::credentials",
+                    target: "boss_github_tracker::credentials",
                     %host,
                     %detail,
                     "gh auth status failed; GitHub-bound products will be skipped until auth is restored"
@@ -167,7 +167,7 @@ impl TrackerCredentialResolver for KeychainOAuthResolver {
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
-                        target: "boss_engine::external_tracker::credentials",
+                        target: "boss_github_tracker::credentials",
                         error = %e,
                         "keychain unavailable; falling back to ambient gh for GitHub sync"
                     );
@@ -186,7 +186,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::external_tracker::github_oauth::{FakeStore, KeychainTokenStore, TokenRecord};
+    use crate::github_oauth::{FakeStore, KeychainTokenStore, TokenRecord};
 
     /// Write a shell script to a temp file, close the write fd, and make it executable.
     ///
