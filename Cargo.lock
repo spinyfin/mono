@@ -529,6 +529,7 @@ name = "boss-transcript-markdown"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "boss-engine-utils",
  "serde",
  "serde_json",
 ]
