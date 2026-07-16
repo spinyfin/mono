@@ -20,7 +20,7 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AutomationTrigger, DesignDocEntry, DesignDocTree, EffortLevel, ExecutionKind, ExecutionStatus,
+    AutomationTrigger, BoothbyPass, DesignDocEntry, DesignDocTree, EffortLevel, ExecutionKind, ExecutionStatus,
     ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
@@ -1616,7 +1616,43 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "automation_state_result",
         },
+        TagCase {
+            label: "BoothbyPassesList",
+            event: FrontendEvent::BoothbyPassesList { passes: vec![] },
+            expected_tag: "boothby_passes_list",
+        },
+        TagCase {
+            label: "BoothbyState",
+            event: FrontendEvent::BoothbyState {
+                mode: "auto".to_string(),
+                open_pass: None,
+                last_pass: None,
+            },
+            expected_tag: "boothby_state",
+        },
+        TagCase {
+            label: "BoothbyPassStarted",
+            event: FrontendEvent::BoothbyPassStarted {
+                pass: sample_boothby_pass(),
+            },
+            expected_tag: "boothby_pass_started",
+        },
+        TagCase {
+            label: "BoothbyActivity",
+            event: FrontendEvent::BoothbyActivity {
+                pass: sample_boothby_pass(),
+            },
+            expected_tag: "boothby_activity",
+        },
     ]
+}
+
+fn sample_boothby_pass() -> BoothbyPass {
+    BoothbyPass::builder()
+        .id("bp_1")
+        .started_at("1700000000")
+        .trigger("schedule")
+        .build()
 }
 
 /// Compile-time guard that every `FrontendEvent` variant is represented in

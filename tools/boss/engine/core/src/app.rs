@@ -1395,16 +1395,6 @@ impl ServerState {
         signal_shell_pids(&pids, kill_grace);
     }
 
-    /// Push a `boothby_passes` row on the `boothby.activity` topic. Called
-    /// whenever a pass opens or closes (via
-    /// [`crate::boothby_scheduler::BoothbyActivitySink`], implemented below
-    /// for `ServerState`) so the Boothby tab's pass history and audit feed
-    /// update without polling.
-    pub async fn broadcast_boothby_activity(&self, pass: boss_protocol::BoothbyPass) {
-        let envelope = FrontendEventEnvelope::push(FrontendEvent::BoothbyActivity { pass });
-        self.topic_broker.publish(TOPIC_BOOTHBY_ACTIVITY, envelope).await;
-    }
-
     fn current_work_revision(&self) -> u64 {
         self.work_revision.load(Ordering::SeqCst)
     }

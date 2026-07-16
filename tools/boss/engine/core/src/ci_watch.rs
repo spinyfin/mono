@@ -134,7 +134,7 @@ struct FailedCheckRecord<'a> {
 }
 
 /// Attention kind used when CI remediation exhausts its attempt budget.
-const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
+pub(crate) const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
 
 /// Create a work-item-scoped attention item signalling that automated CI
 /// remediation gave up, and emit [`FrontendEvent::AttentionItemCreated`]
