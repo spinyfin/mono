@@ -16,6 +16,14 @@ pub struct ResolvedFile {
 pub struct DeclinedFile {
     pub path: String,
     pub reason: String,
+    /// `true` when a registered resolver matched this file and ran, then
+    /// itself declined (`reason` is that resolver's own message); `false`
+    /// when no registered resolver claimed the file at all (`applies_to`
+    /// returned false for every resolver). Callers use this to distinguish
+    /// "no resolver applies" from "a resolver ran and declined" — collapsing
+    /// the two into one generic message previously sent conflict-ladder
+    /// diagnosis down the wrong path (spinyfin/mono#2067 reconciliation).
+    pub matched_resolver: bool,
 }
 
 /// Outcome of running a whole conflicted-file set through the registry.
@@ -102,6 +110,7 @@ impl ResolverRegistry {
                             declined.push(DeclinedFile {
                                 path: file.path.clone(),
                                 reason,
+                                matched_resolver: true,
                             });
                         }
                     }
@@ -117,6 +126,7 @@ impl ResolverRegistry {
                     declined.push(DeclinedFile {
                         path: file.path.clone(),
                         reason,
+                        matched_resolver: false,
                     });
                 }
             }
@@ -252,6 +262,13 @@ mod tests {
             RegistryResolution::Declined { declined, resolved } => {
                 assert_eq!(declined.len(), 1);
                 assert!(resolved.is_empty());
+                // No resolver ever ran for this file — callers (e.g. the
+                // conflict ladder's decline log) must be able to tell this
+                // apart from a resolver that matched and then declined.
+                assert!(
+                    !declined[0].matched_resolver,
+                    "no resolver applied; matched_resolver must be false"
+                );
             }
             other => panic!("expected Declined, got {other:?}"),
         }
@@ -295,6 +312,12 @@ mod tests {
                 assert!(resolved.is_empty());
                 assert_eq!(declined.len(), 1);
                 assert_eq!(declined[0].reason, "nope");
+                // A resolver matched and ran, then declined — distinct from
+                // the no-resolver-applies case above.
+                assert!(
+                    declined[0].matched_resolver,
+                    "a resolver matched and declined; matched_resolver must be true"
+                );
             }
             other => panic!("expected Declined, got {other:?}"),
         }

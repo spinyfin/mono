@@ -620,12 +620,31 @@ pub(crate) async fn attempt_rung0(
     let resolved: Vec<ResolvedFile> = match registry.resolve_all(&lease.workspace_path, &files).await {
         RegistryResolution::AllResolved(resolved) => resolved,
         RegistryResolution::Declined { resolved, declined } => {
+            // Distinguish "no registered resolver applies to this file" from
+            // "a resolver matched and ran, then itself declined" — collapsing
+            // both into one generic message previously sent diagnosis down
+            // the wrong path (mono#2067 reconciliation): a resolver-matched
+            // decline means rung 0's registry logic needs attention, while a
+            // no-resolver-applies file means the residue is simply out of
+            // rung 0's coverage. Per-file reasons make either case
+            // answerable straight from this trace line.
+            let per_file: Vec<String> = declined
+                .iter()
+                .map(|d| {
+                    if d.matched_resolver {
+                        format!("{}: resolver ran and declined: {}", d.path, d.reason)
+                    } else {
+                        format!("{}: no resolver applies to this file", d.path)
+                    }
+                })
+                .collect();
             tracing::info!(
                 work_item_id = %candidate.work_item_id,
                 pr = pr_number,
                 resolved = resolved.len(),
                 declined = declined.len(),
-                "conflict_ladder: rung 0 declined (not every residual file has a resolver); climbing to worker",
+                declined_files = ?per_file,
+                "conflict_ladder: rung 0 declined; climbing to worker",
             );
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,

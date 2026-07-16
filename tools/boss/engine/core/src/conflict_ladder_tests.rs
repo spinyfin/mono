@@ -753,6 +753,53 @@ async fn rung0_declined_file_falls_through_without_pushing() {
 }
 
 #[tokio::test]
+async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
+    // Regression coverage for the decline-log mislabeling defect: a residue
+    // can mix a file no resolver claims at all ("docs/readme.md") with a
+    // file a resolver *does* claim (`lib.rs`, per
+    // `RegistryAppendUnionResolver::applies_to`) but that resolver itself
+    // declines (here because the workspace path doesn't exist, so its read
+    // fails) — the two are genuinely different failure classes
+    // (`DeclinedFile::matched_resolver`) and the ladder must fall through
+    // cleanly for a batch mixing both, not just for one class in isolation.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let lease = CubeWorkspaceLease {
+        lease_id: "lease-r0d".to_owned(),
+        workspace_id: "ws-r0d".to_owned(),
+        workspace_path: PathBuf::from("/tmp/rung0-declined-mixed-does-not-exist"),
+    };
+    let cube = Rung0Cube::new(true);
+
+    let outcome = attempt_rung0(
+        &db,
+        pub_.as_ref(),
+        &cube,
+        &candidate,
+        &attempt,
+        &lease,
+        &["docs/readme.md".to_owned(), "src/lib.rs".to_owned()],
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        LadderOutcome::FellThrough {
+            residual_conflict_files: None
+        }
+    );
+    assert!(
+        cube.pushes.lock().await.is_empty(),
+        "must not push when any residual file is declined, even a mixed-class batch"
+    );
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.resolved_by_rung, None);
+}
+
+#[tokio::test]
 async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     if which("cargo").is_none() {
         eprintln!("skipping: cargo not on PATH");
