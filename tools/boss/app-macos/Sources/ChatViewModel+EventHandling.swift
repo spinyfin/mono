@@ -298,7 +298,7 @@ extension ChatViewModel {
                     }
                     recentlyClearedCIPRs.removeValue(forKey: row.prURL)
                 case "succeeded":
-                    if let observedAt = Self.parseCiRemediationTimestamp(row.finishedAt ?? row.createdAt),
+                    if let observedAt = AutomationTime.parse(row.finishedAt ?? row.createdAt),
                        Date().timeIntervalSince(observedAt) < badgeFreshnessWindow {
                         recentlyClearedCIPRs[row.prURL] = observedAt
                     }
@@ -594,27 +594,6 @@ extension ChatViewModel {
             || message.hasPrefix("socket send failed:")
             || message.hasPrefix("socket receive failed:")
     }
-
-    /// Parses a `ci_remediations` row timestamp for the "ci auto-fixed"
-    /// badge reconciliation above. The engine stamps plain
-    /// `YYYY-MM-DDTHH:MM:SSZ`, but fractional seconds are accepted too in
-    /// case a different surface ever feeds this. `ISO8601DateFormatter`'s
-    /// `date(from:)` is documented thread-safe, so the formatters are
-    /// shared.
-    private static func parseCiRemediationTimestamp(_ string: String) -> Date? {
-        for formatter in ciRemediationTimestampFormatters {
-            if let date = formatter.date(from: string) { return date }
-        }
-        return nil
-    }
-
-    private nonisolated(unsafe) static let ciRemediationTimestampFormatters: [ISO8601DateFormatter] = {
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return [plain, fractional]
-    }()
 
     // MARK: - Test entry point
 

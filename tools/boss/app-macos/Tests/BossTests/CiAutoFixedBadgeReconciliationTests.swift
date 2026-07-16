@@ -62,13 +62,33 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
 
         XCTAssertFalse(model.showsCIAutoFixedBadge(forPR: prURL))
 
+        // Epoch seconds is the shape the engine actually writes
+        // (`now_string()` = `now_epoch_secs().to_string()`).
+        let recent = String(Int(Date().addingTimeInterval(-5 * 60).timeIntervalSince1970))
         model.applyEventForTest(.ciRemediationsList(attempts: [
-            makeRemediation(id: "cir_4", prURL: prURL, status: "succeeded", finishedAt: "2026-07-16T05:00:00Z"),
+            makeRemediation(id: "cir_4", prURL: prURL, status: "succeeded", finishedAt: recent),
         ]))
 
         XCTAssertTrue(
             model.showsCIAutoFixedBadge(forPR: prURL),
             "a fresh succeeded row must stamp the auto-fixed badge even without the push"
+        )
+    }
+
+    /// ISO 8601 is a defensive fallback shape, not what the engine emits,
+    /// but the parser must still accept it if some other surface ever
+    /// feeds this differently.
+    func testSucceededLatestAttemptSetsBadgeFromISOFallback() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/2681"
+
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "cir_9", prURL: prURL, status: "succeeded", finishedAt: "2026-07-16T05:00:00Z"),
+        ]))
+
+        XCTAssertTrue(
+            model.showsCIAutoFixedBadge(forPR: prURL),
+            "an ISO 8601 succeeded row must still stamp the auto-fixed badge via the fallback parser"
         )
     }
 
@@ -78,7 +98,7 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         let model = makeModel()
         let prURL = "https://github.com/x/y/pull/2678"
 
-        let old = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-36 * 60 * 60))
+        let old = String(Int(Date().addingTimeInterval(-36 * 60 * 60).timeIntervalSince1970))
         model.applyEventForTest(.ciRemediationsList(attempts: [
             makeRemediation(id: "cir_5", prURL: prURL, status: "succeeded", finishedAt: old),
         ]))
@@ -96,7 +116,7 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
             // Freshest first: a new attempt is running now...
             makeRemediation(id: "cir_7", prURL: prURL, status: "running", finishedAt: nil),
             // ...even though an older attempt on the same PR had succeeded.
-            makeRemediation(id: "cir_6", prURL: prURL, status: "succeeded", finishedAt: "2026-07-16T04:00:00Z"),
+            makeRemediation(id: "cir_6", prURL: prURL, status: "succeeded", finishedAt: "1784174400"),
         ]))
 
         XCTAssertFalse(
@@ -147,7 +167,7 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
             cubeLeaseID: nil,
             cubeWorkspaceID: nil,
             workerID: nil,
-            createdAt: "2026-07-16T00:00:00Z",
+            createdAt: "1784160000",
             startedAt: nil,
             finishedAt: finishedAt
         )
