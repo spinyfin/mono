@@ -237,6 +237,23 @@ pub fn seed_daily_automation(db: &WorkDb, product_id: &str) -> Automation {
     .unwrap()
 }
 
+/// Plant a `host_capabilities` row directly with an explicit `source`.
+///
+/// `auto`-sourced rows are discovered by the engine's own heartbeat and
+/// have no public insert path, so a test that needs one — to contrast
+/// against a user tag, or to check the refresh replaces it — has to seed
+/// it. Shared by the `host_registry` and `app::tests` modules, which
+/// otherwise hand-roll the same statement.
+pub fn insert_host_capability(db: &WorkDb, host_id: &str, capability: &str, source: &str) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![host_id, capability, source],
+    )
+    .unwrap();
+}
+
 /// A [`CubeClient`] test double that never touches cube. Every method
 /// panics with `unimplemented!()` except `list_workspaces`/`list_repos`,
 /// which return an empty vector.

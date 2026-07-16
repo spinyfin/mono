@@ -96,6 +96,13 @@ pub(super) async fn handle_get_host(ctx: Dispatch, req: FrontendRequest) {
 }
 
 pub(super) async fn handle_add_host(ctx: Dispatch, req: FrontendRequest) {
+    handle_add_host_with(ctx, req, &SshHostProvisioner).await
+}
+
+/// [`handle_add_host`] with the remote-provisioning step injected.
+/// Production passes [`SshHostProvisioner`]; tests pass a double so the
+/// registration path can be driven without an actual remote host.
+pub(super) async fn handle_add_host_with(ctx: Dispatch, req: FrontendRequest, provisioner: &dyn HostProvisioner) {
     let Dispatch {
         work_db,
         sink,
@@ -118,8 +125,9 @@ pub(super) async fn handle_add_host(ctx: Dispatch, req: FrontendRequest) {
         return;
     }
 
-    // Eagerly push the remote wrapper (same path as `bossctl hosts add`).
-    eager_push_wrapper_rpc(&work_db, &id, &ssh_target).await;
+    // Eagerly provision the remote wrapper (same path as `bossctl hosts add`).
+    let outcome = provisioner.provision(&id, &ssh_target).await;
+    apply_provision_outcome(&work_db, &id, outcome);
 
     match fetch_snapshot(&work_db, &id) {
         Ok(host) => {
@@ -225,67 +233,100 @@ pub(super) async fn handle_remove_host_tag(ctx: Dispatch, req: FrontendRequest) 
 
 // ── Eager wrapper push (mirrors bossctl hosts add path) ──────────────────────
 
-/// Push the boss-remote-run wrapper to the remote host. On failure the host is
-/// disabled with `last_error_text` set; the caller reads the updated snapshot
-/// to surface the result to the UI (disabled + error text = add failed).
-async fn eager_push_wrapper_rpc(work_db: &crate::work::WorkDb, host_id: &str, ssh_target: &str) {
-    use crate::ssh_transport::{SshTransport, default_control_socket_dir};
-    use crate::wrapper_distribution::{
-        CubeProbeOutcome, WrapperPushOutcome, push_wrapper, subclass_label, verify_cube_invocable,
-    };
+/// What contacting a freshly-registered host to install the
+/// `boss-remote-run` wrapper produced. Separating the outcome from the
+/// DB writes it drives ([`apply_provision_outcome`]) keeps the
+/// talk-to-a-real-machine half behind [`HostProvisioner`], so the
+/// registration policy — "a host we could not provision must not be left
+/// enabled" — is exercisable without an actual remote.
+#[derive(Clone)]
+pub(super) enum ProvisionOutcome {
+    /// Wrapper installed and `cube` confirmed invocable on the remote.
+    Ok,
+    /// Provisioning was not attempted at all, so the host's enabled state
+    /// and error text are left exactly as registered.
+    Skipped,
+    /// The host could not be reached or provisioned. The string is the
+    /// operator-facing reason stored on `last_error_text`.
+    Failed(String),
+}
 
-    let Some(socket_dir) = default_control_socket_dir() else {
-        tracing::warn!(host_id, "eager_push_wrapper: HOME unset; skipping");
-        return;
-    };
-    let transport = SshTransport::new(host_id, ssh_target, &socket_dir);
+/// The remote half of host registration. `handle_add_host` inserts the
+/// row, asks this to make the host actually usable, then records the
+/// outcome.
+#[async_trait::async_trait]
+pub(super) trait HostProvisioner: Send + Sync {
+    async fn provision(&self, host_id: &str, ssh_target: &str) -> ProvisionOutcome;
+}
 
-    if let Err(err) = transport.open_control_master().await {
-        let detail = format!("opening ssh control master: {err:#}");
-        tracing::warn!(host_id, %detail, "eager_push_wrapper: ssh connection failed");
-        let _ = work_db.set_host_enabled(host_id, false);
-        let _ = work_db.set_host_last_error(host_id, Some(&detail));
-        return;
-    }
+/// Production [`HostProvisioner`]: opens an ssh control master, pushes
+/// the wrapper, and probes `cube` over the same connection.
+pub(super) struct SshHostProvisioner;
 
-    match push_wrapper(&transport).await {
-        Ok(WrapperPushOutcome::Ok) => {
-            // Wrapper script verified — but that's a separate artifact
-            // from the `cube` binary every dispatch-time call shells out
-            // to. Probe it now so a host missing `cube` on its
-            // non-interactive PATH (the anaplian incident) is caught and
-            // disabled at registration time instead of silently failing
-            // every future dispatch.
-            match verify_cube_invocable(&transport).await {
-                Ok(CubeProbeOutcome::Ok) => {
-                    let _ = work_db.set_host_last_error(host_id, None);
-                }
-                Ok(CubeProbeOutcome::Failed(detail)) => {
-                    let msg = format!("cube not invocable via non-interactive ssh: {detail}");
-                    tracing::warn!(host_id, %msg, "eager_push_wrapper: cube probe failed");
-                    let _ = work_db.set_host_enabled(host_id, false);
-                    let _ = work_db.set_host_last_error(host_id, Some(&msg));
-                }
-                Err(err) => {
-                    let msg = format!("probing cube invocability errored: {err:#}");
-                    tracing::warn!(host_id, %msg, "eager_push_wrapper: cube probe errored");
-                    let _ = work_db.set_host_enabled(host_id, false);
-                    let _ = work_db.set_host_last_error(host_id, Some(&msg));
+#[async_trait::async_trait]
+impl HostProvisioner for SshHostProvisioner {
+    async fn provision(&self, host_id: &str, ssh_target: &str) -> ProvisionOutcome {
+        use crate::ssh_transport::{SshTransport, default_control_socket_dir};
+        use crate::wrapper_distribution::{
+            CubeProbeOutcome, WrapperPushOutcome, push_wrapper, subclass_label, verify_cube_invocable,
+        };
+
+        let Some(socket_dir) = default_control_socket_dir() else {
+            tracing::warn!(host_id, "eager_push_wrapper: HOME unset; skipping");
+            return ProvisionOutcome::Skipped;
+        };
+        let transport = SshTransport::new(host_id, ssh_target, &socket_dir);
+
+        if let Err(err) = transport.open_control_master().await {
+            return ProvisionOutcome::Failed(format!("opening ssh control master: {err:#}"));
+        }
+
+        match push_wrapper(&transport).await {
+            Ok(WrapperPushOutcome::Ok) => {
+                // Wrapper script verified — but that's a separate artifact
+                // from the `cube` binary every dispatch-time call shells out
+                // to. Probe it now so a host missing `cube` on its
+                // non-interactive PATH (the anaplian incident) is caught and
+                // disabled at registration time instead of silently failing
+                // every future dispatch.
+                match verify_cube_invocable(&transport).await {
+                    Ok(CubeProbeOutcome::Ok) => ProvisionOutcome::Ok,
+                    Ok(CubeProbeOutcome::Failed(detail)) => {
+                        ProvisionOutcome::Failed(format!("cube not invocable via non-interactive ssh: {detail}"))
+                    }
+                    Err(err) => ProvisionOutcome::Failed(format!("probing cube invocability errored: {err:#}")),
                 }
             }
+            Ok(WrapperPushOutcome::Failed(kind, detail)) => ProvisionOutcome::Failed(format!(
+                "wrapper push failed ({label}): {detail}",
+                label = subclass_label(&kind)
+            )),
+            Err(err) => ProvisionOutcome::Failed(format!("wrapper push errored: {err:#}")),
         }
-        Ok(WrapperPushOutcome::Failed(kind, detail)) => {
-            let label = subclass_label(&kind);
-            let msg = format!("wrapper push failed ({label}): {detail}");
-            tracing::warn!(host_id, %msg, "eager_push_wrapper: push failed");
-            let _ = work_db.set_host_enabled(host_id, false);
-            let _ = work_db.set_host_last_error(host_id, Some(&msg));
+    }
+}
+
+/// Record a [`ProvisionOutcome`] on the host row. A host we could not
+/// provision is disabled with `last_error_text` set; the caller reads the
+/// updated snapshot back, so the UI sees disabled + error text = add
+/// failed.
+///
+/// The writes are best-effort, carried over verbatim from the
+/// `eager_push_wrapper_rpc` this was extracted from. Note that dropping
+/// the disable's error is not harmless: the caller re-reads the row to
+/// build its reply, so a failed `set_host_enabled` makes AddHost report
+/// an unprovisionable host as enabled and healthy. Left as-is here to
+/// keep the extraction behaviour-preserving.
+fn apply_provision_outcome(work_db: &crate::work::WorkDb, host_id: &str, outcome: ProvisionOutcome) {
+    match outcome {
+        ProvisionOutcome::Skipped => {}
+        ProvisionOutcome::Ok => {
+            let _ = work_db.set_host_last_error(host_id, None);
         }
-        Err(err) => {
-            let msg = format!("wrapper push errored: {err:#}");
-            tracing::warn!(host_id, %msg, "eager_push_wrapper: error");
+        ProvisionOutcome::Failed(detail) => {
+            tracing::warn!(host_id, %detail, "eager_push_wrapper: provisioning failed; disabling host");
             let _ = work_db.set_host_enabled(host_id, false);
-            let _ = work_db.set_host_last_error(host_id, Some(&msg));
+            let _ = work_db.set_host_last_error(host_id, Some(&detail));
         }
     }
 }
