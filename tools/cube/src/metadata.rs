@@ -56,6 +56,16 @@ pub enum WorkspaceHealth {
     Dirty,
     /// One or more bookmarks are in a conflicted state; working copy itself is empty.
     Conflicted,
+    /// Reclaimed from an expired lease whose prior holder's `@` still had
+    /// committed-but-unpushed work off the repo's main branch (the
+    /// dirty-reclaim guard in `reset_workspace_guarded` tripped). Unlike
+    /// `Dirty`/`Conflicted`, this state is durable: it is never selected by
+    /// the lease health-check candidate discovery, never auto-recovered by
+    /// health reconciliation, and never recycled by the aged-unhealthy pool
+    /// GC. Only an explicit `cube workspace force-release` clears it, so a
+    /// human confirms the prior holder's work is genuinely abandoned (or
+    /// has been salvaged) before the workspace re-enters the pool.
+    Quarantined,
 }
 
 impl WorkspaceHealth {
@@ -64,6 +74,7 @@ impl WorkspaceHealth {
             Self::Clean => "clean",
             Self::Dirty => "dirty",
             Self::Conflicted => "conflicted",
+            Self::Quarantined => "quarantined",
         }
     }
 }
@@ -76,6 +87,7 @@ impl std::str::FromStr for WorkspaceHealth {
             "clean" => Ok(Self::Clean),
             "dirty" => Ok(Self::Dirty),
             "conflicted" => Ok(Self::Conflicted),
+            "quarantined" => Ok(Self::Quarantined),
             _ => Err(()),
         }
     }
