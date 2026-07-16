@@ -468,8 +468,9 @@ pub struct CubeChangeHandle {
 /// unless `--no-push` was passed, advanced+pushed the boss bookmark) or
 /// `REBASED_WITH_CONFLICTS` (conflicts materialized in the working copy,
 /// nothing pushed). The `conflicted_files` list is best-effort informational
-/// (it comes from `jj resolve --list`, so entries may carry a trailing
-/// conflict-type descriptor after the path).
+/// and sourced from `jj resolve --list`; [`parse_rebase_payload`] strips
+/// jj's trailing conflict-type descriptor from each entry, so callers always
+/// see bare paths here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebaseOutcome {
     /// `true` for `REBASED_CLEAN`, `false` for `REBASED_WITH_CONFLICTS`.
@@ -629,11 +630,44 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
+/// Strip the trailing jj conflict-type descriptor (e.g. `"    2-sided
+/// conflict"` or `"    2-sided conflict including 1 deletion"`) that `jj
+/// resolve --list` glues onto each path, column-aligned with whitespace
+/// padding. Paths can themselves contain spaces, so this deliberately
+/// anchors on the `<N>-sided conflict` marker rather than splitting on
+/// whitespace: it finds the marker, walks back over the digit run that
+/// precedes it, and treats everything before that (whitespace-trimmed) as
+/// the path. Lines that don't match the pattern (already-bare paths, or a
+/// future jj format change) are returned unchanged.
+fn strip_jj_conflict_descriptor(line: &str) -> &str {
+    const MARKER: &str = "-sided conflict";
+    let trimmed = line.trim();
+    let Some(marker_idx) = trimmed.rfind(MARKER) else {
+        return trimmed;
+    };
+    let digits_start = trimmed[..marker_idx]
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if digits_start == marker_idx {
+        // No digits immediately before the marker — not actually the
+        // descriptor we're looking for.
+        return trimmed;
+    }
+    let path = trimmed[..digits_start].trim_end();
+    if path.is_empty() { trimmed } else { path }
+}
+
 /// Parse `cube workspace rebase --json`'s `payload` object
 /// (`{status, pushed, conflicted_files, ...}`) into a [`RebaseOutcome`].
 /// Shared by [`CommandCubeClient::rebase_workspace`] and
 /// [`CommandCubeClient::rebase_workspace_no_push`] — the two commands differ
-/// only by the `--no-push` flag, not by output shape.
+/// only by the `--no-push` flag, not by output shape. `conflicted_files`
+/// entries come from `jj resolve --list` and may carry a trailing
+/// conflict-type descriptor after the path (see
+/// [`strip_jj_conflict_descriptor`]); that descriptor is stripped here so
+/// every downstream consumer of [`RebaseOutcome::conflicted_files`] sees
+/// bare paths.
 fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
     let status = payload
         .get("status")
@@ -648,7 +682,12 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
     let conflicted_files = payload
         .get("conflicted_files")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| strip_jj_conflict_descriptor(s).to_owned())
+                .collect()
+        })
         .unwrap_or_default();
     Ok(RebaseOutcome {
         clean,
@@ -6572,11 +6611,60 @@ mod tests {
         CubeWorkspaceLease, CubeWorkspaceStatus, DispatchPauseOrigin, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator,
         ExecutionKind, Host, HostAdapter, HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
         MAX_WORKER_POOL_SIZE, PreemptOutcome, REVIEW_WORKER_ID_PREFIX, WORKER_PAGE_SIZE, WorkerPool,
-        occupying_live_worker, pick_worst_failing_check, pool_model_override_for_worker_id, slot_busy_occupant,
-        slot_id_from_worker_id, worker_id_for_slot, worker_page_label,
+        occupying_live_worker, parse_rebase_payload, pick_worst_failing_check, pool_model_override_for_worker_id,
+        slot_busy_occupant, slot_id_from_worker_id, strip_jj_conflict_descriptor, worker_id_for_slot,
+        worker_page_label,
     };
     use crate::spawn_flow::StartWorkerError;
     use boss_protocol::{EngineToAppError, ExecutionStatus};
+
+    /// Reproduces the live incident (flunge T449, PR brianduff/flunge#906,
+    /// 2026-07-16): rung 1's `conflicted_files` come straight from `jj
+    /// resolve --list`, whose entries carry a trailing conflict-type
+    /// descriptor glued onto the path (e.g. `"MODULE.bazel.lock    2-sided
+    /// conflict"`). Left unstripped, rung 0's resolver lookup does a
+    /// `file_name()` match against the whole annotated string and never
+    /// matches, so the batch gets declined and escalated to an agent even
+    /// though a resolver for the bare filename exists.
+    #[test]
+    fn strip_jj_conflict_descriptor_removes_trailing_annotation() {
+        assert_eq!(
+            strip_jj_conflict_descriptor("MODULE.bazel.lock    2-sided conflict"),
+            "MODULE.bazel.lock",
+        );
+        // Descriptor can carry extra detail past the sided-conflict marker.
+        assert_eq!(
+            strip_jj_conflict_descriptor("f.txt    2-sided conflict including 1 deletion"),
+            "f.txt",
+        );
+        // Paths with internal spaces must not be truncated at the first space.
+        assert_eq!(
+            strip_jj_conflict_descriptor("a b long name.txt    2-sided conflict"),
+            "a b long name.txt",
+        );
+        // Already-bare paths (or an unrecognized future format) pass through.
+        assert_eq!(strip_jj_conflict_descriptor("MODULE.bazel.lock"), "MODULE.bazel.lock");
+        assert_eq!(strip_jj_conflict_descriptor("  spaced.txt  "), "spaced.txt");
+    }
+
+    #[test]
+    fn parse_rebase_payload_strips_conflict_descriptors_from_conflicted_files() {
+        let payload = serde_json::json!({
+            "status": "conflicts",
+            "pushed": false,
+            "conflicted_files": [
+                "MODULE.bazel.lock    2-sided conflict",
+                "a b long name.txt    3-sided conflict including 1 deletion",
+            ],
+        });
+        let outcome = parse_rebase_payload(payload).expect("payload parses");
+        assert!(!outcome.clean);
+        assert!(!outcome.pushed);
+        assert_eq!(
+            outcome.conflicted_files,
+            vec!["MODULE.bazel.lock".to_owned(), "a b long name.txt".to_owned()],
+        );
+    }
 
     /// Lease-time occupancy guard (defect 3, regression test c). The
     /// pure decision: a workspace is "occupied" only by a tracked worker
