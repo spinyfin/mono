@@ -8,7 +8,7 @@ use super::*;
 use crate::coordinator::{CubeRepoHandle, CubeWorkspaceLease, RebaseOutcome};
 use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 use crate::test_support::*;
-use crate::work::{WorkDb, WorkItem, WorkItemPatch};
+use crate::work::{CreateExecutionInput, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch};
 
 fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
     let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
@@ -30,6 +30,14 @@ fn chore_status(db: &WorkDb, id: &str) -> (TaskStatus, Option<String>) {
         WorkItem::Chore(t) => (t.status, t.blocked_reason),
         other => panic!("expected chore, got {other:?}"),
     }
+}
+
+/// Read a task row back through the public query path — unlike
+/// `WorkDb::get_work_item`, this does not filter out soft-deleted rows, so
+/// it can see an archived (tombstoned) revision after
+/// `close_resolved_conflict_revision` runs.
+fn task(db: &WorkDb, id: &str) -> crate::work::Task {
+    crate::work::query_task(&db.connect().unwrap(), id).unwrap().unwrap()
 }
 
 fn candidate(product_id: &str, work_item_id: &str, pr_url: &str) -> PendingMergeCheck {
@@ -327,6 +335,85 @@ async fn conflict_with_unbounded_residue_declines_rung2() {
     }
 }
 
+/// A [`CubeClient`] double whose `lease_workspace` always errors — drives the
+/// rung-1 lease-unavailable path (the T501/flunge PR #917 incident: a
+/// transient cube dirty-reclaim refusal on both attempts).
+struct LeaseFailsCube {
+    lease_calls: Mutex<u32>,
+}
+
+impl LeaseFailsCube {
+    fn new() -> Self {
+        Self {
+            lease_calls: Mutex::new(0),
+        }
+    }
+}
+
+crate::stub_cube_client! { LeaseFailsCube {
+    async fn ensure_repo(&self, _origin: &str) -> anyhow::Result<CubeRepoHandle> {
+        Ok(CubeRepoHandle { repo_id: "repo-1".to_owned() })
+    }
+    async fn lease_workspace(
+        &self,
+        _repo_id: &str,
+        _task: &str,
+        _prefer: Option<&str>,
+        _allow_dirty: bool,
+        _exclude: &[&str],
+    ) -> anyhow::Result<CubeWorkspaceLease> {
+        *self.lease_calls.lock().await += 1;
+        anyhow::bail!("lease boom");
+    }
+} }
+
+/// Escalation ladder (T4/incident defense-in-depth): when rung 1's
+/// workspace lease fails on both the initial attempt and the retry, the
+/// ladder must NOT spawn a full-worker (rung 3) revision this tick — that
+/// was the actual incident: a pure infra hiccup escalated straight to the
+/// most expensive rung. The attempt stays `pending` with no
+/// `revision_task_id`, and the parent stays `blocked: merge_conflict`
+/// (already flipped upfront) so the next `conflict_watch` tick retries the
+/// ladder from scratch instead of a worker being spawned on a stale signal.
+#[tokio::test]
+async fn conflict_with_lease_unavailable_spawns_no_worker_this_tick() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/81";
+    let (product, chore) = make_in_review(&db, "C-lease-unavailable", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = LeaseFailsCube::new();
+
+    let transitioned = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        Some(&cube),
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+
+    assert!(transitioned, "the upfront blocked-flip is itself a state change");
+    // Retried exactly once (two total attempts), not spawned in a loop.
+    assert_eq!(*cube.lease_calls.lock().await, 2);
+    // No worker spawned: the attempt is live but has no revision vehicle.
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("attempt row must still exist, pending a retry");
+    assert_eq!(active.status, "pending");
+    assert!(
+        active.revision_task_id.is_none(),
+        "a lease-unavailable tick must not spawn a full-worker revision"
+    );
+    // Parent stays blocked (no tractable fix vehicle this tick) rather than
+    // returning to Review with a phantom in-flight revision.
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::Blocked);
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
 /// New-model acceptance: when a revision fix vehicle is successfully spawned,
 /// the parent stays in `in_review` (Review column). The blocked state is only
 /// reached when there is no tractable fix vehicle (churn cap, create_revision
@@ -520,6 +607,161 @@ async fn resolution_retires_attempt_when_parent_was_in_review() {
             .any(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionSucceeded { .. })),
         "ConflictResolutionSucceeded must fire, got {typed:?}",
     );
+}
+
+/// T3 (this chore): a resolved merge-conflict attempt must close the
+/// revision task it spawned, not just its own `conflict_resolutions` row —
+/// otherwise the parent shows a phantom "in revision" badge until the
+/// parent's PR eventually merges (or forever, if the revision never
+/// advances on its own; see the 2026-07-16 incident). A freshly-spawned,
+/// never-dispatched revision has no live execution, so `on_resolved` must
+/// close it out (archived as moot) immediately.
+#[tokio::test]
+async fn resolution_closes_the_revision_task_it_spawned() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/13";
+    let (product, chore) = make_in_review(&db, "C-close-revision", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("worker path must spawn a revision");
+    let revision_id = active
+        .revision_task_id
+        .clone()
+        .expect("revision task id must be stamped");
+
+    let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
+    assert!(resolved);
+
+    let t = task(&db, &revision_id);
+    assert_eq!(
+        t.status,
+        TaskStatus::Archived,
+        "a never-dispatched (no live execution) revision must be closed, not left todo/active forever",
+    );
+    assert!(t.archived_reason.is_some());
+}
+
+/// A revision task still being actively driven by a worker (a `running`
+/// execution) must NOT be closed out from under it — its own on-Stop
+/// completion advances it normally when the worker's turn ends.
+#[tokio::test]
+async fn resolution_leaves_a_live_revision_task_alone() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/14";
+    let (product, chore) = make_in_review(&db, "C-live-revision", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("worker path must spawn a revision");
+    let revision_id = active
+        .revision_task_id
+        .clone()
+        .expect("revision task id must be stamped");
+    let status_before = match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.status,
+        other => panic!("expected a task-shaped revision, got {other:?}"),
+    };
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(revision_id.clone())
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+
+    let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
+    assert!(resolved);
+
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(
+                t.status, status_before,
+                "a revision with a live (running) execution must be left untouched",
+            );
+            assert!(t.archived_reason.is_none());
+        }
+        other => panic!("expected a task-shaped revision, got {other:?}"),
+    }
+}
+
+/// A revision task already `in_review` (its own worker already finished and
+/// pushed) is left alone here — it rides the parent's eventual real merge
+/// to `done` via `flip_in_review_revisions_to_done`, not archived by the
+/// conflict-resolution retire path.
+#[tokio::test]
+async fn resolution_leaves_an_in_review_revision_task_alone() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/15";
+    let (product, chore) = make_in_review(&db, "C-in-review-revision", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    let active = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("worker path must spawn a revision");
+    let revision_id = active
+        .revision_task_id
+        .clone()
+        .expect("revision task id must be stamped");
+    db.update_work_item(
+        &revision_id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
+    assert!(resolved);
+
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(
+                t.status,
+                TaskStatus::InReview,
+                "an in_review revision must ride the eventual real merge to done, not be \
+                 archived by the conflict-resolution retire path",
+            );
+        }
+        other => panic!("expected a task-shaped revision, got {other:?}"),
+    }
 }
 
 /// Old-model compatibility: when the parent IS blocked (revision_create_failed,

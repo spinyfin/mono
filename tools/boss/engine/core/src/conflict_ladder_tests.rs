@@ -44,6 +44,11 @@ struct ScriptCube {
     /// `try_mechanical_rungs` point this at a real fixture directory via
     /// [`Self::with_workspace_path`].
     workspace_path: PathBuf,
+    /// Number of leading `lease_workspace` calls to fail before succeeding —
+    /// drives the rung-1 lease-retry tests (`lease_rung1_workspace`).
+    /// Defaults to 0 (never fails).
+    lease_failures: u32,
+    lease_calls: Mutex<u32>,
     released: Mutex<Vec<String>>,
     gotos: Mutex<Vec<u64>>,
     rebases: Mutex<Vec<u64>>,
@@ -56,6 +61,8 @@ impl ScriptCube {
             script,
             tripwire_findings: Vec::new(),
             workspace_path: PathBuf::from("/tmp/ladder-ws"),
+            lease_failures: 0,
+            lease_calls: Mutex::new(0),
             released: Mutex::new(Vec::new()),
             gotos: Mutex::new(Vec::new()),
             rebases: Mutex::new(Vec::new()),
@@ -76,6 +83,13 @@ impl ScriptCube {
             ..Self::new(script)
         }
     }
+
+    fn with_lease_failures(script: Script, lease_failures: u32) -> Self {
+        Self {
+            lease_failures,
+            ..Self::new(script)
+        }
+    }
 }
 
 crate::stub_cube_client! { ScriptCube {
@@ -93,6 +107,11 @@ crate::stub_cube_client! { ScriptCube {
         _allow_dirty: bool,
         _exclude: &[&str],
     ) -> Result<CubeWorkspaceLease> {
+        let mut calls = self.lease_calls.lock().await;
+        *calls += 1;
+        if *calls <= self.lease_failures {
+            anyhow::bail!("lease boom (call {calls})");
+        }
         Ok(CubeWorkspaceLease {
             lease_id: "lease-1".to_owned(),
             workspace_id: "ws-1".to_owned(),
@@ -399,6 +418,56 @@ async fn rung1_ensure_repo_error_falls_through_without_lease() {
         }
     );
     // Never leased (ensure_repo failed first), so nothing to release, no goto.
+    assert!(cube.gotos.lock().await.is_empty());
+    assert!(cube.released.lock().await.is_empty());
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+}
+
+/// Incident defense-in-depth (T501/flunge PR #917): a rung-1 lease failure
+/// that clears on retry must NOT fall through — the ladder proceeds exactly
+/// as if the first attempt had never failed.
+#[tokio::test]
+async fn rung1_lease_fails_once_then_retry_succeeds_and_proceeds() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ScriptCube::with_lease_failures(Script::CleanPushed, 1);
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::Retired);
+    assert_eq!(*cube.lease_calls.lock().await, 2, "one failure, then one retry");
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(1));
+}
+
+/// Incident defense-in-depth (T501/flunge PR #917): a rung-1 lease that
+/// fails on both the initial attempt and the retry must NOT escalate
+/// straight to a full worker — it reports
+/// [`LadderOutcome::MechanicalRungsUnavailable`] so the caller
+/// (`conflict_watch::on_conflict_detected`) spawns nothing this tick and
+/// retries the ladder on the next `conflict_watch` tick instead.
+#[tokio::test]
+async fn rung1_lease_fails_twice_reports_mechanical_rungs_unavailable() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ScriptCube::with_lease_failures(Script::CleanPushed, 2);
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+
+    assert_eq!(outcome, LadderOutcome::MechanicalRungsUnavailable);
+    assert_eq!(
+        *cube.lease_calls.lock().await,
+        2,
+        "exactly one retry, not an unbounded loop"
+    );
+    // Never actually leased, so nothing was ever released, and no goto/rebase
+    // was attempted.
     assert!(cube.gotos.lock().await.is_empty());
     assert!(cube.released.lock().await.is_empty());
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
