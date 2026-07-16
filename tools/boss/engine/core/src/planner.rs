@@ -204,6 +204,22 @@ impl PlannerOutcome {
     }
 }
 
+/// Audit of the decomposition gate's activity during one [`Planner::plan`]
+/// call, carried alongside [`PlannerOutcome`] so the caller (the Populator)
+/// can surface it to the operator without re-deriving it from logs. Purely
+/// observational — it does not change the gate's behaviour (design/T298
+/// lineage), only exposes what [`plan_with_url`] already computes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecompositionAudit {
+    /// Number of attempts on which [`detect_oversize_tasks`] found an
+    /// oversize task (0 = the gate never triggered).
+    pub oversize_attempts: u32,
+    /// Tasks still oversize when a proposal was accepted best-effort after
+    /// exhausting [`PLANNER_VALIDATION_ATTEMPTS`]. 0 if the gate never
+    /// triggered, or triggered but a later retry resolved cleanly.
+    pub oversize_remaining: usize,
+}
+
 /// The Planner. A zero-sized entry point so callers write the
 /// `Planner::plan(..)` shape the design names; the Planner holds no state
 /// (it is a pure transform).
@@ -223,11 +239,13 @@ impl Planner {
     /// (transport errors and HTTP 429/5xx/overloaded) once before failing safe;
     /// a non-retryable 4xx, a decode failure, or output that fails schema
     /// validation is surfaced immediately, mapped into a [`PlannerOutcome`].
-    pub async fn plan(api_key: Option<&str>, input: &PlannerInput) -> PlannerOutcome {
+    /// The second element of the return tuple is the decomposition-gate audit
+    /// ([`DecompositionAudit`]) for this call.
+    pub async fn plan(api_key: Option<&str>, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
         match api_key {
             None => {
                 tracing::error!("planner: skipped — ANTHROPIC_API_KEY not configured",);
-                PlannerOutcome::NoApiKey
+                (PlannerOutcome::NoApiKey, DecompositionAudit::default())
             }
             Some(key) => plan_with_url(claude_client::ANTHROPIC_MESSAGES_URL, key, input).await,
         }
@@ -254,12 +272,13 @@ enum RetryFeedback {
 /// with the reason fed back into the prompt and tries again, bounded by
 /// [`PLANNER_VALIDATION_ATTEMPTS`], before failing safe / accepting
 /// best-effort.
-async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> PlannerOutcome {
+async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
     let config = CallConfig::new(PLANNER_TIMEOUT)
         .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF))
         .with_endpoint(url);
 
     let mut feedback: Option<RetryFeedback> = None;
+    let mut audit = DecompositionAudit::default();
     for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
         let body = match &feedback {
             None => build_request_body(input),
@@ -278,15 +297,17 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> Planne
                     // sizing contract already pushed hard for the split.
                     let findings = detect_oversize_tasks(&output);
                     if findings.is_empty() {
-                        return PlannerOutcome::Success(output);
+                        return (PlannerOutcome::Success(output), audit);
                     }
+                    audit.oversize_attempts += 1;
                     if attempt >= PLANNER_VALIDATION_ATTEMPTS {
+                        audit.oversize_remaining = findings.len();
                         tracing::warn!(
                             attempt,
                             oversize = findings.len(),
                             "planner: oversize task(s) remain after decomposition retries; accepting best-effort proposal",
                         );
-                        return PlannerOutcome::Success(output);
+                        return (PlannerOutcome::Success(output), audit);
                     }
                     tracing::warn!(
                         attempt,
@@ -297,7 +318,7 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> Planne
                 }
                 Err(msg) => {
                     if attempt >= PLANNER_VALIDATION_ATTEMPTS {
-                        return PlannerOutcome::InvalidOutput(msg);
+                        return (PlannerOutcome::InvalidOutput(msg), audit);
                     }
                     tracing::warn!(
                         attempt,
@@ -308,12 +329,15 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> Planne
                     feedback = Some(RetryFeedback::Schema(msg));
                 }
             },
-            Err(err) => return outcome_from_error(err),
+            Err(err) => return (outcome_from_error(err), audit),
         }
     }
     // Unreachable in practice: the final iteration returns in every branch
     // (Ok → Success/best-effort, Err → InvalidOutput). Kept as a fail-safe.
-    PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned())
+    (
+        PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned()),
+        audit,
+    )
 }
 
 /// Assemble the Anthropic Messages request body. Public so tests and future
@@ -1074,9 +1098,10 @@ mod tests {
 
     #[tokio::test]
     async fn plan_returns_no_api_key_when_key_missing() {
-        let outcome = Planner::plan(None, &sample_input()).await;
+        let (outcome, audit) = Planner::plan(None, &sample_input()).await;
         assert!(matches!(outcome, PlannerOutcome::NoApiKey));
         assert_eq!(outcome.tag(), "no_api_key");
+        assert_eq!(audit, DecompositionAudit::default());
     }
 
     #[tokio::test]
@@ -1090,7 +1115,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
 
         match outcome {
             PlannerOutcome::Success(out) => {
@@ -1100,6 +1126,7 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+        assert_eq!(audit, DecompositionAudit::default());
     }
 
     #[tokio::test]
@@ -1118,7 +1145,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, _audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after one retry, got {outcome:?}",
@@ -1186,11 +1214,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => assert_eq!(out.effort_audit.len(), 1),
             other => panic!("expected Success via coercion, got {other:?}"),
         }
+        assert_eq!(audit, DecompositionAudit::default());
         assert_eq!(
             server.received_requests().await.expect("requests recorded").len(),
             1,
@@ -1217,11 +1247,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after the validation retry, got {outcome:?}",
         );
+        // A schema-invalid retry never trips the oversize gate.
+        assert_eq!(audit, DecompositionAudit::default());
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 2, "expected exactly one validation retry");
@@ -1251,7 +1284,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, _audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::InvalidOutput(_)),
             "expected InvalidOutput after exhausting retries, got {outcome:?}",
@@ -1275,7 +1309,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, _audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         match outcome {
             PlannerOutcome::ApiError { status, .. } => assert_eq!(status, 401),
             other => panic!("expected ApiError, got {other:?}"),
@@ -1384,7 +1419,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => {
                 assert_eq!(out.tasks.len(), 3, "the decomposed plan must replace the monolith");
@@ -1397,6 +1433,15 @@ mod tests {
             }
             other => panic!("expected Success with the decomposed plan, got {other:?}"),
         }
+        // The gate triggered once and resolved cleanly on retry — the audit
+        // must reflect that even though the run succeeded outright.
+        assert_eq!(
+            audit,
+            DecompositionAudit {
+                oversize_attempts: 1,
+                oversize_remaining: 0,
+            }
+        );
 
         // Exactly one re-prompt, and it must feed the oversize rejection back
         // to the model.
@@ -1428,7 +1473,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "an unsplittable oversize proposal is accepted best-effort, not failed: {outcome:?}",
@@ -1437,6 +1483,15 @@ mod tests {
             server.received_requests().await.expect("requests recorded").len(),
             PLANNER_VALIDATION_ATTEMPTS as usize,
             "must stop after exactly PLANNER_VALIDATION_ATTEMPTS calls",
+        );
+        // The best-effort acceptance must be visible to the caller so it can
+        // surface it to the operator, not just logged.
+        assert_eq!(
+            audit,
+            DecompositionAudit {
+                oversize_attempts: PLANNER_VALIDATION_ATTEMPTS,
+                oversize_remaining: 1,
+            }
         );
     }
 
