@@ -16,7 +16,6 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [bazel-build] building"
-echo "[bazel-build] bazel: $(command bazel --version)"
 
 if ! bazel build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
   echo "^^^ +++"
@@ -27,7 +26,6 @@ fi
 echo "[bazel-build] ok"
 
 echo "--- [bazel-test] testing"
-echo "[bazel-test] bazel: $(command bazel --version)"
 
 if ! bazel test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
   echo "^^^ +++"
