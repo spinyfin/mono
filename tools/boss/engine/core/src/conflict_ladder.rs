@@ -601,11 +601,12 @@ pub(crate) async fn attempt_rung0(
     };
     let pr_number = pr_number as u64;
 
-    // Rung 1's `conflicted_files` are bare paths (from `jj resolve --list`),
-    // not the merge-tree-derived diagnosis `boss_conflict_diagnosis` produces
-    // elsewhere — there is no marker-tree available here, so `shape` is the
-    // same generic "content" the producer-rebase diagnosis path uses for the
-    // same reason (see `conflict_res.rs`).
+    // Rung 1's `conflicted_files` are bare paths — `coordinator::parse_rebase_payload`
+    // strips jj's trailing conflict-type descriptor (e.g. "    2-sided conflict")
+    // before these ever reach here. They are not the merge-tree-derived diagnosis
+    // `boss_conflict_diagnosis` produces elsewhere — there is no marker-tree
+    // available here, so `shape` is the same generic "content" the
+    // producer-rebase diagnosis path uses for the same reason (see `conflict_res.rs`).
     let files: Vec<ConflictedFile> = residual_paths
         .iter()
         .map(|path| ConflictedFile {
