@@ -43,4 +43,12 @@ impl ServerState {
         let envelope = FrontendEventEnvelope::push(FrontendEvent::EngineHealthResult { report });
         self.topic_broker.publish(TOPIC_ENGINE_HEALTH, envelope).await;
     }
+
+    /// Push a Boothby pass lifecycle change on the `boothby.activity` topic.
+    /// Called by [`crate::boothby_scheduler::spawn_loop`] via the
+    /// [`crate::boothby_scheduler::BoothbyActivitySink`] impl below.
+    pub async fn broadcast_boothby_activity(&self, pass: boss_protocol::BoothbyPass) {
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::BoothbyActivity { pass });
+        self.topic_broker.publish(TOPIC_BOOTHBY_ACTIVITY, envelope).await;
+    }
 }

@@ -21,32 +21,37 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-/// Dispatch stages (see [`crate::dispatch_events::Stage::as_str`]) that arm a
-/// Boothby pass when they fire — each represents a state a sweep flagged but
-/// could not fully resolve (design table, §"Activation model"). Any other
-/// stage is a silent no-op by construction: it is simply absent from this
-/// list, so future `Stage` variants never need to touch this file to stay
-/// harmless.
-pub const BOOTHBY_TRIGGER_STAGES: &[&str] = &[
-    "dead_pid_reconcile",
-    "stale_worker_reconcile",
-    "orphan_active_redispatch",
-    "lost_workspace_reconcile",
-    "remote_lease_reconcile",
-    "husk_pane_reconcile",
-    "pool_claim_reconcile",
-    "spawn_ack_timeout",
+use crate::dispatch_events::Stage;
+
+/// Dispatch stages that arm a Boothby pass when they fire — each represents
+/// a state a sweep flagged but could not fully resolve (design table,
+/// §"Activation model"). Any other stage is a silent no-op by construction:
+/// it is simply absent from this list, so future `Stage` variants never need
+/// to touch this file to stay harmless. Typed as `&[Stage]` (rather than
+/// re-hardcoded strings) so renaming a `Stage` variant's `as_str()` output is
+/// a compile error here instead of a silently-disabled trigger.
+pub const BOOTHBY_TRIGGER_STAGES: &[Stage] = &[
+    Stage::DeadPidReconcile,
+    Stage::StaleWorkerReconcile,
+    Stage::OrphanActiveRedispatch,
+    Stage::LostWorkspaceReconcile,
+    Stage::RemoteLeaseReconcile,
+    Stage::HuskPaneReconcile,
+    Stage::PoolClaimReconcile,
+    Stage::SpawnAckTimeout,
 ];
 
 /// `work_attention_items.kind` values that arm a Boothby pass when a *new*
 /// item is created with that kind (design table, §"Activation model"). Any
 /// other kind is a silent no-op — same rationale as
-/// [`BOOTHBY_TRIGGER_STAGES`].
+/// [`BOOTHBY_TRIGGER_STAGES`]. Reference the producers' own constants (rather
+/// than re-typing the strings) so a rename there is a compile error here
+/// instead of a silently-disabled trigger.
 pub const BOOTHBY_TRIGGER_ATTENTION_KINDS: &[&str] = &[
-    "nudge_breaker_tripped",
-    "ci_remediation_exhausted",
-    "pr_review_died_without_findings",
-    "app_spawn_capability_unhealthy",
+    crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
+    crate::ci_watch::CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND,
+    crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
+    crate::spawn_health::SPAWN_CAPABILITY_ATTENTION_KIND,
 ];
 
 /// Prefix `BoothbyEventQueue::arm` names its trigger with, so the scheduler
