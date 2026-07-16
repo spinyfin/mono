@@ -16,21 +16,25 @@
 //!
 //! # Crate boundary
 //!
-//! This crate owns the metrics vocabulary — the registry, the
-//! primitives, the declaration macros, the row types and the flush /
-//! rehydrate machinery — and knows nothing about the engine. The
-//! persistence layer talks to storage through the [`MetricsStore`]
-//! trait, which `boss_engine`'s `WorkDb` implements. That keeps the
-//! dependency edge one-directional (`boss_engine` -> `boss_metrics`).
+//! The registry, primitives, declaration macros and row types live
+//! one level down in `boss-engine-metrics-registry` — a deliberately
+//! narrow crate (storage + declaration only) so that touching a
+//! metric doesn't rebuild `boss-engine`, the largest Rust target in
+//! the repo. This crate re-exports that vocabulary and adds the flush
+//! / rehydrate machinery on top. The persistence layer talks to
+//! storage through the [`MetricsStore`] trait, which `boss_engine`'s
+//! `WorkDb` implements. That keeps the dependency edge one-directional
+//! (`boss_engine` -> `boss_metrics` -> `boss_engine_metrics_registry`).
 //!
 //! Registering the engine's own handles is the engine's job: see
 //! `boss_engine::metrics_init::init_all`, which must name every
 //! module that declares a handle.
 
 pub mod persistence;
-pub mod registry;
 pub mod store;
 
+pub use boss_engine_metrics_registry::{
+    CounterHandle, CounterSnapshot, GaugeHandle, GaugeSnapshot, Registry, now_ms, register_counter, register_gauge,
+};
 pub use persistence::{FLUSH_INTERVAL, flush_all, seed_from_db, spawn_flush_task};
-pub use registry::{CounterHandle, CounterSnapshot, GaugeHandle, GaugeSnapshot, Registry, now_ms};
 pub use store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};

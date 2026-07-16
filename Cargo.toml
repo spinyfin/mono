@@ -21,6 +21,7 @@ members = [
   "tools/boss/engine/feature-flags",
   "tools/boss/engine/live-status-redact",
   "tools/boss/engine/metrics",
+  "tools/boss/engine/metrics-registry",
   "tools/boss/log-files",
   "tools/boss/protocol",
   "tools/boss/engine/ssh-transport",

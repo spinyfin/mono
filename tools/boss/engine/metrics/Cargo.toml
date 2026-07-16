@@ -6,6 +6,6 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
-boss-engine-utils = { path = "../utils" }
+boss-engine-metrics-registry = { path = "../metrics-registry" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }

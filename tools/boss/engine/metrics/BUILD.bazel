@@ -14,7 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
-        "//tools/boss/engine/utils",
+        "//tools/boss/engine/metrics-registry:metrics_registry",
     ] + all_crate_deps(normal = True),
 )
 
@@ -28,7 +28,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
-        "//tools/boss/engine/utils",
+        "//tools/boss/engine/metrics-registry:metrics_registry",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

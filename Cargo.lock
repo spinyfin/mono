@@ -413,6 +413,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-metrics-registry"
+version = "0.1.0"
+dependencies = [
+ "boss-engine-utils",
+]
+
+[[package]]
 name = "boss-engine-transient-error"
 version = "0.1.0"
 dependencies = [
@@ -504,7 +511,7 @@ name = "boss-metrics"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "boss-engine-utils",
+ "boss-engine-metrics-registry",
  "tokio",
  "tracing",
 ]

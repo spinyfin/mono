@@ -17,9 +17,9 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::task::JoinHandle;
 
-use crate::store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
+use boss_engine_metrics_registry::{Registry, now_ms};
 
-use super::registry::{Registry, now_ms};
+use crate::store::{MetricsCounterRow, MetricsGaugeRow, MetricsStore};
 
 /// How often the periodic flush task wakes up and snapshots the
 /// registry into the store. Picked for the
@@ -116,9 +116,9 @@ pub fn flush_all<S: MetricsStore + ?Sized>(registry: &Registry, store: &S) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::CounterHandle;
     use crate::store::testing::FakeStore;
     use crate::{register_counter, register_gauge};
+    use boss_engine_metrics_registry::CounterHandle;
 
     register_counter!(
         TEST_PERSIST_COUNTER,
