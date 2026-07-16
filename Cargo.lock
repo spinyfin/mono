@@ -338,6 +338,7 @@ dependencies = [
  "boss-deterministic-resolvers",
  "boss-editorial",
  "boss-engine-driver",
+ "boss-engine-metrics-registry",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-feature-flags",
@@ -386,6 +387,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-metrics-registry"
+version = "0.1.0"
+dependencies = [
+ "boss-engine-utils",
 ]
 
 [[package]]

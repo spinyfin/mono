@@ -1,5 +1,13 @@
 pub use boss_transcript_markdown as transcript_markdown;
 
+// `register_counter!` / `register_gauge!` are defined in
+// `boss-engine-metrics-registry` but re-exported here so call sites keep
+// writing `crate::register_counter!`, matching the `crate::metrics::Registry`
+// they hand the resulting handle to. The macros expand to `$crate::`-qualified
+// paths that resolve against the defining crate, so this is a plain re-export —
+// nothing to keep in sync.
+pub use boss_engine_metrics_registry::{register_counter, register_gauge};
+
 pub mod answer_agent;
 pub mod app;
 pub mod attentions_detector;

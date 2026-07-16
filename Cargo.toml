@@ -18,6 +18,7 @@ members = [
   "tools/boss/engine/pr-template",
   "tools/boss/event-shim",
   "tools/boss/engine/feature-flags",
+  "tools/boss/engine/metrics-registry",
   "tools/boss/log-files",
   "tools/boss/protocol",
   "tools/boss/engine/ssh-transport",

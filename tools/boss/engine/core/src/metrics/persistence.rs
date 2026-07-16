@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::work::{MetricsCounterRow, MetricsGaugeRow, WorkDb};
 
-use super::registry::{Registry, now_ms};
+use super::{Registry, now_ms};
 
 /// How often the periodic flush task wakes up and snapshots the
 /// registry into `state.db`. Picked for the
@@ -115,7 +115,7 @@ pub fn flush_all(registry: &Registry, work_db: &WorkDb) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::registry::CounterHandle;
+    use crate::metrics::CounterHandle;
     use crate::register_counter;
     use crate::register_gauge;
     use std::path::PathBuf;

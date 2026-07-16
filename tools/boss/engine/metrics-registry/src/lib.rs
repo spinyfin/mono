@@ -1,6 +1,13 @@
 //! In-memory metrics registry: counter / gauge primitives and the
 //! `register_counter!` / `register_gauge!` declaration macros.
 //!
+//! This crate holds the storage and declaration half of the engine's
+//! metrics framework. Persisting snapshots to `state.db` and the
+//! `init_all` startup registration sweep stay in `boss-engine`: both
+//! reach into engine internals (`WorkDb`, every metric-declaring
+//! module), so they belong on the consumer side of this edge. The
+//! dependency runs one way — `boss-engine` -> `boss-engine-metrics-registry`.
+//!
 //! Counters are strictly monotonic `u64`s; the only mutator is
 //! `inc` / `inc_by`. Gauges are signed `i64`s overwritten by the
 //! producer on each publication.
@@ -86,22 +93,26 @@ impl GaugeHandle {
 
 /// Declare a static [`CounterHandle`].
 ///
+/// Engine modules reach this macro through the `boss_engine` crate-root
+/// re-export, so call sites use `crate::register_counter!`, not the
+/// fully-qualified path shown below:
+///
 /// ```ignore
-/// register_counter!(
+/// crate::register_counter!(
 ///     PR_URL_CAPTURE_PRIMARY_HIT,
 ///     "pr_url_capture.primary_path.hit",
 ///     "On-stop hook found a staged PR URL and skipped the detector.",
 /// );
 /// ```
 ///
-/// The handle must be added to `metrics::init_all` so registration
-/// runs at engine startup (design §"Risks / open questions" item 2).
+/// The handle must be added to `boss_engine::metrics::init_all` so
+/// registration runs at engine startup (design §"Risks / open
+/// questions" item 2).
 #[macro_export]
 macro_rules! register_counter {
     ($static_name:ident, $name:literal, $description:literal $(,)?) => {
         #[allow(dead_code)]
-        pub static $static_name: $crate::metrics::CounterHandle =
-            $crate::metrics::CounterHandle::new($name, $description);
+        pub static $static_name: $crate::CounterHandle = $crate::CounterHandle::new($name, $description);
     };
 }
 
@@ -110,7 +121,7 @@ macro_rules! register_counter {
 macro_rules! register_gauge {
     ($static_name:ident, $name:literal, $description:literal $(,)?) => {
         #[allow(dead_code)]
-        pub static $static_name: $crate::metrics::GaugeHandle = $crate::metrics::GaugeHandle::new($name, $description);
+        pub static $static_name: $crate::GaugeHandle = $crate::GaugeHandle::new($name, $description);
     };
 }
 
@@ -127,24 +138,24 @@ pub struct Registry {
     gauges: RwLock<HashMap<String, Arc<GaugeEntry>>>,
 }
 
-pub(crate) struct CounterEntry {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) value: AtomicU64,
-    pub(crate) updated_at_ms: AtomicI64,
+struct CounterEntry {
+    name: String,
+    description: String,
+    value: AtomicU64,
+    updated_at_ms: AtomicI64,
     /// True when this row was rehydrated from `state.db` but no
     /// `register_counter!` handle in the current engine binary
     /// matches its name. The design retains these so historical
     /// answers stay queryable (§"Risks / open questions" item 3).
-    pub(crate) stale: AtomicBool,
+    stale: AtomicBool,
 }
 
-pub(crate) struct GaugeEntry {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) value: AtomicI64,
-    pub(crate) observed_at_ms: AtomicI64,
-    pub(crate) stale: AtomicBool,
+struct GaugeEntry {
+    name: String,
+    description: String,
+    value: AtomicI64,
+    observed_at_ms: AtomicI64,
+    stale: AtomicBool,
 }
 
 /// Read-only snapshot of a counter row, suitable for serialising.
@@ -296,7 +307,7 @@ impl Registry {
     /// "stale: not registered by current engine" so the operator can
     /// still see historical values. If a handle later registers
     /// against this name, [`Self::register_counter`] adopts the row.
-    pub(crate) fn insert_stale_counter(&self, name: &str, description: &str, value: u64, updated_at_ms: i64) {
+    pub fn insert_stale_counter(&self, name: &str, description: &str, value: u64, updated_at_ms: i64) {
         let mut counters = self.counters.write().expect("metrics counters lock poisoned");
         counters.insert(
             name.to_owned(),
@@ -310,7 +321,7 @@ impl Registry {
         );
     }
 
-    pub(crate) fn insert_stale_gauge(&self, name: &str, description: &str, value: i64, observed_at_ms: i64) {
+    pub fn insert_stale_gauge(&self, name: &str, description: &str, value: i64, observed_at_ms: i64) {
         let mut gauges = self.gauges.write().expect("metrics gauges lock poisoned");
         gauges.insert(
             name.to_owned(),
@@ -328,7 +339,7 @@ impl Registry {
     /// Used after `register_counter` to load the persisted total
     /// without losing it across the restart boundary. Returns true
     /// if the counter was present.
-    pub(crate) fn seed_counter(&self, name: &str, value: u64, updated_at_ms: i64) -> bool {
+    pub fn seed_counter(&self, name: &str, value: u64, updated_at_ms: i64) -> bool {
         let counters = self.counters.read().expect("metrics counters lock poisoned");
         if let Some(entry) = counters.get(name) {
             entry.value.store(value, Ordering::Relaxed);
@@ -339,7 +350,7 @@ impl Registry {
         }
     }
 
-    pub(crate) fn seed_gauge(&self, name: &str, value: i64, observed_at_ms: i64) -> bool {
+    pub fn seed_gauge(&self, name: &str, value: i64, observed_at_ms: i64) -> bool {
         let gauges = self.gauges.read().expect("metrics gauges lock poisoned");
         if let Some(entry) = gauges.get(name) {
             entry.value.store(value, Ordering::Relaxed);
@@ -526,7 +537,7 @@ fn validate_name(name: &str) {
     }
 }
 
-pub(crate) fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_ms() as i64
 }
 
@@ -676,112 +687,6 @@ mod tests {
         assert_eq!(
             snap_after.description, "Phase 1 unit-test counter A.",
             "adopted row should pick up the current binary's description",
-        );
-    }
-
-    #[test]
-    fn init_all_registers_all_declared_counters() {
-        let registry = Registry::new();
-        crate::metrics::init_all(&registry);
-        let names: Vec<_> = registry.counter_snapshots().into_iter().map(|s| s.name).collect();
-        // Phase 3: PR URL capture counters.
-        for expected in [
-            "pr_url_capture.primary_path.hit",
-            "pr_url_capture.reconstruction_path.hit",
-            "pr_url_capture.reconstruction_path.failed",
-            "pr_url_capture.recheck_staged.branch_mismatch",
-        ] {
-            assert!(
-                names.contains(&expected.to_owned()),
-                "init_all must register {expected}"
-            );
-        }
-        // Phase 3: cube workspace lease counters.
-        for expected in [
-            "cube_workspace_lease.attempts",
-            "cube_workspace_lease.success",
-            "cube_workspace_lease.failure",
-        ] {
-            assert!(
-                names.contains(&expected.to_owned()),
-                "init_all must register {expected}"
-            );
-        }
-        // Phase 4: dispatcher counters.
-        assert!(
-            names.iter().any(|n| n == "dispatcher.hook_events.total"),
-            "expected dispatcher.hook_events.total to be registered; got {names:?}",
-        );
-        assert!(
-            names
-                .iter()
-                .any(|n| n == "dispatcher.hook_events.for_terminal_execution"),
-            "expected dispatcher.hook_events.for_terminal_execution to be registered; got {names:?}",
-        );
-        // Phase 5: merge_poller counters.
-        for expected in [
-            "merge_poller.merged",
-            "merge_poller.conflict_flagged",
-            "merge_poller.conflict_cleared",
-            "merge_poller.pr_recheck_recovered",
-            "merge_poller.pr_recheck_unresolved",
-            "merge_poller.merge_queue_rebounced",
-            "merge_poller.late_pr_recovered",
-            "merge_poller.revision_invalidated",
-            "merge_poller.worker_stopped_on_review",
-            "merge_poller.comments_reopened",
-        ] {
-            assert!(
-                names.contains(&expected.to_owned()),
-                "init_all must register {expected}"
-            );
-        }
-        // External tracker reconciler counters.
-        for expected in [
-            "external_tracker.fetch_succeeded",
-            "external_tracker.fetch_failed",
-            "external_tracker.imported",
-            "external_tracker.closed",
-            "external_tracker.pr_attached",
-            "external_tracker.pr_merge_close_succeeded",
-            "external_tracker.pr_merge_close_failed",
-            "external_tracker.unbound",
-            "external_tracker.skipped_closed_at_first_sight",
-            "external_tracker.skip_no_credential",
-            "external_tracker.in_progress_set_succeeded",
-            "external_tracker.in_progress_set_failed",
-            "external_tracker.tracked_label_attach_succeeded",
-            "external_tracker.tracked_label_attach_failed",
-        ] {
-            assert!(
-                names.contains(&expected.to_owned()),
-                "init_all must register {expected}"
-            );
-        }
-        // Layer 4 / T10: speculative conflict-prediction sweep counters.
-        for expected in ["speculative_conflict.predicted", "speculative_conflict.clean"] {
-            assert!(
-                names.contains(&expected.to_owned()),
-                "init_all must register {expected}"
-            );
-        }
-        // Layer 4 / T11: stacked-PR auto-structuring offer counter.
-        assert!(
-            names.contains(&"stacked_pr_structuring.offered".to_owned()),
-            "init_all must register stacked_pr_structuring.offered"
-        );
-        assert_eq!(
-            names.len(),
-            48,
-            "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
-             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring counters"
-        );
-        // Phase 3: dep_unblock gauge.
-        let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
-        assert_eq!(
-            gauge_names,
-            vec!["dependency_unblock.longest_stale_seconds"],
-            "init_all must register the dep_unblock gauge",
         );
     }
 
