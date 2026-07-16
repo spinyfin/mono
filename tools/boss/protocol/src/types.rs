@@ -3382,7 +3382,15 @@ pub struct Task {
     /// own `status` stays `"in_review"` the whole time, so a drop-out (the
     /// PR leaves the queue/auto-merge without merging) needs no special
     /// transition: this field just reverts to `None` on the next poll and
-    /// the task falls back to rendering under Review.
+    /// the task falls back to rendering under Review. It is also forced to
+    /// `None` (regardless of what GitHub still reports) whenever the same
+    /// poll observes `ci_required_state == "fail"` (mono#2023 / T2675):
+    /// GitHub keeps auto-merge/the queue entry armed on red required
+    /// checks — that's what "merge when ready" means — so without this
+    /// override a card can sit in Merging with a simultaneous red CI chip.
+    /// GitHub's own arming is left untouched; the demotion is purely this
+    /// field, and it lifts automatically on the next poll once CI reads
+    /// `"success"`/`"in_progress"` again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_state: Option<String>,
 
