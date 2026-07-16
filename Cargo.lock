@@ -339,6 +339,7 @@ dependencies = [
  "boss-editorial",
  "boss-engine-day-rotated-log",
  "boss-engine-driver",
+ "boss-engine-live-status-redact",
  "boss-engine-metrics-registry",
  "boss-engine-transient-error",
  "boss-engine-utils",
@@ -401,6 +402,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-live-status-redact"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde_json",
 ]
 
 [[package]]

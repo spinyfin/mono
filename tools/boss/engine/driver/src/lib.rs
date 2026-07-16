@@ -617,7 +617,7 @@ pub trait AgentDriver: Send + Sync {
     // ── TranscriptAccess capability ──────────────────────────────────────────
 
     /// Normalise a raw transcript JSONL entry to the canonical redactable
-    /// field shape that `boss_engine::live_status_redact` and the live-status
+    /// field shape that `boss_engine_live_status_redact` and the live-status
     /// summariser expect: `tool_name` / `tool_input` / `tool_response` at the
     /// top level, and `content[].type == "tool_use"` blocks with `name` +
     /// `input` sub-fields.

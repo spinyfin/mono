@@ -66,7 +66,6 @@ pub mod husk_pane_sweep;
 pub mod ipc_log;
 pub mod live_status;
 pub mod live_status_loop;
-pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod lost_workspace_sweep;
 pub mod materializer;
