@@ -263,8 +263,11 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                     work_item_id: attempt.work_item_id.clone(),
                     pr_url: attempt.pr_url.clone(),
                     status: "merge_queue_rebounce attempts cannot be validated via head-branch CI: the failure is \
-                             on the synthetic merge commit, not the PR head. Fix the rebounce and re-enqueue, or use \
-                             `boss engine ci mark-failed`."
+                             on the synthetic merge commit, not the PR head, so head-branch CI going green \
+                             proves nothing about the rebounce. If post-rebase CI is green, do not retry this \
+                             verb — re-enqueue the PR directly (`gh pr merge --auto --squash`) and stop; the \
+                             merge-poller retires the attempt when the queue outcome is observed. If CI is \
+                             still red, fix the semantic conflict and push."
                         .to_owned(),
                     live_sha: None,
                 },
@@ -584,10 +587,14 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                         );
                     }
                     // Raced to terminal between the lookup and the write
-                    // (another path retired it). Re-fetch and echo so the
-                    // receipt stays honest.
+                    // (another path retired it — could be `mark-failed`, a
+                    // merge-poller retire, or a duplicate winning call).
+                    // Only echo a HONORED receipt if the row actually
+                    // landed on `succeeded`; any other terminal status is a
+                    // real rejection, not a success, so the CLI must exit
+                    // non-zero rather than print a false receipt.
                     Ok(None) => match work_db.get_ci_remediation(&attempt.id) {
-                        Ok(Some(current)) => {
+                        Ok(Some(current)) if current.status == "succeeded" => {
                             let validated_sha = current.head_sha_after.clone();
                             send_response(
                                 &sink,
@@ -599,13 +606,26 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                                 },
                             );
                         }
-                        _ => send_response(
+                        Ok(Some(current)) => send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "ci_remediation attempt {:?} is already terminal ({status}); \
+                                     nothing to validate.",
+                                    attempt.id,
+                                    status = current.status,
+                                ),
+                            },
+                        ),
+                        Ok(None) => send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: format!("ci_remediation attempt {:?} vanished mid-retire", attempt.id),
                             },
                         ),
+                        Err(err) => send_work_error(&sink, &request_id, &err),
                     },
                     Err(err) => send_work_error(&sink, &request_id, &err),
                 }

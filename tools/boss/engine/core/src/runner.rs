@@ -2870,13 +2870,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         if is_rebounce {
             out.push_str(
                 "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-                 - **If post-rebase CI is green**, call \
-                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>`. The engine \
-                 independently re-probes live CI for the PR's current head SHA before honoring this — \
-                 calling it early or on a red head gets a rejection (non-zero exit), not a recorded \
-                 success, so actually wait for `--watch` to finish. On a verified-green response, stop \
-                 and re-enqueue the PR (`gh pr merge --auto --squash`); the attempt is `succeeded` and \
-                 the budget slot is not consumed.\n\
+                 - **If post-rebase CI is green**, do NOT call `mark-succeeded-via-rebase` — rebounce \
+                 attempts are not validatable via head-branch CI (the engine's guard rejects that verb \
+                 unconditionally for this attempt class). Instead re-enqueue the PR directly \
+                 (`gh pr merge --auto --squash`) and stop; the merge-poller retires the attempt when \
+                 the queue outcome is observed.\n\
                  - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
                  continue to Step 2.\n\n",
             );
