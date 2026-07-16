@@ -491,16 +491,35 @@ pub enum FrontendEvent {
         attempt: CiRemediation,
         new_id: String,
     },
-    /// Response to
+    /// HONORED response to
     /// [`FrontendRequest::MarkCiRemediationSucceededViaRebase`]: the
-    /// row after the rebase-only success flip. `budget_refunded`
-    /// reports whether the engine decremented `tasks.ci_attempts_used`
-    /// — `false` when the attempt was a `retrigger` (which didn't
-    /// consume budget to begin with) or when the row was already
-    /// terminal.
+    /// engine independently re-probed live CI and verified every
+    /// required check passing on the PR's current head SHA before
+    /// flipping the row. `budget_refunded` reports whether the engine
+    /// decremented `tasks.ci_attempts_used` — `false` when the attempt
+    /// was a `retrigger` (which didn't consume budget to begin with) or
+    /// when the row was already terminal (idempotent echo).
     CiRemediationSucceededViaRebase {
         attempt: CiRemediation,
         budget_refunded: bool,
+    },
+    /// REJECTED response to
+    /// [`FrontendRequest::MarkCiRemediationSucceededViaRebase`]: the
+    /// engine re-probed live CI and did NOT find it green on the PR's
+    /// current head SHA (`live_sha`). `status` is a human-readable
+    /// description of what the probe actually saw (failing checks,
+    /// still-pending, PR closed). The attempt row is untouched and
+    /// stays actionable — no budget refund, no `CiRemediationSucceeded`
+    /// event. The CLI surfaces this as a non-zero exit so the receipt is
+    /// an honest pass/fail (T2764 postmortem: a worker calling this verb
+    /// before CI has settled must get a rejection, not a recorded lie).
+    CiRemediationSucceededViaRebaseRejected {
+        attempt_id: String,
+        work_item_id: String,
+        pr_url: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_sha: Option<String>,
     },
     /// HONORED response to [`FrontendRequest::MarkCiRemediationNoop`]:
     /// the engine independently re-probed live CI and verified every

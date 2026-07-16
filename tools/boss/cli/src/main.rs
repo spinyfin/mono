@@ -5722,13 +5722,23 @@ async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunContext) -> Re
                             } else {
                                 "no budget change"
                             };
+                            let sha = attempt.head_sha_after.as_deref().unwrap_or("<unknown>");
                             println!(
-                                "ci_remediation {} marked succeeded_via_rebase ({}).",
-                                attempt.id, refund,
+                                "ci_remediation {} verified green on {} — marked succeeded_via_rebase ({}).",
+                                attempt.id, sha, refund,
                             );
                         }
                     },
                 ),
+                // A rejection is a real pass/fail receipt: the engine
+                // re-probed live CI and did not find the current head
+                // green, so the claim was NOT honored. Exit non-zero with
+                // the live status so the worker knows to keep working
+                // rather than believing a false success.
+                FrontendEvent::CiRemediationSucceededViaRebaseRejected { status, live_sha, .. } => {
+                    let sha = live_sha.as_deref().unwrap_or("current head");
+                    Err(CliError::application(format!("CI not green on {sha}: {status}")))
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }

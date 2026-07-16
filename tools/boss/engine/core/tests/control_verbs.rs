@@ -20,10 +20,15 @@
 //!   BossOnly tier rejected the worker-pane case; the verb now uses
 //!   AppOrBoss, which accepts worker descendants too.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use boss_client::BossClient;
+use boss_engine::merge_poller::{
+    MergeProbe, OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleProbe, PrLifecycleState, PrReviewState,
+};
 use boss_engine::work::WorkDb;
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest,
@@ -1527,6 +1532,410 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
         }
         other => return Err(anyhow!("expected WorkError for unknown id, got: {other:?}")),
     }
+
+    Ok(())
+}
+
+/// `MarkCiRemediationSucceededViaRebase` shares the exact verify-before-honor
+/// gate (T2764 postmortem, PR spinyfin/mono#2023) as `MarkCiRemediationNoop`:
+/// the engine no longer takes the worker's "rebase fixed it" claim on
+/// say-so — it re-probes live CI for the PR's current head SHA and only
+/// honors a verified-green claim. The pre-probe guards are deterministic
+/// without `gh`: a forged id errors, a terminal-but-not-`succeeded` row is
+/// rejected outright (the live probe is never reached), and an
+/// already-`succeeded` row echoes a HONORED receipt without double-refunding
+/// the budget counter. These exercise the full request → dispatch → handler
+/// → response wire; the green/pending/red live-CI classification itself is
+/// the shared `classify_noop_validation` decision function, already covered
+/// by its unit tests in `ci_watch_tests.rs`.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_pre_probe_guards() -> Result<()> {
+    let engine = spawn_engine().await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+        design_repo: None,
+        docs_repo: None,
+        worker_branch_prefix: None,
+    })?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr = "https://github.com/foo/bar/pull/88";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+
+    let seed = |head_sha: &str| {
+        work_db
+            .insert_ci_remediation(boss_engine::work::CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr.to_owned(),
+                pr_number: 88,
+                head_branch: "feature".to_owned(),
+                head_sha_at_trigger: head_sha.to_owned(),
+                attempt_kind: "fix".to_owned(),
+                consumes_budget: 1,
+                failed_checks: "[]".to_owned(),
+                failure_kind: "pr_branch_ci".to_owned(),
+                before_commit_sha: None,
+            })
+            .map(|opt| opt.expect("insert should succeed on a fresh row"))
+    };
+
+    // (a) already-succeeded → echoed as a HONORED receipt, no double refund.
+    let succeeded = seed("sha-a")?;
+    work_db
+        .mark_ci_remediation_succeeded_via_rebase(&succeeded.id, None)?
+        .expect("flip to succeeded_via_rebase");
+    // (b) terminal failed → rejected as already terminal; the live-CI probe
+    //     is never reached for a row that isn't the worker's live attempt.
+    let failed = seed("sha-b")?;
+    work_db
+        .mark_ci_remediation_failed(&failed.id, "unfixable")?
+        .expect("flip to failed");
+
+    drop(work_db);
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // (a) already-succeeded → honored echo; budget_refunded=false since it
+    //     was already refunded by the original, verified call.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: succeeded.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebase {
+            attempt,
+            budget_refunded,
+        } => {
+            assert_eq!(attempt.id, succeeded.id);
+            assert_eq!(attempt.status, "succeeded");
+            assert!(
+                !budget_refunded,
+                "idempotent echo must not re-refund the budget counter"
+            );
+        }
+        other => return Err(anyhow!("expected SucceededViaRebase echo, got: {other:?}")),
+    }
+
+    // (b) terminal failed → WorkError naming "already terminal".
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: failed.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("already terminal"), "got: {message}");
+        }
+        other => return Err(anyhow!("expected WorkError for terminal attempt, got: {other:?}")),
+    }
+
+    // (c) unknown id → WorkError naming the bogus id.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: "cir_does_not_exist".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("cir_does_not_exist"), "got: {message}");
+        }
+        other => return Err(anyhow!("expected WorkError for unknown id, got: {other:?}")),
+    }
+
+    Ok(())
+}
+
+/// Fake [`MergeProbe`] returning a fixed CI status on a fixed head SHA for
+/// every PR url — drives the green/pending/red branches of the
+/// `MarkCiRemediationSucceededViaRebase` / `MarkCiRemediationNoop`
+/// validation gates deterministically, without shelling out to `gh`. The
+/// engine reads `ServerState::merge_probe` (rather than constructing a
+/// `CommandMergeProbe` itself) specifically so tests can inject this.
+struct FakeCiProbe {
+    ci: OpenPrCiStatus,
+    head_sha: String,
+}
+
+#[async_trait]
+impl MergeProbe for FakeCiProbe {
+    async fn probe(&self, pr_url: &str) -> anyhow::Result<PrLifecycleProbe> {
+        Ok(PrLifecycleProbe::builder()
+            .url(pr_url.to_owned())
+            .state(PrLifecycleState::Open(OpenPrStatus {
+                mergeability: OpenPrMergeability::Clean,
+                ci: self.ci.clone(),
+            }))
+            .head_ref_oid(self.head_sha.clone())
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build())
+    }
+}
+
+/// Shared setup for the `mark_ci_remediation_succeeded_via_rebase_*_head`
+/// tests below: spawn an engine wired with a [`FakeCiProbe`] reporting `ci`
+/// on `head_sha` for every PR, seed one `pending`/`fix`-kind ci_remediation
+/// attempt, and claim it via `MarkCiRemediationSucceededViaRebase`. Each
+/// case gets its own engine (rather than three sequential spawns sharing
+/// one test) to keep resource usage in line with every other test in this
+/// suite when the full binary runs with many tests in flight concurrently.
+///
+/// Returns the `TestEngine` too (not just the `WorkDb` handle open against
+/// its backing file) — the engine owns the `TempDir` that backs
+/// `state.db`, and dropping it deletes that directory, so the caller must
+/// keep it alive for as long as it still wants to touch the DB.
+async fn seed_and_claim_via_rebase(
+    ci: OpenPrCiStatus,
+    head_sha: &str,
+) -> Result<(FrontendEvent, TestEngine, WorkDb, String)> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        merge_probe: Some(Arc::new(FakeCiProbe {
+            ci,
+            head_sha: head_sha.to_owned(),
+        })),
+        ..Default::default()
+    })
+    .await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+        design_repo: None,
+        docs_repo: None,
+        worker_branch_prefix: None,
+    })?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr = "https://github.com/foo/bar/pull/99";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    let attempt = work_db
+        .insert_ci_remediation(boss_engine::work::CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr.to_owned(),
+            pr_number: 99,
+            head_branch: "feature".to_owned(),
+            head_sha_at_trigger: "sha-at-trigger".to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "pr_branch_ci".to_owned(),
+            before_commit_sha: None,
+        })?
+        .expect("insert should succeed on a fresh row");
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: attempt.id.clone(),
+        })
+        .await?;
+    Ok((response, engine, work_db, attempt.id))
+}
+
+/// A claim verified green on the current head is honored: the row flips to
+/// `succeeded`, budget is refunded, and `head_sha_after` is stamped with
+/// the SHA the gate actually verified (T2764 postmortem, PR
+/// spinyfin/mono#2023). This is the seam the PR review flagged as missing:
+/// `MergeProbe` already has test doubles (`completion.rs`'s
+/// `with_merge_probe` fixtures); the gap was that the handler constructed
+/// its own `CommandMergeProbe` instead of reading one off `ServerState`
+/// where a test could substitute it — fixed by `ServerState::merge_probe` /
+/// `TestEngineOptions::merge_probe`.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_honors_verified_green_head() -> Result<()> {
+    let (response, _engine, work_db, attempt_id) =
+        seed_and_claim_via_rebase(OpenPrCiStatus::Clean, "sha-green").await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebase {
+            attempt,
+            budget_refunded,
+        } => {
+            assert_eq!(attempt.status, "succeeded");
+            assert!(budget_refunded, "fix-kind attempt with consumes_budget=1 must refund");
+            assert_eq!(attempt.head_sha_after.as_deref(), Some("sha-green"));
+        }
+        other => return Err(anyhow!("expected honored SucceededViaRebase, got: {other:?}")),
+    }
+    let row = work_db.get_ci_remediation(&attempt_id)?.expect("row still exists");
+    assert_eq!(
+        row.status, "succeeded",
+        "DB row must actually be succeeded, not just the receipt"
+    );
+    Ok(())
+}
+
+/// A claim made while checks are still pending/in-flight on the current
+/// head is rejected: the row stays actionable (not `succeeded`, not
+/// `failed`) and no `CiRemediationSucceeded` event is published.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_rejects_pending_head() -> Result<()> {
+    let (response, _engine, work_db, attempt_id) =
+        seed_and_claim_via_rebase(OpenPrCiStatus::InFlight, "sha-pending").await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebaseRejected { status, live_sha, .. } => {
+            assert!(
+                status.contains("pending") || status.contains("in-flight"),
+                "got: {status}"
+            );
+            assert_eq!(live_sha.as_deref(), Some("sha-pending"));
+        }
+        other => {
+            return Err(anyhow!(
+                "expected SucceededViaRebaseRejected for pending CI, got: {other:?}"
+            ));
+        }
+    }
+    let row = work_db.get_ci_remediation(&attempt_id)?.expect("row still exists");
+    assert_eq!(
+        row.status, "pending",
+        "a rejected claim must not flip the row to succeeded or failed"
+    );
+    Ok(())
+}
+
+/// A claim made once the head has gone red (required checks failing) is
+/// rejected the same way as the pending case, so a worker that claims
+/// early off a synthetic/stale green cannot manufacture a succeeded row
+/// once the real CI result lands red.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_rejects_red_head() -> Result<()> {
+    let (response, _engine, work_db, attempt_id) =
+        seed_and_claim_via_rebase(OpenPrCiStatus::Failing { failures: vec![] }, "sha-red").await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebaseRejected { status, live_sha, .. } => {
+            assert!(status.contains("failing"), "got: {status}");
+            assert_eq!(live_sha.as_deref(), Some("sha-red"));
+        }
+        other => {
+            return Err(anyhow!(
+                "expected SucceededViaRebaseRejected for red CI, got: {other:?}"
+            ));
+        }
+    }
+    let row = work_db.get_ci_remediation(&attempt_id)?.expect("row still exists");
+    assert_eq!(
+        row.status, "pending",
+        "a red-head claim must not be honored as succeeded; the row stays actionable"
+    );
+    Ok(())
+}
+
+/// The `merge_queue_rebounce` guard on `MarkCiRemediationSucceededViaRebase`
+/// mirrors the one on `MarkCiRemediationNoop`: for a rebounce attempt the
+/// PR's head-branch CI rollup is green BY DEFINITION (the failure lives on
+/// the synthetic merge commit, not the PR head — see the runner's rebounce
+/// directive), so honoring a rebase claim off a green head-branch probe
+/// would be exactly the bypass the T2764 postmortem forbade. This must be
+/// rejected BEFORE the live probe ever runs — proven here by wiring a probe
+/// that would otherwise report green.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_rejects_merge_queue_rebounce() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        merge_probe: Some(Arc::new(FakeCiProbe {
+            ci: OpenPrCiStatus::Clean,
+            head_sha: "sha-green-but-rebounce".to_owned(),
+        })),
+        ..Default::default()
+    })
+    .await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+        design_repo: None,
+        docs_repo: None,
+        worker_branch_prefix: None,
+    })?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr = "https://github.com/foo/bar/pull/100";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    let attempt = work_db
+        .insert_ci_remediation(boss_engine::work::CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr.to_owned(),
+            pr_number: 100,
+            head_branch: "feature".to_owned(),
+            head_sha_at_trigger: "sha-at-trigger".to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "merge_queue_rebounce".to_owned(),
+            before_commit_sha: None,
+        })?
+        .expect("insert should succeed on a fresh row");
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: attempt.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebaseRejected { status, live_sha, .. } => {
+            assert!(status.contains("merge_queue_rebounce"), "got: {status}");
+            assert!(
+                live_sha.is_none(),
+                "rebounce guard rejects before the live probe ever runs"
+            );
+        }
+        other => return Err(anyhow!("expected rebounce rejection, got: {other:?}")),
+    }
+    let row = work_db.get_ci_remediation(&attempt.id)?.expect("row still exists");
+    assert_eq!(
+        row.status, "pending",
+        "rebounce claim must not be honored even though the fake probe reports green"
+    );
 
     Ok(())
 }

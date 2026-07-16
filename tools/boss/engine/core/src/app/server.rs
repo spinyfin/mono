@@ -227,6 +227,32 @@ pub async fn serve(
     control_token_path: Option<std::path::PathBuf>,
     watched_parent_pid: Option<libc::pid_t>,
 ) -> Result<()> {
+    serve_with_merge_probe(
+        cfg,
+        socket_path,
+        pid_file_path,
+        events_socket_path,
+        control_token_path,
+        watched_parent_pid,
+        None,
+    )
+    .await
+}
+
+/// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
+/// straight through to [`ServerState`]. Production callers (and most tests)
+/// go through `serve` and get the real `CommandMergeProbe`; tests that need
+/// to drive the CI-remediation validation gates (green / pending / red)
+/// deterministically — without shelling out to `gh` — inject a fake here.
+pub async fn serve_with_merge_probe(
+    cfg: Arc<RuntimeConfig>,
+    socket_path: std::path::PathBuf,
+    pid_file_path: Option<std::path::PathBuf>,
+    events_socket_path: Option<std::path::PathBuf>,
+    control_token_path: Option<std::path::PathBuf>,
+    watched_parent_pid: Option<libc::pid_t>,
+    merge_probe_override: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
+) -> Result<()> {
     let app_pid = current_parent_pid();
     let (control_token, _control_token_guard) = match control_token_path {
         Some(path) => {
@@ -247,7 +273,12 @@ pub async fn serve(
         }
         None => (None, None),
     };
-    let server_state = ServerState::new_arc_with_app_pid(cfg.clone(), app_pid, control_token.clone())?;
+    let server_state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg.clone(),
+        app_pid,
+        control_token.clone(),
+        merge_probe_override,
+    )?;
 
     // Always attempt to unlink any existing file at the path before
     // binding. `path.exists()` lies for dangling symlinks and races

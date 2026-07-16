@@ -26,9 +26,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
-use boss_engine::app::serve;
+use boss_engine::app::serve_with_merge_probe;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::engine_control::ControlTokenFile;
+use boss_engine::merge_poller::MergeProbe;
 
 /// Budget for the engine to bind its socket. linux-amd64 CI runners run ~6-7x
 /// slower than macOS dev boxes; under concurrent test load the first batch of
@@ -46,6 +47,12 @@ pub struct TestEngineOptions {
     /// Arm the token-authenticated `Shutdown` RPC by passing a control-token
     /// path to `serve`. The path is exposed via `token_path` / `read_token`.
     pub with_control_token: bool,
+    /// Override the engine's live-CI probe (used by the
+    /// `MarkCiRemediationNoop` / `MarkCiRemediationSucceededViaRebase`
+    /// validation gates) with a fake, so tests can drive the
+    /// green/pending/red classification deterministically instead of
+    /// shelling out to `gh`. `None` uses the real `CommandMergeProbe`.
+    pub merge_probe: Option<Arc<dyn MergeProbe>>,
 }
 
 /// An in-process engine bound to a temp socket, torn down on drop.
@@ -87,7 +94,10 @@ impl TestEngine {
 
         let socket_for_serve = socket_path.clone();
         let token_for_serve = token_path.clone();
-        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, token_for_serve, None).await });
+        let merge_probe = opts.merge_probe;
+        let join = tokio::spawn(async move {
+            serve_with_merge_probe(cfg, socket_for_serve, None, None, token_for_serve, None, merge_probe).await
+        });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
             return Err(anyhow!("engine never bound socket {}", socket_path.display()));

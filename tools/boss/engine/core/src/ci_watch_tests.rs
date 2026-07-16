@@ -1214,7 +1214,7 @@ async fn rebase_only_success_refunds_budget_slot() {
         .unwrap()
         .expect("attempt row");
     let updated = db
-        .mark_ci_remediation_succeeded_via_rebase(&attempt.id)
+        .mark_ci_remediation_succeeded_via_rebase(&attempt.id, None)
         .unwrap()
         .expect("WHERE guard hit");
 
@@ -1226,7 +1226,7 @@ async fn rebase_only_success_refunds_budget_slot() {
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
 
     // 4. Idempotent — repeat is a no-op.
-    let again = db.mark_ci_remediation_succeeded_via_rebase(&attempt.id).unwrap();
+    let again = db.mark_ci_remediation_succeeded_via_rebase(&attempt.id, None).unwrap();
     assert!(again.is_none(), "second call must be a no-op");
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
 }
@@ -1730,7 +1730,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         .active_ci_remediation_for_work_item(&chore)
         .unwrap()
         .expect("sha1 attempt row");
-    db.mark_ci_remediation_succeeded_via_rebase(&sha1_attempt.id)
+    db.mark_ci_remediation_succeeded_via_rebase(&sha1_attempt.id, None)
         .unwrap()
         .expect("succeeded_via_rebase update");
 

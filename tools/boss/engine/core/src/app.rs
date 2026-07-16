@@ -82,7 +82,7 @@ mod work_items;
 mod worker_events;
 
 // Re-export public items from server module for external callers.
-pub use server::{process_is_alive, run, serve};
+pub use server::{process_is_alive, run, serve, serve_with_merge_probe};
 
 // Re-import server-internal helpers so child modules can access them via `use super::*`.
 use server::{
@@ -491,6 +491,14 @@ struct ServerState {
     /// (the merge poller, etc.) can publish work-item invalidations
     /// without standing up a second broker.
     publisher: Arc<dyn ExecutionPublisher>,
+    /// Live-CI probe shared by the `MarkCiRemediationNoop` and
+    /// `MarkCiRemediationSucceededViaRebase` validation gates (T2764
+    /// postmortem, PR spinyfin/mono#2023). Both handlers read this
+    /// instead of constructing their own `CommandMergeProbe`, so tests can
+    /// inject a fake and exercise the green/pending/red classification
+    /// without shelling out to `gh`. Defaults to `CommandMergeProbe::new()`
+    /// in production (see [`Self::new_arc_with_app_pid_and_merge_probe`]).
+    merge_probe: Arc<dyn MergeProbe>,
     /// Shared dispatch-event sink. The execution coordinator emits
     /// the per-stage events into this sink during dispatch; the
     /// `UpdateWorkItem` handler emits a `StatusTransition` event
@@ -870,10 +878,17 @@ pub enum SendToAppError {
 }
 
 impl ServerState {
-    fn new_arc_with_app_pid(
+    /// Construct `ServerState` with an optional `MergeProbe` override.
+    /// Production (via [`server::serve`]) passes `None` and gets the real
+    /// `CommandMergeProbe` (shell out to `gh`); tests that need to exercise
+    /// the CI-remediation validation gates (green / pending / red) without
+    /// a live `gh` call inject a fake here — see `MergeProbe`'s doc comment
+    /// ("test doubles can stub it directly").
+    fn new_arc_with_app_pid_and_merge_probe(
         cfg: Arc<RuntimeConfig>,
         app_pid: Option<libc::pid_t>,
         control_token: Option<Arc<String>>,
+        merge_probe_override: Option<Arc<dyn MergeProbe>>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
@@ -1074,7 +1089,8 @@ impl ServerState {
             Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
                 crate::external_tracker::github_oauth::KeychainTokenStore::new(),
             ));
-        let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
+        let ci_probe: Arc<dyn MergeProbe> = merge_probe_override.unwrap_or_else(|| Arc::new(CommandMergeProbe::new()));
+        let merge_probe_for_state = ci_probe.clone();
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -1187,6 +1203,7 @@ impl ServerState {
                 .completion_handler(completion_handler)
                 .cube_client(cube_client_for_state)
                 .publisher(publisher_for_state)
+                .merge_probe(merge_probe_for_state)
                 .dispatch_events(dispatch_events_for_state)
                 .dispatch_event_root(dispatch_event_root_for_state)
                 .topic_broker(topic_broker)

@@ -1936,7 +1936,16 @@ impl WorkDb {
     /// detection-side bump (only when the row was originally
     /// `consumes_budget = 1`; idempotent re-call is a no-op).
     /// Idempotent — `Ok(None)` on a terminal row.
-    pub fn mark_ci_remediation_succeeded_via_rebase(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
+    ///
+    /// `head_sha` (when known) is the live head SHA the validation gate
+    /// verified green — stamped into `head_sha_after` so the row records
+    /// evidence of what was actually checked, mirroring
+    /// [`Self::mark_ci_remediation_validated_green`].
+    pub fn mark_ci_remediation_succeeded_via_rebase(
+        &self,
+        attempt_id: &str,
+        head_sha: Option<&str>,
+    ) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -1948,11 +1957,12 @@ impl WorkDb {
             "UPDATE ci_remediations
                 SET status          = 'succeeded',
                     consumes_budget = 0,
+                    head_sha_after  = COALESCE(?3, head_sha_after),
                     failure_reason  = COALESCE(failure_reason, 'rebase_only'),
                     finished_at     = COALESCE(finished_at, ?2)
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
-            params![attempt_id, now],
+            params![attempt_id, now, head_sha],
         )?;
         if rows == 0 {
             tx.commit()?;
