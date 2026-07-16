@@ -804,13 +804,45 @@ final class ChatViewModel: ObservableObject {
             return items
         }
 
-        return items.filter { item in
+        let matched = items.filter { item in
             item.name.localizedCaseInsensitiveContains(query)
                 || item.description.localizedCaseInsensitiveContains(query)
                 || (item.prURL?.localizedCaseInsensitiveContains(query) ?? false)
                 || (projectName(for: item.projectID)?.localizedCaseInsensitiveContains(query) ?? false)
                 || item.status.localizedCaseInsensitiveContains(query)
+                || (item.shortID.map { "T\($0)" }?.localizedCaseInsensitiveContains(query) ?? false)
         }
+
+        // A bare or "T"-prefixed number (e.g. "2801", "T2801", "t2801") is a
+        // short id lookup. The substring match above already surfaces ids
+        // containing that number anywhere (prefix search), but the id it
+        // names exactly should always be the one the user actually finds —
+        // pull it to the front rather than leaving it wherever taskSort put it.
+        guard let exactShortID = Self.parseShortIDQuery(query) else {
+            return matched
+        }
+        var exact: [WorkTask] = []
+        var rest: [WorkTask] = []
+        for item in matched {
+            if item.shortID == exactShortID {
+                exact.append(item)
+            } else {
+                rest.append(item)
+            }
+        }
+        return exact + rest
+    }
+
+    /// Parses a search query as a short-id lookup: bare digits ("2801") or a
+    /// case-insensitive "T"-prefixed number ("T2801", "t2801"). Returns `nil`
+    /// for anything else so plain text search is unaffected.
+    static func parseShortIDQuery(_ query: String) -> Int? {
+        var digits = Substring(query)
+        if let first = digits.first, first == "T" || first == "t" {
+            digits = digits.dropFirst()
+        }
+        guard !digits.isEmpty, digits.allSatisfy({ $0.isNumber }) else { return nil }
+        return Int(digits)
     }
 
     let engine: EngineClient
