@@ -37,6 +37,7 @@
 //! (no workspace context needed).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -218,6 +219,109 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&REVISION_INVALIDATED);
     registry.register_counter(&WORKER_STOPPED_ON_REVIEW);
     registry.register_counter(&COMMENTS_REOPENED);
+}
+
+// ── GitHub API quota budget ─────────────────────────────────────────────
+//
+// Every hour the token this poller shares with ci_watch, conflict_watch,
+// review flows, and worker `gh` calls resets to a fixed request budget.
+// Per-row polling (one request per candidate per pass) can exceed that
+// budget before the hour is out, blinding the poller for the remainder —
+// see the design note on `fetch_merge_queue_dequeue_events_batch` for the
+// specific per-row cost this closes. The state below is the other half of
+// that fix: react to the *remaining* budget GitHub reports, rather than
+// only reducing request volume and hoping it's now always enough.
+
+/// Process-wide GitHub API rate-limit budget, refreshed by [`record_rate_limit`]
+/// from the `rateLimit { remaining }` field folded into every batched
+/// merge-poller GraphQL query ([`build_batch_query`]). [`PollTier::interval`]
+/// and the full-sweep wait in [`spawn_loop`] read [`rate_limit_throttle_factor`]
+/// to stretch their cadence once the hourly quota is running low, instead of
+/// continuing to poll at full speed until GitHub starts returning 403s.
+///
+/// A process-wide static rather than a field threaded through `MergeProbe`:
+/// every test double implements that trait without a live `gh` transport to
+/// report real quota from, and the budget is a fact about the shared
+/// token/process, not about any one probe instance. `i64::MAX` is the
+/// "no data yet" sentinel — the poller never throttles blind before its
+/// first real reading.
+static RATE_LIMIT_REMAINING: AtomicI64 = AtomicI64::new(i64::MAX);
+
+/// Requests reserved as headroom for every OTHER GitHub consumer sharing
+/// this token (ci_watch, conflict_watch, review flows, worker `gh` calls)
+/// — the poller starts stretching its own cadence once its visibility into
+/// `remaining` drops below this, instead of being the caller that finally
+/// trips the 403 for everyone.
+const RATE_LIMIT_LOW_WATER: i64 = 500;
+
+/// Multiplier the poller applies to its base poll intervals once
+/// `remaining` GraphQL quota drops below `low_water`. Above the low-water
+/// mark this is `1.0` (no behaviour change from today). Below it, the
+/// multiplier scales linearly up to `8.0` as `remaining` approaches zero,
+/// so a badly-drained budget backs off hard but the poller still
+/// eventually polls rather than stalling completely.
+///
+/// Pure function of the two readings so the threshold math is
+/// unit-testable without touching the process-wide atomic.
+fn throttle_factor_for(remaining: i64, low_water: i64) -> f64 {
+    if low_water <= 0 || remaining >= low_water {
+        return 1.0;
+    }
+    if remaining <= 0 {
+        return 8.0;
+    }
+    let severity = 1.0 - (remaining as f64 / low_water as f64);
+    1.0 + severity * 7.0
+}
+
+/// Current poll-cadence multiplier from the last-observed GitHub quota
+/// reading. See [`throttle_factor_for`].
+fn rate_limit_throttle_factor() -> f64 {
+    throttle_factor_for(RATE_LIMIT_REMAINING.load(Ordering::Relaxed), RATE_LIMIT_LOW_WATER)
+}
+
+/// Parse the `rateLimit { remaining }` field a batched GraphQL response
+/// carries alongside its `data`, if present. `None` when the field is
+/// absent (an older `gh`, or a response that never got that far) — the
+/// caller leaves the budget unchanged rather than resetting it to
+/// "unknown".
+fn parse_rate_limit_remaining(body: &serde_json::Value) -> Option<i64> {
+    body["data"]["rateLimit"]["remaining"].as_i64()
+}
+
+/// Record a fresh `remaining` reading from a batched GraphQL response,
+/// logging once when it crosses the throttle threshold in either
+/// direction — not on every still-low pass, which would otherwise spam
+/// the trace at up to one line per sweep for as long as the quota stays
+/// drained.
+fn record_rate_limit(body: &serde_json::Value) {
+    let Some(remaining) = parse_rate_limit_remaining(body) else {
+        return;
+    };
+    let previous = RATE_LIMIT_REMAINING.swap(remaining, Ordering::Relaxed);
+    if remaining < RATE_LIMIT_LOW_WATER && previous >= RATE_LIMIT_LOW_WATER {
+        tracing::warn!(
+            remaining,
+            low_water = RATE_LIMIT_LOW_WATER,
+            throttle_factor = throttle_factor_for(remaining, RATE_LIMIT_LOW_WATER),
+            "merge poller: GitHub API quota running low — stretching poll cadence",
+        );
+    } else if remaining >= RATE_LIMIT_LOW_WATER && previous < RATE_LIMIT_LOW_WATER {
+        tracing::info!(
+            remaining,
+            "merge poller: GitHub API quota recovered — resuming normal poll cadence",
+        );
+    }
+}
+
+/// Whether a `gh` failure's stderr indicates the request was itself
+/// rejected for exceeding the GitHub API rate limit, as opposed to a
+/// network/transport failure or a genuine query error. Distinguishing
+/// this in the trace is what let the hourly-blindness pattern go
+/// unnoticed until a manual trace sweep — both failure modes previously
+/// surfaced as identical "probe failed" debug lines.
+fn is_rate_limit_error(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("rate limit")
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -437,12 +541,18 @@ pub enum PollTier {
 }
 
 impl PollTier {
-    /// How long to wait before reconciling this PR again.
+    /// How long to wait before reconciling this PR again. Stretched by
+    /// [`rate_limit_throttle_factor`] when the hourly GitHub quota is
+    /// running low, so hot PRs back off from their normal 15s cadence
+    /// right alongside the full sweep instead of being the adaptive
+    /// layer that keeps draining an already-low budget.
     pub fn interval(self) -> Duration {
-        match self {
+        let base = match self {
             PollTier::Hot => Duration::from_secs(15),
             PollTier::Cold => Duration::from_secs(180),
-        }
+        };
+        let throttle = rate_limit_throttle_factor();
+        if throttle > 1.0 { base.mul_f64(throttle) } else { base }
     }
 }
 
@@ -698,7 +808,7 @@ impl CommandMergeProbe {
             return out;
         }
 
-        let (query, alias_map) = build_batch_query(&order, &parsed);
+        let (query, alias_map) = build_batch_query(&order, &parsed, PR_PROBE_FIELDS);
 
         tracing::debug!(
             pr_count = order.len(),
@@ -731,8 +841,37 @@ impl CommandMergeProbe {
             // isolates the unresolvable repo from its siblings, exactly like
             // the pre-batching code did.
             Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if is_rate_limit_error(&stderr) {
+                    // Do NOT fall back to per-PR probing here: that would
+                    // turn one failed batch request into `order.len()`
+                    // additional requests, every one of which is also
+                    // going to be rejected while the quota is exhausted —
+                    // exactly the "widen the retry loop" amplification
+                    // that burns the remaining budget faster and starves
+                    // every other GitHub consumer sharing this token.
+                    // Fail the whole batch gracefully instead; the next
+                    // pass (stretched by `rate_limit_throttle_factor` once
+                    // a successful call reports the low reading) retries.
+                    tracing::warn!(
+                        stderr = %stderr.trim(),
+                        pr_count = order.len(),
+                        "merge poller: batched probe graphql call rejected — GitHub API rate limit exceeded; not retrying per-PR this pass",
+                    );
+                    // A rejected call carries no `rateLimit` body to read a
+                    // real number from — force the budget to empty so
+                    // `rate_limit_throttle_factor` maxes out immediately
+                    // rather than waiting for a future successful call to
+                    // report a low `remaining` reading.
+                    RATE_LIMIT_REMAINING.store(0, Ordering::Relaxed);
+                    let msg = "gh api graphql rejected: GitHub API rate limit exceeded".to_owned();
+                    for url in &order {
+                        out.insert(url.clone(), Err(msg.clone()));
+                    }
+                    return out;
+                }
                 tracing::debug!(
-                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    stderr = %stderr.trim(),
                     "merge poller: batched probe graphql call failed — falling back to per-PR probing for this pass",
                 );
                 out.extend(probe_each_individually(&order).await);
@@ -746,6 +885,8 @@ impl CommandMergeProbe {
                 return out;
             }
         };
+
+        record_rate_limit(&body);
 
         // A 200 response can still carry a top-level `errors` array alongside
         // partial `data` (e.g. one repo alias resolves, another doesn't). Treat
@@ -797,20 +938,31 @@ type BatchAliasMap = Vec<(String, Vec<(String, String)>)>;
 
 /// Builds the aliased GraphQL query for a batch of PRs, grouping by (owner,
 /// repo) so multi-PR-per-repo sweeps (the common case) get one
-/// `repository(...)` block instead of one per PR. Returns the query
-/// alongside the alias map needed to walk the response back out.
+/// `repository(...)` block instead of one per PR, with `fields` as each
+/// `pullRequest(...)` block's selection set (callers pass [`PR_PROBE_FIELDS`]
+/// for lifecycle probing or [`DEQUEUE_EVENTS_FIELDS`] for merge-queue
+/// dequeue-event polling — same aliasing/grouping logic, different payload).
+/// Also requests `rateLimit { remaining }` at the query's top level so every
+/// batched call doubles as a quota reading for [`record_rate_limit`], at
+/// zero extra cost (querying `rateLimit` itself doesn't consume quota).
+/// Returns the query alongside the alias map needed to walk the response
+/// back out.
 ///
 /// Pure and side-effect-free so the alias-construction logic — grouping
 /// multiple PRs per repo and multiple repos per batch — can be
 /// unit-tested without a live `gh` call.
-fn build_batch_query(order: &[String], parsed: &HashMap<String, (String, String, u64)>) -> (String, BatchAliasMap) {
+fn build_batch_query(
+    order: &[String],
+    parsed: &HashMap<String, (String, String, u64)>,
+    fields: &str,
+) -> (String, BatchAliasMap) {
     let mut by_repo: std::collections::BTreeMap<(String, String), Vec<&String>> = std::collections::BTreeMap::new();
     for url in order {
         let (owner, repo, _) = &parsed[url];
         by_repo.entry((owner.clone(), repo.clone())).or_default().push(url);
     }
 
-    let mut query = String::from("{");
+    let mut query = String::from("{ rateLimit { remaining }");
     let mut alias_map: BatchAliasMap = Vec::new();
     for (repo_idx, ((owner, repo), urls)) in by_repo.iter().enumerate() {
         let repo_alias = format!("repo{repo_idx}");
@@ -821,9 +973,7 @@ fn build_batch_query(order: &[String], parsed: &HashMap<String, (String, String,
         for (pr_idx, url) in urls.iter().enumerate() {
             let number = parsed[url.as_str()].2;
             let pr_alias = format!("pr{pr_idx}");
-            query.push_str(&format!(
-                " {pr_alias}: pullRequest(number: {number}) {{ {PR_PROBE_FIELDS} }}"
-            ));
+            query.push_str(&format!(" {pr_alias}: pullRequest(number: {number}) {{ {fields} }}"));
             pr_aliases.push((pr_alias, (*url).clone()));
         }
         query.push_str(" }");
@@ -915,53 +1065,124 @@ pub struct MergeQueueDequeueEvent {
     pub before_commit_oid: Option<String>,
 }
 
-/// Query the PR's timeline for `RemovedFromMergeQueueEvent` entries.
-/// Returns events with `reason == "failed_checks"` (case-insensitive;
-/// GitHub's API returns the lowercase form even though the GraphQL schema
-/// documents the enum as uppercase `FAILED_CHECKS`). Events for other
-/// reasons (`MANUAL_REMOVAL`, `MERGE_CONFLICT`, etc.) are filtered out.
+/// Timeline-events selection set for [`build_batch_query`]'s `fields`
+/// parameter, used by [`fetch_merge_queue_dequeue_events_batch`]. Requests
+/// the last 20 `RemovedFromMergeQueueEvent` timeline entries — enough to
+/// cover any realistically plausible burst of re-enqueue/dequeue cycles on
+/// a single PR within one poll pass.
+const DEQUEUE_EVENTS_FIELDS: &str = concat!(
+    "timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { ",
+    "... on RemovedFromMergeQueueEvent { reason beforeCommit { oid } } } }",
+);
+
+/// Batch-fetch merge-queue dequeue events for every PR in `pr_urls` with
+/// one GraphQL round trip per pass — one `repository(...)` alias per
+/// distinct repo, one `pullRequest(...)` alias per PR inside it, the same
+/// grouping [`build_batch_query`] uses for the lifecycle probe — instead of
+/// one `gh api graphql` call per PR. This is what collapses
+/// [`check_merge_queue_rebounce`]'s per-candidate polling from O(open rows)
+/// requests per pass down to O(1): previously every `in_review` /
+/// `blocked_ci` candidate got its own unbatched timeline query on every
+/// full sweep, which was the dominant per-pass request volume behind the
+/// hourly quota exhaustion this batching fixes.
 ///
-/// Returns an empty vec on any error so the sweep degrades gracefully.
-/// The `INSERT OR IGNORE` idempotency on `ci_remediations` deduplicates
-/// re-seen events across sweeps without any extra tracking.
-async fn fetch_merge_queue_dequeue_events(pr_url: &str) -> Vec<MergeQueueDequeueEvent> {
-    let (Some(owner_repo), Some(number)) = (repo_from_pr_url(pr_url), pr_number_from_url(pr_url)) else {
-        return Vec::new();
-    };
-    let (owner, repo) = match owner_repo.split_once('/') {
-        Some(pair) => pair,
-        None => return Vec::new(),
-    };
-    // Query the last 20 timeline items — enough to cover any realistically
-    // plausible burst of re-enqueue/dequeue cycles on a single PR.
-    let query = format!(
-        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) {{ nodes {{ ... on RemovedFromMergeQueueEvent {{ reason beforeCommit {{ oid }} }} }} }} }} }} }}"#
-    );
+/// Best-effort like the lifecycle probe's degradation path, but stricter:
+/// on ANY failure (spawn error, non-zero exit, unparseable body, top-level
+/// GraphQL `errors`) this returns an empty map for the whole batch rather
+/// than falling back to per-PR fetches. Unlike PR-lifecycle probing, a
+/// missed pass of dequeue detection is harmless — the next pass re-queries
+/// the same 20-item timeline window — so spending N extra requests on a
+/// per-PR fallback is never worth it, and would specifically defeat the
+/// point when the failure IS the rate limit (a fallback would turn one
+/// rejected batch into N more rejected requests).
+async fn fetch_merge_queue_dequeue_events_batch(pr_urls: &[String]) -> HashMap<String, Vec<MergeQueueDequeueEvent>> {
+    let mut out = HashMap::new();
+    let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for url in pr_urls {
+        if parsed.contains_key(url) {
+            continue;
+        }
+        if let Some((owner, repo, number)) = parse_pr_url_parts(url) {
+            parsed.insert(url.clone(), (owner.to_owned(), repo.to_owned(), number));
+            order.push(url.clone());
+        }
+    }
+    if order.is_empty() {
+        return out;
+    }
+
+    let (query, alias_map) = build_batch_query(&order, &parsed, DEQUEUE_EVENTS_FIELDS);
     let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+    let body: serde_json::Value = match output {
+        Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::debug!(
+                    ?err,
+                    "merge poller: failed to parse batched dequeue-events graphql response"
+                );
+                return out;
+            }
+        },
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if is_rate_limit_error(&stderr) {
+                tracing::warn!(
+                    stderr = %stderr.trim(),
+                    pr_count = order.len(),
+                    "merge poller: batched dequeue-events graphql call rejected — GitHub API rate limit exceeded; skipping this pass",
+                );
+                RATE_LIMIT_REMAINING.store(0, Ordering::Relaxed);
+            } else {
+                tracing::debug!(
+                    stderr = %stderr.trim(),
+                    "merge poller: batched dequeue-events graphql call failed",
+                );
+            }
+            return out;
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                "merge poller: failed to spawn batched dequeue-events `gh api graphql`"
+            );
+            return out;
+        }
     };
-    parse_dequeue_events_response(&output.stdout)
+
+    record_rate_limit(&body);
+
+    if body
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        tracing::debug!(
+            errors = %body["errors"],
+            "merge poller: batched dequeue-events graphql response carried errors",
+        );
+        return out;
+    }
+
+    for (url, pr_node) in walk_batch_response(&body, &alias_map) {
+        let nodes = pr_node.and_then(|node| node["timelineItems"]["nodes"].as_array());
+        out.insert(url, nodes.map(|n| parse_dequeue_event_nodes(n)).unwrap_or_default());
+    }
+    out
 }
 
-/// Pure parser for the GraphQL `timelineItems` response body from
-/// [`fetch_merge_queue_dequeue_events`]. Extracted so the parsing rules
-/// can be unit-tested without a live `gh` call.
+/// Shared node-level parser for a `timelineItems.nodes` array (whichever
+/// shape the caller located it in — [`fetch_merge_queue_dequeue_events_batch`]'s
+/// per-PR aliased node). Returns events with `reason == "failed_checks"`
+/// (case-insensitive; GitHub's API returns the lowercase form even though
+/// the GraphQL schema documents the enum as uppercase `FAILED_CHECKS`).
+/// Events for other reasons (`MANUAL_REMOVAL`, `MERGE_CONFLICT`, etc.) are
+/// filtered out.
 ///
-/// GitHub's API returns `reason` in lowercase snake_case (e.g.
-/// `"failed_checks"`) even though the GraphQL enum is documented in
-/// uppercase (`FAILED_CHECKS`). The filter uses a case-insensitive
-/// comparison so both forms are accepted.
-fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
-    let body: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let nodes = match body["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"].as_array() {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
+/// Pure and side-effect-free so the filtering/casing rules can be
+/// unit-tested without a live `gh` call.
+fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<MergeQueueDequeueEvent> {
     let mut events = Vec::new();
     for node in nodes {
         let reason = match node["reason"].as_str() {
@@ -2040,12 +2261,23 @@ pub async fn run_one_pass(
     // rescue above can dispatch an execution for it.
     // The `INSERT OR IGNORE` idempotency on `ci_remediations` ensures
     // that events already processed on a prior sweep are no-ops.
+    //
+    // Every candidate's dequeue events are fetched in one batched GraphQL
+    // round trip (`fetch_merge_queue_dequeue_events_batch`) instead of one
+    // `gh api graphql` call per candidate — this was the dominant
+    // per-pass request volume behind the hourly GitHub quota exhaustion
+    // (O(open rows) unbatched requests, every 60s, on top of everything
+    // else sharing the token).
     let mut rebounce_seen = std::collections::HashSet::new();
-    for candidate in in_review.iter().chain(blocked_ci.iter()) {
-        if !rebounce_seen.insert(candidate.work_item_id.clone()) {
-            continue;
-        }
-        check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
+    let rebounce_candidates: Vec<&PendingMergeCheck> = in_review
+        .iter()
+        .chain(blocked_ci.iter())
+        .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
+        .collect();
+    let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
+    let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
+    for candidate in &rebounce_candidates {
+        check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, &mut outcome).await;
     }
 
     // P992 reviewer-fallback sweep: tasks held in `active` (PendingReview)
@@ -2149,11 +2381,15 @@ pub async fn reconcile_one(
         sweep_stranded_blocked_remediation(work_db, &probe_results, publisher, candidate, &mut outcome).await;
     }
     let mut rebounce_seen = std::collections::HashSet::new();
-    for candidate in in_review.iter().chain(blocked_ci.iter()) {
-        if !rebounce_seen.insert(candidate.work_item_id.clone()) {
-            continue;
-        }
-        check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
+    let rebounce_candidates: Vec<&PendingMergeCheck> = in_review
+        .iter()
+        .chain(blocked_ci.iter())
+        .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
+        .collect();
+    let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
+    let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
+    for candidate in &rebounce_candidates {
+        check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, &mut outcome).await;
     }
 
     let reviewer_stale_secs: u64 = 10 * 60;
@@ -2503,13 +2739,16 @@ async fn check_merge_queue_rebounce(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
+    dequeue_events: &HashMap<String, Vec<MergeQueueDequeueEvent>>,
     outcome: &mut SweepOutcome,
 ) {
-    let events = fetch_merge_queue_dequeue_events(&candidate.pr_url).await;
+    let Some(events) = dequeue_events.get(&candidate.pr_url) else {
+        return;
+    };
     if events.is_empty() {
         return;
     }
-    for event in &events {
+    for event in events {
         let Some(before_commit_sha) = event.before_commit_oid.as_deref() else {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
@@ -4125,7 +4364,18 @@ pub fn spawn_loop(
             'wait: loop {
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_run_at);
-                let remaining_interval = interval.saturating_sub(elapsed);
+                // Stretch the full-sweep cadence alongside the per-PR
+                // adaptive tiers (`PollTier::interval`) once the hourly
+                // GitHub quota is running low — see
+                // `rate_limit_throttle_factor`. A no-op (factor 1.0) once
+                // quota is healthy.
+                let throttle = rate_limit_throttle_factor();
+                let effective_interval = if throttle > 1.0 {
+                    interval.mul_f64(throttle)
+                } else {
+                    interval
+                };
+                let remaining_interval = effective_interval.saturating_sub(elapsed);
                 let pr_wait = schedule
                     .next_due()
                     .map(|at| at.saturating_duration_since(now))
@@ -6301,7 +6551,7 @@ mod tests {
         parsed.insert(urls[1].clone(), ("acme".to_owned(), "widgets".to_owned(), 2));
         parsed.insert(urls[2].clone(), ("acme".to_owned(), "gadgets".to_owned(), 7));
 
-        let (query, alias_map) = build_batch_query(&urls, &parsed);
+        let (query, alias_map) = build_batch_query(&urls, &parsed, PR_PROBE_FIELDS);
 
         // BTreeMap ordering of (owner, repo) puts "gadgets" before "widgets".
         assert_eq!(alias_map.len(), 2, "two distinct repos -> two repo aliases");
@@ -8783,30 +9033,17 @@ mod tests {
         assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
     }
 
-    // ----- parse_dequeue_events_response (merge-queue reason case T770/T771) -----
+    // ----- parse_dequeue_event_nodes (merge-queue reason case T770/T771) -----
 
     /// GitHub's GraphQL API returns `reason` in lowercase snake_case
     /// ("failed_checks") even though the schema documents the enum as
     /// FAILED_CHECKS.  The parser must accept the lowercase form.
     #[test]
-    fn parse_dequeue_events_response_accepts_lowercase_failed_checks() {
-        let body = br#"{
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {
-                            "nodes": [
-                                {
-                                    "reason": "failed_checks",
-                                    "beforeCommit": {"oid": "abc123def456"}
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-        }"#;
-        let events = parse_dequeue_events_response(body);
+    fn parse_dequeue_event_nodes_accepts_lowercase_failed_checks() {
+        let nodes = serde_json::json!([
+            {"reason": "failed_checks", "beforeCommit": {"oid": "abc123def456"}}
+        ]);
+        let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
         assert_eq!(events.len(), 1, "lowercase 'failed_checks' must be surfaced");
         assert_eq!(events[0].reason, "failed_checks");
         assert_eq!(events[0].before_commit_oid.as_deref(), Some("abc123def456"));
@@ -8815,24 +9052,11 @@ mod tests {
     /// The schema-documented uppercase form must also be accepted for
     /// forward-compatibility (in case GitHub normalises casing in future).
     #[test]
-    fn parse_dequeue_events_response_accepts_uppercase_failed_checks() {
-        let body = br#"{
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {
-                            "nodes": [
-                                {
-                                    "reason": "FAILED_CHECKS",
-                                    "beforeCommit": {"oid": "def456abc789"}
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-        }"#;
-        let events = parse_dequeue_events_response(body);
+    fn parse_dequeue_event_nodes_accepts_uppercase_failed_checks() {
+        let nodes = serde_json::json!([
+            {"reason": "FAILED_CHECKS", "beforeCommit": {"oid": "def456abc789"}}
+        ]);
+        let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
         assert_eq!(events.len(), 1, "uppercase 'FAILED_CHECKS' must also be surfaced");
         assert_eq!(events[0].before_commit_oid.as_deref(), Some("def456abc789"));
     }
@@ -8840,24 +9064,14 @@ mod tests {
     /// Non-FAILED_CHECKS reasons (manual dequeue, merge conflict, etc.) must
     /// be silently discarded — they must not trigger the ci_failure path.
     #[test]
-    fn parse_dequeue_events_response_filters_non_failed_checks() {
-        let body = br#"{
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {
-                            "nodes": [
-                                {"reason": "dequeued",       "beforeCommit": {"oid": "sha1"}},
-                                {"reason": "merge_conflict", "beforeCommit": {"oid": "sha2"}},
-                                {"reason": "queue_cleared",  "beforeCommit": {"oid": "sha3"}},
-                                {"reason": "failed_checks",  "beforeCommit": {"oid": "sha4"}}
-                            ]
-                        }
-                    }
-                }
-            }
-        }"#;
-        let events = parse_dequeue_events_response(body);
+    fn parse_dequeue_event_nodes_filters_non_failed_checks() {
+        let nodes = serde_json::json!([
+            {"reason": "dequeued",       "beforeCommit": {"oid": "sha1"}},
+            {"reason": "merge_conflict", "beforeCommit": {"oid": "sha2"}},
+            {"reason": "queue_cleared",  "beforeCommit": {"oid": "sha3"}},
+            {"reason": "failed_checks",  "beforeCommit": {"oid": "sha4"}}
+        ]);
+        let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
         assert_eq!(events.len(), 1, "only failed_checks must be surfaced");
         assert_eq!(events[0].before_commit_oid.as_deref(), Some("sha4"));
     }
@@ -8866,38 +9080,139 @@ mod tests {
     /// still be returned (with `before_commit_oid = None`) so the caller
     /// can decide how to handle it.
     #[test]
-    fn parse_dequeue_events_response_handles_null_before_commit() {
-        let body = br#"{
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {
-                            "nodes": [
-                                {"reason": "failed_checks", "beforeCommit": null}
-                            ]
-                        }
-                    }
-                }
-            }
-        }"#;
-        let events = parse_dequeue_events_response(body);
+    fn parse_dequeue_event_nodes_handles_null_before_commit() {
+        let nodes = serde_json::json!([
+            {"reason": "failed_checks", "beforeCommit": null}
+        ]);
+        let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
         assert_eq!(events.len(), 1, "null beforeCommit must not drop the event");
         assert!(events[0].before_commit_oid.is_none());
     }
 
     /// An empty nodes array returns an empty vec without panicking.
     #[test]
-    fn parse_dequeue_events_response_empty_nodes() {
-        let body = br#"{
+    fn parse_dequeue_event_nodes_empty_nodes() {
+        let nodes = serde_json::json!([]);
+        assert!(parse_dequeue_event_nodes(nodes.as_array().unwrap()).is_empty());
+    }
+
+    // ----- fetch_merge_queue_dequeue_events_batch's query/response plumbing -----
+    //
+    // The batch fetcher reuses `build_batch_query` / `walk_batch_response`
+    // (already covered by the PR-probe batching tests above) with
+    // `DEQUEUE_EVENTS_FIELDS` as the selection set — these tests pin that
+    // the fields constant produces the expected query shape and that a
+    // batched response walks back out to the right per-URL node.
+
+    #[test]
+    fn build_batch_query_with_dequeue_events_fields_requests_timeline_items() {
+        let urls = vec!["https://github.com/acme/widgets/pull/1".to_owned()];
+        let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
+        parsed.insert(urls[0].clone(), ("acme".to_owned(), "widgets".to_owned(), 1));
+
+        let (query, alias_map) = build_batch_query(&urls, &parsed, DEQUEUE_EVENTS_FIELDS);
+
+        assert_eq!(alias_map.len(), 1);
+        assert!(
+            query.contains("rateLimit { remaining }"),
+            "quota reading must ride along for free"
+        );
+        assert!(query.contains("REMOVED_FROM_MERGE_QUEUE_EVENT"));
+        assert!(
+            !query.contains("statusCheckRollup"),
+            "must not pull in the PR-probe field set"
+        );
+    }
+
+    #[test]
+    fn walk_batch_response_locates_timeline_items_per_pr() {
+        let alias_map: BatchAliasMap = vec![(
+            "repo0".to_owned(),
+            vec![("pr0".to_owned(), "https://github.com/acme/widgets/pull/1".to_owned())],
+        )];
+        let body = serde_json::json!({
             "data": {
-                "repository": {
-                    "pullRequest": {
-                        "timelineItems": {"nodes": []}
+                "rateLimit": { "remaining": 4321 },
+                "repo0": {
+                    "pr0": {
+                        "timelineItems": {
+                            "nodes": [
+                                {"reason": "failed_checks", "beforeCommit": {"oid": "sha9"}}
+                            ]
+                        }
                     }
                 }
             }
-        }"#;
-        assert!(parse_dequeue_events_response(body).is_empty());
+        });
+        let walked = walk_batch_response(&body, &alias_map);
+        assert_eq!(walked.len(), 1);
+        let (_, node) = &walked[0];
+        let nodes = node.unwrap()["timelineItems"]["nodes"].as_array().cloned().unwrap();
+        let events = parse_dequeue_event_nodes(&nodes);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].before_commit_oid.as_deref(), Some("sha9"));
+    }
+
+    // ----- GitHub API quota throttling -----
+
+    #[test]
+    fn throttle_factor_is_unthrottled_above_low_water() {
+        assert_eq!(throttle_factor_for(5000, 500), 1.0);
+        assert_eq!(
+            throttle_factor_for(500, 500),
+            1.0,
+            "exactly at the mark is not yet throttled"
+        );
+    }
+
+    #[test]
+    fn throttle_factor_scales_up_as_budget_drains() {
+        let half = throttle_factor_for(250, 500);
+        assert!(
+            half > 1.0 && half < 8.0,
+            "midway drained must throttle, but not at max: {half}"
+        );
+        let near_empty = throttle_factor_for(1, 500);
+        assert!(
+            near_empty > half,
+            "closer to empty must throttle harder than halfway: {near_empty} vs {half}"
+        );
+    }
+
+    #[test]
+    fn throttle_factor_caps_at_max_when_exhausted() {
+        assert_eq!(throttle_factor_for(0, 500), 8.0);
+        assert_eq!(
+            throttle_factor_for(-1, 500),
+            8.0,
+            "a negative reading is still fully exhausted"
+        );
+    }
+
+    #[test]
+    fn parse_rate_limit_remaining_reads_the_graphql_field() {
+        let body = serde_json::json!({"data": {"rateLimit": {"remaining": 42}}});
+        assert_eq!(parse_rate_limit_remaining(&body), Some(42));
+    }
+
+    #[test]
+    fn parse_rate_limit_remaining_absent_is_none() {
+        let body = serde_json::json!({"data": {"repo0": {}}});
+        assert_eq!(parse_rate_limit_remaining(&body), None);
+    }
+
+    #[test]
+    fn is_rate_limit_error_matches_githubs_message_case_insensitively() {
+        assert!(is_rate_limit_error(
+            "GraphQL: API rate limit already exceeded for user ID 401512"
+        ));
+        assert!(is_rate_limit_error("api RATE LIMIT exceeded"));
+    }
+
+    #[test]
+    fn is_rate_limit_error_does_not_match_generic_network_failures() {
+        assert!(!is_rate_limit_error("connection reset by peer"));
+        assert!(!is_rate_limit_error("could not resolve to a Resource"));
     }
 
     /// Acceptance test for T831 / the CI-status invalidation gap: once a
