@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/day-rotated-log:__pkg__",
         "//tools/boss/engine/metrics-registry:__pkg__",
+        "//tools/boss/engine/transcript-markdown:__pkg__",
         "//tools/boss/github_tracker:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

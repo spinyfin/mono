@@ -468,7 +468,7 @@ fn render_tool_result_segment(
 ) -> Option<TranscriptSegment> {
     let total_bytes = output.len();
     let (shown_output, truncated) = if total_bytes > opts.max_result_bytes {
-        let shown_len = safe_truncate_len(output, opts.max_result_bytes);
+        let shown_len = boss_engine_utils::string_clip::floor_char_boundary(output, opts.max_result_bytes);
         (
             &output[..shown_len],
             Some(TruncationInfo {
@@ -673,19 +673,6 @@ fn strip_markdown(md: &str) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Return the largest byte index ≤ `max_bytes` that is a valid UTF-8
-/// char boundary in `s`. Always returns a value in `0..=s.len()`.
-fn safe_truncate_len(s: &str, max_bytes: usize) -> usize {
-    if s.len() <= max_bytes {
-        return s.len();
-    }
-    let mut len = max_bytes;
-    while len > 0 && !s.is_char_boundary(len) {
-        len -= 1;
-    }
-    len
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1177,15 +1164,16 @@ mod tests {
         assert!(text.contains("done"), "got: {text}");
     }
 
-    // ── safe_truncate_len ─────────────────────────────────────────────────────
+    // ── char-boundary truncation ──────────────────────────────────────────────
 
     #[test]
-    fn safe_truncate_len_respects_char_boundaries() {
+    fn truncation_len_respects_char_boundaries() {
+        use boss_engine_utils::string_clip::floor_char_boundary;
         // "é" is 2 bytes (0xC3 0xA9). Truncating at byte 1 would be invalid.
         let s = "aé";
         assert_eq!(s.len(), 3); // 'a'=1, 'é'=2
-        assert_eq!(safe_truncate_len(s, 2), 1); // can't split 'é', so stop at 'a'
-        assert_eq!(safe_truncate_len(s, 3), 3);
-        assert_eq!(safe_truncate_len(s, 10), 3);
+        assert_eq!(floor_char_boundary(s, 2), 1); // can't split 'é', so stop at 'a'
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 10), 3);
     }
 }
