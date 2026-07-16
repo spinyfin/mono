@@ -24,16 +24,40 @@ log() { echo "--- $*"; }
 log "[boss-release] releasing"
 echo "[boss-release] agent: $(uname -a)"
 
-# ── resolve last released tag (all trigger paths) ────────────────────────────
-# Always resolve the last boss-v* tag and its commit SHA.  Both the
-# idempotency guard (below) and the cron change-detection block need them,
-# so we do the lookup once here unconditionally.
-
+# ── list all boss-v* releases (single authoritative snapshot) ────────────────
+# A single `gh release list` call, retried on transient failure, backs every
+# decision below (LAST_TAG, the idempotency guard, change-detection, and the
+# next-version computation). Two independent queries used to run minutes
+# apart in this script; a `|| true` on the first swallowed any `gh` failure
+# (auth hiccup, API 5xx, rate limit) into an EMPTY LAST_TAG, indistinguishable
+# from "no prior release exists" — which silently triggered the misleading
+# "Initial Boss release." placeholder even though prior releases existed
+# (observed on boss-v1.0.263, cut 23 releases after boss-v1.0.0). Query once,
+# fail loudly if `gh` can't be trusted, and reuse the result everywhere so the
+# view of "what releases exist" cannot go stale or disagree with itself
+# mid-script.
 BUILDKITE_SOURCE="${BUILDKITE_SOURCE:-}"
 
+_gh_release_list_json() {
+  local out attempt
+  for attempt in 1 2 3; do
+    if out=$(gh release list --repo spinyfin/mono --limit 200 --json tagName 2>&1); then
+      printf '%s' "${out}"
+      return 0
+    fi
+    echo "[boss-release] gh release list attempt ${attempt}/3 failed: ${out}" >&2
+    sleep $((attempt * 5))
+  done
+  return 1
+}
+
+log "[boss-release] listing existing boss-v* releases"
+RELEASE_LIST_JSON=$(_gh_release_list_json) || die \
+  "Unable to list existing releases via 'gh release list' after 3 attempts. Refusing to proceed: treating this as \"no prior release\" would risk publishing a misleading \"Initial Boss release.\" placeholder, or recomputing the next version number, when releases may already exist. Investigate gh/GitHub API health and retry."
+
 log "[boss-release] resolving last boss-v* release tag"
-LAST_TAG=$(gh release list --repo spinyfin/mono --limit 200 --json tagName \
-  --jq '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName' 2>/dev/null || true)
+LAST_TAG=$(echo "${RELEASE_LIST_JSON}" \
+  | jq -r '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName // empty')
 
 LAST_SHA=""
 if [[ -n "${LAST_TAG}" ]]; then
@@ -163,8 +187,11 @@ git fetch --tags origin 2>/dev/null || true
 # version (e.g. "1.0.5") rather than a dev suffix.
 
 log "[boss-release] computing next version"
-EXISTING_TAGS=$(gh release list --repo spinyfin/mono --limit 200 \
-  --json tagName --jq '.[].tagName' 2>/dev/null || true)
+# Reuse the single RELEASE_LIST_JSON snapshot from above instead of issuing a
+# second `gh release list` call — two separate calls run seconds to minutes
+# apart could observe different states (a release created in between) and
+# silently disagree about the last tag vs. the max existing tag.
+EXISTING_TAGS=$(echo "${RELEASE_LIST_JSON}" | jq -r '.[].tagName')
 
 MAX_N=-1
 while IFS= read -r tag; do
@@ -297,6 +324,16 @@ echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 # selective retry on the (flaky) asset-upload step.
 
 log "[boss-release] generating release notes for ${VERSION}"
+
+# Sanity check before trusting the "no prior release" path: if other boss-v*
+# tags exist (MAX_N >= 0) but LAST_TAG came up empty, the two views of
+# release history disagree — do NOT paper over that with the "Initial Boss
+# release." placeholder. Fail loudly so the inconsistency gets investigated
+# instead of silently publishing misleading notes.
+if [[ -z "${LAST_TAG}" && "${MAX_N}" -ge 0 ]]; then
+  die "LAST_TAG resolved empty but existing boss-v* releases were found (highest: boss-v1.0.${MAX_N}). Refusing to publish '${VERSION}' with an 'Initial Boss release.' placeholder — this indicates a bug in tag resolution, not a genuine first release."
+fi
+
 NOTES_FILE="$(mktemp /tmp/boss-release-notes-XXXXXX.md)"
 if [[ -n "${LAST_TAG}" ]]; then
   # Ensure full history for git log — a shallow clone silently truncates the
