@@ -23,6 +23,11 @@ pub enum EffectiveState {
     FreeDirty,
     /// state=free, health_status='conflicted'
     FreeConflicted,
+    /// state=free, health_status='quarantined'. Durably excluded from lease
+    /// candidate discovery (see [`WorkspaceHealth::Quarantined`]); surfaced
+    /// as its own filter so `cube workspace list --state free-quarantined`
+    /// can find rows that need an operator's `force-release` decision.
+    FreeQuarantined,
     /// state=leased
     Leased,
 }
@@ -33,6 +38,7 @@ impl EffectiveState {
             Self::Free => "free",
             Self::FreeDirty => "free-dirty",
             Self::FreeConflicted => "free-conflicted",
+            Self::FreeQuarantined => "free-quarantined",
             Self::Leased => "leased",
         }
     }
@@ -46,6 +52,7 @@ impl std::str::FromStr for EffectiveState {
             "free" => Ok(Self::Free),
             "free-dirty" => Ok(Self::FreeDirty),
             "free-conflicted" => Ok(Self::FreeConflicted),
+            "free-quarantined" => Ok(Self::FreeQuarantined),
             "leased" => Ok(Self::Leased),
             _ => Err(()),
         }
@@ -252,6 +259,10 @@ impl Store {
                 }
                 EffectiveState::FreeConflicted => {
                     sql.push_str(" AND state = ? AND health_status = 'conflicted'");
+                    bound.push(WorkspaceState::Free.as_str().to_string());
+                }
+                EffectiveState::FreeQuarantined => {
+                    sql.push_str(" AND state = ? AND health_status = 'quarantined'");
                     bound.push(WorkspaceState::Free.as_str().to_string());
                 }
                 EffectiveState::Leased => {
@@ -794,6 +805,121 @@ impl Store {
             unhealthy_since_epoch_s: None,
             ..record
         }))
+    }
+
+    /// Release a workspace back to `free`, like [`Self::release_workspace`],
+    /// but mark it [`WorkspaceHealth::Quarantined`] instead of clearing
+    /// health. Used when the dirty-reclaim guard in `reset_workspace_guarded`
+    /// refuses to destructively reset a workspace whose `@` still holds a
+    /// prior expired-lease holder's committed-but-unpushed work.
+    ///
+    /// This is deliberately durable, unlike the caller's one-shot
+    /// `prior_expired` bookkeeping (which only guards the single lease call
+    /// that performed the `expire_stale_leases` sweep): the quarantine
+    /// health status persists across this release, so `list_workspaces_filtered`
+    /// with `EffectiveState::Free`/`FreeDirty`/`FreeConflicted` never matches
+    /// this row again, and no later lease call can select and destructively
+    /// reset it. Only [`Self::clear_workspace_quarantine`] (driven by
+    /// `cube workspace force-release`) undoes it.
+    pub fn quarantine_workspace(&mut self, lease_id: &str, reason: &str) -> Result<Option<WorkspaceRecord>, CubeError> {
+        let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
+        let target = transaction
+            .query_row(
+                "SELECT repo, workspace_id FROM workspaces WHERE lease_id = ?1",
+                params![lease_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(CubeError::Storage)?;
+        let Some((repo, workspace_id)) = target else {
+            transaction.rollback().map_err(CubeError::Storage)?;
+            return Ok(None);
+        };
+
+        transaction
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    state = ?2,
+                    lease_id = NULL,
+                    holder = NULL,
+                    task = NULL,
+                    leased_at_epoch_s = NULL,
+                    lease_expires_at_epoch_s = NULL,
+                    head_commit = NULL,
+                    last_release_reason = ?3,
+                    health_status = ?4,
+                    unhealthy_since_epoch_s = COALESCE(unhealthy_since_epoch_s, unixepoch())
+                WHERE lease_id = ?1
+                "#,
+                params![
+                    lease_id,
+                    WorkspaceState::Free.as_str(),
+                    reason,
+                    WorkspaceHealth::Quarantined.as_str(),
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+
+        let updated = transaction
+            .query_row(
+                r#"
+                SELECT
+                    repo,
+                    workspace_id,
+                    workspace_path,
+                    state,
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    lease_expires_at_epoch_s,
+                    head_commit,
+                    last_release_reason,
+                    health_status,
+                    unhealthy_since_epoch_s
+                FROM workspaces
+                WHERE repo = ?1 AND workspace_id = ?2
+                "#,
+                params![repo, workspace_id],
+                row_to_workspace_record,
+            )
+            .map_err(CubeError::Storage)?;
+        transaction.commit().map_err(CubeError::Storage)?;
+        Ok(Some(updated))
+    }
+
+    /// Clear a durable dirty-reclaim quarantine, returning the workspace to
+    /// plain `free` with no health marker so it re-enters normal lease
+    /// candidate discovery. Only updates rows that are `free` AND
+    /// `health_status = 'quarantined'` — a no-op (`Ok(false)`) otherwise, so
+    /// callers can tell "not quarantined" apart from "not found" and avoid
+    /// silently clearing an unrelated dirty/conflicted marker.
+    pub fn clear_workspace_quarantine(&self, repo: &str, workspace_id: &str) -> Result<bool, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    health_status = NULL,
+                    unhealthy_since_epoch_s = NULL,
+                    last_release_reason = 'quarantine-cleared'
+                WHERE repo = ?1
+                  AND workspace_id = ?2
+                  AND state = ?3
+                  AND health_status = ?4
+                "#,
+                params![
+                    repo,
+                    workspace_id,
+                    WorkspaceState::Free.as_str(),
+                    WorkspaceHealth::Quarantined.as_str(),
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(updated > 0)
     }
 
     pub fn get_workspace_setup_state(

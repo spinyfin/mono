@@ -34,6 +34,12 @@ type Result<T> = std::result::Result<T, CubeError>;
 /// few minutes against this window.
 const DEFAULT_LEASE_TTL_SECS: i64 = 1800;
 
+/// `last_release_reason` recorded when the dirty-reclaim guard in
+/// `reset_workspace_guarded` refuses a destructive reset and the workspace
+/// is quarantined instead of the lease call hard-failing. See
+/// [`crate::metadata::WorkspaceHealth::Quarantined`].
+const DIRTY_RECLAIM_QUARANTINE_REASON: &str = "dirty_reclaim_quarantined";
+
 /// Pool-wide gc runs at most once per 24 hours, triggered from `cube workspace lease`.
 const AUTO_GC_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// Stamped on COMPLETION of a background GC pass; gates the 24-hour throttle.
@@ -1429,7 +1435,7 @@ fn run_workspace(
             // stop — cube always provisions new capacity for a reachable repo.
             let chosen_id = clean_candidate.or_else(|| conflicted_candidate.as_ref().map(|(id, _)| id.clone()));
 
-            let (mut workspace, was_auto_created, repair_bookmarks) = if let Some(ws_id) = chosen_id {
+            let (mut workspace, mut was_auto_created, repair_bookmarks) = if let Some(ws_id) = chosen_id {
                 // Claim the specific workspace we health-checked.
                 let ws = store
                     .claim_specific_workspace(
@@ -1557,8 +1563,93 @@ fn run_workspace(
                 &repo_record.main_branch,
                 prior_expired,
             ) {
-                let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                return Err(error);
+                let CubeError::LeaseExpiredWorkspaceDirty {
+                    prior_lease_id: refused_prior_lease_id,
+                    prior_holder: refused_prior_holder,
+                    ..
+                } = error
+                else {
+                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                    return Err(error);
+                };
+
+                // The health check a few hundred lines up only tests for
+                // uncommitted *file* changes (`jj status`'s "Working copy
+                // changes:" section); the guard above tests a stricter
+                // condition (`@` empty AND its parent is `main`). A
+                // workspace whose prior expired-lease holder ran `jj
+                // describe` (committing their WIP) but never pushed can
+                // pass the health check as Clean yet still fail the guard
+                // above — so a workspace can pass selection and still hit
+                // this refusal. No pool state is ever allowed to hard-fail
+                // a lease call for a reachable repo (see "No pool state
+                // ... is ever a hard stop" above), so: durably quarantine
+                // this workspace — unlike `prior_expired` above (which only
+                // guards this one lease call), the quarantine health status
+                // persists across the release below and blocks every later
+                // lease call from selecting it — and fall back to a
+                // freshly auto-created workspace, which can never trip
+                // this guard (a brand new `jj workspace add` has no prior
+                // holder's work to protect, so `prior_expired` is always
+                // `None` for it below — this cannot recurse).
+                if let Err(store_err) = store.quarantine_workspace(&lease_id, DIRTY_RECLAIM_QUARANTINE_REASON) {
+                    eprintln!(
+                        "warning: cube failed to persist dirty-reclaim quarantine for `{}/{}`: {store_err}",
+                        workspace.repo, workspace.workspace_id,
+                    );
+                }
+                audit!(
+                    database_path,
+                    "workspace.dirty_reclaim_quarantined",
+                    repo = workspace.repo,
+                    workspace_id = workspace.workspace_id,
+                    prior_lease_id = refused_prior_lease_id,
+                    prior_holder = refused_prior_holder,
+                );
+
+                let retry_lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
+                let mut retry_candidates = discover_workspaces(&repo_record)?;
+                store.sync_workspaces(&repo, &retry_candidates)?;
+                let new_candidate = auto_create_workspace(runner, &repo_record, &retry_candidates)?;
+                let new_id = new_candidate.workspace_id.clone();
+                retry_candidates.push(new_candidate);
+                store.sync_workspaces(&repo, &retry_candidates)?;
+                workspace = store
+                    .claim_specific_workspace(
+                        &repo,
+                        &new_id,
+                        &holder,
+                        &task,
+                        &lease_id,
+                        leased_at_epoch_s,
+                        lease_expires_at,
+                    )?
+                    .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+                was_auto_created = true;
+                drop(retry_lock);
+
+                if !workspace_path_exists(&workspace) {
+                    eprintln!(
+                        "warning: cube workspace `{}/{}` directory disappeared between provisioning \
+                         and claim at {}; dropping the dangling registry row",
+                        workspace.repo,
+                        workspace.workspace_id,
+                        workspace.workspace_path.display(),
+                    );
+                    store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
+                    return Err(CubeError::NoAvailableWorkspace(repo));
+                }
+
+                if let Err(error) = reset_workspace_guarded(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repo_record.main_branch,
+                    None,
+                ) {
+                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                    return Err(error);
+                }
             }
 
             let head_commit = current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
@@ -1574,6 +1665,7 @@ fn run_workspace(
                 holder = holder,
                 task = task,
                 head_commit = workspace.head_commit,
+                was_auto_created = was_auto_created,
             );
 
             // Defense-in-depth (issue #1174): keep Boss/host infra files —
@@ -1801,32 +1893,113 @@ fn run_workspace(
             repo,
             reason,
         } => {
-            let lease = resolve_release_lease(&mut store, workspace, lease, repo)?;
-            // Repo-scoped lock so a concurrent normal release can't race.
-            let workspace_record = store
-                .get_workspace_by_lease(&lease)?
-                .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
-            let _lock = RepoLock::acquire(&repo_lock_path(&workspace_record.repo, database_path)?)?;
-            let reason = reason.unwrap_or_else(|| "force-released".to_string());
-            let released = store
-                .force_release_lease(&lease, Some(&reason))?
-                .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            // Resolve the target row directly (not via `resolve_release_lease`,
+            // which requires an active lease): a workspace the dirty-reclaim
+            // guard quarantined is already `free` by the time an operator
+            // salvages it with this command, so "not currently leased" must
+            // not be treated as an error here.
+            let target = if let Some(ref lease_id) = lease {
+                store
+                    .get_workspace_by_lease(lease_id)?
+                    .ok_or_else(|| CubeError::LeaseNotFound(lease_id.clone()))?
+            } else {
+                let workspace_id = workspace.clone().ok_or_else(|| {
+                    CubeError::InvalidArgument("release requires a workspace id positional or --lease".to_string())
+                })?;
+                let matches = store.list_workspaces_filtered(&WorkspaceListFilter {
+                    repo: repo.as_deref(),
+                    workspace_id: Some(&workspace_id),
+                    ..Default::default()
+                })?;
+                match matches.as_slice() {
+                    [] => return Err(CubeError::WorkspaceNotFound(workspace_id)),
+                    [single] => single.clone(),
+                    many => {
+                        let repos = many.iter().map(|r| r.repo.as_str()).collect::<Vec<_>>().join(", ");
+                        return Err(CubeError::InvalidArgument(format!(
+                            "workspace id `{workspace_id}` matches multiple repos ({repos}); disambiguate with --repo"
+                        )));
+                    }
+                }
+            };
 
-            audit!(
-                database_path,
-                "lease.force_released",
-                repo = released.repo,
-                workspace_id = released.workspace_id,
-                lease_id = lease,
-                reason = reason,
-            );
+            // Repo-scoped lock so a concurrent normal release/lease can't race.
+            let _lock = RepoLock::acquire(&repo_lock_path(&target.repo, database_path)?)?;
 
-            RunResult::new(
-                format!("Force-released {} (workspace not reset).", released.workspace_id),
-                json!({
-                    "workspace": released,
-                }),
-            )
+            if target.state == WorkspaceState::Leased {
+                let lease_id = target.lease_id.clone().ok_or_else(|| {
+                    CubeError::InvalidArgument(format!(
+                        "workspace `{}/{}` is leased but has no lease id recorded",
+                        target.repo, target.workspace_id
+                    ))
+                })?;
+                let reason = reason.unwrap_or_else(|| "force-released".to_string());
+                let released = store
+                    .force_release_lease(&lease_id, Some(&reason))?
+                    .ok_or_else(|| CubeError::LeaseNotFound(lease_id.clone()))?;
+
+                audit!(
+                    database_path,
+                    "lease.force_released",
+                    repo = released.repo,
+                    workspace_id = released.workspace_id,
+                    lease_id = lease_id,
+                    reason = reason,
+                );
+
+                RunResult::new(
+                    format!("Force-released {} (workspace not reset).", released.workspace_id),
+                    json!({
+                        "workspace": released,
+                    }),
+                )
+            } else if target.health_status == Some(WorkspaceHealth::Quarantined) {
+                // Salvage path for a `free-quarantined` row: clear the
+                // durable marker the dirty-reclaim guard set (see
+                // `Store::quarantine_workspace`) so the workspace re-enters
+                // normal lease candidate discovery. Does not touch the
+                // working copy — an operator should inspect it first.
+                if !store.clear_workspace_quarantine(&target.repo, &target.workspace_id)? {
+                    return Err(CubeError::InvalidArgument(format!(
+                        "workspace `{}/{}` is no longer quarantined; nothing to clear",
+                        target.repo, target.workspace_id
+                    )));
+                }
+
+                audit!(
+                    database_path,
+                    "workspace.quarantine_cleared",
+                    repo = target.repo,
+                    workspace_id = target.workspace_id,
+                );
+
+                let cleared = store
+                    .list_workspaces_filtered(&WorkspaceListFilter {
+                        repo: Some(&target.repo),
+                        workspace_id: Some(&target.workspace_id),
+                        ..Default::default()
+                    })?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| CubeError::WorkspaceNotFound(target.workspace_id.clone()))?;
+
+                RunResult::new(
+                    format!(
+                        "Cleared dirty-reclaim quarantine on {} (workspace not reset; free for leasing again).",
+                        cleared.workspace_id
+                    ),
+                    json!({
+                        "workspace": cleared,
+                    }),
+                )
+            } else {
+                Err(CubeError::InvalidArgument(format!(
+                    "workspace `{}/{}` is not leased and not quarantined ({}); nothing to force-release",
+                    target.repo,
+                    target.workspace_id,
+                    effective_state_display(&target)
+                )))
+            }
         }
         WorkspaceCommand::Status { workspace } => {
             let path = PathBuf::from(&workspace);
@@ -1871,7 +2044,8 @@ fn run_workspace(
             let parsed_effective_state = match state.as_deref() {
                 Some(raw) => Some(raw.parse::<EffectiveState>().map_err(|()| {
                     CubeError::InvalidArgument(format!(
-                        "invalid --state `{raw}`; expected `free`, `free-dirty`, `free-conflicted`, or `leased`"
+                        "invalid --state `{raw}`; expected `free`, `free-dirty`, `free-conflicted`, \
+                         `free-quarantined`, or `leased`"
                     ))
                 })?),
                 None => None,
@@ -5955,6 +6129,7 @@ fn effective_state_display(record: &WorkspaceRecord) -> String {
         WorkspaceState::Free => match record.health_status {
             Some(WorkspaceHealth::Dirty) => "free-dirty".to_string(),
             Some(WorkspaceHealth::Conflicted) => "free-conflicted".to_string(),
+            Some(WorkspaceHealth::Quarantined) => "free-quarantined".to_string(),
             _ => "free".to_string(),
         },
     }
@@ -5980,9 +6155,13 @@ fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
     for (((record, name), path), eff_state) in records.iter().zip(&names).zip(&paths).zip(&effective_states) {
         let name_pad = format!("{name:<name_w$}");
         let state_pad = format!("{eff_state:<state_w$}");
-        let state_styled = match record.state {
-            WorkspaceState::Free => style(state_pad).green(),
-            WorkspaceState::Leased => style(state_pad).yellow(),
+        let state_styled = match (record.state, record.health_status) {
+            // Quarantined workspaces need an operator decision (`cube
+            // workspace force-release`) before they can be leased again —
+            // call that out distinctly from ordinary free/dirty/conflicted.
+            (WorkspaceState::Free, Some(WorkspaceHealth::Quarantined)) => style(state_pad).red().bold(),
+            (WorkspaceState::Free, _) => style(state_pad).green(),
+            (WorkspaceState::Leased, _) => style(state_pad).yellow(),
         };
         lines.push(format!(
             "{}  {}  {}",
@@ -13923,25 +14102,34 @@ steps:
         assert_eq!(reconciled.len(), 1);
     }
 
-    /// Regression for the 2026-05-12 "`@` got re-pointed mid-flight"
-    /// incident. Setup mimics the race exactly:
+    /// Regression for the 2026-07-16 "dirty-reclaim guard hard-fails the
+    /// lease call, then the next lease destroys the 'protected' work
+    /// anyway" incident. Setup mimics the original 2026-05-12 race:
     ///   1. A worker leases a workspace and starts editing — `@` ends
     ///      up off main on an unbookmarked change (the worker's WIP).
     ///   2. The worker's lease ages past its TTL (engine forgot to
     ///      heartbeat — the orthogonal bug the engine-side fix
     ///      addresses).
-    ///   3. A new lease request arrives. The expected old behavior was
-    ///      to silently `expire_stale_leases`, claim the slot, and run
-    ///      `jj new <main>` — moving the still-active worker's `@`.
+    ///   3. A new lease request arrives. `expire_stale_leases` reclaims
+    ///      the slot, health-check sees no uncommitted *file* changes so
+    ///      claims it as `Clean`, and only then does the guard's stricter
+    ///      `@`-empty-and-on-main check catch the still-there WIP.
     ///
-    /// The fix this test pins down: cube's reset path now checks `@`'s
-    /// emptiness and parent-bookmark before running `jj new`, sees the
-    /// workspace is still on a non-main change with content, refuses
-    /// to reset, releases the just-acquired lease, and surfaces
-    /// `LeaseExpiredWorkspaceDirty` so the caller can fail loudly
-    /// instead of clobbering the prior worker's work.
+    /// Old (buggy) behavior: the guard refused the destructive reset but
+    /// that refusal hard-failed the WHOLE lease call, and the release it
+    /// performed to unwind the claim left the workspace plain `free` with
+    /// no trace of the refusal — so the very next lease call could select
+    /// the same workspace and destructively reset it, destroying the work
+    /// the guard had just "protected" three seconds earlier.
+    ///
+    /// The fix this test pins down: the guard's refusal never hard-fails
+    /// the call. Instead the workspace is durably quarantined (health
+    /// status survives the release, unlike the one-shot `prior_expired`
+    /// bookkeeping) and the lease call transparently falls back to a
+    /// freshly auto-created workspace, so the caller gets a normal
+    /// successful lease and the prior worker's `@` is never touched.
     #[test]
-    fn second_lease_refuses_to_reset_workspace_with_uncommitted_prior_work() {
+    fn second_lease_quarantines_dirty_reclaim_and_falls_back_to_fresh_workspace() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
@@ -13969,10 +14157,15 @@ steps:
         force_lease_expiry(&database_path, &prior_lease_id, 1);
 
         // The second lease's reset path should run `jj status --no-pager`
-        // (health check), then `jj git fetch`, then the head-status probe
-        // and stop. Stub the probe to return a non-empty `@` whose parent
-        // isn't `main` — exactly the shape a still-active worker's WIP looks like.
+        // (health check), then `jj git fetch`, then the head-status probe,
+        // which trips the guard. Stub the probe to return a non-empty `@`
+        // whose parent isn't `main` — exactly the shape a still-active
+        // worker's WIP looks like. Falling back to a freshly auto-created
+        // workspace (`mono-agent-002`) then runs the standard
+        // add/fetch/remote-list/bookmark-set/new/log sequence.
         let probe_output = "abcd1234\tfalse\tfeature-bookmark";
+        let new_path = workspace_root.join("mono-agent-002");
+        let staging = workspace_root.join(".incoming-mono-agent-002");
         let second_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -13994,33 +14187,45 @@ steps:
                 ],
                 probe_output,
             ),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
         ]);
 
-        let err = run_with_dependencies(
+        let second = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "incoming"]),
             Some(&database_path),
             &second_runner,
         )
-        .expect_err("second lease must refuse to clobber the WIP");
-
-        match &err {
-            CubeError::LeaseExpiredWorkspaceDirty {
-                workspace_path: refused_path,
-                prior_lease_id: refused_lease,
-                ..
-            } => {
-                assert_eq!(refused_path, &workspace_path);
-                assert_eq!(refused_lease, &prior_lease_id);
-            }
-            other => panic!("expected LeaseExpiredWorkspaceDirty, got {other:?}"),
-        }
+        .expect("second lease must succeed via fresh-workspace fallback, not hard-fail");
         second_runner.assert_exhausted();
 
-        // The crucial regression-pin: `jj new main` was NEVER invoked
-        // on the leased workspace, so the active worker's `@` is
-        // untouched. The probe is the only post-fetch jj call that
-        // ran; the runner's exhausted assertion above proves no other
-        // command was issued.
+        assert_eq!(second.payload["workspace"]["workspace_id"], "mono-agent-002");
+
+        // The crucial regression-pin: `jj new main` was NEVER invoked on
+        // the quarantined workspace, so the prior worker's `@` is
+        // untouched. The probe is the only post-fetch jj call that ran
+        // against `mono-agent-001`; every remaining command in the script
+        // targets `mono-agent-002`, and the runner's exhausted assertion
+        // above proves nothing extra was issued.
         let events = audit_events(&tempdir);
         let refused: Vec<_> = events
             .iter()
@@ -14032,7 +14237,8 @@ steps:
 
         // `lease.expired_reclaimed` must also have been audited so the
         // timeline reads end-to-end ("we swept this lease, then we
-        // refused to destructively reset its workspace").
+        // refused to destructively reset its workspace, then we
+        // quarantined it and fell back to a fresh one").
         let reclaimed: Vec<_> = events
             .iter()
             .filter(|e| e["event"] == "lease.expired_reclaimed")
@@ -14040,16 +14246,214 @@ steps:
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0]["prior_lease_id"], prior_lease_id);
 
-        // The new lease was rolled back: workspace is back to `free`
-        // with `lease_setup_failed` recorded. The old (expired) row's
-        // lease_id is gone — `expire_stale_leases` cleared it before
-        // the refused claim.
-        use crate::store::{Store, WorkspaceListFilter};
+        let quarantined: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.dirty_reclaim_quarantined")
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0]["workspace_id"], "mono-agent-001");
+        assert_eq!(quarantined[0]["prior_lease_id"], prior_lease_id);
+
+        // mono-agent-001 is durably quarantined (free, not plain free —
+        // this is the fix for the "next lease destroys the 'protected'
+        // work anyway" half of the bug: unlike the old one-shot
+        // `prior_expired` guard, this state survives the release and is
+        // visible to `cube workspace list`). mono-agent-002 is the fresh
+        // workspace, leased.
+        use crate::store::{EffectiveState, Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
         let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Free);
-        assert_eq!(rows[0].last_release_reason.as_deref(), Some("lease_setup_failed"));
+        assert_eq!(rows.len(), 2);
+
+        let quarantined_row = rows
+            .iter()
+            .find(|r| r.workspace_id == "mono-agent-001")
+            .expect("mono-agent-001 row");
+        assert_eq!(quarantined_row.state, crate::metadata::WorkspaceState::Free);
+        assert_eq!(
+            quarantined_row.health_status,
+            Some(crate::metadata::WorkspaceHealth::Quarantined)
+        );
+        assert_eq!(
+            quarantined_row.last_release_reason.as_deref(),
+            Some(super::DIRTY_RECLAIM_QUARANTINE_REASON)
+        );
+
+        let fresh_row = rows
+            .iter()
+            .find(|r| r.workspace_id == "mono-agent-002")
+            .expect("mono-agent-002 row");
+        assert_eq!(fresh_row.state, crate::metadata::WorkspaceState::Leased);
+
+        // The quarantined row is excluded from every `Free*` selection
+        // surface a subsequent lease call would use — proving the guard is
+        // now durable instead of one-shot.
+        for effective in [
+            EffectiveState::Free,
+            EffectiveState::FreeDirty,
+            EffectiveState::FreeConflicted,
+        ] {
+            let matches = store
+                .list_workspaces_filtered(&WorkspaceListFilter {
+                    effective_state: Some(effective),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(
+                matches.iter().all(|r| r.workspace_id != "mono-agent-001"),
+                "quarantined workspace must not appear under {effective:?}"
+            );
+        }
+        let quarantined_filter = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                effective_state: Some(EffectiveState::FreeQuarantined),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(quarantined_filter.len(), 1);
+        assert_eq!(quarantined_filter[0].workspace_id, "mono-agent-001");
+    }
+
+    /// A quarantined workspace must never be selected by a later lease
+    /// call — the durability half of the 2026-07-16 fix. Without it, the
+    /// bug reproduces exactly as reported: the guard "protects" the
+    /// workspace in one call, and the very next call destroys it anyway.
+    #[test]
+    fn quarantined_workspace_is_never_selected_by_a_later_lease() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        {
+            let mut store = crate::store::Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[crate::metadata::WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+                .unwrap();
+        }
+
+        // A lease call must skip the quarantined workspace entirely and
+        // auto-provision a fresh one — never even probe the quarantined
+        // workspace's `@` (no `jj status` etc. against mono-agent-001).
+        let new_path = workspace_root.join("mono-agent-002");
+        let staging = workspace_root.join(".incoming-mono-agent-002");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "incoming"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease must succeed by skipping the quarantined workspace");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-002");
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let quarantined_row = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                workspace_id: Some("mono-agent-001"),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("mono-agent-001 row still present");
+        assert_eq!(quarantined_row.state, crate::metadata::WorkspaceState::Free);
+        assert_eq!(
+            quarantined_row.health_status,
+            Some(crate::metadata::WorkspaceHealth::Quarantined),
+            "quarantine must survive an unrelated lease call untouched"
+        );
+    }
+
+    /// `cube workspace force-release` is the salvage path for a
+    /// `free-quarantined` workspace: it has no active lease to target (the
+    /// guard already released it), so force-release must resolve it by
+    /// workspace id and clear the quarantine instead of erroring
+    /// "not currently leased".
+    #[test]
+    fn force_release_clears_quarantine_on_free_workspace() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        {
+            let mut store = crate::store::Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[crate::metadata::WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+                .unwrap();
+        }
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "force-release", "mono-agent-001"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("force-release must clear the quarantine");
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
+        assert_eq!(result.payload["workspace"]["health_status"], serde_json::Value::Null);
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let row = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                workspace_id: Some("mono-agent-001"),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("row present");
+        assert_eq!(row.state, crate::metadata::WorkspaceState::Free);
+        assert_eq!(row.health_status, None);
+        assert_eq!(row.last_release_reason.as_deref(), Some("quarantine-cleared"));
     }
 
     /// The dirty guard must NOT fire on the steady-state happy path:

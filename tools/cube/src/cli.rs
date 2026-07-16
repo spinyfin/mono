@@ -162,11 +162,20 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         ttl_seconds: Option<u64>,
     },
-    /// Force-release a lease without running the workspace reset.
+    /// Force-release a lease, or clear a quarantined workspace, without
+    /// running the workspace reset.
     ///
     /// Bypasses ownership / holder checks. Intended for orphan
     /// reclamation after a holder process has crashed; pair with
     /// `cube workspace list --holder <pattern>` to find candidates.
+    ///
+    /// Also the salvage path for a `free-quarantined` workspace (see
+    /// `cube workspace list --state free-quarantined`): the dirty-reclaim
+    /// guard already released the lease, so there is no active lease to
+    /// target, but the workspace id form still resolves it and clears the
+    /// quarantine so it re-enters the pool. Inspect the workspace's `@`
+    /// first — the guard tripped because a prior expired-lease holder's
+    /// committed-but-unpushed work is still sitting there — before clearing.
     ForceRelease {
         /// Workspace id to release.
         #[arg(conflicts_with = "lease", required_unless_present = "lease")]
@@ -177,7 +186,9 @@ pub enum WorkspaceCommand {
         /// Optional repo filter; only used with the workspace-id form.
         #[arg(long, requires = "workspace")]
         repo: Option<String>,
-        /// Annotate the release with a reason (defaults to `force-released`).
+        /// Annotate the release with a reason (defaults to `force-released`;
+        /// ignored when clearing a quarantine, which always records
+        /// `quarantine-cleared`).
         #[arg(long)]
         reason: Option<String>,
     },
@@ -201,7 +212,11 @@ pub enum WorkspaceCommand {
         /// Filter by repo id.
         #[arg(long)]
         repo: Option<String>,
-        /// Filter by state (`free` or `leased`).
+        /// Filter by state (`free`, `free-dirty`, `free-conflicted`,
+        /// `free-quarantined`, or `leased`). `free-quarantined` marks a
+        /// workspace the dirty-reclaim guard refused to destructively
+        /// reset; it stays excluded from leasing until an operator runs
+        /// `cube workspace force-release` on it.
         #[arg(long)]
         state: Option<String>,
         /// Filter by holder. SQLite GLOB pattern — `*` matches anything,
