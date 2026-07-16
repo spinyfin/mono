@@ -1,7 +1,7 @@
 //! Generic, non-blocking, day-rotated append-only JSONL background writer.
 //!
-//! Shared by [`crate::ipc_log`] and [`crate::population_timing`]: both need
-//! the same shape — fire-and-forget records queued over a channel to a
+//! Shared by the engine's `ipc_log` and `population_timing` modules: both
+//! need the same shape — fire-and-forget records queued over a channel to a
 //! background task that owns a single rotating file handle, rotating and
 //! pruning by UTC calendar day. This module owns that machinery once,
 //! parameterized over the record type, its filename prefix, and the target

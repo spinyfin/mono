@@ -337,6 +337,7 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-deterministic-resolvers",
  "boss-editorial",
+ "boss-engine-day-rotated-log",
  "boss-engine-driver",
  "boss-engine-metrics-registry",
  "boss-engine-transient-error",
@@ -371,6 +372,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "boss-engine-day-rotated-log"
+version = "0.1.0"
+dependencies = [
+ "boss-engine-utils",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
