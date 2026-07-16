@@ -259,9 +259,10 @@ pub(crate) fn collect_task_runtimes(
 }
 
 /// Runtime snapshot for a single work item. `queries` is incremented by the
-/// number of SQL statements this call actually executes (1-3, depending on
-/// whether a live-execution fallback and a latest-run lookup are needed) so
-/// N+1 callers can report an accurate aggregate subquery count.
+/// number of SQL statements this call actually executes (1-4, depending on
+/// whether a live-execution fallback, a non-abandoned-execution fallback for
+/// an all-abandoned work item, and a latest-run lookup are needed) so N+1
+/// callers can report an accurate aggregate subquery count.
 pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
     *queries += 1;

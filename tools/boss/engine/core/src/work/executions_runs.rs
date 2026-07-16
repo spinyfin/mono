@@ -50,6 +50,19 @@ impl WorkDb {
         )?;
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
+        // Canonical terminalization trace — see `mark_execution_orphaned` for
+        // why every terminal-transition site emits this line: a recurrence
+        // of the ack-timeout / stale-reap contradiction (a live worker whose
+        // execution the engine already terminalized) must be attributable
+        // regardless of which site actually fired.
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %updated.work_item_id,
+            from_status = %existing.status,
+            to_status = %updated.status,
+            reason = "explicit cancel",
+            "execution terminalized: cancel",
+        );
         tx.commit()?;
         Ok(updated)
     }
@@ -943,6 +956,15 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
+        // Canonical terminalization trace — see `mark_execution_orphaned`.
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %execution.work_item_id,
+            from_status = %ExecutionStatus::Ready,
+            to_status = %execution.status,
+            reason = %error_text,
+            "execution terminalized: fail start",
+        );
         tx.commit()?;
         Ok((execution, run))
     }
@@ -1029,6 +1051,17 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
+        if matches!(outcome, PreStartFailureOutcome::PermanentFail) {
+            // Canonical terminalization trace — see `mark_execution_orphaned`.
+            tracing::warn!(
+                execution_id = %execution_id,
+                work_item_id = %execution.work_item_id,
+                from_status = %ExecutionStatus::Ready,
+                to_status = %execution.status,
+                reason = %error_text,
+                "execution terminalized: pre-start failure exhausted retries",
+            );
+        }
         tx.commit()?;
         Ok((execution, run, outcome))
     }
@@ -1162,6 +1195,17 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, run_id).require("run", run_id)?;
+        if execution_status.is_terminal() {
+            // Canonical terminalization trace — see `mark_execution_orphaned`.
+            tracing::warn!(
+                execution_id = %execution_id,
+                work_item_id = %execution.work_item_id,
+                from_status = %ExecutionStatus::Running,
+                to_status = %execution_status,
+                reason = "finish_execution_run",
+                "execution terminalized: run finish",
+            );
+        }
         tx.commit()?;
         Ok((execution, run, attention_item))
     }

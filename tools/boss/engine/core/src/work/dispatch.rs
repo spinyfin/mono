@@ -1213,6 +1213,7 @@ impl WorkDb {
     /// `start_execution_run`.
     pub fn mark_execution_redundant(&self, execution_id: &str) -> Result<()> {
         let conn = self.connect()?;
+        let existing = query_execution(&conn, execution_id)?;
         let now = now_string();
         conn.execute(
             "UPDATE work_executions
@@ -1221,6 +1222,22 @@ impl WorkDb {
              WHERE id = ?1",
             rusqlite::params![execution_id, now],
         )?;
+        // Canonical terminalization trace — see
+        // `WorkDb::mark_execution_orphaned` in executions_runs.rs. The
+        // double-spawn guard abandoning a redundant duplicate is exactly
+        // the secondary-incident shape (a cross-kind duplicate execution
+        // that got abandoned and shadowed the real one), so this site must
+        // be attributable from the trace alone too.
+        if let Some(existing) = existing {
+            tracing::warn!(
+                execution_id = %execution_id,
+                work_item_id = %existing.work_item_id,
+                from_status = %existing.status,
+                to_status = "abandoned",
+                reason = "redundant duplicate execution",
+                "execution terminalized: mark redundant",
+            );
+        }
         Ok(())
     }
 

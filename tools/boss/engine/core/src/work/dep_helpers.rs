@@ -296,6 +296,18 @@ fn cancel_live_execution_for_block_in_tx(
         execution_id = %live.id,
         "engine: cancelled live execution because its dependent transitioned to blocked",
     );
+    // Canonical terminalization trace — see `WorkDb::mark_execution_orphaned`
+    // in executions_runs.rs. This cancels a genuinely *live* execution, so
+    // it is exactly the shape of transition the ack-timeout / stale-reap
+    // contradiction needs traced to be attributable.
+    tracing::warn!(
+        execution_id = %live.id,
+        work_item_id = %work_item_id,
+        from_status = %live.status,
+        to_status = %updated.status,
+        reason = "dependent transitioned to blocked",
+        "execution terminalized: block cancel",
+    );
     Ok(Some(updated))
 }
 
