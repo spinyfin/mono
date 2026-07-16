@@ -206,10 +206,10 @@ pub use boss_protocol::{
     ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput,
     ReviseDocOutcome, SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
-    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed,
-    is_known_created_via,
+    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
+    TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
+    comment_status_is_closed, is_known_created_via,
 };
 
 /// Outcome of [`WorkDb::claim_execution_for_dispatch`]: the Ready → Claimed
@@ -407,7 +407,7 @@ static NEXT_MEM_DB_ID: AtomicU64 = AtomicU64::new(1);
 /// by `WorkDb::conn` (below) holding the one live connection to it, not by
 /// this struct.
 #[derive(Clone)]
-struct InMemoryAnchor {
+pub struct InMemoryAnchor {
     uri: String,
 }
 
@@ -418,6 +418,7 @@ struct InMemoryAnchor {
 /// connection guarded by a mutex."
 pub(crate) type PooledConnection<'a> = std::sync::MutexGuard<'a, Connection>;
 
+#[derive(bon::Builder)]
 pub struct WorkDb {
     path: PathBuf,
     /// Present only when the database is in-memory (path == ":memory:").
