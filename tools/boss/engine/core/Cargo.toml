@@ -19,6 +19,7 @@ boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-editorial = { path = "../editorial" }
 boss-engine-driver = { path = "../driver" }
+boss-engine-effort = { path = "../effort" }
 boss-feature-flags = { path = "../feature-flags" }
 boss-engine-gh-invocation = { path = "../gh-invocation" }
 boss-engine-live-status-redact = { path = "../live-status-redact" }

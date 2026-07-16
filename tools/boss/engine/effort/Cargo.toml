@@ -1,0 +1,10 @@
+[package]
+name = "boss-engine-effort"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+boss-engine-driver = { path = "../driver" }
+boss-protocol = { path = "../../protocol" }
