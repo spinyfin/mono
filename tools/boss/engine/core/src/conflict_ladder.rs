@@ -668,7 +668,11 @@ pub(crate) async fn attempt_rung0(
     let registry = ResolverRegistry::with_builtins();
     let resolved: Vec<ResolvedFile> = match registry.resolve_all(&lease.workspace_path, &files).await {
         RegistryResolution::AllResolved(resolved) => resolved,
-        RegistryResolution::Declined { resolved, declined } => {
+        RegistryResolution::Declined {
+            resolved,
+            declined,
+            failed,
+        } => {
             // Distinguish "no registered resolver applies to this file" from
             // "a resolver matched and ran, then itself declined" — collapsing
             // both into one generic message previously sent diagnosis down
@@ -687,14 +691,35 @@ pub(crate) async fn attempt_rung0(
                     }
                 })
                 .collect();
-            tracing::info!(
-                work_item_id = %candidate.work_item_id,
-                pr = pr_number,
-                resolved = resolved.len(),
-                declined = declined.len(),
-                declined_files = ?per_file,
-                "conflict_ladder: rung 0 declined; climbing to worker",
-            );
+            // Tell the truth in the verdict: a resolver that *matched and
+            // ran* but whose command failed operationally (e.g. `bazel mod
+            // deps` erroring in a cold workspace because a gitignored
+            // artifact is absent) is a fixable environment problem, not the
+            // benign "this file has no resolver" case. Log the two
+            // distinctly so the trace isn't misread as "rung 0 doesn't
+            // apply here" when the real story is "rung 0's environment is
+            // broken". Control flow is identical — both climb to the worker.
+            if failed.is_empty() {
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr = pr_number,
+                    resolved = resolved.len(),
+                    declined = declined.len(),
+                    declined_files = ?per_file,
+                    "conflict_ladder: rung 0 declined; climbing to worker",
+                );
+            } else {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr = pr_number,
+                    resolved = resolved.len(),
+                    declined = declined.len(),
+                    declined_files = ?per_file,
+                    failed = failed.len(),
+                    first_failure = %failed.first().map(|f| f.reason.as_str()).unwrap_or_default(),
+                    "conflict_ladder: rung 0 attempted but a resolver failed operationally (environment/tooling, not a decline); climbing to worker",
+                );
+            }
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
             };

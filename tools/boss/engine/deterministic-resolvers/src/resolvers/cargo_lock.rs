@@ -154,6 +154,7 @@ mod tests {
                 assert!(!regenerated.contains("<<<<<<<"), "conflict markers must be gone");
             }
             ResolveOutcome::Declined { reason } => panic!("expected cargo to regenerate cleanly, declined: {reason}"),
+            ResolveOutcome::Failed { reason } => panic!("expected cargo to regenerate cleanly, failed: {reason}"),
         }
     }
 

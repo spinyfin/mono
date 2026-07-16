@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use globset::GlobMatcher;
 
-use crate::command::{CommandRunner, RealCommandRunner, run_or_decline};
+use crate::command::{CommandRunner, RealCommandRunner, run_or_fail};
 use crate::recipe_config::ConflictRecipe;
 use crate::{ConflictClass, ConflictedFile, DeterministicResolver, ResolveOutcome};
 
@@ -174,8 +174,10 @@ async fn resolve_recipe(
 }
 
 /// Runs one recipe command (`resolve_command` or `verify_command`) via
-/// the shared [`run_or_decline`] core. `field_name` is only used to make
-/// the decline reason legible.
+/// the shared [`run_or_fail`] core. `field_name` is only used to make the
+/// failure reason legible. A spawn error or non-zero exit surfaces as
+/// [`ResolveOutcome::Failed`] (an operational failure of the recipe's own
+/// command), distinct from the recipe declining a file it doesn't match.
 async fn run_command(
     runner: &dyn CommandRunner,
     dir: &Path,
@@ -188,7 +190,7 @@ async fn run_command(
         .expect("recipe commands are validated non-empty at construction");
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    run_or_decline(
+    run_or_fail(
         runner,
         dir,
         program,
@@ -302,7 +304,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_declines_when_resolve_command_fails() {
+    async fn resolve_fails_when_resolve_command_fails() {
+        // The recipe matched and ran its resolve_command, which exited
+        // non-zero: an operational failure of the command, so `Failed`
+        // rather than a clean `Declined`.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("schema.generated.json"), "<<<<<<< ours\n").unwrap();
 
@@ -312,13 +317,13 @@ mod tests {
 
         let outcome = resolver.resolve(dir.path(), &file("schema.generated.json")).await;
         match outcome {
-            ResolveOutcome::Declined { reason } => assert!(reason.contains("regen failed: bad input")),
-            other => panic!("expected Declined, got {other:?}"),
+            ResolveOutcome::Failed { reason } => assert!(reason.contains("regen failed: bad input")),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn resolve_runs_verify_command_and_declines_when_it_fails() {
+    async fn resolve_runs_verify_command_and_fails_when_it_fails() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("schema.generated.json"), "<<<<<<< ours\n").unwrap();
 
@@ -332,11 +337,11 @@ mod tests {
 
         let outcome = resolver.resolve(dir.path(), &file("schema.generated.json")).await;
         match outcome {
-            ResolveOutcome::Declined { reason } => {
+            ResolveOutcome::Failed { reason } => {
                 assert!(reason.contains("verify_command"), "reason: {reason}");
                 assert!(reason.contains("schema invalid"), "reason: {reason}");
             }
-            other => panic!("expected Declined, got {other:?}"),
+            other => panic!("expected Failed, got {other:?}"),
         }
 
         let calls = runner.calls.lock().unwrap();
@@ -382,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_declines_when_resolve_command_fails_to_spawn() {
+    async fn resolve_fails_when_resolve_command_fails_to_spawn() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("schema.generated.json"), "<<<<<<< ours\n").unwrap();
 
@@ -392,8 +397,8 @@ mod tests {
 
         let outcome = resolver.resolve(dir.path(), &file("schema.generated.json")).await;
         match outcome {
-            ResolveOutcome::Declined { reason } => assert!(reason.contains("failed to spawn"), "reason: {reason}"),
-            other => panic!("expected Declined, got {other:?}"),
+            ResolveOutcome::Failed { reason } => assert!(reason.contains("failed to spawn"), "reason: {reason}"),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 

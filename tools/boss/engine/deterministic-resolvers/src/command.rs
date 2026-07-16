@@ -19,14 +19,20 @@ pub(crate) struct CommandOutput {
 }
 
 /// Runs one command, mapping a spawn failure or non-zero exit to a
-/// `Declined` outcome — the shared "run a command, decide success/failure"
-/// core used by every discard→run→verify strategy (the built-in lockfile
-/// resolvers in `lockfile.rs` and the generic [`crate::RecipeResolver`] in
-/// `resolvers/recipe.rs`). `reason_prefix` is prepended verbatim to the
-/// decline reason so each caller can identify which command/strategy
+/// [`ResolveOutcome::Failed`] outcome — the shared "run a command, decide
+/// success/failure" core used by every discard→run→verify strategy (the
+/// built-in lockfile resolvers in `lockfile.rs` and the generic
+/// [`crate::RecipeResolver`] in `resolvers/recipe.rs`). Both branches are
+/// operational failures of a command the resolver *chose to run* (the
+/// resolver already matched the file), so they map to `Failed` rather than
+/// `Declined`: a decline means "not for me", whereas a spawn error or a
+/// non-zero exit means "I tried and my environment/tooling let me down"
+/// (e.g. `bazel mod deps` failing because a gitignored artifact is absent
+/// in a cold workspace). `reason_prefix` is prepended verbatim to the
+/// failure reason so each caller can identify which command/strategy
 /// failed (e.g. `"recipe \"schema\" (verify_command): "`); pass `""` for
 /// no prefix.
-pub(crate) async fn run_or_decline(
+pub(crate) async fn run_or_fail(
     runner: &dyn CommandRunner,
     dir: &Path,
     program: &str,
@@ -36,7 +42,7 @@ pub(crate) async fn run_or_decline(
     let output = match runner.run(program, args, dir).await {
         Ok(output) => output,
         Err(e) => {
-            return Err(ResolveOutcome::Declined {
+            return Err(ResolveOutcome::Failed {
                 reason: format!("{reason_prefix}failed to spawn `{program}`: {e}"),
             });
         }
@@ -48,7 +54,7 @@ pub(crate) async fn run_or_decline(
         } else {
             &output.stderr
         };
-        return Err(ResolveOutcome::Declined {
+        return Err(ResolveOutcome::Failed {
             reason: format!(
                 "{reason_prefix}`{program} {}` exited {:?}: {stderr}",
                 args.join(" "),
@@ -172,27 +178,29 @@ mod tests {
     use super::*;
     use crate::ResolveOutcome;
 
-    /// Unwraps the `Declined` reason string, panicking on `Ok`. Every
-    /// failure branch of `run_or_decline` returns `Err(Declined { .. })`;
-    /// this keeps each assertion focused on the observable reason text.
-    fn declined_reason(result: Result<(), ResolveOutcome>) -> String {
+    /// Unwraps the `Failed` reason string, panicking on `Ok`. Every
+    /// failure branch of `run_or_fail` returns `Err(Failed { .. })` — a
+    /// spawn error or non-zero exit is an operational failure of the
+    /// command the resolver ran, not a clean decline; this keeps each
+    /// assertion focused on the observable reason text.
+    fn failed_reason(result: Result<(), ResolveOutcome>) -> String {
         match result {
-            Err(ResolveOutcome::Declined { reason }) => reason,
-            other => panic!("expected Err(Declined), got {other:?}"),
+            Err(ResolveOutcome::Failed { reason }) => reason,
+            other => panic!("expected Err(Failed), got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn success_returns_ok() {
         let runner = FakeCommandRunner::success();
-        let result = run_or_decline(&runner, Path::new("/w"), "cargo", &["generate-lockfile"], "").await;
+        let result = run_or_fail(&runner, Path::new("/w"), "cargo", &["generate-lockfile"], "").await;
         assert!(result.is_ok(), "successful command should return Ok, got {result:?}");
     }
 
     #[tokio::test]
-    async fn spawn_error_declines_naming_the_program() {
+    async fn spawn_error_fails_naming_the_program() {
         let runner = FakeCommandRunner::spawn_error();
-        let reason = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        let reason = failed_reason(run_or_fail(&runner, Path::new("/w"), "cargo", &["build"], "").await);
         assert!(reason.contains("failed to spawn"), "reason was: {reason}");
         assert!(
             reason.contains("cargo"),
@@ -203,8 +211,8 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_with_stderr_reports_command_code_and_stderr() {
         let runner = FakeCommandRunner::failure("manifest is invalid");
-        let reason = declined_reason(
-            run_or_decline(
+        let reason = failed_reason(
+            run_or_fail(
                 &runner,
                 Path::new("/w"),
                 "cargo",
@@ -238,7 +246,7 @@ mod tests {
         // command that fails but writes nothing to stderr falls back to the
         // literal "(no stderr)" placeholder.
         let runner = FakeCommandRunner::failure("");
-        let reason = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        let reason = failed_reason(run_or_fail(&runner, Path::new("/w"), "cargo", &["build"], "").await);
         assert!(
             reason.contains("(no stderr)"),
             "reason should use the placeholder, was: {reason}"
@@ -254,7 +262,7 @@ mod tests {
         let prefix = "recipe \"schema\" (verify_command): ";
 
         let runner = FakeCommandRunner::failure("boom");
-        let with_prefix = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], prefix).await);
+        let with_prefix = failed_reason(run_or_fail(&runner, Path::new("/w"), "cargo", &["build"], prefix).await);
         assert!(
             with_prefix.starts_with(prefix),
             "reason should start with the verbatim prefix, was: {with_prefix}"
@@ -263,7 +271,7 @@ mod tests {
         // Empty prefix adds nothing: the reason starts with the command
         // backtick rather than any prefix text.
         let runner = FakeCommandRunner::failure("boom");
-        let without_prefix = declined_reason(run_or_decline(&runner, Path::new("/w"), "cargo", &["build"], "").await);
+        let without_prefix = failed_reason(run_or_fail(&runner, Path::new("/w"), "cargo", &["build"], "").await);
         assert!(
             without_prefix.starts_with('`'),
             "empty prefix should add no leading text, was: {without_prefix}"

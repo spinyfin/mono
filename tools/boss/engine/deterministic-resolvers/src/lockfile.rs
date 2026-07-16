@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::ConflictedFile;
 use crate::ResolveOutcome;
-use crate::command::{CommandRunner, run_or_decline};
+use crate::command::{CommandRunner, run_or_fail};
 
 /// `manifest_filename` is the sibling manifest (`Cargo.toml`,
 /// `MODULE.bazel`) the regeneration command reads; it must already be
@@ -47,7 +47,7 @@ pub(crate) async fn regenerate_lockfile(
         };
     }
 
-    if let Err(outcome) = run_or_decline(runner, dir, program, args, "").await {
+    if let Err(outcome) = run_or_fail(runner, dir, program, args, "").await {
         return outcome;
     }
 
@@ -158,7 +158,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declines_with_stderr_when_command_fails() {
+    async fn fails_with_stderr_when_command_fails() {
+        // A non-zero exit from the regeneration command is an operational
+        // failure (the resolver ran, its tool errored) — `Failed`, not a
+        // clean `Declined`. This is the shape of the cold-workspace bazel
+        // env failure: `bazel mod deps` exits non-zero because a gitignored
+        // artifact is absent.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
 
@@ -174,13 +179,13 @@ mod tests {
         .await;
 
         match outcome {
-            ResolveOutcome::Declined { reason } => assert!(reason.contains("manifest is invalid")),
-            other => panic!("expected Declined, got {other:?}"),
+            ResolveOutcome::Failed { reason } => assert!(reason.contains("manifest is invalid")),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn declines_when_spawn_itself_fails() {
+    async fn fails_when_spawn_itself_fails() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
 
@@ -195,7 +200,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, ResolveOutcome::Declined { reason } if reason.contains("failed to spawn")));
+        assert!(matches!(outcome, ResolveOutcome::Failed { reason } if reason.contains("failed to spawn")));
     }
 
     #[tokio::test]

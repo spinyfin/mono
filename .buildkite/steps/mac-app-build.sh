@@ -10,45 +10,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 echo "--- [mac-app-build] building"
 
 # rules_swift_package_manager's swift_deps module extension runs
-# `swift package describe` during every Bazel analysis.  The Package.swift
-# declares a .binaryTarget(path: "ThirdParty/GhosttyKit.xcframework") for
-# SPM-based dev builds; that path is gitignored and built by
-# scripts/bootstrap-ghosttykit.sh.  On CI we only need a stub so that SPM
-# can parse the manifest — the actual Bazel build uses @ghostty_kit from the
-# http_archive defined in MODULE.bazel, not this path.
-XCFW="tools/boss/app-macos/ThirdParty/GhosttyKit.xcframework"
-if [[ ! -f "${XCFW}/Info.plist" ]]; then
-  echo "[mac-app-build] creating GhosttyKit.xcframework stub for SPM describe"
-  mkdir -p "${XCFW}/macos-arm64"
-  cat > "${XCFW}/Info.plist" << 'PLIST_EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>AvailableLibraries</key>
-    <array>
-        <dict>
-            <key>LibraryIdentifier</key>
-            <string>macos-arm64</string>
-            <key>LibraryPath</key>
-            <string>GhosttyKit.a</string>
-            <key>SupportedArchitectures</key>
-            <array><string>arm64</string></array>
-            <key>SupportedPlatform</key>
-            <string>macos</string>
-        </dict>
-    </array>
-    <key>CFBundlePackageType</key>
-    <string>XFWK</string>
-    <key>XCFrameworkFormatVersion</key>
-    <string>1.0</string>
-</dict>
-</plist>
-PLIST_EOF
-  printf 'void GhosttyKit_stub(void) {}\n' | \
-    xcrun clang -arch arm64 -x c - -c -o /tmp/ghosttykit_stub.o -mmacosx-version-min=15.0
-  ar rcs "${XCFW}/macos-arm64/GhosttyKit.a" /tmp/ghosttykit_stub.o
-fi
+# `swift package describe` during every Bazel analysis, which needs a
+# GhosttyKit.xcframework at the gitignored ThirdParty/ path (see the script
+# for the full rationale). Materialize a parse-only stub if it's absent.
+tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 
 bazel build //tools/boss/app-macos/... //tools/boss/installer/...
 # Run every macOS Swift test target, not just BossTests, so the UpdateCore
