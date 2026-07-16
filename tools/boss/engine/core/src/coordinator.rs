@@ -6346,15 +6346,25 @@ impl ExecutionCoordinator {
                 .build(),
         )?;
 
+        // NOTE: for a normal pane spawn this fires ~milliseconds after the
+        // pane comes up — the `WorkRun` tracks the engine's dispatch/spawn
+        // ACTION (a ~5-8s lifetime), NOT the worker's lifetime. `run_status`
+        // going `completed` here while `execution_status` is a LIVE park
+        // (`waiting_human` / `running`) is the worker handing off to its
+        // pane, not the worker finishing. The `parked_live` field makes that
+        // explicit so this line is not misread as "the worker terminalized
+        // 3ms after spawn" (the shell_pid-0-window false alarm); a genuine
+        // terminalization instead logs "execution terminalized: …".
         tracing::info!(
             execution_id = %execution.id,
             run_id = %run.id,
             worker_id,
             execution_status = %execution.status,
             run_status = %run.status,
+            parked_live = execution.status.is_live(),
             attention_created = attention.is_some(),
             released_workspace = released,
-            "execution run completed"
+            "execution run completed (dispatch/spawn run finalized; execution parks at its wait state — LIVE unless a terminal status is shown)"
         );
         self.publisher
             .publish(

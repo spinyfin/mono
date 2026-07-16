@@ -108,6 +108,23 @@ impl WorkDb {
         )?;
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("unknown execution after orphan reap: {execution_id}"))?;
+        // Canonical terminalization trace. `mark_execution_orphaned` is the
+        // stale-reap / dead-pane / lost-workspace terminal-transition site;
+        // its many callers log inconsistently (some not at all), so a run
+        // that went terminal "with no trace line stating the actual cause"
+        // was the exact instrumentation gap behind the ack-timeout /
+        // stale-reap contradiction (a live worker whose execution the engine
+        // had already terminalized). Emit one greppable line naming the
+        // prior status and reason at the moment of the transition, so the
+        // next occurrence is attributable from the trace alone.
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %updated.work_item_id,
+            from_status = %existing.status,
+            to_status = %updated.status,
+            reason = %reason,
+            "execution terminalized: orphan reap",
+        );
         tx.commit()?;
         Ok(updated)
     }
