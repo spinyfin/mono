@@ -1015,7 +1015,13 @@ impl WorkerPool {
 
     /// Claim a **Lower Decks** slot for an automation execution spilling
     /// out of a full automation pool. Returns `None` when page 1 has no
-    /// free slot.
+    /// free slot, or when the live-worker count is already at or above
+    /// `max_concurrent_interactive_workers` — a spilled claim counts
+    /// toward that cap exactly like a mainline claim does (see
+    /// `MAX_CONCURRENT_INTERACTIVE_WORKERS`'s doc), so it must be gated
+    /// the same way. The busy count and the claim happen under the same
+    /// lock hold, so the cap check can never race against a concurrent
+    /// claim on either path.
     ///
     /// Unlike [`Self::claim_worker`], this never considers page 0: a
     /// spilling automation may not take a Bridge Crew slot even when
@@ -1027,8 +1033,13 @@ impl WorkerPool {
         &self,
         execution_id: &str,
         preferred_workspace_id: Option<&str>,
+        max_concurrent_interactive_workers: usize,
     ) -> Option<String> {
         let mut inner = self.inner.lock().await;
+        let busy = inner.workers.iter().filter(|w| w.execution_id.is_some()).count();
+        if busy >= max_concurrent_interactive_workers {
+            return None;
+        }
         let views: Vec<crate::dispatch_spillover::SlotView> = inner
             .workers
             .iter()
@@ -2692,18 +2703,70 @@ impl ExecutionCoordinator {
             // is a different story: it claims an interactive-pool slot (see
             // `claim_worker_spill`), so it DOES count toward the live number
             // this cap compares against — see the constant's doc for why
-            // that's intentional. The actual gate lives at the claim site
-            // below (search
-            // `interactive_concurrency_cap`), not here: it must run AFTER
-            // the once-per-pass automation-preemption fallback gets its
-            // chance, because a preemption is a trade (one live worker for
+            // that's intentional.
+            //
+            // Checked BEFORE `request_recorded` (same invariant the earlier,
+            // pre-preemption gate carried): a capped row must never enter
+            // the dispatch pipeline — no `RequestRecorded` emission, no
+            // `picked_up` log, no chain-hold check, no merge_order stagger —
+            // since none of that reflects what actually happened to it. The
+            // ONE exception is the once-per-pass automation-preemption
+            // fallback: a preemption is a trade (one live worker for
             // another), not growth in the live-worker count, so it can
-            // never itself push the pool over the cap. Gating here, before
-            // that fallback ever runs, would make every mainline row that
-            // arrives at the cap starve permanently — including in the
-            // "every interactive slot is full" case the preemption feature
-            // exists to resolve. See the constant's doc for rationale and
-            // removal criteria.
+            // never itself push the pool over the cap, and capped rows must
+            // still get a chance at it or they'd starve permanently whenever
+            // every interactive slot is full — exactly the case preemption
+            // exists to resolve. A capped row that wins via preemption falls
+            // straight through to `dispatch_claimed_execution` (which does
+            // its own `WorkerClaimed` emit); a capped row that doesn't is
+            // deferred here with the `interactive_concurrency_cap` reason
+            // and never touches the pipeline below. See the constant's doc
+            // for rationale and removal criteria.
+            let live_workers_at_cap_check = if is_main {
+                Some(self.worker_pool.busy_count().await)
+            } else {
+                None
+            };
+            let capped = live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers);
+
+            if capped {
+                let claimed = if preempted_this_pass {
+                    None
+                } else {
+                    match self.try_preempt_automation_for(&execution).await {
+                        // Latch on the teardown having happened, NOT on
+                        // having won the slot — see `PreemptionAttempt`.
+                        PreemptionAttempt::Preempted { claimed } => {
+                            preempted_this_pass = true;
+                            claimed
+                        }
+                        PreemptionAttempt::NotPreempted => None,
+                    }
+                };
+                let Some(worker_id) = claimed else {
+                    let live_workers = live_workers_at_cap_check.unwrap_or_default();
+                    let cap = self.max_concurrent_interactive_workers;
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        pool = pool_label,
+                        live_workers,
+                        cap,
+                        "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
+                    );
+                    self.record_dispatch_wait_reason(
+                        &execution.id,
+                        &format!(
+                            "Held by the interactive concurrency cap ({live_workers}/{cap} \
+                             workers live) — dispatches as workers finish"
+                        ),
+                    );
+                    continue;
+                };
+                self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false)
+                    .await;
+                continue;
+            }
 
             // Dispatch-class + "why it won" bookkeeping (operator directive:
             // revisions before tasks/chores, ordered by revision kind).
@@ -2926,26 +2989,13 @@ impl ExecutionCoordinator {
 
             let pool = self.pool_for_execution(&execution);
 
-            // interactive_concurrency_cap: the TEMPORARY cap gate (see the
-            // comment above, near `is_main`/`is_automation` classification).
-            // A capped mainline row never gets to claim a genuinely idle
-            // slot outright — that would just grow the live-worker count
-            // past the cap — but it still falls through to the once-per-pass
-            // preemption fallback below, since a preemption trade leaves the
-            // live-worker count unchanged.
-            let live_workers_at_cap_check = if is_main {
-                Some(self.worker_pool.busy_count().await)
-            } else {
-                None
-            };
-            let capped = live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers);
-
-            let claimed = if capped {
-                None
-            } else {
-                pool.claim_worker(&execution.id, preferred_workspace_id.as_deref())
-                    .await
-            };
+            // Not capped (capped mainline rows already `continue`d above,
+            // either dispatched via preemption or deferred with
+            // `interactive_concurrency_cap`), so a genuinely idle slot is
+            // fair game.
+            let claimed = pool
+                .claim_worker(&execution.id, preferred_workspace_id.as_deref())
+                .await;
 
             // A mainline row that missed its slot gets ONE chance to
             // reclaim interactive capacity from a spilled automation run
@@ -2968,27 +3018,6 @@ impl ExecutionCoordinator {
                 }
                 None => None,
             };
-
-            if claimed.is_none() && capped {
-                let live_workers = live_workers_at_cap_check.unwrap_or_default();
-                let cap = self.max_concurrent_interactive_workers;
-                tracing::info!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    pool = pool_label,
-                    live_workers,
-                    cap,
-                    "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
-                );
-                self.record_dispatch_wait_reason(
-                    &execution.id,
-                    &format!(
-                        "Held by the interactive concurrency cap ({live_workers}/{cap} \
-                         workers live) — dispatches as workers finish"
-                    ),
-                );
-                continue;
-            }
 
             let Some(worker_id) = claimed else {
                 // This pool is fully claimed. Record exhaustion and continue
@@ -3079,20 +3108,34 @@ impl ExecutionCoordinator {
         // mainline work.
         for execution in spill_candidates {
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            // Re-read per candidate: each successful spill in this loop
+            // raises the live-worker count, so a cap snapshotted once
+            // before the loop would let later candidates in the same
+            // pass slip past it. See `claim_worker_spill`'s doc for why
+            // spilled automation counts toward this cap at all.
             let Some(worker_id) = self
                 .worker_pool
-                .claim_worker_spill(&execution.id, preferred_workspace_id.as_deref())
+                .claim_worker_spill(
+                    &execution.id,
+                    preferred_workspace_id.as_deref(),
+                    self.max_concurrent_interactive_workers,
+                )
                 .await
             else {
-                // No free Lower Decks slot either: this automation row
-                // waits, exactly as it did before spillover existed.
+                // No free Lower Decks slot either, or the interactive
+                // concurrency cap is already saturated: this automation
+                // row waits, exactly as it did before spillover existed.
                 let pool_capacity = self.automation_pool.capacity().await;
+                let live_workers = self.worker_pool.busy_count().await;
+                let cap = self.max_concurrent_interactive_workers;
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
                     pool_capacity,
+                    live_workers,
+                    cap,
                     pool = "automation",
-                    "spawn_attempt status=ready -> deferred reason=pool_exhausted (no Lower Decks slot to spill into)"
+                    "spawn_attempt status=ready -> deferred reason=pool_exhausted (no Lower Decks slot to spill into, or interactive_concurrency_cap reached)"
                 );
                 self.dispatch_events
                     .emit(
@@ -12122,6 +12165,66 @@ mod tests {
             1,
             "one mainline arrival must preempt exactly one automation run; got {:?}",
             preemptor.calls().await
+        );
+    }
+
+    /// Regression test: spilled automation must never push live
+    /// interactive-pool workers past `max_concurrent_interactive_workers`,
+    /// even when the automation pool is full, Lower Decks has physically
+    /// free slots, and no mainline row is ready to trigger preemption.
+    /// Before the fix, `claim_worker_spill` never consulted the cap at
+    /// all, so this scenario let live interactive workers double the cap.
+    #[tokio::test]
+    async fn spilled_automation_does_not_exceed_the_interactive_concurrency_cap() {
+        const MAIN_POOL: usize = WORKER_PAGE_SIZE * 2; // 8 Bridge Crew + 8 Lower Decks
+        const CAP: usize = WORKER_PAGE_SIZE; // cap == Bridge Crew size: no spill room at all
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+
+        // Fill every Bridge Crew slot with mainline work, so busy_count()
+        // already equals the cap before automation ever gets a look.
+        for n in 0..WORKER_PAGE_SIZE {
+            create_test_chore(&db, product.id.clone(), format!("Bridge chore {n}"));
+        }
+        // More automation work than the (small) automation pool can hold,
+        // so several rows become Lower Decks spill candidates.
+        create_automation_chores(&db, &product.id, WORKER_PAGE_SIZE + 2);
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let pool = WorkerPool::new(MAIN_POOL);
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            pool,
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        )
+        .with_max_concurrent_interactive_workers(CAP);
+        coord.set_automation_pool(WorkerPool::new_automation(2));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        // 8 Bridge Crew mainline + 2 automation running in their own pool.
+        wait_for_running_count(&db, WORKER_PAGE_SIZE + 2).await;
+
+        // Give any (incorrect) spill claim a chance to land.
+        sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            coordinator.worker_pool().busy_count().await,
+            CAP,
+            "spilled automation must never push live interactive-pool workers past the cap; claims={:?}",
+            coordinator.worker_pool().claims().await,
+        );
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            MAIN_POOL - CAP,
+            "Lower Decks slots must stay idle while the interactive cap is already \
+             saturated by mainline, with no mainline row ready to trade via preemption"
         );
     }
 
