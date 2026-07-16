@@ -20,7 +20,7 @@ fn boothby_state_event(server_state: &ServerState, work_db: &WorkDb) -> Result<F
         .get_text(crate::boothby_scheduler::SETTING_MODE)
         .unwrap_or_else(|| crate::boothby_scheduler::BOOTHBY_MODE_PROPOSE.to_owned());
     let open_pass = work_db.get_open_boothby_pass()?;
-    let last_pass = work_db.list_boothby_passes(1)?.into_iter().next();
+    let last_pass = work_db.last_finished_boothby_pass()?;
     Ok(FrontendEvent::BoothbyState {
         mode,
         open_pass,
@@ -86,24 +86,42 @@ pub(super) async fn handle_run_boothby_pass(ctx: Dispatch, req: FrontendRequest)
 
     // Manual fire (`boss boothby run` / the tab's "Run now" button): bypasses
     // the schedule and `boothby.min_pass_gap_secs` — this is explicit human
-    // intent — but `run_and_finish_pass` still refuses a second concurrent
-    // pass via `open_boothby_pass`'s single-flight check.
+    // intent — but opening still refuses a second concurrent pass via
+    // `open_boothby_pass`'s single-flight check. Per `BoothbyPassStarted`'s
+    // documented contract, this handler replies as soon as the pass opens
+    // rather than waiting for it to finish — the run/finish remainder runs
+    // in a spawned task, and its terminal state reaches clients via the
+    // `boothby.activity` topic push `run_and_finish_opened_pass` performs.
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let pass_timeout = server_state
         .settings
         .get_text_i64(crate::boothby_scheduler::SETTING_PASS_TIMEOUT_SECS)
         .unwrap_or(900);
-    let outcome = crate::boothby_scheduler::run_and_finish_pass(
+    let opened = crate::boothby_scheduler::open_and_announce_pass(
         &work_db,
-        &crate::boothby_scheduler::NothingToDoPassRunner,
         server_state.as_ref(),
         boss_protocol::BOOTHBY_TRIGGER_MANUAL,
         now,
-        pass_timeout,
     )
     .await;
-    match outcome {
-        Some(pass) => send_response(&sink, &request_id, FrontendEvent::BoothbyPassStarted { pass }),
+    match opened {
+        Some(pass) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::BoothbyPassStarted { pass: pass.clone() },
+            );
+            tokio::spawn(async move {
+                crate::boothby_scheduler::run_and_finish_opened_pass(
+                    &work_db,
+                    &crate::boothby_scheduler::NothingToDoPassRunner,
+                    server_state.as_ref(),
+                    pass,
+                    pass_timeout,
+                )
+                .await;
+            });
+        }
         None => send_response(
             &sink,
             &request_id,
