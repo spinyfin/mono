@@ -217,6 +217,17 @@ pub enum ReviewFindingCategory {
     /// of work an agent could actually do.
     #[serde(rename = "deferred_scope")]
     DeferredScope,
+    /// A code comment that only makes sense to the agent that wrote it: it
+    /// narrates the historical lineage of a change ("we used to do X, but
+    /// removed it because Y") instead of describing the current state of the
+    /// code, references a Boss construct (a work item id, phase, or brief —
+    /// e.g. "implements T234 phase 7"), or refers to the human directing
+    /// Boss as "the operator" or to actors in general instead of stating the
+    /// underlying reason directly. Forces a revision regardless of assigned
+    /// severity (see [`passes_severity_gate`]) — the same treatment as
+    /// [`Self::Regression`], [`Self::Duplication`], and [`Self::DeferredScope`].
+    #[serde(rename = "agent_isms")]
+    AgentIsms,
 }
 
 /// Reviewer's confidence in a finding.
@@ -449,7 +460,12 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
 /// - any finding with `category = DeferredScope` (regardless of severity) —
 ///   undeclared/misdeclared deferred scope or a malformed `[deferred-scope]`
 ///   marker is a process gap the engine cannot otherwise catch, so it gets
-///   the same forcing treatment as regression/duplication.
+///   the same forcing treatment as regression/duplication, **or**
+/// - any finding with `category = AgentIsms` (regardless of severity) — a
+///   code comment that narrates the change's history, names a Boss work
+///   item/phase/brief, or calls the directing human "the operator" reads as
+///   agent scaffolding left behind in the codebase, so it gets the same
+///   forcing treatment as regression/duplication/deferred-scope.
 ///
 /// `revision_warranted = false` in the `ReviewResult` does not suppress the
 /// gate — the engine's own threshold governs.
@@ -463,6 +479,7 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
             ReviewFindingCategory::Regression
                 | ReviewFindingCategory::Duplication
                 | ReviewFindingCategory::DeferredScope
+                | ReviewFindingCategory::AgentIsms
         )
     })
 }
@@ -525,6 +542,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
             ReviewFindingCategory::EdgeCase => "edgecase",
             ReviewFindingCategory::Duplication => "duplication",
             ReviewFindingCategory::DeferredScope => "deferred_scope",
+            ReviewFindingCategory::AgentIsms => "agent_isms",
         };
         out.push_str(&format!(
             "### [{severity}] {title}\n\
@@ -868,7 +886,7 @@ pub fn render_reviewer_initial_prompt(
            \"findings\": [\n\
              {{\n\
                \"severity\": \"critical | high | medium | low\",\n\
-               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope\",\n\
+               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope | agent_isms\",\n\
                \"file\": \"path/to/file.rs\",\n\
                \"location\": \"fn foo, ~L42\",\n\
                \"title\": \"<short scannable title>\",\n\
@@ -887,8 +905,9 @@ pub fn render_reviewer_initial_prompt(
          \n\
          - `revision_warranted`: set to `true` when there is at least one \
            finding at `critical`/`high` severity, or any finding with \
-           `category: \"regression\"`, `category: \"duplication\"`, or \
-           `category: \"deferred_scope\"`, regardless of severity. Set to \
+           `category: \"regression\"`, `category: \"duplication\"`, \
+           `category: \"deferred_scope\"`, or `category: \"agent_isms\"`, \
+           regardless of severity. Set to \
            `false` for findings that are purely `medium`/`low` \
            correctness/style (the engine applies its own gate on top).\n\
          - `regression_check.performed` MUST be `true` — you cannot skip the \
@@ -1079,6 +1098,36 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                you assign it — the same treatment as a regression or \
                duplication finding: an undeclared or unrecorded deferral is \
                a process gap, not a style nit.\n\
+             - **Agent-isms in code comments** *(first-class, explicit \
+               check)* — read every new or changed comment in the diff and \
+               flag any that only makes sense to the agent that wrote it, \
+               not to a human maintainer reading the code cold:\n\
+               (1) **Historical narration** — a comment that describes how \
+               the code came to be instead of what it currently does (e.g. \
+               \"we used to blah blah, but that was removed because foo \
+               foo\"). Comments must represent the *state* of the code, not \
+               its lineage, unless that history is strongly meaningful to \
+               future maintainers (a genuine gotcha, a workaround for a \
+               specific external bug, a non-obvious invariant). When you \
+               flag one, quote the offending comment and propose replacement \
+               wording that states the current behaviour/reason instead.\n\
+               (2) **Boss-construct references** — a comment must never name \
+               a Boss work item id, phase, or brief. Example violation: \
+               \"This implements T234 phase 7.\" Quote the comment and \
+               propose wording that describes what the code does instead of \
+               where the instruction to write it came from.\n\
+               (3) **\"The operator\" / actor references** — a comment must \
+               not refer to the human directing Boss as \"the operator\", nor \
+               to actors in general. Prefer \"We want to avoid showing a \
+               card here because...\" over \"The operator requested that no \
+               card is shown here.\" Quote the comment and propose wording \
+               that states the reason directly, without naming who asked \
+               for it.\n\
+               (`category: \"agent_isms\"`) Any confirmed finding in this \
+               dimension forces a revision regardless of the severity you \
+               assign it — the same treatment as regression, duplication, \
+               and deferred-scope findings: agent-authored scaffolding left \
+               in comments is a process gap, not a style nit.\n\
              - **Code quality/readability** — fails to match surrounding style, \
                naming issues, dead/confusing code. (`category: \"readability\"`)\n\
              - **Lint/warning suppressions** — scrutinize every new \
@@ -1630,6 +1679,74 @@ mod tests {
         );
     }
 
+    /// The agent-isms rubric dimension (operator directive: code comments
+    /// that only make sense to the agent that wrote them — historical
+    /// narration, Boss work-item/phase/brief references, or "the operator"/
+    /// actor phrasing — are revision-required findings, not advisory nits)
+    /// must be present with all three detection modes plus the
+    /// revision-forcing note and the operator's own examples.
+    #[test]
+    fn code_scope_prompt_contains_agent_isms_dimension() {
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement the new feature.",
+            "https://github.com/org/repo/pull/2100",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            None,
+            "org/repo",
+        );
+        assert!(
+            prompt.contains("Agent-isms in code comments"),
+            "code rubric must contain an explicit agent-isms dimension"
+        );
+        assert!(
+            prompt.contains("Historical narration"),
+            "rubric must cover historical-narration comments (lineage instead of current state)"
+        );
+        assert!(
+            prompt.contains("we used to blah blah, but that was removed because foo"),
+            "rubric must include the operator's historical-narration example"
+        );
+        assert!(
+            prompt.contains("Boss-construct references"),
+            "rubric must cover comments naming Boss work items/phases/briefs"
+        );
+        assert!(
+            prompt.contains("This implements T234 phase 7"),
+            "rubric must include the operator's Boss-construct example"
+        );
+        assert!(
+            prompt.contains("\"the operator\""),
+            "rubric must cover comments referring to the directing human as \"the operator\""
+        );
+        assert!(
+            prompt.contains("We want to avoid showing a card here because")
+                && prompt.contains("The operator requested that no card is shown here"),
+            "rubric must include the operator's before/after example for actor references"
+        );
+        assert!(
+            prompt.contains("quote the offending comment and propose replacement"),
+            "rubric must instruct the reviewer to quote the comment and propose replacement wording"
+        );
+        assert!(
+            prompt.contains("\"agent_isms\""),
+            "rubric must name the agent_isms category"
+        );
+        assert!(
+            prompt.contains("forces a revision regardless of the severity"),
+            "rubric must state agent-isms findings are revision-required, not advisory"
+        );
+        let revision_warranted_offset = prompt
+            .find("`revision_warranted`: set to `true`")
+            .expect("prompt must state the revision_warranted rule");
+        let rule_text = &prompt[revision_warranted_offset..revision_warranted_offset + 400];
+        assert!(
+            rule_text.contains("category: \"agent_isms\""),
+            "revision_warranted rule must cover the agent_isms category: {rule_text}"
+        );
+    }
+
     // --- revision-triggered review context (2026-07-01 experiment) ---
 
     /// When `last_reviewed_sha` is set (a revision pushed after a prior
@@ -1861,6 +1978,7 @@ mod tests {
             (ReviewFindingCategory::EdgeCase, "\"edgecase\""),
             (ReviewFindingCategory::Duplication, "\"duplication\""),
             (ReviewFindingCategory::DeferredScope, "\"deferred_scope\""),
+            (ReviewFindingCategory::AgentIsms, "\"agent_isms\""),
         ] {
             let json = serde_json::to_string(&cat).unwrap();
             assert_eq!(json, expected);
@@ -2423,6 +2541,32 @@ mod tests {
         assert!(
             passes_severity_gate(&result),
             "a deferred-scope finding must force a revision even at low severity"
+        );
+    }
+
+    /// Agent-isms in code comments must force a revision exactly like
+    /// regression/duplication/deferred-scope findings, regardless of
+    /// assigned severity — agent-authored scaffolding left in comments is a
+    /// process gap, not a style nit.
+    #[test]
+    fn severity_gate_passes_on_agent_isms_regardless_of_severity() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Low,
+                ReviewFindingCategory::AgentIsms,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(
+            passes_severity_gate(&result),
+            "an agent-isms finding must force a revision even at low severity"
         );
     }
 
