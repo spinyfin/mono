@@ -489,6 +489,9 @@ impl TopicBroker {
                 added.push(topic.to_owned());
             }
         }
+        if !added.is_empty() {
+            tracing::debug!(session_id, topics = ?added, "topic broker: session subscribed");
+        }
         added
     }
 
@@ -524,6 +527,9 @@ impl TopicBroker {
             inner.topics_by_session.remove(session_id);
         }
 
+        if !removed.is_empty() {
+            tracing::debug!(session_id, topics = ?removed, "topic broker: session unsubscribed");
+        }
         removed
     }
 
@@ -551,11 +557,25 @@ impl TopicBroker {
                 .collect::<Vec<_>>()
         };
 
+        // A push with zero recipients means the topic currently has no
+        // subscribed session — the event is silently dropped rather than
+        // queued, so this is the one line that turns a "missed frontend
+        // push" report from forensics into a grep (see T2764: a
+        // `CiRemediationStarted` push vanished during an unsubscribed
+        // window and stranded a stale badge for up to 24h).
+        if sinks.is_empty() {
+            tracing::debug!(topic, "topic broker: publish had no subscribed sessions");
+        }
+
+        let mut enqueued_count = 0usize;
+        let mut closed_count = 0usize;
         let mut slow = Vec::new();
         for (session_id, sink) in sinks {
             match sink.enqueue(envelope.clone()) {
-                EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Closed => {}
+                EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced => enqueued_count += 1,
+                EnqueueOutcome::Closed => closed_count += 1,
                 EnqueueOutcome::Degraded => {
+                    enqueued_count += 1;
                     let stats = sink.queue_stats();
                     tracing::debug!(
                         session_id = %session_id,
@@ -567,6 +587,14 @@ impl TopicBroker {
                 }
                 EnqueueOutcome::Slow => slow.push((session_id, sink)),
             }
+        }
+
+        // Logged after the enqueue loop (not against `sinks.len()`) so the
+        // count reflects sessions the event actually reached — a push to a
+        // sink whose session already closed no longer inflates this to look
+        // like a real delivery (see the finding on PR #2068).
+        if enqueued_count > 0 || closed_count > 0 {
+            tracing::debug!(topic, enqueued_count, closed_count, "topic broker: publish delivered");
         }
 
         for (session_id, sink) in slow {
