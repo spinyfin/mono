@@ -39,6 +39,7 @@ rust_library(
         "//lib/rust/git_utils",
         "//tools/boss/claude_client",
         "//tools/boss/engine/conflict-diagnosis",
+        "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/deterministic-resolvers",
         "//tools/boss/engine/driver",
         "//tools/boss/engine/editorial",

@@ -13,15 +13,15 @@
 //!   `kind`         – snake_case discriminant (e.g. `"release_worker_pane"`)
 //!   `body`         – the full serialised request or response payload
 //!
-//! Built on the generic day-rotated writer in [`crate::day_rotated_log`].
+//! Built on the generic day-rotated writer in [`boss_engine_day_rotated_log`].
 
 use std::path::PathBuf;
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::day_rotated_log::{DayRotatedLogger, TimestampedRecord};
 use crate::protocol::{EngineToAppRequest, EngineToAppResponse};
+use boss_engine_day_rotated_log::{DayRotatedLogger, TimestampedRecord};
 
 const FILE_PREFIX: &str = "ipc-";
 
@@ -64,7 +64,7 @@ impl IpcLogger {
     /// Log an outbound request (engine → app).
     pub fn log_request(&self, request_id: &str, request: &EngineToAppRequest) {
         self.send(IpcLogEntry {
-            ts_epoch_ms: crate::day_rotated_log::now_ms(),
+            ts_epoch_ms: boss_engine_day_rotated_log::now_ms(),
             direction: "engine→app",
             request_id: request_id.to_owned(),
             kind: request_kind(request),
@@ -75,7 +75,7 @@ impl IpcLogger {
     /// Log an inbound response (app → engine).
     pub fn log_response(&self, request_id: &str, response: &EngineToAppResponse) {
         self.send(IpcLogEntry {
-            ts_epoch_ms: crate::day_rotated_log::now_ms(),
+            ts_epoch_ms: boss_engine_day_rotated_log::now_ms(),
             direction: "app→engine",
             request_id: request_id.to_owned(),
             kind: response_kind(response),

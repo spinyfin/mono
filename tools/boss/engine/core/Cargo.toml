@@ -25,6 +25,7 @@ boss-log-files = { path = "../../log-files" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
+boss-engine-day-rotated-log = { path = "../day-rotated-log" }
 boss-engine-transient-error = { path = "../transient-error" }
 boss-engine-utils = { path = "../utils" }
 boss-transcript-tail = { path = "../transcript-tail" }

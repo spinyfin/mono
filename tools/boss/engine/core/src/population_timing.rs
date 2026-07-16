@@ -43,7 +43,7 @@
 //! (`<boss-state-root>` = `~/Library/Application Support/Boss`, overridable
 //! for local runs / tests via `BOSS_ENGINE_DIAGNOSTICS_DIR`.) Rotation,
 //! retention, and the background-writer task are the generic machinery in
-//! [`crate::day_rotated_log`], shared with [`crate::ipc_log`].
+//! the generic `boss_engine_day_rotated_log` crate, shared with `crate::ipc_log`.
 //!
 //! # Correlation
 //!
@@ -64,7 +64,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::day_rotated_log::DayRotatedLogger;
+use boss_engine_day_rotated_log::DayRotatedLogger;
 
 /// Environment override for the diagnostics directory. When set (and
 /// non-empty after trimming) the day files are written under this path
@@ -146,7 +146,7 @@ pub struct EnginePopulationRecord {
     pub items: Option<i64>,
 }
 
-impl crate::day_rotated_log::TimestampedRecord for EnginePopulationRecord {
+impl boss_engine_day_rotated_log::TimestampedRecord for EnginePopulationRecord {
     fn ts_epoch_ms(&self) -> u128 {
         self.ts_epoch_ms
     }
@@ -310,7 +310,7 @@ impl PopulationTrace {
         }
         self.segments.push(
             PendingSegment::builder()
-                .ts_epoch_ms(crate::day_rotated_log::now_ms())
+                .ts_epoch_ms(boss_engine_day_rotated_log::now_ms())
                 .segment(segment)
                 .duration_ms(duration_ms)
                 .maybe_rows(rows)
@@ -365,7 +365,7 @@ pub fn elapsed_ms(start: Instant) -> f64 {
 const FILE_PREFIX: &str = "engine-population-timing-";
 
 /// Non-blocking, append-only day-rotated writer for the engine
-/// population-timing log. Built on [`crate::day_rotated_log::DayRotatedLogger`],
+/// population-timing log. Built on [`boss_engine_day_rotated_log::DayRotatedLogger`],
 /// the same machinery [`crate::ipc_log::IpcLogger`] uses.
 pub struct PopulationTimingLog {
     inner: DayRotatedLogger<EnginePopulationRecord>,
@@ -604,7 +604,7 @@ mod tests {
         let log = PopulationTimingLog::new(dir.path());
 
         log.emit(EnginePopulationRecord {
-            ts_epoch_ms: crate::day_rotated_log::now_ms(),
+            ts_epoch_ms: boss_engine_day_rotated_log::now_ms(),
             product_id: "prod-1".to_owned(),
             request_id: "req-1".to_owned(),
             fetch_seq: Some(3),
