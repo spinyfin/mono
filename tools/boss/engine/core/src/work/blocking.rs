@@ -1987,3 +1987,345 @@ impl WorkDb {
         Ok(updated)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{create_test_chore_manual, create_test_product_named};
+    use std::path::PathBuf;
+
+    /// Per-test named shared-cache in-memory db (see `work::comments::tests`).
+    fn mem_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// Force `products.ci_attempt_budget` to a raw value, bypassing the
+    /// clamp `set_ci_attempt_budget` applies — lets us exercise
+    /// `effective_ci_budget`'s own clamp on a product-level default.
+    fn set_product_ci_budget(db: &WorkDb, product_id: &str, budget: i64) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE products SET ci_attempt_budget = ?2 WHERE id = ?1",
+                params![product_id, budget],
+            )
+            .unwrap();
+    }
+
+    /// Stand up a chore in the `in_review` state (with a PR url) that the
+    /// `mark_chore_blocked_*` WHERE guards require as their entry condition.
+    /// Returns the chore id.
+    fn in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+        let chore = create_test_chore_manual(db, product_id, "Chore under blocking tests");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                params![chore.id, pr_url],
+            )
+            .unwrap();
+        chore.id
+    }
+
+    /// `true` when an uncleared signal with `reason` sits on `work_item_id`.
+    fn has_active_signal(db: &WorkDb, work_item_id: &str, reason: &str) -> bool {
+        db.active_blocked_signals(work_item_id)
+            .unwrap()
+            .iter()
+            .any(|s| s.reason == reason)
+    }
+
+    // ── effective_ci_budget ─────────────────────────────────────────────
+
+    #[test]
+    fn effective_ci_budget_defaults_to_three_for_unknown_task() {
+        let db = mem_db();
+        // No task, no product to join — the documented fallback is 3.
+        assert_eq!(db.effective_ci_budget("nope").unwrap(), 3);
+    }
+
+    #[test]
+    fn effective_ci_budget_falls_back_to_product_default_of_three() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "budget-fallback");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+        // Neither the task nor the product carries an override, so the
+        // COALESCE(p.ci_attempt_budget, 3) default surfaces.
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 3);
+    }
+
+    #[test]
+    fn effective_ci_budget_uses_product_default_when_no_per_pr_override() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "budget-product-default");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+        set_product_ci_budget(&db, &product.id, 7);
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 7);
+    }
+
+    #[test]
+    fn effective_ci_budget_per_pr_override_wins_over_product_default() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "budget-per-pr");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+        set_product_ci_budget(&db, &product.id, 7);
+        db.set_ci_attempt_budget(&chore.id, Some(5)).unwrap();
+        // The per-PR override (5) shadows the product default (7).
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 5);
+    }
+
+    #[test]
+    fn effective_ci_budget_clamps_out_of_range_product_default() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "budget-clamp");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+        // A misconfigured product default above the hard cap clamps to 10.
+        set_product_ci_budget(&db, &product.id, 50);
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 10);
+        // A negative default clamps up to 0.
+        set_product_ci_budget(&db, &product.id, -4);
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 0);
+    }
+
+    // ── set_ci_attempt_budget ───────────────────────────────────────────
+
+    #[test]
+    fn set_ci_attempt_budget_clamps_high_and_low_in_snapshot() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "set-clamp");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+
+        let hi = db.set_ci_attempt_budget(&chore.id, Some(99)).unwrap().unwrap();
+        assert_eq!(hi.per_pr_override, Some(10), "an above-cap override is stored clamped");
+        assert_eq!(hi.effective, 10);
+
+        let lo = db.set_ci_attempt_budget(&chore.id, Some(-7)).unwrap().unwrap();
+        assert_eq!(lo.per_pr_override, Some(0), "a negative override clamps to 0");
+        assert_eq!(lo.effective, 0);
+    }
+
+    #[test]
+    fn set_ci_attempt_budget_none_clears_override_back_to_product_default() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "set-clear");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+
+        db.set_ci_attempt_budget(&chore.id, Some(8)).unwrap();
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 8);
+
+        let cleared = db.set_ci_attempt_budget(&chore.id, None).unwrap().unwrap();
+        assert_eq!(cleared.per_pr_override, None, "None clears the override");
+        // With the override gone, the product default (unset → 3) applies.
+        assert_eq!(cleared.effective, 3);
+        assert_eq!(db.effective_ci_budget(&chore.id).unwrap(), 3);
+    }
+
+    #[test]
+    fn set_ci_attempt_budget_unknown_task_returns_none() {
+        let db = mem_db();
+        assert!(db.set_ci_attempt_budget("nope", Some(4)).unwrap().is_none());
+    }
+
+    // ── ci_attempts_used counters ───────────────────────────────────────
+
+    #[test]
+    fn ci_attempts_used_defaults_to_zero() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "attempts-default");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+        assert_eq!(db.get_ci_attempts_used(&chore.id).unwrap(), 0);
+        // An unknown task reads 0 rather than erroring.
+        assert_eq!(db.get_ci_attempts_used("nope").unwrap(), 0);
+    }
+
+    #[test]
+    fn increment_ci_attempts_used_bumps_the_counter() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "attempts-bump");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+        db.increment_ci_attempts_used(&chore.id).unwrap();
+        db.increment_ci_attempts_used(&chore.id).unwrap();
+        assert_eq!(db.get_ci_attempts_used(&chore.id).unwrap(), 2);
+        db.reset_ci_attempts_used(&chore.id).unwrap();
+        assert_eq!(db.get_ci_attempts_used(&chore.id).unwrap(), 0);
+    }
+
+    // ── active_blocked_signals ──────────────────────────────────────────
+
+    #[test]
+    fn active_blocked_signals_empty_for_untouched_task() {
+        let db = mem_db();
+        assert!(db.active_blocked_signals("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_blocked_signals_reflects_arm_clear_and_reobserve() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "signals-cycle");
+        let pr_url = "https://github.com/spinyfin/mono/pull/900";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+
+        // Arm: flipping to blocked upserts an active merge_conflict signal.
+        db.mark_chore_blocked_merge_conflict(&chore, pr_url)
+            .unwrap()
+            .expect("in_review chore flips to blocked: merge_conflict");
+        assert!(has_active_signal(&db, &chore, "merge_conflict"));
+
+        // Clear: leaving the blocked state marks the signal cleared, so it
+        // no longer appears among the active rows.
+        db.clear_chore_blocked_merge_conflict(&chore, pr_url)
+            .unwrap()
+            .expect("the chore flips back to in_review");
+        assert!(
+            !has_active_signal(&db, &chore, "merge_conflict"),
+            "a cleared signal drops out of the active snapshot"
+        );
+        assert!(db.active_blocked_signals(&chore).unwrap().is_empty());
+
+        // Re-observe: a fresh flip re-arms the signal (a new active row).
+        db.mark_chore_blocked_merge_conflict(&chore, pr_url)
+            .unwrap()
+            .expect("re-flips to blocked: merge_conflict");
+        assert!(
+            has_active_signal(&db, &chore, "merge_conflict"),
+            "re-observing the condition re-arms the signal"
+        );
+    }
+
+    #[test]
+    fn active_blocked_signals_returns_only_uncleared_rows() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "signals-uncleared");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "c");
+
+        // Two side-table upserts on distinct reasons, then clear one.
+        db.record_merge_conflict_in_flight(&chore.id, "att-mc").unwrap();
+        db.record_ci_failure_in_flight(&chore.id, "att-ci").unwrap();
+        assert_eq!(db.active_blocked_signals(&chore.id).unwrap().len(), 2);
+
+        db.clear_ci_failure_signal_only(&chore.id).unwrap();
+        let active = db.active_blocked_signals(&chore.id).unwrap();
+        assert_eq!(active.len(), 1, "only the uncleared row remains active");
+        assert_eq!(active[0].reason, "merge_conflict");
+        assert!(active.iter().all(|s| s.cleared_at.is_none()));
+    }
+
+    // ── rearm_blocked_merge_conflict_signal ─────────────────────────────
+
+    #[test]
+    fn rearm_merge_conflict_returns_false_when_task_not_blocked() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-mc-unblocked");
+        let pr_url = "https://github.com/spinyfin/mono/pull/901";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+
+        // The chore is merely in_review, never flipped — leave the row alone.
+        assert!(!db.rearm_blocked_merge_conflict_signal(&chore).unwrap());
+        assert!(
+            !has_active_signal(&db, &chore, "merge_conflict"),
+            "a false return must not arm a signal"
+        );
+    }
+
+    #[test]
+    fn rearm_merge_conflict_reupserts_when_task_is_blocked() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-mc-blocked");
+        let pr_url = "https://github.com/spinyfin/mono/pull/902";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+        db.mark_chore_blocked_merge_conflict(&chore, pr_url)
+            .unwrap()
+            .expect("flips to blocked: merge_conflict");
+
+        // Simulate the T230 drift: the signal row was cleared prematurely
+        // while the task stayed blocked.
+        db.clear_merge_conflict_signal_only(&chore).unwrap();
+        assert!(!has_active_signal(&db, &chore, "merge_conflict"));
+
+        // Re-arm: task IS blocked: merge_conflict, so it returns true and
+        // restores the active signal.
+        assert!(db.rearm_blocked_merge_conflict_signal(&chore).unwrap());
+        assert!(has_active_signal(&db, &chore, "merge_conflict"));
+    }
+
+    #[test]
+    fn rearm_merge_conflict_returns_false_for_a_differently_blocked_task() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-mc-other");
+        let pr_url = "https://github.com/spinyfin/mono/pull/903";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+        db.mark_chore_blocked_ci_failure(&chore, pr_url, None)
+            .unwrap()
+            .expect("flips to blocked: ci_failure");
+
+        // Blocked, but on the wrong reason — the merge_conflict re-arm guard
+        // rejects it and leaves the row alone.
+        assert!(!db.rearm_blocked_merge_conflict_signal(&chore).unwrap());
+        assert!(!has_active_signal(&db, &chore, "merge_conflict"));
+    }
+
+    // ── rearm_blocked_ci_failure_signal ─────────────────────────────────
+
+    #[test]
+    fn rearm_ci_failure_returns_false_when_task_not_blocked() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-ci-unblocked");
+        let pr_url = "https://github.com/spinyfin/mono/pull/904";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+
+        assert!(!db.rearm_blocked_ci_failure_signal(&chore).unwrap());
+        assert!(!has_active_signal(&db, &chore, "ci_failure"));
+    }
+
+    #[test]
+    fn rearm_ci_failure_reupserts_when_task_is_blocked() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-ci-blocked");
+        let pr_url = "https://github.com/spinyfin/mono/pull/905";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+        db.mark_chore_blocked_ci_failure(&chore, pr_url, None)
+            .unwrap()
+            .expect("flips to blocked: ci_failure");
+
+        db.clear_ci_failure_signal_only(&chore).unwrap();
+        assert!(!has_active_signal(&db, &chore, "ci_failure"));
+
+        assert!(db.rearm_blocked_ci_failure_signal(&chore).unwrap());
+        assert!(has_active_signal(&db, &chore, "ci_failure"));
+    }
+
+    #[test]
+    fn rearm_ci_failure_rearms_the_exhausted_reason_too() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-ci-exhausted");
+        let pr_url = "https://github.com/spinyfin/mono/pull/906";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+        db.mark_chore_blocked_ci_failure_exhausted(&chore, pr_url)
+            .unwrap()
+            .expect("flips to blocked: ci_failure_exhausted");
+
+        db.clear_ci_failure_signal_only(&chore).unwrap();
+        assert!(!has_active_signal(&db, &chore, "ci_failure_exhausted"));
+
+        // The re-arm re-upserts the parent's *current* blocked reason, which
+        // is `ci_failure_exhausted` here, not the plain `ci_failure`.
+        assert!(db.rearm_blocked_ci_failure_signal(&chore).unwrap());
+        assert!(has_active_signal(&db, &chore, "ci_failure_exhausted"));
+    }
+
+    #[test]
+    fn rearm_ci_failure_returns_false_for_a_differently_blocked_task() {
+        let db = mem_db();
+        let product = create_test_product_named(&db, "rearm-ci-other");
+        let pr_url = "https://github.com/spinyfin/mono/pull/907";
+        let chore = in_review_chore(&db, &product.id, pr_url);
+        db.mark_chore_blocked_merge_conflict(&chore, pr_url)
+            .unwrap()
+            .expect("flips to blocked: merge_conflict");
+
+        // Blocked on merge_conflict, not a CI reason — the CI re-arm guard
+        // rejects it.
+        assert!(!db.rearm_blocked_ci_failure_signal(&chore).unwrap());
+        assert!(!has_active_signal(&db, &chore, "ci_failure"));
+    }
+}
