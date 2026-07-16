@@ -81,13 +81,26 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
-# engine_lib_test is split into 4 parallel shards to cut wall time.
+# engine_lib_test is split into parallel shards to cut wall time.
 # Rust's libtest does not honour TEST_SHARD_INDEX / TEST_TOTAL_SHARDS, so
 # shard_count would silently re-run the full suite N times.  Instead we
-# create 4 rust_test targets with disjoint test-name filters (positional
+# create rust_test targets with disjoint test-name filters (positional
 # FILTERS and --skip flags) so Bazel schedules them in parallel.
-# Coverage is identical: the 4 filter sets partition all 1145 tests with
-# no overlap.  A test_suite keeps `bazel test :engine_lib_test` working.
+# Coverage is identical: the filter sets below partition all 3262 tests
+# (as of this split) with no overlap.  A test_suite keeps
+# `bazel test :engine_lib_test` working.
+#
+# Historically this was 4 shards, but the "work" and "coordinator+merge_poller"
+# groups had each grown into single rust_test targets compiling the entire
+# 227-file engine_lib crate on their own critical-path action, with no way to
+# touch a small slice of "work" without waiting on all ~1000 of its tests.
+# This is now 11 shards, grouped along module boundaries and rebalanced by
+# test-case count (a proxy for compile/run weight) so no single group
+# dominates the critical path and editing one module's tests only grows the
+# smallest shard that owns it. Sizes below are per-shard test-case counts
+# measured via `bazel test --test_output=summary` immediately before this
+# split (3262 tests total); rebalance again if a shard drifts far from the
+# others.
 #
 # All shards share size = "small" / timeout = "moderate" (300 s):
 #   linux-amd64 CI runners run ~6-7x slower than macOS dev boxes, so the
@@ -96,12 +109,12 @@ rust_binary(
 #   Bazel's sandbox does not inherit HOME; tests that call
 #   cube_default_workspace_root_for_test need a stable sentinel value.
 
-# Shard 1 — work module (~226 tests, the single heaviest slice ~7s on macOS)
+# Shard: app (236 tests)
 rust_test(
-    name = "engine_lib_test_work",
+    name = "engine_lib_test_app",
     size = "small",
     timeout = "moderate",
-    args = ["work::"],
+    args = ["app::"],
     crate = ":engine_lib",
     edition = "2024",
     env = {"HOME": "/tmp"},
@@ -115,13 +128,12 @@ rust_test(
     ),
 )
 
-# Shard 2 — app + dispatch + conflict + ci_log_reader (~164 tests, ~5s on macOS)
+# Shard: dispatch + conflict + ci_log_reader (103 tests)
 rust_test(
-    name = "engine_lib_test_a",
+    name = "engine_lib_test_dispatch",
     size = "small",
     timeout = "moderate",
     args = [
-        "app::",
         "dispatch_events::",
         "dispatch_reader::",
         "conflict_watch::",
@@ -140,27 +152,46 @@ rust_test(
     ),
 )
 
-# Shard 3 — completion + coordinator + merge_poller + external_tracker +
-#           live_status* + runner + build_info (~358 tests, ~7s on macOS)
+# Shard: completion + merge_poller (296 tests)
 rust_test(
-    name = "engine_lib_test_b",
+    name = "engine_lib_test_completion",
     size = "small",
     timeout = "moderate",
     args = [
         "completion::",
-        "coordinator::",
         "merge_poller::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: coordinator + runner + external_tracker + live_status* +
+#        nudge_breaker + build_info (330 tests)
+rust_test(
+    name = "engine_lib_test_coordinator",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "coordinator::",
+        "runner::",
         "external_tracker::",
         "live_status::",
         "live_status_loop::",
         "live_status_redact::",
-        "runner::",
-        "build_info::",
         # nudge_breaker is pure in-memory (no global state) and is the
-        # auto-nudge sibling of completion; group it here rather than in
-        # shard 4 so it doesn't add parallelism to that shard's
-        # global-state-sharing tests (audit/worker_setup).
+        # auto-nudge sibling of completion; group it here rather than
+        # with a global-state-sharing shard (audit/worker_setup).
         "nudge_breaker::",
+        "build_info::",
     ],
     crate = ":engine_lib",
     edition = "2024",
@@ -185,14 +216,225 @@ rust_test(
     ),
 )
 
-# Shard 4 — everything not covered by shards 1-3 (~397 tests, ~2s on macOS)
+# Shard: work::tests::t01..t08 — the top half (by test count) of the
+# work::tests submodule (365 tests).
+rust_test(
+    name = "engine_lib_test_work_a",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "work::tests::t01::",
+        "work::tests::t02::",
+        "work::tests::t03::",
+        "work::tests::t04::",
+        "work::tests::t05::",
+        "work::tests::t06::",
+        "work::tests::t07::",
+        "work::tests::t08::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: work::tests::t09..t30 — the bottom half of the work::tests
+# submodule (324 tests).
+rust_test(
+    name = "engine_lib_test_work_b",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "work::tests::t09::",
+        "work::tests::t10::",
+        "work::tests::t11::",
+        "work::tests::t12::",
+        "work::tests::t13::",
+        "work::tests::t14::",
+        "work::tests::t15::",
+        "work::tests::t16::",
+        "work::tests::t17::",
+        "work::tests::t18::",
+        "work::tests::t19::",
+        "work::tests::t20::",
+        "work::tests::t21::",
+        "work::tests::t22::",
+        "work::tests::t23::",
+        "work::tests::t24::",
+        "work::tests::t25::",
+        "work::tests::t26::",
+        "work::tests::t27::",
+        "work::tests::t28::",
+        "work::tests::t29::",
+        "work::tests::t30::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: work's own leaf modules (comments, dispatch_helpers, attentions,
+# etc.) — everything under work:: that isn't in work::tests (298 tests).
+rust_test(
+    name = "engine_lib_test_work_leaf",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "work::",
+        "--skip",
+        "work::tests::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: worker_setup + pr_review + ci_watch + pr_url_capture + effort +
+#        live_worker_state (334 tests)
+rust_test(
+    name = "engine_lib_test_misc_a",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "worker_setup::",
+        "pr_review::",
+        "ci_watch::",
+        "pr_url_capture::",
+        "effort::",
+        "live_worker_state::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: planner_validation + spawn_health + host_registry + gh_invocation +
+#        dead_pid_sweep + design_detector + transient_recovery +
+#        resolution_signal_capture + planner + cube_commands + pane_summary +
+#        editorial_hook + attentions_detector (327 tests)
+rust_test(
+    name = "engine_lib_test_misc_b",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "planner_validation::",
+        "spawn_health::",
+        "host_registry::",
+        "gh_invocation::",
+        "dead_pid_sweep::",
+        "design_detector::",
+        "transient_recovery::",
+        "resolution_signal_capture::",
+        "planner::",
+        "cube_commands::",
+        "pane_summary::",
+        "editorial_hook::",
+        "attentions_detector::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: stacked_pr_structuring + populator + automation_triage +
+#        cube_lease_heartbeat + automation_schedule + automation_scheduler +
+#        dispatch_spillover + comments_anchor + comment_classifier +
+#        ssh_spawn + spawn_flow + materializer + events_socket +
+#        wrapper_distribution + worker_registry + worker_escalation +
+#        execution_liveness + work_dependencies + repo_slug +
+#        conflict_ladder + worker_sandbox_audit + settings +
+#        population_timing + no_op_signal (326 tests)
+rust_test(
+    name = "engine_lib_test_misc_c",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "stacked_pr_structuring::",
+        "populator::",
+        "automation_triage::",
+        "cube_lease_heartbeat::",
+        "automation_schedule::",
+        "automation_scheduler::",
+        "dispatch_spillover::",
+        "comments_anchor::",
+        "comment_classifier::",
+        "ssh_spawn::",
+        "spawn_flow::",
+        "materializer::",
+        "events_socket::",
+        "wrapper_distribution::",
+        "worker_registry::",
+        "worker_escalation::",
+        "execution_liveness::",
+        "work_dependencies::",
+        "repo_slug::",
+        "conflict_ladder::",
+        "worker_sandbox_audit::",
+        "settings::",
+        "population_timing::",
+        "no_op_signal::",
+    ],
+    crate = ":engine_lib",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Shard: everything not covered by the shards above (323 tests). This is
+# the catch-all: a brand-new top-level module's tests land here by default
+# until someone gives it its own shard, so CI never silently drops
+# coverage for new modules.
 rust_test(
     name = "engine_lib_test_rest",
     size = "small",
     timeout = "moderate",
     args = [
-        "--skip",
-        "work::",
         "--skip",
         "app::",
         "--skip",
@@ -206,9 +448,11 @@ rust_test(
         "--skip",
         "completion::",
         "--skip",
+        "merge_poller::",
+        "--skip",
         "coordinator::",
         "--skip",
-        "merge_poller::",
+        "runner::",
         "--skip",
         "external_tracker::",
         "--skip",
@@ -218,11 +462,97 @@ rust_test(
         "--skip",
         "live_status_redact::",
         "--skip",
-        "runner::",
+        "nudge_breaker::",
         "--skip",
         "build_info::",
         "--skip",
-        "nudge_breaker::",
+        "work::",
+        "--skip",
+        "worker_setup::",
+        "--skip",
+        "pr_review::",
+        "--skip",
+        "ci_watch::",
+        "--skip",
+        "pr_url_capture::",
+        "--skip",
+        "effort::",
+        "--skip",
+        "live_worker_state::",
+        "--skip",
+        "planner_validation::",
+        "--skip",
+        "spawn_health::",
+        "--skip",
+        "host_registry::",
+        "--skip",
+        "gh_invocation::",
+        "--skip",
+        "dead_pid_sweep::",
+        "--skip",
+        "design_detector::",
+        "--skip",
+        "transient_recovery::",
+        "--skip",
+        "resolution_signal_capture::",
+        "--skip",
+        "planner::",
+        "--skip",
+        "cube_commands::",
+        "--skip",
+        "pane_summary::",
+        "--skip",
+        "editorial_hook::",
+        "--skip",
+        "attentions_detector::",
+        "--skip",
+        "stacked_pr_structuring::",
+        "--skip",
+        "populator::",
+        "--skip",
+        "automation_triage::",
+        "--skip",
+        "cube_lease_heartbeat::",
+        "--skip",
+        "automation_schedule::",
+        "--skip",
+        "automation_scheduler::",
+        "--skip",
+        "dispatch_spillover::",
+        "--skip",
+        "comments_anchor::",
+        "--skip",
+        "comment_classifier::",
+        "--skip",
+        "ssh_spawn::",
+        "--skip",
+        "spawn_flow::",
+        "--skip",
+        "materializer::",
+        "--skip",
+        "events_socket::",
+        "--skip",
+        "wrapper_distribution::",
+        "--skip",
+        "worker_registry::",
+        "--skip",
+        "worker_escalation::",
+        "--skip",
+        "execution_liveness::",
+        "--skip",
+        "work_dependencies::",
+        "--skip",
+        "repo_slug::",
+        "--skip",
+        "conflict_ladder::",
+        "--skip",
+        "worker_sandbox_audit::",
+        "--skip",
+        "settings::",
+        "--skip",
+        "population_timing::",
+        "--skip",
+        "no_op_signal::",
     ],
     crate = ":engine_lib",
     edition = "2024",
@@ -238,14 +568,21 @@ rust_test(
 )
 
 # Umbrella target: `bazel test //tools/boss/engine:engine_lib_test` runs all
-# 4 shards in parallel (subject to --jobs).
+# shards in parallel (subject to --jobs).
 test_suite(
     name = "engine_lib_test",
     tests = [
-        ":engine_lib_test_a",
-        ":engine_lib_test_b",
+        ":engine_lib_test_app",
+        ":engine_lib_test_completion",
+        ":engine_lib_test_coordinator",
+        ":engine_lib_test_dispatch",
+        ":engine_lib_test_misc_a",
+        ":engine_lib_test_misc_b",
+        ":engine_lib_test_misc_c",
         ":engine_lib_test_rest",
-        ":engine_lib_test_work",
+        ":engine_lib_test_work_a",
+        ":engine_lib_test_work_b",
+        ":engine_lib_test_work_leaf",
     ],
 )
 
