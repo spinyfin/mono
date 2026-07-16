@@ -1847,6 +1847,9 @@ pub enum TopicEventPayload {
 mod editorial_controls_tests;
 
 #[cfg(test)]
+mod frontend_event_wire_tests;
+
+#[cfg(test)]
 mod feature_flags_wire_tests;
 
 #[cfg(test)]
