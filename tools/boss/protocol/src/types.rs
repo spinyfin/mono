@@ -3384,12 +3384,16 @@ pub struct Task {
     /// transition: this field just reverts to `None` on the next poll and
     /// the task falls back to rendering under Review. It is also forced to
     /// `None` (regardless of what GitHub still reports) whenever the same
-    /// poll observes `ci_required_state == "fail"` (mono#2023 / T2675):
-    /// GitHub keeps auto-merge/the queue entry armed on red required
-    /// checks — that's what "merge when ready" means — so without this
-    /// override a card can sit in Merging with a simultaneous red CI chip.
-    /// GitHub's own arming is left untouched; the demotion is purely this
-    /// field, and it lifts automatically on the next poll once CI reads
+    /// poll observes `ci_required_state == "fail"` while this field was
+    /// `Some("auto_merge_enabled")` (mono#2023 / T2675): GitHub keeps
+    /// auto-merge armed on red required checks — that's what "merge when
+    /// ready" means — so without this override a card can sit in Merging
+    /// with a simultaneous red CI chip. This override is deliberately
+    /// scoped to the `auto_merge_enabled` bucket only — a `Some("queued")`
+    /// row is left untouched by a failing check, per the invariant
+    /// documented on `renumber_merge_queue`. GitHub's own arming is left
+    /// untouched; the demotion is purely this field, and it lifts
+    /// automatically on the next poll once CI reads
     /// `"success"`/`"in_progress"` again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_state: Option<String>,
@@ -3399,7 +3403,9 @@ pub struct Task {
     /// mergeQueueEntry.state>", "enqueued_at": "<RFC3339>", "section_order":
     /// <i64>}`. `Some` whenever `merge_queue_state` is `Some`; cleared
     /// (`None`) the moment the probe no longer sees a `mergeQueueEntry` or
-    /// an armed `autoMergeRequest` for the PR (merged, or dropped out).
+    /// an armed `autoMergeRequest` for the PR (merged, or dropped out), or
+    /// whenever `merge_queue_state` is cleared by the `auto_merge_enabled`
+    /// CI-fail override described on that field's doc comment.
     /// `state` is GitHub's raw `mergeQueueEntry.state` enum value
     /// (`AWAITING_CHECKS`, `MERGEABLE`, `LOCKED`, `QUEUED`, `UNMERGEABLE`) —
     /// `None` while `merge_queue_state == Some("auto_merge_enabled")`, since
