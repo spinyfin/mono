@@ -3303,11 +3303,19 @@ pub(crate) async fn update_pr_poll_state(
     // Once CI recovers to success/in_progress, this override lifts and the
     // next poll recomputes `merge_queue_state` from the untouched raw probe
     // as usual, so the card returns to Merging with no separate re-arm path.
-    let (merge_queue_state, merge_queue_detail) = if ci_state == "fail" {
-        (None, None)
-    } else {
-        (raw_merge_queue_state, raw_merge_queue_detail)
-    };
+    //
+    // Scoped to the `auto_merge_enabled` bucket only — never `"queued"`.
+    // `renumber_merge_queue`'s invariant (below) requires that a queued
+    // member's position never races between "kept" and "excluded" outside
+    // of a genuine `"queued"` state transition; blanket-demoting a queued
+    // row on a transient required-check failure would violate that while
+    // GitHub may still be actively merging it.
+    let (merge_queue_state, merge_queue_detail) =
+        if ci_state == "fail" && raw_merge_queue_state == Some("auto_merge_enabled") {
+            (None, None)
+        } else {
+            (raw_merge_queue_state, raw_merge_queue_detail)
+        };
 
     let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
@@ -9985,6 +9993,68 @@ mod tests {
             "card must return to Merging once CI recovers, with no separate re-arm path"
         );
         assert_eq!(detail["section_order"], serde_json::json!(1_783_684_494i64));
+    }
+
+    /// Companion to the demotion regression above, scoped to the `"queued"`
+    /// bucket: `renumber_merge_queue`'s doc comment (below) promises that
+    /// membership is governed *only* by `merge_queue_state == "queued"` and
+    /// that a queued-but-failing member keeps its position — its number must
+    /// never race between "kept" and "excluded" mid-transition. A PR that is
+    /// genuinely enqueued in GitHub's merge queue can read a failing
+    /// required check on its own head (GitHub runs required checks against
+    /// the merge-queue branch), so the CI-fail override introduced above
+    /// must NOT touch a `"queued"` row — only `"auto_merge_enabled"`.
+    #[tokio::test]
+    async fn update_pr_poll_state_leaves_queued_row_untouched_when_required_ci_fails() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "CiQueuedDemote", Some("git@github.com:foo/bar.git"));
+        let t = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/1");
+
+        let mut probe = probe_with_queue_fields(
+            true,
+            Some("UNMERGEABLE"),
+            Some(2),
+            Some("2026-07-10T11:54:54Z"),
+            false,
+            None,
+        );
+        probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
+        let candidate = PendingMergeCheck {
+            work_item_id: t.clone(),
+            product_id: product.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
+        };
+        let publisher = RecordingPublisher::default();
+        update_pr_poll_state(&db, &publisher, &candidate, &probe).await;
+
+        let (state, detail) = merge_queue_columns(&db, &t);
+        assert_eq!(
+            state.as_deref(),
+            Some("queued"),
+            "a queued row must keep its position through a failing required check — only the \
+             auto_merge_enabled bucket is demoted, per renumber_merge_queue's invariant"
+        );
+        // `renumber_merge_queue` re-derives rank across the whole product's
+        // queued set (mono#1997), so the sole queued row here renumbers to
+        // position 1 regardless of GitHub's raw position — what matters for
+        // this regression is that the row stayed `"queued"` at all rather
+        // than being demoted to `None`.
+        assert_eq!(detail["position"], serde_json::json!(1));
+        assert_eq!(detail["state"], serde_json::json!("UNMERGEABLE"));
+
+        let conn = db.connect().unwrap();
+        let ci_required_state: Option<String> = conn
+            .query_row(
+                "SELECT ci_required_state FROM tasks WHERE id = ?1",
+                rusqlite::params![t],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ci_required_state.as_deref(),
+            Some("fail"),
+            "ci_required_state must still be stamped normally"
+        );
     }
 
     #[test]
