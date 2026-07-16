@@ -93,8 +93,12 @@ impl GaugeHandle {
 
 /// Declare a static [`CounterHandle`].
 ///
+/// Engine modules reach this macro through the `boss_engine` crate-root
+/// re-export, so call sites use `crate::register_counter!`, not the
+/// fully-qualified path shown below:
+///
 /// ```ignore
-/// boss_engine_metrics_registry::register_counter!(
+/// crate::register_counter!(
 ///     PR_URL_CAPTURE_PRIMARY_HIT,
 ///     "pr_url_capture.primary_path.hit",
 ///     "On-stop hook found a staged PR URL and skipped the detector.",
