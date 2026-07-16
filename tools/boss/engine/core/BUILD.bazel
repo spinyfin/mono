@@ -44,6 +44,7 @@ rust_library(
         "//tools/boss/engine/driver",
         "//tools/boss/engine/editorial",
         "//tools/boss/engine/feature-flags",
+        "//tools/boss/engine/live-status-redact",
         "//tools/boss/engine/metrics-registry:metrics_registry",
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/ssh-transport",

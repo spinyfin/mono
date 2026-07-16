@@ -25,7 +25,7 @@
 //!
 //! Privacy is layered:
 //!
-//! 1. Pre-summarizer redaction via [`crate::live_status_redact`] —
+//! 1. Pre-summarizer redaction via [`boss_engine_live_status_redact`] —
 //!    drop deny-listed entries, truncate large values, then run the
 //!    secret-pattern regexes over the assembled text.
 //! 2. Prompt guardrails — the system message forbids quoting literal
@@ -43,8 +43,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use boss_engine_live_status_redact as live_status_redact;
+
 use crate::claude_client::{self, CallConfig, ClaudeError, Message, MessagesRequest};
-use crate::live_status_redact;
 
 /// Haiku 4.5 is the right shape for a one-sentence cheap summary —
 /// see Q3 in the design doc.
