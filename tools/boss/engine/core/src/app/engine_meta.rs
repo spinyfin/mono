@@ -148,24 +148,41 @@ pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendReque
             let capacity = pool.capacity().await;
             let mut claims = Vec::new();
             for claim in pool.claims().await {
-                let (execution_status, work_item_id) = match server_state.work_db.get_execution(&claim.execution_id) {
-                    Ok(execution) => (Some(execution.status.to_string()), Some(execution.work_item_id)),
-                    Err(err) => {
-                        tracing::warn!(
-                            worker_id = %claim.worker_id,
-                            execution_id = %claim.execution_id,
-                            ?err,
-                            "worker_pool_summary: failed to look up claimed execution",
-                        );
-                        (None, None)
-                    }
-                };
+                // `spilled_from_pool` keeps automation identifiable once it
+                // spills into a Lower Decks slot: the claim then sits in the
+                // main pool under an ordinary `worker-N` id, so without an
+                // explicit attribution this listing would report it as
+                // mainline work. Compare the execution's attributed pool
+                // against the pool actually holding the slot; a mismatch is
+                // by definition a spill.
+                let (execution_status, work_item_id, spilled_from_pool) =
+                    match server_state.work_db.get_execution(&claim.execution_id) {
+                        Ok(execution) => {
+                            let attributed = coordinator.attributed_pool_label(&execution);
+                            let spilled = (attributed != name).then(|| attributed.to_owned());
+                            (
+                                Some(execution.status.to_string()),
+                                Some(execution.work_item_id),
+                                spilled,
+                            )
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                worker_id = %claim.worker_id,
+                                execution_id = %claim.execution_id,
+                                ?err,
+                                "worker_pool_summary: failed to look up claimed execution",
+                            );
+                            (None, None, None)
+                        }
+                    };
                 claims.push(boss_protocol::WorkerPoolClaimEntry {
                     worker_id: claim.worker_id.clone(),
                     execution_id: claim.execution_id.clone(),
                     execution_status,
                     work_item_id,
                     live: live_run_ids.contains(&claim.execution_id),
+                    spilled_from_pool,
                 });
             }
             let idle = capacity.saturating_sub(claims.len());

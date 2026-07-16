@@ -44,6 +44,7 @@ pub mod design_detector;
 pub use boss_deterministic_resolvers as deterministic_resolvers;
 pub mod dispatch_events;
 pub mod dispatch_failure_recovery_sweep;
+pub(crate) mod dispatch_spillover;
 pub mod doc_fetcher;
 pub use boss_editorial as editorial;
 pub use boss_engine_driver as driver;

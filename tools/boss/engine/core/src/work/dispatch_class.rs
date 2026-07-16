@@ -19,6 +19,20 @@ use super::*;
 /// recomputes the class for dispatch-trace logging. Keep all three in
 /// sync when a class changes.
 ///
+/// # Scope: this key orders the queue, it does not allocate slots
+///
+/// The key above decides the order rows come off the ready queue. It does
+/// NOT decide which pool's capacity a row may consume. The dispatcher
+/// layers one rule on top of it that this key cannot express: automation
+/// work ranks below ALL mainline work for an interactive slot, regardless
+/// of dispatch class, priority, or arrival order. `drain_ready_queue`
+/// enforces that structurally by walking this order twice — mainline and
+/// review claim their pools in pass 1; only in pass 2 may automation that
+/// missed its own pool spill into a Lower Decks slot. So an automation row
+/// sorted first here still loses an interactive slot to a mainline row
+/// sorted last. See `crate::dispatch_spillover` for the full priority
+/// order (mainline > review > spilled automation) and the preemption rule.
+///
 /// Classification is keyed off the task's `kind` and `created_via`
 /// provenance stamp — never off task name/title text. `created_via` is
 /// the durable, machine-readable origin discriminator the engine already

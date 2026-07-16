@@ -115,4 +115,17 @@ pub struct WorkerPoolClaimEntry {
     /// pick up within `pool_claim_sweep::LEAK_GRACE_SECS`, or a bug in
     /// whatever path terminated the execution if it doesn't.
     pub live: bool,
+    /// Set when this claim is work that **spilled** out of its own pool
+    /// into another pool's slot, naming the pool it belongs to
+    /// (currently only `"automation"`, spilling into a Lower Decks slot
+    /// of the main pool when the automation pool is full).
+    ///
+    /// `None` for the overwhelming majority of claims: work occupying a
+    /// slot of its own pool. Present so per-pool diagnostics stay
+    /// truthful — a spilled automation run holds an ordinary `worker-N`
+    /// id and would otherwise be indistinguishable from mainline work,
+    /// making the main pool look busier than it is and the automation
+    /// pool idler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spilled_from_pool: Option<String>,
 }

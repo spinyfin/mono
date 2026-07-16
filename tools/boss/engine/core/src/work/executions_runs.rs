@@ -349,6 +349,12 @@ impl WorkDb {
     /// would otherwise treat as "any one character". Within a class, the
     /// existing `priority` column (still respected) then plain FIFO by
     /// `created_at`/`id` break ties, exactly as before this change.
+    ///
+    /// This orders the queue; it does not decide which pool's capacity a
+    /// row may take. `drain_ready_queue` walks the returned order twice so
+    /// that automation ranks below all mainline work for an *interactive*
+    /// slot regardless of where it lands in this sort — see
+    /// `crate::dispatch_spillover` and `DispatchClass`'s docs.
     pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let class_case = format!(
