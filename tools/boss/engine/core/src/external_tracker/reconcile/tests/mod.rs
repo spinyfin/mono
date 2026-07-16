@@ -338,6 +338,7 @@ fn setup_product_with_reverse_close(db: &WorkDb) -> boss_protocol::Product {
 mod attention;
 mod imports;
 mod pass_runner;
+mod pick_best_pr;
 mod project_status;
 mod reconcile_existing;
 mod reverse_close;
