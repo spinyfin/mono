@@ -151,6 +151,67 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for a `boss --json` bug where a chore description
+/// containing raw control bytes (authored via `--description` with a
+/// heredoc) round-tripped through storage and the wire protocol fine,
+/// but the CLI's `--json` output for `chore show` embedded those bytes
+/// unescaped — invalid per RFC 8259, and rejected by `jq`. Drives the
+/// same path the CLI does: create → fetch via `GetWorkItem` → serialize
+/// exactly as `print_entity` does (`serde_json::to_writer_pretty`) →
+/// require the result to parse under a strict (non-lenient) JSON parser.
+#[tokio::test]
+async fn chore_description_with_control_chars_round_trips_as_valid_json() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "ControlChars".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:control-chars.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        },
+    )
+    .await?;
+
+    let raw_description = "line one\tcol two\rcarriage\x01unit-separator-ish end";
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Chore with control chars in description")
+            .description(raw_description)
+            .build(),
+    )
+    .await?;
+    assert_eq!(chore.description, raw_description);
+
+    let fetched = expect_chore(
+        match client
+            .send_request(&FrontendRequest::GetWorkItem { id: chore.id.clone() })
+            .await?
+        {
+            FrontendEvent::WorkItemResult { item } => item,
+            other => return Err(unexpected_event("GetWorkItem", other)),
+        },
+    )?;
+    assert_eq!(fetched.description, raw_description);
+
+    // Mirror `print_entity`'s JSON emission exactly (`to_writer_pretty`)
+    // and confirm the bytes are strictly valid JSON — the same check
+    // `jq` performs and which surfaced the original bug.
+    let mut buf = Vec::new();
+    serde_json::to_writer_pretty(&mut buf, &fetched)?;
+    let text = String::from_utf8(buf)?;
+    let reparsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(reparsed["description"].as_str(), Some(raw_description));
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn delete_then_restore_round_trip_through_engine() -> Result<()> {
     let engine = TestEngine::spawn().await?;
