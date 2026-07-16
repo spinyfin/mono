@@ -192,11 +192,24 @@ pub(crate) enum LadderOutcome {
     ///
     /// `residual_conflict_files` is the number of files rung 1's rebase
     /// left conflicted, when known — `None` when the harness never got far
-    /// enough to run the rebase (ensure_repo/lease/goto/rebase-transport
+    /// enough to run the rebase (ensure_repo/goto/rebase-transport
     /// failures) or the rebase was clean-but-unpushed. The caller passes
     /// this to [`rung2_eligible`] to decide whether the next worker spawn
     /// should use rung 2's small-agent profile or climb straight to rung 3.
     FellThrough { residual_conflict_files: Option<usize> },
+    /// Rung 1 could not even be attempted this pass: leasing a workspace
+    /// failed twice in a row (the initial attempt and one retry — see
+    /// [`lease_rung1_workspace`]). This is deliberately distinct from
+    /// [`Self::FellThrough`]: a lease failure is an infrastructure hiccup
+    /// (the incident that motivated this variant was a transient cube
+    /// dirty-reclaim refusal — `LeaseExpiredWorkspaceDirty`, cube exit code
+    /// 7 — that a retry 3 seconds later cleared), not evidence that the
+    /// conflict is large/semantic. The caller must NOT spawn a worker
+    /// revision on this signal — escalating straight to the most expensive
+    /// rung on a pure infra failure is exactly the bug this variant exists
+    /// to close. The attempt stays `pending` with no `revision_task_id`, so
+    /// the ladder is retried in full on the next `conflict_watch` tick.
+    MechanicalRungsUnavailable,
 }
 
 /// Emits the single canonical decision line for a conflicted-PR
@@ -348,28 +361,25 @@ pub(crate) async fn try_mechanical_rungs(
     };
 
     let task_label = format!("conflict-ladder rung1 {}", candidate.work_item_id);
-    let lease = match cube_client
-        .lease_workspace(&repo.repo_id, &task_label, None, false, &[])
-        .await
-    {
+    let lease = match lease_rung1_workspace(cube_client, &repo.repo_id, &task_label).await {
         Ok(lease) => lease,
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
                 repo_id = %repo.repo_id,
                 error = %format!("{err:#}"),
-                "conflict_ladder: could not lease a workspace for rung 1; falling through to worker",
+                "conflict_ladder: could not lease a workspace for rung 1 after retry; mechanical rungs \
+                 unavailable this attempt",
             );
             log_routing_verdict(
                 &candidate.work_item_id,
                 Some(pr_number),
                 &[],
-                "generic",
-                "could not lease a workspace for rung 1; mechanical rungs skipped",
+                "skip",
+                "could not lease a workspace for rung 1 after one retry; mechanical rungs unavailable \
+                 this attempt, ladder will retry on the next conflict_watch tick",
             );
-            return LadderOutcome::FellThrough {
-                residual_conflict_files: None,
-            };
+            return LadderOutcome::MechanicalRungsUnavailable;
         }
     };
 
@@ -385,6 +395,45 @@ pub(crate) async fn try_mechanical_rungs(
         );
     }
     outcome
+}
+
+/// Lease a rung-1 workspace, retrying once on any error.
+///
+/// The lease step is the one mechanical-rung failure mode known in
+/// practice to be transient: `cube workspace lease` reclaiming an expired
+/// lease refuses to touch a dirty working copy
+/// (`LeaseExpiredWorkspaceDirty`, cube exit code 7) until cube's own
+/// expiry sweep has cleared it — and that sweep runs as a side effect of
+/// the *first* lease attempt itself, so an immediate second attempt lands
+/// on a clean path. The 2026-07-16 incident that motivated this retry saw
+/// exactly that: a full agent's own lease of the same workspace succeeded
+/// 3 seconds after the ladder's first (and only) attempt had failed.
+///
+/// Deliberately one retry, not a loop: if the second attempt also fails,
+/// this is either a genuinely-down cube or a stuck workspace, and further
+/// retries here would only delay the ladder without helping — the caller
+/// treats a persistent failure as [`LadderOutcome::MechanicalRungsUnavailable`]
+/// so the next `conflict_watch` tick tries again from scratch instead of
+/// escalating straight to a worker.
+async fn lease_rung1_workspace(
+    cube_client: &dyn CubeClient,
+    repo_id: &str,
+    task_label: &str,
+) -> anyhow::Result<CubeWorkspaceLease> {
+    match cube_client.lease_workspace(repo_id, task_label, None, false, &[]).await {
+        Ok(lease) => Ok(lease),
+        Err(first_err) => {
+            tracing::debug!(
+                repo_id,
+                error = %format!("{first_err:#}"),
+                "conflict_ladder: rung 1 lease failed; retrying once",
+            );
+            cube_client
+                .lease_workspace(repo_id, task_label, None, false, &[])
+                .await
+                .map_err(|second_err| second_err.context(format!("first lease attempt also failed: {first_err:#}")))
+        }
+    }
 }
 
 /// Position the leased workspace on the PR head, run the engine-direct

@@ -387,6 +387,68 @@ impl WorkDb {
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
+    /// Close the revision task a resolved merge-conflict attempt spawned,
+    /// so a retired `conflict_resolutions` row never leaves a stale
+    /// `todo`/`active`/`blocked` revision behind it. Without this, the
+    /// parent's "in revision" badge (driven by
+    /// [`find_latest_active_revision_in_chain`]'s "status != done" rule)
+    /// persists until the chain root's PR *actually* merges — the only
+    /// other point a stale revision gets closed
+    /// ([`block_pending_revisions_on_parent_close`]) — which can be long
+    /// after the conflict that spawned it was resolved, or, if the
+    /// revision task never advances on its own, permanently.
+    ///
+    /// Every revision this retire path can reach was spawned with
+    /// `created_via = CREATED_VIA_MERGE_CONFLICT_PREFIX…`
+    /// ([`crate::conflict_watch::maybe_spawn_conflict_revision`]) — i.e.
+    /// [`is_moot_revision_kind`] by construction: a conflicting PR cannot
+    /// merge while still conflicted, so by the time the conflict resolved
+    /// the revision's job (if any) was already done. This mirrors
+    /// [`resolve_revision_on_parent_close`]'s moot branch, just triggered
+    /// by "the conflict resolved" instead of "the parent PR merged".
+    ///
+    /// A no-op (`Ok(None)`) when:
+    /// - the task can't be found, or
+    /// - it is already terminal (`done`/`archived`/`cancelled`) or
+    ///   `in_review` (its commit will ride the eventual merge via
+    ///   [`flip_in_review_revisions_to_done`] instead), or
+    /// - a worker is still genuinely driving it (a `running` /
+    ///   `waiting_human` execution) — closing the row out from under a
+    ///   live worker is not this function's job; that execution's own
+    ///   on-Stop completion advances the task normally when the worker's
+    ///   turn ends.
+    pub fn close_resolved_conflict_revision(&self, revision_task_id: &str) -> Result<Option<Task>> {
+        if self.get_live_execution_for_work_item(revision_task_id, "")?.is_some() {
+            return Ok(None);
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let Some(rev) = query_task(&tx, revision_task_id)? else {
+            return Ok(None);
+        };
+        if rev.deleted_at.is_some()
+            || matches!(
+                rev.status,
+                TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled | TaskStatus::InReview
+            )
+        {
+            return Ok(None);
+        }
+        let now = now_string();
+        let rows_changed = archive_revision_task(
+            &tx,
+            &rev.id,
+            &now,
+            "merge conflict resolved before parent PR merged; revision moot",
+        )?;
+        if rows_changed == 0 {
+            return Ok(None);
+        }
+        let updated = query_task(&tx, revision_task_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Stamp `resolved_by_rung` on a still-live attempt *before* the
     /// resolution has actually completed — used by the escalation-ladder
     /// harness (T6) when it hands the conflict to a rung-2 small focused

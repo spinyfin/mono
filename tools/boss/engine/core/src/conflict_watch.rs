@@ -625,6 +625,7 @@ pub async fn on_conflict_detected(
             // large/architectural one — the spawn below uses rung 2's small-
             // agent profile instead of the default full-worker one.
             let mut use_small_agent_profile = false;
+            let mut mechanical_rungs_unavailable = false;
             if let Some(cube) = cube_client {
                 match conflict_ladder::try_mechanical_rungs(work_db, publisher, cube, candidate, a).await {
                     conflict_ladder::LadderOutcome::Retired => {
@@ -656,6 +657,26 @@ pub async fn on_conflict_detected(
                     } => {
                         use_small_agent_profile = conflict_ladder::rung2_eligible(residual_conflict_files);
                     }
+                    conflict_ladder::LadderOutcome::MechanicalRungsUnavailable => {
+                        // Rung 1's workspace lease failed even after a
+                        // retry — an infra hiccup, not evidence of a
+                        // large/semantic conflict. Spawning the most
+                        // expensive rung (full worker) on that signal
+                        // would be strictly worse than trying again
+                        // shortly, so this tick spawns nothing at all:
+                        // the attempt stays `pending` with no
+                        // `revision_task_id`, and the next
+                        // `conflict_watch` tick re-enters the ladder
+                        // from scratch.
+                        mechanical_rungs_unavailable = true;
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: mechanical rungs unavailable this attempt (rung-1 lease); \
+                             no worker spawned, ladder will retry on the next tick",
+                        );
+                    }
                 }
             } else {
                 // No cube client → the mechanical-rebase flag is off, so the
@@ -680,23 +701,28 @@ pub async fn on_conflict_detected(
                     "conflict_ladder_mechanical_rebase feature flag is off; ladder (rungs 0/1) never attempted",
                 );
             }
-            // Fresh attempt — try to spawn a revision.
-            let spawned = maybe_spawn_conflict_revision(
-                work_db,
-                publisher,
-                pr_checker,
-                candidate,
-                probe,
-                a,
-                use_small_agent_profile,
-            )
-            .await;
-            if spawned {
-                task_unblocked_for_revision =
-                    blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &a.id);
+            // Fresh attempt — try to spawn a revision, unless the ladder
+            // itself was unavailable this tick (rung-1 lease failure): in
+            // that case spawn nothing and leave the attempt `pending` for
+            // the next tick's retry (see the match arm above).
+            if !mechanical_rungs_unavailable {
+                let spawned = maybe_spawn_conflict_revision(
+                    work_db,
+                    publisher,
+                    pr_checker,
+                    candidate,
+                    probe,
+                    a,
+                    use_small_agent_profile,
+                )
+                .await;
+                if spawned {
+                    task_unblocked_for_revision =
+                        blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &a.id);
+                }
+                // If !spawned: attempt abandoned (revision_create_failed). Parent
+                // stays `blocked: merge_conflict`.
             }
-            // If !spawned: attempt abandoned (revision_create_failed). Parent
-            // stays `blocked: merge_conflict`.
         } else if a.revision_task_id.is_some() && task_flipped_to_blocked {
             // UNIQUE collision: existing revision in flight (repeat probe at
             // same base sha). The upfront flip to blocked was premature — clear
@@ -1198,6 +1224,37 @@ pub async fn on_resolved(
                             ?err,
                             "conflict_watch: lease release on retire failed (likely already released)",
                         );
+                    }
+                    // Close the revision task this attempt spawned so a
+                    // retired attempt never leaves a stale
+                    // todo/active/blocked row behind — see
+                    // `WorkDb::close_resolved_conflict_revision`'s doc for
+                    // why this can't just wait for the eventual
+                    // parent-PR-merge sweep to clean it up.
+                    if let Some(revision_task_id) = succeeded.revision_task_id.as_deref() {
+                        match work_db.close_resolved_conflict_revision(revision_task_id) {
+                            Ok(Some(_)) => {
+                                tracing::info!(
+                                    work_item_id = %candidate.work_item_id,
+                                    attempt_id = %succeeded.id,
+                                    revision_task_id,
+                                    "conflict_watch: closed the revision task the resolved attempt spawned",
+                                );
+                            }
+                            Ok(None) => {
+                                // Already terminal/in_review, or a worker is
+                                // still live driving it — nothing to do.
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    attempt_id = %succeeded.id,
+                                    revision_task_id,
+                                    ?err,
+                                    "conflict_watch: failed to close revision task on retire",
+                                );
+                            }
+                        }
                     }
                     publisher
                         .publish_frontend_event_on_product(
