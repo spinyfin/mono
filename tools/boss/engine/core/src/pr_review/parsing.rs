@@ -668,6 +668,32 @@ mod tests {
         );
     }
 
+    /// Agent-isms in code comments must force a revision exactly like
+    /// regression/duplication/deferred-scope findings, regardless of
+    /// assigned severity — agent-authored scaffolding left in comments is a
+    /// process gap, not a style nit.
+    #[test]
+    fn severity_gate_passes_on_agent_isms_regardless_of_severity() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Low,
+                ReviewFindingCategory::AgentIsms,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(
+            passes_severity_gate(&result),
+            "an agent-isms finding must force a revision even at low severity"
+        );
+    }
+
     #[test]
     fn severity_gate_blocked_on_medium_non_regression() {
         let result = ReviewResult {

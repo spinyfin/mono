@@ -351,6 +351,7 @@ mod tests {
             (ReviewFindingCategory::EdgeCase, "\"edgecase\""),
             (ReviewFindingCategory::Duplication, "\"duplication\""),
             (ReviewFindingCategory::DeferredScope, "\"deferred_scope\""),
+            (ReviewFindingCategory::AgentIsms, "\"agent_isms\""),
         ] {
             let json = serde_json::to_string(&cat).unwrap();
             assert_eq!(json, expected);

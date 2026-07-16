@@ -1086,6 +1086,74 @@ mod tests {
         );
     }
 
+    /// The agent-isms rubric dimension (operator directive: code comments
+    /// that only make sense to the agent that wrote them — historical
+    /// narration, Boss work-item/phase/brief references, or "the operator"/
+    /// actor phrasing — are revision-required findings, not advisory nits)
+    /// must be present with all three detection modes plus the
+    /// revision-forcing note and the operator's own examples.
+    #[test]
+    fn code_scope_prompt_contains_agent_isms_dimension() {
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement the new feature.",
+            "https://github.com/org/repo/pull/2100",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            None,
+            "org/repo",
+        );
+        assert!(
+            prompt.contains("Agent-isms in code comments"),
+            "code rubric must contain an explicit agent-isms dimension"
+        );
+        assert!(
+            prompt.contains("Historical narration"),
+            "rubric must cover historical-narration comments (lineage instead of current state)"
+        );
+        assert!(
+            prompt.contains("we used to blah blah, but that was removed because foo"),
+            "rubric must include the operator's historical-narration example"
+        );
+        assert!(
+            prompt.contains("Boss-construct references"),
+            "rubric must cover comments naming Boss work items/phases/briefs"
+        );
+        assert!(
+            prompt.contains("This implements T234 phase 7"),
+            "rubric must include the operator's Boss-construct example"
+        );
+        assert!(
+            prompt.contains("\"the operator\""),
+            "rubric must cover comments referring to the directing human as \"the operator\""
+        );
+        assert!(
+            prompt.contains("We want to avoid showing a card here because")
+                && prompt.contains("The operator requested that no card is shown here"),
+            "rubric must include the operator's before/after example for actor references"
+        );
+        assert!(
+            prompt.contains("quote the offending comment and propose replacement"),
+            "rubric must instruct the reviewer to quote the comment and propose replacement wording"
+        );
+        assert!(
+            prompt.contains("\"agent_isms\""),
+            "rubric must name the agent_isms category"
+        );
+        assert!(
+            prompt.contains("forces a revision regardless of the severity"),
+            "rubric must state agent-isms findings are revision-required, not advisory"
+        );
+        let revision_warranted_offset = prompt
+            .find("`revision_warranted`: set to `true`")
+            .expect("prompt must state the revision_warranted rule");
+        let rule_text = &prompt[revision_warranted_offset..revision_warranted_offset + 400];
+        assert!(
+            rule_text.contains("category: \"agent_isms\""),
+            "revision_warranted rule must cover the agent_isms category: {rule_text}"
+        );
+    }
+
     /// Operator directive 2026-07-15: manual/interactive verification a
     /// headless worker cannot perform (live GUI runs, "spawn real workers
     /// and watch the app", screenshot-based checks) must be carved out of
