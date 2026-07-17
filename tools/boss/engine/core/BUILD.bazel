@@ -90,11 +90,7 @@ rust_binary(
 # (as of this split) with no overlap.  A test_suite keeps
 # `bazel test :engine_lib_test` working.
 #
-# Historically this was 4 shards, but the "work" and "coordinator+merge_poller"
-# groups had each grown into single rust_test targets compiling the entire
-# 227-file engine_lib crate on their own critical-path action, with no way to
-# touch a small slice of "work" without waiting on all ~1000 of its tests.
-# This is now 11 shards, grouped along module boundaries and rebalanced by
+# There are 11 shards, grouped along module boundaries and rebalanced by
 # test-case count (a proxy for compile/run weight) so no single group
 # dominates the critical path and editing one module's tests only grows the
 # smallest shard that owns it. Sizes below are per-shard test-case counts
