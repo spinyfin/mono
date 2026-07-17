@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow};
 
 use boss_github::gh_runner::pr_in_merge_queue;
 
-use crate::gh_invocation::gh_output;
+use boss_engine_gh_invocation::gh_output;
 
 /// Outcome of a successful [`gh_merge_when_ready`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]

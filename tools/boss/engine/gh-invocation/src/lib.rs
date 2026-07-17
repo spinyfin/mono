@@ -6,9 +6,9 @@
 //! Two engine surfaces inspect the worker's Bash commands for `gh`
 //! invocations:
 //!
-//! - [`crate::pr_url_capture`] — the PostToolUse path that stages the PR
-//!   URL a worker's `gh pr create` / `view` / `edit` printed on stdout.
-//! - [`crate::editorial_hook`] — the PreToolUse path that runs editorial
+//! - `boss_engine::pr_url_capture` — the PostToolUse path that stages the
+//!   PR URL a worker's `gh pr create` / `view` / `edit` printed on stdout.
+//! - `boss_engine::editorial_hook` — the PreToolUse path that runs editorial
 //!   rules over `gh pr|issue {create,edit,comment,review}` bodies.
 //!
 //! Both need the same first step: decide whether a command string is a
@@ -191,9 +191,10 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 // ── Subprocess spawn helpers ──────────────────────────────────────────────────
 //
 // The implementation lives in the shared `boss-github` crate so engine and
-// the Contents helper share one copy. Re-exported here as `pub(crate)` so
-// all existing call sites within `boss-engine` need no changes.
-pub(crate) use boss_github::gh_runner::{gh_output, run_gh};
+// the Contents helper share one copy. Re-exported here so `boss-engine` call
+// sites reach them through this crate's `gh` vocabulary alongside
+// [`gh_compare_jq`].
+pub use boss_github::gh_runner::{gh_output, run_gh};
 
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` with the
 /// GitHub JSON `Accept` header and the caller-supplied `jq` projection,
@@ -204,7 +205,7 @@ pub(crate) use boss_github::gh_runner::{gh_output, run_gh};
 /// own type-specific parsing of the returned string (e.g. `serde_json` into a
 /// `Vec<CompareFile>`, or a `u64` line-count parse) and their own fail-open
 /// semantics — this helper only builds the request and returns raw stdout.
-pub(crate) async fn gh_compare_jq(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
+pub async fn gh_compare_jq(repo_slug: &str, base: &str, head: &str, jq: &str) -> anyhow::Result<String> {
     let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
     let stdout = run_gh(
         &[

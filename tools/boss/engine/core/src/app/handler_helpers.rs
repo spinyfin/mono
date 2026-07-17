@@ -652,7 +652,7 @@ pub(super) async fn open_review_terminal_async(
 /// `design_detector::do_scan_pr` but requests only the one field we need.
 pub(super) async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
     let output =
-        crate::gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
+        boss_engine_gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
             .await
             .with_context(|| format!("failed to spawn gh pr view for {pr_url}"))?;
 

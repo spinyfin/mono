@@ -494,7 +494,7 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
     };
 
     // Fast path: only evaluate commands that match the editorial hook's scope.
-    if !crate::gh_invocation::is_editorial_candidate(command) {
+    if !boss_engine_gh_invocation::is_editorial_candidate(command) {
         return;
     }
 

@@ -51,8 +51,8 @@ use serde_json::{Value, json};
 
 use boss_editorial::{CompiledRules, EditorialDecision, Finding, FindingKind};
 
-use crate::gh_invocation::{self, GhNoun};
 use crate::ssh_transport::shell_quote;
+use boss_engine_gh_invocation::{self as gh_invocation, GhNoun};
 
 /// A third deny of the same invocation within one execution flips to
 /// allow (R3). Calls 1 and 2 are denied; the 3rd is allowed with an

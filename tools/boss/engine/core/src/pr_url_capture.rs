@@ -35,6 +35,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
+use boss_engine_gh_invocation::{GhNoun, classify};
 use regex::Regex;
 
 /// Canonical PR URL pattern: `https://github.com/<owner>/<repo>/pull/<N>`.
@@ -198,7 +199,7 @@ pub fn is_revision_push_command(tool_input: &serde_json::Value) -> bool {
 /// forms that can legitimately surface a PR URL for the worker's own
 /// PR. Handles environment-variable prefixes such as
 /// `GIT_DIR=.jj/repo/store/git gh pr create ...` via the shared
-/// [`crate::gh_invocation::classify`] matcher.
+/// [`classify`] matcher.
 ///
 /// Use this as the Layer-1 gate in the PostToolUse capture path:
 /// arbitrary Bash commands whose output happens to contain a PR URL
@@ -217,9 +218,9 @@ pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
         return true;
     }
     matches!(
-        crate::gh_invocation::classify(command),
+        classify(command),
         Some(inv)
-            if inv.noun == crate::gh_invocation::GhNoun::Pr
+            if inv.noun == GhNoun::Pr
                 && matches!(inv.subcommand.as_str(), "create" | "view" | "list" | "edit")
     )
 }
