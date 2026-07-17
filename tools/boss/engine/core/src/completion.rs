@@ -1233,6 +1233,184 @@ impl WorkerCompletionHandler {
         outcome
     }
 
+    /// Layer-2 defence-in-depth for the staged-PR-URL primary path:
+    /// returns the URL staged from the worker's hook stream unless it can
+    /// be shown NOT to belong to this execution, and evicts it from the
+    /// staging cache when it is shown not to.
+    ///
+    /// Note the direction: this rejects disproven URLs rather than
+    /// admitting only proven ones. Both arms fall open when verification
+    /// is unavailable — a revision whose bound PR does not resolve, or a
+    /// transient `fetch_pr_head_ref` failure, keeps the staged URL rather
+    /// than discarding legitimate evidence. `validate_pr_url`'s
+    /// product-repo gate at staging time is the only check such a URL has
+    /// passed.
+    ///
+    /// Shared by `on_stop_inner`'s primary path and `recheck_for_pr`'s
+    /// mirror of it; `log_prefix` is the only difference between the two
+    /// (`"stop event"` vs `"pr-recheck"`), so rendered log messages stay
+    /// byte-identical to what each path emitted before extraction. The
+    /// `pr_recheck_staged_branch_mismatch:` warnings keep that literal
+    /// prefix in both paths — it is a metric-shaped log key, and both
+    /// pre-extraction copies emitted it verbatim.
+    ///
+    /// Eviction is deliberately asymmetric: a *definitive* mismatch (a
+    /// fetched head ref whose work-item suffix differs, an unparseable PR
+    /// number or repo slug) forgets the URL immediately, while a
+    /// *transient* API failure keeps it so the next sweep can retry rather
+    /// than stranding the worker on the cold path.
+    async fn verified_staged_pr_url(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        log_prefix: &str,
+    ) -> Option<String> {
+        let staged_url = self.staged_pr_urls.get(execution_id)?;
+
+        // `RevisionImplementation` executions push to the CHAIN ROOT's
+        // existing branch, never one derived from their own execution
+        // id. `expected_branch_name(execution_id, ...)` computes a
+        // branch that structurally never exists for a revision, so the
+        // work-item-suffix check below would always "mismatch" and
+        // discard a legitimate staged URL (2026-07-14 incident, T342 /
+        // exec_18c2124d2f06d768_106d: `cube pr update`'s printed URL —
+        // the chain root's real PR — was dropped here, and the
+        // fallthrough to the SHA-delta gate is what actually caused the
+        // stall). Verify against the resolved bound PR instead: the
+        // URL a compliant `cube pr update` call prints for a revision
+        // IS the chain root's PR.
+        let branch_ok = if execution.kind == ExecutionKind::RevisionImplementation {
+            match self.resolve_bound_pr_url(execution) {
+                Some(bound_url) if bound_url == staged_url => true,
+                Some(bound_url) => {
+                    tracing::warn!(
+                        execution_id,
+                        staged_pr_url = %staged_url,
+                        bound_pr_url = %bound_url,
+                        "pr_recheck_staged_branch_mismatch: staged PR URL does not match the revision's bound (chain root) PR; dropping staged URL",
+                    );
+                    PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                    self.staged_pr_urls.forget(execution_id);
+                    false
+                }
+                None => {
+                    // No bound PR resolvable (execution.pr_url not
+                    // stamped and the chain-root lookup failed) — trust
+                    // the staged URL rather than discard legitimate
+                    // evidence; a wrong URL here would still have to
+                    // pass `validate_pr_url`'s product-repo gate at
+                    // staging time.
+                    true
+                }
+            }
+        } else {
+            let expected_branch = expected_branch_name(
+                execution_id,
+                &execution.branch_naming,
+                execution.worker_branch_prefix.as_deref(),
+            );
+            let repo_slug = parse_repo_slug(&execution.repo_remote_url);
+            match repo_slug {
+                Ok(ref slug) => match pr_number_from_url(&staged_url) {
+                    Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
+                        Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
+                            if head_ref.as_str() != expected_branch.as_str() {
+                                tracing::info!(
+                                    execution_id,
+                                    staged_pr_url = %staged_url,
+                                    staged_pr_branch = %head_ref,
+                                    %expected_branch,
+                                    "{log_prefix}: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                );
+                            }
+                            true
+                        }
+                        Ok(head_ref) => {
+                            tracing::warn!(
+                                execution_id,
+                                staged_pr_url = %staged_url,
+                                staged_pr_branch = %head_ref,
+                                %expected_branch,
+                                "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
+                            );
+                            PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                            self.staged_pr_urls.forget(execution_id);
+                            false
+                        }
+                        Err(err) => {
+                            // Transient API failure: cannot verify this pass, but do NOT
+                            // discard the staged URL. On the next merge-poller sweep the
+                            // staged URL is still present and verification is retried —
+                            // dropping here would strand the worker if the cold path also
+                            // fails. A definitive branch-name mismatch (the Ok(head_ref)
+                            // arm above) still evicts the URL immediately.
+                            tracing::warn!(
+                                execution_id,
+                                staged_pr_url = %staged_url,
+                                ?err,
+                                "{log_prefix}: branch verification failed transiently; \
+                                 keeping staged URL for retry on next sweep",
+                            );
+                            false
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            execution_id,
+                            staged_pr_url = %staged_url,
+                            "{log_prefix}: cannot parse PR number from staged URL; dropping for safety",
+                        );
+                        self.staged_pr_urls.forget(execution_id);
+                        false
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "{log_prefix}: cannot parse repo slug; dropping staged URL for safety",
+                    );
+                    self.staged_pr_urls.forget(execution_id);
+                    false
+                }
+            }
+        };
+
+        branch_ok.then_some(staged_url)
+    }
+
+    /// The staged-PR-URL primary path in full: verify the staged URL via
+    /// [`Self::verified_staged_pr_url`] and, if it survives, finalize the
+    /// `→ in_review` transition from it and skip the cold-path detector.
+    ///
+    /// `Some(outcome)` means this path handled the execution and the
+    /// caller must return `outcome` immediately; `None` means there was no
+    /// usable staged URL and the caller should fall through to its own
+    /// fallback chain.
+    ///
+    /// `log_prefix` and `reason` are the only things that vary between the
+    /// two callers (`"stop event"`/`"stop_staged"` for `on_stop_inner`,
+    /// `"pr-recheck"`/`"pr_recheck_staged"` for `recheck_for_pr`).
+    async fn finalize_from_staged_pr_url(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        log_prefix: &str,
+        reason: &'static str,
+    ) -> Option<StopOutcome> {
+        let staged_url = self.verified_staged_pr_url(execution_id, execution, log_prefix).await?;
+        tracing::info!(
+            execution_id,
+            pr_url = %staged_url,
+            "{log_prefix}: using PR URL captured from worker hook stream (primary path); skipping detector",
+        );
+        PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
+        Some(
+            self.finalize_pr_transition(execution_id, staged_url, WorkerPrCompletionTarget::InReview, reason)
+                .await,
+        )
+    }
+
     async fn on_stop_inner(&self, execution_id: &str) -> StopOutcome {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
@@ -1381,132 +1559,11 @@ impl WorkerCompletionHandler {
         // `gh pr create`, the in-memory staging cache is empty here
         // and we fall through to `detect_pr` to reconstruct the URL
         // via the GitHub API.
-        if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            // `RevisionImplementation` executions push to the CHAIN ROOT's
-            // existing branch, never one derived from their own execution
-            // id. `expected_branch_name(execution_id, ...)` computes a
-            // branch that structurally never exists for a revision, so the
-            // work-item-suffix check below would always "mismatch" and
-            // discard a legitimate staged URL (2026-07-14 incident, T342 /
-            // exec_18c2124d2f06d768_106d: `cube pr update`'s printed URL —
-            // the chain root's real PR — was dropped here, and the
-            // fallthrough to the SHA-delta gate is what actually caused the
-            // stall). Verify against the resolved bound PR instead: the
-            // URL a compliant `cube pr update` call prints for a revision
-            // IS the chain root's PR.
-            let branch_ok = if execution.kind == ExecutionKind::RevisionImplementation {
-                match self.resolve_bound_pr_url(&execution) {
-                    Some(bound_url) if bound_url == staged_url => true,
-                    Some(bound_url) => {
-                        tracing::warn!(
-                            execution_id,
-                            staged_pr_url = %staged_url,
-                            bound_pr_url = %bound_url,
-                            "pr_recheck_staged_branch_mismatch: staged PR URL does not match the revision's bound (chain root) PR; dropping staged URL",
-                        );
-                        PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                        self.staged_pr_urls.forget(execution_id);
-                        false
-                    }
-                    None => {
-                        // No bound PR resolvable (execution.pr_url not
-                        // stamped and the chain-root lookup failed) — trust
-                        // the staged URL rather than discard legitimate
-                        // evidence; a wrong URL here would still have to
-                        // pass `validate_pr_url`'s product-repo gate at
-                        // staging time.
-                        true
-                    }
-                }
-            } else {
-                let expected_branch = expected_branch_name(
-                    execution_id,
-                    &execution.branch_naming,
-                    execution.worker_branch_prefix.as_deref(),
-                );
-                let repo_slug = parse_repo_slug(&execution.repo_remote_url);
-                match repo_slug {
-                    Ok(ref slug) => match pr_number_from_url(&staged_url) {
-                        Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                            Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
-                                if head_ref.as_str() != expected_branch.as_str() {
-                                    tracing::info!(
-                                        execution_id,
-                                        staged_pr_url = %staged_url,
-                                        staged_pr_branch = %head_ref,
-                                        %expected_branch,
-                                        "stop event: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
-                                    );
-                                }
-                                true
-                            }
-                            Ok(head_ref) => {
-                                tracing::warn!(
-                                    execution_id,
-                                    staged_pr_url = %staged_url,
-                                    staged_pr_branch = %head_ref,
-                                    %expected_branch,
-                                    "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
-                                );
-                                PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                                self.staged_pr_urls.forget(execution_id);
-                                false
-                            }
-                            Err(err) => {
-                                // Transient API failure: cannot verify this turn, but do NOT
-                                // discard the staged URL. The cold-path detector runs below
-                                // as a fallback for this Stop. On the next merge-poller sweep
-                                // the staged URL is still present and verification is retried —
-                                // dropping here would strand the worker if the cold path also
-                                // fails. A definitive branch-name mismatch (the Ok(head_ref)
-                                // arm above) still evicts the URL immediately.
-                                tracing::warn!(
-                                    execution_id,
-                                    staged_pr_url = %staged_url,
-                                    ?err,
-                                    "stop event: branch verification failed transiently; \
-                                     keeping staged URL for retry on next sweep",
-                                );
-                                false
-                            }
-                        },
-                        None => {
-                            tracing::warn!(
-                                execution_id,
-                                staged_pr_url = %staged_url,
-                                "stop event: cannot parse PR number from staged URL; dropping for safety",
-                            );
-                            self.staged_pr_urls.forget(execution_id);
-                            false
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            execution_id,
-                            ?err,
-                            "stop event: cannot parse repo slug; dropping staged URL for safety",
-                        );
-                        self.staged_pr_urls.forget(execution_id);
-                        false
-                    }
-                }
-            };
-            if branch_ok {
-                tracing::info!(
-                    execution_id,
-                    pr_url = %staged_url,
-                    "stop event: using PR URL captured from worker hook stream (primary path); skipping detector",
-                );
-                PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
-                return self
-                    .finalize_pr_transition(
-                        execution_id,
-                        staged_url,
-                        WorkerPrCompletionTarget::InReview,
-                        "stop_staged",
-                    )
-                    .await;
-            }
+        if let Some(outcome) = self
+            .finalize_from_staged_pr_url(execution_id, &execution, "stop event", "stop_staged")
+            .await
+        {
+            return outcome;
         }
 
         // AI #6 running-status gate (incident 001 §5): in Claude Code
@@ -2042,115 +2099,11 @@ must not be asked to open one",
         // mismatch means the URL was captured from an unrelated Bash
         // invocation (e.g. reading a chore description that referenced
         // an old PR number) and must be discarded.
-        if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            // See the identical `RevisionImplementation` special-case in
-            // `on_stop_inner`'s primary path for the rationale: a
-            // revision's branch is the chain root's, never one derived
-            // from its own execution id, so the suffix check would always
-            // mismatch and discard a legitimate staged URL.
-            let branch_ok = if execution.kind == ExecutionKind::RevisionImplementation {
-                match self.resolve_bound_pr_url(&execution) {
-                    Some(bound_url) if bound_url == staged_url => true,
-                    Some(bound_url) => {
-                        tracing::warn!(
-                            execution_id,
-                            staged_pr_url = %staged_url,
-                            bound_pr_url = %bound_url,
-                            "pr_recheck_staged_branch_mismatch: staged PR URL does not match the revision's bound (chain root) PR; dropping staged URL",
-                        );
-                        PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                        self.staged_pr_urls.forget(execution_id);
-                        false
-                    }
-                    None => true,
-                }
-            } else {
-                let expected_branch = expected_branch_name(
-                    execution_id,
-                    &execution.branch_naming,
-                    execution.worker_branch_prefix.as_deref(),
-                );
-                let repo_slug = parse_repo_slug(&execution.repo_remote_url);
-                match repo_slug {
-                    Ok(ref slug) => match pr_number_from_url(&staged_url) {
-                        Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                            Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
-                                if head_ref.as_str() != expected_branch.as_str() {
-                                    tracing::info!(
-                                        execution_id,
-                                        staged_pr_url = %staged_url,
-                                        staged_pr_branch = %head_ref,
-                                        %expected_branch,
-                                        "pr-recheck: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
-                                    );
-                                }
-                                true
-                            }
-                            Ok(head_ref) => {
-                                tracing::warn!(
-                                    execution_id,
-                                    staged_pr_url = %staged_url,
-                                    staged_pr_branch = %head_ref,
-                                    %expected_branch,
-                                    "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
-                                );
-                                PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                                self.staged_pr_urls.forget(execution_id);
-                                false
-                            }
-                            Err(err) => {
-                                // Transient API failure: cannot verify this pass. Keep the
-                                // staged URL so the next sweep can retry verification rather
-                                // than falling back to the cold-path detector indefinitely.
-                                // Only a definitive branch-name mismatch (Ok arm above) evicts
-                                // the entry.
-                                tracing::warn!(
-                                    execution_id,
-                                    staged_pr_url = %staged_url,
-                                    ?err,
-                                    "pr-recheck: branch verification failed transiently; \
-                                     keeping staged URL for retry on next sweep",
-                                );
-                                false
-                            }
-                        },
-                        None => {
-                            tracing::warn!(
-                                execution_id,
-                                staged_pr_url = %staged_url,
-                                "pr-recheck: cannot parse PR number from staged URL; dropping for safety",
-                            );
-                            self.staged_pr_urls.forget(execution_id);
-                            false
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            execution_id,
-                            ?err,
-                            "pr-recheck: cannot parse repo slug; dropping staged URL for safety",
-                        );
-                        self.staged_pr_urls.forget(execution_id);
-                        false
-                    }
-                }
-            };
-            if branch_ok {
-                tracing::info!(
-                    execution_id,
-                    pr_url = %staged_url,
-                    "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
-                );
-                PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
-                return self
-                    .finalize_pr_transition(
-                        execution_id,
-                        staged_url,
-                        WorkerPrCompletionTarget::InReview,
-                        "pr_recheck_staged",
-                    )
-                    .await;
-            }
+        if let Some(outcome) = self
+            .finalize_from_staged_pr_url(execution_id, &execution, "pr-recheck", "pr_recheck_staged")
+            .await
+        {
+            return outcome;
         }
 
         // Running-status gate mirror (AI #6): the merge-poller's
