@@ -28,7 +28,7 @@ use async_trait::async_trait;
 pub use boss_conflict_diagnosis::ConflictedFile;
 
 pub use recipe_config::{ConflictRecipe, ConflictRecipesStore};
-pub use registry::{DeclinedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
+pub use registry::{DeclinedFile, FailedFile, RegistryResolution, ResolvedFile, ResolverRegistry};
 pub use resolvers::{
     BazelModuleLockResolver, CargoLockResolver, InvalidRecipe, RecipeResolver, RegistryAppendUnionResolver,
 };
@@ -85,10 +85,23 @@ pub enum ResolveOutcome {
     /// The file is resolved; its content on disk represents both sides'
     /// changes.
     Resolved { summary: String },
-    /// This resolver could not handle this instance. The caller must
-    /// climb to the next rung rather than treat this as a partial
+    /// This resolver could not handle this instance — a clean "not for
+    /// me" (a precondition wasn't met: the sibling manifest is missing,
+    /// the content isn't the shape this resolver knows, etc.). The caller
+    /// must climb to the next rung rather than treat this as a partial
     /// success — see [`RegistryResolution`].
     Declined { reason: String },
+    /// This resolver matched the file and *attempted* resolution, but the
+    /// attempt failed operationally: its regeneration command could not
+    /// spawn or exited non-zero. This is distinct from [`Self::Declined`]
+    /// precisely so a caller can tell "this file has no resolver / isn't
+    /// a formulaic conflict" apart from "the resolver's environment is
+    /// broken" (e.g. a missing toolchain or a gitignored build artifact
+    /// absent in a cold workspace) — the latter is actionable: fix the
+    /// environment, not the ladder. Like a decline it does not resolve
+    /// the file, so the caller still climbs to the next rung; only the
+    /// verdict/telemetry differs.
+    Failed { reason: String },
 }
 
 #[cfg(test)]

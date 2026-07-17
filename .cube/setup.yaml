@@ -1,0 +1,23 @@
+# Cube workspace setup steps for the mono repo.
+#
+# Run by `cube` on every lease against the leased workspace (see
+# tools/cube/src/setup.rs). Steps run through `sh -c` with cwd = the
+# workspace root; a step that exits non-zero fails the lease, so every step
+# must be safe to run on any host cube provisions a mono workspace on.
+version: 1
+steps:
+  # Materialize a placeholder GhosttyKit.xcframework so Bazel *analysis* of
+  # the macOS app works in a cold workspace. rules_swift_package_manager's
+  # swift_deps module extension runs `swift package describe` against
+  # tools/boss/app-macos/Package.swift during any analysis — including
+  # `bazel mod deps --lockfile_mode=update`, which the deterministic
+  # MODULE.bazel.lock conflict resolver shells out to. Package.swift declares
+  # a .binaryTarget at ThirdParty/GhosttyKit.xcframework, a gitignored
+  # artifact that a freshly provisioned workspace never has, so without this
+  # the resolver fails environmentally on every cold workspace. The script is
+  # idempotent, never clobbers a real bootstrapped framework, and no-ops off
+  # macOS, so `run_when: always` is a cheap file-existence check on leases
+  # after the first and self-heals if the stub is ever wiped.
+  - id: ghosttykit-spm-stub
+    command: bash tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
+    run_when: always

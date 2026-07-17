@@ -135,4 +135,31 @@ mod tests {
 
         assert!(matches!(outcome, ResolveOutcome::Declined { reason } if reason.contains("MODULE.bazel")));
     }
+
+    #[tokio::test]
+    async fn fails_when_bazel_command_errors_environmentally() {
+        // Reproduces the production failure mode (mono#2067/#2081/#2084): in
+        // a cold cube workspace `bazel mod deps --lockfile_mode=update`
+        // re-evaluates the SPM module extension and exits non-zero because
+        // the gitignored GhosttyKit.xcframework is absent. That is an
+        // operational/environment failure — `Failed`, not `Declined` — so
+        // the ladder verdict can distinguish it from "MODULE.bazel.lock has
+        // no resolver".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+
+        let runner = Arc::new(FakeCommandRunner::failure(
+            "Error in fail: Failed to execute SPM command ... GhosttyKit.xcframework does not contain binary artifact",
+        ));
+        let resolver = BazelModuleLockResolver::with_runner(runner);
+
+        let outcome = resolver.resolve(dir.path(), &file("MODULE.bazel.lock")).await;
+
+        match outcome {
+            ResolveOutcome::Failed { reason } => {
+                assert!(reason.contains("GhosttyKit.xcframework"), "reason was: {reason}");
+            }
+            other => panic!("expected Failed (environment failure), got {other:?}"),
+        }
+    }
 }

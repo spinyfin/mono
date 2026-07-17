@@ -11,7 +11,9 @@ pub struct ResolvedFile {
     pub summary: String,
 }
 
-/// A file no resolver could handle.
+/// A file no resolver could handle — either no resolver matched it, or a
+/// resolver matched but cleanly declined (a precondition wasn't met). A
+/// clean "not for rung 0", distinct from [`FailedFile`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclinedFile {
     pub path: String,
@@ -26,19 +28,36 @@ pub struct DeclinedFile {
     pub matched_resolver: bool,
 }
 
+/// A file whose matching resolver *attempted* resolution but failed
+/// operationally — its regeneration command could not spawn or exited
+/// non-zero. Distinct from [`DeclinedFile`] so callers can tell "no
+/// resolver / not a formulaic conflict" apart from "a resolver's
+/// environment is broken" (e.g. a missing toolchain or a gitignored build
+/// artifact absent in a cold workspace), which is actionable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedFile {
+    pub path: String,
+    pub reason: String,
+}
+
 /// Outcome of running a whole conflicted-file set through the registry.
 ///
 /// Per the rung-0 design: rung 0 only auto-retires when *every* file
-/// resolves. A single decline means the caller must discard any partial
-/// resolution and climb to the next rung — `resolved` on the `Declined`
-/// variant is informational (useful for telemetry on how close rung 0
-/// got), not a partial success to apply.
+/// resolves. A single decline or failure means the caller must discard any
+/// partial resolution and climb to the next rung — `resolved` on the
+/// `Declined` variant is informational (useful for telemetry on how close
+/// rung 0 got), not a partial success to apply. `declined` and `failed`
+/// are kept apart so the caller's verdict can distinguish "not every file
+/// has a resolver" (climb, nothing wrong) from "a resolver matched but its
+/// command failed operationally" (climb, but the environment is broken and
+/// worth surfacing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryResolution {
     AllResolved(Vec<ResolvedFile>),
     Declined {
         resolved: Vec<ResolvedFile>,
         declined: Vec<DeclinedFile>,
+        failed: Vec<FailedFile>,
     },
 }
 
@@ -75,6 +94,7 @@ impl ResolverRegistry {
     pub async fn resolve_all(&self, workspace_path: &Path, files: &[ConflictedFile]) -> RegistryResolution {
         let mut resolved = Vec::new();
         let mut declined = Vec::new();
+        let mut failed = Vec::new();
 
         // One INFO trace line per resolver invocation (conflict class,
         // resolver id, outcome) so rung-0 activity is answerable from the
@@ -113,6 +133,25 @@ impl ResolverRegistry {
                                 matched_resolver: true,
                             });
                         }
+                        ResolveOutcome::Failed { reason } => {
+                            // The resolver matched and ran but its command
+                            // failed operationally (spawn error / non-zero
+                            // exit) — an environment/tooling problem, not a
+                            // "this file has no resolver" decline. Logged at
+                            // WARN and tracked separately so the ladder
+                            // verdict can tell the two apart.
+                            tracing::warn!(
+                                path = %file.path,
+                                conflict_class = class.as_str(),
+                                outcome = "failed",
+                                reason = %reason,
+                                "deterministic_resolvers: resolver failed on conflicted file (operational/environment failure, not a decline)",
+                            );
+                            failed.push(FailedFile {
+                                path: file.path.clone(),
+                                reason,
+                            });
+                        }
                     }
                 }
                 None => {
@@ -132,10 +171,14 @@ impl ResolverRegistry {
             }
         }
 
-        if declined.is_empty() {
+        if declined.is_empty() && failed.is_empty() {
             RegistryResolution::AllResolved(resolved)
         } else {
-            RegistryResolution::Declined { resolved, declined }
+            RegistryResolution::Declined {
+                resolved,
+                declined,
+                failed,
+            }
         }
     }
 }
@@ -187,6 +230,26 @@ mod tests {
         async fn resolve(&self, _workspace_path: &Path, _file: &ConflictedFile) -> ResolveOutcome {
             ResolveOutcome::Declined {
                 reason: "nope".to_owned(),
+            }
+        }
+    }
+
+    /// Matches every file but reports an operational failure — stands in
+    /// for the cold-workspace bazel env failure (`bazel mod deps` exiting
+    /// non-zero because a gitignored artifact is absent).
+    struct AlwaysFails;
+
+    #[async_trait]
+    impl DeterministicResolver for AlwaysFails {
+        fn class(&self) -> ConflictClass {
+            ConflictClass::BazelModuleLock
+        }
+        fn applies_to(&self, _file: &ConflictedFile) -> bool {
+            true
+        }
+        async fn resolve(&self, _workspace_path: &Path, _file: &ConflictedFile) -> ResolveOutcome {
+            ResolveOutcome::Failed {
+                reason: "bazel blew up".to_owned(),
             }
         }
     }
@@ -259,7 +322,11 @@ mod tests {
         let registry = ResolverRegistry::empty();
         let result = registry.resolve_all(Path::new("/tmp"), &[file("weird.bin")]).await;
         match result {
-            RegistryResolution::Declined { declined, resolved } => {
+            RegistryResolution::Declined {
+                declined,
+                resolved,
+                failed,
+            } => {
                 assert_eq!(declined.len(), 1);
                 assert!(resolved.is_empty());
                 // No resolver ever ran for this file — callers (e.g. the
@@ -269,6 +336,8 @@ mod tests {
                     !declined[0].matched_resolver,
                     "no resolver applied; matched_resolver must be false"
                 );
+                // A missing resolver is a decline, not an operational failure.
+                assert!(failed.is_empty());
             }
             other => panic!("expected Declined, got {other:?}"),
         }
@@ -290,11 +359,16 @@ mod tests {
             .await;
 
         match result {
-            RegistryResolution::Declined { resolved, declined } => {
+            RegistryResolution::Declined {
+                resolved,
+                declined,
+                failed,
+            } => {
                 assert_eq!(resolved.len(), 1);
                 assert_eq!(resolved[0].path, "Cargo.lock");
                 assert_eq!(declined.len(), 1);
                 assert_eq!(declined[0].path, "MODULE.bazel.lock");
+                assert!(failed.is_empty());
             }
             other => panic!("expected Declined even though one file resolved, got {other:?}"),
         }
@@ -308,7 +382,11 @@ mod tests {
         let result = registry.resolve_all(Path::new("/tmp"), &[file("Cargo.lock")]).await;
 
         match result {
-            RegistryResolution::Declined { resolved, declined } => {
+            RegistryResolution::Declined {
+                resolved,
+                declined,
+                failed,
+            } => {
                 assert!(resolved.is_empty());
                 assert_eq!(declined.len(), 1);
                 assert_eq!(declined[0].reason, "nope");
@@ -318,8 +396,41 @@ mod tests {
                     declined[0].matched_resolver,
                     "a resolver matched and declined; matched_resolver must be true"
                 );
+                assert!(failed.is_empty());
             }
             other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_resolver_lands_in_failed_not_declined() {
+        // A resolver that matches but whose command fails operationally
+        // (spawn error / non-zero exit) must surface as `failed`, kept
+        // apart from clean declines so the caller can tell an environment
+        // failure from "no resolver applies".
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(AlwaysFails));
+
+        let result = registry
+            .resolve_all(Path::new("/tmp"), &[file("MODULE.bazel.lock")])
+            .await;
+
+        match result {
+            RegistryResolution::Declined {
+                resolved,
+                declined,
+                failed,
+            } => {
+                assert!(resolved.is_empty());
+                assert!(
+                    declined.is_empty(),
+                    "an operational failure must not be recorded as a decline"
+                );
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].path, "MODULE.bazel.lock");
+                assert_eq!(failed[0].reason, "bazel blew up");
+            }
+            other => panic!("expected Declined carrying a failed file, got {other:?}"),
         }
     }
 
@@ -419,10 +530,15 @@ mod tests {
         let result = registry.resolve_all(Path::new("/tmp"), &[file("Cargo.lock")]).await;
 
         match result {
-            RegistryResolution::Declined { resolved, declined } => {
+            RegistryResolution::Declined {
+                resolved,
+                declined,
+                failed,
+            } => {
                 assert!(resolved.is_empty(), "later resolver must not resolve the file");
                 assert_eq!(declined.len(), 1);
                 assert_eq!(declined[0].reason, "nope");
+                assert!(failed.is_empty());
             }
             other => panic!("expected Declined from the first matching resolver, got {other:?}"),
         }
