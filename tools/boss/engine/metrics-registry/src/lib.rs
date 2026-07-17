@@ -2,11 +2,12 @@
 //! `register_counter!` / `register_gauge!` declaration macros.
 //!
 //! This crate holds the storage and declaration half of the engine's
-//! metrics framework. Persisting snapshots to `state.db` and the
-//! `init_all` startup registration sweep stay in `boss-engine`: both
-//! reach into engine internals (`WorkDb`, every metric-declaring
-//! module), so they belong on the consumer side of this edge. The
-//! dependency runs one way — `boss-engine` -> `boss-engine-metrics-registry`.
+//! metrics framework. Persisting snapshots to a store (`boss-metrics`)
+//! and the `init_all` startup registration sweep (`boss-engine`) stay
+//! one level up: persistence needs a store abstraction and the
+//! startup sweep reaches into every metric-declaring engine module,
+//! so both belong on the consumer side of this edge. The dependency
+//! runs one way — `boss-engine` -> `boss-metrics` -> `boss-engine-metrics-registry`.
 //!
 //! Counters are strictly monotonic `u64`s; the only mutator is
 //! `inc` / `inc_by`. Gauges are signed `i64`s overwritten by the
@@ -49,7 +50,8 @@ impl CounterHandle {
 
     /// Add 1 to this counter in `registry`. Panics if the handle was
     /// not registered via [`Registry::register_counter`] (typically
-    /// fixed by adding the handle to `metrics::init_all`).
+    /// fixed by registering the handle at startup — for the engine,
+    /// in `boss_engine::metrics_init::init_all`).
     pub fn inc(&self, registry: &Registry) {
         registry.counter_inc_by(self.name, 1);
     }
@@ -105,9 +107,10 @@ impl GaugeHandle {
 /// );
 /// ```
 ///
-/// The handle must be added to `boss_engine::metrics::init_all` so
-/// registration runs at engine startup (design §"Risks / open
-/// questions" item 2).
+/// The handle must be added to the consumer's registration entry
+/// point (for the engine, `boss_engine::metrics_init::init_all`) so
+/// registration runs at startup (design §"Risks / open questions"
+/// item 2).
 #[macro_export]
 macro_rules! register_counter {
     ($static_name:ident, $name:literal, $description:literal $(,)?) => {
@@ -372,7 +375,7 @@ impl Registry {
             .unwrap_or_else(|| panic!("counter not registered: {name}"));
         if entry.stale.load(Ordering::Relaxed) {
             panic!(
-                "counter {name} is marked stale (rehydrated from state.db but no current handle); did you forget to add it to metrics::init_all?"
+                "counter {name} is marked stale (rehydrated from state.db but no current handle); did you forget to register the handle at startup (boss_engine::metrics_init::init_all)?"
             );
         }
         entry.value.fetch_add(n, Ordering::Relaxed);
@@ -386,7 +389,7 @@ impl Registry {
             .unwrap_or_else(|| panic!("gauge not registered: {name}"));
         if entry.stale.load(Ordering::Relaxed) {
             panic!(
-                "gauge {name} is marked stale (rehydrated from state.db but no current handle); did you forget to add it to metrics::init_all?"
+                "gauge {name} is marked stale (rehydrated from state.db but no current handle); did you forget to register the handle at startup (boss_engine::metrics_init::init_all)?"
             );
         }
         entry.value.store(value, Ordering::Relaxed);

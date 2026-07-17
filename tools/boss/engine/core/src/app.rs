@@ -1257,7 +1257,7 @@ impl ServerState {
         // counter module so duplicate-name panics trip during this
         // boot path rather than at runtime (design §"Risks / open
         // questions" item 6).
-        crate::metrics::init_all(&server_state.metrics);
+        crate::metrics_init::init_all(&server_state.metrics);
 
         // Seed the in-memory registry from `state.db` so monotonic
         // counter totals span engine restarts. Failures are logged

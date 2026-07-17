@@ -207,7 +207,7 @@ crate::register_counter!(
 );
 
 /// Register all merge-poller counter handles with `registry`. Called
-/// from [`crate::metrics::init_all`] at engine startup.
+/// from [`crate::metrics_init::init_all`] at engine startup.
 pub fn init(registry: &Registry) {
     registry.register_counter(&MERGED);
     registry.register_counter(&CONFLICT_FLAGGED);

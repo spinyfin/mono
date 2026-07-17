@@ -145,7 +145,7 @@ crate::register_counter!(
 const TRACKED_LABEL: &str = "tracked";
 
 /// Register all reconciler metrics with the engine's registry.
-/// Must be called from `metrics::init_all`.
+/// Must be called from `crate::metrics_init::init_all`.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&FETCH_SUCCEEDED);
     registry.register_counter(&FETCH_FAILED);

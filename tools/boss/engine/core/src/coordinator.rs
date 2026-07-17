@@ -47,7 +47,7 @@ crate::register_counter!(
 );
 
 /// Register all cube-workspace-lease counter handles with `registry`. Called
-/// from [`crate::metrics::init_all`] at engine startup.
+/// from [`crate::metrics_init::init_all`] at engine startup.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&CUBE_WORKSPACE_LEASE_ATTEMPTS);
     registry.register_counter(&CUBE_WORKSPACE_LEASE_SUCCESS);

@@ -14,11 +14,11 @@ Rows rehydrated from `state.db` whose name no longer matches any handle in the c
 
 ## Scope
 
-This crate is storage and declaration only. Two neighbouring pieces deliberately stay in `boss-engine`:
+This crate is storage and declaration only. Two neighbouring pieces deliberately stay one level up, in `boss-metrics` and `boss-engine` respectively:
 
-- **Persistence** (`metrics::persistence`) depends on `WorkDb` for the `state.db` flush and rehydrate paths.
-- **`metrics::init_all`** reaches into every metric-declaring engine module to force registration at boot.
+- **Persistence** (`boss_metrics::persistence`) depends on the `MetricsStore` trait for the flush and rehydrate paths; the engine backs it with `WorkDb`'s `state.db` tables.
+- **`boss_engine::metrics_init::init_all`** reaches into every metric-declaring engine module to force registration at boot.
 
-Both sit on the consumer side of the edge, which keeps the dependency one-way: `boss-engine` -> `boss-engine-metrics-registry`. Moving persistence down would mean introducing a sink trait at the boundary.
+Both sit on the consumer side of the edge, which keeps the dependency one-way: `boss-engine` -> `boss-metrics` -> `boss-engine-metrics-registry`. Moving persistence down would mean introducing a sink trait at this boundary — `boss-metrics` is that trait's home.
 
 See `tools/boss/docs/designs/engine-counter-metrics-framework.md` for the framework design and its open questions.

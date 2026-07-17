@@ -60,7 +60,7 @@ crate::register_gauge!(
 );
 
 /// Register all dep-unblock gauge handles with `registry`. Called from
-/// [`crate::metrics::init_all`] at engine startup.
+/// [`crate::metrics_init::init_all`] at engine startup.
 pub fn register_metrics(registry: &Registry) {
     registry.register_gauge(&DEP_UNBLOCK_LONGEST_STALE_SECONDS);
 }
