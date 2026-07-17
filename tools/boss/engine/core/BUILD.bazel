@@ -84,172 +84,43 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
-# engine_lib_test is split into 4 parallel shards to cut wall time.
-# Rust's libtest does not honour TEST_SHARD_INDEX / TEST_TOTAL_SHARDS, so
-# shard_count would silently re-run the full suite N times.  Instead we
-# create 4 rust_test targets with disjoint test-name filters (positional
-# FILTERS and --skip flags) so Bazel schedules them in parallel.
-# Coverage is identical: the 4 filter sets partition all 1145 tests with
-# no overlap.  A test_suite keeps `bazel test :engine_lib_test` working.
+# EXPERIMENT (T2856): engine_lib_test as ONE rust_test with native Bazel
+# sharding (shard_count = 11), enabled by the rules_rust#3774 backport patch
+# in //third_party/patches (see MODULE.bazel single_version_override).
+# One cfg(test) compile of the crate + 11 parallel shard executions, vs the
+# previous layout's 4 filter-partitioned rust_test targets = 4 full compiles.
 #
-# All shards share size = "small" / timeout = "moderate" (300 s):
+# size = "small" / timeout = "moderate" (300 s):
 #   linux-amd64 CI runners run ~6-7x slower than macOS dev boxes, so the
-#   60 s default for size="small" is too tight even per-shard.
-# All shards set env = {"HOME": "/tmp"}:
-#   Bazel's sandbox does not inherit HOME; tests that call
-#   cube_default_workspace_root_for_test need a stable sentinel value.
+#   60 s default for size="small" is too tight.
+# env:
+#   HOME=/tmp — Bazel's sandbox does not inherit HOME; tests that call
+#     cube_default_workspace_root_for_test need a stable sentinel value.
+#   BOSS_EVENT_BIN — non-empty boss-event path so runner tests that call
+#     boss_event_binary() without an injected override don't panic in the
+#     Bazel sandbox (union of the previous per-shard envs; harmless for
+#     tests that don't read it).
 
-# Shard 1 — work module (~226 tests, the single heaviest slice ~7s on macOS)
 rust_test(
-    name = "engine_lib_test_work",
+    name = "engine_lib_test",
     size = "small",
     timeout = "moderate",
-    args = ["work::"],
-    crate = ":engine_lib",
-    edition = "2024",
-    env = {"HOME": "/tmp"},
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
-)
-
-# Shard 2 — app + dispatch + conflict + ci_log_reader (~164 tests, ~5s on macOS)
-rust_test(
-    name = "engine_lib_test_a",
-    size = "small",
-    timeout = "moderate",
-    args = [
-        "app::",
-        "dispatch_events::",
-        "dispatch_reader::",
-        "conflict_watch::",
-        "ci_log_reader::",
-    ],
-    crate = ":engine_lib",
-    edition = "2024",
-    env = {"HOME": "/tmp"},
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
-)
-
-# Shard 3 — completion + coordinator + merge_poller + external_tracker +
-#           live_status* + runner + build_info (~358 tests, ~7s on macOS)
-rust_test(
-    name = "engine_lib_test_b",
-    size = "small",
-    timeout = "moderate",
-    args = [
-        "completion::",
-        "coordinator::",
-        "merge_poller::",
-        "external_tracker::",
-        "live_status::",
-        "live_status_loop::",
-        "live_status_redact::",
-        "runner::",
-        "build_info::",
-        # nudge_breaker is pure in-memory (no global state) and is the
-        # auto-nudge sibling of completion; group it here rather than in
-        # shard 4 so it doesn't add parallelism to that shard's
-        # global-state-sharing tests (audit/worker_setup).
-        "nudge_breaker::",
-    ],
     crate = ":engine_lib",
     edition = "2024",
     env = {
-        "HOME": "/tmp",
-        # Provide a non-empty boss-event path so runner tests that call
-        # boss_event_binary() without an injected override don't panic in
-        # the Bazel sandbox (no runfiles, no stable bin dir, no sibling).
-        # The env-override branch returns this without an existence check,
-        # so it works even though /opt/boss/bin/boss-event doesn't exist on
-        # CI agents. Tests that assert on the actual baked path inject a
-        # real temp file via PaneSpawnRunner::set_boss_event_path() instead.
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "HOME": "/tmp",
     },
+    experimental_enable_sharding = True,
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    shard_count = 11,
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
-)
-
-# Shard 4 — everything not covered by shards 1-3 (~397 tests, ~2s on macOS)
-rust_test(
-    name = "engine_lib_test_rest",
-    size = "small",
-    timeout = "moderate",
-    args = [
-        "--skip",
-        "work::",
-        "--skip",
-        "app::",
-        "--skip",
-        "dispatch_events::",
-        "--skip",
-        "dispatch_reader::",
-        "--skip",
-        "conflict_watch::",
-        "--skip",
-        "ci_log_reader::",
-        "--skip",
-        "completion::",
-        "--skip",
-        "coordinator::",
-        "--skip",
-        "merge_poller::",
-        "--skip",
-        "external_tracker::",
-        "--skip",
-        "live_status::",
-        "--skip",
-        "live_status_loop::",
-        "--skip",
-        "live_status_redact::",
-        "--skip",
-        "runner::",
-        "--skip",
-        "build_info::",
-        "--skip",
-        "nudge_breaker::",
-    ],
-    crate = ":engine_lib",
-    edition = "2024",
-    env = {"HOME": "/tmp"},
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
-)
-
-# Umbrella target: `bazel test //tools/boss/engine:engine_lib_test` runs all
-# 4 shards in parallel (subject to --jobs).
-test_suite(
-    name = "engine_lib_test",
-    tests = [
-        ":engine_lib_test_a",
-        ":engine_lib_test_b",
-        ":engine_lib_test_rest",
-        ":engine_lib_test_work",
-    ],
 )
 
 rust_test(

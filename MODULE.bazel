@@ -5,6 +5,20 @@ module(
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "rules_rust", version = "0.70.0")
+
+# EXPERIMENT (T2856): backport of rules_rust#3774 — native Bazel test sharding
+# for rust_test via an opt-in `experimental_enable_sharding` attribute. The
+# patch teaches the test runner to honour TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
+# and touch TEST_SHARD_STATUS_FILE, so `shard_count` on a rust_test runs one
+# compile + N parallel shard executions instead of silently re-running the
+# full suite N times. See docs/investigations/rust-test-sharding-engine-lib-test.md.
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = ["//third_party/patches:rules_rust-0.70.0-test-sharding.patch"],
+    version = "0.70.0",
+)
+
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rules_swift")

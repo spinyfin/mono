@@ -1,0 +1,442 @@
+diff --git a/rust/private/BUILD.bazel b/rust/private/BUILD.bazel
+index 89444bb..ea92ed7 100644
+--- a/rust/private/BUILD.bazel
++++ b/rust/private/BUILD.bazel
+@@ -5,6 +5,12 @@ load("//rust/private:rustc.bzl", "is_proc_macro_dep", "is_proc_macro_dep_enabled
+ # Exported for docs
+ exports_files(["providers.bzl"])
+ 
++# Test sharding wrapper scripts
++exports_files([
++    "test_sharding_wrapper.sh",
++    "test_sharding_wrapper.bat",
++])
++
+ bzl_library(
+     name = "bazel_tools_bzl_lib",
+     srcs = ["@bazel_tools//tools:bzl_srcs"],
+diff --git a/rust/private/rust.bzl b/rust/private/rust.bzl
+index bd78468..ba94349 100644
+--- a/rust/private/rust.bzl
++++ b/rust/private/rust.bzl
+@@ -219,7 +219,7 @@ def _rust_library_common(ctx, crate_type):
+     deps = transform_deps(ctx.attr.deps)
+     proc_macro_deps = transform_deps(ctx.attr.proc_macro_deps + get_import_macro_deps(ctx))
+ 
+-    return rustc_compile_action(
++    return list(rustc_compile_action(
+         ctx = ctx,
+         attr = ctx.attr,
+         toolchain = toolchain,
+@@ -247,7 +247,7 @@ def _rust_library_common(ctx, crate_type):
+             owner = ctx.label,
+             cfgs = _collect_cfgs(ctx, toolchain, crate_root, crate_type, crate_is_test = False),
+         ),
+-    )
++    ).values())
+ 
+ def _rust_binary_impl(ctx):
+     """The implementation of the `rust_binary` rule
+@@ -313,16 +313,16 @@ def _rust_binary_impl(ctx):
+         ),
+     )
+ 
+-    providers.append(RunEnvironmentInfo(
++    providers["RunEnvironmentInfo"] = RunEnvironmentInfo(
+         environment = expand_dict_value_locations(
+             ctx,
+             ctx.attr.env,
+             ctx.attr.data,
+             {},
+         ),
+-    ))
++    )
+ 
+-    return providers
++    return list(providers.values())
+ 
+ def get_rust_test_flags(attr):
+     """Determine the desired rustc flags for test targets.
+@@ -499,6 +499,50 @@ def _rust_test_impl(ctx):
+         rust_flags = get_rust_test_flags(ctx.attr),
+         skip_expanding_rustc_env = True,
+     )
++
++    # If sharding is enabled and we're using libtest harness, wrap the test binary
++    # with a script that handles test enumeration and shard partitioning
++    if ctx.attr.experimental_enable_sharding and ctx.attr.use_libtest_harness:
++        default_info = providers["DefaultInfo"]
++
++        # Get the test binary from CrateInfo (or TestCrateInfo for staticlib/cdylib)
++        crate_info_provider = providers.get("crate_info") or providers.get("test_crate_info")
++        if crate_info_provider:
++            # TestCrateInfo wraps the actual CrateInfo
++            if hasattr(crate_info_provider, "crate"):
++                crate_info_provider = crate_info_provider.crate
++            test_binary = crate_info_provider.output
++
++            # Select the appropriate wrapper template based on target OS
++            if toolchain.target_os == "windows":
++                wrapper = ctx.actions.declare_file(ctx.label.name + "_sharding_wrapper.bat")
++                wrapper_template = ctx.file._test_sharding_wrapper_windows
++            else:
++                wrapper = ctx.actions.declare_file(ctx.label.name + "_sharding_wrapper.sh")
++                wrapper_template = ctx.file._test_sharding_wrapper_unix
++
++            # Generate wrapper script with test binary path substituted
++            ctx.actions.expand_template(
++                template = wrapper_template,
++                output = wrapper,
++                substitutions = {
++                    "{{TEST_BINARY}}": test_binary.short_path,
++                },
++                is_executable = True,
++            )
++
++            # Update runfiles to include both wrapper and test binary
++            new_runfiles = default_info.default_runfiles.merge(
++                ctx.runfiles(files = [test_binary]),
++            )
++
++            # Replace DefaultInfo with wrapper as executable
++            providers["DefaultInfo"] = DefaultInfo(
++                files = default_info.files,
++                runfiles = new_runfiles,
++                executable = wrapper,
++            )
++
+     data = getattr(ctx.attr, "data", [])
+ 
+     env = expand_dict_value_locations(
+@@ -534,12 +578,12 @@ def _rust_test_impl(ctx):
+         env["CC_CODE_COVERAGE_SCRIPT"] = ctx.executable._collect_cc_coverage.path
+     components = "{}/{}".format(ctx.label.workspace_root, ctx.label.package).split("/")
+     env["CARGO_MANIFEST_DIR"] = "/".join([c for c in components if c])
+-    providers.append(RunEnvironmentInfo(
++    providers["RunEnvironmentInfo"] = RunEnvironmentInfo(
+         environment = env,
+         inherited_environment = ctx.attr.env_inherit,
+-    ))
++    )
+ 
+-    return providers
++    return list(providers.values())
+ 
+ def _rust_library_group_impl(ctx):
+     dep_variant_infos = []
+@@ -920,6 +964,30 @@ _RUST_TEST_ATTRS = {
+             E.g. `bazel test //src:rust_test --test_arg=foo::test::test_fn`.
+         """),
+     ),
++    "experimental_enable_sharding": attr.bool(
++        mandatory = False,
++        default = False,
++        doc = dedent("""\
++            If True, enable support for Bazel test sharding (shard_count attribute).
++
++            When enabled, tests are executed via a wrapper script that:
++            1. Enumerates tests using libtest's --list flag
++            2. Partitions tests across shards based on TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
++            3. Runs only the tests assigned to the current shard
++
++            This attribute only has an effect when use_libtest_harness is True.
++
++            This is experimental and may change in future releases.
++        """),
++    ),
++    "_test_sharding_wrapper_unix": attr.label(
++        default = Label("//rust/private:test_sharding_wrapper.sh"),
++        allow_single_file = True,
++    ),
++    "_test_sharding_wrapper_windows": attr.label(
++        default = Label("//rust/private:test_sharding_wrapper.bat"),
++        allow_single_file = True,
++    ),
+ } | _COVERAGE_ATTRS | _EXPERIMENTAL_USE_CC_COMMON_LINK_ATTRS
+ 
+ rust_library = rule(
+diff --git a/rust/private/rustc.bzl b/rust/private/rustc.bzl
+index f43ddab..7c37b30 100644
+--- a/rust/private/rustc.bzl
++++ b/rust/private/rustc.bzl
+@@ -1373,10 +1373,14 @@ def rustc_compile_action(
+             that are allowed to be used in the crate.
+ 
+     Returns:
+-        list: A list of the following providers:
+-            - (CrateInfo): info for the crate we just built; same as `crate_info` parameter.
+-            - (DepInfo): The transitive dependencies of this crate.
+-            - (DefaultInfo): The output file for this crate, and its runfiles.
++        dict: A dict mapping provider types to provider instances. Keys include:
++            - DefaultInfo: The output file for this crate, and its runfiles.
++            - CrateInfo: info for the crate we just built (or TestCrateInfo for staticlib/cdylib).
++            - DepInfo: The transitive dependencies of this crate.
++            - InstrumentedFilesInfo: Coverage information (if include_coverage is True).
++            - CcInfo: C/C++ interop info (if applicable).
++            - OutputGroupInfo: Additional output groups (if any).
++        Callers should convert to a list via `list(providers.values())` when returning from a rule.
+     """
+     deps = crate_info_dict.pop("deps")
+     proc_macro_deps = crate_info_dict.pop("proc_macro_deps")
+@@ -1775,25 +1779,24 @@ def rustc_compile_action(
+             "metadata_files": coverage_runfiles + [executable] if executable else [],
+         })
+ 
+-    providers = [
+-        DefaultInfo(
++    # Use string keys for providers since provider types are not hashable in all Bazel versions
++    providers = {
++        "DefaultInfo": DefaultInfo(
+             # nb. This field is required for cc_library to depend on our output.
+             files = depset(outputs),
+             runfiles = runfiles,
+             executable = executable,
+         ),
+-    ]
++    }
+ 
+     # When invoked by aspects (and when running `bazel coverage`), the
+     # baseline_coverage.dat created here will conflict with the baseline_coverage.dat of the
+     # underlying target, which is a build failure. So we add an option to disable it so that this
+     # function can be invoked from aspects for rules that have its own InstrumentedFilesInfo.
+     if include_coverage:
+-        providers.append(
+-            coverage_common.instrumented_files_info(
+-                ctx,
+-                **instrumented_files_kwargs
+-            ),
++        providers["InstrumentedFilesInfo"] = coverage_common.instrumented_files_info(
++            ctx,
++            **instrumented_files_kwargs
+         )
+ 
+     if crate_info_dict != None:
+@@ -1812,11 +1815,20 @@ def rustc_compile_action(
+         # as such they shouldn't provide a CrateInfo. However, one may still want to
+         # write a rust_test for them, so we provide the CrateInfo wrapped in a provider
+         # that rust_test understands.
+-        providers.extend([rust_common.test_crate_info(crate = crate_info), dep_info])
++        providers["test_crate_info"] = rust_common.test_crate_info(crate = crate_info)
+     else:
+-        providers.extend([crate_info, dep_info])
++        providers["crate_info"] = crate_info
++
++    providers["dep_info"] = dep_info
+ 
+-    providers += establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library)
++    cc_info_providers = establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library)
++    for cc_provider in cc_info_providers:
++        # establish_cc_info returns CcInfo and optionally AllocatorLibrariesImplInfo
++        if type(cc_provider) == "CcInfo":
++            providers["CcInfo"] = cc_provider
++        else:
++            # AllocatorLibrariesImplInfo
++            providers["AllocatorLibrariesImplInfo"] = cc_provider
+ 
+     output_group_info = {}
+ 
+@@ -1832,12 +1844,12 @@ def rustc_compile_action(
+         output_group_info["rustc_output"] = depset([rustc_output])
+ 
+     if output_group_info:
+-        providers.append(OutputGroupInfo(**output_group_info))
++        providers["OutputGroupInfo"] = OutputGroupInfo(**output_group_info)
+ 
+     # A bit unfortunate, but sidecar the lints info so rustdoc can access the
+     # set of lints from the target it is documenting.
+     if hasattr(ctx.attr, "lint_config") and ctx.attr.lint_config:
+-        providers.append(ctx.attr.lint_config[LintsInfo])
++        providers["LintsInfo"] = ctx.attr.lint_config[LintsInfo]
+ 
+     return providers
+ 
+diff --git b/rust/private/test_sharding_wrapper.bat b/rust/private/test_sharding_wrapper.bat
+new file mode 100644
+index 0000000..e363aed
+--- /dev/null
++++ b/rust/private/test_sharding_wrapper.bat
+@@ -0,0 +1,118 @@
++@REM Copyright 2024 The Bazel Authors. All rights reserved.
++@REM
++@REM Licensed under the Apache License, Version 2.0 (the "License");
++@REM you may not use this file except in compliance with the License.
++@REM You may obtain a copy of the License at
++@REM
++@REM    http://www.apache.org/licenses/LICENSE-2.0
++@REM
++@REM Unless required by applicable law or agreed to in writing, software
++@REM distributed under the License is distributed on an "AS IS" BASIS,
++@REM WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++@REM See the License for the specific language governing permissions and
++@REM limitations under the License.
++
++@REM Wrapper script for rust_test that enables Bazel test sharding support.
++@REM This script intercepts test execution, enumerates tests using libtest's
++@REM --list flag, partitions them by shard index, and runs only the relevant subset.
++
++@ECHO OFF
++SETLOCAL EnableDelayedExpansion
++
++SET TEST_BINARY_RAW={{TEST_BINARY}}
++SET TEST_BINARY_PATH=!TEST_BINARY_RAW:/=\!
++
++@REM Try to find the binary using RUNFILES_DIR if set
++IF DEFINED RUNFILES_DIR (
++    SET TEST_BINARY_IN_RUNFILES=!RUNFILES_DIR!\!TEST_BINARY_PATH!
++    IF EXIST "!TEST_BINARY_IN_RUNFILES!" (
++        SET TEST_BINARY_PATH=!TEST_BINARY_IN_RUNFILES!
++    )
++)
++
++@REM The short_path is like: test/unit/test_sharding/test-2586318641/sharded_test_enabled.exe
++@REM But on Windows, the binary is at grandparent/test-XXX/name.exe (sibling of runfiles dir)
++@REM Extract just the last two components (test-XXX/name.exe)
++FOR %%F IN ("!TEST_BINARY_PATH!") DO SET BINARY_NAME=%%~nxF
++FOR %%F IN ("!TEST_BINARY_PATH!\..") DO SET BINARY_DIR=%%~nxF
++
++@REM Try various path resolutions
++SET FOUND_BINARY=0
++
++@REM Try 1: Direct path (might work in some configurations)
++IF EXIST "!TEST_BINARY_PATH!" (
++    SET FOUND_BINARY=1
++)
++
++@REM Try 2: Grandparent + last two path components
++IF !FOUND_BINARY! EQU 0 (
++    FOR %%F IN ("!TEST_BINARY_PATH!") DO (
++        SET TEMP_PATH=%%~dpF
++        SET TEMP_PATH=!TEMP_PATH:~0,-1!
++        FOR %%D IN ("!TEMP_PATH!") DO SET PARENT_DIR=%%~nxD
++    )
++    SET TEST_BINARY_GP=..\..\!PARENT_DIR!\!BINARY_NAME!
++    IF EXIST "!TEST_BINARY_GP!" (
++        SET TEST_BINARY_PATH=!TEST_BINARY_GP!
++        SET FOUND_BINARY=1
++    )
++)
++
++@REM Try 3: RUNFILES_DIR based path  
++IF !FOUND_BINARY! EQU 0 IF DEFINED RUNFILES_DIR (
++    SET TEST_BINARY_RF=!RUNFILES_DIR!\_main\!TEST_BINARY_PATH!
++    SET TEST_BINARY_RF=!TEST_BINARY_RF:/=\!
++    IF EXIST "!TEST_BINARY_RF!" (
++        SET TEST_BINARY_PATH=!TEST_BINARY_RF!
++        SET FOUND_BINARY=1
++    )
++)
++
++IF !FOUND_BINARY! EQU 0 (
++    ECHO ERROR: Could not find test binary at any expected location
++    EXIT /B 1
++)
++
++@REM If sharding is not enabled, run test binary directly
++IF "%TEST_TOTAL_SHARDS%"=="" (
++    !TEST_BINARY_PATH! %*
++    EXIT /B !ERRORLEVEL!
++)
++
++@REM Touch status file to advertise sharding support to Bazel
++IF NOT "%TEST_SHARD_STATUS_FILE%"=="" (
++    TYPE NUL > "%TEST_SHARD_STATUS_FILE%"
++)
++
++@REM Create a temporary file for test list
++SET TEMP_LIST=%TEMP%\rust_test_list_%RANDOM%.txt
++
++@REM Enumerate all tests using libtest's --list flag
++!TEST_BINARY_PATH! --list --format terse 2>NUL > "!TEMP_LIST!"
++
++@REM Count tests and filter for this shard
++SET INDEX=0
++SET SHARD_TESTS=
++
++FOR /F "tokens=1 delims=:" %%T IN ('TYPE "!TEMP_LIST!" ^| FINDSTR /E ": test"') DO (
++    SET /A MOD=!INDEX! %% %TEST_TOTAL_SHARDS%
++    IF !MOD! EQU %TEST_SHARD_INDEX% (
++        IF "!SHARD_TESTS!"=="" (
++            SET SHARD_TESTS=%%T
++        ) ELSE (
++            SET SHARD_TESTS=!SHARD_TESTS! %%T
++        )
++    )
++    SET /A INDEX=!INDEX! + 1
++)
++
++DEL "!TEMP_LIST!" 2>NUL
++
++@REM If no tests for this shard, exit successfully
++IF "!SHARD_TESTS!"=="" (
++    EXIT /B 0
++)
++
++@REM Run the filtered tests with --exact to match exact test names
++!TEST_BINARY_PATH! !SHARD_TESTS! --exact %*
++EXIT /B !ERRORLEVEL!
+diff --git b/rust/private/test_sharding_wrapper.sh b/rust/private/test_sharding_wrapper.sh
+new file mode 100644
+index 0000000..e05970b
+--- /dev/null
++++ b/rust/private/test_sharding_wrapper.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# Copyright 2024 The Bazel Authors. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Wrapper script for rust_test that enables Bazel test sharding support.
++# This script intercepts test execution, enumerates tests using libtest's
++# --list flag, partitions them by shard index, and runs only the relevant subset.
++
++set -euo pipefail
++
++TEST_BINARY="{{TEST_BINARY}}"
++
++# If sharding is not enabled, run test binary directly
++if [[ -z "${TEST_TOTAL_SHARDS:-}" ]]; then
++    exec "./${TEST_BINARY}" "$@"
++fi
++
++# Touch status file to advertise sharding support to Bazel
++if [[ -n "${TEST_SHARD_STATUS_FILE:-}" ]]; then
++    touch "${TEST_SHARD_STATUS_FILE}"
++fi
++
++# Enumerate all tests using libtest's --list flag
++# Output format: "test_name: test" - we need to strip the ": test" suffix
++test_list=$("./${TEST_BINARY}" --list --format terse 2>/dev/null | grep ': test$' | sed 's/: test$//' || true)
++
++# If no tests found, exit successfully
++if [[ -z "$test_list" ]]; then
++    exit 0
++fi
++
++# Filter tests for this shard
++# test_index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX
++shard_tests=()
++index=0
++while IFS= read -r test_name; do
++    if (( index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX )); then
++        shard_tests+=("$test_name")
++    fi
++    ((index++)) || true
++done <<< "$test_list"
++
++# If no tests for this shard, exit successfully
++if [[ ${#shard_tests[@]} -eq 0 ]]; then
++    exit 0
++fi
++
++# Run the filtered tests with --exact to match exact test names
++exec "./${TEST_BINARY}" "${shard_tests[@]}" --exact "$@"
