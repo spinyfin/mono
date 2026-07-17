@@ -383,33 +383,30 @@ pub async fn add_issue_to_project_with_embedded_token(
 mod tests {
     use super::*;
     use jsonwebtoken::{DecodingKey, Validation, decode};
-    use rsa::RsaPrivateKey;
-    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding as Pkcs1LineEnding};
-    use rsa::pkcs8::EncodePublicKey;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Generate a fresh RSA-2048 keypair for tests. Returns `(private_pem,
-    /// public_pem)` in PKCS#1 and SPKI PEM formats respectively — the same
-    /// formats `jsonwebtoken` expects for `EncodingKey::from_rsa_pem` and
-    /// `DecodingKey::from_rsa_pem`.
-    fn generate_test_keypair() -> (String, String) {
-        let mut rng = rand::thread_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen failed");
-        let public_key = rsa::RsaPublicKey::from(&private_key);
-        let private_pem = private_key
-            .to_pkcs1_pem(Pkcs1LineEnding::LF)
-            .expect("private key to PKCS#1 PEM")
-            .to_string();
-        let public_pem = public_key
-            .to_public_key_pem(rsa::pkcs8::spki::der::pem::LineEnding::LF)
-            .expect("public key to SPKI PEM");
-        (private_pem, public_pem)
-    }
+    // Fixed RSA-2048 keypair used only as test fixture material — it signs
+    // nothing real and is never used outside this test module. Generating a
+    // fresh key per test run cost ~10-40s of pure-Rust prime search (the
+    // `rsa` crate has no fast path at fastbuild opt-level), which made this
+    // target flake against its own timeout; embedding a fixed pair removes
+    // that cost. GitHub secret scanning and push protection are both
+    // disabled repo-wide (`gh api repos/spinyfin/mono` ->
+    // security_and_analysis.secret_scanning.status == "disabled") and no
+    // checkleft/gitleaks secret-pattern check is configured in CHECKS.yaml,
+    // so there is no scanner allowlist mechanism to wire up here. The
+    // `TEST_ONLY_..._NOT_A_SECRET` naming is the durable signal for anyone
+    // (human or scanner) who encounters this key later.
+    const TEST_ONLY_RSA_KEY_NOT_A_SECRET_PRIVATE_PEM: &str =
+        include_str!("test_fixtures/test_only_rsa_key_not_a_secret.pem");
+    const TEST_ONLY_RSA_KEY_NOT_A_SECRET_PUBLIC_PEM: &str =
+        include_str!("test_fixtures/test_only_rsa_key_not_a_secret.pub.pem");
 
     #[test]
     fn build_jwt_produces_decodable_rs256_token() {
-        let (private_pem, public_pem) = generate_test_keypair();
+        let private_pem = TEST_ONLY_RSA_KEY_NOT_A_SECRET_PRIVATE_PEM;
+        let public_pem = TEST_ONLY_RSA_KEY_NOT_A_SECRET_PUBLIC_PEM;
         let token = build_jwt_at("42", private_pem.as_bytes(), 1_700_000_000).unwrap();
 
         let mut validation = Validation::new(Algorithm::RS256);
@@ -456,11 +453,10 @@ mod tests {
     }
 
     fn make_test_config() -> AppConfig {
-        let (private_pem, _) = generate_test_keypair();
         AppConfig {
             app_id: "42".into(),
             installation_id: "67890".into(),
-            private_key_pem: private_pem,
+            private_key_pem: TEST_ONLY_RSA_KEY_NOT_A_SECRET_PRIVATE_PEM.into(),
         }
     }
 
