@@ -84,11 +84,13 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
-# EXPERIMENT (T2856): engine_lib_test as ONE rust_test with native Bazel
-# sharding (shard_count = 11), enabled by the rules_rust#3774 backport patch
-# in //third_party/patches (see MODULE.bazel single_version_override).
-# One cfg(test) compile of the crate + 11 parallel shard executions, vs the
+# engine_lib_test is ONE rust_test with native Bazel sharding
+# (shard_count = 11), enabled by the rules_rust#3774 backport patch in
+# //third_party/patches (see MODULE.bazel single_version_override). One
+# cfg(test) compile of the crate + 11 parallel shard executions, vs the
 # previous layout's 4 filter-partitioned rust_test targets = 4 full compiles.
+# See docs/investigations/rust-test-sharding-engine-lib-test.md (T2856) for
+# the correctness gate and before/after measurements this adoption is based on.
 #
 # size = "small" / timeout = "moderate" (300 s):
 #   linux-amd64 CI runners run ~6-7x slower than macOS dev boxes, so the
@@ -100,6 +102,14 @@ rust_binary(
 #     boss_event_binary() without an injected override don't panic in the
 #     Bazel sandbox (union of the previous per-shard envs; harmless for
 #     tests that don't read it).
+#
+# Single-test dev loop: `bazel test --test_arg=--exact --test_arg=name` does
+# NOT work here (sharding forces --exact name matching per-shard, so a lone
+# test name only reaches whichever shard it hashes into, and `bazel run` on a
+# sharded test is refused outright: "'run' only works with tests with one
+# shard"). Instead, disable sharding for the run and exec the binary directly:
+#   bazel run --test_sharding_strategy=disabled \
+#       //tools/boss/engine/core:engine_lib_test -- --exact path::to::test_name
 
 rust_test(
     name = "engine_lib_test",
