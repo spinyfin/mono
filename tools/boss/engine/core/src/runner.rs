@@ -586,6 +586,28 @@ impl ExecutionRunner for PaneSpawnRunner {
                  Deferring to the spawn-ack sweep to confirm liveness or reap — the \
                  execution stays tracked and the workspace lease is retained.",
             );
+        } else if started.shell_pid == 0 {
+            // A SUCCESSFUL ack that reports shell_pid 0 (the app hosted the
+            // pane but its surface hasn't published the shell pid yet; the
+            // real pid arrives shortly via `update_worker_shell_pid`). This
+            // is the exact `shell_pid: 0, ack_timed_out: false` state seen in
+            // the field, and until the pid lands the slot looks identical to
+            // an ack-timeout provisional spawn (activity=Spawning, pid 0) to
+            // the sweeps. It was previously silent — only the ack-timeout
+            // branch warned — so the window did not appear in the trace.
+            // Surface it explicitly so a run that misbehaves during this
+            // window is diagnosable. This is instrumentation only: the pid is
+            // reconciled by `update_worker_shell_pid`, and the sweeps already
+            // protect a hooking/pid-reporting worker.
+            tracing::warn!(
+                worker_id,
+                execution_id = %execution.id,
+                slot_id = started.slot_id,
+                "pane spawned on a successful ack but with shell_pid 0 — provisional \
+                 liveness window: awaiting update_worker_shell_pid from the app before \
+                 the pid→run mapping is registered. The execution stays tracked and the \
+                 slot is registered; no reap is warranted while it hooks or reports a pid.",
+            );
         }
 
         // Mid-spawn cancel reconciliation (T981). A cancel / force-stop

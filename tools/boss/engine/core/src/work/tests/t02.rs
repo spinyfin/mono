@@ -618,6 +618,60 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Companion to the R693 case for the all-terminal shape (exec_89 / T500):
+/// when there is NO live execution and the newest row is an `abandoned`
+/// redundant/superseded duplicate, `query_task_runtime` must fall back to the
+/// most recent non-abandoned execution. Otherwise a successfully COMPLETED
+/// revision renders as `abandoned` ("broken") in `agents status` because a
+/// duplicate that never ran shadows it.
+#[test]
+fn task_runtime_prefers_completed_over_abandoned_duplicate() {
+    let path = temp_db_path("runtime-prefers-completed-over-abandoned");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "T500-shaped");
+
+    // The execution that actually did the work and completed.
+    let completed = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    // A newer, redundant duplicate abandoned without ever running
+    // (mark_execution_redundant). It must NOT shadow the completed sibling.
+    let abandoned = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Abandoned)
+                .build(),
+        )
+        .unwrap();
+    // Guarantee the abandoned dup is the newest row by created_at (epoch-secs
+    // granularity would otherwise tie same-second creates).
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '9999999999' WHERE id = ?1",
+            rusqlite::params![abandoned.id],
+        )
+        .unwrap();
+
+    let runtime = db.get_task_runtime(&chore.id).unwrap();
+    assert_eq!(
+        runtime.execution_id.as_deref(),
+        Some(completed.id.as_str()),
+        "runtime must prefer the completed execution over the newer abandoned duplicate",
+    );
+    assert_eq!(runtime.execution_status, Some(ExecutionStatus::Completed));
+    let _ = std::fs::remove_file(path);
+}
+
 /// Reaping a running execution stamps it `orphaned` (terminal),
 /// preserves the cube workspace columns, and stamps any active
 /// work_runs with status='orphaned' + the supplied reason as the

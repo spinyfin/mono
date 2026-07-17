@@ -259,9 +259,10 @@ pub(crate) fn collect_task_runtimes(
 }
 
 /// Runtime snapshot for a single work item. `queries` is incremented by the
-/// number of SQL statements this call actually executes (1-3, depending on
-/// whether a live-execution fallback and a latest-run lookup are needed) so
-/// N+1 callers can report an accurate aggregate subquery count.
+/// number of SQL statements this call actually executes (1-4, depending on
+/// whether a live-execution fallback, a non-abandoned-execution fallback for
+/// an all-abandoned work item, and a latest-run lookup are needed) so N+1
+/// callers can report an accurate aggregate subquery count.
 pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
     *queries += 1;
@@ -276,12 +277,28 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries:
     // waiting_human) execution. Steady state — the latest row IS the
     // live run — skips the extra lookup.
     let latest_is_live = latest.as_ref().map(|e| e.status.is_live()).unwrap_or(false);
+    let latest_is_abandoned = latest
+        .as_ref()
+        .map(|e| e.status == ExecutionStatus::Abandoned)
+        .unwrap_or(false);
     let execution = if latest_is_live {
         latest
     } else {
         *queries += 1;
         match query_live_execution_for_work_item(conn, work_item_id)? {
             Some(live) => Some(live),
+            // No live execution. If the latest row is an `abandoned`
+            // redundant/superseded duplicate it never did the work and must
+            // not shadow a genuinely-worked sibling — a successfully
+            // completed revision would otherwise surface as `abandoned`
+            // (broken) in `agents status`. Prefer the most recent
+            // non-abandoned execution; keep `latest` only when every
+            // execution for the item is abandoned. Steady state (latest is a
+            // normal terminal / ready row) skips this extra lookup.
+            None if latest_is_abandoned => {
+                *queries += 1;
+                query_last_non_abandoned_execution_for_work_item(conn, work_item_id)?.or(latest)
+            }
             None => latest,
         }
     };
@@ -417,6 +434,36 @@ pub(crate) fn query_live_execution_for_work_item(
          FROM work_executions
          WHERE work_item_id = ?1
            AND status IN ('running', 'waiting_human')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        [work_item_id],
+        map_execution,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Most-recent execution for `work_item_id` whose status is NOT
+/// `abandoned`. Used as a display fallback in [`query_task_runtime`]: an
+/// `abandoned` execution is a superseded/redundant duplicate
+/// (`mark_execution_redundant`) or a dropped pending row
+/// (`abandon_pending_executions`) — it never did the work, so it must not
+/// shadow a genuinely-worked sibling (a completed revision would otherwise
+/// render as `abandoned`/"broken" in `agents status`). Returns `None` only
+/// when every execution for the work item is abandoned (or there are none),
+/// in which case the caller keeps the latest row.
+pub(crate) fn query_last_non_abandoned_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    conn.query_row(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+         FROM work_executions
+         WHERE work_item_id = ?1
+           AND status != 'abandoned'
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
         [work_item_id],
@@ -720,6 +767,33 @@ pub(crate) fn reconcile_revision_execution(
             // the same revision task (T1503/T1496 regression).
         }
         _ => {
+            // Cross-kind live-execution guard. The `RevisionImplementation`
+            // arms above only suppress a duplicate when the task's *latest*
+            // row is itself a live revision_implementation. But the latest
+            // row may be a live execution of a DIFFERENT kind — most
+            // commonly a `pr_review` reviewing the revision's contribution
+            // to the parent PR. In that case none of the arms above match and
+            // we fall here and mint a fresh revision_implementation that the
+            // redundant-spawn guard abandons seconds later — leaving an
+            // `abandoned` duplicate as the task's newest row, which then
+            // shadows the genuinely-completed revision in `agents status`
+            // (the exec_89/T500-shaped incident). Defer instead: if ANY live
+            // execution is attached to this task, do not create a duplicate.
+            if let Some(live) = query_live_execution_for_work_item(conn, &task.id)? {
+                tracing::info!(
+                    work_item_id = %task.id,
+                    live_execution_id = %live.id,
+                    live_execution_kind = %live.kind.as_str(),
+                    live_execution_status = %live.status,
+                    decision = "defer_live_execution",
+                    "dispatch_decision: reconcile_revision skipped creating a \
+                     revision_implementation — a live execution (possibly a different \
+                     kind, e.g. pr_review) is already attached to this revision task; \
+                     deferring to avoid a redundant duplicate that would be abandoned \
+                     and then shadow the real execution",
+                );
+                return Ok(());
+            }
             // No matching execution yet (or previous is terminal) — create one.
             let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {
                 let label = repo_unresolved_kind_label(conn, &task.id)?;
@@ -739,6 +813,18 @@ pub(crate) fn reconcile_revision_execution(
                     .pr_url(parent_pr_url)
                     .build(),
             )?;
+            // Per-item decision line for the reconcile create path — the
+            // "reconciled product executions" summary only carries counts, so
+            // without this a reconcile-minted revision execution has no
+            // attributable `dispatch_decision` in the trace.
+            tracing::info!(
+                work_item_id = %task.id,
+                execution_id = %created.id,
+                status = %created.status,
+                decision = "create_revision_implementation",
+                "dispatch_decision: reconcile_revision created a revision_implementation \
+                 execution (no live or reconcilable execution existed for this task)",
+            );
             result.created.push(created);
         }
     }

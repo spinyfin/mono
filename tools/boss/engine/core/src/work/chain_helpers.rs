@@ -192,6 +192,20 @@ pub(crate) fn collect_chain_revision_ids_including_deleted(
 ///
 /// Returns the number of execution rows abandoned.
 pub(crate) fn abandon_pending_executions(conn: &Connection, work_item_id: &str, now: &str) -> Result<usize> {
+    // Capture the ids/statuses of the rows about to be abandoned so the
+    // canonical terminalization trace (see `WorkDb::mark_execution_orphaned`
+    // in executions_runs.rs) can name each one individually, rather than
+    // leaving this bulk transition untraced.
+    let mut stmt = conn.prepare(
+        "SELECT id, status FROM work_executions
+         WHERE work_item_id = ?1
+           AND status IN ('queued', 'ready', 'waiting_dependency')",
+    )?;
+    let doomed: Vec<(String, String)> = stmt
+        .query_map(params![work_item_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
     let abandoned = conn.execute(
         "UPDATE work_executions
          SET status = 'abandoned',
@@ -200,6 +214,16 @@ pub(crate) fn abandon_pending_executions(conn: &Connection, work_item_id: &str, 
            AND status IN ('queued', 'ready', 'waiting_dependency')",
         params![work_item_id, now],
     )?;
+    for (execution_id, from_status) in &doomed {
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %work_item_id,
+            from_status = %from_status,
+            to_status = "abandoned",
+            reason = "pending execution abandoned (work item archived/settled)",
+            "execution terminalized: abandon pending",
+        );
+    }
     Ok(abandoned)
 }
 

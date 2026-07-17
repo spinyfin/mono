@@ -1602,6 +1602,85 @@ fn reconcile_does_not_create_duplicate_execution_for_running_revision() {
     assert_eq!(task_status(&db, &revision_id), "active");
 }
 
+/// Regression (exec_89 / T500): the "no duplicate" guard must ALSO fire when
+/// the task's latest live execution is a DIFFERENT kind — e.g. a `pr_review`
+/// reviewing the revision's contribution to the parent PR. Before the
+/// cross-kind guard none of the `RevisionImplementation`-keyed match arms
+/// matched, so `reconcile_revision_execution` fell to `_ =>` and minted a
+/// fresh `revision_implementation`. The redundant-spawn guard abandoned it,
+/// leaving an `abandoned` duplicate as the task's NEWEST row — which then
+/// shadowed the genuinely-completed revision in `agents status`.
+#[test]
+fn reconcile_does_not_create_duplicate_when_pr_review_live() {
+    let db = WorkDb::open(temp_db_path("revision-no-dup-pr-review")).unwrap();
+    let product_id = make_revision_product(&db, "no-dup-pr-review");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1500";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+
+    // First reconcile creates the initial ready revision_implementation.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1, "first reconcile must create exactly one execution");
+    let revision_exec_id = execs[0].0.clone();
+
+    // Simulate: the revision worker ran and completed successfully, then a
+    // pr_review execution was dispatched for the same revision task and is
+    // now live (reviewer pane alive → running). The task stays `active`.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+        rusqlite::params![revision_exec_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        rusqlite::params![revision_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let pr_review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    // Force the pr_review to be unambiguously the latest row by created_at
+    // (now_string is epoch-seconds granularity, so same-second creates would
+    // otherwise tie and fall back to non-deterministic id string ordering).
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '9999999999' WHERE id = ?1",
+            rusqlite::params![pr_review.id],
+        )
+        .unwrap();
+
+    // Reconcile again — the cross-kind live guard must prevent a duplicate
+    // revision_implementation while the pr_review is live.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs_after = executions_for(&db, &revision_id);
+    assert_eq!(
+        execs_after.len(),
+        2,
+        "reconcile must not create a duplicate revision_implementation while a \
+         live pr_review is attached: {execs_after:?}",
+    );
+
+    // And the runtime/agents-status view surfaces the live pr_review — never
+    // a phantom. With no duplicate created there is nothing abandoned.
+    let runtime = db.get_task_runtime(&revision_id).unwrap();
+    assert_eq!(
+        runtime.execution_id.as_deref(),
+        Some(pr_review.id.as_str()),
+        "runtime must point at the live pr_review, not a phantom",
+    );
+}
+
 // Design-family Fable-tier dispatch floor (policy addendum, 2026-07-13):
 // `WorkDb::is_design_family` lineage-walking, and `create_revision`'s
 // default `effort_level` derivation for design-family chain roots. The
