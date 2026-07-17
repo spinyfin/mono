@@ -90,3 +90,84 @@ fn format_ms(ms: u128) -> String {
         format!("{:.1}h", ms as f64 / 3_600_000.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u128 = 1_700_000_000_000;
+
+    #[test]
+    fn parse_since_handles_each_unit_suffix() {
+        assert_eq!(parse_since("45s", NOW).unwrap(), NOW - 45 * 1_000);
+        assert_eq!(parse_since("30m", NOW).unwrap(), NOW - 30 * 60_000);
+        assert_eq!(parse_since("6h", NOW).unwrap(), NOW - 6 * 3_600_000);
+        assert_eq!(parse_since("2d", NOW).unwrap(), NOW - 2 * 86_400_000);
+    }
+
+    #[test]
+    fn parse_since_tolerates_surrounding_whitespace() {
+        assert_eq!(parse_since("  30m\n", NOW).unwrap(), NOW - 30 * 60_000);
+    }
+
+    #[test]
+    fn parse_since_accepts_zero() {
+        assert_eq!(parse_since("0h", NOW).unwrap(), NOW);
+    }
+
+    #[test]
+    fn parse_since_rejects_bare_number_without_suffix() {
+        assert!(parse_since("30", NOW).is_err());
+    }
+
+    #[test]
+    fn parse_since_rejects_unknown_suffix() {
+        assert!(parse_since("30x", NOW).is_err());
+    }
+
+    #[test]
+    fn parse_since_rejects_missing_or_non_numeric_magnitude() {
+        assert!(parse_since("m", NOW).is_err());
+        assert!(parse_since("abcm", NOW).is_err());
+        assert!(parse_since("-5m", NOW).is_err());
+        assert!(parse_since("", NOW).is_err());
+    }
+
+    #[test]
+    fn parse_since_saturates_at_zero_when_older_than_now() {
+        assert_eq!(parse_since("2d", 1_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_since_saturates_instead_of_overflowing_on_large_magnitude() {
+        let huge = format!("{}d", u128::MAX);
+        assert_eq!(parse_since(&huge, NOW).unwrap(), 0);
+    }
+
+    #[test]
+    fn format_ms_renders_sub_second_as_whole_millis() {
+        assert_eq!(format_ms(0), "0ms");
+        assert_eq!(format_ms(1), "1ms");
+        assert_eq!(format_ms(999), "999ms");
+    }
+
+    #[test]
+    fn format_ms_switches_to_seconds_at_one_second() {
+        assert_eq!(format_ms(1_000), "1.0s");
+        assert_eq!(format_ms(1_500), "1.5s");
+        assert_eq!(format_ms(59_999), "60.0s");
+    }
+
+    #[test]
+    fn format_ms_switches_to_minutes_at_one_minute() {
+        assert_eq!(format_ms(60_000), "1.0m");
+        assert_eq!(format_ms(90_000), "1.5m");
+        assert_eq!(format_ms(3_599_999), "60.0m");
+    }
+
+    #[test]
+    fn format_ms_switches_to_hours_at_one_hour() {
+        assert_eq!(format_ms(3_600_000), "1.0h");
+        assert_eq!(format_ms(5_400_000), "1.5h");
+    }
+}
