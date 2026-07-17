@@ -5,7 +5,7 @@ pub mod app;
 pub mod attentions_detector;
 pub mod audit;
 pub mod audit_effort;
-pub mod automation_schedule;
+pub use boss_automation_schedule as automation_schedule;
 pub mod automation_scheduler;
 pub mod automation_triage;
 pub mod blocking_signal;

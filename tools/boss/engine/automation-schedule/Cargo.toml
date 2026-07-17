@@ -1,0 +1,9 @@
+[package]
+name = "boss-automation-schedule"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }

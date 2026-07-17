@@ -14,8 +14,8 @@ boss-transcript-markdown = { path = "../transcript-markdown" }
 async-trait = { workspace = true }
 bon = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }
+boss-automation-schedule = { path = "../automation-schedule" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-editorial = { path = "../editorial" }

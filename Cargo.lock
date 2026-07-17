@@ -260,6 +260,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-automation-schedule"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+]
+
+[[package]]
 name = "boss-build-info"
 version = "0.1.0"
 
@@ -342,6 +350,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-automation-schedule",
  "boss-build-info",
  "boss-ci-log-reader",
  "boss-claude-client",
@@ -368,7 +377,6 @@ dependencies = [
  "boss-transcript-markdown",
  "boss-transcript-tail",
  "chrono",
- "chrono-tz",
  "clap",
  "fastrand 2.4.1",
  "git-utils",
