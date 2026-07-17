@@ -1155,14 +1155,17 @@ pub async fn serve_with_merge_probe(
     // (the process is alive), so this reaps the execution and releases
     // the slot for redispatch. Runs every 60s and fires on boot.
     let _stale_worker_sweep_handle = crate::stale_worker_sweep::spawn_loop(
-        server_state.work_db.clone(),
-        server_state.live_worker_states.clone(),
-        server_state.execution_coordinator.clone(),
-        server_state.dispatch_events.clone(),
-        // Reap via the same `release_worker_pane` teardown as `bossctl
-        // agents stop` so a reconcile-cancel kills the worker's process
-        // tree before its slot/lease is freed.
-        server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+        crate::stale_worker_sweep::StaleWorkerSweepDeps {
+            work_db: server_state.work_db.clone(),
+            live_states: server_state.live_worker_states.clone(),
+            coordinator: server_state.execution_coordinator.clone(),
+            dispatch_events: server_state.dispatch_events.clone(),
+            // Reap via the same `release_worker_pane` teardown as `bossctl
+            // agents stop` so a reconcile-cancel kills the worker's
+            // process tree before its slot/lease is freed.
+            reaper: server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+            hold_registry: server_state.hold_registry.clone(),
+        },
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );

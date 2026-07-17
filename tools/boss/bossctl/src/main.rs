@@ -534,6 +534,28 @@ enum AgentsAction {
         /// Worker reference: run id, slot id, or crew name.
         agent: String,
     },
+    /// Place an explicit hold on a live worker, exempting it from the
+    /// idle-park and auto-reap sweeps until released (`agents
+    /// release-hold`) or the run ends. Does NOT protect the run from
+    /// `agents stop`/`agents reap` — those break-glass verbs still work
+    /// on a held worker. Use this to protect a worker you know is
+    /// legitimately waiting on something the automated checks haven't
+    /// been taught to recognize (e.g. debugging it by hand).
+    Hold {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+        /// Free-text note explaining why the worker is held. Surfaced on
+        /// `agents list`/`agents status`.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Release a hold placed by `agents hold`, restoring the normal
+    /// idle-park/auto-reap sweep behavior. Idempotent — releasing a
+    /// worker with no hold in place succeeds as a no-op.
+    ReleaseHold {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+    },
     /// Print the transcript of a worker's conversation.
     ///
     /// Works for both live workers and terminal/completed executions.
@@ -852,6 +874,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::Stop { agent },
         } => agents::agents_stop(&cli.socket_path, cli.json, agent).await,
+        Command::Agents {
+            action: AgentsAction::Hold { agent, reason },
+        } => agents::agents_hold(&cli.socket_path, cli.json, agent, reason).await,
+        Command::Agents {
+            action: AgentsAction::ReleaseHold { agent },
+        } => agents::agents_release_hold(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
             action: AgentsAction::Focus { agent },
         } => agents::agents_focus(&cli.socket_path, cli.json, agent).await,

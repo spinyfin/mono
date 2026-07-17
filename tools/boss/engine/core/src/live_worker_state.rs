@@ -121,6 +121,24 @@ impl LiveWorkerStateRegistry {
         None
     }
 
+    /// Set the `held` flag for the slot that owns `run_id` — mirrors
+    /// [`Self::update_shell_pid`]'s find-and-set shape. Returns the slot
+    /// id if the entry was found and updated, or `None` if no live slot
+    /// matches. Called by the `HoldRun`/`ReleaseHoldRun` RPC handlers so
+    /// `bossctl agents list`/`status` reflect an operator hold
+    /// immediately, without waiting for the next hook event.
+    pub fn set_held(&self, run_id: &str, held: bool) -> Option<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for state in guard.by_slot.values_mut() {
+            if state.run_id == run_id {
+                let slot_id = state.slot_id;
+                state.held = held;
+                return Some(slot_id);
+            }
+        }
+        None
+    }
+
     /// Look up the state for one slot.
     pub fn get(&self, slot_id: u8) -> Option<LiveWorkerState> {
         self.inner
@@ -142,6 +160,23 @@ impl LiveWorkerStateRegistry {
             .values()
             .find(|state| !state.activity.is_terminal() && state.work_item_id.as_deref() == Some(work_item_id))
             .map(|state| state.run_id.clone())
+    }
+
+    /// Return the current `shell_pid` for the non-terminal slot running
+    /// `run_id`, or `None` if no such slot exists or its pid is unset
+    /// (`0`, the not-yet-plumbed-back sentinel — see
+    /// [`boss_protocol::LiveWorkerState::shell_pid`]). Used by
+    /// [`crate::background_children::RegistryBackgroundActivityProbe`] to
+    /// resolve a Stop-boundary execution id to the pid its process-tree
+    /// scan should walk.
+    pub fn shell_pid_for_run(&self, run_id: &str) -> Option<i32> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .by_slot
+            .values()
+            .find(|state| !state.activity.is_terminal() && state.run_id == run_id)
+            .map(|state| state.shell_pid)
+            .filter(|pid| *pid > 0)
     }
 
     /// True iff a live state entry exists for `run_id` whose activity

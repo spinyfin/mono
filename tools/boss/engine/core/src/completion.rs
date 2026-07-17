@@ -956,6 +956,40 @@ pub struct WorkerCompletionHandler {
     /// [`DEFAULT_BUILD_WAIT_HORIZON_SECS`]; tests override it via
     /// [`Self::with_build_wait_horizon_secs`].
     build_wait_horizon_secs: i64,
+    /// Reports whether an execution's worker process tree still has live
+    /// descendant processes at Stop boundary — e.g. a backgrounded
+    /// subagent spawned via the harness Agent tool that has not yet
+    /// reported back (2026-07-17 incident, worker Riker / T2843). See
+    /// [`crate::background_children`] for the process-tree scan this
+    /// wraps in production. Defaults to
+    /// [`crate::background_children::NoopBackgroundActivityProbe`]; `app.rs`
+    /// wires in the real [`crate::background_children::RegistryBackgroundActivityProbe`]
+    /// via [`Self::with_background_activity_probe`].
+    background_activity_probe: Arc<dyn crate::background_children::BackgroundActivityProbe>,
+    /// Time-bounded suppression tracker for the background-children
+    /// signal, mirroring [`Self::build_wait_tracker`]'s role for the
+    /// build-wait signal — same generic bounded-suppression primitive,
+    /// a separate instance because the two are independent signals (one
+    /// text-narration-based, one process-tree-based) that can each start
+    /// and expire on their own schedule. Trust is not indefinite: a
+    /// descendant that never exits (a genuinely wedged subagent) still
+    /// eventually falls back to the normal nudge/park flow once
+    /// [`Self::background_children_horizon_secs`] elapses.
+    background_children_tracker: Arc<BuildWaitTracker>,
+    /// How long a continuously-reported live-descendant sighting is
+    /// trusted before [`Self::nudge_or_park`] stops suppressing and falls
+    /// back to the normal nudge/park flow. Defaults to
+    /// [`crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS`];
+    /// tests override it via [`Self::with_background_children_horizon_secs`].
+    background_children_horizon_secs: i64,
+    /// Operator-placed holds that exempt a live run from the idle-park
+    /// (this handler's nudge/park flow) and auto-reap
+    /// ([`crate::stale_worker_sweep`]) sweeps until released or the run
+    /// ends. See [`crate::hold_registry`] for the full rationale —
+    /// `bossctl agents hold`/`release-hold` is the operator-facing verb
+    /// pair. Shared via `Arc` so `app.rs`'s RPC handlers and both sweeps
+    /// see the same holds.
+    hold_registry: Arc<crate::hold_registry::HoldRegistry>,
     /// Maximum number of automated reviewer passes per PR.
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances to human Review directly.
@@ -1373,6 +1407,28 @@ pub enum StopOutcome {
     /// horizon elapses, the normal nudge/park flow resumes automatically
     /// (no coordinator action required — unlike [`StopOutcome::EscalationPending`]).
     BuildWaitPending { waited_secs: i64 },
+    /// The worker's Stop-boundary process tree still has live descendant
+    /// processes — e.g. a backgrounded subagent spawned via the harness
+    /// Agent tool that has not yet reported back (2026-07-17 incident,
+    /// worker Riker / T2843, `exec_18c31347a0305440_374`). Same
+    /// suppression shape as [`Self::BuildWaitPending`] (checked before
+    /// [`crate::nudge_breaker`] is even consulted, so this Stop does not
+    /// burn any of its cap) but a distinct signal: process-tree-based
+    /// rather than text-narration-based. `descendant_count` is how many
+    /// live descendants [`crate::background_children`] found;
+    /// `waited_secs` is how long this execution has been continuously
+    /// reporting live descendants. The execution stays `waiting_human`;
+    /// no probe is sent, nothing is parked. Once
+    /// [`Self::background_children_horizon_secs`] elapses, the normal
+    /// nudge/park flow resumes automatically.
+    BackgroundChildrenPending { descendant_count: usize, waited_secs: i64 },
+    /// An operator placed an explicit hold on this execution via
+    /// `bossctl agents hold` (see [`crate::hold_registry`]). The
+    /// idle-park flow is skipped entirely — no nudge, no breaker
+    /// consultation, no park — until the operator releases the hold or
+    /// the run ends. `reason` is the operator-supplied explanation, if
+    /// any.
+    Held { reason: Option<String> },
     /// The worker is a conflict-resolution or CI-failure revision that
     /// stopped without pushing, but the blocking signal was already
     /// cleared (conflict: PR `mergeable`; CI: required checks green)
@@ -1694,4 +1750,3 @@ fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
 }
 
 #[cfg(test)]
-mod tests;

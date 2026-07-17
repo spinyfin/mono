@@ -684,6 +684,14 @@ pub(crate) async fn sweep_pending_pr(
         // on-Stop path (it reads the worker's Stop-boundary transcript for
         // the build-wait heuristic), never from a PR-detection recheck.
         | StopOutcome::BuildWaitPending { .. }
+        // BackgroundChildrenPending is only reachable via `nudge_or_park`
+        // on the on-Stop path (it probes the worker's live process tree),
+        // never from a PR-detection recheck.
+        | StopOutcome::BackgroundChildrenPending { .. }
+        // Held is only reachable via `nudge_or_park` on the on-Stop path
+        // (it checks the operator hold registry), never from a
+        // PR-detection recheck.
+        | StopOutcome::Held { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -759,6 +767,12 @@ pub(crate) async fn sweep_late_pr(
         // BuildWaitPending is only reachable via `nudge_or_park` on the
         // on-Stop path, never from a late-PR recheck.
         | StopOutcome::BuildWaitPending { .. }
+        // BackgroundChildrenPending is only reachable via `nudge_or_park`
+        // on the on-Stop path, never from a late-PR recheck.
+        | StopOutcome::BackgroundChildrenPending { .. }
+        // Held is only reachable via `nudge_or_park` on the on-Stop path,
+        // never from a late-PR recheck.
+        | StopOutcome::Held { .. }
         | StopOutcome::DbError => {}
     }
 }
