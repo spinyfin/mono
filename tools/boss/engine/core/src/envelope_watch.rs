@@ -365,24 +365,14 @@ fn file_overrun_attention(
 mod tests {
     use std::ffi::OsString;
 
-    use boss_protocol::{RequestExecutionInput, WorkItemBinding, WorkItemPatch, WorkerEvent};
+    use boss_protocol::{WorkItemBinding, WorkItemPatch, WorkerEvent};
 
     use super::*;
-    use crate::test_support::{create_active_chore, create_product, open_db};
+    use crate::test_support::{create_active_chore, create_execution_started_secs_ago, create_product, open_db};
     use crate::work::WorkDb;
 
     fn now() -> i64 {
         boss_engine_utils::epoch_time::now_epoch_secs()
-    }
-
-    /// Create an execution for `work_item_id` whose `started_at` is
-    /// `age_secs` in the past.
-    fn create_execution_started_ago(db: &WorkDb, work_item_id: &str, age_secs: i64) -> String {
-        let execution = db
-            .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
-            .unwrap();
-        db.force_started_at_for_test(&execution.id, now() - age_secs).unwrap();
-        execution.id
     }
 
     /// Set the work item's effort classification.
@@ -453,7 +443,7 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "oversize chore");
         set_effort(&db, &work_item_id, EffortLevel::Small); // 15 min envelope
         // Started 20 minutes ago — comfortably past the 15-minute small envelope.
-        let execution_id = create_execution_started_ago(&db, &work_item_id, 20 * 60);
+        let execution_id = create_execution_started_secs_ago(&db, &work_item_id, 20 * 60);
 
         let live_states = LiveWorkerStateRegistry::new();
         register_working_slot(&live_states, 1, &execution_id, &work_item_id);
@@ -478,7 +468,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "healthy chore");
         set_effort(&db, &work_item_id, EffortLevel::Small); // 15 min envelope
-        let execution_id = create_execution_started_ago(&db, &work_item_id, 60); // 1 min in
+        let execution_id = create_execution_started_secs_ago(&db, &work_item_id, 60); // 1 min in
 
         let live_states = LiveWorkerStateRegistry::new();
         register_working_slot(&live_states, 1, &execution_id, &work_item_id);
@@ -496,7 +486,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "unclassified chore");
         // No set_effort — effort_level stays None.
-        let execution_id = create_execution_started_ago(&db, &work_item_id, 5 * 60 * 60); // 5h
+        let execution_id = create_execution_started_secs_ago(&db, &work_item_id, 5 * 60 * 60); // 5h
 
         let live_states = LiveWorkerStateRegistry::new();
         register_working_slot(&live_states, 1, &execution_id, &work_item_id);
@@ -514,7 +504,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "max chore");
         set_effort(&db, &work_item_id, EffortLevel::Max);
-        let execution_id = create_execution_started_ago(&db, &work_item_id, 10 * 60 * 60); // 10h
+        let execution_id = create_execution_started_secs_ago(&db, &work_item_id, 10 * 60 * 60); // 10h
 
         let live_states = LiveWorkerStateRegistry::new();
         register_working_slot(&live_states, 1, &execution_id, &work_item_id);
@@ -532,7 +522,7 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "spawning chore");
         set_effort(&db, &work_item_id, EffortLevel::Small);
-        let execution_id = create_execution_started_ago(&db, &work_item_id, 60 * 60); // 1h
+        let execution_id = create_execution_started_secs_ago(&db, &work_item_id, 60 * 60); // 1h
 
         let live_states = LiveWorkerStateRegistry::new();
         // Register but leave at Spawning (no events applied → not Working).

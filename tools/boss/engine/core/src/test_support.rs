@@ -183,6 +183,16 @@ pub fn create_execution_started_secs_ago(db: &WorkDb, work_item_id: &str, secs_a
     execution.id
 }
 
+/// Request an execution for `work_item_id` and stamp its `started_at` to
+/// now. Returns the execution id.
+///
+/// The counterpart to [`create_execution_started_secs_ago`] for the sweep
+/// tests that assert a grace-period guard *skips* a freshly-started
+/// execution: the `started_at` must be inside the grace window.
+pub fn create_execution_started_now(db: &WorkDb, work_item_id: &str) -> String {
+    create_execution_started_secs_ago(db, work_item_id, 0)
+}
+
 /// Create a `ready` execution for `work_item_id` and stamp its
 /// `started_at` to 5 minutes ago so a grace-period guard passes.
 ///

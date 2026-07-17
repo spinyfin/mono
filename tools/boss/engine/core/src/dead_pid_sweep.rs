@@ -1013,26 +1013,17 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
-        use boss_protocol::RequestExecutionInput;
-        let execution = db
-            .request_execution(
-                RequestExecutionInput::builder()
-                    .work_item_id(work_item_id.clone())
-                    .build(),
-            )
-            .unwrap();
         // Stamp started_at = NOW so the grace guard fires.
-        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-        db.force_started_at_for_test(&execution.id, now_secs).unwrap();
+        let execution_id = create_execution_started_now(&db, &work_item_id);
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         // Use a definitely-dead PID; the grace guard should fire before
         // we even get to the kill(0) probe.
         let the_dead_pid = dead_pid();
-        register_slot_with_binding(&live_states, 1, &execution.id, the_dead_pid, &work_item_id);
+        register_slot_with_binding(&live_states, 1, &execution_id, the_dead_pid, &work_item_id);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution.id, None).await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(
@@ -1388,25 +1379,16 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
-        use boss_protocol::RequestExecutionInput;
-        let execution = db
-            .request_execution(
-                RequestExecutionInput::builder()
-                    .work_item_id(work_item_id.clone())
-                    .build(),
-            )
-            .unwrap();
         // Stamp started_at = NOW — within the grace window the periodic
         // sweep would respect, but reap_reported_pane_death must not.
-        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-        db.force_started_at_for_test(&execution.id, now_secs).unwrap();
+        let execution_id = create_execution_started_now(&db, &work_item_id);
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         // Still-alive PID (self) — the periodic sweep would never reap this.
-        register_slot_with_binding(&live_states, 1, &execution.id, std::process::id() as i32, &work_item_id);
+        register_slot_with_binding(&live_states, 1, &execution_id, std::process::id() as i32, &work_item_id);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution.id, None).await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let reaped = reap_reported_pane_death(
@@ -1414,18 +1396,18 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            &execution.id,
+            &execution_id,
             "surface failed to attach",
         )
         .await;
 
         assert!(reaped, "app-reported pane death must reap immediately");
 
-        let exec = db.get_execution(&execution.id).unwrap();
+        let exec = db.get_execution(&execution_id).unwrap();
         assert_eq!(exec.status, ExecutionStatus::Orphaned);
 
         let claimed_after = coordinator.worker_pool().claimed_execution_ids().await;
-        assert!(!claimed_after.contains(&execution.id), "pool slot must be released");
+        assert!(!claimed_after.contains(&execution_id), "pool slot must be released");
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
