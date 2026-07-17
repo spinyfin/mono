@@ -117,6 +117,44 @@ pub struct PendingMergeCheck {
     pub pr_url: String,
 }
 
+impl WorkDb {
+    /// Shared body of every merge-poller candidate list
+    /// ([`Self::list_chores_pending_merge_check`],
+    /// [`Self::list_chores_blocked_on_merge_conflict`],
+    /// [`Self::list_chores_blocked_on_ci_failure`],
+    /// [`Self::list_chores_stranded_blocked_remediation`]). Those queries
+    /// differ only in their state predicate; everything else — the
+    /// chore-like kind filter, the bound-PR and soft-delete guards, the
+    /// projection, the row mapping, and the oldest-first ordering — is
+    /// identical, so it lives here.
+    ///
+    /// `predicate_sql` is spliced into the `WHERE` chain as an additional
+    /// `AND` term. The `tasks` table is aliased `t`, so a predicate may
+    /// reference `t.<column>` and may carry correlated subqueries keyed on
+    /// `t.id`. It is a caller-supplied SQL literal, never user input.
+    pub(super) fn query_pending_merge_checks(&self, predicate_sql: &str) -> Result<Vec<PendingMergeCheck>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.id, t.product_id, t.pr_url
+             FROM tasks t
+             WHERE t.kind IN ({CHORE_LIKE_KINDS_SQL})
+               AND {predicate_sql}
+               AND t.pr_url IS NOT NULL
+               AND t.pr_url != ''
+               AND t.deleted_at IS NULL
+             ORDER BY t.updated_at ASC",
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingMergeCheck {
+                work_item_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+}
+
 /// One row from [`WorkDb::list_recently_terminal_executions_pending_pr_detection`]:
 /// a terminal execution whose task is still `active` with no `pr_url`. The merge
 /// poller's late-PR sweep uses this to recover chores that were orphan-swept
