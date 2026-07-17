@@ -264,6 +264,17 @@ name = "boss-build-info"
 version = "0.1.0"
 
 [[package]]
+name = "boss-ci-log-reader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "boss-github",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "boss-claude-client"
 version = "0.1.0"
 dependencies = [
@@ -332,6 +343,7 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-build-info",
+ "boss-ci-log-reader",
  "boss-claude-client",
  "boss-client",
  "boss-conflict-diagnosis",

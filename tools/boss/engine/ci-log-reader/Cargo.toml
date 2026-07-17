@@ -1,0 +1,14 @@
+[package]
+name = "boss-ci-log-reader"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+boss-github = { path = "../../github" }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
