@@ -9745,11 +9745,12 @@ mod tests {
         classify_lint_finding, compile_schedule, decide_open_design_action, dependency_status_is_satisfied,
         ensure_explicit_product_matches, expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
         is_typed_work_item_id, lint_summary_line, parse_attention_group_selector, parse_automation_selector,
-        pick_by_index, split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
+        pick_by_index, split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url,
+        with_display_status,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
-        TaskKind, TaskStatus, WorkItem,
+        TaskKind, TaskRuntime, TaskStatus, WorkItem,
     };
 
     #[test]
@@ -10385,6 +10386,27 @@ mod tests {
         for stored in ["todo", "active", "in_review"] {
             assert_eq!(status_vocab::to_stored(status_vocab::to_ui(stored)), stored);
         }
+    }
+
+    #[test]
+    fn task_json_with_runtime_escapes_control_chars_for_strict_json_parsers() {
+        let task = Task::builder()
+            .id("task_1")
+            .product_id("prod_1")
+            .name("n")
+            .description("line1\tline2\rline3\x01end")
+            .kind(TaskKind::Task)
+            .status(TaskStatus::InReview)
+            .created_at("t")
+            .updated_at("t")
+            .build();
+        let runtime = TaskRuntime::builder().work_item_id("task_1").build();
+        let value = task_json_with_runtime(&task, &runtime).unwrap();
+        let mut buf = Vec::new();
+        serde_json::to_writer_pretty(&mut buf, &value).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&text).expect("must be strictly valid JSON");
+        assert_eq!(reparsed["description"].as_str().unwrap(), "line1\tline2\rline3\x01end");
     }
 
     #[test]
