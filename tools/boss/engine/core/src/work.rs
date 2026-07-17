@@ -403,11 +403,17 @@ mod query_ensure;
 mod revise_doc;
 mod revision_helpers;
 mod schema_init;
+mod task_targets;
 #[cfg(test)]
 mod tests;
 mod updates;
 mod workitems;
 
+// Private on purpose: only the create-path gate that needs to file an
+// attention item inside its own transaction (`WorkDb::create_automation_task`)
+// reaches for the in-tx variant; every other caller uses the public,
+// tx-owning `WorkDb::create_attention`.
+use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;
 pub(crate) use dep_helpers::*;
@@ -427,6 +433,7 @@ pub(crate) use migrations_boothby::*;
 pub(crate) use products_design::{parse_pr_doc_artifact_id, resolve_task_doc_pointer};
 pub(crate) use query_ensure::*;
 pub(crate) use revision_helpers::*;
+pub(crate) use task_targets::*;
 
 pub use attentions::ActionedAttentionGroup;
 pub use audit_misc::AUDIT_ACTOR_DESIGN_DETECTOR;

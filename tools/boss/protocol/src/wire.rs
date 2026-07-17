@@ -415,12 +415,25 @@ pub enum FrontendRequest {
     /// and — because the produced task is `autostart` — requests its
     /// execution (which the dispatcher routes to the automations pool).
     /// Replies with [`FrontendEvent::WorkItemCreated`] on success, or
-    /// [`FrontendEvent::WorkError`] when the automation is unknown or the
-    /// open-task cap is already reached.
+    /// [`FrontendEvent::WorkError`] when the automation is unknown, the
+    /// open-task cap is already reached, or the pre-file dedup gate
+    /// (investigation `automation-duplicate-work-2026-07-14.md` §4 Layer 1)
+    /// suppresses the create as a likely duplicate of an already-open
+    /// automation-sourced task.
+    ///
+    /// `target_files` / `target_symbols` are the files/symbols the triage
+    /// agent declares this task will touch (`--target-file`/
+    /// `--target-symbol`, repeatable). Stored in `task_targets` and used by
+    /// the dedup gate; empty is allowed (an undeclared candidate is never
+    /// gated) but weakens the gate for every automation on this product.
     CreateAutomationTask {
         automation_id: String,
         name: String,
         description: Option<String>,
+        #[serde(default)]
+        target_files: Vec<String>,
+        #[serde(default)]
+        target_symbols: Vec<String>,
     },
 
     CreateChore {

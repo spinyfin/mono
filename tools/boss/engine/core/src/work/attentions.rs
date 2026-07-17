@@ -373,6 +373,46 @@ fn recompute_group_state(conn: &Connection, group_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a new attention member within an already-open transaction,
+/// reconciling (or creating) its owning group. Shared by
+/// [`WorkDb::create_attention`] and callers that need the attention filed
+/// atomically alongside other writes in their own transaction (e.g. the
+/// automation pre-file dedup gate, which files a suppression attention item
+/// in the same `Immediate` transaction as the create-path gate check it
+/// lost to — see `WorkDb::create_automation_task`).
+pub(crate) fn create_attention_in_tx(
+    conn: &Connection,
+    input: CreateAttentionInput,
+) -> Result<(Attention, AttentionGroup)> {
+    let group = resolve_or_create_group(conn, &input)?;
+    if group.kind != input.kind {
+        bail!(
+            "attention kind {:?} does not match group {} kind {:?}",
+            input.kind,
+            group.id,
+            group.kind
+        );
+    }
+    if group_is_terminal(&group.state) {
+        bail!(
+            "attention group {} is {} (terminal); new attentions form a new generation, \
+             they cannot join a closed group",
+            group.id,
+            group.state
+        );
+    }
+    validate_member_input(&input)?;
+
+    let ordinal = next_member_ordinal(conn, &group.id)?;
+    let attention = insert_member(conn, &group.id, ordinal, &input)?;
+    // A brand-new member is always `open`, so it cannot change the
+    // group's `open`/`partially_answered` state; re-fetch only to return
+    // a canonical group row.
+    let group = query_attention_group(conn, &group.id)?
+        .with_context(|| format!("missing attention group after insert: {}", group.id))?;
+    Ok((attention, group))
+}
+
 impl WorkDb {
     /// Create a new attention member, reconciling (or creating) its owning
     /// group. Returns the member plus its group so the caller can push an
@@ -385,35 +425,9 @@ impl WorkDb {
     pub fn create_attention(&self, input: CreateAttentionInput) -> Result<(Attention, AttentionGroup)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-
-        let group = resolve_or_create_group(&tx, &input)?;
-        if group.kind != input.kind {
-            bail!(
-                "attention kind {:?} does not match group {} kind {:?}",
-                input.kind,
-                group.id,
-                group.kind
-            );
-        }
-        if group_is_terminal(&group.state) {
-            bail!(
-                "attention group {} is {} (terminal); new attentions form a new generation, \
-                 they cannot join a closed group",
-                group.id,
-                group.state
-            );
-        }
-        validate_member_input(&input)?;
-
-        let ordinal = next_member_ordinal(&tx, &group.id)?;
-        let attention = insert_member(&tx, &group.id, ordinal, &input)?;
-        // A brand-new member is always `open`, so it cannot change the
-        // group's `open`/`partially_answered` state; re-fetch only to return
-        // a canonical group row.
-        let group = query_attention_group(&tx, &group.id)?
-            .with_context(|| format!("missing attention group after insert: {}", group.id))?;
+        let result = create_attention_in_tx(&tx, input)?;
         tx.commit()?;
-        Ok((attention, group))
+        Ok(result)
     }
 
     /// Reconcile a batch of structured attentions — a design-doc question

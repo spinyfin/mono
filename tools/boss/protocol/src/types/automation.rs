@@ -188,6 +188,16 @@ fn one_repeat_count() -> u32 {
 pub const AUTOMATION_OUTCOME_PRODUCED_TASK: &str = "produced_task";
 pub const AUTOMATION_OUTCOME_SKIPPED: &str = "skipped";
 pub const AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT: &str = "suppressed_at_limit";
+/// `create_automation_task`'s pre-file dedup gate (investigation
+/// `automation-duplicate-work-2026-07-14.md` §4 Layer 1) refused to create
+/// the candidate task because its declared target files are a subset of
+/// (or equal to) an already-open automation-sourced task's declared
+/// targets, with high name/description token overlap. Recorded as a
+/// standalone `automation_runs` row (not tied to a scheduler occurrence)
+/// carrying the blocking task's id in `detail`; an attention item links the
+/// suppressed candidate to the blocking row so an operator can ack or
+/// override.
+pub const AUTOMATION_OUTCOME_SUPPRESSED_DUPLICATE: &str = "suppressed_duplicate";
 pub const AUTOMATION_OUTCOME_FAILED_WILL_RETRY: &str = "failed_will_retry";
 pub const AUTOMATION_OUTCOME_FAILED_GAVE_UP: &str = "failed_gave_up";
 pub const AUTOMATION_OUTCOME_POOL_THROTTLED: &str = "pool_throttled";
