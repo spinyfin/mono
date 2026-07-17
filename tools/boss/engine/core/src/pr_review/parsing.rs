@@ -170,10 +170,13 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
 ///   marker is a process gap the engine cannot otherwise catch, so it gets
 ///   the same forcing treatment as regression/duplication, **or**
 /// - any finding with `category = AgentIsms` (regardless of severity) — a
-///   code comment that narrates the change's history, names a Boss work
-///   item/phase/brief, or calls the directing human "the operator" reads as
-///   agent scaffolding left behind in the codebase, so it gets the same
-///   forcing treatment as regression/duplication/deferred-scope.
+///   code comment or PR title/description that names a Boss work
+///   item/phase/brief/effort-level, or calls the directing human "the
+///   operator", reads as agent scaffolding left behind, so it gets the same
+///   forcing treatment as regression/duplication/deferred-scope. (Historical
+///   narration is flagged only in code comments — PR descriptions are exempt
+///   from that specific sub-check, since narrating what changed and why is
+///   their normal job.)
 ///
 /// `revision_warranted = false` in the `ReviewResult` does not suppress the
 /// gate — the engine's own threshold governs.

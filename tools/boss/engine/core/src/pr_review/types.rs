@@ -143,15 +143,21 @@ pub enum ReviewFindingCategory {
     /// of work an agent could actually do.
     #[serde(rename = "deferred_scope")]
     DeferredScope,
-    /// A code comment that only makes sense to the agent that wrote it: it
-    /// narrates the historical lineage of a change ("we used to do X, but
-    /// removed it because Y") instead of describing the current state of the
-    /// code, references a Boss construct (a work item id, phase, or brief —
-    /// e.g. "implements T234 phase 7"), or refers to the human directing
+    /// A code comment, PR title, or PR description that only makes sense to
+    /// the agent that wrote it. In a code comment: narrates the historical
+    /// lineage of a change ("we used to do X, but removed it because Y")
+    /// instead of describing the current state of the code, references a
+    /// Boss construct (a work item id, phase, chore, brief, or effort level
+    /// — e.g. "implements T234 phase 7"), or refers to the human directing
     /// Boss as "the operator" or to actors in general instead of stating the
-    /// underlying reason directly. Forces a revision regardless of assigned
-    /// severity (see [`passes_severity_gate`]) — the same treatment as
-    /// [`Self::Regression`], [`Self::Duplication`], and [`Self::DeferredScope`].
+    /// underlying reason directly. In a PR title/description: references a
+    /// Boss construct or "the operator"/actor framing, same as above —
+    /// **except** historical/narrative context ("previously X, this PR makes
+    /// it Y") is expected and exempt in PR descriptions, since that is a
+    /// description's normal job; the lineage restriction applies to code
+    /// comments only. Forces a revision regardless of assigned severity (see
+    /// [`passes_severity_gate`]) — the same treatment as [`Self::Regression`],
+    /// [`Self::Duplication`], and [`Self::DeferredScope`].
     #[serde(rename = "agent_isms")]
     AgentIsms,
 }
