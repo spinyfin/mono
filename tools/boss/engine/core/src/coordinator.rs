@@ -1637,6 +1637,24 @@ pub struct ExecutionCoordinator {
     /// call and otherwise left at its last value.
     #[builder(default)]
     dispatch_pause_exempts_reviews: AtomicBool,
+    /// Global automation-pause flag — independent of `dispatch_paused`. When
+    /// `true`: `drain_ready_queue` holds every execution bound for the
+    /// automation pool (see [`Self::execution_targets_automation_pool`]),
+    /// and [`crate::automation_triage::EngineTriageDispatcher::fire`] refuses
+    /// to start a new triage pass (both the scheduler's and `boss automation
+    /// run`'s fire path go through that one seam). Already-claimed automation
+    /// workers are unaffected. Seeded from the `automation_paused` metadata
+    /// key at engine startup; persisted there on every toggle so the pause
+    /// survives an engine restart. See [`FrontendRequest::SetAutomationPaused`]
+    /// (`boss_protocol`) for why this is deliberately a separate switch from
+    /// `dispatch_paused` rather than folded into it.
+    #[builder(default)]
+    automation_paused: AtomicBool,
+    /// Epoch seconds when automation was last paused. Zero means "not
+    /// paused". Seeded at startup from `automation_paused_since_epoch_s` in
+    /// `state.db`.
+    #[builder(default)]
+    automation_paused_since_epoch_s: AtomicU64,
     /// Live per-slot worker registry, used by the lease-time occupancy
     /// guard to refuse leasing a workspace that is still the cwd of a
     /// tracked, live worker process (defect 3 — belt-and-suspenders
@@ -1745,6 +1763,8 @@ impl ExecutionCoordinator {
             dispatch_paused: AtomicBool::new(false),
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
             dispatch_pause_exempts_reviews: AtomicBool::new(false),
+            automation_paused: AtomicBool::new(false),
+            automation_paused_since_epoch_s: AtomicU64::new(0),
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
             max_concurrent_interactive_workers: MAX_CONCURRENT_INTERACTIVE_WORKERS,
@@ -1989,6 +2009,35 @@ impl ExecutionCoordinator {
     /// `None` when not currently paused.
     pub fn dispatch_paused_since_epoch_s(&self) -> Option<u64> {
         let v = self.dispatch_paused_since_epoch_s.load(Ordering::Acquire);
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// Pause or resume automation-originated activity — independent of
+    /// [`Self::set_dispatch_paused`]. When `paused = true`,
+    /// `drain_ready_queue` stops claiming worker slots for executions bound
+    /// for the automation pool, and the triage-fire seam
+    /// (`EngineTriageDispatcher::fire`) refuses to start a new pass; an
+    /// already-claimed automation worker is unaffected. Pass
+    /// `paused_since_epoch_s = 0` when resuming (it is ignored).
+    ///
+    /// The caller is responsible for persisting the new state to `state.db`
+    /// so it survives an engine restart — see `handle_set_automation_paused`
+    /// in `app/engine_meta.rs`.
+    pub fn set_automation_paused(&self, paused: bool, paused_since_epoch_s: u64) {
+        self.automation_paused.store(paused, Ordering::Release);
+        self.automation_paused_since_epoch_s
+            .store(if paused { paused_since_epoch_s } else { 0 }, Ordering::Release);
+    }
+
+    /// `true` when automation-originated activity is globally paused.
+    pub fn is_automation_paused(&self) -> bool {
+        self.automation_paused.load(Ordering::Acquire)
+    }
+
+    /// The epoch-seconds timestamp at which automation was last paused, or
+    /// `None` when not currently paused.
+    pub fn automation_paused_since_epoch_s(&self) -> Option<u64> {
+        let v = self.automation_paused_since_epoch_s.load(Ordering::Acquire);
         if v == 0 { None } else { Some(v) }
     }
 
@@ -2614,6 +2663,12 @@ impl ExecutionCoordinator {
         // attempt against the same dead path.
         let paused = self.dispatch_paused.load(Ordering::Acquire);
         let reviews_exempt_from_pause = paused && self.dispatch_pause_exempts_reviews.load(Ordering::Acquire);
+        // Automation-pause gate — independent of `paused` above (see
+        // `FrontendRequest::SetAutomationPaused`). Checked per-row below
+        // alongside `paused`, rather than short-circuiting the whole drain
+        // here, because an automation-only pause must still let main/review
+        // rows dispatch normally.
+        let automation_paused = self.automation_paused.load(Ordering::Acquire);
 
         let executions = match self.work_db.list_ready_executions() {
             Ok(e) => e,
@@ -2711,6 +2766,15 @@ impl ExecutionCoordinator {
             // returned above), so this holds every non-review row while
             // review rows fall through to normal dispatch below.
             if paused && !is_review {
+                continue;
+            }
+
+            // Automation is paused: hold this row regardless of the global
+            // dispatch-pause state above. Unlike the dispatch-pause hold,
+            // this also prevents the row from ever reaching the spill-
+            // candidate queue below — an automation-paused row must not
+            // claim ANY slot, home or spilled.
+            if automation_paused && is_automation {
                 continue;
             }
 
@@ -13035,6 +13099,117 @@ mod tests {
             runner.calls.lock().await.len(),
             1,
             "the held row must be dispatched exactly once after resume"
+        );
+    }
+
+    // ── Automation-pause tests ──────────────────────────────────────────────
+
+    /// An automation-pause must hold an automation-pool row — it stays
+    /// `ready` until an explicit resume kicks the scheduler — mirroring
+    /// `operator_pause_holds_main_pool_row_until_resume` for the
+    /// independent `automation_paused` flag.
+    #[tokio::test]
+    async fn automation_pause_holds_automation_pool_row_until_resume() {
+        use crate::work::CreateAutomationInput;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Test automation".to_owned(),
+                repo_remote_url: None,
+                trigger: boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * 1-5".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "do maintenance".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+        let auto_chore = create_test_chore(&db, product.id.clone(), "Automation chore");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+                rusqlite::params![automation.id, auto_chore.id],
+            )
+            .unwrap();
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&auto_chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+
+        coordinator.set_automation_paused(true, 0);
+        coordinator.kick();
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            0,
+            "an automation-pool row must be held, not dispatched, while automation is paused"
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Ready,
+            "the held execution must remain `ready` while automation-paused"
+        );
+
+        coordinator.set_automation_paused(false, 0);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
+    }
+
+    /// An automation-pause must NOT hold main-pool or review-pool rows —
+    /// only rows targeting the automation pool are held. Demonstrates the
+    /// independence from `dispatch_paused`: dispatch keeps running normally
+    /// while only automation is paused.
+    #[tokio::test]
+    async fn automation_pause_does_not_hold_main_pool_row() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        coordinator.set_automation_paused(true, 0);
+        coordinator.kick();
+
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            1,
+            "a main-pool row must dispatch normally while only automation is paused"
+        );
+        assert!(
+            !coordinator.is_dispatch_paused(),
+            "automation pause must not flip the independent dispatch-pause flag"
         );
     }
 

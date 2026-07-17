@@ -325,8 +325,12 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
         }
 
         let coord = server_state.execution_coordinator.clone();
-        let dispatcher =
-            crate::automation_triage::EngineTriageDispatcher::new(work_db.clone(), Arc::new(move || coord.kick()));
+        let coord_for_pause_check = server_state.execution_coordinator.clone();
+        let dispatcher = crate::automation_triage::EngineTriageDispatcher::new(
+            work_db.clone(),
+            Arc::new(move || coord.kick()),
+            Arc::new(move || coord_for_pause_check.is_automation_paused()),
+        );
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         match dispatcher.fire(&automation) {
             crate::automation_scheduler::TriageDispatch::Dispatched { execution_id } => {

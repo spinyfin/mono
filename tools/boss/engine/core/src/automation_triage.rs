@@ -316,15 +316,28 @@ fn strip_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
 ///
 /// `kick` is a thin closure over `ExecutionCoordinator::kick`, mirroring how
 /// the other sweepers (`dep_unblock_sweep`) re-enter the scheduler — it keeps
-/// this module free of a hard dependency on the coordinator type.
+/// this module free of a hard dependency on the coordinator type. `is_paused`
+/// is the same pattern for `ExecutionCoordinator::is_automation_paused` — the
+/// single seam both the scheduler's fire path and `boss automation run`'s
+/// manual fire path go through, so a `bossctl automation pause` blocks new
+/// triage passes from either caller without each needing its own check.
 pub struct EngineTriageDispatcher {
     work_db: Arc<WorkDb>,
     kick: Arc<dyn Fn() + Send + Sync>,
+    is_paused: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl EngineTriageDispatcher {
-    pub fn new(work_db: Arc<WorkDb>, kick: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { work_db, kick }
+    pub fn new(
+        work_db: Arc<WorkDb>,
+        kick: Arc<dyn Fn() + Send + Sync>,
+        is_paused: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self {
+            work_db,
+            kick,
+            is_paused,
+        }
     }
 
     /// Resolve the repo the triage worker should lease: the automation's
@@ -345,6 +358,13 @@ impl EngineTriageDispatcher {
     /// `boss automation run` verb: resolve repo, create the triage execution,
     /// kick the coordinator.
     pub fn fire(&self, automation: &Automation) -> TriageDispatch {
+        if (self.is_paused)() {
+            return TriageDispatch::TransientFailure {
+                detail: "automation is paused (bossctl automation pause); holding new triage \
+                         passes until `bossctl automation resume`"
+                    .to_owned(),
+            };
+        }
         let Some(repo) = self.resolve_repo(automation) else {
             return TriageDispatch::TransientFailure {
                 detail: format!(

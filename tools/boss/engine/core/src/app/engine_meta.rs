@@ -538,3 +538,101 @@ pub(super) async fn handle_get_dispatch_state(ctx: Dispatch, req: FrontendReques
         );
     }
 }
+
+pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetAutomationPaused { paused } = req else {
+        unreachable!()
+    };
+    {
+        let coordinator = &server_state.execution_coordinator;
+        let already = coordinator.is_automation_paused();
+        if already == paused {
+            // Idempotent: no-op but still respond with the current state.
+            let paused_since_epoch_s = coordinator.automation_paused_since_epoch_s();
+            tracing::debug!(paused, "set_automation_paused: idempotent no-op");
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::AutomationStateResult {
+                    paused,
+                    paused_since_epoch_s,
+                },
+            );
+            return;
+        }
+        let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
+        coordinator.set_automation_paused(paused, now_epoch_s);
+        let db_result = if paused {
+            work_db
+                .set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "1")
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, &now_epoch_s.to_string()))
+        } else {
+            work_db
+                .set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "0")
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, "0"))
+        };
+        if let Err(err) = db_result {
+            tracing::warn!(
+                paused,
+                ?err,
+                "automation_pause: failed to persist to state.db — state is \
+                 applied in-memory but will revert on engine restart",
+            );
+        }
+        if paused {
+            tracing::info!(
+                "automation: globally paused (operator) — new triage passes and automation-pool \
+                 spawns are held; already-running automation workers finish normally",
+            );
+        } else {
+            // Re-kick the scheduler so anything that queued while paused is
+            // drained immediately without waiting for the next external event.
+            coordinator.kick();
+            tracing::info!("automation: resumed — scheduler kicked to drain queued executions");
+        }
+        let paused_since_epoch_s = coordinator.automation_paused_since_epoch_s();
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::AutomationStateResult {
+                paused,
+                paused_since_epoch_s,
+            },
+        );
+        // Broadcast the new health report to all connected app clients so
+        // the pause banner updates live without requiring an app restart.
+        server_state.broadcast_engine_health().await;
+    }
+}
+
+pub(super) async fn handle_get_automation_state(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetAutomationState = req else {
+        unreachable!()
+    };
+    {
+        let coordinator = &server_state.execution_coordinator;
+        let paused = coordinator.is_automation_paused();
+        let paused_since_epoch_s = coordinator.automation_paused_since_epoch_s();
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::AutomationStateResult {
+                paused,
+                paused_since_epoch_s,
+            },
+        );
+    }
+}

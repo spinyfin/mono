@@ -920,6 +920,18 @@ pub enum FrontendEvent {
         #[serde(default)]
         reviews_exempt: bool,
     },
+    /// Response to [`FrontendRequest::SetAutomationPaused`] and
+    /// [`FrontendRequest::GetAutomationState`]. Carries the current
+    /// automation-pause state and, when paused, the epoch-seconds
+    /// timestamp at which it was set. Independent of
+    /// [`FrontendEvent::DispatchStateResult`] — see
+    /// [`FrontendRequest::SetAutomationPaused`] for the scope.
+    AutomationStateResult {
+        paused: bool,
+        /// Epoch seconds when automation was paused. `None` when `paused = false`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paused_since_epoch_s: Option<u64>,
+    },
     /// Response to [`FrontendRequest::SyncProductExternalTracker`].
     /// Emitted when the engine begins the on-demand reconcile pass
     /// for the named product. The pass runs synchronously; this event

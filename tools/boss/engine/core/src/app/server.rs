@@ -1144,10 +1144,12 @@ pub async fn serve_with_merge_probe(
     // transient pre-start failure transparently; the completion handler's
     // outcome detector finalises the run once the worker reaches a decision.
     let coord_for_automation_triage = server_state.execution_coordinator.clone();
+    let coord_for_automation_pause_check = server_state.execution_coordinator.clone();
     let automation_triage_dispatcher: Arc<dyn crate::automation_scheduler::TriageDispatcher> =
         Arc::new(crate::automation_triage::EngineTriageDispatcher::new(
             server_state.work_db.clone(),
             Arc::new(move || coord_for_automation_triage.kick()),
+            Arc::new(move || coord_for_automation_pause_check.is_automation_paused()),
         ));
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),

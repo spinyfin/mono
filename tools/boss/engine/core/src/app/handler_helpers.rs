@@ -58,6 +58,15 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_sin
 /// [`crate::coordinator::DispatchPauseOrigin::from_metadata_str`].
 pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
 
+/// Metadata key for the global automation-pause flag — independent of
+/// [`METADATA_KEY_DISPATCH_PAUSED`]. `"1"` = paused, `"0"` or absent =
+/// running. Persisted at every toggle so the pause survives an engine
+/// restart.
+pub(super) const METADATA_KEY_AUTOMATION_PAUSED: &str = "automation_paused";
+/// Metadata key storing the epoch-seconds timestamp at which automation was
+/// last paused. Zero (or absent) means not paused.
+pub(super) const METADATA_KEY_AUTOMATION_PAUSED_SINCE: &str = "automation_paused_since_epoch_s";
+
 /// Persist the disabled-slot snapshot to the metadata KV. Called
 /// from the toggle handler. Errors bubble up so the caller can log
 /// them — persistence failure is non-fatal (the in-memory set still
@@ -118,6 +127,26 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             severity: "warning".to_owned(),
             title: "Dispatch is globally paused".to_owned(),
             body,
+        });
+    }
+
+    let automation_paused = server_state.execution_coordinator.is_automation_paused();
+    if automation_paused {
+        let since_str = server_state
+            .execution_coordinator
+            .automation_paused_since_epoch_s()
+            .map(|s| format!(" since {}", format_epoch_iso8601(s as i64)))
+            .unwrap_or_default();
+        issues.push(EngineHealthIssue {
+            kind: "automation_paused".to_owned(),
+            severity: "warning".to_owned(),
+            title: format!("Automations paused{since_str}"),
+            body: "The automation scheduler is not starting new triage passes, and the \
+                   automation pool is not claiming new work, including tasks a triage worker \
+                   produces. Currently-running automation workers continue to completion. \
+                   This is independent of dispatch pause. Run `bossctl automation resume` to \
+                   restore normal automation activity."
+                .to_owned(),
         });
     }
 
@@ -187,6 +216,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     EngineHealthReport {
         anthropic_api_key_present,
         dispatch_paused,
+        automation_paused,
         issues,
     }
 }
@@ -318,6 +348,25 @@ pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64, crate:
     let origin_raw = work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN).ok().flatten();
     let origin = crate::coordinator::DispatchPauseOrigin::from_metadata_str(origin_raw.as_deref());
     (paused, since_epoch_s, origin)
+}
+
+/// Read the persisted automation-pause state from the metadata KV. Returns
+/// `(paused, paused_since_epoch_s)`. On first boot or if absent/malformed
+/// defaults to `(false, 0)`. Independent of [`load_dispatch_paused_state`].
+pub(super) fn load_automation_paused_state(work_db: &WorkDb) -> (bool, u64) {
+    let paused = work_db
+        .get_metadata(METADATA_KEY_AUTOMATION_PAUSED)
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let since_epoch_s = work_db
+        .get_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    (paused, since_epoch_s)
 }
 
 /// Downcast `err` to `DuplicateTaskError` and return a structured
