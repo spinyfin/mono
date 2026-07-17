@@ -90,6 +90,18 @@ fn duplicate_pr_number_is_skipped() {
     assert!(plan_stack_proposals(&branches).is_empty());
 }
 
+#[test]
+fn empty_input_yields_no_proposals() {
+    assert!(plan_stack_proposals(&[]).is_empty());
+}
+
+#[test]
+fn single_branch_yields_no_proposals() {
+    // One branch has no pair to stack against, however many files it touches.
+    let branches = vec![branch("p1", 1, &["src/a.rs", "src/b.rs"])];
+    assert!(plan_stack_proposals(&branches).is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // `is_stack_worthy_file` — mechanical classes excluded from the signal.
 // ---------------------------------------------------------------------------
