@@ -1144,12 +1144,13 @@ pub(crate) async fn compose_worker_spawn(
                     "pr_review execution: PR metadata fetch failed; reviewer will use URL-only prompt",
                 );
             }
-            // When the diff is small enough, pre-fetch it and embed it
-            // directly in the reviewer's initial prompt so the reviewer
-            // skips one `gh pr diff` tool call. Disabled when
-            // max_embed_diff_lines is 0.
-            if max_embed_diff_lines > 0
-                && let Some(ref mut ctx) = pr_review_context
+            // Fetch the diff unconditionally (independent of
+            // max_embed_diff_lines) so the mechanical Boss-construct sweep
+            // below always runs, even when diff embedding is disabled via
+            // BOSS_MAX_EMBED_DIFF_LINES=0. Embedding the fetched diff into
+            // the reviewer's initial prompt is still gated on
+            // max_embed_diff_lines so operators can disable that separately.
+            if let Some(ref mut ctx) = pr_review_context
                 && let Some(diff) = fetch_pr_diff(pr_url).await
             {
                 // Mechanical assist for the agent-isms "Boss-construct
@@ -1162,7 +1163,7 @@ pub(crate) async fn compose_worker_spawn(
                     .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
 
                 let line_count = diff.lines().count() as u64;
-                if line_count <= max_embed_diff_lines {
+                if max_embed_diff_lines > 0 && line_count <= max_embed_diff_lines {
                     tracing::info!(
                         execution_id = %execution.id,
                         pr_url,
@@ -1177,8 +1178,8 @@ pub(crate) async fn compose_worker_spawn(
                         pr_url,
                         line_count,
                         max_embed_diff_lines,
-                        "pr_review execution: diff too large to embed; \
-                         reviewer will fetch it",
+                        "pr_review execution: diff too large to embed, or \
+                         embedding disabled; reviewer will fetch it",
                     );
                 }
             }
