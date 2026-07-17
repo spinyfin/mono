@@ -118,7 +118,7 @@ use handler_helpers::{
     resolve_transcript_for_tail, segment_to_wire, send_push, send_response, send_response_with_revision,
     send_work_error, tail_lines_from_content, task_name_description_for_id, task_status_for_id,
     task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch, work_item_product_id,
+    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every

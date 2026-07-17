@@ -209,7 +209,7 @@ impl ServerState {
             crate::work::WorkItem::Project(p) => p.id.clone(),
             crate::work::WorkItem::Product(p) => p.id.clone(),
         };
-        let product_id = work_item_product_id(&item);
+        let product_id = item.product_id().to_string();
         let request = EngineToAppRequest::RevealWorkItem(RevealWorkItemInput {
             work_item_id: canonical_id.clone(),
             product_id,

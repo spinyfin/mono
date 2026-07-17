@@ -532,7 +532,7 @@ pub(super) async fn publish_batch_work_invalidation(
     let mut by_product: HashMap<String, Vec<String>> = HashMap::new();
     for item in items {
         by_product
-            .entry(work_item_product_id(item))
+            .entry(item.product_id().to_string())
             .or_default()
             .push(work_item_id(item));
     }
@@ -772,14 +772,6 @@ pub(super) fn validate_external_tracker_config(kind: &str, config: &serde_json::
             Ok(())
         }
         other => Err(format!("unknown tracker kind '{other}'; supported: github")),
-    }
-}
-
-pub(super) fn work_item_product_id(item: &WorkItem) -> String {
-    match item {
-        WorkItem::Product(product) => product.id.clone(),
-        WorkItem::Project(project) => project.product_id.clone(),
-        WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.clone(),
     }
 }
 

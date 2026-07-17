@@ -54,7 +54,7 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
                 // the dependency surfaces (kanban badge, show view) and
                 // the dependent's possibly-changed status.
                 let product_id = match work_db.get_work_item(&edge.dependent_id) {
-                    Ok(item) => Some(work_item_product_id(&item)),
+                    Ok(item) => Some(item.product_id().to_string()),
                     Err(_) => None,
                 };
                 let revision = if let Some(pid) = product_id.as_deref() {
@@ -99,7 +99,7 @@ pub(super) async fn handle_remove_dependency(ctx: Dispatch, req: FrontendRequest
         match work_db.remove_dependency(input) {
             Ok(removed) => {
                 let product_id = match work_db.get_work_item(&dependent_id) {
-                    Ok(item) => Some(work_item_product_id(&item)),
+                    Ok(item) => Some(item.product_id().to_string()),
                     Err(_) => None,
                 };
                 let revision = if let Some(pid) = product_id.as_deref() {

@@ -3745,7 +3745,7 @@ impl ExecutionCoordinator {
             .ok()
             .flatten()?;
         let owner_item = self.work_db.get_work_item(&doc_owner.task_id).ok()?;
-        let product_id = work_item_product_id(&owner_item);
+        let product_id = owner_item.product_id().to_string();
         let short_quote = if comment.body.chars().count() > 60 {
             format!("{}…", comment.body.chars().take(60).collect::<String>())
         } else {
@@ -3793,7 +3793,7 @@ impl ExecutionCoordinator {
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
         // enabled host capability-eligible — preserving local behaviour.
-        let product_id = work_item_product_id(work_item);
+        let product_id = work_item.product_id().to_string();
         let project_id = work_item_project_id(work_item);
         let mut subject_ids: Vec<&str> = vec![execution.work_item_id.as_str(), product_id.as_str()];
         if let Some(pid) = project_id.as_deref() {
@@ -4895,7 +4895,7 @@ impl ExecutionCoordinator {
                 if let Ok(work_item) = self.resolve_execution_work_item(&execution) {
                     self.publisher
                         .publish_work_item_changed(
-                            &work_item_product_id(&work_item),
+                            work_item.product_id(),
                             &execution.work_item_id,
                             "execution_started_auto_advance",
                         )
@@ -5637,7 +5637,7 @@ impl ExecutionCoordinator {
                 let work_item_id = execution.work_item_id.clone();
                 let status_str = execution.status.as_str();
                 let product_id = match self.work_db.get_work_item(&work_item_id) {
-                    Ok(item) => Some(work_item_product_id(&item)),
+                    Ok(item) => Some(item.product_id().to_string()),
                     Err(err) => {
                         tracing::warn!(
                             ?err,
@@ -6062,7 +6062,7 @@ impl ExecutionCoordinator {
                         if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
                             self.publisher
                                 .publish_work_item_changed(
-                                    &work_item_product_id(&item),
+                                    item.product_id(),
                                     &execution.work_item_id,
                                     "execution_run_failed",
                                 )
@@ -6483,22 +6483,10 @@ impl ExecutionCoordinator {
             .await;
         if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
             self.publisher
-                .publish_work_item_changed(
-                    &work_item_product_id(&item),
-                    &execution.work_item_id,
-                    "execution_run_completed",
-                )
+                .publish_work_item_changed(item.product_id(), &execution.work_item_id, "execution_run_completed")
                 .await;
         }
         Ok(())
-    }
-}
-
-fn work_item_product_id(item: &WorkItem) -> String {
-    match item {
-        WorkItem::Product(p) => p.id.clone(),
-        WorkItem::Project(p) => p.product_id.clone(),
-        WorkItem::Task(t) | WorkItem::Chore(t) => t.product_id.clone(),
     }
 }
 

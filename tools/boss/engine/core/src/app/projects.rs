@@ -50,7 +50,7 @@ pub(super) async fn handle_create_project(ctx: Dispatch, req: FrontendRequest) {
     match work_db.create_project(input) {
         Ok(project) => {
             let item = WorkItem::Project(project);
-            let product_id = work_item_product_id(&item);
+            let product_id = item.product_id().to_string();
             let revision = publish_work_invalidation(
                 &server_state,
                 &session_id,
@@ -84,7 +84,7 @@ pub(super) async fn handle_reorder_project_tasks(ctx: Dispatch, req: FrontendReq
     match work_db.get_work_item(&project_id) {
         Ok(project_item) => match work_db.reorder_project_tasks(&project_id, &task_ids) {
             Ok(()) => {
-                let product_id = work_item_product_id(&project_item);
+                let product_id = project_item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -128,7 +128,7 @@ pub(super) async fn handle_set_project_design_doc(ctx: Dispatch, req: FrontendRe
         match work_db.set_project_design_doc(input) {
             Ok(project) => {
                 let item = WorkItem::Project(project);
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
