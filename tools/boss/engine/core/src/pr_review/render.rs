@@ -618,36 +618,54 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                you assign it — the same treatment as a regression or \
                duplication finding: an undeclared or unrecorded deferral is \
                a process gap, not a style nit.\n\
-             - **Agent-isms in code comments** *(first-class, explicit \
-               check)* — read every new or changed comment in the diff and \
-               flag any that only makes sense to the agent that wrote it, \
-               not to a human maintainer reading the code cold:\n\
-               (1) **Historical narration** — a comment that describes how \
-               the code came to be instead of what it currently does (e.g. \
-               \"we used to blah blah, but that was removed because foo \
-               foo\"). Comments must represent the *state* of the code, not \
-               its lineage, unless that history is strongly meaningful to \
-               future maintainers (a genuine gotcha, a workaround for a \
-               specific external bug, a non-obvious invariant). When you \
+             - **Agent-isms in code comments and PR descriptions** *(first-class, \
+               explicit check)* — read every new or changed comment in the diff, \
+               plus the PR title and description (fetch with `gh pr view` — \
+               review step 3), and flag any that only makes sense to the agent \
+               that wrote it, not to a human reading it cold. **The Task / Task \
+               description block elsewhere in this prompt is engine-authored \
+               context about this review run, not the PR's own title or \
+               description — never flag it under this check.**\n\
+               (1) **Historical narration** — *code comments only.* A comment \
+               that describes how the code came to be instead of what it \
+               currently does (e.g. \"we used to blah blah, but that was \
+               removed because foo foo\"). Comments must represent the *state* \
+               of the code, not its lineage, unless that history is strongly \
+               meaningful to future maintainers (a genuine gotcha, a workaround \
+               for a specific external bug, a non-obvious invariant). When you \
                flag one, quote the offending comment and propose replacement \
-               wording that states the current behaviour/reason instead.\n\
-               (2) **Boss-construct references** — a comment must never name \
-               a Boss work item id, phase, or brief. Example violation: \
-               \"This implements T234 phase 7.\" Quote the comment and \
-               propose wording that describes what the code does instead of \
-               where the instruction to write it came from.\n\
-               (3) **\"The operator\" / actor references** — a comment must \
-               not refer to the human directing Boss as \"the operator\", nor \
-               to actors in general. Prefer \"We want to avoid showing a \
-               card here because...\" over \"The operator requested that no \
-               card is shown here.\" Quote the comment and propose wording \
-               that states the reason directly, without naming who asked \
-               for it.\n\
+               wording that states the current behaviour/reason instead. \
+               **This does NOT apply to the PR description** — descriptions \
+               exist to narrate what changed and why (\"previously X, this PR \
+               makes it Y\"), so historical/narrative context there is expected \
+               and must never be flagged. Do not overgeneralize the code-comment \
+               rule to descriptions.\n\
+               (2) **Boss-construct references** — *code comments and PR \
+               title/description alike.* Neither may name a Boss work item id, \
+               phase, chore, brief, or effort level. Example violation in a \
+               comment: \"This implements T234 phase 7.\" Example violation in a \
+               PR title/description: \"Implements T234 phase 7 per the brief.\" \
+               PR descriptions are read on GitHub, where those identifiers mean \
+               nothing to a human reader. Quote the offending text and propose \
+               wording that describes what the code does instead of where the \
+               instruction to write it came from.\n\
+               (3) **\"The operator\" / actor references** — *code comments and \
+               PR title/description alike.* Neither may refer to the human \
+               directing Boss as \"the operator\", nor to actors in general \
+               (\"the operator requested\", \"per the operator's review\"). \
+               Prefer \"We want to avoid showing a card here because...\" over \
+               \"The operator requested that no card is shown here.\" Quote the \
+               offending text and propose wording that states the reason \
+               directly, without naming who asked for it.\n\
                (`category: \"agent_isms\"`) Any confirmed finding in this \
-               dimension forces a revision regardless of the severity you \
+               dimension — whether in a code comment or in the PR \
+               title/description — forces a revision regardless of the severity you \
                assign it — the same treatment as regression, duplication, \
                and deferred-scope findings: agent-authored scaffolding left \
-               in comments is a process gap, not a style nit.\n\
+               behind, in code or in the PR's own description, is a process \
+               gap, not a style nit. For a finding about the PR title/description \
+               itself (not a code comment), set `file` to the literal `PR \
+               description` and omit `location`.\n\
              - **Code quality/readability** — fails to match surrounding style, \
                naming issues, dead/confusing code. (`category: \"readability\"`)\n\
              - **Lint/warning suppressions** — scrutinize every new \
@@ -1087,11 +1105,14 @@ mod tests {
     }
 
     /// The agent-isms rubric dimension (operator directive: code comments
-    /// that only make sense to the agent that wrote them — historical
-    /// narration, Boss work-item/phase/brief references, or "the operator"/
+    /// and PR descriptions/titles that only make sense to the agent that
+    /// wrote them — historical narration (code comments only), Boss
+    /// work-item/phase/brief/effort-level references, or "the operator"/
     /// actor phrasing — are revision-required findings, not advisory nits)
     /// must be present with all three detection modes plus the
-    /// revision-forcing note and the operator's own examples.
+    /// revision-forcing note and the operator's own examples, and must
+    /// state that historical/narrative context is expected and exempt in
+    /// PR descriptions even though it is flagged in code comments.
     #[test]
     fn code_scope_prompt_contains_agent_isms_dimension() {
         let prompt = render_reviewer_initial_prompt(
@@ -1104,8 +1125,8 @@ mod tests {
             "org/repo",
         );
         assert!(
-            prompt.contains("Agent-isms in code comments"),
-            "code rubric must contain an explicit agent-isms dimension"
+            prompt.contains("Agent-isms in code comments and PR descriptions"),
+            "code rubric must contain an explicit agent-isms dimension covering both comments and PR descriptions"
         );
         assert!(
             prompt.contains("Historical narration"),
@@ -1116,6 +1137,15 @@ mod tests {
             "rubric must include the operator's historical-narration example"
         );
         assert!(
+            prompt.contains("code comments only"),
+            "rubric must scope historical-narration to code comments, not PR descriptions"
+        );
+        assert!(
+            prompt.contains("This does NOT apply to the PR description")
+                && prompt.contains("historical/narrative context there is expected"),
+            "rubric must explicitly exempt historical/narrative context in PR descriptions"
+        );
+        assert!(
             prompt.contains("Boss-construct references"),
             "rubric must cover comments naming Boss work items/phases/briefs"
         );
@@ -1124,13 +1154,25 @@ mod tests {
             "rubric must include the operator's Boss-construct example"
         );
         assert!(
+            prompt.contains("Implements T234 phase 7 per the brief"),
+            "rubric must include a Boss-construct example specific to a PR title/description"
+        );
+        assert!(
             prompt.contains("\"the operator\""),
             "rubric must cover comments referring to the directing human as \"the operator\""
+        );
+        assert!(
+            prompt.contains("the operator requested\", \"per the operator's review"),
+            "rubric must cover PR-description actor framing like \"the operator requested\"/\"per the operator's review\""
         );
         assert!(
             prompt.contains("We want to avoid showing a card here because")
                 && prompt.contains("The operator requested that no card is shown here"),
             "rubric must include the operator's before/after example for actor references"
+        );
+        assert!(
+            prompt.contains("code comments and PR title/description alike"),
+            "rubric must state Boss-construct and actor-reference checks apply to both comments and PR descriptions"
         );
         assert!(
             prompt.contains("quote the offending comment and propose replacement"),
