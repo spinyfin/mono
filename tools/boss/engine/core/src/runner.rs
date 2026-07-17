@@ -715,6 +715,8 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         #[serde(rename = "headRefOid")]
         head_ref_oid: String,
         #[serde(default)]
+        title: String,
+        #[serde(default)]
         body: String,
         #[serde(default)]
         commits: Vec<PrCommit>,
@@ -741,17 +743,18 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
     // Shellout + exit-code/parse boilerplate lives once in
     // `boss_github::pr_files`, shared with `design_detector.rs` and
     // `stacked_pr_structuring.rs`.
-    let root = boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,body,commits,comments")
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                pr_url,
-                error = %e,
-                "fetch_pr_review_context: gh pr view failed; reviewer will use URL-only prompt",
-            );
-            e
-        })
-        .ok()?;
+    let root =
+        boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,title,body,commits,comments")
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    pr_url,
+                    error = %e,
+                    "fetch_pr_review_context: gh pr view failed; reviewer will use URL-only prompt",
+                );
+                e
+            })
+            .ok()?;
 
     let changed_files = boss_github::pr_files::parse_changed_file_paths(&root);
 
@@ -787,6 +790,18 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
     let supersession_flags =
         crate::supersession_scan::hit_lines(&crate::supersession_scan::scan_supersession_language(&narrative));
 
+    // Mechanical assist for the agent-isms "Boss-construct references"
+    // sub-rule: deterministically sweep the PR's own title and description
+    // (not commits/comments, which are not part of the sub-rule's scope) for
+    // bare T<n>/P<n> tokens. The diff-added-lines half of the sweep is filled
+    // in by the caller once the diff is fetched (see `compose_worker_spawn`).
+    let mut boss_construct_refs = crate::boss_construct_scan::hit_lines(
+        &crate::boss_construct_scan::scan_narrative_text(&response.title, "PR title"),
+    );
+    boss_construct_refs.extend(crate::boss_construct_scan::hit_lines(
+        &crate::boss_construct_scan::scan_narrative_text(&response.body, "PR description"),
+    ));
+
     Some(crate::pr_review::PrReviewContext {
         pr_number,
         base_sha: response.base_ref_oid,
@@ -800,6 +815,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         // Filled in by the caller (the spawn path computes the merge-parent
         // deletion tripwire for conflict-resolution reviews — incident-002 P2).
         merged_parent_deletions: Vec::new(),
+        boss_construct_refs,
     })
 }
 
@@ -1136,6 +1152,15 @@ pub(crate) async fn compose_worker_spawn(
                 && let Some(ref mut ctx) = pr_review_context
                 && let Some(diff) = fetch_pr_diff(pr_url).await
             {
+                // Mechanical assist for the agent-isms "Boss-construct
+                // references" sub-rule: sweep the diff's added lines for bare
+                // T<n>/P<n> tokens regardless of whether the diff ends up
+                // embedded, so a large diff the reviewer fetches itself still
+                // gets forced-disposition candidates.
+                let diff_hits = crate::boss_construct_scan::scan_diff_added_lines(&diff);
+                ctx.boss_construct_refs
+                    .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
+
                 let line_count = diff.lines().count() as u64;
                 if line_count <= max_embed_diff_lines {
                     tracing::info!(

@@ -56,6 +56,15 @@ pub struct PrReviewContext {
     /// default.
     #[builder(default)]
     pub merged_parent_deletions: Vec<String>,
+    /// Deterministic bare Boss work-item id (`T<n>`/`P<n>`) sweep hits from
+    /// the PR's title, description, and added diff lines — a mechanical
+    /// assist for the agent-isms "Boss-construct references" sub-rule. Each
+    /// entry is a rendered `` `id` at location — "snippet" `` line. When
+    /// non-empty the reviewer prompt carries a forced-disposition block
+    /// requiring each hit be flagged or explicitly dismissed. Populated by
+    /// the caller; empty here by default.
+    #[builder(default)]
+    pub boss_construct_refs: Vec<String>,
 }
 
 /// Which review rubric to apply to a PR.
