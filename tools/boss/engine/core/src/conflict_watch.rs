@@ -1316,5 +1316,5 @@ pub async fn on_resolved(
 }
 
 #[cfg(test)]
-#[path = "conflict_watch_tests.rs"]
+#[path = "conflict_watch_tests/mod.rs"]
 mod tests;
