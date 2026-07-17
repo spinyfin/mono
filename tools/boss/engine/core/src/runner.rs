@@ -1066,7 +1066,23 @@ pub(crate) async fn compose_worker_spawn(
                         );
                         Vec::new()
                     });
-                crate::automation_triage::render_triage_preamble(&automation, &product_name, &siblings)
+                // Layer-0 context injection (automation-duplicate-work
+                // investigation, 2026-07-14, §4): gather in-flight and
+                // recently-merged automation work for the WHOLE product —
+                // across all automations, not just this one — so the agent
+                // can decline a candidate that overlaps a sibling
+                // automation's recent output. Failures here degrade to an
+                // empty context rather than blocking the spawn.
+                let since_epoch = boss_engine_utils::epoch_time::now_epoch_secs()
+                    - crate::automation_triage::RECENTLY_MERGED_WINDOW_SECS;
+                let open_tasks = work_db
+                    .list_open_automation_tasks_for_product(&automation.product_id)
+                    .unwrap_or_default();
+                let merged_tasks = work_db
+                    .list_recently_completed_automation_tasks_for_product(&automation.product_id, since_epoch)
+                    .unwrap_or_default();
+                let triage_context = crate::automation_triage::TriageContext::from_rows(open_tasks, merged_tasks);
+                crate::automation_triage::render_triage_preamble(&automation, &product_name, &siblings, &triage_context)
             }
             other => {
                 tracing::warn!(

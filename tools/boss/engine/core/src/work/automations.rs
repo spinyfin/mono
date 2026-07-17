@@ -438,6 +438,76 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// List open tasks produced by *any* automation for a product (cross-
+    /// automation, unlike [`list_tasks_for_automation`] which is scoped to
+    /// one), ordered newest first. Used by the triage preamble's layer-0
+    /// context injection (automation-duplicate-work investigation, 2026-07-14)
+    /// so a firing triage run can see in-flight work filed by *other*
+    /// automations on the same product, not just its own — the
+    /// cross-automation blindness that let two overlapping automations both
+    /// file duplicate work items in the 2026-07-13 incident.
+    pub fn list_open_automation_tasks_for_product(&self, product_id: &str) -> Result<Vec<boss_protocol::Task>> {
+        let conn = self.connect()?;
+        ensure_product_exists(&conn, product_id)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
+                    pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
+                    priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
+                    effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
+                    ci_required_state, review_required_state, ci_required_detail,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    source_automation_id
+               FROM tasks
+              WHERE product_id = ?1
+                AND source_automation_id IS NOT NULL
+                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
+                AND deleted_at IS NULL
+              ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([product_id], map_task_with_source_automation_id)?;
+        collect_rows(rows)
+    }
+
+    /// List automation-sourced tasks for a product that reached `done` with a
+    /// PR at or after `since_epoch` (UTC seconds), newest first. Used by the
+    /// triage preamble's layer-0 context injection to show recently merged
+    /// automation work — the "stale brief" half of the automation-duplicate-work
+    /// investigation (§1.4): a run re-derives a target another automation
+    /// already swept and merged hours earlier, because closed rows drop out of
+    /// [`list_open_automation_tasks_for_product`] the moment they finish.
+    /// `updated_at` is stored as an epoch-seconds string (see `now_string`),
+    /// so the comparison casts it to INTEGER like [`list_due_automations`] does
+    /// for `next_due_at`.
+    pub fn list_recently_completed_automation_tasks_for_product(
+        &self,
+        product_id: &str,
+        since_epoch: i64,
+    ) -> Result<Vec<boss_protocol::Task>> {
+        let conn = self.connect()?;
+        ensure_product_exists(&conn, product_id)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
+                    pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
+                    priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
+                    effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
+                    ci_required_state, review_required_state, ci_required_detail,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    source_automation_id
+               FROM tasks
+              WHERE product_id = ?1
+                AND source_automation_id IS NOT NULL
+                AND status = 'done'
+                AND pr_url IS NOT NULL AND pr_url != ''
+                AND CAST(updated_at AS INTEGER) >= ?2
+                AND deleted_at IS NULL
+              ORDER BY CAST(updated_at AS INTEGER) DESC",
+        )?;
+        let rows = stmt.query_map(params![product_id, since_epoch], map_task_with_source_automation_id)?;
+        collect_rows(rows)
+    }
+
     /// List automations the scheduler should evaluate this tick: enabled,
     /// `trigger_kind = 'schedule'`, and either never-scheduled
     /// (`next_due_at IS NULL`, needs initialisation) or due
