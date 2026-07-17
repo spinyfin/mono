@@ -1935,3 +1935,39 @@ impl WorkDb {
         Ok(updated)
     }
 }
+
+// The bulk of `effective_ci_budget`, `set_ci_attempt_budget`,
+// `ci_attempts_used`, `active_blocked_signals`, and the `rearm_*` signal
+// contracts are already covered end-to-end by the sibling external suite
+// (`work/tests/t05.rs`, `work/tests/t16.rs`) — including cases this module
+// does not exercise, like `active_blocked_signals`'s `created_at`/`reason`
+// ordering and the `deleted_at` guard on the attempts-used writers. This
+// module is intentionally narrow: it holds only the unknown-work-item
+// fallbacks for those same methods, which none of the external tests cover.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn mem_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn set_ci_attempt_budget_unknown_task_returns_none() {
+        let db = mem_db();
+        assert!(db.set_ci_attempt_budget("nope", Some(4)).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_ci_attempts_used_reads_zero_for_unknown_task() {
+        let db = mem_db();
+        assert_eq!(db.get_ci_attempts_used("nope").unwrap(), 0);
+    }
+
+    #[test]
+    fn active_blocked_signals_empty_for_untouched_task() {
+        let db = mem_db();
+        assert!(db.active_blocked_signals("nope").unwrap().is_empty());
+    }
+}
