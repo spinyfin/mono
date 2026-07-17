@@ -835,7 +835,7 @@ async fn import_new(rctx: &ProductReconcileCtx<'_>, upstream: &UpstreamItem, out
 
 /// Pick the best PR to use as the `pr_url`: prefer merged (highest `merged_at`),
 /// then fall back to any unmerged PR association.
-fn pick_best_pr(associations: &[UpstreamPrAssociation]) -> Option<&UpstreamPrAssociation> {
+pub(super) fn pick_best_pr(associations: &[UpstreamPrAssociation]) -> Option<&UpstreamPrAssociation> {
     let merged = associations
         .iter()
         .filter(|p| p.merged)
