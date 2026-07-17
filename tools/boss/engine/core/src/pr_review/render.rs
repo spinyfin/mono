@@ -620,9 +620,12 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                a process gap, not a style nit.\n\
              - **Agent-isms in code comments and PR descriptions** *(first-class, \
                explicit check)* — read every new or changed comment in the diff, \
-               plus the PR title and description above, and flag any that only \
-               makes sense to the agent that wrote it, not to a human reading it \
-               cold:\n\
+               plus the PR title and description (fetch with `gh pr view` — \
+               review step 3), and flag any that only makes sense to the agent \
+               that wrote it, not to a human reading it cold. **The Task / Task \
+               description block elsewhere in this prompt is engine-authored \
+               context about this review run, not the PR's own title or \
+               description — never flag it under this check.**\n\
                (1) **Historical narration** — *code comments only.* A comment \
                that describes how the code came to be instead of what it \
                currently does (e.g. \"we used to blah blah, but that was \
@@ -655,12 +658,14 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                offending text and propose wording that states the reason \
                directly, without naming who asked for it.\n\
                (`category: \"agent_isms\"`) Any confirmed finding in this \
-               dimension — whether in a code comment or in the PR title/ \
-               description — forces a revision regardless of the severity you \
+               dimension — whether in a code comment or in the PR \
+               title/description — forces a revision regardless of the severity you \
                assign it — the same treatment as regression, duplication, \
                and deferred-scope findings: agent-authored scaffolding left \
                behind, in code or in the PR's own description, is a process \
-               gap, not a style nit.\n\
+               gap, not a style nit. For a finding about the PR title/description \
+               itself (not a code comment), set `file` to the literal `PR \
+               description` and omit `location`.\n\
              - **Code quality/readability** — fails to match surrounding style, \
                naming issues, dead/confusing code. (`category: \"readability\"`)\n\
              - **Lint/warning suppressions** — scrutinize every new \
