@@ -406,25 +406,7 @@ impl WorkDb {
     /// deliberately because non-project tasks don't share the
     /// PR-on-merge lifecycle yet.
     pub fn list_chores_pending_merge_check(&self) -> Result<Vec<PendingMergeCheck>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, pr_url
-             FROM tasks
-             WHERE kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND status = 'in_review'
-               AND pr_url IS NOT NULL
-               AND pr_url != ''
-               AND deleted_at IS NULL
-             ORDER BY updated_at ASC",
-        ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PendingMergeCheck {
-                work_item_id: row.get(0)?,
-                product_id: row.get(1)?,
-                pr_url: row.get(2)?,
-            })
-        })?;
-        collect_rows(rows)
+        self.query_pending_merge_checks("t.status = 'in_review'")
     }
 
     /// Executions whose bound chore is still `active` with no `pr_url`,

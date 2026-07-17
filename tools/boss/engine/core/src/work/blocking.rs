@@ -15,26 +15,7 @@ impl WorkDb {
     /// Same `PendingMergeCheck` shape as the in-review list so the
     /// poller can chain both iterators through one sweep loop.
     pub fn list_chores_blocked_on_merge_conflict(&self) -> Result<Vec<PendingMergeCheck>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, pr_url
-             FROM tasks
-             WHERE kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND status = 'blocked'
-               AND blocked_reason = 'merge_conflict'
-               AND pr_url IS NOT NULL
-               AND pr_url != ''
-               AND deleted_at IS NULL
-             ORDER BY updated_at ASC",
-        ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PendingMergeCheck {
-                work_item_id: row.get(0)?,
-                product_id: row.get(1)?,
-                pr_url: row.get(2)?,
-            })
-        })?;
-        collect_rows(rows)
+        self.query_pending_merge_checks("t.status = 'blocked' AND t.blocked_reason = 'merge_conflict'")
     }
 
     /// CI-remediation attempts that are stranded: the parent task is
@@ -106,26 +87,9 @@ impl WorkDb {
     ///     engine has given up); it only watches for the clear signal
     ///     (design §Q1 "Probe-pool extension").
     pub fn list_chores_blocked_on_ci_failure(&self) -> Result<Vec<PendingMergeCheck>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, pr_url
-             FROM tasks
-             WHERE kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND status = 'blocked'
-               AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
-               AND pr_url IS NOT NULL
-               AND pr_url != ''
-               AND deleted_at IS NULL
-             ORDER BY updated_at ASC",
-        ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PendingMergeCheck {
-                work_item_id: row.get(0)?,
-                product_id: row.get(1)?,
-                pr_url: row.get(2)?,
-            })
-        })?;
-        collect_rows(rows)
+        self.query_pending_merge_checks(
+            "t.status = 'blocked' AND t.blocked_reason IN ('ci_failure', 'ci_failure_exhausted')",
+        )
     }
 
     /// Parents that have stranded in `status='blocked'` with a NULL scalar
@@ -157,16 +121,9 @@ impl WorkDb {
     /// prerequisite, leaving genuine dependency blocks to the
     /// dependency-unblock sweep.
     pub fn list_chores_stranded_blocked_remediation(&self) -> Result<Vec<PendingMergeCheck>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT t.id, t.product_id, t.pr_url
-             FROM tasks t
-             WHERE t.kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND t.status = 'blocked'
+        self.query_pending_merge_checks(
+            "t.status = 'blocked'
                AND t.blocked_reason IS NULL
-               AND t.pr_url IS NOT NULL
-               AND t.pr_url != ''
-               AND t.deleted_at IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM task_blocked_signals s
                     WHERE s.work_item_id = t.id
@@ -183,17 +140,8 @@ impl WorkDb {
                         WHERE ci.work_item_id = t.id
                           AND ci.revision_task_id IS NOT NULL
                    )
-               )
-             ORDER BY t.updated_at ASC",
-        ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PendingMergeCheck {
-                work_item_id: row.get(0)?,
-                product_id: row.get(1)?,
-                pr_url: row.get(2)?,
-            })
-        })?;
-        collect_rows(rows)
+               )",
+        )
     }
 
     /// Re-canonicalise a stranded NULL-reason blocked parent (see
