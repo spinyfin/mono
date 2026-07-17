@@ -379,7 +379,7 @@ new file mode 100644
 index 0000000..e05970b
 --- /dev/null
 +++ b/rust/private/test_sharding_wrapper.sh
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,65 @@
 +#!/usr/bin/env bash
 +# Copyright 2024 The Bazel Authors. All rights reserved.
 +#
@@ -417,9 +417,14 @@ index 0000000..e05970b
 +# Output format: "test_name: test" - we need to strip the ": test" suffix
 +test_list=$("./${TEST_BINARY}" --list --format terse 2>/dev/null | grep ': test$' | sed 's/: test$//' || true)
 +
-+# If no tests found, exit successfully
++# An empty enumeration means the binary crashed, hung, or --list is broken --
++# not that there are zero tests (a genuinely test-less *shard* is a separate,
++# legitimate case handled after partitioning below). Failing loudly here turns
++# what would otherwise be a silent all-shards-green run into a visible
++# failure instead of masking a broken test harness.
 +if [[ -z "$test_list" ]]; then
-+    exit 0
++    echo "test_sharding_wrapper: '${TEST_BINARY} --list --format terse' enumerated zero tests; refusing to report success for a broken/empty test binary under sharding" >&2
++    exit 1
 +fi
 +
 +# Filter tests for this shard
