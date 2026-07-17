@@ -627,6 +627,12 @@ pub enum FrontendRequest {
         automation_id: String,
     },
 
+    /// Query the current automation-pause state without changing it.
+    /// Independent of [`FrontendRequest::GetDispatchState`] — see
+    /// [`FrontendRequest::SetAutomationPaused`] for the scope of what
+    /// this flag holds. Replies with [`FrontendEvent::AutomationStateResult`].
+    GetAutomationState,
+
     /// Read-only: snapshot a work item's CI attempt budget — the
     /// `tasks.ci_attempt_budget` override, the product's default, the
     /// effective value the engine uses, and the live
@@ -1497,6 +1503,32 @@ pub enum FrontendRequest {
         text: String,
     },
 
+    /// Pause or resume automation-originated activity. When `paused = true`
+    /// the engine holds NEW automation activity: the automation scheduler
+    /// (and `bossctl` / `boss automation run`'s manual fire) stop starting
+    /// triage passes, and `drain_ready_queue` stops claiming executions
+    /// bound for the automation pool (both fresh triage executions and
+    /// tasks a triage worker produces) until a subsequent
+    /// `SetAutomationPaused { paused: false }` call. Already-running
+    /// automation workers are NOT interrupted — they complete normally,
+    /// including recording whatever task their triage decision produces.
+    /// The flag is persisted to `state.db` so it survives an engine
+    /// restart. Idempotent: pausing while already paused (or resuming
+    /// while already running) is a no-op.
+    ///
+    /// Independent of [`FrontendRequest::SetDispatchPaused`]: a dispatch
+    /// pause already holds automation-pool *spawns* (automation rows are
+    /// not exempt from it, same as main-pool rows) but does not stop the
+    /// automation scheduler from creating new triage executions — they
+    /// just queue `ready` until dispatch resumes. This flag additionally
+    /// stops those triage passes from starting in the first place, which
+    /// matters when the goal is curbing runaway automation-produced work
+    /// items rather than just throttling dispatch. Toggling one flag never
+    /// changes the other. Replies with [`FrontendEvent::AutomationStateResult`].
+    SetAutomationPaused {
+        paused: bool,
+    },
+
     /// Set (or clear) a work item's per-PR `tasks.ci_attempt_budget`
     /// override. Pass `Some(n)` (clamped server-side to `0..=10`) or
     /// `None` (clear → product default applies). Backs
@@ -1514,7 +1546,16 @@ pub enum FrontendRequest {
     /// executions are NOT interrupted — they complete normally. The flag is
     /// persisted to `state.db` so it survives an engine restart. Idempotent:
     /// pausing while already paused (or resuming while already running) is a
-    /// no-op. Replies with [`FrontendEvent::DispatchStateResult`].
+    /// no-op.
+    ///
+    /// Independent of [`FrontendRequest::SetAutomationPaused`]: this pause
+    /// already holds automation-pool executions from claiming a slot (they
+    /// are not exempt, same as main-pool rows) but does NOT stop the
+    /// automation scheduler from creating new triage executions or a
+    /// running triage worker from recording a produced task — those keep
+    /// queueing and drain once dispatch resumes. Pausing dispatch never
+    /// sets or implies the automation-pause flag, and vice versa. Replies
+    /// with [`FrontendEvent::DispatchStateResult`].
     SetDispatchPaused {
         paused: bool,
     },

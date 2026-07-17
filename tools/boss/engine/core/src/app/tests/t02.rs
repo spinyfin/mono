@@ -2182,6 +2182,67 @@ fn dispatch_paused_state_missing_origin_defaults_to_breaker() {
     );
 }
 
+// ── automation-pause state persistence ───────────────────────────────────
+
+#[test]
+fn automation_paused_state_defaults_when_absent() {
+    let (_dir, db) = open_temp_work_db();
+    assert_eq!(
+        load_automation_paused_state(&db),
+        (false, 0),
+        "with no metadata keys set, the state defaults to (not-paused, since 0)"
+    );
+}
+
+#[test]
+fn automation_paused_state_reads_paused_and_since() {
+    let (_dir, db) = open_temp_work_db();
+    db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "1").unwrap();
+    db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, "1700000000")
+        .unwrap();
+    assert_eq!(
+        load_automation_paused_state(&db),
+        (true, 1_700_000_000),
+        "paused flag '1' with a numeric since must parse both components"
+    );
+}
+
+#[test]
+fn automation_paused_state_since_defaults_to_zero_when_missing_or_garbage() {
+    let (_dir, db) = open_temp_work_db();
+    // Paused, but the since key is absent → since defaults to 0.
+    db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "1").unwrap();
+    assert_eq!(
+        load_automation_paused_state(&db),
+        (true, 0),
+        "missing since key must default the timestamp to 0 while preserving paused=true"
+    );
+    // Non-numeric since value is also treated as 0.
+    db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, "not-a-number")
+        .unwrap();
+    assert_eq!(
+        load_automation_paused_state(&db),
+        (true, 0),
+        "non-numeric since value must fall back to 0"
+    );
+}
+
+#[test]
+fn automation_paused_state_non_one_flag_is_not_paused() {
+    let (_dir, db) = open_temp_work_db();
+    // Any flag value other than exactly "1" reads as not paused, but the
+    // since component is parsed independently.
+    db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "0").unwrap();
+    db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, "1700000000")
+        .unwrap();
+    let (paused, since) = load_automation_paused_state(&db);
+    assert!(!paused, "flag '0' must read as not paused");
+    assert_eq!(
+        since, 1_700_000_000,
+        "the since component still parses independently of the flag"
+    );
+}
+
 // ── duplicate_or_work_error ──────────────────────────────────────────────
 
 #[test]

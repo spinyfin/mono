@@ -119,6 +119,13 @@ enum Command {
         #[command(subcommand)]
         action: DispatchAction,
     },
+    /// Pause, resume, and inspect automation-originated activity —
+    /// independent of `dispatch pause`/`resume`/`state`. See
+    /// [`AutomationAction`] for the exact scope each verb holds.
+    Automation {
+        #[command(subcommand)]
+        action: AutomationAction,
+    },
     /// Query and manage engine counter / gauge metrics.
     ///
     /// `list` and `show` read `state.db` directly — they work even
@@ -264,10 +271,19 @@ enum DispatchAction {
     /// manual start). Already-running executions are not interrupted. The
     /// paused state persists across engine restarts. Idempotent — pausing
     /// while already paused is a no-op.
+    ///
+    /// Independent of `bossctl automation pause`/`resume`: this already
+    /// holds automation-pool executions from claiming a slot (they are not
+    /// exempt, same as main-pool rows) but does NOT stop the automation
+    /// scheduler from creating new triage passes or a running triage worker
+    /// from recording a produced task — those keep queueing and drain once
+    /// dispatch resumes. It never sets, clears, or implies `automation
+    /// pause`/`resume`.
     Pause,
     /// Resume global dispatch. The engine immediately drains any executions
     /// that queued while paused and resumes normal dispatch. Idempotent —
-    /// resuming while already running is a no-op.
+    /// resuming while already running is a no-op. Does not affect the
+    /// independent automation-pause flag — see `Pause` above.
     Resume,
     /// Show the current dispatch-pause state (paused/running and, if paused,
     /// when it was paused).
@@ -304,6 +320,37 @@ enum DispatchAction {
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AutomationAction {
+    /// Pause automation-originated activity. The engine stops starting new
+    /// automation triage passes (both the scheduler's own fires and `boss
+    /// automation run`'s manual fire), and stops claiming worker slots for
+    /// executions bound for the automation pool — both fresh triage
+    /// executions and tasks a triage worker produces. Already-running
+    /// automation workers are not interrupted; they finish normally,
+    /// including recording whatever task their decision produces. The
+    /// paused state persists across engine restarts. Idempotent — pausing
+    /// while already paused is a no-op.
+    ///
+    /// Independent of `bossctl dispatch pause`/`resume`: a dispatch pause
+    /// already holds automation-pool *spawns* but leaves the automation
+    /// scheduler free to keep creating (queueing) new triage executions.
+    /// This verb additionally stops those triage passes from starting in
+    /// the first place — the tighter gate you want when the goal is
+    /// curbing runaway automation-produced work items, not just throttling
+    /// dispatch. It never sets, clears, or implies `dispatch pause`/`resume`.
+    Pause,
+    /// Resume automation-originated activity. The engine immediately
+    /// drains any automation-pool executions that queued while paused and
+    /// resumes normal triage scheduling. Idempotent — resuming while
+    /// already running is a no-op. Does not affect the independent
+    /// dispatch-pause flag — see `Pause` above.
+    Resume,
+    /// Show the current automation-pause state (paused/running and, if
+    /// paused, when it was paused).
+    State,
 }
 
 /// Output format for `bossctl agents transcript --format`.
@@ -822,6 +869,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Dispatch {
             action: DispatchAction::Stats { state_root, since, top },
         } => dispatch_stats::dispatch_stats(cli.json, state_root, since.as_deref(), top),
+        Command::Automation {
+            action: AutomationAction::Pause,
+        } => automation_set_paused(&cli.socket_path, cli.json, true).await,
+        Command::Automation {
+            action: AutomationAction::Resume,
+        } => automation_set_paused(&cli.socket_path, cli.json, false).await,
+        Command::Automation {
+            action: AutomationAction::State,
+        } => automation_state(&cli.socket_path, cli.json).await,
         Command::Metrics {
             action: MetricsAction::List { prefix, state_root },
         } => metrics_list(cli.json, state_root, prefix.as_deref()),
@@ -1105,6 +1161,84 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected GetDispatchState: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn automation_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::SetAutomationPaused { paused })
+        .await
+        .context("sending SetAutomationPaused")?;
+    match response {
+        FrontendEvent::AutomationStateResult {
+            paused: new_paused,
+            paused_since_epoch_s,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "paused": new_paused,
+                        "paused_since_epoch_s": paused_since_epoch_s,
+                    })
+                );
+            } else if new_paused {
+                let since_str = paused_since_epoch_s
+                    .map(|s| format!(" (since epoch {s})"))
+                    .unwrap_or_default();
+                println!(
+                    "automation paused{since_str} — new triage passes and automation-pool spawns are held; \
+                     already-running automation workers finish normally"
+                );
+            } else {
+                println!("automation resumed");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected SetAutomationPaused: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn automation_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::GetAutomationState)
+        .await
+        .context("sending GetAutomationState")?;
+    match response {
+        FrontendEvent::AutomationStateResult {
+            paused,
+            paused_since_epoch_s,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "paused": paused,
+                        "paused_since_epoch_s": paused_since_epoch_s,
+                    })
+                );
+            } else if paused {
+                let since_str = paused_since_epoch_s
+                    .map(|s| format!("  paused_since: epoch {s}"))
+                    .unwrap_or_default();
+                println!("state: paused");
+                if !since_str.is_empty() {
+                    println!("{since_str}");
+                }
+            } else {
+                println!("state: running");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected GetAutomationState: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

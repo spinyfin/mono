@@ -563,6 +563,55 @@ async fn engine_health_report_flags_dispatch_paused() {
     );
 }
 
+/// Pausing automation must surface a warning-severity `automation_paused`
+/// engine-health issue and flip the report's top-level `automation_paused`
+/// bool, independently of `dispatch_paused`. This is the banner the macOS
+/// app shows so an operator doesn't wonder why no new triage passes are
+/// starting after `bossctl automation pause`.
+#[tokio::test]
+async fn engine_health_report_flags_automation_paused() {
+    let (state, _dir) = test_server_state();
+
+    let has_automation_issue =
+        |report: &boss_protocol::EngineHealthReport| report.issues.iter().any(|i| i.kind == "automation_paused");
+
+    // Default: automation is running, so no automation_paused issue and the
+    // top-level bool is false.
+    let report = build_engine_health_report(&state);
+    assert!(
+        !report.automation_paused,
+        "fresh engine must not report automation as paused",
+    );
+    assert!(
+        !has_automation_issue(&report),
+        "running automation must not raise the automation_paused banner",
+    );
+
+    // Pause automation through the same coordinator API the human toggle
+    // uses. Dispatch itself stays unpaused — the two flags are independent.
+    state.execution_coordinator.set_automation_paused(true, 0);
+
+    let report = build_engine_health_report(&state);
+    assert!(
+        report.automation_paused,
+        "paused automation must set the top-level automation_paused bool",
+    );
+    assert!(
+        !report.dispatch_paused,
+        "pausing automation must not flip the independent dispatch_paused bool",
+    );
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.kind == "automation_paused")
+        .expect("automation_paused issue must be present once automation is paused");
+    assert_eq!(issue.severity, "warning");
+    assert!(
+        !issue.title.is_empty() && !issue.body.is_empty(),
+        "title and body must be populated so the banner has user-visible text",
+    );
+}
+
 /// A wedged `syspolicyd` must surface an error-severity
 /// `syspolicyd_wedged` engine-health issue with the offending pid and
 /// CPU% interpolated into the body so the operator gets the exact

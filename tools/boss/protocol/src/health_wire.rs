@@ -26,6 +26,12 @@ pub struct EngineHealthReport {
     /// it with a simple `jq .dispatch_paused`.
     #[serde(default)]
     pub dispatch_paused: bool,
+    /// True when automation-originated activity is globally paused. See
+    /// `SetAutomationPaused` — independent of `dispatch_paused`. Surfaced
+    /// as a top-level field for the same `jq .automation_paused`
+    /// convenience `dispatch_paused` provides.
+    #[serde(default)]
+    pub automation_paused: bool,
     /// Issues the UI should render, in display order (highest priority
     /// first). Empty when the engine is healthy.
     pub issues: Vec<EngineHealthIssue>,

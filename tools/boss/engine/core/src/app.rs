@@ -108,10 +108,11 @@ use pane_delivery::{PaneInjectOutcome, PaneSendFailure};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
-    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
-    TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
-    build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
-    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
+    METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE, METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
+    TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
+    build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
+    handle_create_many, in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
     load_dispatch_paused_state, load_live_status_disabled_slots, open_review_terminal_async,
     persist_live_status_disabled_slots, publish_comment_invalidation, publish_work_invalidation, read_transcript_tail,
     resolve_transcript_for_tail, segment_to_wire, send_push, send_response, send_response_with_revision,
@@ -1307,6 +1308,23 @@ impl ServerState {
             );
         }
 
+        // Seed the automation-pause flag from the engine metadata KV —
+        // independent of the dispatch-pause flag above. Same restart-safety
+        // rationale: set before any scheduler kicks so no automation triage
+        // pass or automation-pool spawn slips through the gap between boot
+        // and pause restoration.
+        let (automation_paused, automation_paused_since) = load_automation_paused_state(&server_state.work_db);
+        if automation_paused {
+            server_state
+                .execution_coordinator
+                .set_automation_paused(true, automation_paused_since);
+            tracing::info!(
+                paused_since_epoch_s = automation_paused_since,
+                "automation: restoring persisted pause state — automation remains \
+                 globally paused until `bossctl automation resume` is called",
+            );
+        }
+
         Ok(server_state)
     }
 
@@ -2347,6 +2365,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetAutomationOpenTaskCount { .. } => {
                 automations::handle_get_automation_open_task_count(ctx, r).await
             }
+            r @ FrontendRequest::GetAutomationState => engine_meta::handle_get_automation_state(ctx, r).await,
             r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
             r @ FrontendRequest::GetCiRemediation { .. } => ci_remediation::handle_get_ci_remediation(ctx, r).await,
             r @ FrontendRequest::GetConflictHotspots { .. } => {
@@ -2468,6 +2487,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RevealWorkItem { .. } => work_items::handle_reveal_work_item(ctx, r).await,
             r @ FrontendRequest::RunAutomation { .. } => automations::handle_run_automation(ctx, r).await,
             r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
+            r @ FrontendRequest::SetAutomationPaused { .. } => engine_meta::handle_set_automation_paused(ctx, r).await,
             r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
             r @ FrontendRequest::SetDispatchPaused { .. } => engine_meta::handle_set_dispatch_paused(ctx, r).await,
             r @ FrontendRequest::SetFeatureFlag { .. } => engine_meta::handle_set_feature_flag(ctx, r).await,
