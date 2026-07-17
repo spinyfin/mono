@@ -1,12 +1,13 @@
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 use std::sync::Arc;
 
 use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::checks::workflow_yaml::{
+    is_github_workflow_file, mapping_get, parse_workflow, workflow_steps, yaml_parse_finding,
+};
 use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -49,20 +50,11 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                 let workflow = match parse_workflow(contents) {
                     Ok(workflow) => workflow,
                     Err(error) => {
-                        findings.push(Finding {
-                            fixable: false,
-                            severity: Severity::Error,
-                            message: format!("failed to parse workflow YAML while enforcing action versions: {error}"),
-                            location: Some(Location {
-                                path: changed_file.path.clone(),
-                                line: None,
-                                column: None,
-                            }),
-                            remediations: vec![
-                                "Fix YAML syntax so checks can validate `uses:` action versions.".to_owned(),
-                            ],
-                            suggested_fix: None,
-                        });
+                        findings.push(yaml_parse_finding(
+                            changed_file,
+                            format!("failed to parse workflow YAML while enforcing action versions: {error}"),
+                            "Fix YAML syntax so checks can validate `uses:` action versions.",
+                        ));
                         return;
                     }
                 };
@@ -148,68 +140,35 @@ fn parse_config(config: &toml::Value) -> Result<CompiledWorkflowActionVersionCon
     })
 }
 
-fn is_github_workflow_file(path: &Path) -> bool {
-    if !path.starts_with(Path::new(".github/workflows")) {
-        return false;
-    }
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("yml") | Some("yaml")
-    )
-}
-
-fn parse_workflow(contents: &str) -> Result<Value> {
-    serde_yaml::from_str(contents).context("invalid YAML document")
-}
-
 fn find_version_violations(
     workflow: &Value,
     rules: &[WorkflowActionVersionRule],
 ) -> Vec<WorkflowActionVersionViolation> {
     let mut violations = Vec::new();
-    let Some(root) = workflow.as_mapping() else {
-        return violations;
-    };
-    let Some(jobs) = mapping_get(root, "jobs").and_then(Value::as_mapping) else {
-        return violations;
-    };
 
-    for (job_key, job_value) in jobs {
-        let Some(job) = job_value.as_mapping() else {
+    for step in workflow_steps(workflow) {
+        let Some(uses) = mapping_get(step.step, "uses").and_then(Value::as_str) else {
             continue;
         };
-        let Some(steps) = mapping_get(job, "steps").and_then(Value::as_sequence) else {
+        let Some((action, version)) = parse_uses_ref(uses) else {
             continue;
         };
-        let job_name = job_key.as_str().unwrap_or("<unknown-job>").to_owned();
 
-        for (index, step) in steps.iter().enumerate() {
-            let Some(step_map) = step.as_mapping() else {
+        for rule in rules {
+            if action != rule.action {
                 continue;
-            };
-            let Some(uses) = mapping_get(step_map, "uses").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some((action, version)) = parse_uses_ref(uses) else {
-                continue;
-            };
-
-            for rule in rules {
-                if action != rule.action {
-                    continue;
-                }
-                if version == rule.version {
-                    continue;
-                }
-
-                violations.push(WorkflowActionVersionViolation {
-                    action: action.to_owned(),
-                    expected_version: rule.version.clone(),
-                    actual_version: version.to_owned(),
-                    job_name: job_name.clone(),
-                    step_index: index + 1,
-                });
             }
+            if version == rule.version {
+                continue;
+            }
+
+            violations.push(WorkflowActionVersionViolation {
+                action: action.to_owned(),
+                expected_version: rule.version.clone(),
+                actual_version: version.to_owned(),
+                job_name: step.job_name.clone(),
+                step_index: step.step_index,
+            });
         }
     }
 
@@ -219,10 +178,6 @@ fn find_version_violations(
 fn parse_uses_ref(uses: &str) -> Option<(&str, &str)> {
     let (action, version) = uses.rsplit_once('@')?;
     Some((action.trim(), version.trim()))
-}
-
-fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a Value> {
-    mapping.get(Value::String(key.to_owned()))
 }
 
 #[cfg(test)]

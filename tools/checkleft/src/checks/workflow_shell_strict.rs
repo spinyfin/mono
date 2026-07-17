@@ -1,11 +1,13 @@
-use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 
 use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::checks::workflow_yaml::{
+    is_github_workflow_file, mapping_get, parse_workflow, workflow_steps, yaml_parse_finding,
+};
 use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -50,22 +52,11 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                 let workflow = match parse_workflow(contents) {
                     Ok(workflow) => workflow,
                     Err(error) => {
-                        findings.push(Finding {
-                            fixable: false,
-                            severity: Severity::Error,
-                            message: format!(
-                                "failed to parse workflow YAML while enforcing strict shell mode: {error}"
-                            ),
-                            location: Some(Location {
-                                path: changed_file.path.clone(),
-                                line: None,
-                                column: None,
-                            }),
-                            remediations: vec![
-                                "Fix YAML syntax so checks can validate `run:` script blocks.".to_owned(),
-                            ],
-                            suggested_fix: None,
-                        });
+                        findings.push(yaml_parse_finding(
+                            changed_file,
+                            format!("failed to parse workflow YAML while enforcing strict shell mode: {error}"),
+                            "Fix YAML syntax so checks can validate `run:` script blocks.",
+                        ));
                         return;
                     }
                 };
@@ -106,63 +97,25 @@ struct RunScriptViolation {
     step_index: usize,
 }
 
-fn is_github_workflow_file(path: &Path) -> bool {
-    if !path.starts_with(Path::new(".github/workflows")) {
-        return false;
-    }
-
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("yml") | Some("yaml")
-    )
-}
-
-fn parse_workflow(contents: &str) -> Result<Value> {
-    serde_yaml::from_str(contents).context("invalid YAML document")
-}
-
 fn find_non_strict_run_scripts(workflow: &Value) -> Vec<RunScriptViolation> {
     let mut violations = Vec::new();
-    let Some(root) = workflow.as_mapping() else {
-        return violations;
-    };
-    let Some(jobs) = mapping_get(root, "jobs").and_then(Value::as_mapping) else {
-        return violations;
-    };
 
-    for (job_key, job_value) in jobs {
-        let Some(job) = job_value.as_mapping() else {
+    for step in workflow_steps(workflow) {
+        let Some(run_script) = mapping_get(step.step, "run").and_then(Value::as_str) else {
             continue;
         };
-        let Some(steps) = mapping_get(job, "steps").and_then(Value::as_sequence) else {
+        if !is_multiline_script(run_script) {
             continue;
-        };
-
-        let job_name = job_key.as_str().unwrap_or("<unknown-job>").to_owned();
-        for (index, step) in steps.iter().enumerate() {
-            let Some(step_map) = step.as_mapping() else {
-                continue;
-            };
-            let Some(run_script) = mapping_get(step_map, "run").and_then(Value::as_str) else {
-                continue;
-            };
-            if !is_multiline_script(run_script) {
-                continue;
-            }
-            if !starts_with_strict_mode(run_script) {
-                violations.push(RunScriptViolation {
-                    job_name: job_name.clone(),
-                    step_index: index + 1,
-                });
-            }
+        }
+        if !starts_with_strict_mode(run_script) {
+            violations.push(RunScriptViolation {
+                job_name: step.job_name,
+                step_index: step.step_index,
+            });
         }
     }
 
     violations
-}
-
-fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a Value> {
-    mapping.get(Value::String(key.to_owned()))
 }
 
 fn is_multiline_script(script: &str) -> bool {
