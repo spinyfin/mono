@@ -1,5 +1,5 @@
 //! Effort-level → dispatch knobs (model, effort value, prompt addendum) resolved
-//! against the selected driver's [`crate::driver::ModelMenu`]. The per-driver tables
+//! against the selected driver's [`boss_engine_driver::ModelMenu`]. The per-driver tables
 //! live in each driver's static descriptor; this module owns the resolution
 //! precedence logic (design §Q2 / §Q3 / §Mix-and-match).
 
@@ -7,7 +7,7 @@ use std::path::Path;
 
 use boss_protocol::EffortLevel;
 
-use crate::driver::AgentDriver;
+use boss_engine_driver::AgentDriver;
 
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).
@@ -57,7 +57,7 @@ pub struct SpawnConfig {
 impl SpawnConfig {
     /// Worker spawn line written into the libghostty pane via the
     /// spawn RPC's `initial_input`. Delegates to
-    /// [`crate::driver::ClaudeDriver::spawn_invocation`], which owns the
+    /// [`boss_engine_driver::ClaudeDriver::spawn_invocation`], which owns the
     /// Claude-specific command-line logic (Spawn capability, P1422 Depth 1).
     ///
     /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
@@ -66,7 +66,7 @@ impl SpawnConfig {
         // No permission-mode override on this convenience wrapper: the
         // capability-restricted answer-agent path spawns via
         // `ClaudeDriver::spawn_invocation` directly (see `runner.rs`).
-        crate::driver::ClaudeDriver.spawn_invocation(
+        boss_engine_driver::ClaudeDriver.spawn_invocation(
             &self.model,
             self.claude_effort,
             settings_path,
@@ -111,13 +111,13 @@ pub fn resolve_driver(task_driver: Option<&str>, product_default_driver: Option<
     ENGINE_DEFAULT_DRIVER.to_owned()
 }
 
-/// Return the [`crate::driver::ModelMenu`] for the given driver slug.
+/// Return the [`boss_engine_driver::ModelMenu`] for the given driver slug.
 ///
 /// Currently only `"claude"` is registered; unknown slugs fall back to the
 /// Claude menu until a driver registry is added (design §Mix-and-match,
 /// "Copilot: its own menu, 3-value effort").
-fn menu_for_driver(_driver_slug: &str) -> &'static crate::driver::ModelMenu {
-    &crate::driver::ClaudeDriver.descriptor().model_menu
+fn menu_for_driver(_driver_slug: &str) -> &'static boss_engine_driver::ModelMenu {
+    &boss_engine_driver::ClaudeDriver.descriptor().model_menu
 }
 
 /// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
@@ -130,7 +130,7 @@ fn menu_for_driver(_driver_slug: &str) -> &'static crate::driver::ModelMenu {
 ///    main-pool executions.
 /// 3. Effort-level default — from the selected driver's model menu.
 /// 4. `products.default_model` (when non-empty after trim).
-/// 5. Driver's engine-default model (from [`crate::driver::ModelMenu::engine_default`]).
+/// 5. Driver's engine-default model (from [`boss_engine_driver::ModelMenu::engine_default`]).
 ///
 /// The effort value and prompt addendum follow `effort_level` only via the
 /// driver's menu; neither `model_override` nor `pool_model_override` changes
@@ -457,7 +457,7 @@ mod tests {
         // Falls through to Claude driver's engine_default ("opus").
         assert_eq!(
             cfg.model,
-            crate::driver::ClaudeDriver.descriptor().model_menu.engine_default
+            boss_engine_driver::ClaudeDriver.descriptor().model_menu.engine_default
         );
         assert_eq!(cfg.prompt_addendum, None);
     }
@@ -475,7 +475,7 @@ mod tests {
         // Falls through to Claude driver's engine_default ("opus").
         assert_eq!(
             cfg.model,
-            crate::driver::ClaudeDriver.descriptor().model_menu.engine_default
+            boss_engine_driver::ClaudeDriver.descriptor().model_menu.engine_default
         );
     }
 
@@ -519,7 +519,7 @@ mod tests {
         // level may select Haiku as its default model. Boss must never
         // dispatch a worker on Haiku — it supports neither auto mode nor
         // --dangerously-skip-permissions on the user's work machine.
-        let menu = &crate::driver::ClaudeDriver.descriptor().model_menu;
+        let menu = &boss_engine_driver::ClaudeDriver.descriptor().model_menu;
         for level in [
             EffortLevel::Trivial,
             EffortLevel::Small,

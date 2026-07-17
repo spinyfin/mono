@@ -14,6 +14,7 @@ members = [
   "tools/boss/engine/core",
   "tools/boss/engine/day-rotated-log",
   "tools/boss/engine/driver",
+  "tools/boss/engine/effort",
   "tools/boss/engine/editorial",
   "tools/boss/engine/transcript-markdown",
   "tools/boss/engine/pr-template",

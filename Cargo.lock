@@ -339,6 +339,7 @@ dependencies = [
  "boss-editorial",
  "boss-engine-day-rotated-log",
  "boss-engine-driver",
+ "boss-engine-effort",
  "boss-engine-gh-invocation",
  "boss-engine-live-status-redact",
  "boss-engine-transient-error",
@@ -403,6 +404,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-effort"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-engine-driver",
+ "boss-protocol",
 ]
 
 [[package]]

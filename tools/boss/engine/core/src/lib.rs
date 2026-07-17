@@ -41,7 +41,7 @@ pub use boss_editorial as editorial;
 pub use boss_engine_driver as driver;
 pub mod dispatch_reader;
 pub mod editorial_hook;
-pub mod effort;
+pub use boss_engine_effort as effort;
 pub mod engine_control;
 pub mod envelope_watch;
 pub mod events_socket;
