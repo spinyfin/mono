@@ -164,7 +164,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
          {boundaries_and_coordinator}",
         lease = lease_id,
         workspace_path = workspace_path,
-        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        boundaries_and_coordinator = boss_engine_prompt_fragments::boundaries_and_coordinator_fragment(),
     )
 }
 
@@ -193,9 +193,9 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
 /// section covers that case.
 ///
 /// `output_path` is the absolute, engine-owned artifact path the reviewer must
-/// write its `ReviewResult` JSON to (see [`crate::structured_output`]). It is
-/// the primary output channel; the prompt also asks for a fenced-JSON copy in
-/// the final message as a transitional fallback.
+/// write its `ReviewResult` JSON to (see `boss_engine`'s `structured_output`
+/// module). It is the primary output channel; the prompt also asks for a
+/// fenced-JSON copy in the final message as a transitional fallback.
 pub fn render_reviewer_initial_prompt(
     task_name: &str,
     task_description: &str,
@@ -724,7 +724,7 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::pr_review::*;
+    use crate::*;
 
     #[test]
     fn reviewer_initial_prompt_contains_rubric_and_pr_url() {

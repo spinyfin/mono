@@ -241,7 +241,7 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          \n\
          {boundaries_and_coordinator}",
         lease = lease_id,
-        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        boundaries_and_coordinator = boss_engine_prompt_fragments::boundaries_and_coordinator_fragment(),
     )
 }
 

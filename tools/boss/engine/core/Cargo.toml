@@ -24,6 +24,8 @@ boss-engine-gh-invocation = { path = "../gh-invocation" }
 boss-engine-live-status-redact = { path = "../live-status-redact" }
 boss-log-files = { path = "../../log-files" }
 boss-metrics = { path = "../metrics" }
+boss-engine-pr-review = { path = "../pr-review" }
+boss-engine-prompt-fragments = { path = "../prompt-fragments" }
 boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }

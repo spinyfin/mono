@@ -1,18 +1,20 @@
 //! Shared text fragments used verbatim across multiple agent-prompt
 //! renderers.
 //!
-//! Several agent prompts (see [`crate::pr_review`],
-//! [`crate::automation_triage`]) end with an identical `## Boundaries` +
-//! `## Coordinator` block. Keeping one copy here prevents the renderers from
-//! drifting apart and makes an intentional wording change a one-line edit.
+//! Several agent prompts (the `boss_engine_pr_review` reviewer prompt and
+//! `boss_engine`'s `automation_triage`) end with an identical
+//! `## Boundaries` + `## Coordinator` block. Keeping one copy here prevents
+//! the renderers from drifting apart and makes an intentional wording change
+//! a one-line edit. This crate sits below both consumers so neither has to
+//! depend on the other.
 //!
 //! Note that not every prompt shares this fragment: renderers with
 //! *intentionally* different boundaries wording keep their own copy —
-//! [`crate::answer_agent`] widens the first rule to "inside or outside"
-//! (a strictly read-only agent) and omits the coordinator-probe section,
-//! and [`crate::worker_setup`] names a concrete sibling-workspace path and
-//! adds a work-taxonomy sentence. Do not fold those onto this fragment
-//! without matching each site's semantics.
+//! `boss_engine`'s `answer_agent` widens the first rule to "inside or outside"
+//! (a strictly read-only agent) and omits the coordinator-probe section, and
+//! its `worker_setup` names a concrete sibling-workspace path and adds a
+//! work-taxonomy sentence. Do not fold those onto this fragment without
+//! matching each site's semantics.
 
 /// The `## Boundaries` + `## Coordinator` block shared verbatim by the
 /// `pr_review` and `automation_triage` agent prompts.
@@ -20,7 +22,7 @@
 /// The string starts at the `## Boundaries` heading and ends with a trailing
 /// newline after the coordinator-probe sentence, so a caller embeds it right
 /// after the blank line that precedes the boundaries section.
-pub(crate) fn boundaries_and_coordinator_fragment() -> &'static str {
+pub fn boundaries_and_coordinator_fragment() -> &'static str {
     "## Boundaries\n\
      \n\
      - Do not modify files outside your workspace. Other workspaces\n\

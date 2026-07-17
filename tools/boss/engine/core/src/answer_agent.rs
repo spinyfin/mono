@@ -53,7 +53,7 @@
 pub const THREAD_REPLY_COMMAND: &str = "boss comment reply";
 
 /// Render the read-only agent-rules file (`CLAUDE.md`) for an answer-agent
-/// worker. Modeled on [`crate::pr_review::render_reviewer_claude_md`] but for
+/// worker. Modeled on [`boss_engine_pr_review::render_reviewer_claude_md`] but for
 /// the answer agent's mandate: read anything the coordinator can see, read code
 /// in a leased checkout, and post exactly one thread reply — never edit, push,
 /// open a PR, or mutate task/comment/cube state.

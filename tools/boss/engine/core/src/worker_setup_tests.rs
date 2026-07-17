@@ -1145,7 +1145,7 @@ fn claude_md_has_reuse_before_you_build_guardrail() {
 /// implementers) must be scoped to standard workers only.
 #[test]
 fn reviewer_claude_md_omits_reuse_before_you_build_guardrail() {
-    let rendered = crate::pr_review::render_reviewer_claude_md("lease-1", "/tmp/ws");
+    let rendered = boss_engine_pr_review::render_reviewer_claude_md("lease-1", "/tmp/ws");
     assert!(
         !rendered.contains("Reuse before you build"),
         "reviewer CLAUDE.md must not include the authoring-side guardrail"

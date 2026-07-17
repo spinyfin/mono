@@ -2901,7 +2901,7 @@ must not be asked to open one",
 
         let from_artifact = match crate::structured_output::read(&self.structured_output_dir, &execution.id) {
             None => None,
-            Some(raw) => match crate::pr_review::ReviewResult::from_json(&raw) {
+            Some(raw) => match boss_engine_pr_review::ReviewResult::from_json(&raw) {
                 Ok(result) => Some(result),
                 Err(err) => {
                     let err_str = err.to_string();
@@ -2922,7 +2922,7 @@ must not be asked to open one",
             None => match self.read_final_triage_message(&execution.id).await.into_message() {
                 None => None,
                 Some(text) => {
-                    let (result, err) = crate::pr_review::extract_review_result_verbose(&text);
+                    let (result, err) = boss_engine_pr_review::extract_review_result_verbose(&text);
                     if let Some(ref e) = err {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -3025,7 +3025,7 @@ must not be asked to open one",
 
         let revision_warranted = review_result
             .as_ref()
-            .is_some_and(crate::pr_review::passes_severity_gate);
+            .is_some_and(boss_engine_pr_review::passes_severity_gate);
 
         // incident-002 P2: rationale-independent both-parents deletion
         // tripwire. For a conflict-resolution review, diff the resolution
@@ -3202,7 +3202,7 @@ must not be asked to open one",
         if revision_warranted {
             // `review_result` is Some when `revision_warranted` is true.
             let result = review_result.expect("revision_warranted implies Some(ReviewResult)");
-            let instructions = crate::pr_review::render_revision_instructions(&result);
+            let instructions = boss_engine_pr_review::render_revision_instructions(&result);
             let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", execution.id);
 
             match self.work_db.create_revision(

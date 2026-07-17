@@ -233,7 +233,7 @@ pub struct WorkerSetupInput {
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer {
-        return crate::pr_review::render_reviewer_claude_md(
+        return boss_engine_pr_review::render_reviewer_claude_md(
             &input.lease_id,
             &input.workspace_path.display().to_string(),
         );

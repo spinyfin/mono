@@ -704,10 +704,10 @@ pub(crate) struct ComposedWorkerSpawn {
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
 ///
 /// Calls `gh pr view <pr_url> --json baseRefOid,headRefOid,files` and returns
-/// a [`crate::pr_review::PrReviewContext`] on success. Returns `None` on any
+/// a [`boss_engine_pr_review::PrReviewContext`] on success. Returns `None` on any
 /// network or parse error — callers fall back to the URL-only prompt
 /// gracefully without blocking the spawn.
-async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrReviewContext> {
+async fn fetch_pr_review_context(pr_url: &str) -> Option<boss_engine_pr_review::PrReviewContext> {
     #[derive(serde::Deserialize)]
     struct PrViewResponse {
         #[serde(rename = "baseRefOid")]
@@ -784,10 +784,12 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         narrative.push_str(&c.body);
         narrative.push('\n');
     }
-    let supersession_flags =
-        crate::supersession_scan::hit_lines(&crate::supersession_scan::scan_supersession_language(&narrative));
+    let supersession_flags = {
+        use boss_engine_pr_review::supersession_scan::{hit_lines, scan_supersession_language};
+        hit_lines(&scan_supersession_language(&narrative))
+    };
 
-    Some(crate::pr_review::PrReviewContext {
+    Some(boss_engine_pr_review::PrReviewContext {
         pr_number,
         base_sha: response.base_ref_oid,
         head_sha: response.head_ref_oid,
@@ -1162,13 +1164,13 @@ pub(crate) async fn compose_worker_spawn(
             let scope = match &pr_review_context {
                 Some(ctx) => {
                     let files: Vec<&str> = ctx.changed_files.iter().map(String::as_str).collect();
-                    crate::pr_review::classify_changed_files(&files)
+                    boss_engine_pr_review::classify_changed_files(&files)
                 }
-                None => crate::pr_review::ReviewScope::Code,
+                None => boss_engine_pr_review::ReviewScope::Code,
             };
             let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_else(|_| "<owner/repo>".to_owned());
-            crate::pr_review::render_reviewer_initial_prompt(
+            boss_engine_pr_review::render_reviewer_initial_prompt(
                 task_name,
                 task_description,
                 pr_url,

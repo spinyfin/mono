@@ -17,7 +17,7 @@ use super::types::*;
 /// # Examples
 ///
 /// ```
-/// use boss_engine::pr_review::{classify_changed_files, ReviewScope};
+/// use boss_engine_pr_review::{classify_changed_files, ReviewScope};
 ///
 /// assert_eq!(
 ///     classify_changed_files(&["docs/design.md", "README.md"]),
@@ -197,7 +197,7 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::pr_review::*;
+    use crate::*;
 
     #[test]
     fn classify_empty_files_returns_code() {

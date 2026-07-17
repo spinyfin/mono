@@ -2387,7 +2387,7 @@ impl ExecutionCoordinator {
     /// Rationale (the 2026-07-10 T270/T258 priority-inversion incident): a
     /// `pr_review` execution is strictly read-only — never writes, commits,
     /// or pushes (enforced by the reviewer CLAUDE.md, its tool denylist, and
-    /// its prompt mandate; see `crate::pr_review` module docs) — so it
+    /// its prompt mandate; see the `boss_engine_pr_review` crate docs) — so it
     /// cannot participate in the writer-vs-writer T1577/T1815 hazard this
     /// guard exists to prevent (two *writers* rebasing/rewriting each
     /// other's commits on the shared jj backing store). Meanwhile a pending

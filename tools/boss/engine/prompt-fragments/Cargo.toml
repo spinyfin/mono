@@ -1,0 +1,7 @@
+[package]
+name = "boss-engine-prompt-fragments"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]

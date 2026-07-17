@@ -1,37 +1,35 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-exports_files(["Cargo.toml"])
-
 rust_library(
-    name = "utils",
+    name = "pr-review",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_engine_utils",
+    crate_name = "boss_engine_pr_review",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/day-rotated-log:__pkg__",
-        "//tools/boss/engine/metrics:__pkg__",
-        "//tools/boss/engine/metrics-registry:__pkg__",
-        "//tools/boss/engine/pr-review:__pkg__",
-        "//tools/boss/engine/transcript-markdown:__pkg__",
-        "//tools/boss/github_tracker:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/prompt-fragments",
+        "//tools/boss/engine/utils",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "utils_test",
+    name = "pr-review-test",
     size = "small",
-    crate = ":utils",
+    crate = ":pr-review",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/engine/prompt-fragments",
+        "//tools/boss/engine/utils",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
