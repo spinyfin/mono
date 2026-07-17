@@ -2885,9 +2885,20 @@ fn rebase_workspace_branch(
         ),
     )?;
 
-    // Check whether the rebase left any conflicts in the working copy. The jj
-    // `conflict` template field is true when a commit's tree has conflicts.
-    let conflict_check = run_jj(
+    // Check whether the rebase left any conflicts anywhere in the range of
+    // commits this rebase will push — not just the working-copy tip. `@` is
+    // always a descendant of (or equal to) the rebased `boss_branch` head
+    // here (either it was already positioned on/after the boss head before
+    // this call, or the self-heal above made it a fresh child of the boss
+    // head), so `main_ref..@` is exactly the commit range `jj git push`
+    // would refuse if any commit in it is still conflicted. Checking only
+    // `@` misses this: a lower commit can remain individually conflicted
+    // even when a later commit's own edits happen to make the *tip*'s
+    // merged tree look clean for that path — jj's per-commit `conflict`
+    // flag does not retroactively clear just because a descendant's diff
+    // no longer touches the conflicted region, and `jj git push` refuses
+    // the whole range if any commit in it carries the flag.
+    let conflicted_commits = run_jj(
         runner,
         database_path,
         &RealCommandRunner::invocation(
@@ -2896,30 +2907,43 @@ fn rebase_workspace_branch(
             &[
                 "log",
                 "-r",
-                "@",
+                &format!("{main_ref}..@"),
                 "--no-graph",
                 "-T",
-                r#"if(conflict, "CONFLICT", "CLEAN")"#,
+                r#"if(conflict, commit_id ++ "\n")"#,
             ],
         ),
     )?;
-    let has_conflicts = conflict_check.trim() == "CONFLICT";
+    let conflicted_commit_ids: Vec<&str> = conflicted_commits
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let has_conflicts = !conflicted_commit_ids.is_empty();
 
     if has_conflicts {
-        // Best-effort: list conflicted files. Ignore errors — informational.
-        let conflicted_files: Vec<String> = runner
-            .run(&RealCommandRunner::invocation(cwd, "jj", &["resolve", "--list"]))
-            .map(|out| {
-                out.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Best-effort: list conflicted files across every conflicted commit
+        // in the range, deduped by path (the same file can show as
+        // conflicted on more than one commit when a later commit inherits
+        // an earlier one's unresolved region). Ignore per-commit errors —
+        // informational only.
+        let mut conflicted_files: Vec<String> = Vec::new();
+        for commit_id in &conflicted_commit_ids {
+            if let Ok(out) = runner.run(&RealCommandRunner::invocation(
+                cwd,
+                "jj",
+                &["resolve", "--list", "-r", commit_id],
+            )) {
+                for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if !conflicted_files.iter().any(|f| f == line) {
+                        conflicted_files.push(line.to_owned());
+                    }
+                }
+            }
+        }
 
         let file_hint = if conflicted_files.is_empty() {
-            "run `jj resolve --list` to see conflicted files".to_string()
+            "run `jj resolve --list -r <revision>` to see conflicted files".to_string()
         } else {
             conflicted_files.join(", ")
         };
@@ -2928,19 +2952,22 @@ fn rebase_workspace_branch(
         );
         eprintln!(
             "cube: workspace rebase: {boss_branch} rebased onto {main_branch}; \
-             conflicts in working copy: {file_hint}"
+             {} commit(s) still conflicted: {file_hint}",
+            conflicted_commit_ids.len()
         );
         return RunResult::new(
             format!(
                 "REBASED_WITH_CONFLICTS: branch `{boss_branch}` rebased onto `{main_branch}`. \
-                 Conflicts are materialized in the working copy — resolve them (see \
-                 `jj resolve --list`, `jj st`), then advance and push with `{push_cmd}`."
+                 {} commit(s) in the branch remain conflicted — resolve them (see \
+                 `jj resolve --list -r <revision>`, `jj st`), then advance and push with `{push_cmd}`.",
+                conflicted_commit_ids.len()
             ),
             json!({
                 "status": "conflicts",
                 "branch": boss_branch,
                 "main_branch": main_branch,
                 "conflicted_files": conflicted_files,
+                "conflicted_commit_count": conflicted_commit_ids.len(),
                 "pushed": false,
                 "rebase_output": rebase_out,
             }),
@@ -14581,6 +14608,7 @@ steps:
     const REBASE_OWNER_REPO: &str = "spinyfin/mono";
     const ANCESTRY_TMPL: &str = r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#;
     const CONFLICT_TMPL: &str = r#"if(conflict, "CONFLICT", "CLEAN")"#;
+    const CONFLICT_COMMITS_TMPL: &str = r#"if(conflict, commit_id ++ "\n")"#;
 
     fn rebase_cwd() -> PathBuf {
         PathBuf::from(REBASE_CWD)
@@ -14640,10 +14668,17 @@ steps:
     }
 
     /// The track + set + rebase + conflict-check quartet shared by every
-    /// rebase that gets as far as actually rebasing. `conflict` selects the
-    /// conflict-check verdict ("CLEAN" / "CONFLICT").
-    fn set_track_rebase_check_cmds(branch: &str, conflict: &str) -> Vec<ExpectedCommand> {
+    /// rebase that gets as far as actually rebasing. `conflicted_commit_ids`
+    /// is the set of commit ids the range conflict-check (`main@github..@`)
+    /// should report as conflicted — empty means the whole range rebased
+    /// clean.
+    fn set_track_rebase_check_cmds(branch: &str, conflicted_commit_ids: &[&str]) -> Vec<ExpectedCommand> {
         let remote_ref = format!("{branch}@{REBASE_REMOTE}");
+        let conflict_out = if conflicted_commit_ids.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", conflicted_commit_ids.join("\n"))
+        };
         vec![
             ExpectedCommand::ok(
                 rebase_cwd(),
@@ -14661,10 +14696,17 @@ steps:
             ExpectedCommand::ok(
                 rebase_cwd(),
                 "jj",
-                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-                conflict,
+                &["log", "-r", "main@github..@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+                &conflict_out,
             ),
         ]
+    }
+
+    /// A `jj resolve --list -r <commit_id>` expectation for one conflicted
+    /// commit in the range — the per-commit enumeration `rebase_workspace_branch`
+    /// runs once per id the range conflict-check reports.
+    fn resolve_list_for_commit_cmd(commit_id: &str, out: &str) -> ExpectedCommand {
+        ExpectedCommand::ok(rebase_cwd(), "jj", &["resolve", "--list", "-r", commit_id], out)
     }
 
     /// Push + verify, the clean-rebase tail.
@@ -14719,7 +14761,7 @@ steps:
             remote_exists_cmd(branch, "aaa111"),
             positioned_cmd(branch, "aaa111"),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(set_track_rebase_check_cmds(branch, &[]));
         cmds.extend(push_and_verify_cmds(branch));
 
         let runner = FakeRunner::new(cmds);
@@ -14760,7 +14802,7 @@ steps:
         let branch = "boss/exec_xyz";
         let mut cmds = vec![fetch_cmd(), remote_exists_cmd(branch, "ccc")];
         cmds.push(positioned_cmd(branch, "ccc"));
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(set_track_rebase_check_cmds(branch, &[]));
         cmds.extend(push_and_verify_cmds(branch));
 
         let runner = FakeRunner::new(cmds);
@@ -14786,7 +14828,7 @@ steps:
             remote_exists_cmd(branch, "e1"),
             positioned_cmd(branch, "e1"),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(set_track_rebase_check_cmds(branch, &[]));
         cmds.extend(push_and_verify_cmds(branch));
 
         let runner = FakeRunner::new(cmds);
@@ -14804,19 +14846,15 @@ steps:
             remote_exists_cmd(branch, "f1"),
             positioned_cmd(branch, "f1"),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CONFLICT"));
-        cmds.push(ExpectedCommand::ok(
-            rebase_cwd(),
-            "jj",
-            &["resolve", "--list"],
-            "src/foo.rs\nsrc/bar.rs\n",
-        ));
+        cmds.extend(set_track_rebase_check_cmds(branch, &["tip1"]));
+        cmds.push(resolve_list_for_commit_cmd("tip1", "src/foo.rs\nsrc/bar.rs\n"));
 
         let runner = FakeRunner::new(cmds);
         let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("conflict rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["status"], "conflicts");
         assert_eq!(result.payload["pushed"], false);
+        assert_eq!(result.payload["conflicted_commit_count"], 1);
         assert_eq!(result.payload["conflicted_files"][0], "src/foo.rs");
         assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
         assert!(
@@ -14827,6 +14865,74 @@ steps:
     }
 
     #[test]
+    fn rebase_conflicts_span_ancestor_commit_beyond_the_working_copy_tip() {
+        // Regression coverage: a rebase can leave an ANCESTOR commit
+        // individually conflicted even when the working-copy tip's own
+        // merged tree looks clean for that path (a later commit's edits can
+        // make the tip's `jj resolve --list` miss it entirely). The range
+        // check (`main@github..@`) must catch both the tip's own conflict
+        // and the lower commit's, and the aggregated `conflicted_files` must
+        // include files from both — not just the tip's.
+        let branch = "boss/exec_multi";
+        let mut cmds = vec![
+            fetch_cmd(),
+            remote_exists_cmd(branch, "m1"),
+            positioned_cmd(branch, "m1"),
+        ];
+        // Two conflicted commits in the range: the tip and one ancestor.
+        cmds.extend(set_track_rebase_check_cmds(branch, &["tip9", "ancestor1"]));
+        cmds.push(resolve_list_for_commit_cmd("tip9", "BUILD.bazel\n"));
+        cmds.push(resolve_list_for_commit_cmd("ancestor1", "MODULE.bazel.lock\n"));
+
+        let runner = FakeRunner::new(cmds);
+        let result =
+            run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("multi-commit conflict rebase");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["status"], "conflicts");
+        assert_eq!(result.payload["pushed"], false);
+        assert_eq!(result.payload["conflicted_commit_count"], 2);
+        let files: Vec<&str> = result.payload["conflicted_files"]
+            .as_array()
+            .expect("conflicted_files is an array")
+            .iter()
+            .map(|v| v.as_str().expect("file entry is a string"))
+            .collect();
+        assert_eq!(
+            files,
+            vec!["BUILD.bazel", "MODULE.bazel.lock"],
+            "must include the ancestor commit's conflicted file, not just the tip's: {files:?}"
+        );
+    }
+
+    #[test]
+    fn rebase_conflicts_dedupe_a_file_conflicted_on_more_than_one_commit() {
+        // Cascading conflicts: the same path can show as conflicted on more
+        // than one commit in the range (a descendant inheriting an
+        // unresolved region from its parent). The aggregated list must not
+        // report the same file twice.
+        let branch = "boss/exec_dupe";
+        let mut cmds = vec![
+            fetch_cmd(),
+            remote_exists_cmd(branch, "d1"),
+            positioned_cmd(branch, "d1"),
+        ];
+        cmds.extend(set_track_rebase_check_cmds(branch, &["tip5", "ancestor5"]));
+        cmds.push(resolve_list_for_commit_cmd("tip5", "src/shared.rs\n"));
+        cmds.push(resolve_list_for_commit_cmd("ancestor5", "src/shared.rs\n"));
+
+        let runner = FakeRunner::new(cmds);
+        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("dedupe conflict rebase");
+        runner.assert_exhausted();
+        let files = result.payload["conflicted_files"].as_array().expect("array");
+        assert_eq!(
+            files.len(),
+            1,
+            "must dedupe the file shared by both conflicted commits: {files:?}"
+        );
+        assert_eq!(files[0], "src/shared.rs");
+    }
+
+    #[test]
     fn rebase_no_push_flag_skips_advance_and_push() {
         let branch = "boss/exec_np";
         let mut cmds = vec![
@@ -14834,7 +14940,7 @@ steps:
             remote_exists_cmd(branch, "g1"),
             positioned_cmd(branch, "g1"),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(set_track_rebase_check_cmds(branch, &[]));
         // no push/verify commands expected
 
         let runner = FakeRunner::new(cmds);
@@ -14874,7 +14980,7 @@ steps:
             remote_exists_cmd(branch, "h1"),
             positioned_cmd(branch, "h1"),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(set_track_rebase_check_cmds(branch, &[]));
         cmds.push(failing_cmd(
             rebase_cwd(),
             "jj",
@@ -14905,7 +15011,7 @@ steps:
             // self-heal: create an editable child of the remote boss head
             ExpectedCommand::ok(rebase_cwd(), "jj", &["new", &format!("{branch}@{REBASE_REMOTE}")], ""),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(set_track_rebase_check_cmds(branch, &[]));
         cmds.extend(push_and_verify_cmds(branch));
 
         let runner = FakeRunner::new(cmds);
