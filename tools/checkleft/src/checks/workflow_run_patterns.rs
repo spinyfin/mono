@@ -1,13 +1,14 @@
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 use std::sync::Arc;
 
 use crate::check::{Check, ConfiguredCheck, count_applicable, run_per_text_file};
+use crate::checks::workflow_yaml::{
+    is_github_workflow_file, mapping_get, parse_workflow, workflow_steps, yaml_parse_finding,
+};
 use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -50,20 +51,11 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                 let workflow = match parse_workflow(contents) {
                     Ok(workflow) => workflow,
                     Err(error) => {
-                        findings.push(Finding {
-                            fixable: false,
-                            severity: Severity::Error,
-                            message: format!("failed to parse workflow YAML while checking run patterns: {error}"),
-                            location: Some(Location {
-                                path: changed_file.path.clone(),
-                                line: None,
-                                column: None,
-                            }),
-                            remediations: vec![
-                                "Fix YAML syntax so checks can validate workflow `run:` blocks.".to_owned(),
-                            ],
-                            suggested_fix: None,
-                        });
+                        findings.push(yaml_parse_finding(
+                            changed_file,
+                            format!("failed to parse workflow YAML while checking run patterns: {error}"),
+                            "Fix YAML syntax so checks can validate workflow `run:` blocks.",
+                        ));
                         return;
                     }
                 };
@@ -172,51 +164,18 @@ fn parse_config(config: &toml::Value) -> Result<CompiledWorkflowRunPatternsConfi
     Ok(CompiledWorkflowRunPatternsConfig { rules })
 }
 
-fn is_github_workflow_file(path: &Path) -> bool {
-    if !path.starts_with(Path::new(".github/workflows")) {
-        return false;
-    }
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("yml") | Some("yaml")
-    )
-}
-
-fn parse_workflow(contents: &str) -> Result<Value> {
-    serde_yaml::from_str(contents).context("invalid YAML document")
-}
-
 fn list_run_scripts(workflow: &Value) -> Vec<WorkflowRunScript<'_>> {
     let mut scripts = Vec::new();
-    let Some(root) = workflow.as_mapping() else {
-        return scripts;
-    };
-    let Some(jobs) = mapping_get(root, "jobs").and_then(Value::as_mapping) else {
-        return scripts;
-    };
 
-    for (job_key, job_value) in jobs {
-        let Some(job) = job_value.as_mapping() else {
+    for step in workflow_steps(workflow) {
+        let Some(script) = mapping_get(step.step, "run").and_then(Value::as_str) else {
             continue;
         };
-        let Some(steps) = mapping_get(job, "steps").and_then(Value::as_sequence) else {
-            continue;
-        };
-        let job_name = job_key.as_str().unwrap_or("<unknown-job>").to_owned();
-
-        for (index, step) in steps.iter().enumerate() {
-            let Some(step_map) = step.as_mapping() else {
-                continue;
-            };
-            let Some(script) = mapping_get(step_map, "run").and_then(Value::as_str) else {
-                continue;
-            };
-            scripts.push(WorkflowRunScript {
-                job_name: job_name.clone(),
-                step_index: index + 1,
-                script,
-            });
-        }
+        scripts.push(WorkflowRunScript {
+            job_name: step.job_name,
+            step_index: step.step_index,
+            script,
+        });
     }
 
     scripts
@@ -233,10 +192,6 @@ fn script_violates_rule(script: &str, rule: &WorkflowRunPatternRule) -> bool {
         }
         rule.must_include.iter().any(|token| !line.contains(token))
     })
-}
-
-fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a Value> {
-    mapping.get(Value::String(key.to_owned()))
 }
 
 #[cfg(test)]

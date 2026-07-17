@@ -9,6 +9,7 @@ mod typo;
 mod workflow_action_version;
 mod workflow_run_patterns;
 mod workflow_shell_strict;
+mod workflow_yaml;
 
 use anyhow::Result;
 
