@@ -57,7 +57,6 @@ use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
 use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
-use crate::gh_invocation::run_gh;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };
@@ -70,6 +69,7 @@ use crate::work::{
 #[cfg(test)]
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
+use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
 use boss_github::pr_url::pr_number_from_url;
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
@@ -495,7 +495,7 @@ impl BranchVerifier for CommandBranchVerifier {
 /// in the comparison. Returns `0` when the diff is empty (pure rebase with no
 /// file-content changes). Used by the no-op skip gate (P992 design §8).
 async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
-    let trimmed = crate::gh_invocation::gh_compare_jq(
+    let trimmed = gh_compare_jq(
         repo_slug,
         base,
         head,

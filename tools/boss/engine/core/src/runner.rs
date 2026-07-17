@@ -5,6 +5,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use boss_engine_gh_invocation::gh_output;
 
 use crate::ci_log_reader::{parse_buildkite_build_id, parse_buildkite_pipeline_slug};
 use crate::config::RuntimeConfig;
@@ -809,7 +810,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 /// caller is responsible for deciding whether the diff is small enough to
 /// embed.
 async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
-    let output = crate::gh_invocation::gh_output(&["pr", "diff", pr_url]).await.ok()?;
+    let output = gh_output(&["pr", "diff", pr_url]).await.ok()?;
 
     if !output.status.success() {
         tracing::warn!(
