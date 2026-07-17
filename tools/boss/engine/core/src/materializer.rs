@@ -31,7 +31,7 @@
 //!
 //! ## Defense in depth: validate the graph before any insert
 //!
-//! The validation layer (task 6, [`crate::planner_validation`]) runs before
+//! The validation layer (task 6, [`boss_engine_planner_validation`]) runs before
 //! apply on the trigger path. But `apply` is a public entry point (operator
 //! commands, replanning, tests) and must be self-contained, so it re-checks
 //! handle integrity and acyclicity *before* opening the write transaction
@@ -288,7 +288,7 @@ fn existing_task_names(conn: &Connection, project_id: &str) -> Result<HashMap<St
 
 /// Pure graph validation: reject duplicate handles, edges referencing unknown
 /// handles, and cycles — before any DB write. Mirrors the checks in
-/// [`crate::planner_validation`] but returns a plain `Result<()>` (apply's
+/// [`boss_engine_planner_validation`] but returns a plain `Result<()>` (apply's
 /// caller has already mapped the richer `ValidationResult` to an audit
 /// outcome; here the checks are self-contained defense in depth).
 fn check_graph(output: &PlannerOutput) -> Result<()> {

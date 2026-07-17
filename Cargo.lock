@@ -354,6 +354,7 @@ dependencies = [
  "boss-engine-effort",
  "boss-engine-gh-invocation",
  "boss-engine-live-status-redact",
+ "boss-engine-planner-validation",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-feature-flags",
@@ -449,6 +450,13 @@ name = "boss-engine-metrics-registry"
 version = "0.1.0"
 dependencies = [
  "boss-engine-utils",
+]
+
+[[package]]
+name = "boss-engine-planner-validation"
+version = "0.1.0"
+dependencies = [
+ "boss-protocol",
 ]
 
 [[package]]

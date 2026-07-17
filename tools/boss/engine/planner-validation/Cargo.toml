@@ -1,0 +1,8 @@
+[package]
+name = "boss-engine-planner-validation"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-protocol = { path = "../../protocol" }
