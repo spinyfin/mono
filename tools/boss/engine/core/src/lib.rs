@@ -12,7 +12,7 @@ pub mod blocking_signal;
 pub mod build_info;
 pub mod build_wait;
 pub mod build_wait_tracker;
-pub mod ci_log_reader;
+pub use boss_ci_log_reader as ci_log_reader;
 pub mod ci_watch;
 pub use boss_claude_client as claude_client;
 pub mod cli;

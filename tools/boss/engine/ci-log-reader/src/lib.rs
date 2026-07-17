@@ -15,7 +15,7 @@
 //! to.
 //!
 //! Provider inference from `targetUrl` host lives on
-//! [`merge_poller::CiProvider`]; this module re-exports the type and
+//! [`boss_github::CiProvider`]; this module re-exports the type and
 //! adds the URL → id parsing helpers each impl needs to translate
 //! GitHub's `targetUrl` into the provider-CLI arguments.
 //!
@@ -31,7 +31,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tokio::process::Command;
 
-pub use crate::merge_poller::CiProvider;
+pub use boss_github::CiProvider;
 
 /// Reader + retrigger surface for one CI provider's failing-job
 /// signals. The engine implements one reader per known provider; an
