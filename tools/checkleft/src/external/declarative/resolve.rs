@@ -149,10 +149,22 @@ fn resolve_binding(repo_root: &Path, binding: &BinaryBinding, npx: Option<&Path>
     }
 }
 
+/// Minimum Node.js major version an `npm` binding may run under. `npx` itself
+/// pins the *package* version, but not the runtime that executes it — resolution
+/// takes whatever `node`/`npx` the ambient PATH offers, which is non-hermetic. A
+/// stale runtime can crash pinned packages outright rather than merely behaving
+/// differently: npm packages shipping `"type": "module"` with an extensionless
+/// `bin` entry (e.g. oxfmt) hit `ERR_UNKNOWN_FILE_EXTENSION` under Node 20.7.0 but
+/// run cleanly under Node 24.8.0 (empirically verified 2026-07-18). This gate
+/// turns that crash into an actionable diagnostic ahead of the spawn, instead of
+/// surfacing an opaque Node internal error attributed to the wrong file.
+const MIN_NODE_MAJOR_VERSION: u32 = 22;
+
 /// Resolve an `npm` binding to `npx --yes <package>@<version>`. The version is part
 /// of the package spec, so npx fetches and runs exactly that release regardless of
 /// any globally-installed copy. Returns `Err` (so a declared `fallback` can take
-/// over) when `npx` is not on PATH.
+/// over) when `npx` is not on PATH, or when the Node runtime `npx` would run under
+/// is older than [`MIN_NODE_MAJOR_VERSION`].
 fn resolve_npm_binding(package: &str, version: &str, npx: Option<&Path>) -> Result<ResolvedBinary> {
     let npx = npx.ok_or_else(|| {
         anyhow::anyhow!(
@@ -160,6 +172,7 @@ fn resolve_npm_binding(package: &str, version: &str, npx: Option<&Path>) -> Resu
              (install Node.js/npm, or declare a `needs.<name>.fallback.path`)"
         )
     })?;
+    check_node_runtime_version(package, npx)?;
     Ok(ResolvedBinary {
         program: npx.to_path_buf(),
         // `--yes` auto-confirms fetching the pinned package non-interactively (CI);
@@ -186,6 +199,40 @@ fn locate_npx() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Preflight the Node runtime that `npx` would actually execute under, rejecting
+/// it if older than [`MIN_NODE_MAJOR_VERSION`]. Node distributions install
+/// `node`/`npx` side by side in the same directory, so the colocated `node` is
+/// the runtime npx will use. When no colocated `node` is found, or its version
+/// can't be parsed, this is a no-op (best-effort diagnostic, not a strict gate —
+/// npx's own PATH resolution is authoritative for what actually runs).
+fn check_node_runtime_version(package: &str, npx: &Path) -> Result<()> {
+    let Some(node) = npx.parent().map(|dir| dir.join("node")) else {
+        return Ok(());
+    };
+    if !node.is_file() {
+        return Ok(());
+    }
+    let raw_version = binary_version_string(&node);
+    let Some(major) = parse_node_major_version(&raw_version) else {
+        return Ok(());
+    };
+    if major < MIN_NODE_MAJOR_VERSION {
+        bail!(
+            "npm package `{package}` needs Node.js >= {MIN_NODE_MAJOR_VERSION}; found {raw_version} at `{}` \
+             (this `npx` would run the package under a stale/non-hermetic Node runtime; \
+             put a newer Node on PATH ahead of it, or declare a `needs.<name>.fallback.path`)",
+            node.display()
+        );
+    }
+    Ok(())
+}
+
+/// Parses the major version number out of a `node --version` line (`"v20.7.0"` →
+/// `20`). Returns `None` for anything that doesn't match that shape.
+fn parse_node_major_version(raw: &str) -> Option<u32> {
+    raw.trim().trim_start_matches('v').split('.').next()?.parse().ok()
 }
 
 /// Resolve a `path` binding to a concrete program path.
@@ -398,5 +445,69 @@ pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) ->
         Ok(path)
     } else {
         Ok(repo_root.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn parse_node_major_version_parses_standard_format() {
+        assert_eq!(parse_node_major_version("v20.7.0"), Some(20));
+        assert_eq!(parse_node_major_version("v24.8.0"), Some(24));
+        assert_eq!(parse_node_major_version("  v22.1.0  "), Some(22));
+    }
+
+    #[test]
+    fn parse_node_major_version_rejects_malformed_input() {
+        assert_eq!(parse_node_major_version(""), None);
+        assert_eq!(parse_node_major_version("not-a-version"), None);
+    }
+
+    #[cfg(unix)]
+    fn write_fake_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write fake executable");
+        let mut perms = fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("set permissions");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_node_runtime_version_rejects_stale_node() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fake_executable(&temp.path().join("node"), "#!/bin/sh\necho 'v20.7.0'\n");
+        let npx = temp.path().join("npx");
+        write_fake_executable(&npx, "#!/bin/sh\n");
+
+        let err = check_node_runtime_version("oxfmt", &npx).expect_err("stale node must fail preflight");
+        let message = format!("{err:#}");
+        assert!(message.contains("Node.js >= 22"), "message: {message}");
+        assert!(message.contains("v20.7.0"), "message: {message}");
+        assert!(message.contains("oxfmt"), "message: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_node_runtime_version_accepts_current_node() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fake_executable(&temp.path().join("node"), "#!/bin/sh\necho 'v24.8.0'\n");
+        let npx = temp.path().join("npx");
+        write_fake_executable(&npx, "#!/bin/sh\n");
+
+        check_node_runtime_version("oxfmt", &npx).expect("current node must pass preflight");
+    }
+
+    #[test]
+    fn check_node_runtime_version_is_noop_without_colocated_node() {
+        // No `node` binary next to `npx` — best-effort diagnostic, not a strict
+        // gate, so resolution proceeds and npx's own PATH lookup is authoritative.
+        check_node_runtime_version("oxfmt", Path::new("/fake/bin/npx"))
+            .expect("must not fail without a colocated node");
     }
 }
