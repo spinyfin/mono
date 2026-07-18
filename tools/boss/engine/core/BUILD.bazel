@@ -49,6 +49,7 @@ rust_library(
         "//tools/boss/engine/gh-invocation",
         "//tools/boss/engine/live-status-redact",
         "//tools/boss/engine/metrics",
+        "//tools/boss/engine/planner-validation",
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
@@ -177,6 +178,7 @@ rust_test(
     ),
     deps = [
         ":engine_lib",
+        "//tools/boss/engine/planner-validation",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

@@ -68,7 +68,7 @@ use serde_json::{Value, json};
 use boss_protocol::{PlannerInput, PlannerOutput, planner_output_schema};
 
 use crate::claude_client::{self, CallConfig, ClaudeError, MessagesResponse, RetryPolicy};
-use crate::planner_validation::{OversizeFinding, detect_oversize_tasks};
+use boss_engine_planner_validation::{OversizeFinding, detect_oversize_tasks};
 
 /// The model the Planner runs on. A direct API call needs a concrete model
 /// id (the `--model` family aliases used for worker dispatch are resolved by

@@ -50,9 +50,9 @@ use boss_engine::coordinator::NoopExecutionPublisher;
 use boss_engine::doc_fetcher::DocFetchOutcome;
 use boss_engine::materializer::Materializer;
 use boss_engine::planner::{DecompositionAudit, PLANNER_MODEL, PlannerOutcome, build_request_body, build_user_prompt};
-use boss_engine::planner_validation::{ValidationResult, validate};
 use boss_engine::populator::{DEFAULT_MAX_TASKS, PopulateContext, PopulateOutcome, Populator, PopulatorSteps};
 use boss_engine::work::WorkDb;
+use boss_engine_planner_validation::{ValidationResult, validate};
 
 // ---------------------------------------------------------------------------
 // Ground-truth fixture docs (verbatim breakdown excerpts, see tests/fixtures)
