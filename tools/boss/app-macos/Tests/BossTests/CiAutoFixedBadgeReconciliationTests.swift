@@ -82,8 +82,10 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         let model = makeModel()
         let prURL = "https://github.com/x/y/pull/2681"
 
+        let isoFormatter = ISO8601DateFormatter()
+        let recentISO = isoFormatter.string(from: Date().addingTimeInterval(-5 * 60))
         model.applyEventForTest(.ciRemediationsList(attempts: [
-            makeRemediation(id: "cir_9", prURL: prURL, status: "succeeded", finishedAt: "2026-07-16T05:00:00Z"),
+            makeRemediation(id: "cir_9", prURL: prURL, status: "succeeded", finishedAt: recentISO),
         ]))
 
         XCTAssertTrue(
