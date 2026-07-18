@@ -203,6 +203,49 @@ pub(super) async fn handle_find_work_items_by_pr(ctx: Dispatch, req: FrontendReq
     }
 }
 
+/// Shared tail for the four single-item create handlers
+/// (`handle_create_task`/`chore`/`investigation`/`revision`). Each
+/// handler does its own pre-processing (`created_via` defaulting,
+/// repo-slug resolution) and calls the matching `work_db.create_*`,
+/// then funnels the `Result<WorkItem>` through here so the
+/// resolve-product / publish-invalidation / respond logic lives in
+/// exactly one place.
+///
+/// On success, publish a `<reason>` work invalidation on the item's
+/// product topic and reply with a `WorkItemCreated` event. On error,
+/// reply with whatever event `on_error` maps the error to —
+/// [`duplicate_or_work_error`] for the task/chore duplicate-aware path,
+/// a plain `WorkError` for investigation/revision.
+async fn finish_create_work_item(
+    server_state: &ServerState,
+    sink: &SessionSink,
+    session_id: &str,
+    request_id: &str,
+    result: anyhow::Result<WorkItem>,
+    reason: &str,
+    on_error: impl FnOnce(anyhow::Error) -> FrontendEvent,
+) {
+    match result {
+        Ok(item) => {
+            let product_id = item.product_id().to_string();
+            let revision = publish_work_invalidation(
+                server_state,
+                session_id,
+                request_id,
+                vec![work_product_topic(&product_id)],
+                reason,
+                Some(product_id),
+                vec![work_item_id(&item)],
+            )
+            .await;
+            send_response_with_revision(sink, request_id, revision, FrontendEvent::WorkItemCreated { item });
+        }
+        Err(err) => {
+            send_response(sink, request_id, on_error(err));
+        }
+    }
+}
+
 pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -215,36 +258,24 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::CreateTask { mut input } = req else {
         unreachable!()
     };
-    {
-        if input.created_via.is_none() {
-            input.created_via = Some(transport_default_created_via(&server_state, &session_id).await);
-        }
-        // A `--repo <slug>` override (e.g. `bduff`) names a
-        // registered cube repo, not a git URL. Resolve it to the
-        // canonical origin now so the durable row is dispatchable
-        // and `cube repo ensure` never sees a bare slug (#861).
-        repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
-        match work_db.create_task(input) {
-            Ok(task) => {
-                let item = WorkItem::Task(task);
-                let product_id = item.product_id().to_string();
-                let revision = publish_work_invalidation(
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    vec![work_product_topic(&product_id)],
-                    "task_created",
-                    Some(product_id),
-                    vec![work_item_id(&item)],
-                )
-                .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
-            }
-            Err(err) => {
-                send_response(&sink, &request_id, duplicate_or_work_error(err));
-            }
-        }
+    if input.created_via.is_none() {
+        input.created_via = Some(transport_default_created_via(&server_state, &session_id).await);
     }
+    // A `--repo <slug>` override (e.g. `bduff`) names a
+    // registered cube repo, not a git URL. Resolve it to the
+    // canonical origin now so the durable row is dispatchable
+    // and `cube repo ensure` never sees a bare slug (#861).
+    repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    finish_create_work_item(
+        &server_state,
+        &sink,
+        &session_id,
+        &request_id,
+        work_db.create_task(input).map(WorkItem::Task),
+        "task_created",
+        duplicate_or_work_error,
+    )
+    .await;
 }
 
 pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
@@ -259,34 +290,22 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::CreateChore { mut input } = req else {
         unreachable!()
     };
-    {
-        if input.created_via.is_none() {
-            input.created_via = Some(transport_default_created_via(&server_state, &session_id).await);
-        }
-        // Resolve a `--repo <slug>` override to its canonical cube
-        // origin before persisting (#861); see the CreateTask arm.
-        repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
-        match work_db.create_chore(input) {
-            Ok(task) => {
-                let item = WorkItem::Chore(task);
-                let product_id = item.product_id().to_string();
-                let revision = publish_work_invalidation(
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    vec![work_product_topic(&product_id)],
-                    "chore_created",
-                    Some(product_id),
-                    vec![work_item_id(&item)],
-                )
-                .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
-            }
-            Err(err) => {
-                send_response(&sink, &request_id, duplicate_or_work_error(err));
-            }
-        }
+    if input.created_via.is_none() {
+        input.created_via = Some(transport_default_created_via(&server_state, &session_id).await);
     }
+    // Resolve a `--repo <slug>` override to its canonical cube
+    // origin before persisting (#861); see the CreateTask arm.
+    repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
+    finish_create_work_item(
+        &server_state,
+        &sink,
+        &session_id,
+        &request_id,
+        work_db.create_chore(input).map(WorkItem::Chore),
+        "chore_created",
+        duplicate_or_work_error,
+    )
+    .await;
 }
 
 pub(super) async fn handle_create_many_tasks(ctx: Dispatch, req: FrontendRequest) {
@@ -896,26 +915,18 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::CreateInvestigation { input } = req else {
         unreachable!()
     };
-    {
-        match work_db.create_investigation(input) {
-            Ok(task) => {
-                let item = WorkItem::Task(task);
-                let product_id = item.product_id().to_string();
-                let revision = publish_work_invalidation(
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    vec![work_product_topic(&product_id)],
-                    "investigation_created",
-                    Some(product_id),
-                    vec![work_item_id(&item)],
-                )
-                .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
-            }
-            Err(err) => send_work_error(&sink, &request_id, &err),
-        }
-    }
+    finish_create_work_item(
+        &server_state,
+        &sink,
+        &session_id,
+        &request_id,
+        work_db.create_investigation(input).map(WorkItem::Task),
+        "investigation_created",
+        |err| FrontendEvent::WorkError {
+            message: err.to_string(),
+        },
+    )
+    .await;
 }
 
 pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) {
@@ -930,24 +941,16 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
     let FrontendRequest::CreateRevision { input } = req else {
         unreachable!()
     };
-    {
-        match work_db.create_revision(input, &GhPrStateChecker) {
-            Ok(task) => {
-                let item = WorkItem::Task(task);
-                let product_id = item.product_id().to_string();
-                let revision = publish_work_invalidation(
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    vec![work_product_topic(&product_id)],
-                    "revision_created",
-                    Some(product_id),
-                    vec![work_item_id(&item)],
-                )
-                .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
-            }
-            Err(err) => send_work_error(&sink, &request_id, &err),
-        }
-    }
+    finish_create_work_item(
+        &server_state,
+        &sink,
+        &session_id,
+        &request_id,
+        work_db.create_revision(input, &GhPrStateChecker).map(WorkItem::Task),
+        "revision_created",
+        |err| FrontendEvent::WorkError {
+            message: err.to_string(),
+        },
+    )
+    .await;
 }
