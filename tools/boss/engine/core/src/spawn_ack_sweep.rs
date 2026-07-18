@@ -684,22 +684,13 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let db = Arc::new(db);
 
-        use boss_protocol::RequestExecutionInput;
-        let execution = db
-            .request_execution(
-                RequestExecutionInput::builder()
-                    .work_item_id(work_item_id.clone())
-                    .build(),
-            )
-            .unwrap();
-        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-        db.force_started_at_for_test(&execution.id, now_secs).unwrap();
+        let execution_id = create_execution_started_now(&db, &work_item_id);
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_zero_pid(&live_states, 1, &execution.id, &work_item_id);
+        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution.id, None).await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
