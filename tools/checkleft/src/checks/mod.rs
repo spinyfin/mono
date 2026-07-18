@@ -1,5 +1,6 @@
 mod bazel;
 mod code_patterns;
+mod doc_structure;
 mod forbidden_imports_deps;
 mod frontend_no_legacy_api;
 mod repo_visibility;
@@ -20,6 +21,7 @@ pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(bazel::BazelrcPoliciesCheck)?;
     registry.register(bazel::BazelversionPoliciesCheck)?;
     registry.register(code_patterns::CodePatternsCheck)?;
+    registry.register(doc_structure::DocStructureCheck)?;
     registry.register(forbidden_imports_deps::ForbiddenImportsDepsCheck)?;
     registry.register(frontend_no_legacy_api::FrontendNoLegacyApiCheck)?;
     registry.register(repo_visibility::RepoVisibilityCheck)?;

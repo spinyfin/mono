@@ -70,6 +70,15 @@ checks:
     policy:
       severity: warning
 
+  - id: md/doc-structure
+    check: md/doc-structure
+    config:
+      include_globs:
+        - "**/docs/investigations/**/*.md"
+        - "**/docs/designs/**/*.md"
+    policy:
+      severity: error
+
   - id: format/oxc
     policy:
       severity: error

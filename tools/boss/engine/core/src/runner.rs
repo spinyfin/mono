@@ -2028,6 +2028,23 @@ fn ci_monitoring_directive(execution: &WorkExecution) -> String {
     out
 }
 
+/// Markdown structure guidance shared by design and investigation docs.
+/// Generated docs frequently render their intro as a single wall-of-text
+/// paragraph: workers write metadata and framing as consecutive
+/// single-newline lines, and a single newline is a soft wrap in Markdown —
+/// it folds into one paragraph on render even though the source looks fine
+/// line-by-line in an editor. Stated explicitly here because it looks
+/// correct in the editor, so workers never self-correct without being told.
+fn doc_structure_conventions_block() -> String {
+    let mut out = String::new();
+    out.push_str("- **Markdown structure — avoid wall-of-text rendering.** A single newline is a soft wrap in Markdown: consecutive non-blank lines collapse into one paragraph when rendered, even though they look like separate lines in an editor.\n");
+    out.push_str("  - put metadata (Date, Task/provenance, related work items) in a bullet list or table immediately after the H1 — never as consecutive prose lines.\n");
+    out.push_str("  - put a blank line between every logical block (metadata, framing, method, each finding, the verdict). Single newlines between blocks will smoosh them together.\n");
+    out.push_str("  - give the verdict/TL;DR its own short section or paragraph — never embed it mid-paragraph.\n");
+    out.push_str("  - keep the first paragraph after the title to 2-3 sentences; move framing and method detail into later sections.\n");
+    out
+}
+
 /// Directive block for the synthetic `kind = 'design'` task that the
 /// engine auto-creates with every project. Without this block the
 /// `project_design` worker only sees the generic "draft or update a
@@ -2045,6 +2062,7 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     if let Some(path_line) = canonical_design_doc_path_line(parent_project) {
         out.push_str(&path_line);
     }
+    out.push_str(&doc_structure_conventions_block());
     out.push_str("- the design must cover, at minimum, these sections (use these as headings unless the parent project's description specifies a different shape):\n");
     out.push_str("  - **Goals** — what this project is trying to achieve, pulled from the parent project's goal/description above.\n");
     out.push_str("  - **Non-goals** — what is explicitly out of scope so reviewers don't have to guess.\n");
@@ -2149,6 +2167,7 @@ fn compose_investigation_directive() -> String {
     out.push_str("- the deliverable is a **markdown document**, not code. Do not edit source code, build files, or anything other than the investigation doc.\n");
     out.push_str("- the PR for this run contains **only the markdown doc** (one new file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n");
     out.push_str("- choose a filename that reflects the topic (e.g. `docs/investigations/my-topic.md`). Use an `investigations/` subdirectory if one exists in the repo, or create it.\n");
+    out.push_str(&doc_structure_conventions_block());
     out.push_str("- open a PR with the doc regardless of which repo it lands in. Do NOT push directly to `main` even on the user's personal docs repo (e.g. `brianduff/docs`). The PR is the user's edit window. The kanban card's doc link is derived from this PR automatically — there is no separate pointer to register.\n");
     out.push_str("- investigations do not touch code. If the description asks for both research and a code change, write only the investigation doc and note the follow-up code changes at the end of the doc for the user to file separately.\n");
     out
