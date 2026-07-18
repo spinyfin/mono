@@ -36,8 +36,40 @@ pub mod selector;
 pub mod template;
 pub mod transform;
 
+// The declarative test surface is split by concern across these `tests_*`
+// files, sharing fixtures/helpers via `tests_common`, to keep each file well
+// under the repo file-size cap. All live under the `external::declarative::`
+// test-name prefix so the `checkleft_lib_test_declarative` bazel shard covers
+// them without a BUILD change (srcs are globbed).
 #[cfg(test)]
-mod tests;
+mod tests_common;
+
+#[cfg(test)]
+mod tests_e2e;
+
+#[cfg(test)]
+mod tests_execution;
+
+#[cfg(test)]
+mod tests_manifest;
+
+#[cfg(test)]
+mod tests_passthrough;
+
+#[cfg(test)]
+mod tests_prettier;
+
+#[cfg(test)]
+mod tests_rustfmt;
+
+#[cfg(test)]
+mod tests_selection;
+
+#[cfg(test)]
+mod tests_selector_template;
+
+#[cfg(test)]
+mod tests_transform;
 
 #[cfg(test)]
 mod tests_bazel_aspect;
