@@ -13,7 +13,7 @@ pub(super) use super::super::*;
 pub(super) use crate::coordinator::{CubeRepoHandle, CubeWorkspaceLease, RebaseOutcome};
 pub(super) use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 pub(super) use crate::test_support::*;
-pub(super) use crate::work::{CreateExecutionInput, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch};
+pub(super) use crate::work::{CreateExecutionInput, ExecutionKind, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch};
 
 pub(super) fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
     let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
