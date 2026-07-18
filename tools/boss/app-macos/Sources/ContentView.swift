@@ -977,7 +977,7 @@ struct ContentView: View {
         switch kanbanBoardStyle {
         case .classic:
             return Color(nsColor: .controlBackgroundColor)
-        case .airy:
+        case .airy, .elevated:
             return Color(nsColor: .quaternaryLabelColor).opacity(0.06)
         case .minimal:
             return Color(nsColor: .separatorColor).opacity(0.12)
@@ -988,7 +988,7 @@ struct ContentView: View {
         switch kanbanBoardStyle {
         case .classic:
             return Color(nsColor: .separatorColor)
-        case .airy, .minimal:
+        case .airy, .elevated, .minimal:
             return .clear
         }
     }
@@ -2631,7 +2631,7 @@ struct WorkBoardCardView: View {
                 )
         )
         .shadow(
-            color: boardStyle == .airy ? Color.black.opacity(0.07) : .clear,
+            color: (boardStyle == .airy || boardStyle == .elevated) ? Color.black.opacity(0.07) : .clear,
             radius: 4, x: 0, y: 1.5
         )
         .draggable(task.id)
@@ -2705,6 +2705,13 @@ struct WorkBoardCardView: View {
         switch boardStyle {
         case .classic, .airy:
             return Color(nsColor: .windowBackgroundColor)
+        case .elevated:
+            // Distinct from the column's tinted panel (see `columnBackground`)
+            // so card boundaries stay legible without relying on the drop
+            // shadow alone — controlBackgroundColor renders as a visibly
+            // lighter "elevated" surface against windowBackgroundColor in
+            // dark mode, and a subtly different neutral in light mode.
+            return Color(nsColor: .controlBackgroundColor)
         case .minimal:
             return Color(nsColor: .controlBackgroundColor)
         }
@@ -2720,6 +2727,12 @@ struct WorkBoardCardView: View {
         switch boardStyle {
         case .classic:
             return Color(nsColor: .separatorColor)
+        case .elevated:
+            // A faint outline reinforces the card edge on top of the
+            // background-color contrast, since some card kinds (revision
+            // sub-rows, collapsed groups) are small enough that shadow alone
+            // is easy to miss.
+            return Color(nsColor: .separatorColor).opacity(0.5)
         case .airy, .minimal:
             return .clear
         }
