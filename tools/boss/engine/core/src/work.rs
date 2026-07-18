@@ -250,20 +250,36 @@ use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS}
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MEM_DB_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Keeps a named shared-cache in-memory SQLite database alive. `Connection`
-/// is `Send` but not `Sync`; wrapping in `Mutex` makes the anchor `Sync`.
-/// `Arc` lets `WorkDb::clone` share the anchor across copies of the same
-/// in-memory database (needed by the concurrent-insert test).
+/// Identifies a named shared-cache in-memory SQLite database. Kept for
+/// `is_in_memory()` and error messages; the database itself is kept alive
+/// by `WorkDb::conn` (below) holding the one live connection to it, not by
+/// this struct.
 #[derive(Clone)]
 struct InMemoryAnchor {
     uri: String,
-    _conn: Arc<Mutex<Connection>>,
 }
+
+/// A connection handle borrowed from [`WorkDb::connect`]'s pool. Derefs
+/// transparently to [`Connection`], so existing call sites (`conn.execute`,
+/// `conn.prepare`, `conn.transaction()` on a `mut` binding, …) are unaffected
+/// by the switch from "fresh connection per call" to "one shared, cached
+/// connection guarded by a mutex."
+pub(crate) type PooledConnection<'a> = std::sync::MutexGuard<'a, Connection>;
 
 pub struct WorkDb {
     path: PathBuf,
     /// Present only when the database is in-memory (path == ":memory:").
     memory: Option<InMemoryAnchor>,
+    /// The single connection this `WorkDb` (and every clone of it) uses for
+    /// every operation. Opening a fresh `rusqlite::Connection` used to run
+    /// 3 PRAGMAs and re-parse the entire schema on every `connect()` call —
+    /// 337+ call sites deep, this was most of the SQLite mutex/malloc
+    /// contention seen under parallel test load and adds needless overhead
+    /// to production cold paths too. `Mutex` serializes access the same way
+    /// SQLite's own connection locking already effectively did; `Arc` lets
+    /// `WorkDb::clone` share the one connection across copies (`WorkDb` is
+    /// cloned freely across the engine).
+    conn: Arc<Mutex<Connection>>,
     /// The Boothby action the executor is currently performing, if any.
     /// Set by [`WorkDb::arm_boothby_action`] and read by the mutation layer
     /// when a write arrives with `actor = "boothby"`, which is how the
@@ -281,6 +297,7 @@ impl Clone for WorkDb {
         Self {
             path: self.path.clone(),
             memory: self.memory.clone(),
+            conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
         }
     }

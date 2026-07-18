@@ -35,28 +35,30 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
     // After unblock the parent should no longer be blocked.
     assert_eq!(snapshot.blocked_reason, None);
 
-    let conn = db.connect().unwrap();
-    let (status, blocked_reason): (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, blocked_reason FROM tasks WHERE id = ?1",
-            rusqlite::params![chore.id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-        )
-        .unwrap();
-    assert_eq!(status, "in_review");
-    assert_eq!(blocked_reason, None);
-    // The matching blocked-signal row must be cleared.
-    let cleared: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM task_blocked_signals
-                  WHERE work_item_id = ?1
-                    AND reason = 'ci_failure_exhausted'
-                    AND cleared_at IS NULL",
-            rusqlite::params![chore.id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(cleared, 0);
+    {
+        let conn = db.connect().unwrap();
+        let (status, blocked_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, blocked_reason FROM tasks WHERE id = ?1",
+                rusqlite::params![chore.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "in_review");
+        assert_eq!(blocked_reason, None);
+        // The matching blocked-signal row must be cleared.
+        let cleared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_blocked_signals
+                      WHERE work_item_id = ?1
+                        AND reason = 'ci_failure_exhausted'
+                        AND cleared_at IS NULL",
+                rusqlite::params![chore.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared, 0);
+    }
 
     // Second call: counter is already zero and the parent is
     // already in_review, so was_exhausted is false.

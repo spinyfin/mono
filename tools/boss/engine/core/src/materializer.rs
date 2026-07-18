@@ -550,14 +550,15 @@ mod tests {
 
         // The edge's prerequisite resolves to the PRE-EXISTING task id, proving
         // the deduped handle still wired the graph.
-        let conn = db.connect().unwrap();
-        let pre: String = conn
-            .query_row(
+        let pre: String = {
+            let conn = db.connect().unwrap();
+            conn.query_row(
                 "SELECT prerequisite_id FROM work_item_dependencies WHERE relation = 'blocks'",
                 [],
                 |row| row.get(0),
             )
-            .unwrap();
+            .unwrap()
+        };
         assert_eq!(pre, existing.id);
 
         // The pre-existing task is NOT tagged with the run (only newly created rows are).

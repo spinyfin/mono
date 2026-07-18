@@ -2166,6 +2166,17 @@ async fn engine_conflicts_abandon_flips_attempt_status() -> Result<()> {
     Ok(())
 }
 
+/// Current wall-clock time as whole seconds since the Unix epoch, mirroring
+/// `boss_engine_utils::epoch_time::now_epoch_secs` (not a dependency of this
+/// test binary) — used only to poll for a `created_at` second-boundary tick
+/// in [`seed_two_conflict_resolutions`].
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Helper: seed a product + chore + two `pending` `conflict_resolutions`
 /// rows. Returns the second one as the freshest (different
 /// `base_sha_at_trigger` so the UNIQUE key allows both inserts).
@@ -2214,9 +2225,15 @@ async fn seed_two_conflict_resolutions(
             head_sha_before: Some("ddd".to_owned()),
         })?
         .expect("first insert seeds the row");
-    // Tick `created_at` forward by sleeping briefly so the second row
-    // sorts after the first. `now_string()` has second resolution.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // `created_at` has second resolution (`now_string()` stamps whole
+    // epoch seconds), so the second row only sorts after the first once
+    // the wall clock ticks into a new second. Poll for that instead of a
+    // flat worst-case sleep — usually much less than a full second, and
+    // never more than one.
+    let a_created_at: i64 = a.created_at.parse().expect("created_at is epoch seconds");
+    while now_epoch_secs() <= a_created_at {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let b = work_db
         .insert_conflict_resolution(boss_engine::work::ConflictResolutionInsertInput {
             product_id: product.id.clone(),

@@ -1123,10 +1123,12 @@ mod tests {
     #[test]
     fn ensure_local_host_is_idempotent() {
         let db = open_db();
-        let conn = db.connect().unwrap();
-        // `local` already exists from open(); re-running must not error or dup.
-        ensure_local_host(&conn).unwrap();
-        ensure_local_host(&conn).unwrap();
+        {
+            let conn = db.connect().unwrap();
+            // `local` already exists from open(); re-running must not error or dup.
+            ensure_local_host(&conn).unwrap();
+            ensure_local_host(&conn).unwrap();
+        }
 
         let locals = db.list_hosts().unwrap().into_iter().filter(|h| h.id == "local").count();
         assert_eq!(locals, 1);
@@ -1139,8 +1141,10 @@ mod tests {
         db.add_user_host_capability("local", "team=infra").unwrap();
         insert_host_capability(&db, "local", "stale=auto", "auto");
 
-        let conn = db.connect().unwrap();
-        refresh_local_host_auto_capabilities(&conn).unwrap();
+        {
+            let conn = db.connect().unwrap();
+            refresh_local_host_auto_capabilities(&conn).unwrap();
+        }
 
         let caps = db.list_host_capabilities("local").unwrap();
         // The user-sourced row survives the refresh.

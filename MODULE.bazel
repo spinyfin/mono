@@ -102,6 +102,23 @@ register_toolchains(
 register_toolchains("@rust_toolchains//:all")
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.annotation(
+    # SQLITE_DEFAULT_MEMSTATUS=0 removes SQLite's process-global malloc
+    # tracking mutex, which otherwise serializes every allocation across all
+    # connections/threads in the process — under parallel `cargo test`/`bazel
+    # test` load with many WorkDb instances this mutex, not the underlying
+    # work, was most of the wall time (see
+    # tools/boss/docs/investigations, WorkDb reconnect profiling). OPT_LEVEL=3
+    # optimizes the bundled sqlite3.c even in a fastbuild/dbg Rust compile,
+    # since `cc`'s build-script probe (libsqlite3-sys build.rs) otherwise
+    # infers -O0 from Bazel's compilation mode.
+    build_script_env = {
+        "LIBSQLITE3_FLAGS": "SQLITE_DEFAULT_MEMSTATUS=0",
+        "OPT_LEVEL": "3",
+    },
+    crate = "libsqlite3-sys",
+    repositories = ["mono_crates"],
+)
 crate.from_cargo(
     name = "mono_crates",
     cargo_lockfile = "//:Cargo.lock",

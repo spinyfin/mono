@@ -123,7 +123,6 @@ impl WorkDb {
     /// Returns `Ok(Some(run))` with the post-update state, or `Ok(None)` if
     /// no row with `id` exists (stale call after a delete).
     pub fn update_planner_run(&self, id: &str, patch: PlannerRunPatch) -> Result<Option<PlannerRun>> {
-        let conn = self.connect()?;
         let now = now_string();
         let mut sets: Vec<String> = vec!["updated_at = ?1".to_owned()];
         // We build the SET list dynamically. Param index 1 is `now`; the `id`
@@ -154,7 +153,10 @@ impl WorkDb {
 
         let sql = format!("UPDATE planner_runs SET {} WHERE id = ?{}", sets.join(", "), id_idx,);
         let params_refs: Vec<&dyn rusqlite::ToSql> = extra_params.iter().map(|p| p.as_ref()).collect();
-        let changed = conn.execute(&sql, params_refs.as_slice())?;
+        let changed = {
+            let conn = self.connect()?;
+            conn.execute(&sql, params_refs.as_slice())?
+        };
         if changed == 0 {
             return Ok(None);
         }

@@ -1159,17 +1159,19 @@ impl WorkDb {
     /// reserved range. Returns the post-update [`CiBudgetSnapshot`];
     /// `Ok(None)` when the work item does not exist.
     pub fn set_ci_attempt_budget(&self, work_item_id: &str, budget: Option<i64>) -> Result<Option<CiBudgetSnapshot>> {
-        let conn = self.connect()?;
         let clamped = budget.map(|b| b.clamp(0, 10));
         let now = now_string();
-        let rows = conn.execute(
-            "UPDATE tasks
-                SET ci_attempt_budget = ?2,
-                    updated_at        = ?3
-              WHERE id = ?1
-                AND deleted_at IS NULL",
-            params![work_item_id, clamped, now],
-        )?;
+        let rows = {
+            let conn = self.connect()?;
+            conn.execute(
+                "UPDATE tasks
+                    SET ci_attempt_budget = ?2,
+                        updated_at        = ?3
+                  WHERE id = ?1
+                    AND deleted_at IS NULL",
+                params![work_item_id, clamped, now],
+            )?
+        };
         if rows == 0 {
             return Ok(None);
         }

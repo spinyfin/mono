@@ -313,7 +313,12 @@ fn surface_design_doc_conflict_on_approve_emits_attention_item_when_pointer_diff
 /// connection-per-call with no busy-timeout, and one of them
 /// would surface "database is locked" to the caller. With WAL +
 /// busy_timeout + IMMEDIATE transactions, concurrent writes on
-/// distinct rows must all succeed.
+/// distinct rows must all succeed. (`WorkDb` now pools one shared
+/// connection behind a mutex, which serializes these writes
+/// in-process rather than at the SQLite layer — the busy-timeout
+/// path is no longer what's exercised here, but the observable
+/// contract this test asserts, no "database is locked" and every
+/// write lands, still holds.)
 #[test]
 fn concurrent_writes_do_not_return_database_locked() {
     const WORKERS: usize = 8;
@@ -487,24 +492,29 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
         .unwrap();
 
     // Find the seed design task (ordinal = 0).
-    let conn = db.connect().unwrap();
-    let design_task_id: String = conn
-        .query_row(
+    let design_task_id: String = {
+        let conn = db.connect().unwrap();
+        conn.query_row(
             "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'design'",
             [&project.id],
             |row| row.get(0),
         )
-        .unwrap();
+        .unwrap()
+    };
 
-    let resolved = resolve_repo_for_work_item(&conn, &design_task_id).unwrap();
-    assert_eq!(
-        resolved.as_deref(),
-        Some("git@github.com:linkedin-sandbox/bduff.git"),
-        "design task must resolve to product.design_repo",
-    );
+    {
+        let conn = db.connect().unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &design_task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:linkedin-sandbox/bduff.git"),
+            "design task must resolve to product.design_repo",
+        );
+    }
 
     // Implementation-kind tasks on the same product are unaffected.
     let chore = create_test_chore_manual(&db, product.id.clone(), "Implementation chore");
+    let conn = db.connect().unwrap();
     let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
     assert_eq!(
         resolved.as_deref(),
@@ -680,22 +690,25 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
     // (bypassing the create invariant) so the resolver sees an
     // investigation row on a single-repo product.
     let investigation = create_test_chore_manual(&db, product.id.clone(), "Investigation");
-    let conn = db.connect().unwrap();
-    conn.execute(
-        "UPDATE tasks SET kind = 'investigation' WHERE id = ?1",
-        [&investigation.id],
-    )
-    .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = 'investigation' WHERE id = ?1",
+            [&investigation.id],
+        )
+        .unwrap();
 
-    let resolved = resolve_repo_for_work_item(&conn, &investigation.id).unwrap();
-    assert_eq!(
-        resolved.as_deref(),
-        Some("git@github.com:linkedin-sandbox/bduff.git"),
-        "investigation task must resolve to product.docs_repo",
-    );
+        let resolved = resolve_repo_for_work_item(&conn, &investigation.id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:linkedin-sandbox/bduff.git"),
+            "investigation task must resolve to product.docs_repo",
+        );
+    }
 
     // Implementation-kind tasks on the same product are unaffected.
     let chore = create_test_chore_manual(&db, product.id.clone(), "Implementation chore");
+    let conn = db.connect().unwrap();
     let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
     assert_eq!(
         resolved.as_deref(),
@@ -989,31 +1002,33 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
 
     // Re-open re-runs the migrations.
     let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    assert!(table_has_column(&conn, "tasks", "effort_level").unwrap());
-    assert!(table_has_column(&conn, "tasks", "model_override").unwrap());
-    assert!(table_has_column(&conn, "products", "default_model").unwrap());
+    {
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "effort_level").unwrap());
+        assert!(table_has_column(&conn, "tasks", "model_override").unwrap());
+        assert!(table_has_column(&conn, "products", "default_model").unwrap());
 
-    let chore_effort: Option<String> = conn
-        .query_row("SELECT effort_level FROM tasks WHERE id = ?1", [&chore.id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let chore_model: Option<String> = conn
-        .query_row("SELECT model_override FROM tasks WHERE id = ?1", [&chore.id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let product_model: Option<String> = conn
-        .query_row(
-            "SELECT default_model FROM products WHERE id = ?1",
-            [&product.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(chore_effort.is_none());
-    assert!(chore_model.is_none());
-    assert!(product_model.is_none());
+        let chore_effort: Option<String> = conn
+            .query_row("SELECT effort_level FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let chore_model: Option<String> = conn
+            .query_row("SELECT model_override FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let product_model: Option<String> = conn
+            .query_row(
+                "SELECT default_model FROM products WHERE id = ?1",
+                [&product.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(chore_effort.is_none());
+        assert!(chore_model.is_none());
+        assert!(product_model.is_none());
+    }
 
     // Post-migration rows can carry any of the five enum
     // values; the round-trip continues to work.
@@ -1095,7 +1110,6 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
     // disk_db_path required: the test re-opens the DB to trigger the migration.
     let (_dir, path) = disk_db_path("migration-null-redundant-repos");
     let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
 
     // Product with repo_remote_url = "git@example.com:foo.git".
     let product = create_test_product_with_repo(&db, "Foo", Some("git@example.com:foo.git"));
@@ -1109,6 +1123,8 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
             no_design_task: false,
         })
         .unwrap();
+
+    let conn = db.connect().unwrap();
 
     // Seed 3 chores that mirror the product's repo (the legacy bug).
     // We bypass the API to plant the now-invalid state directly.
@@ -1197,8 +1213,8 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
 fn migrate_clear_merge_queue_state_on_terminal_tasks_clears_orphans_preserves_live() {
     let (_dir, path) = disk_db_path("migration-clear-merge-queue-orphans");
     let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
     let product = create_test_product_with_repo(&db, "Foo", Some("git@example.com:foo.git"));
+    let conn = db.connect().unwrap();
 
     let seed = |id: &str, status: &str| {
         let now = now_string();
@@ -1457,6 +1473,12 @@ fn unique_short_id_index_rejects_manual_duplicate() {
         .unwrap()
     };
 
+    // Same `short_id` on a DIFFERENT product is allowed — the
+    // uniqueness invariant is `(product_id, short_id)`, not
+    // global. Created before the raw connection below so this
+    // doesn't nest a `db.` call inside an open `db.connect()` guard.
+    let other = create_test_product_with_repo(&db, "Flunge", None);
+
     // Try to hand-roll a second `tasks` row with the same
     // (product_id, short_id) — the partial unique index must
     // refuse it.
@@ -1476,10 +1498,6 @@ fn unique_short_id_index_rejects_manual_duplicate() {
         "expected UNIQUE constraint failure, got: {err}",
     );
 
-    // Same `short_id` on a DIFFERENT product is allowed — the
-    // uniqueness invariant is `(product_id, short_id)`, not
-    // global.
-    let other = create_test_product_with_repo(&db, "Flunge", None);
     let other_manual_id = next_id("task");
     conn.execute(
             "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)

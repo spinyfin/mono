@@ -8,12 +8,14 @@ fn seed_active_chore(db: &WorkDb, product_id: &str, canonical_id: &str, issue_nu
         .expect("set_external_ref");
     // Simulate the task being dragged to Doing (active) via direct SQL,
     // mirroring what the engine's update_task RPC does.
-    let conn = db.connect().expect("connect for seed_active_chore");
-    conn.execute(
-        "UPDATE tasks SET status = 'active' WHERE id = ?1",
-        rusqlite::params![chore.id],
-    )
-    .expect("set status to active");
+    {
+        let conn = db.connect().expect("connect for seed_active_chore");
+        conn.execute(
+            "UPDATE tasks SET status = 'active' WHERE id = ?1",
+            rusqlite::params![chore.id],
+        )
+        .expect("set status to active");
+    }
     db.find_by_external_ref("spy", canonical_id)
         .expect("query ok")
         .expect("chore exists")
