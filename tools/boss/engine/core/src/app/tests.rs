@@ -61,10 +61,17 @@ pub(super) fn make_session_sink() -> Arc<SessionSink> {
     Arc::new(SessionSink::new(shutdown_tx))
 }
 
-mod t01;
+mod app_channel;
+mod engine_health_report;
+mod session_sink_queue;
 mod t02;
 mod t03;
 mod t04;
 mod t05;
 mod t06;
 mod t07;
+mod trust_authorization;
+mod worker_pane_interaction;
+mod worker_pane_lifecycle;
+mod worker_probe_dispatch;
+mod worker_process_reaping;

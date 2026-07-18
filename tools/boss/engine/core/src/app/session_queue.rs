@@ -2,7 +2,7 @@
 //!
 //! Split out of `app.rs`; pure structural move — no behavioural change.
 //! Everything here is `pub(super)` (visible to `app` and, transitively, the
-//! rest of its module tree — `app::tests`, `app::tests::t01`, and sibling
+//! rest of its module tree — `app::tests`, `app::tests::session_sink_queue`, and sibling
 //! handler modules) rather than `pub`, matching the encapsulation this code
 //! had while it lived directly in `app.rs`.
 

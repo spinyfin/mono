@@ -1,7 +1,7 @@
 // Unit tests for `TopicBroker`'s subscription-routing contract:
 // `subscribe` / `unsubscribe` / `remove_session` / `publish`.
 //
-// The two publish-overflow paths are covered in `t01.rs`
+// The two publish-overflow paths are covered in `session_sink_queue.rs`
 // (`broker_publish_disconnects_slow_subscriber`,
 // `broker_publish_degrades_bursty_subscriber_without_disconnecting`); the
 // routing itself was only exercised incidentally by integration tests.
