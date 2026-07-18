@@ -318,6 +318,14 @@ pub fn render_reviewer_initial_prompt(
         .map(|c| crate::supersession_scan::render_supersession_flag_block(&c.supersession_flags))
         .unwrap_or_default();
 
+    // Mechanical assist for the agent-isms "Boss-construct references"
+    // sub-rule: a deterministic sweep of the PR title/description and added
+    // diff lines for bare T<n>/P<n> tokens, each forced into an explicit
+    // disposition rather than a judgment call the reviewer can reason past.
+    let boss_construct_sweep_block = ctx
+        .map(|c| crate::boss_construct_scan::render_boss_construct_sweep_block(&c.boss_construct_refs))
+        .unwrap_or_default();
+
     format!(
         "# PR review\n\
          \n\
@@ -350,6 +358,7 @@ pub fn render_reviewer_initial_prompt(
          {revision_context_block}\
          {merged_parent_deletion_block}\
          {supersession_flag_block}\
+         {boss_construct_sweep_block}\
          ## Review steps\n\
          \n\
          1. Your workspace is already checked out to the PR head — read \
@@ -448,6 +457,7 @@ pub fn render_reviewer_initial_prompt(
         revision_context_block = revision_context_block,
         merged_parent_deletion_block = merged_parent_deletion_block,
         supersession_flag_block = supersession_flag_block,
+        boss_construct_sweep_block = boss_construct_sweep_block,
         pr_ref = pr_ref,
         diff_step = diff_step,
         embedded_diff_section = embedded_diff_section,
@@ -648,7 +658,25 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                PR descriptions are read on GitHub, where those identifiers mean \
                nothing to a human reader. Quote the offending text and propose \
                wording that describes what the code does instead of where the \
-               instruction to write it came from.\n\
+               instruction to write it came from. **There is no escape hatch \
+               here — do not reason your way out of flagging a bare `T<n>`/ \
+               `P<n>` token:** in every Boss-managed repo, a bare `T<n>` or \
+               `P<n>` token (e.g. `T339`, `P42`) IS a Boss work-item id by \
+               definition — there is no other issue tracker in this repo that \
+               uses that format, so \"the file already uses T-numbers, so this \
+               must be a project convention\" is never a valid inference. \
+               Pre-existing `T<n>`/`P<n>` references already sitting on `main` \
+               are earlier leaks of the same violation, not evidence of a \
+               legitimate non-Boss tracker — they never legitimize a new one; \
+               if you notice one, flag it too. Likewise, an id appearing bare \
+               in this prompt's own **Task description** above (an \
+               engine-authored field, not the PR's own text) is evidence FOR a \
+               violation if the worker echoed it into a comment or the PR \
+               body — it proves the id is Boss-internal bookkeeping, not that \
+               the id is ordinary project vocabulary a human reader would \
+               recognise. Every bare `T<n>`/`P<n>` token you encounter in a \
+               changed comment or in the PR title/description must be \
+               flagged; do not silently classify one as legitimate.\n\
                (3) **\"The operator\" / actor references** — *code comments and \
                PR title/description alike.* Neither may refer to the human \
                directing Boss as \"the operator\", nor to actors in general \
@@ -781,6 +809,7 @@ mod tests {
                 "`components/RecommendationBadge.tsx` — added by a merged parent, removed by this resolution"
                     .to_owned(),
             ],
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Forward-port drill-down modal",
@@ -811,6 +840,7 @@ mod tests {
             last_reviewed_sha: None,
             supersession_flags: vec![],
             merged_parent_deletions: vec![],
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -861,6 +891,7 @@ mod tests {
             last_reviewed_sha: None,
             supersession_flags: Vec::new(),
             merged_parent_deletions: Vec::new(),
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Fix the auth bug",
@@ -904,6 +935,7 @@ mod tests {
             last_reviewed_sha: None,
             supersession_flags: Vec::new(),
             merged_parent_deletions: Vec::new(),
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -943,6 +975,7 @@ mod tests {
             last_reviewed_sha: None,
             supersession_flags: Vec::new(),
             merged_parent_deletions: Vec::new(),
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -1194,6 +1227,93 @@ mod tests {
             rule_text.contains("category: \"agent_isms\""),
             "revision_warranted rule must cover the agent_isms category: {rule_text}"
         );
+        assert!(
+            prompt.contains("There is no escape hatch here"),
+            "rubric must close the escape hatch on the Boss-construct sub-rule"
+        );
+        assert!(
+            prompt.contains("there is no other issue tracker in this repo that") && prompt.contains("uses that format"),
+            "rubric must state every bare T<n>/P<n> token is a Boss id by definition"
+        );
+        assert!(
+            prompt.contains("Pre-existing `T<n>`/`P<n>` references already sitting on `main`")
+                && prompt.contains("never legitimize a new one"),
+            "rubric must state pre-existing T<n> leaks on main never legitimize new ones"
+        );
+        assert!(
+            prompt.contains("is evidence FOR a")
+                && prompt.contains("violation if")
+                && prompt.contains("Task description"),
+            "rubric must state ids in the engine-authored Task description are evidence FOR a violation, not against"
+        );
+    }
+
+    /// The mechanical Boss-construct-id sweep (deterministic regex assist for
+    /// the agent-isms Boss-construct sub-rule, since a reviewer once reasoned
+    /// itself out of flagging a bare T<n> despite the rubric text alone)
+    /// renders as a forced-disposition block naming each candidate's id and
+    /// location when the caller-supplied context carries hits, and is absent
+    /// entirely when there are none.
+    #[test]
+    fn boss_construct_sweep_block_renders_when_context_has_hits() {
+        let ctx = PrReviewContext {
+            pr_number: 942,
+            base_sha: "base".to_owned(),
+            head_sha: "head".to_owned(),
+            changed_files: vec!["crates/rec_engine/src/lib.rs".to_owned()],
+            diff_content: None,
+            last_reviewed_sha: None,
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
+            boss_construct_refs: vec![
+                "`T339` at crates/rec_engine/src/lib.rs:42 — \"originally chose not to serialize this\"".to_owned(),
+                "`T191` at PR description — \"see T191 for background\"".to_owned(),
+            ],
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Reverse a prior serialization choice",
+            "Reverses an earlier decision.",
+            "https://github.com/org/repo/pull/942",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(
+            prompt.contains("Boss work-item id sweep (engine-computed)"),
+            "prompt must carry the engine-computed sweep block when hits are present"
+        );
+        assert!(prompt.contains("`T339` at crates/rec_engine/src/lib.rs:42"));
+        assert!(prompt.contains("`T191` at PR description"));
+        assert!(
+            prompt.contains("you must either flag it as a finding or state why it is not one"),
+            "each candidate must force an explicit disposition"
+        );
+    }
+
+    #[test]
+    fn boss_construct_sweep_block_absent_when_context_has_no_hits() {
+        let ctx = PrReviewContext {
+            pr_number: 1,
+            base_sha: "b".to_owned(),
+            head_sha: "h".to_owned(),
+            changed_files: vec!["src/lib.rs".to_owned()],
+            diff_content: None,
+            last_reviewed_sha: None,
+            supersession_flags: Vec::new(),
+            merged_parent_deletions: Vec::new(),
+            boss_construct_refs: Vec::new(),
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement it.",
+            "https://github.com/org/repo/pull/1",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(!prompt.contains("Boss work-item id sweep (engine-computed)"));
     }
 
     /// Operator directive 2026-07-15: manual/interactive verification a
@@ -1271,6 +1391,7 @@ mod tests {
             last_reviewed_sha: Some("sha_reviewed_at_1843".to_owned()),
             supersession_flags: Vec::new(),
             merged_parent_deletions: Vec::new(),
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Extract rec_engine into its own crate",
@@ -1317,6 +1438,7 @@ mod tests {
             last_reviewed_sha: None,
             supersession_flags: Vec::new(),
             merged_parent_deletions: Vec::new(),
+            boss_construct_refs: Vec::new(),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
