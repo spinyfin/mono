@@ -1159,6 +1159,7 @@ fn tag_cases() -> Vec<TagCase> {
                 report: EngineHealthReport {
                     anthropic_api_key_present: true,
                     dispatch_paused: false,
+                    automation_paused: false,
                     issues: vec![],
                 },
             },
@@ -1476,6 +1477,14 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "automation_run_enqueued",
         },
+        TagCase {
+            label: "AutomationStateResult",
+            event: FrontendEvent::AutomationStateResult {
+                paused: false,
+                paused_since_epoch_s: None,
+            },
+            expected_tag: "automation_state_result",
+        },
     ]
 }
 
@@ -1639,7 +1648,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::EditorialRulesEvaluated { .. }
         | FrontendEvent::AutomationRunsList { .. }
         | FrontendEvent::AutomationTasksList { .. }
-        | FrontendEvent::AutomationRunEnqueued { .. } => {}
+        | FrontendEvent::AutomationRunEnqueued { .. }
+        | FrontendEvent::AutomationStateResult { .. } => {}
     }
 }
 
