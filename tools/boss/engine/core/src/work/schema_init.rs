@@ -465,6 +465,13 @@ impl WorkDb {
         // `REBASED_WITH_CONFLICTS`) and per-rung outcomes are captured,
         // not just in-review `conflict_watch` detections.
         migrate_conflict_resolutions_telemetry_columns(&conn)?;
+        // Durable in-flight marker for the mechanical escalation-ladder
+        // rungs (0/1), which run inline in the engine with no dispatched
+        // worker: `conflict_resolutions.mechanical_rung_in_flight`. Lets the
+        // startup reconciler recover an attempt killed mid-rung by a restart
+        // (2026-07-18 conflict-ladder restart incident) instead of leaving it
+        // stranded and mistaken for a live "old-style" attempt forever.
+        migrate_conflict_resolutions_mechanical_rung_column(&conn)?;
         // One-time cleanup of orphaned `merge_queue_state = 'queued'` rows on
         // already-terminal tasks (see `mark_chore_pr_merged` and its sibling
         // terminal-transition sites, which now clear these columns going

@@ -48,11 +48,18 @@ struct ScriptCube {
     /// drives the rung-1 lease-retry tests (`lease_rung1_workspace`).
     /// Defaults to 0 (never fails).
     lease_failures: u32,
+    /// When `Some((db_path, attempt_id))`, `rebase_workspace` opens a fresh
+    /// `WorkDb` at `db_path` and snapshots the attempt's live
+    /// `mechanical_rung_in_flight` marker into
+    /// [`Self::marker_seen_during_rebase`] — used to prove the in-flight
+    /// marker is durably persisted *while* a mechanical rung is executing.
+    peek: Option<(PathBuf, String)>,
     lease_calls: Mutex<u32>,
     released: Mutex<Vec<String>>,
     gotos: Mutex<Vec<u64>>,
     rebases: Mutex<Vec<u64>>,
     pushes: Mutex<Vec<u64>>,
+    marker_seen_during_rebase: Mutex<Option<Option<i64>>>,
 }
 
 impl ScriptCube {
@@ -62,11 +69,23 @@ impl ScriptCube {
             tripwire_findings: Vec::new(),
             workspace_path: PathBuf::from("/tmp/ladder-ws"),
             lease_failures: 0,
+            peek: None,
             lease_calls: Mutex::new(0),
             released: Mutex::new(Vec::new()),
             gotos: Mutex::new(Vec::new()),
             rebases: Mutex::new(Vec::new()),
             pushes: Mutex::new(Vec::new()),
+            marker_seen_during_rebase: Mutex::new(None),
+        }
+    }
+
+    /// A `CleanPushed` double that snapshots the attempt's
+    /// `mechanical_rung_in_flight` marker mid-rebase (i.e. while rung 1 is
+    /// in flight) into [`Self::marker_seen_during_rebase`].
+    fn with_peek(db_path: PathBuf, attempt_id: String) -> Self {
+        Self {
+            peek: Some((db_path, attempt_id)),
+            ..Self::new(Script::CleanPushed)
         }
     }
 
@@ -124,6 +143,14 @@ crate::stub_cube_client! { ScriptCube {
     }
     async fn rebase_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<RebaseOutcome> {
         self.rebases.lock().await.push(pr);
+        if let Some((db_path, attempt_id)) = &self.peek {
+            // Rung 1 stamped the in-flight marker before calling us; snapshot
+            // it through a fresh handle to prove it is durably on disk while
+            // the rung is executing.
+            let peek_db = WorkDb::open(db_path.clone()).unwrap();
+            let marker = peek_db.get_conflict_resolution(attempt_id).unwrap().unwrap().mechanical_rung_in_flight;
+            *self.marker_seen_during_rebase.lock().await = Some(marker);
+        }
         match &self.script {
             Script::CleanPushed => Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new() }),
             Script::CleanUnpushed => Ok(RebaseOutcome { clean: true, pushed: false, conflicted_files: Vec::new() }),
@@ -911,4 +938,193 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     assert_eq!(row.resolved_by_rung, None);
     let (_status, reason) = chore_state(&db, &chore_id);
     assert_eq!(reason.as_deref(), Some("merge_conflict"));
+}
+
+// ── Restart-recovery: persist in-flight mechanical state, reconcile at startup ──
+// (2026-07-18 flunge incident: a rung-0 attempt killed mid-rung by an engine
+// restart vanished with no verdict and left its parent blocked:merge_conflict
+// pointing at a dead attempt forever.)
+
+/// Read a task's `blocked_attempt_id`.
+fn chore_blocked_attempt_id(db: &WorkDb, id: &str) -> Option<String> {
+    match db.get_work_item(id).unwrap() {
+        WorkItem::Chore(t) => t.blocked_attempt_id,
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mechanical_rung_marker_is_persisted_during_rung1_and_cleared_after_retire() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    // The peek double snapshots the marker mid-rebase (rung 1 in flight).
+    let cube = ScriptCube::with_peek(db_path.clone(), attempt.id.clone());
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+
+    // Requirement 1: while the mechanical rung ran, the attempt durably
+    // carried `mechanical_rung_in_flight = 1` on disk.
+    assert_eq!(
+        *cube.marker_seen_during_rebase.lock().await,
+        Some(Some(RUNG_ENGINE_DIRECT_REBASE)),
+        "rung-1 in-flight marker must be persisted on disk during the rebase",
+    );
+    // After the rung concludes the marker (and its mechanical lease/workspace)
+    // is cleared; the succeeded row carries only the terminal rung stamp.
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(1));
+    assert_eq!(
+        row.mechanical_rung_in_flight, None,
+        "marker must be cleared once the rung concludes"
+    );
+    assert_eq!(
+        row.cube_lease_id, None,
+        "mechanical lease must be cleared once the rung concludes"
+    );
+    assert_eq!(row.cube_workspace_id, None);
+}
+
+#[tokio::test]
+async fn mechanical_rung_marker_is_cleared_on_fall_through() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, _chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cube = ScriptCube::new(Script::Conflicts(vec!["src/lib.rs 2-sided conflict".to_owned()]));
+
+    let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
+    assert!(matches!(outcome, LadderOutcome::FellThrough { .. }));
+
+    // The attempt is handed to the worker path still pending, and carries no
+    // stale mechanical marker/lease — otherwise the startup reconciler would
+    // later mistake a live revision-backed attempt for an orphan.
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.mechanical_rung_in_flight, None);
+    assert_eq!(row.cube_lease_id, None);
+    assert_eq!(row.cube_workspace_id, None);
+}
+
+#[tokio::test]
+async fn reconcile_recovers_orphaned_mechanical_attempt_and_frees_its_slot() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (_candidate, attempt, chore_id) = blocked_with_attempt(&db);
+
+    // Model the incident: the engine stamped the in-flight rung-0 marker and
+    // then died mid-rung (no retire, no clear).
+    db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 0, "lease-dead", "ws-dead")
+        .unwrap();
+    // Precondition: the wedged state — parent blocked pointing at a
+    // non-terminal, no-revision attempt with a live in-flight marker.
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "Blocked");
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(
+        chore_blocked_attempt_id(&db, &chore_id).as_deref(),
+        Some(attempt.id.as_str())
+    );
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .mechanical_rung_in_flight,
+        Some(0),
+    );
+
+    let recovered = db.reconcile_orphaned_conflict_ladder_attempts().unwrap();
+
+    // Requirement 2/3: exactly this attempt is recovered, at the rung it died on.
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].work_item_id, chore_id);
+    assert_eq!(recovered[0].attempt_id.as_deref(), Some(attempt.id.as_str()));
+    assert_eq!(recovered[0].rung, Some(0));
+
+    // The orphaned attempt is abandoned with the slot freed (base SHA nulled)
+    // and its marker cleared.
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "abandoned");
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("engine_restart_orphaned_ladder_attempt")
+    );
+    assert_eq!(
+        row.base_sha_at_trigger, None,
+        "UNIQUE slot must be freed for a fresh attempt"
+    );
+    assert_eq!(row.mechanical_rung_in_flight, None);
+
+    // The parent is back in Review with no attempt pointer, so the watcher
+    // re-detects the still-open conflict on the next sweep.
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none());
+    assert_eq!(chore_blocked_attempt_id(&db, &chore_id), None);
+    assert!(
+        db.active_conflict_resolution_for_work_item(&chore_id)
+            .unwrap()
+            .is_none(),
+        "no active attempt should remain after recovery",
+    );
+
+    // The freed slot admits a fresh attempt at the original (base, head) key.
+    let fresh = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: recovered[0].product_id.clone(),
+            work_item_id: chore_id.clone(),
+            pr_url: PR.to_owned(),
+            pr_number: 42,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("base111".to_owned()),
+            head_sha_before: Some("head222".to_owned()),
+        })
+        .unwrap();
+    assert!(
+        fresh.is_some(),
+        "the freed UNIQUE slot must admit a fresh attempt at the same key"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_leaves_revision_backed_and_terminal_attempts_alone() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+
+    // (a) A revision-backed in-flight attempt is owned by a dispatched worker
+    // (supersede_if_stale handles a dead revision on re-detect), not this sweep.
+    let (_candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    db.set_conflict_resolution_revision_task_id(&attempt.id, "task_rev_1")
+        .unwrap();
+
+    let recovered = db.reconcile_orphaned_conflict_ladder_attempts().unwrap();
+    assert!(
+        recovered.is_empty(),
+        "a revision-backed attempt must not be recovered by the ladder sweep"
+    );
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "Blocked");
+    assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id).unwrap().unwrap().status,
+        "pending"
+    );
+
+    // (b) A terminal (failed) attempt the parent still points at is a
+    // legitimate resting state (churn/human-owned), not a wedge.
+    let dir2 = tempdir().unwrap();
+    let db2 = WorkDb::open(dir2.path().join("boss.db")).unwrap();
+    let (_c2, attempt2, chore2) = blocked_with_attempt(&db2);
+    db2.mark_conflict_resolution_failed(&attempt2.id, "gave_up").unwrap();
+
+    let recovered2 = db2.reconcile_orphaned_conflict_ladder_attempts().unwrap();
+    assert!(recovered2.is_empty(), "a terminal attempt must not be recovered");
+    let (status2, reason2) = chore_state(&db2, &chore2);
+    assert_eq!(status2, "Blocked");
+    assert_eq!(reason2.as_deref(), Some("merge_conflict"));
 }

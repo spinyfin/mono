@@ -399,6 +399,7 @@ fn conflict_resolution_roundtrips_with_all_fields() {
         event_source: "review_watch".into(),
         conflict_class: Some("semantic".into()),
         resolved_by_rung: Some(3),
+        mechanical_rung_in_flight: None,
     };
     let raw = serde_json::to_value(&attempt).unwrap();
     let back: ConflictResolution = serde_json::from_value(raw).unwrap();
@@ -431,6 +432,7 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         event_source: "review_watch".into(),
         conflict_class: None,
         resolved_by_rung: None,
+        mechanical_rung_in_flight: None,
     };
     let encoded = serde_json::to_value(&attempt).unwrap();
     let obj = encoded.as_object().unwrap();
@@ -447,6 +449,7 @@ fn conflict_resolution_pending_skips_optional_fields_on_encode() {
         "finished_at",
         "conflict_class",
         "resolved_by_rung",
+        "mechanical_rung_in_flight",
     ] {
         assert!(!obj.contains_key(absent), "expected {absent} omitted on encode",);
     }

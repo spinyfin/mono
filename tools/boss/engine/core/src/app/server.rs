@@ -412,6 +412,45 @@ pub async fn serve_with_merge_probe(
         }
     }
 
+    // Recover conflict-ladder attempts orphaned by the previous engine's
+    // shutdown. The escalation ladder's mechanical rungs (0/1) run inline in
+    // the engine with no dispatched worker; a restart mid-rung leaves the
+    // `conflict_resolutions` row non-terminal and the parent stuck
+    // `blocked: merge_conflict` pointing at a dead attempt that the
+    // conflict-watch re-arm path mistakes for a live "old-style" attempt
+    // forever (the 2026-07-18 flunge incident). This sweep abandons each
+    // such attempt, frees its idempotency slot, and flips the parent back to
+    // `in_review` so the merge poller re-detects the still-open conflict and
+    // re-enters the ladder. Runs before the poller/watch loops spawn, so no
+    // live mechanical rung can race it.
+    match server_state.work_db.reconcile_orphaned_conflict_ladder_attempts() {
+        Ok(recovered) if !recovered.is_empty() => {
+            tracing::warn!(
+                count = recovered.len(),
+                "recovered orphaned conflict-ladder attempts at startup",
+            );
+            for r in &recovered {
+                // Refetch the kanban card out of the Blocked column now that
+                // the parent is back in Review — without the invalidation the
+                // engine's flip stays invisible until the next manual refresh.
+                server_state
+                    .publisher
+                    .publish_work_item_changed(
+                        &r.product_id,
+                        &r.work_item_id,
+                        "conflict_ladder_attempt_recovered: engine restart orphaned the in-flight attempt",
+                    )
+                    .await;
+            }
+        }
+        Ok(_) => {
+            tracing::debug!("no orphaned conflict-ladder attempts to recover at startup");
+        }
+        Err(err) => {
+            tracing::error!(?err, "conflict-ladder orphan recovery sweep failed; continuing");
+        }
+    }
+
     // Install boss-event to a stable location and heal existing worker
     // settings.json files. This ensures that hook paths baked into worker
     // settings.json survive a `bazel clean` or workspace re-lease.
