@@ -493,6 +493,28 @@ Notes:
 - Severity is `warning`.
 - Runs as an embedded WASM check with `whole_repo` access so it can verify targets anywhere in the repo.
 
+## `md/doc-structure`
+
+Purpose:
+
+- Flags Markdown that will render as a single wall-of-text paragraph even though it looks fine in the editor. Markdown folds consecutive single-newline lines into one paragraph, so metadata lines and long framing prose glued together with no blank line collapse into one block when rendered.
+- Rule 1: a line matching `metadata_prefixes` (e.g. `Date:`, `Task:`, `Verdict:`) is flagged when it is part of a multi-line paragraph block instead of standing alone (blank-line-separated) or as a list item.
+- Rule 2: the first paragraph immediately after the document's H1 is flagged when it exceeds `max_first_paragraph_chars`.
+
+Config keys:
+
+- `include_globs` (required array of glob strings) — this check ships with no default scope; each consuming repo enables it for the doc trees it wants gated (e.g. `docs/investigations/**`, `docs/design-docs/**`).
+- `exclude_globs` (optional array of glob strings)
+- `metadata_prefixes` (optional array of strings, default `["Date", "Task", "Verdict"]`)
+- `max_first_paragraph_chars` (optional integer, default `600`)
+- `severity` (optional `error|warning|info`, default `error`)
+
+Notes:
+
+- Only applies to files with a `.md` extension.
+- The opening-paragraph check is skipped when the block right after the H1 is not prose (a heading, list, table, blockquote, or code fence) — it only measures an actual lead-in paragraph.
+- Forward-looking by design: it only evaluates changed files in the current diff, so it never flags pre-existing docs that aren't being touched.
+
 ## `file/size`
 
 Purpose:
