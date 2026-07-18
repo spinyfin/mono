@@ -3090,7 +3090,7 @@ must not be asked to open one",
         }
         self.pane_releaser.release_pane(&execution.id).await;
 
-        let product_id = work_item_product_id(&completion.work_item);
+        let product_id = completion.work_item.product_id().to_string();
         let work_item_id = work_item_id(&completion.work_item);
 
         // incident-002 P2 gate: the deletion tripwire fired, so the task is now
@@ -3688,7 +3688,7 @@ must not be asked to open one",
             );
         }
         self.pane_releaser.release_pane(execution_id).await;
-        let product_id = work_item_product_id(&completion.work_item);
+        let product_id = completion.work_item.product_id().to_string();
         let work_item_id = work_item_id(&completion.work_item);
         let publish_reason = match (merged, source) {
             (true, "pr_recheck") => "worker_pr_merged_recheck",
@@ -4395,7 +4395,7 @@ must not be asked to open one",
             if let Ok(execution) = self.work_db.get_execution(execution_id)
                 && let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id)
             {
-                let product_id = work_item_product_id(&work_item);
+                let product_id = work_item.product_id().to_string();
                 let wid = work_item_id(&work_item);
                 self.publisher
                     .publish_work_item_changed(&product_id, &wid, "worker_force_stopped")
@@ -4690,7 +4690,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             }) {
                 Ok(item) => {
                     if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                        let product_id = work_item_product_id(&work_item);
+                        let product_id = work_item.product_id().to_string();
                         self.publisher
                             .publish_frontend_event_on_product(
                                 &product_id,
@@ -4794,7 +4794,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             .await;
         match completion.work_item.as_ref() {
             Some(work_item) => {
-                let product_id = work_item_product_id(work_item);
+                let product_id = work_item.product_id().to_string();
                 self.publisher
                     .publish_work_item_changed(&product_id, &work_item_id, "worker_idle_park_finalized")
                     .await;
@@ -4907,7 +4907,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
         }) {
             Ok(item) => {
                 if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item_product_id(&work_item);
+                    let product_id = work_item.product_id().to_string();
                     self.publisher
                         .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
                         .await;
@@ -5016,7 +5016,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
         }) {
             Ok(item) => {
                 if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item_product_id(&work_item);
+                    let product_id = work_item.product_id().to_string();
                     self.publisher
                         .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
                         .await;
@@ -5125,7 +5125,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 "worker_no_op_completed",
             )
             .await;
-        let product_id = work_item_product_id(&completion.work_item);
+        let product_id = completion.work_item.product_id().to_string();
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, "worker_no_op_completed")
             .await;
@@ -5166,7 +5166,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
         }) {
             Ok(item) => {
                 if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item_product_id(&work_item);
+                    let product_id = work_item.product_id().to_string();
                     self.publisher
                         .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
                         .await;
@@ -6621,14 +6621,6 @@ fn work_item_id(item: &WorkItem) -> String {
         WorkItem::Product(product) => product.id.clone(),
         WorkItem::Project(project) => project.id.clone(),
         WorkItem::Task(task) | WorkItem::Chore(task) => task.id.clone(),
-    }
-}
-
-fn work_item_product_id(item: &WorkItem) -> String {
-    match item {
-        WorkItem::Product(product) => product.id.clone(),
-        WorkItem::Project(project) => project.product_id.clone(),
-        WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.clone(),
     }
 }
 
@@ -9457,7 +9449,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 crate::work::CreateChoreInput::builder()
                     .product_id({
                         let item = db.get_work_item(&c1).unwrap();
-                        work_item_product_id(&item)
+                        item.product_id().to_string()
                     })
                     .name("Crusher")
                     .build(),
@@ -9480,7 +9472,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 crate::work::CreateChoreInput::builder()
                     .product_id({
                         let item = db.get_work_item(&c1).unwrap();
-                        work_item_product_id(&item)
+                        item.product_id().to_string()
                     })
                     .name("Troi")
                     .build(),

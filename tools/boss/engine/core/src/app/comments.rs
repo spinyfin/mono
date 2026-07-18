@@ -903,7 +903,7 @@ pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendReque
                     let product_id = work_db
                         .get_work_item(task_id)
                         .ok()
-                        .map(|item| work_item_product_id(&item));
+                        .map(|item| item.product_id().to_string());
                     let work_revision = publish_work_invalidation(
                         &server_state,
                         &session_id,

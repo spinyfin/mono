@@ -40,7 +40,7 @@ pub(super) async fn handle_set_product_external_tracker(ctx: Dispatch, req: Fron
                 match result {
                     Ok(product) => {
                         let item = WorkItem::Product(product);
-                        let product_id = work_item_product_id(&item);
+                        let product_id = item.product_id().to_string();
                         let revision = publish_work_invalidation(
                             &server_state,
                             &session_id,
@@ -148,7 +148,7 @@ pub(super) async fn handle_link_work_item_external_ref(ctx: Dispatch, req: Front
             .and_then(|()| work_db.get_task_with_external_ref(&input.work_item_id));
         match result {
             Ok(item) => {
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -187,7 +187,7 @@ pub(super) async fn handle_unlink_work_item_external_ref(ctx: Dispatch, req: Fro
             .and_then(|()| work_db.get_task_with_external_ref(&target_id));
         match result {
             Ok(item) => {
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,

@@ -28,7 +28,7 @@ pub(super) async fn handle_create_product(ctx: Dispatch, req: FrontendRequest) {
                 &request_id,
                 vec![TOPIC_WORK_PRODUCTS.to_owned(), work_product_topic(&work_item_id(&item))],
                 "product_created",
-                Some(work_item_product_id(&item)),
+                Some(item.product_id().to_string()),
                 vec![work_item_id(&item)],
             )
             .await;
@@ -82,7 +82,7 @@ pub(super) async fn handle_set_product_default_model(ctx: Dispatch, req: Fronten
         match work_db.set_product_default_model(&product_id, model.as_deref()) {
             Ok(product) => {
                 let item = WorkItem::Product(product);
-                let pid = work_item_product_id(&item);
+                let pid = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -116,7 +116,7 @@ pub(super) async fn handle_set_product_default_driver(ctx: Dispatch, req: Fronte
         match work_db.set_product_default_driver(&product_id, driver.as_deref()) {
             Ok(product) => {
                 let item = WorkItem::Product(product);
-                let pid = work_item_product_id(&item);
+                let pid = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -150,7 +150,7 @@ pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: Front
         match work_db.set_product_editorial_rules(&input.product_id, input.rules.as_ref()) {
             Ok(product) => {
                 let item = WorkItem::Product(product);
-                let pid = work_item_product_id(&item);
+                let pid = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,

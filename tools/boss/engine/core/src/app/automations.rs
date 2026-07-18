@@ -414,7 +414,7 @@ pub(super) async fn handle_create_automation_task(ctx: Dispatch, req: FrontendRe
                         );
                     }
                 }
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,

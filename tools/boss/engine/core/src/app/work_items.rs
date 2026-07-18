@@ -227,7 +227,7 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
         match work_db.create_task(input) {
             Ok(task) => {
                 let item = WorkItem::Task(task);
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -269,7 +269,7 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
         match work_db.create_chore(input) {
             Ok(task) => {
                 let item = WorkItem::Chore(task);
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -442,7 +442,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
         let actor = resolve_status_actor(&server_state, peer_pid);
         match work_db.update_work_item_as_actor(&id, patch, actor) {
             Ok(item) => {
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let mut topics = vec![work_product_topic(&product_id)];
                 if matches!(item, WorkItem::Product(_)) {
                     topics.push(TOPIC_WORK_PRODUCTS.to_owned());
@@ -717,7 +717,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                         "reason": "delete_work_item request",
                     }),
                 );
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -759,7 +759,7 @@ pub(super) async fn handle_restore_work_item(ctx: Dispatch, req: FrontendRequest
             // they would for any other mutation. Reuse the
             // `work_item_updated` invalidation rather than minting
             // a restore-specific topic event.
-            let product_id = work_item_product_id(&item);
+            let product_id = item.product_id().to_string();
             let revision = publish_work_invalidation(
                 &server_state,
                 &session_id,
@@ -900,7 +900,7 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
         match work_db.create_investigation(input) {
             Ok(task) => {
                 let item = WorkItem::Task(task);
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -934,7 +934,7 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
         match work_db.create_revision(input, &GhPrStateChecker) {
             Ok(task) => {
                 let item = WorkItem::Task(task);
-                let product_id = work_item_product_id(&item);
+                let product_id = item.product_id().to_string();
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
