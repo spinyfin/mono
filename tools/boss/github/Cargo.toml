@@ -17,7 +17,5 @@ tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-rand = { workspace = true }
-rsa = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 wiremock = { workspace = true }

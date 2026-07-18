@@ -6,6 +6,7 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "github",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["src/test_fixtures/**"]),
     crate_name = "boss_github",
     crate_root = "src/lib.rs",
     edition = "2024",
