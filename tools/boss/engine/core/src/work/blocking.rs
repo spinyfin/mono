@@ -1377,8 +1377,7 @@ impl WorkDb {
     ///      (a worker is attached, or one is queued/ready to run).
     ///
     /// Condition 2 is what makes this restart-robust, and closes the gap
-    /// behind "a blocked row never re-scans after an engine restart"
-    /// (chore: conflict_watch emits zero scan activity after restart). The
+    /// behind "a blocked row never re-scans after an engine restart". The
     /// task `status` column is a *paper* liveness signal: it survives an
     /// engine restart (or any worker death) even though the backing
     /// execution is gone, so a check on status alone reports a revision
