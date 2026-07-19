@@ -137,6 +137,29 @@ fn insert_ci_remediation_execution(db: &WorkDb, work_item_id: &str, status: &str
     .unwrap();
 }
 
+/// Insert a `work_executions` row of `kind='revision_implementation'` with
+/// the given status for `work_item_id`, so the execution-liveness half of
+/// `is_conflict_resolution_revision_live` can be exercised. `created_at` is
+/// stamped explicitly so a test can control which row is "latest".
+fn insert_revision_execution(db: &WorkDb, work_item_id: &str, status: &str, created_at: &str) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+         VALUES (?1, ?2, 'revision_implementation', ?3, 'git@github.com:spinyfin/mono.git', ?4)",
+        params![next_id("exec"), work_item_id, status, created_at],
+    )
+    .unwrap();
+}
+
+/// Set a task's `status` column directly (revision tasks in these tests are
+/// planted via raw INSERT, so there is no guarded public flip to `active` /
+/// `blocked`).
+fn set_task_status(db: &WorkDb, task_id: &str, status: &str) {
+    let conn = db.connect().unwrap();
+    conn.execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![task_id, status])
+        .unwrap();
+}
+
 fn pr(n: u32) -> String {
     format!("https://github.com/spinyfin/mono/pull/{n}")
 }
@@ -520,6 +543,81 @@ fn is_conflict_resolution_revision_live_true_and_false() {
 
     // Unknown id → false.
     assert!(!db.is_conflict_resolution_revision_live("task_does_not_exist").unwrap());
+}
+
+/// A live-status revision *task* is only a live fix vehicle when it is
+/// genuinely being (or about to be) worked. The task `status` column is a
+/// paper signal that survives an engine restart, so a revision whose worker
+/// died — its execution reaped to a terminal `orphaned`/`failed` while the
+/// task row stayed `active`/`blocked` — must report NOT live so the conflict
+/// watcher supersedes the dead attempt and re-fires. This is the direct
+/// regression for "conflict_watch emits zero scan activity after restart".
+#[test]
+fn is_conflict_resolution_revision_live_reflects_execution_liveness() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "revision-exec-live");
+    let parent = make_chore_root(&db, &product_id, "parent");
+
+    // active task + a RUNNING execution → a worker is attached → live.
+    let running = insert_revision_row(&db, &product_id, &parent);
+    set_task_status(&db, &running, "active");
+    insert_revision_execution(&db, &running, "running", &now_string());
+    assert!(
+        db.is_conflict_resolution_revision_live(&running).unwrap(),
+        "a running execution is a live fix vehicle"
+    );
+
+    // active task whose only execution is ORPHANED (the engine-restart
+    // shape: the task status survived the restart but the worker is gone) →
+    // NOT live.
+    let orphaned = insert_revision_row(&db, &product_id, &parent);
+    set_task_status(&db, &orphaned, "active");
+    insert_revision_execution(&db, &orphaned, "orphaned", &now_string());
+    assert!(
+        !db.is_conflict_resolution_revision_live(&orphaned).unwrap(),
+        "an orphaned execution behind a still-active task is a dead fix vehicle"
+    );
+
+    // blocked task whose only execution is FAILED → NOT live.
+    let failed = insert_revision_row(&db, &product_id, &parent);
+    set_task_status(&db, &failed, "blocked");
+    insert_revision_execution(&db, &failed, "failed", &now_string());
+    assert!(
+        !db.is_conflict_resolution_revision_live(&failed).unwrap(),
+        "a failed execution behind a still-blocked task is a dead fix vehicle"
+    );
+
+    // active task + a READY (queued for dispatch) execution → live: it is
+    // about to be worked, so the watcher must not supersede it.
+    let ready = insert_revision_row(&db, &product_id, &parent);
+    set_task_status(&db, &ready, "active");
+    insert_revision_execution(&db, &ready, "ready", &now_string());
+    assert!(
+        db.is_conflict_resolution_revision_live(&ready).unwrap(),
+        "a queued (ready) execution is still a live fix vehicle"
+    );
+
+    // active task whose latest execution COMPLETED (on-Stop finalize race:
+    // the worker finished but the task has not advanced yet) → still live;
+    // the crz-finalize path owns that transition, not the watcher.
+    let completed = insert_revision_row(&db, &product_id, &parent);
+    set_task_status(&db, &completed, "active");
+    insert_revision_execution(&db, &completed, "completed", &now_string());
+    assert!(
+        db.is_conflict_resolution_revision_live(&completed).unwrap(),
+        "a cleanly-completed execution is not the watcher's death signal"
+    );
+
+    // A dead execution shadowed by a newer live one (re-dispatch after the
+    // reaper reaped the first) → live: the newer worker is attached.
+    let redispatched = insert_revision_row(&db, &product_id, &parent);
+    set_task_status(&db, &redispatched, "active");
+    insert_revision_execution(&db, &redispatched, "orphaned", "100");
+    insert_revision_execution(&db, &redispatched, "running", "200");
+    assert!(
+        db.is_conflict_resolution_revision_live(&redispatched).unwrap(),
+        "a live re-dispatch shadowing an older orphaned execution is live"
+    );
 }
 
 /// `task_blocked_reason` returns the scalar reason only for a live,

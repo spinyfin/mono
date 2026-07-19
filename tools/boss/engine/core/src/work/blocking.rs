@@ -1359,28 +1359,96 @@ impl WorkDb {
         Ok(n > 0)
     }
 
-    /// Is the revision task identified by `revision_task_id` still live
-    /// (i.e. status in `todo`, `active`, or `blocked`)?
+    /// Is the `kind=revision` fix vehicle identified by `revision_task_id`
+    /// still a live, in-flight vehicle?
     ///
     /// Used by `conflict_watch::on_conflict_detected` as the secondary gate
-    /// in the stale-crz supersede check: if the linked revision task has
-    /// reached a terminal status (`in_review`, `done`, `cancelled`, …) but
-    /// `finalize_conflict_resolution_attempt` was never called (the exec was
-    /// abandoned by the orphan sweep rather than via `NudgeBreakerParked`),
-    /// the crz stays `pending` with `revision_task_id` set. Checking for a
-    /// terminal revision lets conflict_watch abandon the stale crz and
-    /// re-detect rather than spinning as an idempotent no-op forever.
+    /// in the stale-crz supersede check ([`crate::conflict_watch`]'s
+    /// `supersede_if_stale`): a crz whose linked revision is no longer live
+    /// must be abandoned and re-detected rather than spun as an idempotent
+    /// "revision in flight" no-op forever.
+    ///
+    /// A revision is live only when BOTH hold:
+    ///   1. its task row exists, is not soft-deleted, and is in a
+    ///      non-terminal status (`todo` / `active` / `blocked`); AND
+    ///   2. it is genuinely being — or about to be — worked: either it has
+    ///      not been dispatched yet (no `work_executions` rows: the
+    ///      freshly-spawned `todo` case), or it has a non-terminal execution
+    ///      (a worker is attached, or one is queued/ready to run).
+    ///
+    /// Condition 2 is what makes this restart-robust, and closes the gap
+    /// behind "a blocked row never re-scans after an engine restart". The
+    /// task `status` column is a *paper* liveness signal: it survives an
+    /// engine restart (or any worker death) even though the backing
+    /// execution is gone, so a check on status alone reports a revision
+    /// whose worker died as still live. `supersede_if_stale` trusted this
+    /// helper, so a dead fix vehicle was treated as in-flight forever and
+    /// the attempt was never superseded. Requiring positive execution
+    /// evidence means that once the dead execution is reaped to a terminal
+    /// status (`orphaned` / `failed` / … — the shape a restart leaves
+    /// behind, per the design's "engine restarts mid-attempt … next probe
+    /// re-fires; new attempt"), this reports the revision dead and the
+    /// watcher re-fires.
+    ///
+    /// A `completed` most-recent execution is deliberately treated as still
+    /// live: a worker that finished cleanly but whose task has not yet been
+    /// advanced is the on-Stop finalize path's race to resolve, not a death
+    /// signal for the watcher to act on. A terminal revision *task* status
+    /// (`in_review`, `done`, `cancelled`, …) is still caught by condition 1
+    /// — the orphan-sweep-abandoned-before-`NudgeBreakerParked` case.
     pub fn is_conflict_resolution_revision_live(&self, revision_task_id: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE id = ?1
-               AND status IN ('todo', 'active', 'blocked')
-               AND deleted_at IS NULL",
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![revision_task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            // Task missing or soft-deleted → not live.
+            return Ok(false);
+        };
+        if !matches!(status.as_str(), "todo" | "active" | "blocked") {
+            // Terminal / review task status → not a live fix vehicle.
+            return Ok(false);
+        }
+        // A worker is attached, or an execution is queued/ready to run.
+        let has_non_terminal_execution: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM work_executions
+                  WHERE work_item_id = ?1
+                    AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             )",
             params![revision_task_id],
             |row| row.get(0),
         )?;
-        Ok(n > 0)
+        if has_non_terminal_execution {
+            return Ok(true);
+        }
+        // Every execution (if any) is terminal. Distinguish "never
+        // dispatched" (still a legitimately-pending todo vehicle) and
+        // "finished cleanly" (leave to the on-Stop / retire path) from
+        // "dispatched then died" (orphaned / failed / … — the engine-restart
+        // shape), which is dead and must be superseded.
+        let latest_execution_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM work_executions
+                  WHERE work_item_id = ?1
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT 1",
+                params![revision_task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match latest_execution_status.as_deref() {
+            // Never dispatched → still pending its first dispatch → live.
+            None => Ok(true),
+            // Finished cleanly → not the watcher's death signal → live.
+            Some("completed") => Ok(true),
+            // Dispatched then died (orphaned/failed/cancelled/abandoned) → dead.
+            Some(_) => Ok(false),
+        }
     }
 
     /// Does the work item have a `ci_failure_suppressions` row for

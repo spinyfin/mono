@@ -396,3 +396,114 @@ async fn rearm_supersedes_blocked_parent_when_revision_is_dead() {
     );
     assert!(reason.is_none());
 }
+
+/// Live-repro regression for "conflict_watch emits zero scan activity after
+/// engine restart". The revision task the crz points at still EXISTS in a
+/// live status (`active`) — its status column survived the restart — but its
+/// backing execution died and was reaped to `orphaned`. Before the fix,
+/// `is_conflict_resolution_revision_live` looked only at the paper-live task
+/// status, so `supersede_if_stale` treated this dead fix vehicle as in flight
+/// and every post-boot probe was an idempotent no-op: the blocked row could
+/// never recover. The watcher must now recognise the fix vehicle is dead,
+/// supersede the stale attempt, and spawn a fresh revision on the FIRST pass.
+///
+/// This is the real-world shape (`rearm_supersedes_blocked_parent_when_revision_is_dead`
+/// models the simpler dangling-revision-id case where the task row is gone;
+/// here the task row survives with a live status and only its execution died).
+#[tokio::test]
+async fn rearm_supersedes_blocked_parent_when_revision_execution_died_in_restart() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/20x";
+    let (product, chore) = make_in_review(&db, "C-restart-dead-exec", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+    let attempt = db
+        .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+            product_id: product.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 20,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("abc123".into()),
+            head_sha_before: Some("head456".into()),
+        })
+        .unwrap()
+        .expect("fresh insert");
+    let original_id = attempt.id.clone();
+
+    // A genuinely-live revision TASK whose backing execution was running when
+    // the engine restarted and has since been reaped to `orphaned`. The task
+    // status column stayed `active` across the restart — exactly the paper-live
+    // shape the old status-only check misread as "revision in flight".
+    let dead_revision = create_active_chore(&db, &product, "revision whose worker died on restart");
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(dead_revision.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    db.mark_execution_orphaned(&exec.id, "engine_restart_orphan").unwrap();
+    db.set_conflict_resolution_revision_task_id(&attempt.id, &dead_revision)
+        .unwrap();
+
+    let (s, _) = chore_status(&db, &chore);
+    assert_eq!(s, TaskStatus::Blocked, "sanity: parent must be blocked before probe");
+
+    // First post-restart probe (same head SHA, still CONFLICTING). The dead
+    // execution behind a still-active task must be superseded on THIS pass.
+    let result = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(
+        result,
+        "a revision whose execution died in a restart must be superseded (state changed)"
+    );
+
+    // The dead attempt is abandoned; a fresh one is inserted with a new
+    // (live) revision, not the dead one.
+    let all_crz = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(
+        all_crz.len(),
+        2,
+        "dead attempt abandoned and a fresh attempt spawned on the first post-boot pass"
+    );
+    let original = all_crz
+        .iter()
+        .find(|r| r.id == original_id)
+        .expect("original crz must still exist");
+    assert_eq!(
+        original.status, "abandoned",
+        "dead attempt must be abandoned, not left pending"
+    );
+    let fresh = all_crz
+        .iter()
+        .find(|r| r.id != original_id)
+        .expect("fresh crz must exist");
+    assert_eq!(fresh.status, "pending");
+    assert!(
+        fresh.revision_task_id.is_some() && fresh.revision_task_id.as_deref() != Some(dead_revision.as_str()),
+        "fresh crz must carry a new, live revision, not the dead one"
+    );
+
+    // Parent recovers to in_review with the fresh revision in flight — the
+    // blocked row is no longer permanently stranded.
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(
+        status,
+        TaskStatus::InReview,
+        "parent recovers to in_review once the dead attempt is superseded"
+    );
+    assert!(reason.is_none());
+}
