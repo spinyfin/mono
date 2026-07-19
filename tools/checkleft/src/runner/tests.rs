@@ -833,28 +833,23 @@ id = "fails"
     assert_eq!(results[0].check_id, "fails");
     assert_eq!(results[0].findings[0].severity, Severity::Error);
     assert!(results[0].findings[0].message.contains("boom"));
-    // Execution failures must carry source attribution — not <unknown>.
+    // The check's *config file* (CHECKS.toml) was never an input to the failing
+    // run — it only names/enables the check. Pinning the finding there
+    // misattributes the failure (e.g. renders as `--> CHECKS.toml` for a crash
+    // that has nothing to do with that file), so execution failures must carry
+    // no location rather than a wrong one.
     assert!(
-        results[0].findings[0].location.is_some(),
-        "execution-failure finding must have a location (got <unknown>)"
-    );
-    assert_eq!(
-        results[0].findings[0]
-            .location
-            .as_ref()
-            .unwrap()
-            .path
-            .file_name()
-            .and_then(|n| n.to_str()),
-        Some("CHECKS.toml"),
-        "execution-failure location must point at the CHECKS config file"
+        results[0].findings[0].location.is_none(),
+        "execution-failure finding must not misattribute to the check's config file"
     );
 }
 
 #[tokio::test]
-async fn runner_external_execution_failure_carries_source_attribution() {
+async fn runner_external_execution_failure_does_not_misattribute_to_config_file() {
     // Verifies that when an external check executor returns Err, the resulting
-    // finding has a location pointing at the CHECKS config file — not <unknown>.
+    // finding carries no location — the CHECKS config file names/enables the
+    // check but was never fed to it as input, so pinning the finding there
+    // misattributes a spawn/execution crash to an unrelated file.
     use crate::external::{
         EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage,
         ExternalCheckPackage, ExternalCheckPackageImplementation,
@@ -931,19 +926,8 @@ checks:
         result.findings[0].message
     );
     assert!(
-        result.findings[0].location.is_some(),
-        "execution-failure finding must have a location (got <unknown>)"
-    );
-    assert_eq!(
-        result.findings[0]
-            .location
-            .as_ref()
-            .unwrap()
-            .path
-            .file_name()
-            .and_then(|n| n.to_str()),
-        Some("CHECKS.yaml"),
-        "execution-failure location must point at the CHECKS config file"
+        result.findings[0].location.is_none(),
+        "execution-failure finding must not misattribute to the check's config file"
     );
 }
 

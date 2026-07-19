@@ -391,17 +391,25 @@ impl Runner {
             match join_result {
                 Ok(Ok(result)) => results.push(result),
                 Ok(Err((check_id, source_path, err))) => {
+                    // The failure is in the tool invocation (spawn/execution), not in the
+                    // check's config file — `source_path` was never fed to the failing
+                    // tool as input, so pinning the finding's location to it misattributes
+                    // the error (e.g. "--> CHECKS.yaml" for a crash caused by an unrelated
+                    // matched file). Keep `source_path` in the log only, for troubleshooting
+                    // which configured check instance failed.
+                    tracing::warn!(
+                        check_id = %check_id,
+                        config_path = %source_path.display(),
+                        error = %format!("{err:#}"),
+                        "check execution failed"
+                    );
                     let result = CheckResult {
                         check_id,
                         findings: vec![Finding {
                             fixable: false,
                             severity: Severity::Error,
                             message: format!("check execution failed: {err:#}"),
-                            location: Some(Location {
-                                path: source_path,
-                                line: None,
-                                column: None,
-                            }),
+                            location: None,
                             remediations: vec![],
                             suggested_fix: None,
                         }],
