@@ -127,10 +127,13 @@ use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
 const RUNG_DETERMINISTIC_RESOLVER: i64 = 0;
 const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 
-/// Prefix stamped on every rung-1 lease's `--task` label (see
-/// `try_mechanical_rungs` below). Exposed so `crate::ladder_lease_reap`'s
-/// startup sweep can scope itself to exactly the leases this engine's
-/// conflict-ladder code creates — never a worker or human lease.
+/// Prefix stamped on every rung-1 lease's `--task` label, followed by
+/// `crate::ladder_lease_reap::engine_install_id()` and a space, then
+/// `candidate.work_item_id` (see `try_mechanical_rungs` below). Exposed so
+/// `crate::ladder_lease_reap`'s startup sweep can scope itself to exactly
+/// the leases this engine's conflict-ladder code created *on this
+/// install* — never a worker or human lease, and never a lease created by
+/// a different engine install sharing the same cube pool.
 pub(crate) const RUNG1_TASK_LABEL_PREFIX: &str = "conflict-ladder rung1 ";
 
 /// Rung 0 (deterministic-resolver apply/commit/push, [`attempt_rung0`]) is
@@ -366,7 +369,11 @@ pub(crate) async fn try_mechanical_rungs(
         }
     };
 
-    let task_label = format!("{RUNG1_TASK_LABEL_PREFIX}{}", candidate.work_item_id);
+    let task_label = format!(
+        "{RUNG1_TASK_LABEL_PREFIX}{} {}",
+        crate::ladder_lease_reap::engine_install_id(),
+        candidate.work_item_id
+    );
     let lease = match lease_rung1_workspace(cube_client, &repo.repo_id, &task_label).await {
         Ok(lease) => lease,
         Err(err) => {

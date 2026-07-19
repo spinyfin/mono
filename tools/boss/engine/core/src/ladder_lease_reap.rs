@@ -16,27 +16,36 @@
 //! This module runs once at the *next* engine startup and force-releases
 //! any such orphan directly, instead of waiting out the TTL.
 //!
-//! ## Why "any rung-1 lease found at startup is orphaned" is a safe rule
+//! ## Why "a rung-1 lease bearing this install's id, found at startup, is
+//! ## orphaned" is a safe rule
 //!
 //! A rung-1 lease's entire lifetime — acquire, rebase, release — is one
 //! in-process async call (see `conflict_ladder::try_mechanical_rungs`); it
 //! is never persisted to the work-execution DB and never survives past
 //! that single call within the process that created it. So a freshly
 //! started engine, which by construction has not yet run any rung-1
-//! attempt of its own, cannot be looking at a lease of its own making —
-//! anything bearing the rung-1 task-label prefix
-//! ([`crate::conflict_ladder::RUNG1_TASK_LABEL_PREFIX`]) here was left
-//! behind by a *previous* engine instance that never got to release it.
-//! That scoping is also what keeps this reap strictly to leases the
-//! engine's own conflict-ladder code created — it never touches a worker
-//! or human-held lease, both of which use their own, unrelated task
-//! labels.
+//! attempt of its own, cannot be looking at a lease of its own making.
 //!
-//! As a belt-and-braces corroboration (not the sole signal — see the note
-//! on `holder` below), each candidate's recorded lease holder is also
-//! pid-probed via the same `kill(pid, 0)` check
-//! [`crate::dead_pid_sweep`] uses; a lease whose holder still resolves to
-//! a live process is left alone rather than force-released.
+//! The scoping is deliberately narrower than "any lease bearing the rung-1
+//! task-label prefix": [`crate::conflict_ladder::RUNG1_TASK_LABEL_PREFIX`]
+//! alone tells us a lease is *some* engine's rung-1 lease, but not whether
+//! it belongs to *this* engine install — a second engine install sharing
+//! the same cube pool would also mint leases with that prefix, and a
+//! startup reap that force-released those out from under a live,
+//! in-flight rebase would be a correctness regression, not a fix. So every
+//! rung-1 lease's task label also carries [`engine_install_id`] (this
+//! process's hostname, stable across restarts of the same install but
+//! distinct from any other install sharing the pool), and this reap only
+//! ever considers a candidate whose label's install-id segment matches its
+//! own. A label with no parseable install-id segment (e.g. one written by
+//! a rung-1 attempt from before this scoping existed) is left alone rather
+//! than guessed at.
+//!
+//! As a belt-and-braces corroboration on top of the install-id match (not
+//! the sole signal — see the note on `holder` below), each candidate's
+//! recorded lease holder is also pid-probed via the same `kill(pid, 0)`
+//! check [`crate::dead_pid_sweep`] uses; a lease whose holder still
+//! resolves to a live process is left alone rather than force-released.
 //!
 //! Note: cube stamps `holder` from the *transient* `cube` CLI subprocess
 //! that performed the lease call (`holder_identity()` in `tools/cube`),
@@ -44,23 +53,47 @@
 //! that subprocess exits moments after the lease call returns regardless
 //! of whether the owning engine is still alive. So an `Alive` holder here
 //! is the genuinely rare/anomalous case (a lease call still literally in
-//! flight, or a second engine instance concurrently sharing this cube
-//! pool); `Dead`, `PermissionDenied`, or an unparseable/missing holder are
-//! all treated as safe to reclaim.
+//! flight); `Dead`, `PermissionDenied`, or an unparseable/missing holder
+//! are all treated as safe to reclaim once the install-id match above has
+//! already confirmed the lease is this install's own.
+
+use std::sync::OnceLock;
 
 use crate::coordinator::CubeClient;
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
+
+/// Stable identifier for this engine installation (its hostname), embedded
+/// in every rung-1 lease's task label at acquisition
+/// (`conflict_ladder::try_mechanical_rungs`) and consulted here at startup
+/// so the reap can restrict itself to leases *this install* created,
+/// never a lease legitimately held by a second, concurrently running
+/// engine install sharing the same cube pool. Cached for the life of the
+/// process — the hostname does not change while an engine is running.
+pub(crate) fn engine_install_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..end]).into_owned()
+        } else {
+            "unknown-host".to_owned()
+        }
+    })
+}
 
 /// Reason recorded on every force-release this sweep performs.
 const REAP_REASON: &str =
     "conflict_ladder: startup reap — rung-1 lease orphaned by a prior engine instance (2026-07-18 incident)";
 
-/// Force-release every cube workspace lease still bearing the rung-1
-/// task-label prefix at engine startup (see the module doc comment for why
-/// that alone is sufficient proof of orphaning). Best-effort and
-/// non-fatal: a `list_workspaces` failure or an individual
-/// `force_release_lease` failure is logged and does not block startup.
-/// Returns the number of leases reclaimed.
+/// Force-release every cube workspace lease bearing the rung-1 task-label
+/// prefix *and* this engine install's id at engine startup (see the module
+/// doc comment for why that combination is sufficient proof of orphaning,
+/// and why the prefix alone would not be). Best-effort and non-fatal: a
+/// `list_workspaces` failure or an individual `force_release_lease` failure
+/// is logged and does not block startup. Returns the number of leases
+/// reclaimed.
 pub async fn reap_orphaned_rung1_leases(cube_client: &dyn CubeClient) -> usize {
     let workspaces = match cube_client.list_workspaces().await {
         Ok(workspaces) => workspaces,
@@ -78,7 +111,26 @@ pub async fn reap_orphaned_rung1_leases(cube_client: &dyn CubeClient) -> usize {
         let Some(task) = workspace.task.as_deref() else {
             continue;
         };
-        if !task.starts_with(crate::conflict_ladder::RUNG1_TASK_LABEL_PREFIX) {
+        let Some(rest) = task.strip_prefix(crate::conflict_ladder::RUNG1_TASK_LABEL_PREFIX) else {
+            continue;
+        };
+        let Some((label_install_id, _work_item_id)) = rest.split_once(' ') else {
+            tracing::warn!(
+                workspace_id = %workspace.workspace_id,
+                task,
+                "conflict_ladder: startup reap found a rung-1 lease with no parseable engine-install id \
+                 segment; leaving it alone (predates install-scoped reap)",
+            );
+            continue;
+        };
+        if label_install_id != engine_install_id() {
+            tracing::info!(
+                workspace_id = %workspace.workspace_id,
+                task,
+                this_install = engine_install_id(),
+                "conflict_ladder: startup reap found a rung-1 lease belonging to a different engine \
+                 install sharing this cube pool; leaving it alone",
+            );
             continue;
         }
         let Some(lease_id) = workspace.lease_id.as_deref() else {
@@ -126,7 +178,7 @@ fn holder_pid_status(holder: Option<&str>) -> PidStatus {
     let Some(holder) = holder else {
         return PidStatus::Unknown(std::io::Error::other("no holder recorded"));
     };
-    let Some(pid_str) = holder.rsplit(':').next() else {
+    let Some((_, pid_str)) = holder.rsplit_once(':') else {
         return PidStatus::Unknown(std::io::Error::other("holder has no `:<pid>` suffix"));
     };
     match pid_str.parse::<i32>() {
@@ -189,14 +241,18 @@ mod tests {
 
     /// A dead-pid holder (the overwhelmingly common case — see the module
     /// doc comment on why the transient `cube` CLI subprocess pid is
-    /// always dead) with the rung-1 task-label prefix is reclaimed.
+    /// always dead) with the rung-1 task-label prefix and this install's
+    /// id is reclaimed.
     #[tokio::test]
     async fn reaps_rung1_lease_with_dead_holder() {
         let cube = RecordingCube {
             workspaces: vec![workspace(
                 "flunge-agent-035",
                 Some("lease-1"),
-                Some("conflict-ladder rung1 task_18c2e3766445e4f0_165"),
+                Some(&format!(
+                    "conflict-ladder rung1 {} task_18c2e3766445e4f0_165",
+                    engine_install_id()
+                )),
                 Some(&format!("agent@host:{}", dead_pid())),
             )],
             ..Default::default()
@@ -232,6 +288,51 @@ mod tests {
         assert!(cube.force_released.lock().unwrap().is_empty());
     }
 
+    /// A rung-1 lease bearing a *different* engine install's id (a second
+    /// engine instance concurrently sharing this cube pool) is never
+    /// touched, even with a dead-looking holder pid — the install-id scope
+    /// guard is what actually protects a live concurrent instance, since
+    /// its holder is always a transient, already-exited `cube` CLI
+    /// subprocess regardless of whether the owning engine is alive.
+    #[tokio::test]
+    async fn ignores_lease_from_different_engine_install() {
+        let cube = RecordingCube {
+            workspaces: vec![workspace(
+                "flunge-agent-036",
+                Some("lease-4"),
+                Some("conflict-ladder rung1 some-other-host task_y"),
+                Some(&format!("agent@host:{}", dead_pid())),
+            )],
+            ..Default::default()
+        };
+
+        let reaped = reap_orphaned_rung1_leases(&cube).await;
+
+        assert_eq!(reaped, 0);
+        assert!(cube.force_released.lock().unwrap().is_empty());
+    }
+
+    /// A rung-1 lease whose label has no parseable install-id segment
+    /// (e.g. written before this scoping existed) is left alone rather
+    /// than guessed at.
+    #[tokio::test]
+    async fn ignores_rung1_lease_with_no_install_id_segment() {
+        let cube = RecordingCube {
+            workspaces: vec![workspace(
+                "flunge-agent-037",
+                Some("lease-5"),
+                Some("conflict-ladder rung1 task_x"),
+                Some(&format!("agent@host:{}", dead_pid())),
+            )],
+            ..Default::default()
+        };
+
+        let reaped = reap_orphaned_rung1_leases(&cube).await;
+
+        assert_eq!(reaped, 0);
+        assert!(cube.force_released.lock().unwrap().is_empty());
+    }
+
     /// A rung-1 lease whose holder pid is still alive is left alone.
     #[tokio::test]
     async fn leaves_rung1_lease_with_live_holder() {
@@ -239,7 +340,7 @@ mod tests {
             workspaces: vec![workspace(
                 "flunge-agent-035",
                 Some("lease-3"),
-                Some("conflict-ladder rung1 task_x"),
+                Some(&format!("conflict-ladder rung1 {} task_x", engine_install_id())),
                 Some(&format!("agent@host:{}", std::process::id())),
             )],
             ..Default::default()
