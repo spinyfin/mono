@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -686,7 +686,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "26");
+        assert_eq!(schema_version, "27");
 
         let boothby_passes_exists: bool = conn
             .query_row(
