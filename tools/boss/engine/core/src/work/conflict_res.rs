@@ -12,6 +12,13 @@ use super::*;
 /// the whole job by hand.
 const RUNG_FULL_WORKER: i64 = 3;
 
+/// One candidate row read by
+/// [`WorkDb::reconcile_orphaned_conflict_ladder_attempts`]:
+/// `(work_item_id, product_id, pr_url, blocked_attempt_id, attempt_status,
+/// mechanical_rung_in_flight)`. `attempt_status` is `None` when
+/// `blocked_attempt_id` points at a row that no longer exists.
+type OrphanedLadderCandidate = (String, String, String, Option<String>, Option<String>, Option<i64>);
+
 impl WorkDb {
     /// Read the unified auto-maintenance opt-out flag for a product.
     /// Defaults to `true` when the column is unset or the product row
@@ -376,10 +383,11 @@ impl WorkDb {
         let now = now_string();
         let rows = tx.execute(
             "UPDATE conflict_resolutions
-                SET status           = 'succeeded',
-                    head_sha_after   = COALESCE(?2, head_sha_after),
-                    finished_at      = COALESCE(finished_at, ?3),
-                    resolved_by_rung = COALESCE(resolved_by_rung, ?4)
+                SET status                    = 'succeeded',
+                    head_sha_after            = COALESCE(?2, head_sha_after),
+                    finished_at               = COALESCE(finished_at, ?3),
+                    resolved_by_rung          = COALESCE(resolved_by_rung, ?4),
+                    mechanical_rung_in_flight = NULL
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
             params![attempt_id, head_sha_after, now, rung],
@@ -476,6 +484,73 @@ impl WorkDb {
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
             params![attempt_id, rung],
+        )?;
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+    }
+
+    /// Persist that a **mechanical** escalation-ladder rung (0 =
+    /// deterministic resolvers, 1 = engine-direct rebase) is now in flight
+    /// for this attempt, stamping the leased `cube_lease_id` /
+    /// `cube_workspace_id` alongside the rung marker. The mechanical rungs
+    /// (`crate::conflict_ladder`) run *inline* in the engine process with no
+    /// dispatched worker and no `revision_task_id`; without this durable
+    /// marker an attempt killed mid-rung by an engine restart is
+    /// indistinguishable from a fresh `pending` row and is silently
+    /// stranded — the 2026-07-18 flunge incident, where a rung-0 attempt
+    /// vanished with no verdict and left its parent `blocked:
+    /// merge_conflict` pointing at a dead attempt forever.
+    ///
+    /// Does not change `status` (kept `pending`/`running` so the existing
+    /// fall-through-to-worker paths read identically) — only the marker and
+    /// lease columns. Overwrites on a second call, so escalating rung 1 →
+    /// rung 0 simply re-stamps the new rung. Guarded to non-terminal rows;
+    /// `Ok(None)` once the attempt is terminal. Cleared by
+    /// [`Self::clear_conflict_resolution_mechanical_rung`] the moment the
+    /// rung concludes, and by every terminal transition.
+    pub fn stamp_conflict_resolution_mechanical_rung(
+        &self,
+        attempt_id: &str,
+        rung: i64,
+        cube_lease_id: &str,
+        cube_workspace_id: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET mechanical_rung_in_flight = ?2,
+                    cube_lease_id             = ?3,
+                    cube_workspace_id         = ?4
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, rung, cube_lease_id, cube_workspace_id],
+        )?;
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
+    }
+
+    /// Clear the mechanical-rung-in-flight marker (and the mechanical
+    /// lease/workspace it stamped) once a mechanical rung has concluded —
+    /// whether it retired the attempt, halted it for sign-off, or fell
+    /// through to a worker. Called unconditionally by
+    /// [`crate::conflict_ladder::try_mechanical_rungs`] right before it
+    /// releases the leased workspace, so a row only ever carries a
+    /// non-`NULL` `mechanical_rung_in_flight` while a rung is genuinely
+    /// executing. Nulling the lease/workspace here is safe: the mechanical
+    /// lease is released immediately afterwards, and a fall-through worker
+    /// re-stamps its own lease via
+    /// [`Self::mark_conflict_resolution_running`]. No status guard — this
+    /// must succeed even after the retire transition already set the row
+    /// terminal. `Ok(None)` when the id is unknown.
+    pub fn clear_conflict_resolution_mechanical_rung(&self, attempt_id: &str) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET mechanical_rung_in_flight = NULL,
+                    cube_lease_id             = NULL,
+                    cube_workspace_id         = NULL
+              WHERE id = ?1",
+            params![attempt_id],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
@@ -923,5 +998,159 @@ impl WorkDb {
             .with_context(|| format!("unknown conflict_resolution after speculative-prediction insert: {id}"))?;
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Engine-startup reconciliation for orphaned conflict-ladder attempts
+    /// (the 2026-07-18 flunge restart incident). The mechanical rungs (0/1)
+    /// run *inline* in the engine process — no dispatched worker, no
+    /// `revision_task_id` — so if the engine restarts mid-rung the
+    /// `conflict_resolutions` row is left non-terminal, the parent stays
+    /// `blocked: merge_conflict` pointing at it via `blocked_attempt_id`,
+    /// and nothing recovers it: the merge poller re-probes the blocked
+    /// parent, but `conflict_watch::on_conflict_detected`'s re-arm path
+    /// treats a pending/no-revision attempt as an "old-style crz still in
+    /// flight" and declines to dispatch, forever.
+    ///
+    /// This one-shot startup sweep breaks that wedge. For every task
+    /// `blocked: merge_conflict` whose `blocked_attempt_id` points at either
+    /// (a) a row that no longer exists, or (b) a non-terminal attempt with
+    /// `revision_task_id IS NULL` (an inline mechanical-rung attempt or a
+    /// bare pending row that no live driver owns), it:
+    ///   1. abandons the orphaned attempt and frees its UNIQUE idempotency
+    ///      slot (nullifying `base_sha_at_trigger`, like
+    ///      [`Self::abandon_conflict_resolution_for_supersede`]) so a fresh
+    ///      attempt can land at the same key,
+    ///   2. flips the parent back to `in_review` and clears
+    ///      `blocked_attempt_id` + the side-table `merge_conflict` signal,
+    ///      so the next merge-poller sweep re-detects the still-open
+    ///      conflict and re-enters the ladder cleanly, and
+    ///   3. emits an explicit trace line per recovered attempt so the death
+    ///      is observable instead of silent.
+    ///
+    /// Revision-backed non-terminal attempts (`revision_task_id` set) are
+    /// deliberately left alone: a dispatched revision worker owns them, and
+    /// `conflict_watch::supersede_if_stale` already recovers one whose
+    /// revision died in a restart on the next detection pass. Terminal
+    /// attempts (churn-exhausted, human-owned) are also left alone — a
+    /// `blocked_attempt_id` pointing at a terminal row is a legitimate
+    /// resting state, not a wedge.
+    ///
+    /// Safe to run only at startup, before the poller/watch loops spawn:
+    /// the mechanical rungs never overlap it, so any matching row is
+    /// definitively orphaned (nothing in-process is driving it).
+    ///
+    /// Edge case: `conflict_watch::maybe_spawn_conflict_revision` creates
+    /// the revision row and then stamps `revision_task_id` back onto the
+    /// attempt as two separate synchronous DB calls with no yield point in
+    /// between. A kill in that narrow window leaves a revision task
+    /// created but not yet latched, so this sweep sees `revision_task_id
+    /// IS NULL` and treats the attempt as orphaned per criterion (b) —
+    /// abandoning it and re-arming detection even though a (now-orphaned)
+    /// revision task row also exists. This is the intended, safe choice:
+    /// the window is a single instruction boundary (negligible exposure),
+    /// and the fall-through re-detect is self-healing.
+    pub fn reconcile_orphaned_conflict_ladder_attempts(&self) -> Result<Vec<RecoveredConflictLadderAttempt>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let candidates: Vec<OrphanedLadderCandidate> = {
+            let mut stmt = tx.prepare(
+                "SELECT t.id, t.product_id, t.pr_url, t.blocked_attempt_id,
+                        cr.status, cr.mechanical_rung_in_flight
+                 FROM tasks t
+                 LEFT JOIN conflict_resolutions cr ON cr.id = t.blocked_attempt_id
+                 WHERE t.status = 'blocked'
+                   AND t.blocked_reason = 'merge_conflict'
+                   AND t.blocked_attempt_id IS NOT NULL
+                   AND t.deleted_at IS NULL
+                   AND (
+                         cr.id IS NULL
+                      OR (cr.status IN ('pending', 'running') AND cr.revision_task_id IS NULL)
+                   )",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,         // work_item_id
+                    row.get::<_, String>(1)?,         // product_id
+                    row.get::<_, String>(2)?,         // pr_url
+                    row.get::<_, Option<String>>(3)?, // blocked_attempt_id
+                    row.get::<_, Option<String>>(4)?, // cr.status (None when the row is missing)
+                    row.get::<_, Option<i64>>(5)?,    // mechanical_rung_in_flight
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = now_string();
+        let mut recovered = Vec::new();
+        for (work_item_id, product_id, pr_url, blocked_attempt_id, attempt_status, rung) in candidates {
+            // Abandon the orphaned attempt when it still exists, freeing its
+            // UNIQUE (work_item_id, base_sha_at_trigger, head_sha_before)
+            // slot so the fall-through re-detect can insert a fresh attempt
+            // at the same key.
+            if attempt_status.is_some()
+                && let Some(attempt_id) = blocked_attempt_id.as_deref()
+            {
+                tx.execute(
+                    "UPDATE conflict_resolutions
+                        SET status                    = 'abandoned',
+                            failure_reason            = 'engine_restart_orphaned_ladder_attempt',
+                            base_sha_at_trigger       = NULL,
+                            resolved_by_rung          = NULL,
+                            mechanical_rung_in_flight = NULL,
+                            finished_at               = COALESCE(finished_at, ?2)
+                      WHERE id = ?1
+                        AND status IN ('pending', 'running')",
+                    params![attempt_id, now],
+                )?;
+            }
+            // Flip the parent back to in_review + clear the attempt pointer.
+            // Guarded so a row a human moved out of blocked:merge_conflict in
+            // the meantime is left alone.
+            let flipped = tx.execute(
+                "UPDATE tasks
+                    SET status             = 'in_review',
+                        blocked_reason     = NULL,
+                        blocked_attempt_id = NULL,
+                        last_status_actor  = 'engine',
+                        updated_at         = ?2
+                  WHERE id = ?1
+                    AND status = 'blocked'
+                    AND blocked_reason = 'merge_conflict'
+                    AND deleted_at IS NULL",
+                params![work_item_id, now],
+            )?;
+            if flipped == 0 {
+                continue;
+            }
+            // Clear the side-table merge_conflict signal so the polymorphic
+            // clear dispatch doesn't re-fire (mirrors
+            // `clear_chore_blocked_merge_conflict`).
+            tx.execute(
+                "UPDATE task_blocked_signals
+                    SET cleared_at = ?2
+                  WHERE work_item_id = ?1
+                    AND reason = 'merge_conflict'
+                    AND cleared_at IS NULL",
+                params![work_item_id, now],
+            )?;
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                pr_url = %pr_url,
+                attempt_id = ?blocked_attempt_id,
+                mechanical_rung_in_flight = ?rung,
+                "conflict_ladder: recovered an orphaned conflict-ladder attempt at startup — the previous \
+                 engine died mid-attempt (restart) and left the parent blocked:merge_conflict pointing at a \
+                 dead attempt; abandoned it, freed its idempotency slot, and flipped the parent back to \
+                 in_review so the watcher re-detects and re-enters the ladder",
+            );
+            recovered.push(RecoveredConflictLadderAttempt {
+                work_item_id,
+                product_id,
+                pr_url,
+                attempt_id: blocked_attempt_id,
+                rung,
+            });
+        }
+        tx.commit()?;
+        Ok(recovered)
     }
 }

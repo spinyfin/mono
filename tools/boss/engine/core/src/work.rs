@@ -186,6 +186,32 @@ pub struct AbandonedStrandedExecution {
     pub work_item_id: String,
 }
 
+/// One task recovered by
+/// [`WorkDb::reconcile_orphaned_conflict_ladder_attempts`] at engine
+/// startup — a `blocked: merge_conflict` parent whose `blocked_attempt_id`
+/// pointed at a non-terminal `conflict_resolutions` attempt that no live
+/// driver owns (an inline mechanical-rung attempt killed mid-flight by a
+/// restart, or a missing row). The reconciler abandoned the orphaned
+/// attempt, freed its idempotency slot, and flipped the parent back to
+/// `in_review` so the merge poller re-detects the still-open conflict and
+/// re-enters the ladder cleanly. Carries the owning `product_id` so the
+/// caller can publish a `work_item_changed` invalidation on the product
+/// topic, and the `rung`/`attempt_id` the death happened on for the
+/// observability trace line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredConflictLadderAttempt {
+    pub work_item_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+    /// The orphaned attempt id, or `None` when `blocked_attempt_id`
+    /// pointed at a row that no longer exists at all.
+    pub attempt_id: Option<String>,
+    /// The mechanical rung (0/1) the attempt was mid-flight on when it was
+    /// orphaned, when known (`mechanical_rung_in_flight`); `None` for a
+    /// pre-marker orphan or a missing row.
+    pub rung: Option<i64>,
+}
+
 /// One work item returned by
 /// [`WorkDb::list_dead_pr_review_candidates`] — a non-terminal work item
 /// whose latest execution is a `pr_review` that reached a terminal state

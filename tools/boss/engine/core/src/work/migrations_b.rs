@@ -1967,6 +1967,26 @@ pub(crate) fn migrate_conflict_resolutions_telemetry_columns(conn: &Connection) 
     Ok(())
 }
 
+/// Add `conflict_resolutions.mechanical_rung_in_flight`: the mechanical
+/// escalation-ladder rung (0 = deterministic resolvers, 1 = engine-direct
+/// rebase) currently being driven inline by the engine for this attempt,
+/// or `NULL` when none is. The mechanical rungs run in-process with no
+/// dispatched worker and no `revision_task_id`; a restart mid-rung would
+/// otherwise leave the attempt non-terminal with no way to tell it apart
+/// from a fresh pending row. This durable marker lets the startup
+/// reconciler recover an attempt killed mid-rung (persist-and-recover fix
+/// for the 2026-07-18 conflict-ladder restart incident). Additive and
+/// idempotent — rides the current schema-version marker.
+pub(crate) fn migrate_conflict_resolutions_mechanical_rung_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "conflict_resolutions", "mechanical_rung_in_flight")? {
+        conn.execute(
+            "ALTER TABLE conflict_resolutions ADD COLUMN mechanical_rung_in_flight INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// One-time cleanup for orphaned `merge_queue_state = 'queued'` rows left
 /// behind by terminal transitions (done/archived paths in `exec_tail.rs`,
 /// `chain_helpers.rs`, `dispatch_helpers.rs`) that predated clearing

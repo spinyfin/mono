@@ -249,6 +249,22 @@ pub struct ConflictResolution {
     /// (rung 3). `None` for non-terminal or pre-migration rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by_rung: Option<i64>,
+
+    /// Which mechanical rung (0 = deterministic resolvers, 1 =
+    /// engine-direct rebase) is *currently* being driven inline by the
+    /// engine's conflict ladder for this attempt, or `None` when no
+    /// mechanical rung is in flight. Unlike [`Self::resolved_by_rung`]
+    /// (a terminal telemetry stamp of the rung that *succeeded*), this is
+    /// a live-execution marker: the mechanical rungs run in-process with
+    /// no dispatched worker and no `revision_task_id`, so if the engine
+    /// restarts mid-rung the attempt would otherwise vanish with no
+    /// verdict. A non-`None` value on startup means the attempt was
+    /// killed mid-rung and must be recovered
+    /// ([`crate`]-side `reconcile_orphaned_conflict_ladder_attempts`).
+    /// Set when a rung begins and cleared the moment it concludes (retire,
+    /// halt, or fall-through). `None` for every non-mechanical row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical_rung_in_flight: Option<i64>,
 }
 
 fn default_review_watch_event_source() -> String {

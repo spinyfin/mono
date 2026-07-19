@@ -383,8 +383,40 @@ pub(crate) async fn try_mechanical_rungs(
         }
     };
 
+    // Persist that a mechanical rung is now in flight against this attempt,
+    // stamping the lease/workspace, so a restart mid-rung is recoverable
+    // rather than silently stranded (the 2026-07-18 incident). Cleared
+    // unconditionally below once the rung concludes. Best-effort: a failure
+    // to stamp only weakens restart recovery, it must not abort the rung.
+    if let Err(err) = work_db.stamp_conflict_resolution_mechanical_rung(
+        &attempt.id,
+        RUNG_ENGINE_DIRECT_REBASE,
+        &lease.lease_id,
+        &lease.workspace_id,
+    ) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            attempt_id = %attempt.id,
+            ?err,
+            "conflict_ladder: failed to persist in-flight mechanical-rung marker; restart recovery weakened",
+        );
+    }
+
     // From here the lease is held: run the rung and release unconditionally.
     let outcome = run_rung1_in_lease(work_db, publisher, cube_client, candidate, attempt, pr_number, &lease).await;
+
+    // The rung has concluded (retired, halted, or fell through) — clear the
+    // in-flight marker (and the mechanical lease/workspace it stamped) now,
+    // before the lease is released, so a row only ever carries a live marker
+    // while a rung is genuinely executing.
+    if let Err(err) = work_db.clear_conflict_resolution_mechanical_rung(&attempt.id) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            attempt_id = %attempt.id,
+            ?err,
+            "conflict_ladder: failed to clear in-flight mechanical-rung marker",
+        );
+    }
 
     if let Err(err) = cube_client.release_workspace(&lease.lease_id).await {
         tracing::debug!(
@@ -556,6 +588,22 @@ async fn run_rung1_in_lease(
             residual_conflicts = rebase.conflicted_files.len(),
             "conflict_ladder: escalating to rung 0 (deterministic resolvers) for rung-1 residue",
         );
+        // Update the durable in-flight marker to rung 0 so a restart during
+        // the deterministic-resolver apply/push is recovered as a rung-0
+        // death, not a rung-1 one.
+        if let Err(err) = work_db.stamp_conflict_resolution_mechanical_rung(
+            &attempt.id,
+            RUNG_DETERMINISTIC_RESOLVER,
+            &lease.lease_id,
+            &lease.workspace_id,
+        ) {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %attempt.id,
+                ?err,
+                "conflict_ladder: failed to update in-flight marker to rung 0; restart recovery weakened",
+            );
+        }
         let rung0_outcome = attempt_rung0(
             work_db,
             publisher,

@@ -4276,6 +4276,7 @@ mod compose_prompt_tests {
             event_source: "review_watch".into(),
             conflict_class: None,
             resolved_by_rung: None,
+            mechanical_rung_in_flight: None,
         }
     }
 
