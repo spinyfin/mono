@@ -1038,6 +1038,17 @@ impl WorkDb {
     /// Safe to run only at startup, before the poller/watch loops spawn:
     /// the mechanical rungs never overlap it, so any matching row is
     /// definitively orphaned (nothing in-process is driving it).
+    ///
+    /// Edge case: `conflict_watch::maybe_spawn_conflict_revision` creates
+    /// the revision row and then stamps `revision_task_id` back onto the
+    /// attempt as two separate synchronous DB calls with no yield point in
+    /// between. A kill in that narrow window leaves a revision task
+    /// created but not yet latched, so this sweep sees `revision_task_id
+    /// IS NULL` and treats the attempt as orphaned per criterion (b) —
+    /// abandoning it and re-arming detection even though a (now-orphaned)
+    /// revision task row also exists. This is the intended, safe choice:
+    /// the window is a single instruction boundary (negligible exposure),
+    /// and the fall-through re-detect is self-healing.
     pub fn reconcile_orphaned_conflict_ladder_attempts(&self) -> Result<Vec<RecoveredConflictLadderAttempt>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;

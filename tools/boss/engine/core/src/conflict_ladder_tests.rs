@@ -1092,6 +1092,77 @@ async fn reconcile_recovers_orphaned_mechanical_attempt_and_frees_its_slot() {
 }
 
 #[tokio::test]
+async fn reconcile_recovers_bare_pending_attempt_with_no_mechanical_marker() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    // A bare pending, no-marker, no-revision attempt: no rung was ever
+    // stamped (e.g. the engine died before entering rung 0, or between
+    // rungs with no marker live). `rung` must be reported as `None`, not
+    // mistaken for "nothing to recover".
+    let (_candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    assert_eq!(
+        db.get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .mechanical_rung_in_flight,
+        None,
+    );
+
+    let recovered = db.reconcile_orphaned_conflict_ladder_attempts().unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].work_item_id, chore_id);
+    assert_eq!(recovered[0].attempt_id.as_deref(), Some(attempt.id.as_str()));
+    assert_eq!(recovered[0].rung, None);
+
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "abandoned");
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("engine_restart_orphaned_ladder_attempt")
+    );
+    assert_eq!(row.base_sha_at_trigger, None, "UNIQUE slot must be freed");
+
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none());
+    assert_eq!(chore_blocked_attempt_id(&db, &chore_id), None);
+}
+
+#[tokio::test]
+async fn reconcile_recovers_parent_when_blocked_attempt_row_is_missing() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    // `blocked_attempt_id` points at a row that no longer exists (e.g.
+    // hard-deleted out of band). The LEFT JOIN reports `cr.id IS NULL`, so
+    // there is nothing to abandon, but the parent must still be flipped
+    // back to `in_review` and the dangling pointer cleared.
+    let (_candidate, attempt, chore_id) = blocked_with_attempt(&db);
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM conflict_resolutions WHERE id = ?1", [&attempt.id])
+        .unwrap();
+    assert_eq!(db.get_conflict_resolution(&attempt.id).unwrap(), None);
+    assert_eq!(
+        chore_blocked_attempt_id(&db, &chore_id).as_deref(),
+        Some(attempt.id.as_str()),
+        "the dangling pointer must still be in place before reconcile runs"
+    );
+
+    let recovered = db.reconcile_orphaned_conflict_ladder_attempts().unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].work_item_id, chore_id);
+    assert_eq!(recovered[0].attempt_id.as_deref(), Some(attempt.id.as_str()));
+    assert_eq!(recovered[0].rung, None, "no row to read a rung from");
+
+    let (status, reason) = chore_state(&db, &chore_id);
+    assert_eq!(status, "InReview");
+    assert!(reason.is_none());
+    assert_eq!(chore_blocked_attempt_id(&db, &chore_id), None);
+}
+
+#[tokio::test]
 async fn reconcile_leaves_revision_backed_and_terminal_attempts_alone() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
