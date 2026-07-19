@@ -527,6 +527,21 @@ pub async fn serve_with_merge_probe(
         crate::worker_setup::heal_worker_settings_json(&worker_settings_dir, &stable_boss_event_path);
     }
 
+    // Reap cube workspace leases orphaned by a prior engine instance's
+    // conflict-ladder rung-1 attempt (see the 2026-07-18 incident:
+    // `crate::ladder_lease_reap`'s module doc comment has the full story).
+    // Independent of the in-flight-execution reconcile below — rung-1
+    // leases carry no `work_executions` row — so this runs unconditionally
+    // and first. Best-effort; never blocks startup.
+    let ladder_leases_reaped =
+        crate::ladder_lease_reap::reap_orphaned_rung1_leases(server_state.cube_client.as_ref()).await;
+    if ladder_leases_reaped > 0 {
+        tracing::warn!(
+            count = ladder_leases_reaped,
+            "engine startup: reaped conflict-ladder rung-1 leases orphaned by a prior engine instance",
+        );
+    }
+
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
     // executions ended without being moved out of the column. See
@@ -817,6 +832,16 @@ pub async fn serve_with_merge_probe(
         server_state.cube_client.clone(),
         server_state.dispatch_events.clone(),
         crate::cube_lease_heartbeat::heartbeat_interval(),
+    );
+
+    // Belt-and-braces short-TTL heartbeat for any cube workspace lease
+    // currently held by an in-flight conflict-ladder rung-1 attempt — see
+    // `crate::ladder_lease_heartbeat`'s module doc comment. Normally a
+    // no-op: rung-1 attempts are mechanical rebases that finish in well
+    // under this sweep's interval.
+    let _ladder_lease_heartbeat_handle = crate::ladder_lease_heartbeat::spawn_loop(
+        server_state.cube_client.clone(),
+        crate::ladder_lease_heartbeat::DEFAULT_INTERVAL,
     );
 
     // Periodic pool-claim reconciler: detects worker-pool slots still
@@ -1355,6 +1380,7 @@ pub async fn serve_with_merge_probe(
             signal = graceful_shutdown_signal() => {
                 tracing::info!(signal, "shutdown signal received; releasing worker panes");
                 crate::audit::record_shutdown(format!("signal:{signal}"));
+                crate::ladder_lease_registry::release_all_on_shutdown(server_state.cube_client.as_ref()).await;
                 server_state
                     .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
                     .await;
@@ -1375,6 +1401,7 @@ pub async fn serve_with_merge_probe(
             _ = shutdown_trigger_for_loop.notified() => {
                 tracing::info!("shutdown rpc accepted; releasing worker panes");
                 crate::audit::record_shutdown("rpc");
+                crate::ladder_lease_registry::release_all_on_shutdown(server_state.cube_client.as_ref()).await;
                 server_state
                     .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
                     .await;

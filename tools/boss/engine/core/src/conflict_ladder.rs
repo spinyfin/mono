@@ -127,6 +127,15 @@ use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
 const RUNG_DETERMINISTIC_RESOLVER: i64 = 0;
 const RUNG_ENGINE_DIRECT_REBASE: i64 = 1;
 
+/// Prefix stamped on every rung-1 lease's `--task` label, followed by
+/// `crate::ladder_lease_reap::engine_install_id()` and a space, then
+/// `candidate.work_item_id` (see `try_mechanical_rungs` below). Exposed so
+/// `crate::ladder_lease_reap`'s startup sweep can scope itself to exactly
+/// the leases this engine's conflict-ladder code created *on this
+/// install* — never a worker or human lease, and never a lease created by
+/// a different engine install sharing the same cube pool.
+pub(crate) const RUNG1_TASK_LABEL_PREFIX: &str = "conflict-ladder rung1 ";
+
 /// Rung 0 (deterministic-resolver apply/commit/push, [`attempt_rung0`]) is
 /// fully implemented and unit-tested. T2562 (T9, "T2253 safety integration
 /// for the ladder") landed the result-gate: both rungs 0 and 1 route their
@@ -360,7 +369,11 @@ pub(crate) async fn try_mechanical_rungs(
         }
     };
 
-    let task_label = format!("conflict-ladder rung1 {}", candidate.work_item_id);
+    let task_label = format!(
+        "{RUNG1_TASK_LABEL_PREFIX}{} {}",
+        crate::ladder_lease_reap::engine_install_id(),
+        candidate.work_item_id
+    );
     let lease = match lease_rung1_workspace(cube_client, &repo.repo_id, &task_label).await {
         Ok(lease) => lease,
         Err(err) => {
@@ -402,7 +415,12 @@ pub(crate) async fn try_mechanical_rungs(
         );
     }
 
-    // From here the lease is held: run the rung and release unconditionally.
+    // From here the lease is held: track it so the engine shutdown path can
+    // release it if this process exits before the unconditional release
+    // below runs (see `crate::ladder_lease_registry` — closes the
+    // 2026-07-18 leaked-lease incident), then run the rung and release
+    // unconditionally.
+    crate::ladder_lease_registry::register(&lease);
     let outcome = run_rung1_in_lease(work_db, publisher, cube_client, candidate, attempt, pr_number, &lease).await;
 
     // The rung has concluded (retired, halted, or fell through) — clear the
@@ -426,6 +444,7 @@ pub(crate) async fn try_mechanical_rungs(
             "conflict_ladder: releasing rung-1 workspace failed (likely already released)",
         );
     }
+    crate::ladder_lease_registry::unregister(&lease.lease_id);
     outcome
 }
 
