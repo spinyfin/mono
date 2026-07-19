@@ -84,7 +84,11 @@ pub fn take_backup(work_db: &WorkDb, dest: &Path) -> Result<()> {
         .with_context(|| format!("backup path is not valid UTF-8: {}", dest.display()))?;
     // SQL string literal: escape embedded single quotes as ''.
     let escaped = dest_str.replace('\'', "''");
-    let conn = work_db.connect()?;
+    // A fresh, independent connection — not the shared pooled one — so this
+    // VACUUM INTO (which can run for a while on a large database) doesn't
+    // hold up every other operation on `work_db` for its duration. WAL mode
+    // lets it run alongside concurrent reads and writes on the real connection.
+    let conn = work_db.connect_new()?;
     conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
         .with_context(|| format!("VACUUM INTO {}", dest.display()))?;
     Ok(())

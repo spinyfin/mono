@@ -527,18 +527,21 @@ fn is_conflict_resolution_revision_live_true_and_false() {
     // Fresh revision rows are `todo` → live.
     assert!(db.is_conflict_resolution_revision_live(&revision).unwrap());
 
-    let conn = db.connect().unwrap();
     // A terminal status (in_review) is not live.
-    conn.execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", params![revision])
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", params![revision])
         .unwrap();
     assert!(!db.is_conflict_resolution_revision_live(&revision).unwrap());
 
     // A live-status row that is soft-deleted is not live.
-    conn.execute(
-        "UPDATE tasks SET status = 'active', deleted_at = ?2 WHERE id = ?1",
-        params![revision, now_string()],
-    )
-    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'active', deleted_at = ?2 WHERE id = ?1",
+            params![revision, now_string()],
+        )
+        .unwrap();
     assert!(!db.is_conflict_resolution_revision_live(&revision).unwrap());
 
     // Unknown id → false.

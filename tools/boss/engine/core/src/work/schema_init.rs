@@ -1,8 +1,105 @@
 use super::*;
 
+use std::sync::OnceLock;
+
 impl WorkDb {
+    /// Bring this database up to the current schema. A brand-new, empty
+    /// database is seeded directly from [`Self::final_schema_ddl`] — the
+    /// fast path, see its docs. Anything else (reopening an on-disk or
+    /// shared-cache in-memory database that already went through `init()`
+    /// once) replays the real incremental chain via
+    /// [`Self::run_full_migration_chain`], so in-place upgrades of existing
+    /// databases keep working exactly as before.
     pub(crate) fn init(&self) -> Result<()> {
         let conn = self.connect()?;
+        if Self::has_any_existing_table(&conn)? {
+            return Self::run_full_migration_chain(&conn);
+        }
+        Self::apply_final_schema_template(&conn)
+    }
+
+    /// `true` if this connection's database already has ANY user table —
+    /// not just `metadata`. Gates the fast fresh-schema template path: that
+    /// path replays `CREATE TABLE` statements captured verbatim from
+    /// `sqlite_master.sql`, which (unlike this file's own DDL) does not
+    /// retain `IF NOT EXISTS` and so errors outright if the table already
+    /// exists. A caller can hand `init()` a database that already has some
+    /// (but not all — e.g. a hand-seeded pre-v3 fixture missing `metadata`
+    /// entirely) tables, so checking only for `metadata` is not enough:
+    /// only a database with zero tables is safe to seed from the template.
+    /// Everything else must replay the real incremental chain, whose
+    /// `CREATE TABLE IF NOT EXISTS` / `table_has_column` guards tolerate a
+    /// partially-present schema.
+    fn has_any_existing_table(conn: &Connection) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table')",
+            [],
+            |row| row.get(0),
+        )
+        .context("checking for existing tables")
+    }
+
+    /// Seed a brand-new, empty database directly from the final schema DDL
+    /// instead of replaying ~80 incremental `migrate_*` calls (most of
+    /// which are column-only `ALTER TABLE`/`table_has_column` probes against
+    /// an empty database that never needed them) against an empty database.
+    /// End state is identical to [`Self::run_full_migration_chain`] — see
+    /// `full_migration_chain_produces_current_schema` in this module's
+    /// tests, which exercises the real chain directly and remains the
+    /// coverage of record for the migration steps themselves.
+    fn apply_final_schema_template(conn: &Connection) -> Result<()> {
+        for statement in Self::final_schema_ddl() {
+            conn.execute_batch(statement)?;
+        }
+        // Not schema — these establish required *data* (the local host row
+        // and its capability probe) that `run_full_migration_chain` also
+        // performs unconditionally on every call, fresh database or not.
+        crate::host_registry::ensure_local_host(conn)?;
+        crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// The current schema's full DDL — every `CREATE TABLE`/`CREATE INDEX`
+    /// statement as it stands after every migration has run — captured once
+    /// per process from a scratch in-memory database taken through the real
+    /// [`Self::run_full_migration_chain`]. `sqlite_master.sql` reflects a
+    /// table's *current* column set even after `ALTER TABLE ... ADD COLUMN`,
+    /// so this is a complete final-state snapshot, not just the original
+    /// schema-init batch.
+    fn final_schema_ddl() -> &'static [String] {
+        static DDL: OnceLock<Vec<String>> = OnceLock::new();
+        DDL.get_or_init(|| {
+            let scratch = Connection::open_in_memory().expect("open scratch db for schema template capture");
+            Self::run_full_migration_chain(&scratch).expect("run full migration chain against scratch db");
+            let mut stmt = scratch
+                .prepare(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE sql IS NOT NULL \
+                     ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END",
+                )
+                .expect("prepare schema template capture query");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("query schema template")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("collect schema template rows")
+        })
+    }
+
+    /// Every migration this database has ever needed, applied in order
+    /// against an existing connection. This is the only path for a database
+    /// that isn't brand-new (reopening an on-disk or shared-cache database
+    /// an earlier `init()` call already migrated) — every step here must
+    /// stay idempotent against its own prior output, since `init()` can run
+    /// it again on an already-current database. For a brand-new database,
+    /// [`Self::apply_final_schema_template`] reaches the same end state far
+    /// faster; that fast path's own template is itself captured by running
+    /// this function once, in [`Self::final_schema_ddl`].
+    pub(crate) fn run_full_migration_chain(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
@@ -182,15 +279,15 @@ impl WorkDb {
                 ON project_property_audit(project_id, changed_at);
             ",
         )?;
-        migrate_work_executions_v3(&conn)?;
-        migrate_tasks_autostart(&conn)?;
-        migrate_last_status_actor(&conn)?;
-        migrate_tasks_priority(&conn)?;
-        migrate_project_design_doc_columns(&conn)?;
-        migrate_tasks_created_via(&conn)?;
-        migrate_backfill_project_design_tasks(&conn)?;
-        migrate_tasks_repo_remote_url(&conn)?;
-        migrate_project_property_audit_table(&conn)?;
+        migrate_work_executions_v3(conn)?;
+        migrate_tasks_autostart(conn)?;
+        migrate_last_status_actor(conn)?;
+        migrate_tasks_priority(conn)?;
+        migrate_project_design_doc_columns(conn)?;
+        migrate_tasks_created_via(conn)?;
+        migrate_backfill_project_design_tasks(conn)?;
+        migrate_tasks_repo_remote_url(conn)?;
+        migrate_project_property_audit_table(conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
@@ -209,91 +306,91 @@ impl WorkDb {
                 WHERE repo_remote_url IS NOT NULL",
             [],
         )?;
-        migrate_timestamps_to_epoch(&conn)?;
-        migrate_tasks_blocked_reason(&conn)?;
-        migrate_products_auto_pr_maintenance_enabled(&conn)?;
-        migrate_conflict_resolutions_table(&conn)?;
-        migrate_backfill_blocked_reason_dependency(&conn)?;
-        migrate_work_attention_items_work_item_id(&conn)?;
-        migrate_work_attention_items_converted_task_id(&conn)?;
-        migrate_tasks_effort_and_model_columns(&conn)?;
-        migrate_products_default_model(&conn)?;
-        migrate_task_blocked_signals_table(&conn)?;
-        migrate_ci_remediations_table(&conn)?;
-        migrate_ci_remediations_failure_kind_columns(&conn)?;
-        migrate_ci_failure_suppressions_table(&conn)?;
-        migrate_ci_inflight_observations_table(&conn)?;
-        migrate_tasks_ci_attempt_columns(&conn)?;
-        migrate_products_ci_attempt_budget(&conn)?;
-        migrate_products_dispatch_preamble(&conn)?;
-        migrate_products_design_repo(&conn)?;
-        migrate_products_docs_repo(&conn)?;
-        migrate_products_worker_branch_prefix(&conn)?;
-        migrate_work_executions_worker_branch_prefix(&conn)?;
+        migrate_timestamps_to_epoch(conn)?;
+        migrate_tasks_blocked_reason(conn)?;
+        migrate_products_auto_pr_maintenance_enabled(conn)?;
+        migrate_conflict_resolutions_table(conn)?;
+        migrate_backfill_blocked_reason_dependency(conn)?;
+        migrate_work_attention_items_work_item_id(conn)?;
+        migrate_work_attention_items_converted_task_id(conn)?;
+        migrate_tasks_effort_and_model_columns(conn)?;
+        migrate_products_default_model(conn)?;
+        migrate_task_blocked_signals_table(conn)?;
+        migrate_ci_remediations_table(conn)?;
+        migrate_ci_remediations_failure_kind_columns(conn)?;
+        migrate_ci_failure_suppressions_table(conn)?;
+        migrate_ci_inflight_observations_table(conn)?;
+        migrate_tasks_ci_attempt_columns(conn)?;
+        migrate_products_ci_attempt_budget(conn)?;
+        migrate_products_dispatch_preamble(conn)?;
+        migrate_products_design_repo(conn)?;
+        migrate_products_docs_repo(conn)?;
+        migrate_products_worker_branch_prefix(conn)?;
+        migrate_work_executions_worker_branch_prefix(conn)?;
         // The bespoke investigation-doc pointer columns are gone — the card
         // affordance now derives from `pr_url`, mirroring the design-doc model.
         // This drop is idempotent (fresh DBs never had the columns).
-        migrate_drop_tasks_investigation_doc_columns(&conn)?;
+        migrate_drop_tasks_investigation_doc_columns(conn)?;
         // Per-task doc-pointer columns (doc_repo_remote_url / doc_branch /
         // doc_path) for the project-less doc-link card affordance —
         // investigations have no project, so they cannot reuse the
         // per-project `design_doc_*` columns. Detector-populated from the
         // PR's changed files, mirroring the design-doc model.
-        migrate_tasks_doc_pointer_columns(&conn)?;
-        migrate_backfill_task_blocked_signals(&conn)?;
-        migrate_effort_escalations_table(&conn)?;
-        migrate_null_redundant_task_repo_remote_urls(&conn)?;
+        migrate_tasks_doc_pointer_columns(conn)?;
+        migrate_backfill_task_blocked_signals(conn)?;
+        migrate_effort_escalations_table(conn)?;
+        migrate_null_redundant_task_repo_remote_urls(conn)?;
         // Runs last so the per-product `(created_at, id)` backfill
         // sees every task/project row that earlier migrations may
         // have inserted (notably `migrate_backfill_project_design_tasks`).
-        migrate_short_id_columns(&conn)?;
+        migrate_short_id_columns(conn)?;
         // Clears `autostart` on rows that have already been dispatched
         // so the single-shot semantics (AI #2, Incident 001) apply to
         // existing data too. Must run after `migrate_tasks_autostart`
         // so the column exists.
-        migrate_backfill_autostart_consumed(&conn)?;
+        migrate_backfill_autostart_consumed(conn)?;
         // Engine counter-metrics framework (phase 1). Independent of
         // every other table — runs last because order doesn't matter
         // for `CREATE TABLE IF NOT EXISTS`.
-        migrate_metrics_tables(&conn)?;
-        migrate_work_executions_pre_start_retry(&conn)?;
-        migrate_work_executions_pr_url(&conn)?;
-        migrate_work_executions_pr_head_before(&conn)?;
+        migrate_metrics_tables(conn)?;
+        migrate_work_executions_pre_start_retry(conn)?;
+        migrate_work_executions_pr_url(conn)?;
+        migrate_work_executions_pr_head_before(conn)?;
         // Positive-evidence columns for the metadata-only CI-fix finalize
         // gate (issue #1252): the PR body snapshotted at run start plus the
         // Stop-boundary "metadata delta observed" marker.
-        migrate_work_executions_metadata_fix_columns(&conn)?;
+        migrate_work_executions_metadata_fix_columns(conn)?;
         // PR poll state columns for CI + review indicators on Review-lane cards.
-        migrate_pr_poll_state_columns(&conn)?;
+        migrate_pr_poll_state_columns(conn)?;
         // External tracker binding columns (products) and per-work-item
         // upstream-ref columns (tasks) plus partial indices. Design:
         // tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md
-        migrate_external_tracker_columns(&conn)?;
+        migrate_external_tracker_columns(conn)?;
         // Host registry tables + work_executions host columns for distributed
         // agent execution (phase 1 — schema + CLI only, no dispatch change).
         // Design: tools/boss/docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md
-        crate::host_registry::migrate_host_registry_tables(&conn)?;
-        crate::host_registry::migrate_work_executions_host_columns(&conn)?;
+        crate::host_registry::migrate_host_registry_tables(conn)?;
+        crate::host_registry::migrate_work_executions_host_columns(conn)?;
         // Phase 3: add host_id / cube_workspace_id / remote_pid to work_runs
         // so the macOS app (and run-failure paths) can see which host
         // a run executed on.
-        crate::host_registry::migrate_work_runs_host_columns(&conn)?;
-        crate::host_registry::migrate_work_runs_shell_pid(&conn)?;
+        crate::host_registry::migrate_work_runs_host_columns(conn)?;
+        crate::host_registry::migrate_work_runs_shell_pid(conn)?;
         // Dispatch-time host health circuit breaker (starves-on-broken-host
         // fix): consecutive-failure counter used by
         // `record_host_dispatch_failure` / `_success` to auto-disable a
         // host that fails every dispatch instead of retrying it forever.
-        crate::host_registry::migrate_hosts_health_columns(&conn)?;
-        crate::host_registry::ensure_local_host(&conn)?;
-        crate::host_registry::refresh_local_host_auto_capabilities(&conn)?;
+        crate::host_registry::migrate_hosts_health_columns(conn)?;
+        crate::host_registry::ensure_local_host(conn)?;
+        crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         // Revision tasks (Phase 1): parent linkage column + index on tasks,
         // and soft-prefer signal on work_executions. Ships dark — the
         // `revision` kind is parseable but not yet dispatchable.
         // Design: tools/boss/docs/designs/revision-tasks.md
-        migrate_tasks_parent_task_id_column(&conn)?;
-        migrate_work_executions_prefer_is_soft(&conn)?;
-        migrate_work_executions_transient_failure_count(&conn)?;
-        migrate_work_executions_allow_dirty(&conn)?;
+        migrate_tasks_parent_task_id_column(conn)?;
+        migrate_work_executions_prefer_is_soft(conn)?;
+        migrate_work_executions_transient_failure_count(conn)?;
+        migrate_work_executions_allow_dirty(conn)?;
         // Revision card fix: update existing revision rows whose `name` was
         // set to the full description text (the original insertion behaviour).
         // The new insertion code uses only the first line; this backfill
@@ -301,117 +398,117 @@ impl WorkDb {
         // segment using SQLite string functions. Rows whose name already
         // differs from description (e.g. manually patched via `boss task edit`)
         // are intentionally skipped.
-        migrate_revision_names_to_first_line(&conn)?;
+        migrate_revision_names_to_first_line(conn)?;
         // Phase 1 of `unify-pr-remediation-on-revisions.md`: add the
         // `revision_task_id` reverse link to both attempt side-tables so
         // Phase 2+ can stamp the FK when a producer creates a revision.
         // Additive only — bespoke conflict/CI flows are untouched.
-        migrate_conflict_resolutions_revision_task_id(&conn)?;
-        migrate_ci_remediations_revision_task_id(&conn)?;
+        migrate_conflict_resolutions_revision_task_id(conn)?;
+        migrate_ci_remediations_revision_task_id(conn)?;
         // Comments in the markdown viewer (Phase 2): engine-backed comment
         // rows with W3C TextQuoteSelector anchors. Independent of every
         // other table; `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comments-in-markdown-viewer.md
-        migrate_work_comments_table(&conn)?;
+        migrate_work_comments_table(conn)?;
         // Comments Phase 3: magic-wand dispatch audit trail.
-        migrate_magic_wand_dispatches_table(&conn)?;
+        migrate_magic_wand_dispatches_table(conn)?;
         // Comments Phase 4: PR-backed doc → Boss chore worker. Adds `chore_id`
         // to `magic_wand_dispatches` for audit linkage.
-        migrate_magic_wand_dispatches_add_chore_id(&conn)?;
+        migrate_magic_wand_dispatches_add_chore_id(conn)?;
         // Automations foundation (maintenance-tasks.md): `automations`,
         // `automation_runs`, `automation_short_id_sequences` tables plus
         // `tasks.source_automation_id` provenance column. Purely additive —
         // no existing rows are touched and no behaviour changes ship with
         // this migration. Everything depends on these tables existing.
-        migrate_automations_tables(&conn)?;
-        migrate_tasks_source_automation_id(&conn)?;
+        migrate_automations_tables(conn)?;
+        migrate_tasks_source_automation_id(conn)?;
         // Attentions — new `attention_groups` and `attentions` tables for
         // agent-raised, human-actionable notifications (questions +
         // followups). Design: tools/boss/docs/designs/attentions.md.
-        migrate_attentions(&conn)?;
+        migrate_attentions(conn)?;
         // Editorial controls (P576, chore #1): per-product editorial_rules JSON
         // column, branch_naming snapshot on work_executions, and editorial_actions
         // audit table. Ships dark — no behaviour change until a product opts in.
         // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
-        migrate_editorial_controls_schema(&conn)?;
+        migrate_editorial_controls_schema(conn)?;
         // Normalise any effort_level rows stored as '' to NULL. The mapper
         // already converts '' → None at read time, but canonical DB storage
         // should use NULL (consistent with schema intent and SQL IS NULL queries).
-        migrate_tasks_empty_effort_to_null(&conn)?;
+        migrate_tasks_empty_effort_to_null(conn)?;
         // Behavior 8: upstream title/body drift detection. Adds
         // `external_ref_upstream_title` and `external_ref_upstream_body` to
         // `tasks` so the reconciler can tell apart operator edits from upstream
         // changes without parsing the description prose. Superseded by the
         // checksum migration below but kept for safe forward compatibility.
-        migrate_external_tracker_upstream_content(&conn)?;
+        migrate_external_tracker_upstream_content(conn)?;
         // Behavior 8 (revision): replace raw-content columns with SHA-256
         // checksums. Adds `external_ref_upstream_checksum` and
         // `external_ref_boss_checksum`; the old title/body columns remain in
         // the schema but are no longer read or written.
-        migrate_external_tracker_content_checksums(&conn)?;
+        migrate_external_tracker_content_checksums(conn)?;
         // P992 task 9: loop termination & bounds — per-PR review cycle
         // counter and last-reviewed SHA for the no-op skip gate.
-        migrate_tasks_review_cycle_columns(&conn)?;
+        migrate_tasks_review_cycle_columns(conn)?;
         // P783 task 2: planner_runs audit ledger + per-project idempotency gate.
         // The UNIQUE partial index is created here (after the table) so SQLite
         // can resolve the `outcome` column. `CREATE TABLE IF NOT EXISTS` +
         // `CREATE INDEX IF NOT EXISTS` make this fully idempotent.
         // Design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md
-        migrate_planner_runs_table(&conn)?;
+        migrate_planner_runs_table(conn)?;
         // P1422 task B: driver data model (mix-and-match agent-driver
         // abstraction). Adds `tasks.driver` and `products.default_driver`
         // TEXT columns. NULL resolves to the engine default (`"claude"`).
-        migrate_tasks_driver_column(&conn)?;
-        migrate_products_default_driver(&conn)?;
+        migrate_tasks_driver_column(conn)?;
+        migrate_products_default_driver(conn)?;
         // Followup provenance: origin_task_short_id and origin_pr_number
         // on kind='followup' tasks (PR-review follow-ups created when the
         // reviewed PR merges before findings are addressed).
-        migrate_tasks_followup_provenance_columns(&conn)?;
+        migrate_tasks_followup_provenance_columns(conn)?;
         // Done-lane bucketing fix: add completed_at so the kanban can group
         // done tasks by their actual completion time instead of updated_at.
-        migrate_tasks_completed_at(&conn)?;
+        migrate_tasks_completed_at(conn)?;
         // P783 task 5: tag tasks created by an auto-populate run with the
         // originating planner_runs.id, so the undo path can delete exactly
         // that batch. Purely additive nullable column; NULL for every
         // non-planner task.
-        migrate_tasks_planner_run_id(&conn)?;
+        migrate_tasks_planner_run_id(conn)?;
         // Comment intent classification (P1a): the four intent-classifier
         // columns on `work_comments`. Purely additive, `NULL` for every
         // existing row (classifier never ran on them).
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        migrate_work_comments_intent_columns(&conn)?;
+        migrate_work_comments_intent_columns(conn)?;
         // Comment intent handling (P3a): `answer_agent_runs` tracks each
         // ephemeral read-only answer-agent run against a question-classified
         // comment. Independent of every other table; `CREATE TABLE IF NOT
         // EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        migrate_answer_agent_runs_table(&conn)?;
+        migrate_answer_agent_runs_table(conn)?;
         // Archival provenance: tasks.archived_reason surfaces why the
         // engine auto-archived a revision (parent PR merged/closed) so
         // `boss task show` doesn't leave the operator guessing.
-        migrate_tasks_archived_reason(&conn)?;
+        migrate_tasks_archived_reason(conn)?;
         // Buckets 1&3 unification (P2a): `work_comments.revise_task_id`, the
         // soft FK a `CommentsReviseDoc` batch stamps on every comment it
         // addresses. Purely additive, `NULL` for every existing row.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        migrate_work_comments_revise_task_id_column(&conn)?;
+        migrate_work_comments_revise_task_id_column(conn)?;
         // Buckets 1&3 unification (P2b) / comment intent handling (P3b):
         // `comment_thread_entries`, the shared engine-authored
         // nudge/answer/follow-up table. Purely additive, `CREATE TABLE IF NOT
         // EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        migrate_comment_thread_entries_table(&conn)?;
+        migrate_comment_thread_entries_table(conn)?;
         // Magic-wand removal (P2e): retire any `work_comments` row still
         // sitting in the now-invalid `dispatched` status. Data-only, no
         // schema change; the `magic_wand_dispatches` table itself is left
         // in place, unread, as a historical record.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
-        migrate_retire_magic_wand_dispatched_comments(&conn)?;
+        migrate_retire_magic_wand_dispatched_comments(conn)?;
         // Dispatch-failure surface: tasks.dispatch_failed_reason /
         // dispatch_failed_error / dispatch_failed_at, so a task that fails
         // to start (as opposed to merely waiting on a full worker pool)
         // renders an error inline on its kanban card.
-        migrate_tasks_dispatch_failure_columns(&conn)?;
+        migrate_tasks_dispatch_failure_columns(conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker
@@ -419,24 +516,24 @@ impl WorkDb {
         // P1203 task 1: add score + merged_into_attention_id + linked_work_item_id
         // to `attentions` and create the `attention_merges` provenance ledger.
         // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
-        migrate_attentions_score_and_merges(&conn)?;
+        migrate_attentions_score_and_merges(conn)?;
         // Comment intent classifier terminal-failure surface:
         // work_comments.intent_classification_failed_at /
         // intent_classification_error, so a comment whose classifier call
         // never succeeds shows a failed state instead of an indefinite
         // "classifying…" spinner. Purely additive.
-        migrate_work_comments_classification_failure_columns(&conn)?;
+        migrate_work_comments_classification_failure_columns(conn)?;
         // Dispatch-wait surface: work_executions.dispatch_wait_reason /
         // dispatch_wait_since, so a ready-but-undispatched execution's
         // kanban card can show the real defer reason (chain_serialized,
         // pool_exhausted) instead of a generic "Waiting for a slot".
-        migrate_work_executions_dispatch_wait(&conn)?;
+        migrate_work_executions_dispatch_wait(conn)?;
         // Widen the conflict_resolutions idempotency key so the
         // stale-base re-arm path in conflict_watch can dispatch a fresh
         // attempt once a `succeeded` row's resolution has gone stale,
         // instead of colliding with that row's UNIQUE slot forever
         // (T2396 / PR #1874).
-        migrate_conflict_resolutions_widen_unique_key(&conn)?;
+        migrate_conflict_resolutions_widen_unique_key(conn)?;
         // Regression fix (T1503/T1496): SHA-delta gate in recheck_for_pr must
         // only fire for revision executions after a Stop event has been
         // observed, not the moment any commit lands on the parent PR. Without
@@ -446,17 +543,17 @@ impl WorkDb {
         // has done any work. `stop_seen` is set by `on_stop_inner` the first
         // time a Stop fires; the gate checks it before running the SHA delta
         // comparison.
-        migrate_work_executions_stop_seen(&conn)?;
+        migrate_work_executions_stop_seen(conn)?;
         // `revision_stop_contributed_head`: SHA that on_stop_inner's Contributed arm
         // observed for a revision_implementation execution. recheck_for_pr uses this
         // as the T848 recovery gate: only finalize when head matches the SHA on_stop
         // previously attempted to finalize on — not on any head movement from a
         // concurrently-active parent worker.
-        migrate_work_executions_revision_stop_contributed_head(&conn)?;
+        migrate_work_executions_revision_stop_contributed_head(conn)?;
         // Merge-queue sub-state: tasks.merge_queue_detail JSON blob (queue
         // position, GitHub's raw entry state, enqueued-at timestamp) for the
         // Review card's merging indicator (T2467/mono#1904).
-        migrate_tasks_merge_queue_detail_column(&conn)?;
+        migrate_tasks_merge_queue_detail_column(conn)?;
         // Layer 0 conflict telemetry (T1 of
         // merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md):
         // conflict_resolutions.event_source / conflict_class /
@@ -464,20 +561,20 @@ impl WorkDb {
         // worker's own `cube workspace rebase` hitting
         // `REBASED_WITH_CONFLICTS`) and per-rung outcomes are captured,
         // not just in-review `conflict_watch` detections.
-        migrate_conflict_resolutions_telemetry_columns(&conn)?;
+        migrate_conflict_resolutions_telemetry_columns(conn)?;
         // Durable in-flight marker for the mechanical escalation-ladder
         // rungs (0/1), which run inline in the engine with no dispatched
         // worker: `conflict_resolutions.mechanical_rung_in_flight`. Lets the
         // startup reconciler recover an attempt killed mid-rung by a restart
         // (2026-07-18 conflict-ladder restart incident) instead of leaving it
         // stranded and mistaken for a live "old-style" attempt forever.
-        migrate_conflict_resolutions_mechanical_rung_column(&conn)?;
+        migrate_conflict_resolutions_mechanical_rung_column(conn)?;
         // One-time cleanup of orphaned `merge_queue_state = 'queued'` rows on
         // already-terminal tasks (see `mark_chore_pr_merged` and its sibling
         // terminal-transition sites, which now clear these columns going
         // forward) — snaps stale queue positions back to 1..N immediately
         // after deploy instead of leaving dead rows in `queued` state forever.
-        migrate_clear_merge_queue_state_on_terminal_tasks(&conn)?;
+        migrate_clear_merge_queue_state_on_terminal_tasks(conn)?;
         // Boothby, the autonomous groundskeeper: boothby_passes /
         // _actions / _findings / _cursors. Independent of every other
         // table and additive-only (`CREATE TABLE IF NOT EXISTS`), so
@@ -485,7 +582,7 @@ impl WorkDb {
         // the tables exist but nothing writes them until the Boothby
         // agent lands; the actor-boothby capture in the mutation layer
         // is inert until a caller passes `LAST_STATUS_ACTOR_BOOTHBY`.
-        migrate_boothby_tables(&conn)?;
+        migrate_boothby_tables(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -494,17 +591,22 @@ impl WorkDb {
         Ok(())
     }
 
-    pub(crate) fn connect(&self) -> Result<Connection> {
-        let mut conn = if let Some(mem) = &self.memory {
-            // For in-memory databases, connect via the named shared-cache URI
-            // so every connect() call shares the same database instance.
+    /// Open the one raw connection a `WorkDb` (and every clone of it) will
+    /// ever use, with every per-connection PRAGMA/behavior setting applied
+    /// once up front. `WorkDb::connect()` just locks this connection's
+    /// mutex — see the docs on `WorkDb::conn`.
+    pub(in crate::work) fn open_raw_connection(path: &Path, memory: Option<&InMemoryAnchor>) -> Result<Connection> {
+        let mut conn = if let Some(mem) = memory {
+            // For in-memory databases, connect via the named shared-cache URI.
             Connection::open_with_flags(
                 &mem.uri,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
-            .with_context(|| format!("failed to connect to in-memory db {}", mem.uri))?
+            .with_context(|| format!("failed to open in-memory db {}", mem.uri))?
         } else {
-            Connection::open(&self.path).with_context(|| format!("failed to open work db {}", self.path.display()))?
+            Connection::open(path).with_context(|| format!("failed to open work db {}", path.display()))?
         };
         // WAL lets readers and writers coexist (read-side concurrency
         // is unaffected by an in-flight write) and `busy_timeout`
@@ -528,5 +630,113 @@ impl WorkDb {
         // the busy handler instead of racing.
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
         Ok(conn)
+    }
+
+    /// Borrow the shared connection. Every call site gets what looks like
+    /// its own `Connection` (via `Deref`/`DerefMut`) but is really a mutex
+    /// guard over the one connection this `WorkDb` (and every clone of it)
+    /// shares — see the docs on `WorkDb::conn`. A function that already
+    /// holds a `connect()` guard must drop it (e.g. scope it in a block)
+    /// before calling anything that connects again, or it deadlocks against
+    /// itself.
+    pub(crate) fn connect(&self) -> Result<PooledConnection<'_>> {
+        self.conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("work db connection lock poisoned"))
+    }
+
+    /// Escape hatch: open a brand-new connection to this database instead of
+    /// borrowing the shared pooled one. For the rare caller that genuinely
+    /// needs an independent connection — e.g. a long-running `VACUUM INTO`
+    /// snapshot that must not hold up every other operation on this `WorkDb`
+    /// for its duration (see `database_backup::take_backup`). Most callers
+    /// want [`Self::connect`], not this.
+    pub(crate) fn connect_new(&self) -> Result<Connection> {
+        Self::open_raw_connection(&self.path, self.memory.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Coverage of record for the real incremental migration chain — the
+    /// fast fresh-database path (`apply_final_schema_template`) reaches an
+    /// end state captured FROM a run of this same chain, so this is the
+    /// only place that actually exercises every `migrate_*` step in order
+    /// against a blank database.
+    #[test]
+    fn full_migration_chain_produces_current_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        WorkDb::run_full_migration_chain(&conn).unwrap();
+
+        let schema_version: String = conn
+            .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(schema_version, "26");
+
+        let boothby_passes_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'boothby_passes')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            boothby_passes_exists,
+            "expected boothby_passes table from migrate_boothby_tables, the last migration in the chain"
+        );
+
+        let dispatch_failed_reason_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'dispatch_failed_reason'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_failed_reason_columns, 1,
+            "expected tasks.dispatch_failed_reason from migrate_tasks_dispatch_failure_columns"
+        );
+
+        let local_host_exists: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM hosts WHERE id = 'local')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            local_host_exists,
+            "expected ensure_local_host to have seeded the local host row"
+        );
+    }
+
+    /// The fast path a brand-new database actually takes must reach the
+    /// exact same schema shape as the real chain: same tables, same final
+    /// column set per table (post-`ALTER TABLE ... ADD COLUMN`), same
+    /// indexes.
+    #[test]
+    fn fresh_schema_template_matches_full_migration_chain() {
+        let via_chain = Connection::open_in_memory().unwrap();
+        WorkDb::run_full_migration_chain(&via_chain).unwrap();
+
+        let via_template = Connection::open_in_memory().unwrap();
+        WorkDb::apply_final_schema_template(&via_template).unwrap();
+
+        let capture = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type || ':' || name || ':' || sql FROM sqlite_master \
+                     WHERE sql IS NOT NULL ORDER BY type, name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+        };
+
+        assert_eq!(capture(&via_chain), capture(&via_template));
     }
 }

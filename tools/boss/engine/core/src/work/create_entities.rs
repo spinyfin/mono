@@ -11,9 +11,11 @@ impl WorkDb {
                 .with_context(|| format!("failed to create work db directory {}", parent.display()))?;
         }
 
+        let conn = Self::open_raw_connection(&path, None)?;
         let db = Self {
             path,
             memory: None,
+            conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
         };
         db.init()?;
@@ -21,24 +23,18 @@ impl WorkDb {
     }
 
     /// Create a per-call named shared-cache in-memory database. Each call
-    /// gets a unique name so parallel tests never share state. The anchor
-    /// connection keeps the database alive until the `WorkDb` is dropped.
+    /// gets a unique name so parallel tests never share state. The one
+    /// connection opened here (held in `WorkDb::conn`) keeps the shared-cache
+    /// database alive until the `WorkDb` (and every clone of it) is dropped.
     pub(crate) fn open_in_memory() -> Result<Self> {
         let id = NEXT_MEM_DB_ID.fetch_add(1, Ordering::Relaxed);
         let uri = format!("file:boss_mem_{id}?mode=memory&cache=shared");
-        let anchor = Connection::open_with_flags(
-            &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("failed to open in-memory db {uri}"))?;
+        let anchor = InMemoryAnchor { uri };
+        let conn = Self::open_raw_connection(&PathBuf::from(":memory:"), Some(&anchor))?;
         let db = Self {
             path: PathBuf::from(":memory:"),
-            memory: Some(InMemoryAnchor {
-                uri,
-                _conn: Arc::new(Mutex::new(anchor)),
-            }),
+            memory: Some(anchor),
+            conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
         };
         db.init()?;

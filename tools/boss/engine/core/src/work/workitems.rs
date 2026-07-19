@@ -851,8 +851,10 @@ impl WorkDb {
     /// id. Unlike `get_work_item`, this never calls `classify_id`, so
     /// it accepts both forms without the caller choosing.
     pub fn get_work_item_resolving_short_id(&self, id: &str) -> Result<Option<WorkItem>> {
-        let conn = self.connect()?;
-        let canonical = resolve_friendly_work_item_id(&conn, id)?.unwrap_or_else(|| id.to_owned());
+        let canonical = {
+            let conn = self.connect()?;
+            resolve_friendly_work_item_id(&conn, id)?.unwrap_or_else(|| id.to_owned())
+        };
         match classify_id(&canonical) {
             Ok(_) => match self.get_work_item(&canonical) {
                 Ok(item) => Ok(Some(item)),

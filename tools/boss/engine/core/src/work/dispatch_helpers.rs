@@ -1648,10 +1648,12 @@ mod tests {
     fn record_attention_inserts_open_row_then_dedupes() {
         let db = open_db();
         let product = product_with_repo(&db, None);
-        let conn = db.connect().unwrap();
-        let work_id = insert_raw_task(&conn, &product, "chore", None);
-
-        record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
+        let work_id = {
+            let conn = db.connect().unwrap();
+            let work_id = insert_raw_task(&conn, &product, "chore", None);
+            record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
+            work_id
+        };
         let items = db.list_attention_items_for_work_item(&work_id).unwrap();
         assert_eq!(items.len(), 1, "first call inserts one row");
         let item = &items[0];
@@ -1662,7 +1664,10 @@ mod tests {
         assert_eq!(item.body_markdown, repo_unresolved_attention_body(&work_id, "chore"),);
 
         // Second call while one is already open does NOT duplicate.
-        record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
+        {
+            let conn = db.connect().unwrap();
+            record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
+        }
         assert_eq!(
             db.list_attention_items_for_work_item(&work_id).unwrap().len(),
             1,
@@ -1680,8 +1685,10 @@ mod tests {
             .create_chore(CreateChoreInput::builder().product_id(product).name("Chore").build())
             .unwrap();
 
-        let mut conn = db.connect().unwrap();
-        ensure_dispatch_repo_resolvable(&mut conn, &chore.id).unwrap();
+        {
+            let mut conn = db.connect().unwrap();
+            ensure_dispatch_repo_resolvable(&mut conn, &chore.id).unwrap();
+        }
         assert!(
             db.list_attention_items_for_work_item(&chore.id).unwrap().is_empty(),
             "a resolvable work item must not raise an attention item",
@@ -1709,8 +1716,10 @@ mod tests {
         assert_eq!(items[0].kind, "repo_unresolved");
         assert_eq!(items[0].status, "open");
 
-        let mut conn = db.connect().unwrap();
-        let _ = ensure_dispatch_repo_resolvable(&mut conn, &chore_id).unwrap_err();
+        {
+            let mut conn = db.connect().unwrap();
+            let _ = ensure_dispatch_repo_resolvable(&mut conn, &chore_id).unwrap_err();
+        }
         assert_eq!(
             db.list_attention_items_for_work_item(&chore_id).unwrap().len(),
             1,
@@ -1863,10 +1872,12 @@ mod tests {
         assert!(exec.pr_url.is_none(), "execution must start without pr_url");
 
         // Fetch the revision task row and run reconcile.
-        let conn = db.connect().unwrap();
-        let revision_task = query_task(&conn, &revision_id)
-            .unwrap()
-            .expect("revision task must exist");
+        let revision_task = {
+            let conn = db.connect().unwrap();
+            query_task(&conn, &revision_id)
+                .unwrap()
+                .expect("revision task must exist")
+        };
         let mut result = ExecutionReconcileResult::default();
         {
             let mut conn2 = db.connect().unwrap();
@@ -1876,6 +1887,7 @@ mod tests {
         }
 
         // After reconcile, the execution must have pr_url set from the chain root.
+        let conn = db.connect().unwrap();
         let updated = query_execution(&conn, &exec.id)
             .unwrap()
             .expect("execution must still exist");
@@ -1925,10 +1937,12 @@ mod tests {
             )
             .unwrap();
 
-        let conn = db.connect().unwrap();
-        let revision_task = query_task(&conn, &revision_id)
-            .unwrap()
-            .expect("revision task must exist");
+        let revision_task = {
+            let conn = db.connect().unwrap();
+            query_task(&conn, &revision_id)
+                .unwrap()
+                .expect("revision task must exist")
+        };
         let mut result = ExecutionReconcileResult::default();
         {
             let mut conn2 = db.connect().unwrap();
@@ -1937,6 +1951,7 @@ mod tests {
             tx.commit().unwrap();
         }
 
+        let conn = db.connect().unwrap();
         let (status, deleted_at): (String, Option<String>) = conn
             .query_row(
                 "SELECT status, deleted_at FROM tasks WHERE id = ?1",
@@ -1990,10 +2005,12 @@ mod tests {
             )
             .unwrap();
 
-        let conn = db.connect().unwrap();
-        let revision_task = query_task(&conn, &revision_id)
-            .unwrap()
-            .expect("revision task must exist");
+        let revision_task = {
+            let conn = db.connect().unwrap();
+            query_task(&conn, &revision_id)
+                .unwrap()
+                .expect("revision task must exist")
+        };
         let mut result = ExecutionReconcileResult::default();
         {
             let mut conn2 = db.connect().unwrap();
@@ -2002,6 +2019,7 @@ mod tests {
             tx.commit().unwrap();
         }
 
+        let conn = db.connect().unwrap();
         let (merge_queue_state, merge_queue_detail): (Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
@@ -2063,10 +2081,12 @@ mod tests {
             )
             .unwrap();
 
-        let conn = db.connect().unwrap();
-        let revision_task = query_task(&conn, &revision_id)
-            .unwrap()
-            .expect("revision task must exist");
+        let revision_task = {
+            let conn = db.connect().unwrap();
+            query_task(&conn, &revision_id)
+                .unwrap()
+                .expect("revision task must exist")
+        };
         let mut result = ExecutionReconcileResult::default();
         {
             let mut conn2 = db.connect().unwrap();
@@ -2104,6 +2124,7 @@ mod tests {
 
         // The revision itself is archived, tombstoned, and its archived_reason
         // names the followup that superseded it (not a "chore").
+        let conn = db.connect().unwrap();
         let (status, deleted_at, archived_reason): (String, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT status, deleted_at, archived_reason FROM tasks WHERE id = ?1",

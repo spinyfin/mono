@@ -79,17 +79,19 @@ fn migration_v6_to_v7_relaxes_work_attention_items() {
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    assert!(table_has_column(&conn, "work_attention_items", "work_item_id").unwrap());
-    let (exec_id, work_item_id): (Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT execution_id, work_item_id FROM work_attention_items WHERE id = 'attn_legacy'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(exec_id.as_deref(), Some("exec_legacy"));
-    assert_eq!(work_item_id, None);
+    {
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "work_attention_items", "work_item_id").unwrap());
+        let (exec_id, work_item_id): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT execution_id, work_item_id FROM work_attention_items WHERE id = 'attn_legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(exec_id.as_deref(), Some("exec_legacy"));
+        assert_eq!(work_item_id, None);
+    }
 
     // The new code path accepts a work-item-scoped insert,
     // proving the CHECK constraint is the relaxed v7 shape.
@@ -508,28 +510,32 @@ fn migration_backfills_blocked_reason_for_active_prereqs() {
 fn fresh_init_includes_ci_phase7_schema() {
     let path = temp_db_path("ci-p7-fresh");
     let db = WorkDb::open(path.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    for table in ["task_blocked_signals", "ci_remediations", "ci_failure_suppressions"] {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master \
-                     WHERE type = 'table' AND name = ?1",
-                [table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(exists, 1, "{table} table should exist after fresh init");
+    {
+        let conn = db.connect().unwrap();
+        for table in ["task_blocked_signals", "ci_remediations", "ci_failure_suppressions"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                         WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} table should exist after fresh init");
+        }
+        assert!(table_has_column(&conn, "tasks", "ci_attempt_budget").unwrap());
+        assert!(table_has_column(&conn, "tasks", "ci_attempts_used").unwrap());
+        assert!(table_has_column(&conn, "products", "ci_attempt_budget").unwrap());
     }
-    assert!(table_has_column(&conn, "tasks", "ci_attempt_budget").unwrap());
-    assert!(table_has_column(&conn, "tasks", "ci_attempts_used").unwrap());
-    assert!(table_has_column(&conn, "products", "ci_attempt_budget").unwrap());
 
     // The fresh-init `CREATE TABLE` for products carries the
     // design's documented default budget (3). A product inserted
     // through the normal path picks that up without the caller
     // having to set it.
     let product = create_test_product_with_repo(&db, "P", None);
-    let budget: i64 = conn
+    let budget: i64 = db
+        .connect()
+        .unwrap()
         .query_row(
             "SELECT ci_attempt_budget FROM products WHERE id = ?1",
             [&product.id],
