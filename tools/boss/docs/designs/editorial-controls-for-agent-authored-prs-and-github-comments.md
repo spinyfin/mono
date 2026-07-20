@@ -1,5 +1,9 @@
 # Boss: Editorial Controls for Agent-Authored PRs and GitHub Comments
 
+- **Status:** implemented (PRs #1047, #1048, #1049, #1056, #1060, #1087, #1089, #1112, #1113, #1383, #1397, #1403 — merged 2026-05-31 through 2026-06-05). This document describes the system as built; divergences from the original plan are noted inline.
+- **Rollout:** the whole feature sits behind the `editorial_controls` feature flag, **default off** (see "Feature flag" below — added during implementation, not in the original design).
+- **Known limitation:** the PreToolUse hook currently runs in **observe-only** mode — it evaluates, audits, and emits events, but its allow/rewrite/deny decision does not yet reach the worker (see Point 3).
+
 ## Problem
 
 A Boss worker writes free-form text into several GitHub-visible surfaces
@@ -72,6 +76,9 @@ or a combination. This document picks one.
      and either rewrites the body in place (for redactable taxonomy
      leaks) or blocks the call with actionable feedback (for
      structural failures like a missing template section).
+     _As built, this point is only partially realised: the evaluator
+     and handler shipped and every decision is audited, but the
+     decision does not yet flow back to the worker — see Point 3._
 - Repo conventions the user _already documented_ in
   `.github/PULL_REQUEST_TEMPLATE.md` (or its directory variant) are
   picked up automatically — the user does not re-type the template
@@ -86,7 +93,10 @@ or a combination. This document picks one.
   detector's "unique by construction" invariant.
 - Graceful degradation: every editorial rule kind defaults to "off"
   for an unconfigured product, so this design changes no behaviour
-  in `mono` until the user opts in.
+  in `mono` until the user opts in. _As built, the degradation story
+  gained an extra layer: a global `editorial_controls` feature flag
+  (default off) sits above the per-product defaults, so even the
+  baked-in rules render nothing until the operator flips the flag._
 
 ## Non-goals
 
@@ -115,8 +125,11 @@ or a combination. This document picks one.
   the hook will reject. There is no adversary here; the editorial
   controls protect the user from the worker's default vocabulary,
   not from a malicious worker.
-- **A web UI for editing rules.** v1 is a CLI verb; an app surface
-  is a follow-up after the schema settles.
+- **A web UI for editing rules.** v1 was planned as CLI-only, with an
+  app surface as a follow-up after the schema settled. In practice the
+  schema settled fast enough that the macOS app surface shipped inside
+  the same project (PRs #1397, #1403): an Editorial Controls sheet with
+  Rules / Recent Actions / Test tabs. There is still no _web_ UI.
 - **Retro-editing existing PR bodies on rule changes.** Rules apply
   at write-time. Past PRs the worker already published stay as they
   were; if the user wants them rewritten they edit by hand or run
@@ -371,6 +384,9 @@ pub struct EditorialRules {
     /// trailer (today's `Co-Authored-By: Claude …` line) — workers
     /// don't currently emit one, but `claude` may start to, and the
     /// rule lets the user say "no, our org policy is no AI trailer."
+    /// NOTE (as built): this knob shipped in the type, the CLI, and
+    /// the macOS editor, but nothing enforces it yet — no hook
+    /// watches `git commit` / `jj describe` invocations. See R9.
     pub commit_trailer_policy: TrailerPolicy,
 }
 
@@ -439,17 +455,28 @@ the right shape — same shape decision as `external_tracker_config`
 
 #### Point 1 — Branch naming, at `completion::expected_branch_name`
 
-`expected_branch_name(execution_id)` becomes
-`expected_branch_name(execution_id, branch_naming)`. The cold-path
-detector (`detect_pr` callers) takes the same arg pair so it
-reconstructs the same name from `state.db` alone. The `BranchNaming`
-strategy is read off the product's `editorial_rules` at execution
-spawn time and stored on the `executions` row (so a rule change after
-spawn doesn't break the detector's reconstruction — the row remembers
-which scheme it was opened under). This mirrors how
-`expected_branch_name` is _already_ read off `executions.id` rather
-than recomputed from the chore row; the same "snapshot at spawn,
-detect deterministically forever after" invariant holds.
+Shipped in PR #1060. `expected_branch_name` now takes
+`(execution_id: &str, branch_naming: &BranchNaming)`. This replaced
+the previous `(worker_branch_prefix: Option<&str>, execution_id)`
+signature — the old per-product `worker_branch_prefix` knob was
+subsumed by the `BranchNaming` strategy rather than kept alongside it
+(`CustomPrefix { prefix }` is its successor, with the opaque-hash
+suffix added for uniqueness). `LatePrCandidate` likewise carries
+`branch_naming` where it used to carry `worker_branch_prefix`, so the
+late-PR sweep and the primary path use the same strategy.
+
+The cold-path detector (`detect_pr` callers) takes the same arg pair
+so it reconstructs the same name from `state.db` alone. The
+`BranchNaming` strategy is read off the product's `editorial_rules` at
+execution spawn time (`resolve_execution_branch_naming` in
+`query_ensure.rs`) and frozen onto the `work_executions.branch_naming`
+column, so a rule change after spawn doesn't break the detector's
+reconstruction — the row remembers which scheme it was opened under.
+`request_resume_execution` copies `branch_naming` from the dead
+execution. This mirrors how `expected_branch_name` is _already_ read
+off the execution row rather than recomputed from the chore row; the
+same "snapshot at spawn, detect deterministically forever after"
+invariant holds.
 
 `OpaqueHash` uses `&hex::encode(Sha256::digest(execution_id))[..8]`,
 which is collision-resistant within an org's execution-id space (the
@@ -462,12 +489,19 @@ and one's hash collides with another's open PR, `gh pr list --head
 
 #### Point 2 — Prompt injection, at `runner::compose_execution_prompt`
 
-Today the prompt assembly in `engine/src/runner.rs` already prepends
+Shipped in PR #1087 (block rendering) and PR #1113 (flag gating). The
+prompt assembly in `runner.rs` already prepends
 `[product-preamble]\n{}\n[/product-preamble]` when
 `product.dispatch_preamble` is set. The same pattern adds an
-`[editorial-rules]` block when `product.editorial_rules.instructions`
-is non-empty or the baked-in defaults are active. The block is
-rendered as:
+`[editorial-rules]` block, built by a `render_editorial_rules_block()`
+helper. As built, `compose_execution_prompt` gained three inputs:
+`editorial_rules: Option<&EditorialRules>`, `pr_template_set:
+&PrTemplateSet` (loaded from the leased workspace by the
+`boss-pr-template` crate, cached per `(product_id, lease_id)`), and
+`editorial_enabled: bool` — the `editorial_controls` feature flag,
+read at spawn time; when false the block is omitted entirely. The
+product fetch moved ahead of prompt composition in `run_execution` so
+these can be passed in. When enabled, the block is rendered as:
 
 ````text
 [editorial-rules]
@@ -525,16 +559,26 @@ user hasn't configured anything.
 
 #### Point 3 — PreToolUse hook on `gh` invocations
 
+Shipped in PRs #1089 (handler) and #1112 (wiring + audit), with one
+significant as-built caveat described under "Wiring status" below.
+
 The boss-event shim already forwards every PreToolUse event to the
-engine. The engine grows a new handler for the subset of Bash
-invocations matching:
+engine. The engine's handler (`editorial_hook::evaluate_gh_pretooluse`)
+covers the subset of Bash invocations matching:
 
 ```text
 ^\s*(GIT_DIR=\S+\s+)?gh\s+(pr|issue)\s+(create|edit|comment|review)\b
 ````
 
-(the same envelope `pr_url_capture::is_gh_pr_invocation` already
-recognises; the regex moves to a shared module). The handler:
+The classification lives in a shared `gh-invocation` crate
+(`gh_invocation::classify`), extracted so `pr_url_capture`'s
+PostToolUse path and the editorial PreToolUse path can never drift on
+what counts as a `gh` invocation. During implementation the candidate
+set was **widened beyond the design's envelope**: workers in this repo
+open PRs with `cube pr create` / `cube pr update`, not bare `gh pr
+create`, so `is_editorial_candidate` also matches `cube … pr …
+create|ensure` commands — the design's gh-only regex would have missed
+the main PR-creation path entirely. The handler:
 
 1. Parses out `--body`, `--body-file` (reads the file), `--title`,
    `--message`, `--editor`, and `--web` flags.
@@ -566,13 +610,34 @@ Step 3's "in-place rewrite" is the only delicate part: claude's
 PreToolUse contract supports `permissionDecisionInput` mutation,
 which lets the hook return a _modified_ `tool_input` instead of the
 original. The hook substitutes the rewritten body into the
-`tool_input.command` string (the same parsing the redactor already
-did), and claude runs the modified command.
+`tool_input.command` string at its exact byte span (the same
+UTF-8-safe parsing the redactor already did), and claude runs the
+modified command. `PreToolUseDecision::to_hook_output` renders the
+decision (including `updatedInput`) as claude's PreToolUse hook JSON.
 
 For `--body-file <path>`, the hook _overwrites_ the file at the
 referenced path on disk before allowing the call. The path is
 inside the leased workspace (the worker is the only writer), so
 there's no shared-state concern.
+
+**Wiring status (as built): observe-only.** The `boss-event` shim and
+events socket are fire-and-forget — the shim half-closes and exits,
+and the engine never writes a response — so there is currently **no
+channel through which the handler's decision reaches the worker**.
+What actually runs today is `dispatch_editorial_on_pretooluse` (in
+`app/worker_events.rs`, called from the events-socket loop): on every
+candidate PreToolUse event it loads the product's rules
+(`WorkDb::get_editorial_context`), evaluates the command, writes an
+`editorial_actions` row, and publishes a `WorkEditorialAction` topic
+event — but a `deny` outcome does not block the `gh` call and a
+`rewrite` outcome does not mutate it. The fully-tested enforcement
+handler (`to_hook_output` and all) has no live caller; closing that
+gap — a local hook binary or a response channel on the socket — is
+the project's largest open follow-up. Two further consequences of the
+observe-only wiring: the live path passes `template_body: None` (so
+`Enforce`-tier template findings never appear even in the audit log),
+and the `EditorialAttention` produced by the three-deny loop guard is
+dropped rather than surfaced as a `WorkAttentionItem`.
 
 #### Failure handling on the hook
 
@@ -597,16 +662,40 @@ audit-pr-bodies <product>` chore that runs the rules over the
   product to ship something the rules say not to mention): the hook
   denies, the worker retries, the hook denies again. After three
   denies on the same `gh pr create` invocation within one execution
-  (the engine tracks this in-memory), the hook flips to _allow with
-  a `WorkAttentionItem`_ — the body ships, but the user gets a
-  flagged item to review. Prevents infinite loops without
-  silently surrendering the rule.
+  (tracked by an in-memory `DenyTracker` on `ServerState`, keyed
+  `(execution_id, command)`, resetting on engine restart — the safe
+  direction), the hook flips to _allow with a `WorkAttentionItem`_ —
+  the body ships, but the user gets a flagged item to review.
+  Prevents infinite loops without silently surrendering the rule.
+  (As built the tracker and the `EditorialAttention` payload exist,
+  but the attention item is not yet persisted — see "Wiring status"
+  above.)
+
+### Feature flag — global kill switch, default off
+
+Added during implementation (PR #1113), not part of the original
+design: a single `editorial_controls` flag in the engine's
+feature-flags registry, `default_enabled: false`, read at execution
+spawn time (no rebuild or restart to toggle). When off, the
+`[editorial-rules]` block is omitted from worker prompts entirely —
+including the baked-in rules. The flag inverts the design's original
+rollout posture ("baked-ins active everywhere from day one") into an
+operator opt-in: nothing about worker prompts changes until
+`editorial_controls = true` is set in `feature-flags.toml`.
+
+One as-built wrinkle: the flag gates only the prompt block. The
+audit path (`dispatch_editorial_on_pretooluse`) runs unconditionally
+— `editorial_actions` rows are written whether or not the flag is
+on, despite PR #1113's stated intent that audit writes be gated too.
+Harmless (the audit is observe-only) but inconsistent with the
+flag's documented contract.
 
 ### Default rules — every product gets the baked-ins
 
-Every product gets the identifier-redaction list and the
-"don't say Boss / engine / coordinator / work item" plain-text rules
-applied _without_ any per-product config. This is the design's
+Once the feature flag is on, every product gets the
+identifier-redaction list and the "don't say Boss / engine /
+coordinator / work item" plain-text rules applied _without_ any
+per-product config. This is the design's
 ergonomic answer to "I don't want to write rules for my personal
 product but I'd still like my PRs to not say `exec_18b07a…`":
 
@@ -632,16 +721,21 @@ short `instructions` block.
 
 ### Surfacing what the hook did
 
-Every hook decision (allow / allow-with-rewrite / deny) is forwarded
-to the engine over the events socket as a new
-`work_editorial_action` event. The engine writes it to a per-product
-audit table (`editorial_actions`) so the user can answer "which of
-my PRs had bodies rewritten by the hook?" with a CLI:
+Shipped in PR #1112. Every hook decision (allow / rewrite / deny) is
+written to a per-product audit table (`editorial_actions`) and
+published as a `WorkEditorialAction` payload on the
+`editorial_actions.<product_id>` topic, so subscribers (bossctl, the
+kanban, the macOS app) can observe decisions live. The user can
+answer "which of my PRs had bodies rewritten by the hook?" with a
+CLI:
 
 ```sh
 boss editorial show <selector>            # last 50 actions on this product
 boss editorial show <selector> --pr 1234  # actions on this PR
 ```
+
+The macOS app surfaces the same audit trail in the Editorial Controls
+sheet's "Recent Actions" tab (PR #1397).
 
 This matters in a work environment where the user wants to know that
 the hook is actually doing things (and isn't silently no-opping). It
@@ -654,12 +748,15 @@ if the rule was right, adjust.
 
 ### Column adds
 
+Shipped in PR #1047 as the schema version 13 → 14 migration
+(`migrate_editorial_controls_schema`), idempotent:
+
 ```sql
-ALTER TABLE products ADD COLUMN editorial_rules TEXT; -- JSON, NULL → all defaults
-ALTER TABLE executions ADD COLUMN branch_naming TEXT; -- snapshot at spawn, NULL → "boss_exec_prefix"
+ALTER TABLE products ADD COLUMN editorial_rules TEXT;        -- JSON, NULL → all defaults
+ALTER TABLE work_executions ADD COLUMN branch_naming TEXT;   -- snapshot at spawn, NULL → "boss_exec_prefix"
 
 CREATE TABLE IF NOT EXISTS editorial_actions (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER PRIMARY KEY,
     product_id    TEXT    NOT NULL REFERENCES products(id),
     execution_id  TEXT,            -- NULL for actions fired outside an execution
     pr_url        TEXT,            -- best-effort; populated when the gh call is on a PR
@@ -673,8 +770,13 @@ CREATE INDEX IF NOT EXISTS idx_editorial_actions_product
 ```
 
 JSON column on `products` (same shape as `external_tracker_config`,
-which the team already lives with). `executions.branch_naming` is a
-string so future strategies don't require another migration.
+which the team already lives with). `work_executions.branch_naming`
+is a string so future strategies don't require another migration.
+DB access lives in `work/editorial.rs`: `get_editorial_context`
+(single JOIN returning product id, rules, and workspace path for an
+execution), `insert_editorial_action`, and `list_editorial_actions`
+(ordered `created_at DESC`, optional `pr_url` filter, default limit
+50).
 
 ### Protocol additions
 
@@ -703,20 +805,28 @@ pub struct EditorialRules {
 // as sketched above. Default for each enum preserves today's behaviour.
 
 pub struct EditorialAction {
-    pub id: i64,
+    pub id: String,            // stringified rowid (as built; the design sketched i64)
+    pub execution_id: String,
     pub product_id: String,
-    pub execution_id: Option<String>,
-    pub pr_url: Option<String>,
-    pub tool_command: String,
     pub action: String,        // "allow" | "rewrite" | "deny"
-    pub reason: Option<String>,
     pub created_at: String,
+    pub reason: String,
+    /* pr_url, tool_command as optional fields */
 }
 
 // wire.rs
 SetProductEditorialRules { request_id: String, input: SetProductEditorialRulesInput }
 ListEditorialActions     { request_id: String, product_id: String, limit: Option<u32> }
+// Added during implementation (PR #1403), backing the macOS "Test" tab:
+EvaluateEditorialRules   { product_id: String, body: String, title: Option<String> }
+// with response event EditorialRulesEvaluated { product_id, decision, findings, rewritten_body? }
 ```
+
+All types (PR #1049) carry `#[serde(default)]`; `Default` for
+`EditorialRules` maps to today's unconstrained behaviour, and
+`Product.editorial_rules` is `Option<EditorialRules>` with
+`skip_serializing_if` so existing wire payloads round-trip. The full
+set is mirrored in `Models.swift` with `Codable` conformance.
 
 ### CLI
 
@@ -730,38 +840,60 @@ boss editorial test <selector> --body-file <p>    # runs the rules against a bod
                                                   # without touching GitHub
 ```
 
-`boss editorial test` is the rule-author's REPL — they edit
-`editorial.json`, run it against a representative PR body, see what
-the hook would do, iterate. Same pattern as `bossctl conflict
-diagnose` for the conflict-resolution worker.
+`boss editorial test` is the rule-author's REPL — set the rules on
+the product, run them against a representative PR body, see what the
+hook would do, iterate. (As built it fetches the product's stored
+rules from the engine and evaluates locally via `boss_editorial::
+evaluate`, rather than reading a rules file directly — so the loop
+is set-rules → test, not edit-file → test.) Same pattern as `bossctl
+conflict diagnose` for the conflict-resolution worker. All verbs
+shipped in PR #1383, including the `boss product show` "Editorial
+rules:" block with the R11 consolidation hint. The macOS "Test" tab
+(PR #1403) offers the same affordance over IPC via the
+`EvaluateEditorialRules` RPC.
 
-### Engine module split
+### Engine crate / module split
 
-- `engine/src/editorial.rs` (new) — rule loading, baked-in default
-  list, regex compilation + caching, `evaluate(body, rules) ->
-EditorialDecision` (the pure function).
-- `engine/src/runner.rs` — assemble the `[editorial-rules]` block
-  in `compose_execution_prompt`, read `editorial_rules` off the
-  product row.
-- `engine/src/completion.rs` —
-  `expected_branch_name(execution_id, branch_naming)` overload;
-  callers in `pr_url_capture` and `conflict_watch` thread the new
-  arg through.
-- `engine/src/pr_url_capture.rs` — refactor `is_gh_pr_invocation`
-  out to a shared `gh_invocation::classify` so the editorial
-  PreToolUse handler reuses it.
-- `engine/src/app.rs` (or wherever PreToolUse dispatch lives) — new
-  handler `handle_pretooluse_for_editorial` that calls
-  `editorial::evaluate` and serialises the decision to the hook's
-  expected JSON.
-- `cli/src/commands/product.rs` — `set-editorial-rules` verb.
-- `cli/src/commands/editorial.rs` (new) — `show` / `test` verbs.
+The design sketched engine-internal modules; per the repo's
+"prefer crates over modules" convention, the two pure pieces shipped
+as peer crates instead (smaller rebuild/retest scopes):
+
+- `tools/boss/engine/editorial/` (`boss-editorial`, PR #1056) — the
+  pure evaluator. `evaluate(body, title, rules, template_body) ->
+EditorialDecision` (`Allow` / `Rewrite { body, title, findings }` /
+  `Block { findings }`), plus `CompiledRules::compile` so callers
+  pre-compile user regexes once and reuse them across calls (the R1
+  latency budget). Baked-in default patterns live here.
+- `tools/boss/engine/pr-template/` (`boss-pr-template`, PR #1048) —
+  template loader. `load(product_id, lease_id, workspace_path) ->
+PrTemplateSet`; single-file and directory forms; cache keyed
+  `(product_id, lease_id)` so a new lease forces a fresh disk read;
+  H2/H3 heading parser that skips fenced code blocks.
+- `tools/boss/engine/gh-invocation/` (`boss-engine-gh-invocation`,
+  extracted from core after PR #1089) — `classify` +
+  `is_editorial_candidate`; shared by `pr_url_capture` (PostToolUse)
+  and the editorial path (PreToolUse) so the two can't drift.
+- `engine/core/src/editorial_hook.rs` (PR #1089) — the PreToolUse
+  handler: arg parsing, rewrite-in-place, `DenyTracker`,
+  `PreToolUseDecision::to_hook_output`.
+- `engine/core/src/work/editorial.rs` (PR #1112) — the `WorkDb`
+  methods for `editorial_actions`.
+- `engine/core/src/runner.rs` — `render_editorial_rules_block` +
+  `compose_execution_prompt` params; `completion.rs` — the
+  `expected_branch_name` signature change.
+- `cli/src/main.rs` — `boss product set-editorial-rules`,
+  `boss editorial show`, `boss editorial test`.
+- `app-macos/Sources/EditorialControlsSheet.swift` (PRs #1397,
+  #1403) — Rules / Recent Actions / Test tabs.
 
 ### Topic / event
 
-`work_editorial_action` is a new event, forwarded over the existing
-events socket. The kanban can subscribe and badge a product card
-when actions accumulate; v1 doesn't ship that UI.
+`TopicEventPayload::WorkEditorialAction` is published on the
+`editorial_actions.<product_id>` topic (helper:
+`editorial_actions_topic()`), shipped in PR #1112. The kanban could
+subscribe and badge a product card when actions accumulate; that
+badge didn't ship — the macOS Editorial Controls sheet's "Recent
+Actions" tab (PR #1397) is the shipped consumer.
 
 ---
 
@@ -772,18 +904,23 @@ run synchronously between claude deciding to run `gh pr create` and
 the bash invocation firing. If the editorial evaluator takes more
 than ~100ms, the worker feels slow. Mitigation: the evaluator is
 pure regex over a body (typically < 5KB); benchmark target is < 5ms
-per call. Pre-compile regexes at engine startup and cache by product.
+per call. `CompiledRules` exists so callers can pre-compile user
+regexes once and reuse them. (As built the audit dispatch compiles
+per event rather than caching per product — currently moot since the
+path is observe-only and off the worker's critical path, but worth a
+per-product cache when the enforcement channel lands.)
 
 **R2 — Auto-rewrite can corrupt code blocks.** A worker that wrote
 `This fixes the bug where exec_18b07a506d2518d0_1b appears in
 output` is fine to rewrite. A worker that wrote a _literal example_
 of a Boss id inside a fenced code block (`This system uses ids like
 \`exec\_…\``) is not, but the redactor will strip it anyway.
-Mitigation: the evaluator parses the body's markdown structure
-(commonmark; the repo already depends on a markdown parser for the
-designs renderer) and skips matches inside fenced code blocks. Inline
-code spans are matched but with a higher confidence bar (only
-matches anchored as full inline-code-span contents trigger).
+Mitigation (shipped in PR #1056): the evaluator's markdown-aware
+scanner skips fenced code blocks (backtick and tilde fences)
+entirely; inline code spans are matched with a higher confidence bar
+(only matches anchored as full inline-code-span contents trigger).
+As built this is a hand-rolled scanner rather than a commonmark
+parse — sufficient for fence/span detection without the dependency.
 
 **R3 — Worker oscillation on repeated denies.** The "three denies
 then allow with attention item" mitigation prevents the worker from
@@ -850,7 +987,11 @@ hook can't see the body. Per the existing worker setup,
 `$EDITOR` is intentionally unusable in the worker (see CLAUDE.md
 "Commit messages must be inline"), so the rule covers the common
 case. Mitigation: document the gap; the user is informed that
-`NoAiTrailer` is best-effort.
+`NoAiTrailer` is best-effort. _As built the situation is starker:
+no enforcement shipped at all. `TrailerPolicy` exists in the
+protocol, the CLI displays it, and the macOS sheet edits it, but
+no hook watches commit invocations and the evaluator ignores the
+field — the knob is currently inert._
 
 **R10 — Editorial rules drift from baked-in identifier patterns.**
 If the engine introduces a new id format (`run_…`, say) and the
@@ -902,55 +1043,61 @@ worker's cwd (claude's PreToolUse hook payload includes
 
 ---
 
-## Follow-up implementation chores (to enqueue once approved)
+## Implementation status
 
-Each fits one worker session.
+What shipped, by chore:
 
-1. **Schema + migration.** `products.editorial_rules` JSON,
-   `executions.branch_naming` text, `editorial_actions` table.
-   Idempotent. Existing rows default to NULL.
-2. **Protocol types.** `EditorialRules`, `RedactionRule`,
-   `RedactionKind`, `TemplatePolicy`, `BranchNaming`,
-   `TrailerPolicy`, `EditorialAction`. Mirror in `Models.swift`.
-3. **`engine/src/editorial.rs` — pure evaluator.** `evaluate(body,
-title, rules) -> EditorialDecision`. Baked-in default list. Unit
-   tests for every redaction kind, code-fence skipping, template
-   missing-section detection.
-4. **Engine: `expected_branch_name(execution_id, branch_naming)`
-   overload + plumb the new arg through `pr_url_capture` and
-   `conflict_watch`.** Acceptance: existing tests pass with
-   `BossExecPrefix`; new tests cover `OpaqueHash` and
-   `CustomPrefix`; detector reconstructs the right name from
-   `executions.branch_naming`.
-5. **Engine: `compose_execution_prompt` adds `[editorial-rules]`
-   block.** Acceptance: default-config product renders the
-   baked-in identifier rules only; configured product renders
-   the user instructions + template + enforcement banner.
-6. **Engine: PreToolUse handler for `gh pr|issue {create,edit,
-comment,review}` Bash invocations.** Acceptance: integration
-   test against a stub `gh` shim — a worker that runs
-   `gh pr create --body "<bad body>"` sees a deny; a worker that
-   runs with a body containing redactable identifiers sees an
-   allow-with-rewrite and the substituted body lands.
-7. **Engine: `editorial_actions` event emit + table writes.**
-   Acceptance: action rows appear after every hook decision; CLI
-   `boss editorial show` lists them.
-8. **CLI: `boss product set-editorial-rules` /
-   `boss editorial show` / `boss editorial test`.** Acceptance:
-   `--help` for each verb; integration test for the round-trip.
-9. **PR-template loader.** Read `.github/PULL_REQUEST_TEMPLATE.md`
-   and `.github/PULL_REQUEST_TEMPLATE/*.md` from the leased
-   workspace at spawn time; cache per product per workspace lease.
-   Acceptance: covers single-file, directory-form, missing-file.
-10. **(Optional follow-up) `boss admin audit-pr-bodies <product>`.**
-    Scan open PRs against the rules and emit a `WorkAttentionItem`
-    per violation. Out of v1; documented as the cleanup path for
-    when the hook fails open (R-engine-unreachable).
-11. **(Optional follow-up) Sub-agent rewriter for `Advise`-tier
-    template policy.** When the deterministic redactor can't fix a
-    structural issue but the user wants the PR shipped anyway, a
-    one-shot Claude call rewrites the body to fit the template.
-    Strictly opt-in; reuses the project's design-renderer infra.
+1. **Schema + migration** — PR #1047. `products.editorial_rules`
+   JSON, `work_executions.branch_naming` text, `editorial_actions`
+   table + index. Schema version 13 → 14, idempotent, ships dark.
+2. **Protocol types** — PR #1049. All types + Swift mirror, plus
+   wire stubs. `EvaluateEditorialRules` was added later (PR #1403).
+3. **Pure evaluator** — PR #1056, as the `boss-editorial` crate
+   (not an engine module). 38 unit tests.
+4. **Branch-naming overload + detector plumbing** — PR #1060.
+   Replaced the old `worker_branch_prefix` knob with `BranchNaming`.
+5. **`[editorial-rules]` prompt block** — PR #1087; flag-gated by
+   PR #1113.
+6. **PreToolUse handler** — PR #1089. Handler + integration tests
+   against a stub `gh` shim landed; **live enforcement wiring did
+   not** (fire-and-forget events socket; see Point 3 "Wiring
+   status"). What runs today is the observe-only audit dispatch.
+7. **`editorial_actions` writes + topic event** — PR #1112, plus
+   `ListEditorialActions` RPC and the `cube pr` candidate widening.
+8. **CLI verbs** — PR #1383, including engine-side persistence for
+   `SetProductEditorialRules`.
+9. **PR-template loader** — PR #1048, as the `boss-pr-template`
+   crate. Consumed by the prompt block only; the hook path does not
+   yet pass a template body.
+
+Scope added during implementation (not in the original chore list):
+
+- **Feature flag** (PR #1113) — `editorial_controls` kill switch,
+  default off.
+- **macOS Editorial Controls sheet** (PR #1397) — Rules editor +
+  Recent Actions audit tab.
+- **macOS Test tab + `EvaluateEditorialRules` RPC** (PR #1403).
+
+Not yet shipped (open follow-ups, roughly in priority order):
+
+1. **Enforcement channel for PreToolUse decisions.** The core
+   promise of Point 3 — deny/rewrite actually gating the `gh` call —
+   needs either a local hook binary whose stdout claude reads, or a
+   response channel on the events socket. Until then the hook is a
+   forensic log. Includes surfacing the three-deny
+   `EditorialAttention` as a real `WorkAttentionItem`.
+2. **Template body in the hook path.** The audit dispatch passes
+   `template_body: None`, so `Enforce`-tier template findings never
+   fire outside the prompt.
+3. **`TrailerPolicy` enforcement** (or removal of the inert knob).
+4. **Flag-gating the audit path**, to match PR #1113's stated
+   contract.
+5. **(Optional) `boss admin audit-pr-bodies <product>`.** Scan open
+   PRs against the rules and emit a `WorkAttentionItem` per
+   violation; the cleanup path for fail-open windows.
+6. **(Optional) Sub-agent rewriter for `Advise`-tier template
+   policy.** One-shot Claude call rewrites a body to fit the
+   template; strictly opt-in.
 
 ---
 
