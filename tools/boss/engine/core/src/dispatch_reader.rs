@@ -282,13 +282,21 @@ pub struct ResolvedWait {
 /// One execution that is `ready` right now but hasn't claimed a slot
 /// yet (and hasn't hit a terminal error) — a currently-blocked item
 /// for `bossctl dispatch stats`'s "top blocked" listing.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct BlockedNow {
     pub execution_id: String,
     pub work_item_id: Option<String>,
     pub ready_ts_epoch_ms: u128,
     pub wait_so_far_ms: u128,
     pub reason: String,
+    /// Dispatch pool this execution targets (`"main"` / `"automation"` /
+    /// `"review"`), read from a `request_recorded` event's
+    /// `details.pool`. `"unknown"` when no `request_recorded` event has
+    /// fired yet — i.e. exactly the never-picked-up class this report
+    /// used to drop entirely (see [`compute_wait_stats`]). Feeds
+    /// `bossctl dispatch stats`'s per-pool queue summary.
+    pub pool: String,
 }
 
 /// count / p50 / p95 / max dispatch wait, bucketed by the defer
@@ -345,14 +353,26 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
     for (execution_id, evs) in &by_execution {
         // `request_recorded` marks the execution coming off the ready
         // queue for a dispatch attempt — the closest existing event to
-        // "became ready to dispatch". A timeline with none (e.g. only
-        // reconciler-emitted events) has nothing to measure a wait
-        // against.
-        let Some(ready) = evs.iter().find(|e| e.stage == "request_recorded") else {
-            continue;
+        // "became ready to dispatch". Previously, a timeline with none
+        // was dropped entirely — but that is exactly the worst-waiter
+        // class (an execution stuck BEFORE its first dispatch attempt,
+        // e.g. the `status_transition` -> `request_recorded` gap; see
+        // T2692, 2026-07-15's post-pause backlog). Anchor on the
+        // earliest event we DO have instead of skipping — `evs` is
+        // non-empty (it only exists in `by_execution` because at least
+        // one event referenced this execution_id) and preserves file
+        // order, so `evs[0]` is the earliest surviving event.
+        let (ready_ts, work_item_id) = match evs.iter().find(|e| e.stage == "request_recorded") {
+            Some(ready) => (ready.ts_epoch_ms, ready.work_item_id.clone()),
+            None => (evs[0].ts_epoch_ms, evs[0].work_item_id.clone()),
         };
-        let ready_ts = ready.ts_epoch_ms;
-        let work_item_id = ready.work_item_id.clone();
+        let pool = evs
+            .iter()
+            .find(|e| e.stage == "request_recorded")
+            .and_then(|e| e.details.get("pool"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
 
         let last_defer_reason_upto = |upto_ts: Option<u128>| -> String {
             evs.iter()
@@ -389,6 +409,7 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
                     ready_ts_epoch_ms: ready_ts,
                     wait_so_far_ms: now_ms.saturating_sub(ready_ts),
                     reason,
+                    pool,
                 });
             }
             // A terminal error before ever claiming a slot means dispatch
@@ -422,6 +443,52 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
         by_reason,
         blocked_now: blocked,
     }
+}
+
+/// Per-pool rollup of the ready queue, for `bossctl dispatch stats`'s
+/// consolidated summary line: how many executions are currently blocked
+/// in each pool, and how long the oldest of them has been waiting.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PoolQueueSummary {
+    pub pool: String,
+    pub queued: usize,
+    pub oldest_wait_ms: u128,
+}
+
+/// Roll [`DispatchWaitReport::blocked_now`] up by pool, sorted by `queued`
+/// descending then pool name ascending. `pool` is `"unknown"` for entries
+/// whose timeline has no `request_recorded` event yet — see
+/// [`compute_wait_stats`].
+pub fn summarize_queue_by_pool(blocked_now: &[BlockedNow]) -> Vec<PoolQueueSummary> {
+    let mut by_pool: BTreeMap<&str, (usize, u128)> = BTreeMap::new();
+    for entry in blocked_now {
+        let bucket = by_pool.entry(entry.pool.as_str()).or_insert((0, 0));
+        bucket.0 += 1;
+        bucket.1 = bucket.1.max(entry.wait_so_far_ms);
+    }
+    let mut out: Vec<PoolQueueSummary> = by_pool
+        .into_iter()
+        .map(|(pool, (queued, oldest_wait_ms))| PoolQueueSummary {
+            pool: pool.to_owned(),
+            queued,
+            oldest_wait_ms,
+        })
+        .collect();
+    out.sort_by(|a, b| b.queued.cmp(&a.queued).then_with(|| a.pool.cmp(&b.pool)));
+    out
+}
+
+/// Count `worker_claimed`/`ok` events (successful dispatch completions)
+/// within `[now_ms - window_ms, now_ms]` — the dispatch-completion rate
+/// for `bossctl dispatch stats`'s "dispatch rate over last N min" line.
+pub fn dispatches_in_window(events: &[DispatchEvent], now_ms: u128, window_ms: u128) -> usize {
+    let cutoff = now_ms.saturating_sub(window_ms);
+    events
+        .iter()
+        .filter(|e| {
+            e.stage == "worker_claimed" && e.outcome == "ok" && e.ts_epoch_ms >= cutoff && e.ts_epoch_ms <= now_ms
+        })
+        .count()
 }
 
 /// Nearest-rank percentile over an already-ascending-sorted slice.
@@ -489,6 +556,69 @@ pub fn pending_stalls(root: &Path, now_ms: u128, thresholds: &StageThresholds) -
             continue;
         };
         out.push(stall);
+    }
+    Ok(out)
+}
+
+/// Walk every per-execution mirror under `root` and return timelines
+/// whose current (non-`stage_stalled`) stage has been stuck for at least
+/// `threshold_ms` — independent of the smaller per-stage
+/// [`StageThresholds`] used to decide when to emit the `stage_stalled`
+/// event itself (see [`pending_stalls`]).
+///
+/// Unlike `pending_stalls`, this does NOT dedupe against a prior
+/// `stage_stalled` line: `stage_stalled` is write-only telemetry with no
+/// alert or attention item behind it (`dispatch_events.rs`'s own doc
+/// calls this out — "does NOT auto-remediate"), so a stall that has sat
+/// past a much larger, operator-facing threshold needs to keep
+/// surfacing on every pass. The caller (the attention-escalation sweep)
+/// owns its own idempotency via a DB-side open-attention-item upsert, so
+/// re-including an already-surfaced stall here is what lets that sweep
+/// refresh the item's elapsed-time text on each tick instead of freezing
+/// it at the first trip.
+pub fn persistently_stalled(root: &Path, now_ms: u128, threshold_ms: u128) -> Result<Vec<StalledStage>> {
+    let executions_dir = root.join("executions");
+    let read_dir = match fs::read_dir(&executions_dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("opening {}", executions_dir.display()));
+        }
+    };
+
+    let mut out = Vec::new();
+    for dirent in read_dir {
+        let dirent = dirent.with_context(|| format!("reading {}", executions_dir.display()))?;
+        let path = dirent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(execution_id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let dispatch_path = path.join("dispatch.jsonl");
+        if !dispatch_path.exists() {
+            continue;
+        }
+        let events = read_jsonl(&dispatch_path)?;
+        let Some(last_real) = events.iter().rev().find(|e| e.stage != "stage_stalled") else {
+            continue;
+        };
+        if is_terminal_event(last_real) {
+            continue;
+        }
+        let elapsed = now_ms.saturating_sub(last_real.ts_epoch_ms);
+        if elapsed < threshold_ms {
+            continue;
+        }
+        out.push(StalledStage {
+            execution_id: execution_id.to_owned(),
+            work_item_id: last_real.work_item_id.clone(),
+            stalled_stage: last_real.stage.clone(),
+            stalled_outcome: last_real.outcome.clone(),
+            last_ts_epoch_ms: last_real.ts_epoch_ms,
+            elapsed_in_stage_ms: elapsed,
+        });
     }
     Ok(out)
 }
@@ -984,6 +1114,74 @@ mod tests {
         assert_eq!(report.blocked_now[1].wait_so_far_ms, 100);
     }
 
+    /// The pre-request_recorded blind spot (T2692, 2026-07-15): an
+    /// execution that never received a `request_recorded` event — e.g. it
+    /// is stuck between `status_transition` and its first dispatch
+    /// attempt — must still show up as blocked, with its wait measured
+    /// from the earliest event we do have, not dropped from the report
+    /// entirely.
+    #[test]
+    fn compute_wait_stats_includes_never_picked_up_executions() {
+        let events = vec![ev(
+            Stage::StatusTransition,
+            Outcome::Ok,
+            "exec-stuck-pre-pickup",
+            0,
+            serde_json::Value::Null,
+        )];
+        let report = compute_wait_stats(&events, 840_000, None);
+        assert_eq!(report.blocked_now.len(), 1);
+        let entry = &report.blocked_now[0];
+        assert_eq!(entry.execution_id, "exec-stuck-pre-pickup");
+        assert_eq!(entry.ready_ts_epoch_ms, 0);
+        assert_eq!(entry.wait_so_far_ms, 840_000);
+        assert_eq!(entry.reason, "pending_first_attempt");
+        assert_eq!(entry.pool, "unknown", "no request_recorded event means pool is unknown");
+    }
+
+    /// A never-picked-up execution that DOES eventually claim a slot (some
+    /// paths, e.g. force-dispatch, can skip `request_recorded` entirely)
+    /// must land in `by_reason`, anchored on its earliest event, rather
+    /// than being dropped.
+    #[test]
+    fn compute_wait_stats_resolves_execution_with_no_request_recorded() {
+        let events = vec![
+            ev(
+                Stage::StatusTransition,
+                Outcome::Ok,
+                "exec-force",
+                0,
+                serde_json::Value::Null,
+            ),
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Ok,
+                "exec-force",
+                300,
+                serde_json::Value::Null,
+            ),
+        ];
+        let report = compute_wait_stats(&events, 1_000, None);
+        assert!(report.blocked_now.is_empty());
+        assert_eq!(report.by_reason.len(), 1);
+        assert_eq!(report.by_reason[0].max_ms, 300);
+    }
+
+    /// `pool` is read from `request_recorded`'s `details.pool` when that
+    /// event exists, powering the per-pool queue summary.
+    #[test]
+    fn compute_wait_stats_reads_pool_from_request_recorded_details() {
+        let events = vec![ev(
+            Stage::RequestRecorded,
+            Outcome::Ok,
+            "exec-auto",
+            0,
+            serde_json::json!({"pool": "automation"}),
+        )];
+        let report = compute_wait_stats(&events, 1_000, None);
+        assert_eq!(report.blocked_now[0].pool, "automation");
+    }
+
     #[test]
     fn compute_wait_stats_excludes_executions_that_errored_before_claiming() {
         let events = vec![
@@ -1051,5 +1249,132 @@ mod tests {
         assert_eq!(percentile_ms(&sorted, 50.0), 30);
         assert_eq!(percentile_ms(&sorted, 95.0), 50);
         assert_eq!(percentile_ms(&[], 50.0), 0);
+    }
+
+    fn blocked(execution_id: &str, wait_so_far_ms: u128, pool: &str) -> BlockedNow {
+        BlockedNow {
+            execution_id: execution_id.to_owned(),
+            work_item_id: None,
+            ready_ts_epoch_ms: 0,
+            wait_so_far_ms,
+            reason: "pool_exhausted".to_owned(),
+            pool: pool.to_owned(),
+        }
+    }
+
+    #[test]
+    fn summarize_queue_by_pool_groups_and_finds_oldest_per_pool() {
+        let entries = vec![
+            blocked("exec-a", 1_000, "main"),
+            blocked("exec-b", 5_000, "main"),
+            blocked("exec-c", 2_000, "automation"),
+        ];
+        let summary = summarize_queue_by_pool(&entries);
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].pool, "main");
+        assert_eq!(summary[0].queued, 2);
+        assert_eq!(summary[0].oldest_wait_ms, 5_000);
+        assert_eq!(summary[1].pool, "automation");
+        assert_eq!(summary[1].queued, 1);
+        assert_eq!(summary[1].oldest_wait_ms, 2_000);
+    }
+
+    #[test]
+    fn summarize_queue_by_pool_sorts_by_queued_desc_then_pool_name() {
+        let entries = vec![
+            blocked("exec-a", 1_000, "review"),
+            blocked("exec-b", 1_000, "automation"),
+        ];
+        let summary = summarize_queue_by_pool(&entries);
+        // Tied queue depth (1 each) -> alphabetical.
+        assert_eq!(summary[0].pool, "automation");
+        assert_eq!(summary[1].pool, "review");
+    }
+
+    #[test]
+    fn summarize_queue_by_pool_empty_input_yields_empty_output() {
+        assert!(summarize_queue_by_pool(&[]).is_empty());
+    }
+
+    #[test]
+    fn dispatches_in_window_counts_only_worker_claimed_ok_within_window() {
+        let events = vec![
+            ev(Stage::WorkerClaimed, Outcome::Ok, "e1", 9_000, serde_json::Value::Null),
+            ev(Stage::WorkerClaimed, Outcome::Ok, "e2", 9_500, serde_json::Value::Null),
+            // Outside the window.
+            ev(Stage::WorkerClaimed, Outcome::Ok, "e3", 1_000, serde_json::Value::Null),
+            // Skipped, not a completed dispatch.
+            ev(
+                Stage::WorkerClaimed,
+                Outcome::Skipped,
+                "e4",
+                9_600,
+                serde_json::Value::Null,
+            ),
+        ];
+        assert_eq!(dispatches_in_window(&events, 10_000, 5_000), 2);
+    }
+
+    #[test]
+    fn dispatches_in_window_empty_events_yields_zero() {
+        assert_eq!(dispatches_in_window(&[], 10_000, 5_000), 0);
+    }
+
+    #[tokio::test]
+    async fn persistently_stalled_includes_entries_past_flat_threshold_ignoring_prior_flag() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+
+        let mut a = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-x");
+        a.ts_epoch_ms = 0;
+        write(&sink, a).await;
+        // Already flagged by the (smaller-threshold) stage_stalled
+        // detector — persistently_stalled must still return this entry,
+        // unlike `pending_stalls`.
+        let mut flag = DispatchEvent::new(Stage::StageStalled, Outcome::Ok, "exec-x");
+        flag.ts_epoch_ms = 6_500;
+        flag.details = serde_json::json!({
+            "stalled_stage": "cube_change_created",
+            "stalled_outcome": "ok",
+            "stalled_at_ts_epoch_ms": 0,
+        });
+        write(&sink, flag).await;
+
+        let stalls = persistently_stalled(dir.path(), 400_000, 300_000).unwrap();
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(stalls[0].execution_id, "exec-x");
+        assert_eq!(stalls[0].stalled_stage, "cube_change_created");
+        assert_eq!(stalls[0].elapsed_in_stage_ms, 400_000);
+    }
+
+    #[tokio::test]
+    async fn persistently_stalled_excludes_entries_under_threshold() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+        let mut a = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-fresh");
+        a.ts_epoch_ms = 0;
+        write(&sink, a).await;
+
+        let stalls = persistently_stalled(dir.path(), 100_000, 300_000).unwrap();
+        assert!(stalls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistently_stalled_excludes_terminal_timelines() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+        let mut a = DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-done");
+        a.ts_epoch_ms = 0;
+        write(&sink, a).await;
+
+        let stalls = persistently_stalled(dir.path(), 9_999_999, 300_000).unwrap();
+        assert!(stalls.is_empty());
+    }
+
+    #[test]
+    fn persistently_stalled_on_missing_root_yields_empty() {
+        let dir = TempDir::new().unwrap();
+        let stalls = persistently_stalled(dir.path(), 1_000_000, 300_000).unwrap();
+        assert!(stalls.is_empty());
     }
 }

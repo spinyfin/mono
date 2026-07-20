@@ -200,6 +200,38 @@ impl WorkDb {
         }
     }
 
+    /// File (idempotently) the operator-visible attention item raised when
+    /// [`crate::dispatch_stall_escalation`] finds a dispatch timeline stuck
+    /// in one stage past
+    /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`] —
+    /// see [`crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND`]. Reuses
+    /// [`Self::upsert_external_tracker_attention`] so repeated sweep ticks
+    /// refresh the same row's elapsed-time text instead of piling up
+    /// duplicates; the item stays open until the execution finally claims a
+    /// worker slot (`Coordinator::dispatch_claimed_execution` resolves it).
+    ///
+    /// Best-effort: a failure here is logged and swallowed by the caller
+    /// rather than aborting the sweep pass.
+    pub fn file_dispatch_stage_stalled_attention(
+        &self,
+        work_item_id: &str,
+        execution_id: &str,
+        stalled_stage: &str,
+        elapsed_secs: u64,
+        threshold_secs: u64,
+    ) -> Result<()> {
+        let elapsed_minutes = elapsed_secs / 60;
+        let title = format!("Dispatch stuck at `{stalled_stage}` for {elapsed_minutes}m");
+        let body = format!(
+            "Execution `{execution_id}` has been in dispatch stage `{stalled_stage}` for {elapsed_secs}s \
+             without progressing — past the persistent-stall threshold ({threshold_secs}s).\n\n\
+             This clears automatically once the execution claims a worker slot. See `bossctl dispatch \
+             diagnose {execution_id}` for the full timeline, or `bossctl dispatch ghost-active \
+             --include-stalled` for every currently-stuck execution."
+        );
+        self.upsert_external_tracker_attention(work_item_id, DISPATCH_STAGE_STALLED_ATTENTION_KIND, &title, &body)
+    }
+
     /// Mark every open `worker_escalation` / `worker_blocked` attention item
     /// for `execution_id` as resolved. Returns the count resolved (`0` when
     /// none were open — a normal, non-error case).

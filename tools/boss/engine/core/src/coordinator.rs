@@ -1482,6 +1482,7 @@ pub(crate) fn occupying_live_worker(
 fn default_coordinator_metrics() -> Arc<Registry> {
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
+    crate::dispatch_metrics::register_metrics(&metrics);
     metrics
 }
 
@@ -1741,6 +1742,7 @@ impl ExecutionCoordinator {
         // on "counter not registered" in a test context.
         let local_metrics = Arc::new(Registry::new());
         register_metrics(&local_metrics);
+        crate::dispatch_metrics::register_metrics(&local_metrics);
         let host_adapter_provider: Arc<dyn HostAdapterProvider> =
             Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {
@@ -2310,7 +2312,12 @@ impl ExecutionCoordinator {
         // the symptom motivating this fix (see `task_18ae9d21044843b8_44`).
         loop {
             self.scheduling_pending.store(false, Ordering::Release);
+            let drain_started_at = std::time::Instant::now();
             let drain_outcome = self.drain_ready_queue().await;
+            crate::dispatch_metrics::record_drain_pass_duration_ms(
+                &self.metrics,
+                drain_started_at.elapsed().as_millis() as i64,
+            );
 
             // Pool-exhaustion exits don't re-loop here: another
             // scheduler will spawn from the post-`release_worker`
@@ -2677,6 +2684,33 @@ impl ExecutionCoordinator {
                 return DrainOutcome::QueueEmpty;
             }
         };
+
+        // Queue-level depth/oldest-wait gauges, sampled here (before the
+        // pause gate and any filtering below) so they reflect the true
+        // ready-queue state on every pass — including an all-zero
+        // snapshot on an empty queue, and the real backlog while dispatch
+        // sits paused. See `dispatch_metrics.rs`.
+        {
+            let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+            let mut snapshot = crate::dispatch_metrics::QueueSnapshot::default();
+            for execution in &executions {
+                let is_review = self.execution_targets_review_pool(execution);
+                let is_automation = !is_review && self.execution_targets_automation_pool(execution);
+                let sample = if is_review {
+                    &mut snapshot.review
+                } else if is_automation {
+                    &mut snapshot.automation
+                } else {
+                    &mut snapshot.main
+                };
+                sample.depth += 1;
+                if let Some(created_secs) = execution.created_epoch() {
+                    let age_secs = (now_secs - created_secs).max(0);
+                    sample.oldest_wait_secs = sample.oldest_wait_secs.max(age_secs);
+                }
+            }
+            crate::dispatch_metrics::record_queue_snapshot(&self.metrics, snapshot);
+        }
 
         if executions.is_empty() {
             return DrainOutcome::QueueEmpty;
@@ -3644,6 +3678,24 @@ impl ExecutionCoordinator {
                     })),
             )
             .await;
+        crate::dispatch_metrics::record_dispatch_completed(&self.metrics);
+        // Clear any `dispatch_stage_stalled` attention item this execution
+        // may have accumulated while it sat stuck pre-dispatch — it just
+        // claimed a slot, so whatever was blocking it is resolved. Mirrors
+        // how the churn-guard `parked` attention item resolves on the work
+        // item's next successful dispatch attempt rather than being
+        // proactively cleared by the sweep that raised it.
+        if let Err(err) = self.work_db.resolve_external_tracker_attention(
+            &execution.work_item_id,
+            crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "failed to resolve dispatch_stage_stalled attention item on successful claim",
+            );
+        }
         if let Err(err) = self.work_db.clear_dispatch_wait_reason(&execution.id) {
             tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
         }
