@@ -269,7 +269,7 @@ async fn on_stop_excludes_earlier_run_task_and_records_failed_will_retry() {
     let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());
 
     let earlier_task = db
-        .create_automation_task(&automation_id, "from an earlier triage run", None)
+        .create_automation_task(&automation_id, "from an earlier triage run", None, &[], &[])
         .unwrap();
     {
         let conn = db.connect().unwrap();
@@ -329,7 +329,7 @@ async fn on_stop_recovers_task_created_by_this_run_as_produced_task() {
         .unwrap();
     }
     let this_run_task = db
-        .create_automation_task(&automation_id, "created by this run", None)
+        .create_automation_task(&automation_id, "created by this run", None, &[], &[])
         .unwrap();
     {
         let conn = db.connect().unwrap();

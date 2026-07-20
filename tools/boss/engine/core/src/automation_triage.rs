@@ -36,11 +36,13 @@
 //! treated as the primary signal by
 //! [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`],
 //! and the marker — when it *does* parse — as a same-answer fast-path
-//! override, not the thing recovery falls back to. The marker parser still
-//! enforces "exactly one"; the transactional cap re-check at
-//! `boss task create --automation` (see
-//! [`crate::work::WorkDb::create_automation_task`]) remains the backstop
-//! against a misbehaving agent fanning out.
+//! override, not the thing recovery falls back to. The marker parser does
+//! not enforce "exactly one": it scans the joined transcript in reverse and
+//! takes the last marker-shaped line, so a marker the agent narrated earlier
+//! (e.g. quoting the preamble's example) cannot shadow the real final
+//! decision. The transactional cap re-check at `boss task create
+//! --automation` (see [`crate::work::WorkDb::create_automation_task`])
+//! remains the backstop against a misbehaving agent fanning out.
 
 use std::sync::Arc;
 
@@ -939,13 +941,10 @@ mod tests {
         );
     }
 
-    /// Round-trip check closing the loop the module doc describes: every
-    /// literal `automation: task`/`automation: skip` example line the
-    /// preamble shows the agent must itself parse cleanly, so a future edit
-    /// to either the preamble's wording or the validator's matching rules
-    /// can't silently drift the two apart again (the failure mode this test
-    /// would have caught immediately if it were the actual root cause of the
-    /// 0/67 marker rate — see the module doc).
+    /// Every literal `automation: task`/`automation: skip` example line the
+    /// preamble shows the agent must itself parse cleanly, so an edit to
+    /// either the preamble's wording or the validator's matching rules
+    /// cannot silently drift the two apart.
     #[test]
     fn preamble_marker_examples_round_trip_through_the_validator() {
         let automation = Automation::builder()
@@ -961,7 +960,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[]);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
 
         let marker_lines: Vec<&str> = preamble
             .lines()
