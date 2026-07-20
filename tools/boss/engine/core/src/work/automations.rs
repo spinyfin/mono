@@ -272,15 +272,18 @@ impl WorkDb {
     /// open-task cap is otherwise holding open) is never misattributed to
     /// *this* run. Without the bound, "most recent" is a guess across the
     /// automation's entire history; with it, the row must have been created
-    /// no earlier than the run being finalized. `None` preserves the
-    /// unbounded historical behaviour (used by callers, like the dead-pane
-    /// reconciler, that only have the automation id).
+    /// no earlier than the run being finalized. `None` disables the bound
+    /// entirely — no production caller does this today; both call sites
+    /// (`completion.rs`'s Stop-driven finalizer and `execution_liveness.rs`'s
+    /// dead-pane reconciler) pass their execution's creation time. It exists
+    /// for callers with no execution context, and for tests asserting the
+    /// unbounded ordering behaviour.
     ///
     /// This is the primary decision-derivation path for a triage run's
     /// finalization (see [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`]):
     /// the decision marker the triage agent is asked to emit is, in practice,
-    /// almost never present in the transcript (2026-07-20 coordinator audit:
-    /// 0/67 recent `produced_task` finalizations found a valid marker), so
+    /// almost never present in the transcript (a measurement of 67 recent
+    /// `produced_task` finalizations found none with a valid marker), so
     /// this DB-state-derived recovery — not the marker — is what actually
     /// determines the outcome for the overwhelming majority of runs. The
     /// marker remains a fast-path override: when it *is* present and

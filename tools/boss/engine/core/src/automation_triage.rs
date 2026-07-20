@@ -19,11 +19,9 @@
 //!
 //! ## The marker protocol (design Risk #3) — and why it is not the primary signal
 //!
-//! The design's original bet was that the triage agent would reliably emit
-//! *exactly one* decision marker and **not** do the work itself. In practice
-//! it does not: a 2026-07-20 coordinator audit found 0 of 67 recent
-//! `produced_task` finalizations contained a marker the parser accepted —
-//! every one was decided by
+//! The decision marker is unreliable in practice: a measurement of 67
+//! consecutive `produced_task` finalizations found none carrying a marker
+//! the parser accepted — every one was decided by
 //! [`crate::work::WorkDb::find_most_recent_open_task_for_automation`]'s
 //! DB-state recovery instead. This is not a parser bug (the parser accepts
 //! exactly the marker text the preamble instructs, see the
@@ -33,10 +31,10 @@
 //! `completion.rs`). It is that a single-shot agent asked to both
 //! investigate *and* end its very last line with an exact, bare, no-prose-
 //! after-it string essentially never complies literally, even when it
-//! reaches the right decision. So the contract has been inverted in
-//! practice: [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`]
-//! treats the DB-derived decision (a task actually created, or a final
-//! message that plainly concludes "nothing to do") as the primary signal,
+//! reaches the right decision. So the DB-derived decision (a task actually
+//! created, or a final message that plainly concludes "nothing to do") is
+//! treated as the primary signal by
+//! [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`],
 //! and the marker — when it *does* parse — as a same-answer fast-path
 //! override, not the thing recovery falls back to. The marker parser still
 //! enforces "exactly one"; the transactional cap re-check at
@@ -963,7 +961,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product");
+        let preamble = render_triage_preamble(&automation, "My Product", &[]);
 
         let marker_lines: Vec<&str> = preamble
             .lines()
