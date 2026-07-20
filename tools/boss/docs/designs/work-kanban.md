@@ -198,6 +198,42 @@ When grouped by project:
 Grouping should be a presentation choice only. It should not change storage or
 identity.
 
+### 3. Archived projects are excluded by default
+
+`ChatViewModel.projectsForSelectedProduct` filters out any project whose
+`status` is `archived` unless the user has toggled `showArchivedProjects`
+on (default off). Every project-scoped task kind — `design`, `project_task`,
+`investigation`, `revision`, `design_postmortem` — only ever reaches the
+board through its parent project's section (`ChatViewModel.swift`'s
+`projectFilter` loop). A project-scoped task whose parent project is
+archived therefore has no section to render into and is invisible on the
+board, **regardless of the task's own status or whether it has a live
+worker running against it.**
+
+This is a deliberate default for the common case (an archived project's
+finished work shouldn't clutter the board), but it is a real visibility gap
+for the uncommon case: a task on an archived project that is still `todo`,
+`active`, or `in_review` with a running worker is exactly as invisible as
+one that is `done`. Incident postmortem-archived-fanout-2026-07-20 hit this
+when the engine's `design_postmortem` sweep (see
+`project_postmortem_sweep.rs`) auto-created and dispatched postmortem tasks
+against several already-archived projects — the board query was correct
+(it does include `design_postmortem`), but every one of those cards was
+unreachable through the client-side archived-project filter, so the
+operator had no way to see or steer work that was actively burning worker
+time.
+
+The fix landed on the _producer_ side, not the board: the sweep now skips
+archived projects entirely (a postmortem is never created for one), so the
+invariant "a work item with a dispatched worker must be representable on
+the board" holds without changing the board's deliberate archived-project
+default. The general hazard remains for any other subsystem that might
+create or reactivate work on an archived project — the board currently has
+no escape hatch (e.g. "show archived projects that have a live worker")
+for that case; if a future subsystem needs one, that is a board-side
+design question, not something the postmortem-sweep fix should be
+generalized to solve on its own.
+
 ## Board Interactions
 
 ### Create
