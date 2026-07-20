@@ -1,18 +1,19 @@
 # Design: Automatic Boss updates
 
-Status: **Draft — for review**
-Owner: Boss
-Related: [`installable-distribution-package-for-boss.md`](installable-distribution-package-for-boss.md) (this is the deferred "Auto-update / Sparkle / a release feed" follow-on it names), [`buildkite-release-setup.md`](../buildkite-release-setup.md)
+- Status: **Shipped** — updated 2026-07-20 to reflect as-built reality after the T1–T8 implementation PRs (#911, #926, #927, #953, #954, #956, #978, #996) and the follow-on fix/polish PRs (#1086, #1226, #1238, #1855) they triggered.
+- Owner: Boss
+- Related: [`installable-distribution-package-for-boss.md`](installable-distribution-package-for-boss.md) (this is the deferred "Auto-update / Sparkle / a release feed" follow-on it names), [`buildkite-release-setup.md`](../buildkite-release-setup.md)
+- Implementation history: see [Implementation history](#implementation-history) at the end for the task→PR mapping and what diverged.
 
 ## Context
 
 Boss is distributed as a macOS `.app` bundle. The Buildkite release pipeline (`.buildkite/steps/boss-release.sh`) cuts a GitHub Release on `spinyfin/mono`, tagged `boss-v1.0.N`, with a single asset `Boss-1.0.N.zip` — a zipped, codesigned `Boss.app`. Users today have no in-app way to learn a newer build exists; they must notice the release manually and re-download. The installable-package design explicitly deferred auto-update to a follow-on project — this is that project.
 
-This document designs an in-app self-update mechanism with three settings-gated modes (manual check, periodic badge notification, automatic background install). It polls the **unauthenticated** GitHub REST API — no token, no `gh` dependency.
+This document describes the in-app self-update mechanism with three settings-gated modes (manual check, periodic badge notification, automatic background install). It polls the **unauthenticated** GitHub REST API — no token, no `gh` dependency.
 
-### What I verified against the live repo and codebase
+### What was verified against the live repo and codebase
 
-These facts shaped the design; they are stated here so reviewers can re-check them:
+These facts, checked at design time (May 2026), shaped the design:
 
 - **`spinyfin/mono` is publicly readable unauthenticated.** `GET https://api.github.com/repos/spinyfin/mono/releases` returns `HTTP 200` with no `Authorization` header, and the response carries `X-RateLimit-Limit: 60` (the unauthenticated per-IP core limit). The unauthenticated premise is sound _as long as the repo stays public_ (see Risks).
 - **Releases are tagged `boss-v1.0.N`**, titled `Boss 1.0.N`, with one asset `Boss-1.0.N.zip` (~34 MB) downloadable at `https://github.com/spinyfin/mono/releases/download/boss-v1.0.N/Boss-1.0.N.zip`. The asset is a zipped `Boss.app` bundle produced by `bazel build //tools/boss/app-macos:Boss`.
@@ -85,7 +86,9 @@ A small Swift module in the app that polls `GET /repos/spinyfin/mono/releases` u
 
 ## Chosen approach
 
-A new `Updater` actor in `tools/boss/app-macos/Sources/Update/`, plus a small UI layer (menu item, chrome badge, Settings pane). It has four responsibilities — **check**, **download/stage**, **swap**, **surface** — described in turn.
+The updater has four responsibilities — **check**, **download/stage**, **swap**, **surface** — described in turn.
+
+**Module layout (as built).** The design originally sketched a single `Sources/Update/` directory inside the app target. During implementation the pure logic instead landed in **`Sources/UpdateCore/`, a standalone `swift_library` Bazel module** (the pilot for per-module Bazel targets in the mac app), with its own `Tests/UpdateCore` test target that gates CI. Only the thin UI/lifecycle glue lives in the app target. The split is deliberate: everything filesystem/network/state-machine-shaped is unit-testable in `UpdateCore` without the app, and the app-target seam (`UpdateLifecycle`) is confined to the two side-effects a library shouldn't own — spawning the detached relaunch `Process` and exiting the app.
 
 ### 1. Version detection
 
@@ -107,14 +110,14 @@ We deliberately do **not** use `/releases/latest` (returns the wrong product in 
 3. Discard any release that has no asset named `Boss-<major>.<minor>.<patch>.zip` (handles the `boss-v1.0.21`-style assetless release).
 4. Pick the **maximum** tuple (not the first in the list — the list isn't version-sorted).
 5. Compare against the running `(major, minor, patch)` parsed from `CFBundleShortVersionString` using tuple ordering (semver-style; future-proof if `minor`/`major` ever move beyond the current `1.0.x`).
-6. If `latest > current` → an update is available; carry the `tag_name`, version, asset `browser_download_url`, asset `size`, and release `body` (markdown notes, for the UI).
+6. If `latest > current` → an update is available; carry the `tag_name`, version, asset `browser_download_url`, asset `size`, and release notes. As built, `AvailableUpdate` carries not just the newest release's `body` but a **`changelog: [ReleaseNote]` accumulating the notes of every version in `(installed, newest]`**, newest first — added post-T3 so a user several releases behind sees everything they're picking up, not only the latest release's notes.
 
 **Why tuple compare, not "max integer N":** today everything is `1.0.x` so comparing the patch integer suffices, but encoding the assumption "major and minor are always 1.0" into the comparator is a latent bug the day someone cuts `1.1.0`. Tuple compare costs nothing and removes the trap.
 
 **Rate limits.** Unauthenticated = **60 requests/hour/IP**, shared across everything on that IP. Mitigations:
 
 - **Conservative default interval: every 6 hours**, plus one check shortly after launch (jittered 30–120 s so a fleet of machines behind one NAT doesn't thundering-herd the same minute). 6 h ⇒ ~4 checks/day/app, leaving ample headroom even with several Boss installs and other GitHub usage sharing the IP.
-- **Conditional requests.** Persist the response `ETag`; send `If-None-Match`. A `304 Not Modified` is cheap and, per GitHub's documented policy, conditional `304`s do not count against the primary rate limit — so steady-state polling of an unchanged release list is effectively free. (We still treat the limit as real and back off regardless; see below.)
+- **Conditional requests.** Store the response `ETag`; send `If-None-Match`. A `304 Not Modified` is cheap and, per GitHub's documented policy, conditional `304`s do not count against the primary rate limit — so steady-state polling of an unchanged release list is effectively free. (We still treat the limit as real and back off regardless; see below.) _As built, the ETag lives in the `UpdateChecker` actor's memory for the process lifetime rather than being persisted to disk — each app launch pays one full listing fetch and every subsequent poll in that session is conditional. At ~4 polls/day this is well inside budget, so cross-launch persistence wasn't worth the plumbing._
 - **Honor `Retry-After` / secondary limits.** On `403`/`429` with `Retry-After`, or when `X-RateLimit-Remaining: 0`, suspend polling until `X-RateLimit-Reset`. Never retry-storm.
 - **Manual checks bypass the interval** but still share the budget; a manual check that hits the limit reports "rate-limited, try again at HH:MM" rather than erroring opaquely.
 
@@ -132,16 +135,20 @@ The "Check for Updates…" menu item works in **all** modes — it is always-on 
 
 **Default = Notify.** Rationale: detection with zero silent mutation of the user's `/Applications` is the least surprising default; auto-install is opt-in. (Reviewer decision point — see Open questions; an argument exists for `Automatic` as default once notarization lands.)
 
-**Where the setting lives — app-side `@AppStorage`, not engine settings.** The existing engine `settings.rs` registry is **boolean-only** and a 3-state enum doesn't fit it without extending the value type. More fundamentally, the updater is a pure _app_ concern: it polls, downloads, and swaps from the app process, and it must read its mode **at startup and at quit, when the engine may not be running** (indeed, post-swap the engine binary on disk is the _new_ one). Tying the update mode to engine RPC state would couple a UI-process decision to a separate process's lifecycle for no benefit. The app already uses `@AppStorage` for app-local state (`BossMacApp.swift:108`). We add:
+**Where the setting lives — app-side `UserDefaults`, not engine settings.** The existing engine `settings.rs` registry is **boolean-only** and a 3-state enum doesn't fit it without extending the value type. More fundamentally, the updater is a pure _app_ concern: it polls, downloads, and swaps from the app process, and it must read its mode **at startup and at quit, when the engine may not be running** (indeed, post-swap the engine binary on disk is the _new_ one). Tying the update mode to engine RPC state would couple a UI-process decision to a separate process's lifecycle for no benefit.
+
+As built, persistence is owned by **`UpdateModel`** (a `@MainActor ObservableObject` in `UpdateCore`) writing `UserDefaults` directly through an injected `defaults:` parameter (so tests run against an isolated suite), rather than view-level `@AppStorage` property wrappers as originally sketched. The keys are exactly the designed ones:
 
 ```
-@AppStorage("boss.update.mode")              // "manual" | "notify" | "automatic"; default "notify"
-@AppStorage("boss.update.lastCheck")         // epoch seconds, for the Settings "last checked" line
-@AppStorage("boss.update.skippedVersion")    // optional "1.0.N" the user dismissed in Notify mode
-// ETag + staged-download bookkeeping live in the staging dir manifest, not UserDefaults.
+boss.update.mode              // "manual" | "notify" | "automatic"; default "notify"
+boss.update.lastCheck         // epoch seconds, for the Settings "last checked" line
+boss.update.skippedVersion    // optional "1.0.N" the user dismissed in Notify mode
+// Staged-download bookkeeping lives in the staging dir manifest, not UserDefaults.
 ```
 
-**UI placement:** a new **"Updates"** tab in `SettingsView`'s `TabView` (alongside Workers / Engine / Feature Flags), bound directly to `@AppStorage`. It shows the mode picker (segmented or radio), the current version, "Last checked: …", a "Check now" button, and — in Automatic mode — a one-line status ("Up to date" / "1.0.N downloaded, will install on quit"). This pane reads/writes `UserDefaults` directly and does **not** go through `chatModel.refreshSettings()`/RPC, unlike the other panes.
+One consumer reads a key outside `UpdateModel`: the app-target `UpdateLifecycle` glue reads `boss.update.mode` straight from `UserDefaults.standard` at the quit/startup swap boundaries, when constructing view models would be wrong (`UpdateLifecycle.swift` documents the key as matching `UpdateModel`'s storage).
+
+**UI placement:** a new **"Updates"** tab in `SettingsView`'s `TabView` (alongside the existing panes). It shows the segmented mode picker (bound to `UpdateModel.setMode(_:)`), the current version (`BossFullVersion`), a relative "Last checked" line, a "Check Now" button with an in-progress spinner, the last check result, and the live download/stage status ("Downloading… n%" / "1.0.N downloaded, will install on quit"). This pane reads/writes `UserDefaults` via `UpdateModel` and does **not** go through `chatModel.refreshSettings()`/RPC, unlike the other panes.
 
 ### 3. Download & staging
 
@@ -149,14 +156,18 @@ The "Check for Updates…" menu item works in **all** modes — it is always-on 
 
 ```
 ~/Library/Application Support/Boss/Updates/
-  staging/                       ← in-progress download (temp), never a complete version
+  staging/1.0.28/                ← in-progress download+verify working dir, never a complete version
   1.0.28/
     Boss-1.0.28.zip              ← downloaded asset (kept until superseded)
     Boss.app/                    ← extracted, verified bundle ready to swap in
-    manifest.json                ← { version, tag, etag, sha256, sourceURL, verifiedAt, state }
+    manifest.json                ← { version, tag, sourceURL, etag, sha256, verifiedAt, state, failureReason }
 ```
 
-**Atomicity of download.** Download with `URLSession` (background `URLSessionDownloadTask` so it survives app-state changes and supports resume) to a temp file under `staging/`. Only after the download completes **and** integrity verification passes do we `rename(2)` it into `Updates/<version>/` — a rename is atomic within the same filesystem, so a crash mid-download never leaves a partial file masquerading as a ready version. The `manifest.json` `state` field (`downloading` → `verifying` → `ready` → `failed`) is the source of truth on next launch; any directory whose manifest isn't `ready` is garbage-collected.
+`UpdateDownloader` (an actor in `UpdateCore`) runs the whole download → verify → stage → prune pipeline. Each step must pass before the next; any failure marks the staging directory `failed` without ever promoting a bundle. `sha256` of the zip is recorded for diagnostics and a future checksum-asset check; `failureReason` (an additive field beyond the original manifest sketch) captures why a stage failed.
+
+**Atomicity of download.** The asset downloads into `staging/<version>/` via an injectable `AssetDownloader` seam. Only after the download completes **and** integrity verification passes is the whole version directory `rename(2)`-ed into `Updates/<version>/` — a rename is atomic within the same filesystem, so a crash mid-download never leaves a partial directory masquerading as a ready version. The `manifest.json` `state` field (`downloading` → `verifying` → `ready` → `failed`) is the source of truth on next launch; any directory whose manifest isn't `ready` is garbage-collected.
+
+> **Divergence — foreground, not background, URLSession.** The design originally called for a background `URLSessionDownloadTask` (survives app-state changes, supports resume). As built, `AssetDownloader.live` uses the foreground async `URLSession.shared.download(from:)`: T6 deliberately kept the session lifecycle out of the leaf module behind the `AssetDownloader` seam, and no follow-on task picked the background session up. Consequence: quitting Boss mid-download abandons the partial file (swept by cleanup) and the next poll restarts the ~34 MB download from scratch. Acceptable for a long-lived desktop app; the seam means a background-configured session remains a drop-in if it ever matters.
 
 > **Quarantine-stripping (chosen approach for v1):** The current manual update flow — `curl` download → `unzip` → `cp -R` into `/Applications` — works today without notarization because command-line tools do **not** set `com.apple.quarantine`. Gatekeeper only assesses notarization when that xattr is present; without it, the app launches freely. The updater replicates this: after extracting the staged bundle, we explicitly run `xattr -dr com.apple.quarantine <bundle>` before any swap. This is _necessary_ (not just defensive) because an app-initiated `URLSession` download **can** receive the quarantine xattr from the system; stripping it ensures Gatekeeper never blocks an un-notarized release. Notarization remains a deferred future improvement (trust signal + robustness), but it is explicitly **not a blocker for v1**.
 
@@ -165,12 +176,12 @@ The "Check for Updates…" menu item works in **all** modes — it is always-on 
 1. **Transport** — HTTPS to `api.github.com` / `github.com` / `objects.githubusercontent.com`. (We follow GitHub's redirect to the signed object-store URL.)
 2. **Size** — bytes received == asset `size` from the API.
 3. **Unzip integrity** — extract with `ditto -x -k` (the same tool `boss-release.sh` uses to build/verify the zip), failing on any error.
-4. **Code signature** — `codesign --verify --deep --strict` on the extracted `Boss.app`, and confirm the signing identity's Team ID matches the _currently running_ bundle's Team ID (so a swap can never move us to a differently-signed bundle).
+4. **Code signature** — `codesign --verify --deep --strict` on the extracted `Boss.app`, and confirm the signing identity's Team ID matches the _currently running_ bundle's Team ID (so a swap can never move us to a differently-signed bundle). As built this is an equality of `Optional`s: today's `bazel build`-produced releases are ad-hoc-signed (both Team IDs `nil` → match), while a Developer-ID running bundle would reject an ad-hoc staged one.
 5. **Quarantine strip** — `xattr -dr com.apple.quarantine <bundle>` (see the quarantine-stripping note above). This is the final step before the bundle is marked `ready`, ensuring Gatekeeper never has a chance to assess notarization on the swapped-in bundle. `spctl --assess` is intentionally **not** run in v1; it would fail on un-notarized releases and is not needed given the quarantine-strip guarantee.
 
 There is **no published checksum or detached signature asset** today (only the `.zip`). Integrity therefore rests on HTTPS + Apple code-signing (step 4), which combined with quarantine-stripping (step 5) is sufficient for v1. _If_ we later want defense-in-depth, the cheapest additions are a `Boss-1.0.N.zip.sha256` asset checked at step 3 and notarization (deferred; see §4 and Risks); both are optional pipeline enhancements, not v1 requirements.
 
-**Cleanup rule ("delete older versions on success").** After a download is marked `ready`, delete every other `Updates/<version>/` directory whose version is **≤** the newly-staged version. We keep exactly one staged version (the newest ready one). We never delete a directory mid-verify. Cleanup is also run at launch to sweep any `state != ready` leftovers from an interrupted run.
+**Cleanup rule ("delete older versions on success").** `cleanup()` runs after a successful stage and again at launch. It sweeps the `staging/` working area unconditionally (reclaiming kill-mid-download leftovers), deletes any version directory whose manifest is not `ready`, deletes any `ready` version **≤ the running app's version** (superseded), and among the rest keeps only the newest `ready` version. We keep exactly one staged version and never delete a directory mid-verify.
 
 ### 4. Install / swap mechanics
 
@@ -179,18 +190,19 @@ The unit of swap is the app's _own_ bundle, located via `Bundle.main.bundleURL` 
 **Privilege.**
 
 - `~/Applications` (the installer's default) is **user-writable** → swap needs no admin password. This is the common case and the only one we make seamless in v1.
-- `/Applications` may require admin rights to replace. If `Bundle.main.bundleURL` is not writable by the current user, we **do not** silently escalate. We surface "Update ready — quit Boss and replace it via the downloaded copy" and reveal the staged `Boss.app` in Finder (or fall back to opening the `.pkg`-style flow). Privileged swap via `SMJobBless`/an admin helper is explicitly out of scope for v1 (Open questions).
+- `/Applications` may require admin rights to replace. If `Bundle.main.bundleURL` is not writable by the current user, we **do not** silently escalate: `planSwap` returns `.notWritable` and no filesystem mutation happens. Privileged swap via `SMJobBless`/an admin helper is explicitly out of scope for v1. **Known gap (as built):** the designed graceful degradation — surface "update ready, replace manually" and reveal the staged `Boss.app` in Finder — never shipped. `.notWritable` is only logged by `UpdateLifecycle`; in the UI it collapses into the generic install-failed message, whose text ("make sure Boss is installed in /Applications") is actively misleading for this case. Follow-up work is tracked to surface it properly.
 
-**The core problem: you can't replace a running bundle's executable while it's mapped.** macOS lets you `rename` a running `.app` directory (the open file handles keep referencing the old inode), but you cannot guarantee a clean swap of a _running_ process's own bundle and then relaunch from it in one step without a tiny external helper. So the swap happens at a **boundary where Boss is (about to be) not running**, per the brief's "quit or startup, whichever can be performed successfully":
+**The core problem: you can't replace a running bundle's executable while it's mapped.** macOS lets you `rename` a running `.app` directory (the open file handles keep referencing the old inode), but you cannot relaunch from the swapped bundle in one step without a tiny external helper. So the swap happens at a **boundary where Boss is (about to be) not running**, per the brief's "quit or startup, whichever can be performed successfully".
 
-**Swap strategy — a minimal external relaunch helper script.** When a `ready` update exists and the mode is `automatic` (or the user clicked "Install & Relaunch"):
+**Swap strategy — in-process rename + a minimal external relaunch helper (as built).** The design originally sketched the shell helper performing the bundle renames after the app exited. That moved during T7: to keep the swap mechanics unit-testable in `UpdateCore`, **the renames run in-process** in `UpdateInstaller.applySwap` at a safe boundary — `current → Boss.app.bak`, then `staged → install location`, with the first move undone if the second fails, so a thrown error always leaves the previous bundle live. (Renaming a running `.app` directory is the documented-safe operation; the whole-bundle atomic rename never touches the signature.) A pending-swap record is persisted before the renames so the next launch can complete or roll back. The shell helper (`relaunch-helper.sh`, bundled in `Contents/Resources/`) is reduced to the parts Swift can't do after the process exits: wait for the old PID to exit (capped ~60 s), `open` the new bundle, watchdog its first launch by polling for the first-launch-OK flag (30 s), and on timeout restore the `.bak`, reopen the previous version, and write a rolled-back marker that the next launch folds into the failed-version blocklist.
 
-- **On quit** (`applicationWillTerminate` / a pre-quit hook): if no agents are running (the app already gates quit on `activeAgentCount`, `BossMacApp.swift:203`), write the swap plan and `Process`-launch a detached `/bin/sh` helper that: waits for Boss's PID to exit → moves the current bundle to `Updates/<oldversion>/Boss.app.bak` (atomic rename) → moves the staged `Boss.app` into the install location (atomic rename) → `open`s the new bundle → on any failure, rolls back by renaming `.bak` back. The helper is tiny, shipped as a resource, and runs after we're gone. This is the "swap on quit" path and is preferred because the swap completes immediately and the user lands on the new version next time they launch (the helper relaunches only on explicit "Install & Relaunch"; a plain quit just swaps and exits).
-- **On startup** (`applicationDidFinishLaunching`, _before_ the engine launches): if a `ready` update exists _and_ the swap-on-quit helper didn't already apply it (e.g. the app crashed, or the bundle was locked last time), apply it now while the bundle is freshly launched and least likely to be busy, then **relaunch into the new version** and exit the old one.
+The boundaries, orchestrated by the app-target `UpdateLifecycle` seam:
 
-"Whichever can be performed successfully" ⇒ **quit is tried first; startup is the fallback.** If the quit-time swap fails (bundle busy, rename across volumes, permission denied), the staged `ready` version simply remains and the next startup retries. We never block quit on a failed swap — quit always proceeds.
+- **On quit** (`applicationWillTerminate`, automatic mode): apply the swap in-process without relaunching; the next launch runs the new version. Best-effort and non-blocking — a failed swap rolls back, leaves the current bundle intact, and the staged version waits for the next boundary. Quit always proceeds.
+- **On startup** (at the engine-launch chokepoint in `ChatViewModel.startIfNeeded()`, _before_ the engine spawns): if a `ready` update wasn't applied at the last quit (crash, failed swap), apply it now, arm the relaunch helper, and `exit(0)` — the helper waits for us to die and relaunches into the new bundle.
+- **User-initiated "Install & Relaunch"** (result sheet / badge popover; works in _any_ mode, not just automatic): apply the swap immediately, park the swap plan, and request termination. The helper is armed only in `applicationWillTerminate` — i.e. once the quit is actually **confirmed** — so a vetoed quit (agents still working) strands nothing: the swap is already durably on disk, the UI reports "installed — quit to finish", and a repeated press is idempotent. An explicit Install & Relaunch also intentionally retries a previously blocklisted version (clearing its block); the watchdog re-blocklists it if it still fails to launch.
 
-**Engine coordination.** `EngineProcessController` owns a detached engine spawned from `<bundle>/Contents/Resources/bin/engine`. The swap replaces that binary on disk. Sequence: the helper relies on the app having already called `EngineProcessController.stop()` during normal termination; on the startup path, the swap happens _before_ the engine is launched, so the new engine binary is what gets spawned. Either way the new app launches the new engine — no stale-engine window.
+**Engine coordination.** `EngineProcessController` owns a detached engine spawned from `<bundle>/Contents/Resources/bin/engine`. The swap replaces that binary on disk. On the quit path the engine was already stopped by normal termination; on the startup path the swap happens _before_ the engine is launched, so the new engine binary is what gets spawned. Either way the new app launches the new engine — no stale-engine window.
 
 **Gatekeeper, quarantine, and signing — three risks that must be handled regardless of notarization status.**
 
@@ -202,81 +214,101 @@ The unit of swap is the app's _own_ bundle, located via `Bundle.main.bundleURL` 
 
 **Notarization is deferred.** Un-notarized bundles work fine after quarantine-stripping: Gatekeeper only assesses notarization when the quarantine xattr is present. Notarization would add a trust signal (cryptographic proof of Apple scan) and robustness (survives future Gatekeeper policy tightening), but it is explicitly **not required for v1** and is recorded in Risks as a future improvement, not a blocker.
 
-**Rollback.** The `.bak` of the previous bundle is retained until the new version has launched successfully once (a "first launch OK" flag written by the new version on `applicationDidFinishLaunching`). If the new version fails to launch (see Failure handling), the startup helper restores `.bak`.
+**Rollback and reconciliation.** The `.bak` of the previous bundle is retained until the new version has launched successfully once (a "first launch OK" flag written by the new version on `applicationDidFinishLaunching`; the relaunch helper's watchdog polls for it). If the new version fails to launch within the watchdog window, the helper restores `.bak`, reopens the previous version, and writes a rolled-back marker. `reconcileAtLaunch()` (run on every launch, regardless of mode) then settles the state: a completed swap drops its `.bak`; a rolled-back marker is folded into the persisted **failed-version blocklist** (`install-state.json`) so that version is never auto-attempted again, and its staged directory is reaped. Stale first-launch flags from other versions are pruned.
 
 ### 5. UI surfaces
 
-**(a) Menu item — always available.** Add `Button("Check for Updates…")` in a `CommandGroup(after: .appInfo)` in `BossMacApp.swift` (directly under "About Boss", the macOS-conventional spot). Clicking runs a check and presents result state:
+**(a) Menu item — always available.** `Button("Check for Updates…")` in a `CommandGroup(after: .appInfo)` in `BossMacApp.swift` (directly under "About Boss", the macOS-conventional spot; the model reaches the command via `AppDelegate` injection, since `@EnvironmentObject` is unreliable in `CommandGroup` views). As built, only the _available_ outcome opens the sheet; every other outcome (up-to-date, network error, rate-limited) shows a **transient self-dismissing toast** instead of a dialog — a post-T3 refinement so a routine "you're current" doesn't demand a click:
 
-- _Up to date_ — a brief sheet/alert "Boss 1.0.N is the latest version."
-- _Update available_ — a sheet showing the new version, the release notes (`body` markdown, rendered with the existing `Textual`/markdown stack), and buttons: **Install & Relaunch** (if a swap is feasible) / **Download** / **Later** / **Skip this version**.
-- _Error / rate-limited_ — inline message with the reason and, if rate-limited, when to retry.
-- _Dev build_ — "You're running a development build (1.0.N-dev-…). Latest release is 1.0.M." with download disabled by default.
+- _Up to date / error / rate-limited_ — toast with the reason and, if rate-limited, when to retry.
+- _Update available_ — the `UpdateResultSheet`: new version, scrollable accumulated release notes (markdown, rendered with the existing `StructuredText`/`bossMarkdown` stack), and **Skip This Version** / **Later** plus a primary action that walks the pipeline: **Download** (stages the verified bundle in-app, with determinate progress) → **Install & Relaunch** → on a vetoed quit, **Quit to Finish**. Install failures render as a terminal disabled "Install Failed" state with the reason — no silent browser fallback.
+- _Dev build_ — "Running a development build (1.0.N-dev-…)" caption; Skip hidden; the primary action stays a plain **Download** that opens the asset URL in the browser, since the updater never stages or swaps over a dev build.
 
-**(b) Window-chrome badge — Notify/Automatic modes.** When a newer version is known and not yet applied (and not "skipped"), show a button in the main window's **trailing toolbar region** — a new `ToolbarItem(placement: .primaryAction)` in `ContentView`'s `.toolbar` block (the same region as the existing `ToolbarItemGroup(placement: .primaryAction)`, which renders top-right under `.windowToolbarStyle(.unified)`). Appearance: a small pill/button, `arrow.down.circle.fill` SF Symbol with an accent tint (and, in Automatic mode once the download is staged, a subtle "ready" check). Clicking it opens the same update sheet as the menu item. This mirrors the existing `EngineHealthBanner` precedent (`ContentView.swift:77`) for non-modal chrome signaling, but as a compact trailing button rather than a full-width banner, since an available update is informational, not an error.
+The check flow carries `os.log` observability (`subsystem: dev.spinyfin.bossmacapp`, `category: updater`) covering trigger source, result, scheduler cadence, staging, and swap decisions — added post-T3 when field-debugging the first real update.
 
-**(c) Progress & error feedback.**
+**(b) Window-chrome badge — Notify/Automatic modes.** When a newer version is known and not yet applied (and not "skipped"), a button appears in the main window's **trailing toolbar region** — a `ToolbarItem(placement: .primaryAction)` in `ContentView`'s `.toolbar` block, rendering top-right under `.windowToolbarStyle(.unified)`. Appearance: `arrow.down.circle.fill` SF Symbol with an accent tint. Clicking opens a **popover** (`UpdateBadgePopover`) rather than the sheet, with full release-notes and action parity with the result sheet (parity restored post-T4 in #1226): the same Download → Install & Relaunch → Quit to Finish pipeline plus Skip This Version / Later. This mirrors the existing `EngineHealthBanner` precedent for non-modal chrome signaling, but as a compact trailing button rather than a full-width banner, since an available update is informational, not an error.
 
-- Download progress (Automatic mode or after "Download") surfaces as determinate progress on the chrome badge's popover and in the Settings "Updates" pane; we reuse the `ProgressView` idiom already in `SettingsView`.
-- Swap-in-progress is brief; the main feedback is simply relaunching into the new version.
-- Errors are non-blocking: a transient status line in the Settings pane + the badge reverting to "update available" (or disappearing if the check now says up-to-date). We never throw a modal that interrupts work.
+**(c) Progress & error feedback.** A shared `UpdateDownloadState` enum on `UpdateModel` (`idle` / `downloading(fraction)` / `readyToInstall` / `failed` / `installFailed` / `installedPendingRelaunch`) drives all three surfaces consistently:
 
-### Component summary (for the implementation tasks)
+- Download progress (auto-stage in Automatic mode, or after "Download") surfaces as determinate progress in the sheet, the badge popover, and the Settings "Updates" pane.
+- Swap-in-progress is brief; the main feedback is simply relaunching into the new version. A swap that succeeded but couldn't relaunch (vetoed quit, missing helper) is reported truthfully as "installed — quit to finish" (#1855), never as a failure.
+- Errors are non-blocking: a status line in the Settings pane and terminal states in the sheet/popover. We never throw a modal that interrupts work.
+
+### Component summary (as built)
 
 ```
-tools/boss/app-macos/Sources/Update/
-  UpdateChecker.swift     — unauth GitHub Releases fetch, ETag cache, filter+select, version compare
-  UpdateModel.swift       — ObservableObject: mode, availableVersion, downloadState, badge visibility
-  UpdateDownloader.swift  — background URLSession download → staging → verify → ready, cleanup rule
-  UpdateInstaller.swift   — swap plan, relaunch-helper script, quit/startup boundary logic, rollback
-  UpdateSettingsView.swift— the "Updates" Settings tab
-  Resources/relaunch-helper.sh — tiny detached swap+relaunch script
+tools/boss/app-macos/Sources/UpdateCore/          — standalone swift_library, unit-tested in Tests/UpdateCore
+  UpdateChecker.swift    — unauth GitHub Releases fetch, ETag cache, filter+select, version compare, changelog
+  UpdateModel.swift      — @MainActor ObservableObject: mode + persistence, scheduler, downloadState, auto-stage
+  UpdateDownloader.swift — URLSession download → staging → verify → ready, manifest state machine, cleanup rule
+  UpdateInstaller.swift  — ready-update discovery, in-process swap + .bak rollback, blocklist, reconciliation
+
+tools/boss/app-macos/Sources/                     — app-target glue and UI
+  UpdateLifecycle.swift                — mode/dev-build gating, boundary orchestration, helper spawning, exit
+  Update/UpdateResultSheet.swift       — the check-result sheet
+  Settings/UpdateSettingsView.swift    — the "Updates" Settings tab
+  Resources/RelaunchHelper/relaunch-helper.sh — detached wait-relaunch-watchdog-rollback script
 ```
 
-Plus edits to `BossMacApp.swift` (menu item, startup swap hook, `@AppStorage` wiring), `ContentView.swift` (chrome badge toolbar item), and `SettingsView.swift` (register the new tab).
+Plus edits to `BossMacApp.swift` (menu item, `reconcileAtLaunch()`, quit-swap + helper arming in `applicationWillTerminate`), `ChatViewModel.swift` (startup-swap fallback before the engine spawns), `ContentView.swift` (chrome badge toolbar item + `UpdateBadgePopover`), and `SettingsView.swift` (registers the new tab).
 
 ---
 
 ## Failure handling
 
-| Failure                                                                      | Detection                                                                      | Behavior                                                                                                                                                                 |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Network unreachable / DNS / timeout**                                      | `URLSession` error                                                             | Silent in periodic mode (log only); explicit "couldn't reach GitHub" in manual mode. Retry on next interval.                                                             |
-| **Rate-limited (`403`/`429`, `X-RateLimit-Remaining: 0`)**                   | response headers                                                               | Suspend polling until `X-RateLimit-Reset`/`Retry-After`. Manual check reports "try again at HH:MM".                                                                      |
-| **Malformed / unexpected API response**                                      | JSON decode / no `boss-v` releases                                             | Treat as "no update"; log. Never crash on schema drift.                                                                                                                  |
-| **Newest release has no usable asset**                                       | asset filter (§1 step 3)                                                       | Skip it; consider the next-newest `boss-v` release with an asset.                                                                                                        |
-| **Partial / interrupted download**                                           | size mismatch or task error; manifest `state != ready`                         | Discard staging temp; retry next interval. The atomic-rename rule means a partial never looks ready.                                                                     |
-| **Integrity check fails** (bad unzip / `codesign` reject / Team-ID mismatch) | §3 steps 3–5                                                                   | Mark `failed`, delete the staged dir, do **not** swap, surface "update could not be verified".                                                                           |
-| **Swap fails** (bundle busy, cross-volume rename, permission denied)         | helper exit code / pre-flight writability check                                | Leave `ready` staged version in place; retry at next boundary. Quit still proceeds. For `/Applications`-without-write, fall back to "reveal in Finder / manual install". |
-| **New version won't launch** (crashes before "first launch OK" flag)         | startup helper sees prior launch left no success flag within a watchdog window | Roll back: restore `Boss.app.bak`, mark that version `failed` so we don't re-attempt it, surface "update rolled back".                                                   |
-| **Dev build**                                                                | `BossFullVersion` contains `-dev-`                                             | Report availability but never auto-install; "Download" still allowed for manual testing.                                                                                 |
-| **Agents running at quit**                                                   | existing `activeAgentCount` gate (`BossMacApp.swift:203`)                      | Do not swap-on-quit if the user cancels quit; the staged version waits for the next clean quit/startup.                                                                  |
+| Failure                                                                      | Detection                                                 | Behavior                                                                                                                                                      |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Network unreachable / DNS / timeout**                                      | `URLSession` error                                        | Silent in periodic mode (log only); explicit "couldn't reach GitHub" in manual mode. Retry on next interval.                                                  |
+| **Rate-limited (`403`/`429`, `X-RateLimit-Remaining: 0`)**                   | response headers                                          | Suspend polling until `X-RateLimit-Reset`/`Retry-After`. Manual check reports "try again at HH:MM".                                                           |
+| **Malformed / unexpected API response**                                      | JSON decode / no `boss-v` releases                        | Treat as "no update"; log. Never crash on schema drift.                                                                                                       |
+| **Newest release has no usable asset**                                       | asset filter (§1 step 3)                                  | Skip it; consider the next-newest `boss-v` release with an asset.                                                                                             |
+| **Partial / interrupted download**                                           | size mismatch or task error; manifest `state != ready`    | Discard staging temp; retry next interval. The atomic-rename rule means a partial never looks ready.                                                          |
+| **Integrity check fails** (bad unzip / `codesign` reject / Team-ID mismatch) | §3 steps 3–5                                              | Mark `failed`, delete the staged dir, do **not** swap, surface "update could not be verified".                                                                |
+| **Swap fails** (rename throws mid-swap)                                      | `applySwap` error after in-process rollback               | Rollback restores the previous bundle before the error propagates; the `ready` staged version stays for the next boundary. Quit still proceeds.               |
+| **Install location not writable** (`/Applications` without admin)            | `planSwap` pre-flight writability check → `.notWritable`  | No mutation, no escalation; logged. _Gap: the designed "reveal staged bundle in Finder" UI never shipped — the sheet shows a generic install-failed message._ |
+| **New version won't launch** (crashes before "first launch OK" flag)         | relaunch helper's watchdog (30 s) sees no flag            | Helper restores `Boss.app.bak`, reopens the old version, writes a rolled-back marker; next launch blocklists the version so it's never auto-attempted again.  |
+| **Dev build**                                                                | `BossFullVersion` contains `-dev-`                        | Report availability but never auto-install; "Download" still allowed for manual testing.                                                                      |
+| **Agents running at quit**                                                   | existing `activeAgentCount` gate (`BossMacApp.swift:203`) | Do not swap-on-quit if the user cancels quit; the staged version waits for the next clean quit/startup.                                                       |
 
 ---
 
 ## Risks / open questions
 
-1. **🟢 Notarization deferred — quarantine-stripping is sufficient for v1.** The published `Boss-1.0.N.zip` is un-notarized, and the updater does **not** require notarization. Quarantine-stripping (`xattr -dr com.apple.quarantine`) before swap replicates the existing manual workflow (terminal `curl` + unzip + copy), which works today for the same reason. Notarization would add a trust signal (Apple's malware scan) and robustness against future Gatekeeper policy changes, making it a worthwhile future improvement — but it is explicitly **not a blocker** for the first version, and no pipeline changes are required to ship v1. When notarization is added later, §3's integrity verification can add a `spctl --assess` step and the quarantine-strip remains correct as a belt-and-suspenders measure.
-2. **🟠 Repo must stay public.** The whole design relies on `spinyfin/mono` being unauthenticated-readable (verified: HTTP 200, 60/hr). If the repo is ever made private, every check returns 404 and updates silently stop. _Mitigation if that happens:_ publish releases (or a manifest) to a dedicated public repo (e.g. `spinyfin/boss-releases`) or a public bucket/Pages site, and point the updater there. _Reviewer: is "public forever" an acceptable assumption, or should we design the public-manifest indirection now?_
-3. **🟠 `/Applications` privileged swap is out of scope.** v1 is seamless only for the user-writable `~/Applications` install (the installer's default). For a `/Applications` install we degrade to a guided manual swap. _Reviewer: is that acceptable for v1, or do we need an `SMAppService`/privileged-helper swap?_
-4. **🟡 Default mode.** Proposed default is **Notify** (no silent mutation of installed apps). Is **Automatic** the better default for an internal tool where everyone wants latest? _Reviewer decision._
-5. **🟡 Shared-IP rate limiting.** 60/hr is per-IP, shared across all GitHub traffic from that IP (multiple Boss installs behind one office NAT, plus `gh`, plus browsers). The 6 h interval + conditional `304`s should keep us well under budget, but a large co-located fleet is a theoretical concern. _Mitigation already in design: jittered launch check + ETag + hard backoff on `X-RateLimit-Remaining: 0`._
-6. **🟡 Engine-restart UX during swap.** Swapping replaces the bundled engine binary; the new app spawns the new engine. Edge case: an in-flight engine operation at quit. The existing `activeAgentCount` quit-gate covers running agents, but non-agent engine work (e.g. an in-progress RPC) isn't gated. _Likely fine — the engine is restart-tolerant by design — but worth a reviewer nod._
-7. **🟢 Optional integrity hardening.** No checksum/signature asset is published today; integrity rests on HTTPS + notarization. A cheap `Boss-1.0.N.zip.sha256` asset would add defense-in-depth. Not required for v1; flag if reviewers want it.
-8. **🟢 Sparkle revisit.** If we later want phased rollouts / staged percentages / a hardened third-party swapper, migrating to Sparkle (Alternative A) is the natural path. The custom module is intentionally small to keep that door open.
+Items that were reviewer decision points at design time are marked with how they resolved.
+
+1. **🟢 Notarization deferred — quarantine-stripping is sufficient for v1.** _Held up as built._ The published `Boss-1.0.N.zip` is un-notarized, and the updater does **not** require notarization. Quarantine-stripping (`xattr -dr com.apple.quarantine`) before swap replicates the existing manual workflow, which works for the same reason. Notarization remains a worthwhile future improvement (trust signal, robustness against Gatekeeper policy tightening); when it lands, §3's verification gains a `spctl --assess` step and the quarantine-strip stays as belt-and-suspenders.
+2. **🟠 Repo must stay public.** Still true: the design relies on `spinyfin/mono` being unauthenticated-readable. If the repo goes private, every check 404s and updates silently stop. _Mitigation if that happens:_ publish releases (or a manifest) to a dedicated public repo or Pages site and point the updater there. We shipped without the indirection.
+3. **🟠 `/Applications` privileged swap is out of scope.** _Resolved: shipped without it._ v1 is seamless only for a user-writable install location. Note the related as-built gap: even the designed _guided_ degradation (reveal staged bundle in Finder) hasn't shipped yet — `.notWritable` currently surfaces as a generic install failure (§4).
+4. **🟡 Default mode.** _Resolved: **Notify** shipped as the default_ (`UpdateModel` falls back to `notify` when the key is unset). Automatic remains opt-in.
+5. **🟡 Shared-IP rate limiting.** Unchanged: 6 h interval + jittered launch check + ETag conditional requests + hard backoff on rate-limit responses. No budget problems observed in practice.
+6. **🟡 Engine-restart UX during swap.** Unchanged: the existing `activeAgentCount` quit-gate covers running agents; non-agent in-flight engine work at quit is accepted as restart-tolerant. The user-initiated Install & Relaunch path additionally respects a vetoed quit — the swap stands and completes on the next confirmed quit.
+7. **🟢 Optional integrity hardening.** No checksum asset is published; integrity rests on HTTPS + code-signature verification + Team-ID pinning. The staged zip's `sha256` is already recorded in the manifest, so a published `Boss-1.0.N.zip.sha256` asset remains a cheap future addition.
+8. **🟢 Sparkle revisit.** Unchanged: if we later want phased rollouts / staged percentages / a hardened third-party swapper, migrating to Sparkle (Alternative A) is the natural path. `UpdateCore` is intentionally small to keep that door open.
 
 ---
 
-## Proposed implementation task breakdown
+## Implementation history
 
-These are the follow-on tasks to file once this design is approved. No pipeline changes are prerequisites; all tasks can proceed against the existing un-notarized releases.
+The design's T1–T8 task breakdown shipped as eight PRs (May 2026), followed by fix/polish PRs that real-world use surfaced. Divergences worth knowing are folded into the sections above; this is the map.
 
-- **T1:** `UpdateChecker` — unauthenticated `/releases` fetch with required headers, ETag conditional requests, `boss-v` filtering, assetless-release skipping, max-tuple selection, semver-tuple comparison vs `CFBundleShortVersionString`, dev-build detection. Unit tests with canned API JSON (including the interleaved-order and missing-asset cases observed live).
-- **T2:** `UpdateModel` (`ObservableObject`) + `@AppStorage` mode/skipped-version/last-check wiring; the 3-state mode enum and the polling scheduler (6 h interval, jittered launch check, rate-limit backoff).
-- **T3:** "Check for Updates…" menu item (`CommandGroup(after: .appInfo)`) + the update result sheet (up-to-date / available + notes / error / dev-build), reusing the markdown renderer for release notes.
-- **T4:** Window-chrome badge — trailing `ToolbarItem(placement: .primaryAction)` in `ContentView`, visibility driven by `UpdateModel`, popover with download/install affordance.
-- **T5:** "Updates" Settings tab (`UpdateSettingsView`) registered in `SettingsView`'s `TabView`; mode picker, current version, last-checked, "Check now", staged-status line.
-- **T6:** `UpdateDownloader` — background `URLSession` download to `Updates/staging/`, size + `ditto` + `codesign --verify` + Team-ID verification, quarantine strip (`xattr -dr com.apple.quarantine`), atomic rename to `Updates/<version>/`, manifest state machine, and the "delete ≤ current staged version" cleanup rule.
-- **T7:** `UpdateInstaller` — `relaunch-helper.sh` resource, swap-on-quit hook (App Translocation guard: quarantine already stripped at stage time, so the helper never runs from a shadow mount), swap-on-startup fallback (before engine launch), `.bak` rollback + "first launch OK" flag + failed-version blocklist, `/Applications`-not-writable graceful degradation. _Depends on T6._
-- **T8:** End-to-end manual verification on `~/Applications` and `/Applications` installs; failure-injection tests (kill mid-download, corrupt staged zip, non-launching build → rollback).
-- **T-future (pipeline, not a v1 blocker):** Extend `boss-release.sh` to Developer-ID-sign + notarize + staple the `Boss.app` before zipping, so `Boss-1.0.N.zip` passes `spctl --assess`. When this lands, add a `spctl --assess` step to §3's integrity verification.
+| Task                         | PR                                                | Notes                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T1 `UpdateChecker`           | [#911](https://github.com/spinyfin/mono/pull/911) | As designed; landed in the new `UpdateCore` module with canned-JSON tests for the live-observed interleaved-order and assetless-release cases.                                                                                                                                          |
+| T2 `UpdateModel` + scheduler | [#926](https://github.com/spinyfin/mono/pull/926) | As designed; persistence via injected `UserDefaults` rather than view-level `@AppStorage`.                                                                                                                                                                                              |
+| T3 Menu item + result sheet  | [#956](https://github.com/spinyfin/mono/pull/956) | Shipped with browser-download only; the in-app Download/Install pipeline came later (see below).                                                                                                                                                                                        |
+| T4 Chrome badge + popover    | [#953](https://github.com/spinyfin/mono/pull/953) | Landed before T3 and carried some of the `BossMacApp` wiring; popover initially had a cut-down UI.                                                                                                                                                                                      |
+| T5 Updates Settings tab      | [#954](https://github.com/spinyfin/mono/pull/954) | As designed.                                                                                                                                                                                                                                                                            |
+| T6 `UpdateDownloader`        | [#927](https://github.com/spinyfin/mono/pull/927) | Foreground `URLSession` behind the `AssetDownloader` seam (§3 divergence note); also widened the `mac-app-build` CI step from `:BossTests` to `bazel test //tools/boss/app-macos/...` so the updater tests actually gate merges.                                                        |
+| T7 `UpdateInstaller`         | [#978](https://github.com/spinyfin/mono/pull/978) | Biggest design adaptation: renames moved in-process into `applySwap` for unit-testability; the shell helper reduced to wait/relaunch/watchdog/rollback (§4).                                                                                                                            |
+| T8 End-to-end verification   | [#996](https://github.com/spinyfin/mono/pull/996) | Delivered as automated integration tests (`EndToEndUpdateTests`) chaining checker → downloader → installer, including the kill-mid-download, corrupt-zip, rollback-blocklist, and writability-degradation scenarios — rather than the manual verification pass the breakdown described. |
+
+Notable follow-ons the initial cut needed:
+
+- **[#1086](https://github.com/spinyfin/mono/pull/1086) — wired up the orphaned download/stage step.** As merged, T1–T8 never actually invoked `UpdateDownloader` from the app: automatic mode detected updates but nothing downloaded them, so the installer's `newestReadyUpdate` never found anything. This PR added the `UpdateStager` seam and `maybeAutoStage` on every check, plus the user-initiated in-app Download → Install & Relaunch pipeline in the sheet. The T2↔T6 handoff ("app layer will own the download lifecycle") had fallen through the task boundaries — a lesson for future task splits: name an owner for every seam.
+- **[#1226](https://github.com/spinyfin/mono/pull/1226)** — badge-popover parity with the sheet (release notes + full action set).
+- **[#1238](https://github.com/spinyfin/mono/pull/1238) / [#1855](https://github.com/spinyfin/mono/pull/1855)** — Install & Relaunch honesty: blocklisted-version handling (an explicit user install now unblocks and retries) and truthful post-swap reporting (`installedPendingRelaunch` / "Quit to Finish" instead of claiming failure after the bundle was already durably swapped).
+- Smaller polish: accumulated changelog across skipped versions, manual-check toast feedback, `os.log` observability, release-notes date formatting.
+
+**Known remaining gap:** the `/Applications`-not-writable guided degradation (§4) — tracked as follow-up work.
+
+**T-future (pipeline, unchanged, not yet scheduled):** extend `boss-release.sh` to Developer-ID-sign + notarize + staple `Boss.app` before zipping, so `Boss-1.0.N.zip` passes `spctl --assess`; then add `spctl --assess` to §3's verification.
