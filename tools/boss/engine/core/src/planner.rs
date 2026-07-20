@@ -43,15 +43,29 @@
 //! failure ([`PlannerOutcome::InvalidOutput`]), never a parse-and-hope over
 //! free-form markdown.
 //!
-//! A healthy ~13-task proposal has nevertheless been observed to fail whole
-//! because one array-typed field (`effort_audit`) came back as a single
-//! JSON-encoded string rather than a JSON array — model flakiness on an
-//! otherwise-valid result, not a prompt or schema defect. Two mitigations, in
-//! order: (1) [`coerce_stringified_array_fields`] rewrites a known-array field
-//! back into an array, when the string itself parses as one, before schema
-//! validation runs; (2) if validation still fails, [`plan_with_url`] retries
-//! (bounded by [`PLANNER_VALIDATION_ATTEMPTS`]) with the validation error fed
-//! back into the prompt, rather than failing the whole run on one bad field.
+//! A healthy proposal has nevertheless been observed to fail whole because an
+//! array-typed field came back as a single JSON-encoded string rather than a
+//! JSON array — observed on `effort_audit` in production, and guarded against
+//! on the fields still deserialized from the model (`tasks`, `edges`) as a
+//! precaution — model flakiness on an otherwise-valid result, not a prompt or
+//! schema defect. Mitigations, in order: (1) the model is no longer asked to
+//! emit `effort_audit` at all — [`planner_output_schema`] omits it from both
+//! `required` and `properties`, and [`planner_output_from_response`]
+//! overwrites the raw `effort_audit` key (if the model sends one anyway)
+//! before deserialising, so [`PlannerOutput::effort_audit`] instead comes
+//! from [`derive_effort_audit`], which reads it back out of each task's
+//! `description` — the array was always redundant with data already present
+//! there, so its shape can never fail deserialization at all (mirrors
+//! `pr_review`'s `suspected_deletions` fix); (2)
+//! [`coerce_stringified_array_fields`] rewrites a remaining known-array field
+//! (`tasks`, `edges`) back into an array, when the string itself parses as
+//! one, before schema validation runs; (3) if validation still fails,
+//! [`plan_with_url`] retries (bounded by [`PLANNER_VALIDATION_ATTEMPTS`])
+//! with the validation error fed back into the prompt; (4) if the *final*
+//! attempt is still schema-invalid, it falls back to the last schema-valid
+//! proposal an earlier attempt produced (if any) rather than discarding a
+//! stageable plan — only when no attempt ever produced a schema-valid output
+//! does the run fail whole ([`PlannerOutcome::InvalidOutput`]).
 //!
 //! ## Bounded model / effort / timeout
 //!
@@ -115,10 +129,11 @@ pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 ///
 /// 1. **Schema-invalid output** — a model occasionally emits a tool call that
 ///    violates [`planner_output_schema`] (observed: an array-typed field like
-///    `effort_audit` emitted as a single JSON-encoded string). That is model
-///    flakiness, not a transient transport error, so [`PLANNER_ATTEMPTS`]'s
-///    429/5xx retry never sees it and a single miss used to fail the whole
-///    proposal.
+///    `edges` emitted as a single JSON-encoded string; historically also
+///    `effort_audit`, before the model stopped being asked to emit it — see
+///    the module doc). That is model flakiness, not a transient transport
+///    error, so [`PLANNER_ATTEMPTS`]'s 429/5xx retry never sees it and a
+///    single miss used to fail the whole proposal.
 /// 2. **Oversize tasks (the decomposition gate)** — a schema-valid proposal
 ///    that packs a monolithic "project in disguise" task
 ///    ([`detect_oversize_tasks`]). The retry asks the model to decompose it
@@ -126,10 +141,14 @@ pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 ///
 /// Bounded at 2 (one retry): the retry re-sends the request with the
 /// rejection reason appended to the prompt, so the model can see and correct
-/// exactly what it got wrong. A schema failure that survives the budget fails
-/// the run ([`PlannerOutcome::InvalidOutput`]); an oversize proposal that
-/// survives it is accepted best-effort (the valid, operator-reviewed plan is
-/// not worth discarding over an imperfect split).
+/// exactly what it got wrong. An oversize proposal that survives the budget
+/// is accepted best-effort (the valid, operator-reviewed plan is not worth
+/// discarding over an imperfect split). A schema failure that survives the
+/// budget falls back to the last schema-valid proposal seen on an earlier
+/// attempt, if any (same best-effort policy — a validation-clean, merely
+/// oversize proposal from attempt 1 must not be thrown away just because
+/// attempt 2 flaked on schema); only when NO attempt ever produced a
+/// schema-valid output does the run fail ([`PlannerOutcome::InvalidOutput`]).
 pub const PLANNER_VALIDATION_ATTEMPTS: u32 = 2;
 
 /// Name of the forced tool whose `input_schema` is [`planner_output_schema`].
@@ -279,6 +298,11 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (Plann
 
     let mut feedback: Option<RetryFeedback> = None;
     let mut audit = DecompositionAudit::default();
+    // The last schema-valid proposal seen on an earlier attempt (with its
+    // oversize-finding count), kept so a *later* attempt's schema failure can
+    // fall back to it instead of discarding a stageable plan — see the
+    // fallback branch below and [`PLANNER_VALIDATION_ATTEMPTS`]'s doc comment.
+    let mut last_valid: Option<(PlannerOutput, usize)> = None;
     for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
         let body = match &feedback {
             None => build_request_body(input),
@@ -314,10 +338,32 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (Plann
                         oversize = findings.len(),
                         "planner: proposal packs oversize task(s); re-prompting for decomposition",
                     );
+                    last_valid = Some((output, findings.len()));
                     feedback = Some(RetryFeedback::Oversize(findings));
                 }
                 Err(msg) => {
                     if attempt >= PLANNER_VALIDATION_ATTEMPTS {
+                        // Final attempt is schema-invalid. Rather than discard
+                        // the run outright, fall back to the last schema-valid
+                        // proposal an earlier attempt already produced (if
+                        // any) and accept it best-effort — symmetric with the
+                        // oversize best-effort acceptance above. This is the
+                        // exact incident this budget failed to handle: attempt
+                        // 1 produced a valid-but-oversize proposal, attempt
+                        // 2's only retry was already spent on the oversize
+                        // re-prompt, and the model's final response flaked on
+                        // schema (`effort_audit` as a JSON-encoded string) —
+                        // the valid attempt-1 plan was discarded instead of
+                        // staged.
+                        if let Some((output, oversize_remaining)) = last_valid {
+                            audit.oversize_remaining = oversize_remaining;
+                            tracing::warn!(
+                                attempt,
+                                err = %msg,
+                                "planner: final attempt schema-invalid; falling back to last schema-valid proposal",
+                            );
+                            return (PlannerOutcome::Success(output), audit);
+                        }
                         return (PlannerOutcome::InvalidOutput(msg), audit);
                     }
                     tracing::warn!(
@@ -333,7 +379,8 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (Plann
         }
     }
     // Unreachable in practice: the final iteration returns in every branch
-    // (Ok → Success/best-effort, Err → InvalidOutput). Kept as a fail-safe.
+    // (Ok → Success/best-effort, Err → InvalidOutput/fallback-Success). Kept
+    // as a fail-safe.
     (
         PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned()),
         audit,
@@ -443,10 +490,9 @@ fn retry_user_prompt(input: &PlannerInput, feedback: &RetryFeedback) -> String {
                 "\n--- YOUR PREVIOUS emit_task_graph CALL WAS REJECTED ---\n\
                  Schema validation error: {validation_error}\n\
                  Every field must have exactly the JSON type the schema declares — in \
-                 particular, array fields (`tasks`, `edges`, `effort_audit`) must be \
-                 emitted as a JSON array, never as a single JSON-encoded string \
-                 containing one. Call `emit_task_graph` again with a schema-valid \
-                 payload that fixes this.\n\
+                 particular, array fields (`tasks`, `edges`) must be emitted as a JSON \
+                 array, never as a single JSON-encoded string containing one. Call \
+                 `emit_task_graph` again with a schema-valid payload that fixes this.\n\
                  --- END REJECTION NOTICE ---\n"
             ));
         }
@@ -498,20 +544,75 @@ fn planner_output_from_response(response: &MessagesResponse) -> Result<PlannerOu
         .ok_or_else(|| format!("model did not call the {TOOL_NAME} tool"))?;
     let mut input = input.clone();
     coerce_stringified_array_fields(&mut input);
+    // `effort_audit` is no longer part of the model contract (see the module
+    // doc), but `PlannerOutput::effort_audit` deserialises normally now that
+    // it is a bidirectional wire field — so overwrite whatever the raw JSON
+    // holds here (present or not, well-formed or not) with an empty array
+    // before deserialising. This confines tolerance for any shape the model
+    // might still emit to this one call site, then [`derive_effort_audit`]
+    // fills in the real values from each task's `description`.
+    if let Some(obj) = input.as_object_mut() {
+        obj.insert("effort_audit".to_owned(), json!([]));
+    }
     let mut output = serde_json::from_value::<PlannerOutput>(input)
         .map_err(|err| format!("tool input did not match the PlannerOutput schema: {err}"))?;
     normalize_output_text(&mut output);
+    derive_effort_audit(&mut output);
     Ok(output)
 }
 
-/// Top-level [`PlannerOutput`] fields the schema requires to be a JSON array.
-const ARRAY_TYPED_FIELDS: &[&str] = &["tasks", "edges", "effort_audit"];
+/// Top-level [`PlannerOutput`] fields the schema requires to be a JSON array
+/// and that are still deserialized from the model's JSON (unlike
+/// `effort_audit`, which the model is no longer asked to emit at all and
+/// which [`planner_output_from_response`] overwrites before deserialising —
+/// see [`derive_effort_audit`]).
+const ARRAY_TYPED_FIELDS: &[&str] = &["tasks", "edges"];
+
+/// Prefix marking the audit line the system prompt requires at the end of
+/// every task's `description` (see [`SYSTEM_PROMPT`] "`[effort-classification]`
+/// audit line").
+const EFFORT_AUDIT_PREFIX: &str = "[effort-classification]";
+
+/// Derive [`PlannerOutput::effort_audit`] from each task's `description`
+/// instead of trusting a separately-emitted array. The system prompt requires
+/// the model to write a `[effort-classification]` line at the end of every
+/// task's `description`; the model is no longer asked to also duplicate that
+/// line into an `effort_audit` array — that array was redundant with data
+/// already present in `description`, and duplicating it invited a whole
+/// class of failure (observed in production: `effort_audit` emitted as a
+/// single JSON-encoded string rather than a JSON array, which used to fail
+/// deserialization of an otherwise fully valid proposal). Deriving the field
+/// here instead removes that failure mode entirely: `effort_audit` no longer
+/// depends on anything the model puts in its own JSON —
+/// [`planner_output_from_response`] overwrites the raw key unconditionally
+/// before deserialising — mirrors `pr_review::types::
+/// RegressionCheck::suspected_deletions`, which is derived from `findings`
+/// for the same reason.
+///
+/// One entry per task, same order as `tasks` (an empty string for a task
+/// whose description has no audit line), so callers that index it against
+/// `tasks` by position (e.g. [`detect_oversize_tasks`]) stay aligned.
+fn derive_effort_audit(output: &mut PlannerOutput) {
+    output.effort_audit = output
+        .tasks
+        .iter()
+        .map(|task| {
+            task.description
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| line.starts_with(EFFORT_AUDIT_PREFIX))
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect();
+}
 
 /// Undo a model slip observed in production (T-planner-string-array): an
 /// array-typed field emitted as a single JSON-encoded string instead of an
-/// actual JSON array — e.g. `"effort_audit": "[\"[effort-classification] …\"]"`
-/// rather than `"effort_audit": ["[effort-classification] …"]`. The model's
-/// *content* is fine; only the outer JSON type is wrong. When one of
+/// actual JSON array — e.g. `"edges": "[{\"dependent\": …}]"` rather than
+/// `"edges": [{"dependent": …}]`. The model's *content* is fine; only the
+/// outer JSON type is wrong. When one of
 /// [`ARRAY_TYPED_FIELDS`] is a string that itself parses as a JSON array, this
 /// swaps it in place before schema validation, logging a warning so the slip
 /// stays visible rather than being silently masked. A string that fails to
@@ -540,15 +641,16 @@ fn coerce_stringified_array_fields(input: &mut Value) {
 /// Undo over-escaping the model occasionally introduces in free-text fields
 /// (observed as literal `\"` and `\n` sequences surviving the JSON decode —
 /// the model wrote `\\"` / `\\n` inside its tool-call JSON, one escape level
-/// too many). Applied once here, right after deserialisation, so every
-/// downstream consumer (the `planner_runs` audit row, the Materializer, the
-/// app UI) sees clean text instead of each display site having to band-aid
-/// around it.
+/// too many). Applied once here, right after deserialisation and before
+/// [`derive_effort_audit`] extracts the audit line out of each (now clean)
+/// `description`, so every downstream consumer (the `planner_runs` audit
+/// row, the Materializer, the app UI) sees clean text instead of each
+/// display site having to band-aid around it. `effort_audit` itself needs no
+/// entry here — [`planner_output_from_response`] always resets it to an
+/// empty array before this runs, and [`derive_effort_audit`] populates it
+/// afterwards from the (now-clean) task descriptions.
 fn normalize_output_text(output: &mut PlannerOutput) {
     output.notes = unescape_over_escaped(&output.notes);
-    for line in &mut output.effort_audit {
-        *line = unescape_over_escaped(line);
-    }
     for task in &mut output.tasks {
         task.name = unescape_over_escaped(&task.name);
         task.description = unescape_over_escaped(&task.description);
@@ -688,8 +790,6 @@ format (backticks around the level and the rule; double-quoted reasons):\n\
 \n\
 - Put this line at the END of the task's `description`, separated from the \
 rest of the description by a blank line.\n\
-- ALSO add the identical line to the `effort_audit` array — one entry per \
-task, in the same order as `tasks`.\n\
 - The `level` in the line MUST equal the task's `effort`.\n\
 \n\
 ## dependency edges — maximise safe parallelism\n\
@@ -938,11 +1038,15 @@ mod tests {
     }
 
     #[test]
-    fn coerces_a_stringified_effort_audit_array_before_validation() {
+    fn effort_audit_is_derived_from_task_descriptions_ignoring_a_malformed_raw_field() {
         // Reproduces the production failure: the model emitted `effort_audit`
         // as a single JSON-encoded string (`"[\"[effort-classification] …\"]"`)
         // instead of a JSON array, which used to fail the whole otherwise-valid
-        // proposal with a serde type-mismatch error.
+        // proposal with a serde type-mismatch error. `effort_audit` is now
+        // `#[serde(skip_deserializing)]`, so the raw field — whatever shape it
+        // took — is never even looked at; the real value is derived from the
+        // task's `description`, which the system prompt already requires to
+        // carry the identical audit line.
         let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
@@ -951,7 +1055,7 @@ mod tests {
                     "tasks": [{
                         "handle": "h",
                         "name": "Task",
-                        "description": "Do the thing.",
+                        "description": "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\"",
                         "kind": "project_task",
                         "effort": "small",
                         "ordinal": 0
@@ -960,12 +1064,12 @@ mod tests {
                     "confidence": "high",
                     "breakdown_found": true,
                     "notes": "n",
-                    "effort_audit": "[\"[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\"\"]"
+                    "effort_audit": "not even a JSON array, complete garbage {{{"
                 }
             }]
         }));
         let out = planner_output_from_response(&response)
-            .expect("stringified-array effort_audit must be coerced and accepted");
+            .expect("a malformed raw effort_audit field must never fail deserialization");
         assert_eq!(out.effort_audit.len(), 1);
         assert_eq!(
             out.effort_audit[0],
@@ -974,22 +1078,53 @@ mod tests {
     }
 
     #[test]
+    fn effort_audit_is_empty_for_a_task_with_no_audit_line() {
+        // A task description with no `[effort-classification]` line derives
+        // an empty entry rather than failing, and stays index-aligned with
+        // `tasks` (relied on by `detect_oversize_tasks`).
+        let response = response_from(json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [{
+                        "handle": "h",
+                        "name": "Task",
+                        "description": "Do the thing, no audit line here.",
+                        "kind": "project_task",
+                        "effort": "small",
+                        "ordinal": 0
+                    }],
+                    "edges": [],
+                    "confidence": "high",
+                    "breakdown_found": true,
+                    "notes": "n",
+                    "effort_audit": []
+                }
+            }]
+        }));
+        let out = planner_output_from_response(&response).expect("valid tool_use response parses");
+        assert_eq!(out.effort_audit, vec!["".to_owned()]);
+    }
+
+    #[test]
     fn does_not_coerce_a_non_json_string_field() {
         // A field that is a string but does not itself parse as a JSON array
         // (e.g. a genuine free-text mistake, not the known stringified-array
         // slip) must still be rejected by schema validation rather than
-        // silently accepted.
+        // silently accepted. `edges` is still schema-validated (unlike
+        // `effort_audit`, which is derived and never validated).
         let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
                 "name": TOOL_NAME,
                 "input": {
                     "tasks": [],
-                    "edges": [],
+                    "edges": "not an array at all",
                     "confidence": "high",
                     "breakdown_found": false,
                     "notes": "n",
-                    "effort_audit": "not an array at all"
+                    "effort_audit": []
                 }
             }]
         }));
@@ -1000,11 +1135,42 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_over_escaped_notes_and_effort_audit() {
+    fn coerces_a_stringified_edges_array_before_validation() {
+        // `edges` is still schema-validated and deserialized from the model's
+        // JSON (unlike `effort_audit`, which is now derived and never
+        // validated), so it still needs the pre-validation coercion —
+        // guarding against the same class of slip observed on
+        // `effort_audit`, even though `edges` itself has not been observed to
+        // flake this way in production.
+        let response = response_from(json!({
+            "content": [{
+                "type": "tool_use",
+                "name": TOOL_NAME,
+                "input": {
+                    "tasks": [],
+                    "edges": "[{\"dependent\": \"b\", \"prerequisite\": \"a\"}]",
+                    "confidence": "high",
+                    "breakdown_found": false,
+                    "notes": "n",
+                    "effort_audit": []
+                }
+            }]
+        }));
+        let out =
+            planner_output_from_response(&response).expect("stringified-array edges must be coerced and accepted");
+        assert_eq!(out.edges.len(), 1);
+        assert_eq!(out.edges[0].dependent, "b");
+        assert_eq!(out.edges[0].prerequisite, "a");
+    }
+
+    #[test]
+    fn normalizes_over_escaped_notes_and_task_descriptions() {
         // Guards against a model that over-escapes its JSON tool-call
         // arguments (writes `\\"` / `\\n` where a single JSON escape level
         // was meant), which otherwise survives the JSON decode as literal
-        // backslash-quote and backslash-n sequences.
+        // backslash-quote and backslash-n sequences. `effort_audit` is
+        // derived from `description` *after* it is unescaped, so the derived
+        // audit line must come out clean too.
         let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
@@ -1013,7 +1179,7 @@ mod tests {
                     "tasks": [{
                         "handle": "h",
                         "name": "Over-escaped \\\"name\\\"",
-                        "description": "First paragraph.\\n\\nSecond paragraph with a \\\"quote\\\".",
+                        "description": "First paragraph.\\n\\nSecond paragraph with a \\\"quote\\\".\\n\\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\"",
                         "kind": "project_task",
                         "effort": "small",
                         "ordinal": 0
@@ -1022,7 +1188,7 @@ mod tests {
                     "confidence": "high",
                     "breakdown_found": true,
                     "notes": "the doc's \\\"Proposed implementation task breakdown\\\" section\\n\\nmore prose",
-                    "effort_audit": ["[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\""]
+                    "effort_audit": []
                 }
             }]
         }));
@@ -1031,14 +1197,14 @@ mod tests {
             out.notes,
             "the doc's \"Proposed implementation task breakdown\" section\n\nmore prose"
         );
-        assert_eq!(
-            out.effort_audit[0],
-            "[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
-        );
         assert_eq!(out.tasks[0].name, "Over-escaped \"name\"");
         assert_eq!(
             out.tasks[0].description,
-            "First paragraph.\n\nSecond paragraph with a \"quote\"."
+            "First paragraph.\n\nSecond paragraph with a \"quote\".\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
+        );
+        assert_eq!(
+            out.effort_audit[0],
+            "[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
         );
     }
 
@@ -1184,7 +1350,7 @@ mod tests {
                     "tasks": [{
                         "handle": "h",
                         "name": "Task",
-                        "description": "Do the thing.",
+                        "description": "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\"",
                         "kind": "project_task",
                         "effort": "small",
                         "ordinal": 0
@@ -1200,12 +1366,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_to_end_stringified_array_is_coerced_without_a_retry_round_trip() {
-        // Regression test for the production incident: the model's array
-        // field arrived as a JSON-encoded string. This must succeed off the
-        // *first* HTTP call via coercion — no second round trip needed. Only
-        // one response is mounted (`up_to_n_times(1)`); if the code
-        // mistakenly retried, the second call would get no matching mock.
+    async fn end_to_end_stringified_effort_audit_never_causes_a_retry() {
+        // Regression test for the production incident: the model's
+        // `effort_audit` field arrived as a JSON-encoded string. This must
+        // succeed off the *first* HTTP call — `effort_audit` is
+        // `#[serde(skip_deserializing)]` and derived from `tasks[].description`
+        // instead, so a malformed raw value can never trigger a validation
+        // retry at all (stronger than the old coercion fix, which only
+        // tolerated a string that itself parsed as a JSON array). Only one
+        // response is mounted (`up_to_n_times(1)`); if the code mistakenly
+        // retried, the second call would get no matching mock.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -1218,13 +1388,13 @@ mod tests {
             plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => assert_eq!(out.effort_audit.len(), 1),
-            other => panic!("expected Success via coercion, got {other:?}"),
+            other => panic!("expected Success via derivation, got {other:?}"),
         }
         assert_eq!(audit, DecompositionAudit::default());
         assert_eq!(
             server.received_requests().await.expect("requests recorded").len(),
             1,
-            "coercion must resolve the stringified array on the first call, with no retry round trip",
+            "a malformed effort_audit field must never trigger a retry round trip",
         );
     }
 
@@ -1492,6 +1662,58 @@ mod tests {
                 oversize_attempts: PLANNER_VALIDATION_ATTEMPTS,
                 oversize_remaining: 1,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn final_attempt_schema_failure_falls_back_to_earlier_valid_oversize_proposal() {
+        // Regression test for the live incident this fix addresses: attempt 1
+        // produces a fully schema-valid, merely-oversize proposal (consuming
+        // the only retry to re-prompt for a split); attempt 2 — the final
+        // attempt — comes back schema-invalid (the model's `effort_audit`
+        // stringified-array flake, or any other schema miss). The run must
+        // NOT discard attempt 1's stageable plan: it falls back and accepts
+        // it best-effort, exactly like the existing oversize best-effort
+        // path, with the oversize attention item (`oversize_remaining`)
+        // still reported.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_tool_use_response()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(missing_confidence_tool_use_response()))
+            .mount(&server)
+            .await;
+
+        let (outcome, audit) =
+            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        match outcome {
+            PlannerOutcome::Success(out) => {
+                assert_eq!(
+                    out.tasks.len(),
+                    1,
+                    "must stage attempt 1's oversize-but-valid proposal, not discard it"
+                );
+                assert_eq!(out.tasks[0].handle, "national-rolling-points");
+            }
+            other => panic!("expected best-effort fallback to attempt 1's proposal, got {other:?}"),
+        }
+        assert_eq!(
+            audit,
+            DecompositionAudit {
+                oversize_attempts: 1,
+                oversize_remaining: 1,
+            },
+            "the fallback must still surface the oversize attention item",
+        );
+        assert_eq!(
+            server.received_requests().await.expect("requests recorded").len(),
+            PLANNER_VALIDATION_ATTEMPTS as usize,
+            "must stop after exactly PLANNER_VALIDATION_ATTEMPTS calls",
         );
     }
 
