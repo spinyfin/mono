@@ -1,32 +1,36 @@
 # Boss: Automations (scheduled maintenance work)
 
+- **Status:** shipped (v1) and in production. This doc was revised on 2026-07-20, after the project completed, to describe what was actually built — including decisions that changed during implementation and one post-ship reversal.
+- **Shipped via:** [#921](https://github.com/spinyfin/mono/pull/921) schema + protocol · [#966](https://github.com/spinyfin/mono/pull/966) engine CRUD/RPC · [#1042](https://github.com/spinyfin/mono/pull/1042) CLI · [#1043](https://github.com/spinyfin/mono/pull/1043) second pool + routing · [#1070](https://github.com/spinyfin/mono/pull/1070) scheduler + occurrence math · [#1077](https://github.com/spinyfin/mono/pull/1077) triage + outcome detection · [#1025](https://github.com/spinyfin/mono/pull/1025) Automations tab + schedule editor · [#1068](https://github.com/spinyfin/mono/pull/1068) pool switcher + backlog exclusion.
+- **Notable post-v1 revisions:** [#1098](https://github.com/spinyfin/mono/pull/1098) fixed the app's create-automation wire shape; [#1280](https://github.com/spinyfin/mono/pull/1280) reversed kanban exclusion (automation tasks now shown with a badge); the automation pool grew 3 → 6 → 8 and gained spillover/preemption into interactive slots (2026-07).
+
 ## Problem
 
 Boss's work model assumes a human (or the Boss coordinator) decides _what_ to do and _when_. Every task is filed by hand, dispatched off the kanban, and the deliverable is a merged PR. That is the right shape for feature work, but it leaves a whole class of work unserved: the recurring, low-stakes housekeeping that nobody wants to remember to file. "Fix clippy warnings." "Look for duplicated code and extract a helper if it makes sense." "Bump the dependencies that have a clean changelog." This work is _valuable_ but _episodic_ — most days there is nothing to do, and on the days there is, it should not jump the queue ahead of the human's real priorities.
 
 Today the only way to get this is to remember to file a chore, periodically, forever. That is exactly the kind of standing instruction a machine should hold.
 
-This doc designs **Automations**: a standing, triggered instruction that periodically asks "is there a concrete maintenance task to do right now?" and, if so, spawns a normal task to do it. Automations live _outside_ the normal backlog — they are created and managed from a new top-level **Automations** tab, and the tasks they produce run in a dedicated 3-agent pool so they never contend with interactive work. The work they spawn is otherwise an ordinary task: it lands in a worker pane, produces a PR, and trampolines to GitHub review like everything else. Only its _origin_ (an automation) and its _pool_ (automations) differ.
+This doc describes **Automations**: a standing, triggered instruction that periodically asks "is there a concrete maintenance task to do right now?" and, if so, spawns a normal task to do it. Automations live _outside_ the normal backlog — they are created and managed from a top-level **Automations** tab, and the tasks they produce run in a dedicated agent pool (launched at 3 slots, since grown to 8 — see Pool model) so they don't contend with interactive work. The work they spawn is otherwise an ordinary task: it lands in a worker pane, produces a PR, and trampolines to GitHub review like everything else. Only its _origin_ (an automation) and its _pool_ (automations) differ.
 
 ## Goals
 
-- A first-class **automation** entity: a standing instruction with a **trigger**, a **product** (and optional repo), a **standing-instruction prompt**, and an **open-task cap**.
-- Initially one trigger type — a cron-like **schedule** — with a schema that is **open to other trigger types later** (event-driven, manual-only) without a migration to the core shape.
-- A **two-phase execution model**: phase-1 _triage_ decides whether concrete work exists right now and is allowed to **skip** the occurrence; phase-2 _execute_ spawns a normal task and runs it to a PR.
-- A **dedicated pool of 3 agents**, fully distinct from the main 8-worker pool, with an Agents-tab affordance to switch between the two.
-- **Robust scheduling**: catch up after a missed fire (laptop was closed) unless the next fire is imminent, and **retry** rather than drop an occurrence when execution is transiently impossible (VPN down, remote unreachable).
-- A per-automation **open-task limit** enforced at fire time so pending changes can't pile up.
-- Automation-produced tasks are **excluded from the normal backlog/kanban** and surfaced only under the Automations tab.
-- CLI verbs (`boss automation …`) and a SwiftUI **Automations** tab, both thin clients over the engine, which owns scheduling, pool accounting, and reconciliation.
+- A first-class **automation** entity: a standing instruction with a **trigger**, a **product** (and optional repo), a **standing-instruction prompt**, and an **open-task cap**. _(Shipped as designed.)_
+- Initially one trigger type — a cron-like **schedule** — with a schema that is **open to other trigger types later** (event-driven, manual-only) without a migration to the core shape. _(Shipped as designed; still schedule-only.)_
+- A **two-phase execution model**: phase-1 _triage_ decides whether concrete work exists right now and is allowed to **skip** the occurrence; phase-2 _execute_ spawns a normal task and runs it to a PR. _(Shipped as designed.)_
+- A **dedicated pool of agents**, distinct from the main worker pool, with an Agents-tab affordance to switch between pools. _(Shipped; the fixed sizes and strict isolation the v1 design specified did not survive contact with real demand — see Pool model.)_
+- **Robust scheduling**: catch up after a missed fire (laptop was closed) unless the occurrence is stale, and **retry** rather than drop an occurrence when execution is transiently impossible (VPN down, remote unreachable). _(Shipped, with a reformulated staleness rule and simpler retry mechanics than designed — see Scheduling semantics.)_
+- A per-automation **open-task limit** enforced at fire time so pending changes can't pile up. _(Shipped as designed, default 1.)_
+- Automation-produced tasks surfaced under the Automations tab. _(The original goal — exclude them from the normal backlog/kanban entirely — shipped and was then deliberately reversed in #1280: they now appear on the kanban with an automation badge. See App UI.)_
+- CLI verbs (`boss automation …`) and a SwiftUI **Automations** tab, both thin clients over the engine, which owns scheduling, pool accounting, and reconciliation. _(Shipped as designed; engine ownership held completely.)_
 
 ## Non-goals
 
-- **Trigger types other than `schedule`.** The schema is built to accept them (tagged kind + payload), but only the cron variant is implemented in v1. Event-driven triggers (e.g. "on every merge to main") are explicitly deferred.
-- **Automations that span products or repos.** An automation belongs to exactly one product and targets exactly one repo per fire, mirroring the one-product-per-work-item rule in `work-taxonomy.md`.
-- **Multi-task fan-out per fire.** A single triage run produces **at most one** task. If maintenance naturally splits, that is two automations (or two fires), not one fire spawning a batch. This keeps open-task-limit accounting and provenance 1:1-per-fire.
-- **Auto-merge of automation PRs.** Produced tasks trampoline to GitHub review and a human merges, exactly like every other task. Nothing about the downstream lifecycle is special.
-- **Pre-emption / dynamic pool sizing.** The automations pool is fixed at 3, the main pool stays fixed at 8 (`coordinator.rs` `MAX_WORKER_POOL_SIZE`). A long-running maintenance task is not killed to make room.
-- **A general job scheduler.** This is not cron-as-a-service; the only thing an automation can do is run a triage agent against a standing instruction.
+- **Trigger types other than `schedule`.** The schema accepts them (tagged kind + payload), but only the cron variant is implemented. Event-driven triggers (e.g. "on every merge to main") remain deferred.
+- **Automations that span products or repos.** An automation belongs to exactly one product and targets exactly one repo per fire, mirroring the one-product-per-work-item rule in `work-taxonomy.md`. _(Held.)_
+- **Multi-task fan-out per fire.** A single triage run produces **at most one** task, enforced by the triage prompt and a transactional cap re-check at task creation. _(Held.)_
+- **Auto-merge of automation PRs.** Produced tasks trampoline to GitHub review and a human merges, exactly like every other task. _(Held.)_
+- **Pre-emption / dynamic pool sizing.** _This v1 non-goal was reversed post-ship._ The design fixed the automations pool at 3 and forbade pre-emption; in production, automation demand regularly exceeded the pool, and the answer was growth (3 → 6 → 8 slots, main pool 8 → 16) plus **spillover with preemption**: automation work can spill into idle interactive ("Lower Decks") slots and be preempted there by mainline work (`dispatch_spillover.rs`, priority mainline > review > spilled automation). The two-pool structure remains; strict isolation does not.
+- **A general job scheduler.** This is not cron-as-a-service; the only thing an automation can do is run a triage agent against a standing instruction. _(Held.)_
 
 ## Alternatives considered
 
@@ -34,27 +38,29 @@ This doc designs **Automations**: a standing, triggered instruction that periodi
 
 Register each automation's cron expression with the OS scheduler; on fire, the OS runs `boss automation run <id>`.
 
-Rejected. The engine is the only component that knows the open-task count, the automations-pool capacity, and whether the machine can currently reach the git remote — an OS-level cron firing blind would either ignore the open-task limit or have to re-implement the engine's accounting over the CLI. More decisively, Boss is a laptop app that is _frequently asleep_: launchd's catch-up semantics for missed wakeups are coarse and not configurable per the "skip-if-imminent" rule the brief requires. The engine already runs interval sweepers (`spawn_merge_poller`, the orphan/dead-PID sweeps in `app.rs`, all built on a shared `spawn_loop(... Duration ...)` helper) and already persists `next_due_at`-style bookkeeping for other pollers. An in-engine automation scheduler reuses that machinery and keeps all dispatch policy in one place. **Chosen: in-engine periodic scheduler loop.**
+Rejected. The engine is the only component that knows the open-task count, the automations-pool capacity, and whether the machine can currently reach the git remote — an OS-level cron firing blind would either ignore the open-task limit or have to re-implement the engine's accounting over the CLI. More decisively, Boss is a laptop app that is _frequently asleep_: launchd's catch-up semantics for missed wakeups are coarse and not configurable per the staleness rule this design requires. **Chosen and shipped: an in-engine scheduler.** (It launched as a fixed 30-second `spawn_loop` tick per the original design, and was later made event-driven: the loop now sleeps until the earliest `next_due_at`, clamped to an hour, and is kicked by a `Notify` whenever a mutation changes the schedule.)
 
 ### A2 — Reuse the main worker pool with a priority/quota instead of a second pool
 
 Keep one `WorkerPool`, tag automation executions low-priority, and reserve (or cap) some slots for them.
 
-Rejected. The brief mandates isolation, and isolation by quota inside a shared pool is strictly more complex than a second pool: `claim_worker`/`release_worker` (`coordinator.rs`) would grow a per-class accounting layer, and a burst of maintenance work could still starve interactive work (or vice-versa) at the margins, inviting pre-emption — which is a non-goal. A second `WorkerPool::new(3)` is the same proven primitive (`Vec<WorkerSlot>` behind a mutex) instantiated twice; routing is a single branch in `drain_ready_queue`. The cost is 3 extra panes in the app, which the brief already calls for. **Chosen: a separate, fixed automations pool of 3.**
+Rejected for v1, and the second pool shipped: `WorkerPool::new_automation(size)` is the same proven primitive instantiated again, and per-pool exhaustion means a full automations pool defers automation work without touching main-pool throughput. **Postscript:** the argument this section originally made — that quota-inside-one-pool invites starvation pressure and pre-emption — turned out to be prescient but not decisive. Under real load the strict two-pool split was itself too rigid, and the shipped system now layers exactly the kind of cross-pool accounting this alternative anticipated (spillover of automation work into interactive slots, with preemption) on top of the two-pool structure. The second pool was still the right foundation: routing, accounting, and the UI all key off it.
 
 ### A3 — One hidden "Maintenance" project owns all automation tasks (the brief's open question 1)
 
-The brief sketches a single hidden project that owns every automation-produced task, with backlog exclusion keyed on project membership.
+The brief sketched a single hidden project owning every automation-produced task, with backlog exclusion keyed on project membership.
 
-Rejected as the _primary_ mechanism (see Chosen approach → Provenance). A project is the wrong primitive here: the open-task limit is **per-automation**, so even with a shared project we still need a per-task `source_automation_id` to count correctly — the project adds nothing to accounting. And automation tasks are product-level housekeeping, structurally like chores (`kind = 'chore'`, `project_id = NULL`), not members of a feature project. Auto-creating a magic project per product just to hang tasks off it adds a lifecycle to manage (what is its status? does it show in `boss project list`?) for no benefit. **Chosen: provenance via a `source_automation_id` FK; exclusion keyed on that FK; no synthetic project.** The brief's "Maintenance tasks" framing is satisfied by the Automations _tab_ grouping tasks by their automation, which is what a human actually wants to see.
+Rejected, and the rejection held. A project is the wrong primitive here: the open-task limit is **per-automation**, so even with a shared project we would still need a per-task `source_automation_id` to count correctly — the project adds nothing to accounting. **Shipped: provenance via a `tasks.source_automation_id` FK; no synthetic project.** One nuance the original reasoning got wrong: it assumed the FK would also drive backlog _exclusion_, and that exclusion was reversed post-ship (see App UI) — the FK now drives routing, accounting, provenance links, and a kanban badge instead.
 
-## Chosen approach
+## Chosen approach (as built)
 
-The engine gains an `automations` table, a per-fire `automation_runs` history table, a `source_automation_id` provenance column on `tasks`, a second worker pool, and a periodic scheduler loop. The CLI gains a `boss automation` noun; the app gains an Automations tab and an Agents-tab pool switcher. Everything downstream of "a task was produced" is unchanged.
+The engine gained an `automations` table, a per-fire `automation_runs` history table, an `automation_short_id_sequences` allocator table, a `source_automation_id` provenance column on `tasks`, a second worker pool, and a scheduler loop. The CLI gained a `boss automation` noun; the app gained an Automations tab and an Agents-tab pool switcher. Everything downstream of "a task was produced" is unchanged except its kanban presentation (badge, not exclusion).
 
 ### Data model
 
 #### `automations` table
+
+Shipped exactly as the following DDL (schema version 12 → 13, `migrations_b.rs`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS automations (
@@ -75,7 +81,7 @@ CREATE TABLE IF NOT EXISTS automations (
     -- bookkeeping, updated by the scheduler
     last_fired_at       TEXT,
     last_outcome        TEXT,                          -- mirrors latest automation_runs.outcome
-    next_due_at         TEXT                           -- UTC RFC3339; computed from the cron + tz
+    next_due_at         TEXT                           -- epoch-seconds string, UTC
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS automations_product_short_id_idx
@@ -84,35 +90,36 @@ CREATE INDEX IF NOT EXISTS automations_due_idx
     ON automations(enabled, next_due_at);
 ```
 
-**Trigger representation — tagged `kind` + JSON payload.** This is the exact pattern Product already uses for external trackers: `external_tracker_kind TEXT` + `external_tracker_config` holding a `serde_json::Value` (`protocol/src/types.rs`, the `Product` struct). We mirror it so we add trigger types later without a schema migration. In protocol code the trigger is a serde-tagged enum:
+One deliberate deviation from the original draft: `next_due_at` and `automation_runs.scheduled_for` are stored as **epoch-seconds strings**, not RFC3339, for consistency with the rest of the schema (`created_at`, `dispatch_not_before`).
+
+**Trigger representation — tagged `kind` + JSON payload.** As designed, mirroring Product's external-tracker pattern. In protocol code the trigger is a serde-tagged enum with a single variant so far:
 
 ```rust
-#[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AutomationTrigger {
-    Schedule { cron: String, timezone: String },   // timezone = IANA name, e.g. "America/Los_Angeles"
-    // future: Event { event: String, filter: ... },
-    // future: Manual {},
+    Schedule { cron: String, timezone: String },   // timezone = IANA name
 }
 ```
 
-`trigger_kind` is the persisted discriminator (so `automations_due_idx` and the scheduler can filter cheaply); `trigger_config` is the serialized variant body. A non-`schedule` automation simply never matches the schedule scan and is inert until its trigger type is implemented.
+`trigger_kind` is the persisted discriminator; `trigger_config` stores **only the variant body** — the `kind` field is stripped from the JSON on write and re-injected on read (`automation_trigger_to_db`/`_from_db`), so the discriminator lives in exactly one column.
 
-The `Automation` struct in `boss-protocol` carries ≥8 fields, so per the repo builder convention it uses `#[derive(bon::Builder)]` with `#[builder(on(String, into))]`; `Option<T>` fields (`repo_remote_url`, `catch_up_window_secs`, `last_fired_at`, …) are builder-optional, `open_task_limit`/`enabled` carry `#[builder(default = …)]`, and the DB `map_automation` mapper uses an explicit struct literal (never the builder), matching the `map_task`/`map_product` rule in `work.rs`.
+The `Automation` struct (17 fields) uses `#[derive(bon::Builder)]` with `#[builder(on(String, into))]` per repo convention, as do the `CreateAutomationInput` and `AutomationPatch` types that #921 added alongside it. The DB mappers (`map_automation`, `map_automation_run`) are explicit struct literals per the mapper rule, and normalize empty-string columns to `None`. One known limitation of the patch shape: `AutomationPatch`'s optional fields are `Option<T>`, so an override like `catch_up_window_secs` or `repo_remote_url` **cannot be cleared back to NULL** via update (that would need `Option<Option<T>>`); the limitation is flagged in a code comment and remains open.
+
+**No write-time trigger validation.** `create_automation`/`update_automation` accept any cron/timezone string; a malformed cron is stored and only rejected lazily at scheduler tick (warn-and-skip, counted as a config error). This is a known gap — the original design promised CLI-side validation "by the same crate the engine uses", which never materialized at any layer (see CLI surface).
 
 #### `automation_runs` table (run history)
 
-Every fire — including no-ops and transient failures — records a row. This is the source of truth for the open-task limit's denominator is _not_ here (that's a live count over `tasks`), but it is the audit trail the Automations tab shows.
+Shipped exactly as designed:
 
 ```sql
 CREATE TABLE IF NOT EXISTS automation_runs (
     id                  TEXT PRIMARY KEY,
     automation_id       TEXT NOT NULL REFERENCES automations(id),
-    scheduled_for       TEXT NOT NULL,                -- the cron occurrence this run satisfies (UTC)
+    scheduled_for       TEXT NOT NULL,                -- the cron occurrence this run satisfies (epoch secs, UTC)
     started_at          TEXT NOT NULL,
     finished_at         TEXT,
     triage_execution_id TEXT,                          -- the phase-1 work_execution
-    outcome             TEXT NOT NULL,                 -- see enum below
+    outcome             TEXT NOT NULL,
     produced_task_id    TEXT REFERENCES tasks(id),     -- set iff outcome = 'produced_task'
     detail              TEXT                           -- skip reason / failure detail (free text)
 );
@@ -121,13 +128,14 @@ CREATE INDEX IF NOT EXISTS automation_runs_by_automation_idx
     ON automation_runs(automation_id, scheduled_for);
 ```
 
-`outcome` is a string discriminator (matching the codebase's string-enum convention for `status`/`kind`/`blocked_reason`):
+`outcome` values as built:
 
 - `produced_task` — triage created a task (`produced_task_id` set); phase 2 is underway.
-- `skipped` — triage ran and decided nothing actionable exists right now (a recorded no-op).
-- `suppressed_at_limit` — the fire was due but the open-task count was already at the cap, so no triage ran. (Recorded so the UI can explain why an enabled automation looks idle.)
-- `failed_will_retry` — triage could not execute (transient infra: cube lease failed, git remote unreachable). The scheduler will re-attempt with backoff; `scheduled_for` is preserved.
-- `failed_gave_up` — retries exhausted; the occurrence is abandoned and the schedule advances to the next occurrence.
+- `skipped` — triage ran and decided nothing actionable exists right now, **or** the scheduler recorded a stale missed occurrence for observability.
+- `suppressed_at_limit` — the fire was due but the open-task count was already at the cap, so no triage ran.
+- `failed_will_retry` — the pessimistic default written at fire time and the state for transient failures. _As-built caveat:_ an occurrence abandoned because its catch-up window elapsed mid-retry is also left in this state (detail `"stale: catch-up window elapsed before retry"`) even though it will never be retried — the designed `failed_gave_up` transition for that path was never implemented (known gap).
+- `failed_gave_up` — emitted only when the coordinator's pre-start retry machinery permanently fails a triage execution (and on retry-creation failure), not by the scheduler.
+- `pool_throttled`, `triage_running` — post-v1 additions the original design didn't anticipate, surfacing pool-pressure and in-flight states to the UI.
 
 #### Provenance: `tasks.source_automation_id`
 
@@ -139,153 +147,152 @@ CREATE INDEX IF NOT EXISTS tasks_source_automation_idx
 
 A non-null `source_automation_id`:
 
-1. **Links a produced task back to its automation** — enabling `boss automation tasks <id>` and the tab's per-automation task list.
-2. **Drives backlog/kanban exclusion** — the work-tree RPC and the app filter out any task where `source_automation_id IS NOT NULL`.
-3. **Routes the task's execution to the automations pool** — the dispatcher reads it to pick the pool.
-4. **Is the denominator for the open-task limit** — `COUNT(*) WHERE source_automation_id = ? AND status IN ('todo','ready','doing','in_review','blocked')`.
+1. **Links a produced task back to its automation** — `boss automation tasks <id>` and per-run task links in the app.
+2. **Routes the task's execution to the automations pool** — the dispatcher resolves it with a per-dispatch `SELECT` (see Pool model).
+3. **Is the denominator for the open-task limit** — `COUNT(*) WHERE source_automation_id = ? AND status IN ('todo','ready','doing','in_review','blocked') AND deleted_at IS NULL`.
+4. **Badges the task on the kanban.** The original fourth role — driving backlog/kanban _exclusion_ — shipped and was reversed in #1280; see App UI.
 
-Produced tasks keep `kind = 'task'` and `project_id = NULL`; they are product-level like chores. We do **not** introduce a `kind = 'maintenance'` — the kind discriminator is about _deliverable shape_ (PR vs doc), and a maintenance task's deliverable is an ordinary PR. Provenance, not kind, is the right axis (this is the same reasoning `design-producing-tasks.md` Q1 used to reject a parallel boolean flag).
+Produced tasks are inserted as **chores** (`kind = 'chore'`, `project_id = NULL`, `created_via = 'engine_auto'`, `autostart = true`, `force_duplicate = true` to bypass the recent-duplicate guard). The original design said `kind = 'task'`; implementation landed on the chore path (`insert_chore_in_tx`) since these are product-level housekeeping items structurally identical to chores — the design's own analogy, taken literally. There is still no `kind = 'maintenance'`: provenance, not kind, is the discriminating axis.
+
+Deletion semantics (decided during implementation, #966): `delete_automation` is a hard delete that cascades to `automation_runs` in the same transaction; produced tasks are intentionally **orphaned** — they keep their `source_automation_id` and live out their normal lifecycle.
 
 #### Short-id namespace: a new `A` prefix
 
-Automations get their own per-product `A` namespace (`A1`, `A2`, …), allocated by the same `allocate_short_id`/`short_id_sequences` machinery (`work.rs`) used for `T`/`P`. They are **not** added to `resolve_friendly_work_item_id` (that resolver returns _work items_; an automation is not a work item). Instead `boss automation` verbs resolve `A<n>` within the automation namespace. Justification: reusing `T`/`P` would make `boss automation show T42` ambiguous, and automations are a genuinely distinct noun deserving a distinct prefix, consistent with `friendly-numeric-ids-for-work-items.md`.
+Automations get their own per-product `A` namespace (`A1`, `A2`, …). The original plan to reuse the existing `short_id_sequences` table "with no schema change" was wrong — that table holds a single per-product counter shared by `T`/`P`, so A-numbers would have interleaved with task numbers. #921 added a dedicated `automation_short_id_sequences` table (`product_id` PK, `next_value`) with a parallel `allocate_automation_short_id()`. Automations are not in `resolve_friendly_work_item_id`; `A<n>` resolution is **CLI-side** (`resolve_automation`: `ListAutomations` + match on `short_id`), which is why every selector-taking CLI verb needs product context (see CLI surface). There is no engine-side `A<n>` resolver.
 
-### Repo selection (brief's "prompt-only vs explicit field" question)
+### Repo selection
 
-**Recommendation: an optional explicit `repo_remote_url` field, authoritative for the cube lease, with the standing instruction as documentation only.** A product can have multiple repos (`multi-repo-work-modeling.md`); the engine must lease a _specific_ cube workspace before the triage agent runs, so it needs the target repo as structured data, not buried in prose it would have to parse. If `repo_remote_url` is null, default to the product's primary repo. The standing instruction may still _mention_ the repo for the agent's benefit, but the explicit field is what the engine acts on, and the produced task inherits it via the existing `tasks.repo_remote_url` per-task override.
+As designed: an optional explicit `repo_remote_url` field, authoritative for the cube lease, with the standing instruction as documentation only. If `repo_remote_url` is null, the product's primary repo is used. The produced task inherits the repo via the existing `tasks.repo_remote_url` per-task override.
 
 ### Two-phase execution
 
 #### Phase 1 — Triage
 
-When the scheduler decides an automation should fire (due, enabled, under cap, machine able), it creates a `work_execution` of a new kind `automation_triage`, **bound to the automation, not to a task**, and enqueues it for the automations pool. A new `automation_runs` row is opened with `outcome = failed_will_retry` as a pessimistic default (flipped on success), so a crash mid-triage leaves a retryable record.
+When the scheduler fires an automation (due, enabled, under cap), it creates a `work_execution` of kind `automation_triage` (`EXECUTION_KIND_AUTOMATION_TRIAGE`, now a typed `ExecutionKind::AutomationTriage` in `boss-protocol`), **bound to the automation, not to a task**: `work_item_id` is the automation's id, and the coordinator synthesizes an in-memory `WorkItem::Chore` (`synthetic_triage_work_item`) to satisfy spawn plumbing — a deliberate dodge of adding a `WorkItem::Automation` enum variant, which would have rippled through ~50 exhaustive matches. The `automation_runs` row is opened with `outcome = failed_will_retry` as a pessimistic default, so a crash mid-triage leaves a retryable record.
 
-The triage worker is spawned into a cube workspace for the automation's repo exactly like any worker (`schedule_execution` → `cube lease` → `SpawnWorkerPane`), but its rendered `CLAUDE.md`/initial input is a **triage preamble** the engine composes:
+The triage worker is spawned into a cube workspace like any worker, but its prompt is a **triage preamble** rendered by `render_triage_preamble` (`automation_triage.rs`) instead of the normal execution prompt. Key contract points as shipped:
 
-> You are a maintenance **triage** agent for automation `A<n>` on product `<product>`. Standing instruction: _"<standing_instruction>"_. Decide whether a **single, concrete, actionable** task can be derived from this instruction **right now** in this repo. You are explicitly allowed to conclude that nothing appropriate exists.
->
-> - If there **is** work: create exactly one task with `boss task create --automation A<n> --autostart "<concise title>" --description "<what to do>"`, then end your final message with the line `automation: task <the-new-T-id>`. **Do not do the work or open a PR yourself** — a separate worker will execute the task.
-> - If there is **nothing** appropriate: end your final message with `automation: skip — <one-line reason>`.
+- The create command embeds the **canonical `auto_…` id**, not `A<n>` — `boss task create --automation auto_… --name "<title>" --description "<what>"` — so the agent's call resolves without a `--product` flag. (The original sketch's `--autostart` flag doesn't exist; autostart is hard-coded server-side.)
+- Hard guardrails: do not do the work yourself; create at most one task (a second `boss task create --automation` in one run is rejected transactionally); end with **exactly one** decision marker — `automation: task <id>` or `automation: skip — <reason>`. Zero or multiple markers is an inconclusive run, not a skip.
+- The preamble has since grown substantially in response to field failures (open question 3's exact worry): an "already tracked" section listing open sibling tasks, a "single-shot mandate — no sub-agents, no deferral" section, and keep-it-lightweight guidance.
 
-Outcome detection mirrors `PrDetector` (`completion.rs`) and the proposed `DesignDetector`: a new **`AutomationTriageDetector`** inspects the triage execution's final output on Stop:
+**Outcome detection.** The design named an `AutomationTriageDetector` struct mirroring `PrDetector`; what shipped follows `completion.rs`'s method-per-kind shape instead: a `finalize_automation_triage` branch taken on Stop when `kind == automation_triage`, plus a `StopOutcome::AutomationTriage` variant. The marker parser (`parse_triage_decision`) is stricter and looser than the design in instructive ways: it scans **every line** of the final assistant message (not just the last line), enforces **exactly one** marker (a new `Ambiguous` state refuses to guess between two), matches the `automation:` prefix case-insensitively, and accepts em-dash, hyphen, or colon as the skip separator. A `task` marker is verified against the DB — the named task must exist with this automation's provenance — before `produced_task` is recorded.
 
-- final line matches `automation: task <id>` **and** a task with that id and `source_automation_id = this` exists → `automation_runs.outcome = produced_task`, `produced_task_id` set. Phase 2 proceeds automatically because the produced task is `autostart`.
-- final line matches `automation: skip — <reason>` → `outcome = skipped`, `detail = reason`. No task. This is the explicit, agent-authored skip — distinct from a failure (see Scheduling → transient detection).
-- neither marker present (worker errored, was reaped, or produced no decision) → left at `failed_will_retry`; the scheduler re-attempts.
+Post-v1, **marker recovery** was added for inconclusive runs (a class of real incidents, e.g. the "at limit 3/3" wedge): if a run ends with no usable marker but an open task with this automation's provenance exists, it is recorded as `produced_task`; if the final message plainly concluded there was nothing to do, it is recorded as `skipped`.
 
-The triage agent creating the task via `boss task create --automation` (rather than the engine reading a manifest) is the cheap path: `create_task` already exists (`work.rs`), and the `--automation` flag is a thin addition that stamps `source_automation_id` and re-checks the cap transactionally (so even a misbehaving agent can't exceed the limit). We considered an engine-side manifest à la `design-producing-tasks.md`, but that feature is itself unbuilt; reusing `boss task create` keeps this design landable on today's primitives.
+The triage agent creating the task itself (rather than the engine reading a manifest) shipped as designed: the CLI's `boss task create --automation` maps to a dedicated `CreateAutomationTask` RPC whose handler runs one immediate transaction — cap re-check against `open_task_limit`, chore insert, provenance stamp — so even a misbehaving agent can't exceed the limit.
 
 #### Phase 2 — Execute
 
-The produced task is an ordinary `tasks` row with `source_automation_id` set, `autostart = true`, `project_id = NULL`, `repo_remote_url` inherited from the automation. The engine requests an execution for it (the normal `request_execution` path), but the dispatcher routes it to the **automations pool** because `source_automation_id` is non-null. From there the lifecycle is identical to any task: Doing → worker opens a PR → `PrDetector` flips it to `in_review` → human reviews/merges on GitHub → `done`. The Automations tab shows this lifecycle; the main kanban never sees the task.
+The produced task is an ordinary chore row with `source_automation_id` set. The engine requests an execution for it via the normal path, and the dispatcher routes it to the automations pool because the provenance column is non-null. From there the lifecycle is identical to any task: Doing → worker opens a PR → `PrDetector` flips it to `in_review` → human reviews/merges on GitHub → `done`. Since #1280, the main kanban **does** see the task — badged as automation work — because the Automations tab shows run history rather than a full produced-task lifecycle view (see App UI).
 
-### Pool model
+### Pool model (as built)
 
-A second `WorkerPool` instance, `automation_pool: WorkerPool::new(3)`, lives in `ServerState` beside the existing main pool. Size comes from config `BOSS_AUTOMATION_POOL_SIZE` (default 3), parallel to `BOSS_WORKER_POOL_SIZE` (default 8). Routing is one branch in `drain_ready_queue` / `schedule_execution`:
+A second `WorkerPool` instance lives on the **`ExecutionCoordinator`** (not `ServerState` as originally sketched — the coordinator owns claim/release; `app.rs` constructs the pool from config and injects it via `set_automation_pool()`, which also gives tests a seam). It is built with `WorkerPool::new_automation(size)`, which namespaces slot ids with an `auto-worker-` prefix — an unplanned but load-bearing design element: the release path only has a worker-id string, so the prefix is what routes releases to the right pool (`pool_for_worker_id`) without a DB round-trip. Size comes from `BOSS_AUTOMATION_POOL_SIZE`, clamped to `MAX_AUTOMATION_POOL_SIZE` — **3 at launch, raised to 6 and then 8 (2026-07-15) as automation demand regularly exceeded the pool**. The main pool likewise grew 8 → 16 (two UI pages, "Bridge Crew" and "Lower Decks"), and a third **review pool** (8, `review-` prefix) was later cloned from the same pattern.
 
-```text
-pool = if execution.kind == "automation_triage"
-        || work_item.source_automation_id.is_some()
-       { &automation_pool } else { &main_pool };
-let worker = pool.claim_worker(exec_id, preferred_workspace).await;
+Routing as shipped:
+
+```rust
+fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
+    if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE { return true; }
+    matches!(self.work_db.source_automation_id_for_work_item(&execution.work_item_id), Ok(Some(_)))
+}
 ```
 
-`claim_worker`/`release_worker`/`release_worker_and_kick` are unchanged — they operate on whichever pool instance they're called against. Pool exhaustion (`DrainOutcome::PoolExhausted`) is per-pool: an exhausted automations pool defers automation work without touching main-pool throughput, and vice-versa. The scheduler heartbeat already re-kicks; nothing new is needed there.
+The original sketch read `work_item.source_automation_id` from an in-memory work item the drain loop doesn't actually hold, so the shipped predicate does a single `SELECT` per dispatch. (Known wart: a DB _error_ here silently routes to the main pool.)
 
-The two pools draw cube workspaces from the same cube pool (workspaces are repo-scoped and fungible); only the _slot/pane_ accounting is separate. The app renders 8 panes for the main pool and 3 for the automations pool.
+Per-pool exhaustion required more than the "single branch" the design promised: the old one-at-a-time `drain_ready_queue` early-returned on the first full pool, which would have let a full automations pool block main dispatch. It was rewritten to batch-fetch ready executions per pass with independent per-pool exhaustion flags; executions for a full pool stay `ready` and are retried on the next kick. `DrainOutcome` remains a binary enum (callers can't tell which pool stalled; the unconditional re-kick on release makes that acceptable).
 
-### Scheduling semantics
+**Post-v1 spillover.** Strict isolation was relaxed once the pool cap kept binding: `dispatch_spillover.rs` lets automation work spill into idle Lower-Decks interactive slots, where mainline work can preempt it (priority mainline > review > spilled automation). Spilled automation holds `worker-N` ids, so the worker-id-prefix-as-pool-proxy had to be patched with `attributed_pool_label()` for accounting.
 
-A new interval loop, `automation_scheduler`, is spawned in `app.rs` alongside the other sweepers using the shared `spawn_loop(... Duration::from_secs(30) ...)` pattern. Each tick, for each enabled automation with `trigger_kind = 'schedule'`:
+The pools draw cube workspaces from the same cube pool (workspaces are repo-scoped and fungible); only slot/pane accounting is separate.
 
-1. **Compute occurrences.** Parse the cron expression with a cron crate (`croner` or `cron`), iterate in the stored IANA timezone via `chrono-tz`. `next_due_at` is stored as UTC. (Timezone/DST handling below.)
-2. **Open-task-limit gate (enforced here, at fire time).** Count open produced tasks: `status IN ('todo','ready','doing','in_review','blocked')` with this `source_automation_id`. ("Open" = anything not `done`/`archived`/soft-deleted — confirming the brief's open question 5.) If count ≥ `open_task_limit`: do **not** fire; record one `suppressed_at_limit` run for the missed occurrence and advance `next_due_at` to the following occurrence. (We advance rather than hold so a capped automation doesn't fire a stampede the instant a task merges.)
-3. **Due check + catch-up after a miss.** If `now >= next_due_at`:
-   - Let `following` be the next occurrence strictly after `next_due_at`.
-   - If `following - now <= catch_up_window` → the missed fire is **stale**; skip it (record nothing, or a `skipped`/`detail="stale, within catch-up window"` run for observability) and set `next_due_at = following`. This is the "we're already nearly at the next one" rule.
-   - Else → **catch up**: fire the missed occurrence now.
-     `catch_up_window` defaults to an **engine constant of 15 minutes**, overridable per automation via `automations.catch_up_window_secs`. Rationale: 15 min is long enough that a brief sleep/wake doesn't lose a daily job, short enough that a "2pm weekday" job missed until 1:50pm next day correctly skips to the real 2pm.
-4. **Ability check + transient retry.** Firing creates the `automation_triage` execution. If the **pre-start** steps fail transiently — cube lease error, git remote unreachable (VPN down), product repo unresolvable — this is detected exactly as the existing dispatcher detects it: `schedule_execution` increments `WorkExecution::pre_start_failure_count` and sets `dispatch_not_before` to a backoff time (the same `dispatch_not_before` epoch-seconds gate already on `work_executions`). The run is `failed_will_retry`; the scheduler re-attempts after the backoff, **preserving `scheduled_for`** so we retry _this_ occurrence, not skip to the next. Backoff is exponential (e.g. 1, 2, 4, 8 … min) capped at the `catch_up_window`; once the backoff would push past the next occurrence, the run becomes `failed_gave_up` and the schedule advances.
+### Scheduling semantics (as built)
 
-**Transient inability vs genuine phase-1 skip — the key distinction:**
+The scheduler lives in `automation_scheduler.rs` around a pure `run_one_pass(work_db, now_epoch, dispatcher)` — "now" is injected, so occurrence math is deterministically testable. It launched as the designed 30-second `spawn_loop` tick and fires immediately on boot (so an occurrence that elapsed while the engine was down catches up without waiting an interval); the fixed tick was later replaced by an event-driven sleep until the earliest `next_due_at` (clamped to 3600s, with a 5s bootstrap poll and a `Notify` kick from mutation handlers). Each pass, for each enabled automation with `trigger_kind = 'schedule'`:
 
-| Signal                                                                  | Meaning                     | Recorded as                                 |
-| ----------------------------------------------------------------------- | --------------------------- | ------------------------------------------- |
-| Pre-start failure (lease/remote/VPN) — worker never produced a decision | Can't execute right now     | `failed_will_retry` → retry same occurrence |
-| Worker ran, ended with `automation: skip — …`                           | Agent decided nothing to do | `skipped` → advance schedule, **no** retry  |
-| Worker ran, ended with `automation: task <id>`                          | Found work                  | `produced_task` → phase 2                   |
-| Worker ran but emitted neither marker (crash/reap mid-run)              | Ambiguous failure           | `failed_will_retry` (bounded retries)       |
+1. **Compute occurrences.** Open question 7 asked "`croner` or `cron`?" — the answer was **neither**: occurrence math is a hand-rolled five-field cron parser (now the `boss-engine-automation-schedule` crate) plus `chrono-tz`. Rationale: purity (no DB, no async, no wall-clock reads) and full control of DST resolution so gap/fold behavior exactly matches this doc. The parser supports `*`, values, ranges, lists, steps, dow 0–7 with 7→0, and the Vixie dom/dow union rule; no month/day names. An unsatisfiable cron yields nothing within a 5-year scan horizon.
+2. **Open-task-limit gate (at fire time).** Count open produced tasks (`todo|ready|doing|in_review|blocked`, not soft-deleted). If count ≥ `open_task_limit`: don't fire; record a `suppressed_at_limit` run and advance `next_due_at` to the following occurrence — the open-question-8 "advance" choice, so a capped automation doesn't stampede the instant a task merges. (Refinement: if no following occurrence exists, hold rather than lose the slot.)
+3. **Due check + catch-up after a miss.** The design's staleness rule — skip if `following - now <= catch_up_window` — was **reformulated during implementation** because it is degenerate for cron periods shorter than the window: an every-5-minutes job always has its next fire within 15 minutes and would have skipped every occurrence. The shipped rule tests the miss itself: an occurrence is **stale** when `now - occurrence > catch_up_window`; stale misses are recorded as `skipped` runs (detail explains the lateness) and the schedule advances. A sleep backlog is **collapsed to the single most recent occurrence** (bounded at 10,000 scanned occurrences per pass) — one catch-up fire after a week's vacation, not a stampede. `catch_up_window` defaults to an engine constant of **15 minutes**, overridable per automation via `catch_up_window_secs` (though no CLI/app surface can currently set the override — known gap).
+4. **Dispatch + transient retry.** Firing goes through a `TriageDispatcher` seam (`EngineTriageDispatcher` in production). The design's bespoke exponential backoff ("1, 2, 4, 8 … min capped at the catch-up window") was **not built**; what shipped is simpler reuse: pre-start failures (cube lease, remote unreachable) flow through the coordinator's generic machinery — fixed retry delays of 5s/15s/45s, then permanent failure finalizes the run as `failed_gave_up`. Dispatcher-level transient failures hold `next_due_at` (preserving `scheduled_for` so the same occurrence retries) and re-attempt every scheduler pass until the catch-up window elapses, at which point the occurrence is abandoned — currently mislabeled `failed_will_retry` rather than the designed `failed_gave_up` (known gap).
 
-The discriminator is **whether the worker reached a decision marker**. A skip is an explicit, agent-authored statement; everything that prevents the agent from _getting to_ a marker is treated as transient and retried (bounded).
+**Transient inability vs genuine phase-1 skip — the key distinction, as built:**
 
-#### Timezone / DST handling (brief's open question 4)
+| Signal                                                                  | Meaning                     | Recorded as                                                                                                                                                            |
+| ----------------------------------------------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pre-start failure (lease/remote/VPN) — worker never produced a decision | Can't execute right now     | `failed_will_retry` → retried (5s/15s/45s), then `failed_gave_up`                                                                                                      |
+| Worker ran, ended with `automation: skip — …`                           | Agent decided nothing to do | `skipped` → advance schedule, no retry                                                                                                                                 |
+| Worker ran, ended with `automation: task <id>` (verified in DB)         | Found work                  | `produced_task` → phase 2                                                                                                                                              |
+| Worker ran, emitted zero or multiple markers                            | Inconclusive                | Marker recovery first; else `failed_will_retry` — but the schedule already advanced at fire time, so the effective retry is the next cron occurrence, not the same one |
 
-Store the IANA timezone name (not a fixed UTC offset) alongside the cron, so "every weekday at 2pm" means 2pm _local_ across DST transitions. Compute occurrences with `chrono-tz`:
+The discriminator remains **whether the worker reached a decision marker**; the marker-recovery pass narrows the inconclusive bucket that in the original design would have burned retries.
 
-- **Spring-forward gap** (a wall-clock time that doesn't exist, e.g. 02:30 on the skip day): advance to the next valid instant — the job runs once, slightly later, not zero times.
-- **Fall-back overlap** (a wall-clock time that occurs twice): fire on the **first** occurrence only; dedupe by `scheduled_for` so the second 01:30 doesn't double-fire.
-  `automation_runs.scheduled_for` (UTC) is the dedupe key — a given occurrence fires at most once regardless of clock weirdness.
+#### Timezone / DST handling
+
+Shipped as designed: the IANA timezone name is stored alongside the cron, occurrences are computed in that zone, and `(automation_id, scheduled_for)` is the dedupe key — `record_automation_run_and_advance` is a transactional upsert on that pair, so a given occurrence fires at most once regardless of clock weirdness.
+
+- **Spring-forward gap**: advance minute-by-minute to the first valid instant (bounded at 240 minutes) — the job runs once, slightly later.
+- **Fall-back overlap**: fire on the **earliest** mapping of the ambiguous wall-clock time only.
 
 ### CLI surface (`boss automation`)
 
-Mirrors `boss task` / `boss project` conventions: clap subcommand enum, `--product` resolution, `--json` via the existing `print_entity` (direct serialization, no wrapper), `--no-input` for non-interactive use, `A<n>` selector resolution.
+All ten designed verbs shipped (`create list show update enable disable delete run runs tasks`), mirroring `boss task`/`boss project` conventions (`--json`/`--no-input` are global flags rendered via `print_entity`). Deviations and refinements vs the original table:
 
-```
-boss automation create  --product <p> --name <n> --instruction <text>
-                         --schedule <preset|raw-cron> [--timezone <IANA>]
-                         [--repo <url>] [--open-task-limit N] [--disabled]
-boss automation list     [--product <p>] [--json]
-boss automation show     <A-id|id> [--json]
-boss automation update   <A-id> [--name|--instruction|--schedule|--timezone|--repo|--open-task-limit …]
-boss automation enable   <A-id>
-boss automation disable  <A-id>
-boss automation delete   <A-id>
-boss automation run      <A-id> [--force]        # fire triage now; --force bypasses the open-task cap
-boss automation runs     <A-id> [--json]         # run history (automation_runs)
-boss automation tasks    <A-id> [--json]         # produced tasks + their current status
-```
+- **Every selector-taking verb accepts `--product`**, because `A<n>` is a per-product namespace resolved client-side. When exactly one product exists it is auto-selected, so `--product` is usually omittable; selectors accept `A<n>`, `a<n>`, a bare integer, or the canonical `auto_…` id.
+- `create` flags: `--product --name --instruction --schedule --timezone --repo --open-task-limit --disabled`; missing required values are prompted interactively unless `--no-input`. **`--timezone` defaults to `UTC`** (the app defaults to the system zone — a small inconsistency).
+- Presets compile as: `weekday-2pm` → `0 14 * * 1-5`, `nightly` → `0 2 * * *`, `weekly-mon-am` → `0 9 * * 1`, `hourly` → `0 * * * *` (case-insensitive).
+- **Raw-cron validation is shallow**: five whitespace-separated fields of `[0-9A-Za-z*/,-]` only. The design's promise — "validated by the same crate the engine uses, so the CLI rejects garbage before it reaches the DB" — is unfulfilled: `99 99 * * *` passes the CLI, is stored, and is only rejected per-tick by the scheduler. The schedule crate even exports a `validate_schedule()` doc-commented for CLI use that has zero callers. Known gap at every layer.
+- `run [--force]` shipped in #1042 as a stub (the engine returned "not yet implemented") and became real in #1077: manual fire respecting the cap unless `--force`, recording a run with `scheduled_for = now` and leaving `next_due_at` undisturbed.
+- `update` can patch name/instruction/schedule/timezone/repo/open-task-limit (partial trigger patches merge with stored values; `--repo ""` clears). It cannot toggle `enabled` (dedicated verbs) and **`catch_up_window_secs` has no CLI surface at all**.
 
-`--schedule` accepts either a **preset keyword** (e.g. `weekday-2pm`, `nightly`, `weekly-mon-am`, `hourly`) that the CLI compiles to a cron expression, or a **raw cron string** (validated by the same crate the engine uses, so the CLI rejects garbage before it reaches the DB). `boss automation run` enqueues an immediate `automation_triage` execution out of band of the schedule; it still respects the open-task cap unless `--force`.
+### App UI (as built)
 
-### App UI
+- **Automations tab** (#1025): `NavigationMode.automations` + a `NavigationSplitView` — sidebar list, detail pane, empty states. Rows show the `A<n>` id, name, enabled status dot, human-readable schedule, color-coded last outcome, and `open/limit` count (via a `GetAutomationOpenTaskCount` RPC the design didn't specify); next-due time and the enabled toggle live in the detail pane rather than the row. The detail pane has schedule/status/instruction/settings sections, an enable toggle, an Edit sheet, and Delete-with-confirmation. Run history was added post-#1025 once a list RPC existed ("Recent Runs" section, per-run produced-task `T…` links that reveal the task on the kanban). Ship note: #1025's create call disagreed with the engine's `#[serde(flatten)]` wire shape and creation was broken at merge until #1098 — the price of item 7's "can start against mocked RPC" plan meaning it was never integration-tested against the real engine.
+- **Schedule editor**: presets ("Every weekday at 2pm", "Every night at midnight", "Weekly on Monday at 9am", "Every hour", "Custom…") compiled to cron with reverse cron→preset mapping on edit; a raw-cron escape hatch (validation is a field-count check only); a timezone picker defaulting to the system zone; the compiled cron shown read-only. Plus name, instruction, open-task-limit stepper (1–10), start-enabled toggle, optional repo field. (The edit sheet collects but currently **discards** repo and enabled changes — known gap.)
+- **Agents-tab pool switcher** (#1068): shipped as the designed segmented "Main (8)" ↔ "Automations (3)" control; now a four-way picker — Bridge Crew / Lower Decks / Automations / Reviewers — as the pools grew. The designed "worker states tagged by pool" subscription never existed; pool identity is conveyed by **disjoint slot-id ranges** (main 1–16, automations 17–24, reviewers 25–32), with dynamic pool config pushed to the app via `EnginePoolConfig` at session registration. Functionally equivalent, mechanically different.
+- **Backlog/kanban exclusion — shipped, then reversed.** #1068 shipped the client-side filter (`computeVisibleWorkItems()` dropped tasks with non-null `sourceAutomationId`); the promised server-side work-tree exclusion was never built. #1280 then deliberately **removed** the client filter: because the Automations tab surfaces run history but not a produced-task lifecycle list, excluded `in_review` tasks had no visible surface anywhere — a task waiting on human PR review was invisible. The shipped end-state is **inclusion with provenance**: automation tasks appear on the kanban with a purple `wand.and.stars` badge and an "Automation" detail row. The design's assumption that "the Automations tab shows this lifecycle; the main kanban never sees the task" is the single largest thing this project got wrong.
 
-- **New top-level Automations tab.** Add `case automations = "Automations"` to `NavigationMode` (`Models.swift`) and a branch in the `ContentView` ZStack + the segmented mode `Picker`. The tab lists automations for the selected product — each row showing name, human-readable schedule, enabled toggle, `open/limit` count, last outcome, and next-due time. The detail pane is the edit form + run history (`automation runs`) + produced-task list with live lifecycle state.
-- **Schedule editor.** A presets dropdown ("Every weekday at 2pm", "Every night", "Weekly on Monday morning", "Hourly", "Custom…") that compiles to cron, a **raw-cron escape hatch** text field with inline validation, and a timezone picker (defaulting to the system zone). The compiled cron is shown read-only beneath the presets so the user can see what they get.
-- **Agents-tab pool switcher.** A segmented control in `WorkersDetailView` toggling **Main (8)** ↔ **Automations (3)**, rendering the corresponding pool's panes. The engine exposes both pools' live worker states over the existing worker-state subscription, tagged by pool.
-- **Backlog/kanban exclusion.** `computeVisibleWorkItems()` (`ChatViewModel.swift`) filters out any task with non-null `source_automation_id`; the engine's work-tree RPC also excludes them server-side so the app never receives them in the main board feed. The Automations tab fetches them explicitly via the per-automation query.
+### Engine ownership
 
-### Engine ownership (brief's open question 2)
+Confirmed and held throughout: the engine owns the scheduling tick, occurrence computation, open-task-limit enforcement, pool accounting, triage dispatch, outcome detection, and run-history writes. The app and CLI are thin clients. No scheduling logic lives in the app.
 
-Confirmed: the **engine owns** the scheduling tick, occurrence computation, open-task-limit enforcement, pool accounting, triage dispatch, outcome detection, and run-history writes. The app and CLI are thin clients that create/edit/enable automations and render state pushed over the existing subscription layer (`work-subscriptions.md`). No scheduling logic lives in the app.
+### Migration (as shipped)
 
-### Migration
+- Schema version 12 → 13: `CREATE TABLE automations`, `CREATE TABLE automation_runs`, `CREATE TABLE automation_short_id_sequences`, `ALTER TABLE tasks ADD COLUMN source_automation_id` (+ partial index). The original claim that the `A` namespace needed "no schema change" was wrong (see Short-id namespace).
+- No change to `work_executions` — `automation_triage` is just a new kind string, and `dispatch_not_before`/`pre_start_failure_count` already existed, exactly as predicted.
 
-- `ALTER TABLE tasks ADD COLUMN source_automation_id` — null for every existing row; no behavioral change to existing tasks.
-- `CREATE TABLE automations`, `CREATE TABLE automation_runs` — new, empty.
-- Extend `short_id_sequences` usage to the `A` namespace (no schema change; the sequence table is per-product already).
-- No change to `work_executions` schema — the new `automation_triage` kind is just a new string value, and `dispatch_not_before`/`pre_start_failure_count` already exist.
+### Implementation (as shipped)
 
-### Implementation breakdown (follow-up tasks, in dependency order)
+The eight planned PR-sized tasks all landed, in the planned dependency order, with scope shifting at the edges:
 
-These are the PR-sized tasks a human would file once this design is approved; stack where there is a hard dependency.
+1. **Schema + protocol types** — #921. Added the unplanned `automation_short_id_sequences` table and the `CreateAutomationInput`/`AutomationPatch` types; deferred cron-crate choice entirely (resolved in #1070 as "neither").
+2. **Engine CRUD + RPC** — #966. Landed in a new `work/automations.rs` submodule rather than `work.rs`; added `GetAutomationOpenTaskCount`; defined an `AutomationRunResult` event that was never wired to a producer (superseded by the later `AutomationRunsList`; still dead wire surface).
+3. **CLI `boss automation`** — #1042. Also had to build the runs/tasks/run RPC pairs #966 hadn't; `run` shipped as an engine stub.
+4. **Second pool + dispatch routing** — #1043. Grew into a `drain_ready_queue` rewrite plus the worker-id-prefix scheme; both became foundations for the later review pool and spillover.
+5. **Scheduler loop + occurrence math** — #1070. Hand-rolled cron parser; reformulated staleness rule; catch-up collapse; dispatched into a placeholder until #1077.
+6. **Triage + outcome detection** — #1077. Marker parser + `finalize_automation_triage` (no Detector struct); `CreateAutomationTask` RPC; synthetic chore work items; made `boss automation run` real.
+7. **App: Automations tab + schedule editor** — #1025 (merged before items 5/6; create wire-broken until #1098; run history followed later).
+8. **App: pool switcher + backlog exclusion** — #1068 (exclusion later reversed by #1280).
 
-1. **Schema + protocol types.** `automations` / `automation_runs` tables, `Automation`/`AutomationRun` structs (bon builder), `AutomationTrigger` tagged enum, `tasks.source_automation_id` column + mapper update, `A` short-id allocation. (Foundation; everything depends on it.)
-2. **Engine CRUD + RPC.** `create/list/show/update/enable/disable/delete` automation methods in `work.rs`, RPC handlers, open-task-count query. (Depends on 1.)
-3. **CLI `boss automation`.** All verbs, preset→cron compilation, raw-cron validation, `A<n>` resolution. (Depends on 2.)
-4. **Second worker pool + dispatch routing.** `automation_pool`, config var, routing branch, per-pool exhaustion. (Depends on 1; independent of 3.)
-5. **Scheduler loop + occurrence math.** `automation_scheduler` spawn_loop, cron/tz computation, catch-up + skip-if-imminent, open-task gate, run-history writes. (Depends on 1, 4.)
-6. **Triage execution + outcome detection.** `automation_triage` execution kind, triage preamble rendering, `boss task create --automation`, `AutomationTriageDetector`, transient-retry wiring on `dispatch_not_before`. (Depends on 4, 5.)
-7. **App: Automations tab + schedule editor.** (Depends on 2; can start against mocked RPC.)
-8. **App: Agents-tab pool switcher + backlog exclusion.** (Depends on 4 for pool state; exclusion depends on 1.)
+## Open questions — how they resolved
 
-## Risks / open questions
+1. **Synthetic Maintenance project (Q1):** stayed rejected. Provenance-by-FK shipped and carries routing, accounting, and links; the exclusion role it was also supposed to carry was reversed post-ship.
+2. **Engine owns everything (Q2):** held completely.
+3. **Triage prompt quality (Q3):** the worry was justified. The final-line marker protocol was kept (the alternative `boss automation triage-result` verb was never introduced), but it needed post-ship shoring up in exactly the predicted direction: an exactly-one-marker rule with an `Ambiguous` refusal state, DB verification of task markers, marker recovery for inconclusive runs, and a much longer preamble (single-shot mandate, already-tracked task list) — all responses to real field failures.
+4. **Timezone/DST (Q4):** shipped as designed (fire-once-on-earliest for folds, run-slightly-later for gaps), with explicit bounds on the gap search.
+5. **Open-task definition (Q5):** as proposed — fire-time enforcement; open = `todo|ready|doing|in_review|blocked` and not soft-deleted; `blocked` counts.
+6. **`open_task_limit` default (Q6):** 1, as proposed; per-automation override in schema and CLI/app.
+7. **Cron crate (Q7):** neither `croner` nor `cron` — a hand-rolled parser in the `boss-engine-automation-schedule` crate, chosen for purity, deterministic tests, and full control of DST policy.
+8. **Suppressed-at-limit advancement (Q8):** advance-and-skip, as proposed, with a hold-if-no-following-occurrence refinement.
+9. **Pool starvation within automations (Q9):** the risk materialized ("automation demand regularly exceeds the pool"). The answer was not per-automation fairness in `claim_worker` (still unbuilt) but pool growth (3 → 8) plus spillover into interactive slots with preemption.
 
-1. **Confirmed — no synthetic Maintenance project (open question 1).** Provenance is `tasks.source_automation_id`; exclusion and accounting key on it; the Automations tab provides the grouping a project would have. Reviewer: confirm you're happy dropping the "one hidden project" framing in favor of provenance-by-FK.
-2. **Confirmed — engine owns everything (open question 2).** Scheduling, pool accounting, reconciliation all in-engine; app/CLI are thin. No concern flagged; noted for completeness.
-3. **Triage prompt quality (open question 3).** The whole value of phase 1 hinges on the triage agent reliably emitting exactly one decision marker and _not_ doing the work itself. The marker protocol (`automation: task <id>` / `automation: skip — …`) and the "do not open a PR" instruction are the guardrails; the cap re-check at `boss task create --automation` is the backstop against fan-out. Reviewer: is a final-line marker robust enough, or do we want a dedicated `boss automation triage-result` verb the agent must call (stronger contract, more new surface)?
-4. **Timezone/DST (open question 4).** Resolved: store IANA tz, compute with `chrono-tz`, dedupe occurrences by UTC `scheduled_for`, fire-once on fall-back, run-slightly-later on spring-forward. Reviewer: confirm "fire on first occurrence of an ambiguous wall-clock time" is the desired fall-back behavior.
-5. **Open-task definition + enforcement point (open question 5).** Resolved: enforced at fire time in the scheduler; "open" = `todo|ready|doing|in_review|blocked` (not `done`/`archived`/soft-deleted). Reviewer: should `blocked` count as open? (I say yes — a blocked maintenance task is still pending change pile-up — but it's a judgment call.)
-6. **`open_task_limit` default.** I propose **1** (one outstanding maintenance change per automation at a time — the most conservative anti-pile-up stance). Some automations ("fix any clippy warning") might reasonably allow more. Reviewer: is a default of 1 right, or should it be higher with a per-automation override (which the schema already supports)?
-7. **Cron crate choice.** `croner` (actively maintained, DST-aware, supports seconds field) vs `cron` (older, simpler). Picking one is a small but real dependency decision deferred to implementation task 1.
-8. **Suppressed-at-limit advancement.** I chose to _advance_ `next_due_at` past a suppressed occurrence rather than hold it, so a freshly-merged automation doesn't immediately fire its whole missed backlog. The alternative (fire once as soon as it drops below cap) is arguably more responsive. Reviewer: advance-and-skip vs fire-once-on-recovery?
-9. **Pool starvation within automations.** Three slots shared across all automations means a slow maintenance task can block triage of others. With `open_task_limit` defaulting low and maintenance being episodic this is unlikely to bite, but if it does, the fix is per-automation fairness in `claim_worker` — explicitly out of scope for v1.
+## Known gaps (as of 2026-07-20)
+
+Follow-up work this postmortem surfaced; each is tracked as a project task:
+
+- **No semantic cron/timezone validation at any write path** — CLI, engine create/update, and the app editor all accept garbage that only fails per-tick in the scheduler; `validate_schedule()` exists and has zero callers.
+- **Stale-abandoned occurrences are terminally mislabeled `failed_will_retry`** — the scheduler never emits `failed_gave_up` for a held occurrence whose catch-up window elapses; the code comment still defers this to "Maint task 6", which didn't deliver it.
+- **The app never consumes `ListAutomationTasks` or `RunAutomation`** — no produced-task lifecycle list (the gap that forced the #1280 exclusion reversal) and no Run-now button, despite both RPCs and CLI verbs existing.
+- **The edit sheet discards repo and enabled edits**; `AutomationPatch` can't clear optional overrides to NULL; `catch_up_window_secs` is settable nowhere.
+- **Routing DB-error fallback** — a failed provenance lookup silently routes an automation task to the main pool.
+- **Dead wire surface** — `FrontendEvent::AutomationRunResult` has never had a producer.
