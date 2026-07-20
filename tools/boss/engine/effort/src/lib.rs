@@ -43,15 +43,6 @@ pub struct SpawnConfig {
     /// Per-level prompt addendum to prepend to `.claude/initial-prompt.txt`.
     /// `None` when the level has no addendum (or no level is set).
     pub prompt_addendum: Option<&'static str>,
-    /// Set when the design-family Fable-tier dispatch floor (policy
-    /// addendum, 2026-07-13) overrode the ordinary effort-level→model
-    /// default for this spawn — `Some("design_family")` when the floor
-    /// fired, `None` otherwise (including a spawn that already resolved to
-    /// `fable` via `effort_level = max`). Lets `bossctl dispatch diagnose`
-    /// distinguish a policy-driven Fable spawn from an `effort=max` one.
-    /// Always `None` out of [`resolve_spawn_config`] itself — only
-    /// [`resolve_spawn_config_with_family_floor`] sets it.
-    pub model_floor: Option<&'static str>,
 }
 
 impl SpawnConfig {
@@ -165,109 +156,7 @@ pub fn resolve_spawn_config(
         model,
         driver,
         prompt_addendum: effort_level.and_then(|l| (menu.prompt_addendum_for_level)(l)),
-        model_floor: None,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Design-family Fable-tier dispatch floor — policy addendum, 2026-07-13
-// ---------------------------------------------------------------------------
-//
-// Design-family rows (kind `design`/`investigation`, or — transitively — a
-// `revision` whose chain root is design-family) default to the `fable`
-// model regardless of the ordinary effort-level→model table, because
-// designs and investigations are low-volume, highest-leverage,
-// judgment-heavy artifacts whose errors compound into every downstream
-// implementation task. Effort remains an explicit escape hatch downward:
-// only a *hand-set* demotion below `large` opts a row out — a heuristic or
-// defaulted low effort must never silently drop below Fable.
-
-/// Heuristic-classification audit marker the Planner/materializer appends
-/// to a task's `description` when its `effort_level` was derived by the
-/// coordinator's heuristic pass (see `materializer.rs`, `planner.rs`). Its
-/// *absence* means any `effort_level` on the row was typed explicitly by a
-/// human/coordinator rather than heuristically classified.
-const EFFORT_CLASSIFICATION_TAG: &str = "[effort-classification]";
-
-/// True when `description` carries no heuristic classification audit tag —
-/// i.e. the row's `effort_level` (if any) was hand-set rather than derived
-/// by the Planner's heuristic pass. See
-/// [`resolve_spawn_config_with_family_floor`].
-pub fn effort_is_hand_set(description: &str) -> bool {
-    !description.contains(EFFORT_CLASSIFICATION_TAG)
-}
-
-/// True when `effort_level` is a hand-set demotion below `large` — the one
-/// escape hatch that opts a design-family row out of the Fable-tier floor.
-/// `None`/`Large`/`Max` never opt out: an unset level is a default, and
-/// `large`/`max` are already at or above the floor's tier.
-fn is_hand_set_demotion(effort_level: Option<EffortLevel>, description: &str) -> bool {
-    matches!(
-        effort_level,
-        Some(EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium)
-    ) && effort_is_hand_set(description)
-}
-
-/// Named-argument bundle for [`resolve_spawn_config_with_family_floor`] —
-/// grouped into a `bon::Builder` struct (rather than eight positional
-/// parameters) to stay under `clippy::too_many_arguments`, matching the
-/// project's convention for many-field internal types.
-#[derive(bon::Builder)]
-pub struct FamilyFloorSpawnParams<'a> {
-    pub effort_level: Option<EffortLevel>,
-    pub model_override: Option<&'a str>,
-    pub pool_model_override: Option<&'a str>,
-    pub product_default_model: Option<&'a str>,
-    pub task_driver: Option<&'a str>,
-    pub product_default_driver: Option<&'a str>,
-    pub design_family: bool,
-    pub description: &'a str,
-}
-
-/// Resolve dispatch knobs via [`resolve_spawn_config`], then apply the
-/// design-family Fable-tier dispatch floor: a design-family row resolves to
-/// the `fable` model regardless of the effort-level→model table, unless its
-/// `effort_level` is a hand-set demotion below `large` (see
-/// [`is_hand_set_demotion`]).
-///
-/// The floor only overrides precedence step 3 (the effort-level default) of
-/// [`resolve_spawn_config`]'s §Q3 table — an explicit `tasks.model_override`
-/// or `pool_model_override` (steps 1–2) still wins, same as always: an
-/// operator who explicitly pins a model, or the automation/review pool's
-/// unconditional Opus pin, is a stronger signal than the family default.
-///
-/// `claude_effort` and `prompt_addendum` are untouched — they still follow
-/// `effort_level` alone; the floor changes the model, not the
-/// reasoning-effort knob.
-pub fn resolve_spawn_config_with_family_floor(params: FamilyFloorSpawnParams<'_>) -> SpawnConfig {
-    let FamilyFloorSpawnParams {
-        effort_level,
-        model_override,
-        pool_model_override,
-        product_default_model,
-        task_driver,
-        product_default_driver,
-        design_family,
-        description,
-    } = params;
-    let mut cfg = resolve_spawn_config(
-        effort_level,
-        model_override,
-        pool_model_override,
-        product_default_model,
-        task_driver,
-        product_default_driver,
-    );
-    let floor_applies = design_family && !is_hand_set_demotion(effort_level, description);
-    if floor_applies {
-        let step_1_or_2_fired = model_override.map(str::trim).filter(|s| !s.is_empty()).is_some()
-            || pool_model_override.map(str::trim).filter(|s| !s.is_empty()).is_some();
-        if !step_1_or_2_fired {
-            cfg.model = "fable".to_owned();
-            cfg.model_floor = Some("design_family");
-        }
-    }
-    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +396,10 @@ mod tests {
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
         let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
-        assert_eq!(max.model, "fable");
+        // 2026-07-20 model-economy directive: the table tops out at Opus for
+        // every level, including Max — Fable is opt-in only via an explicit
+        // model_override, never a table default.
+        assert_eq!(max.model, "opus");
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
@@ -645,7 +537,6 @@ mod tests {
                     model: model.to_owned(),
                     driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                     prompt_addendum: None,
-                    model_floor: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
                 assert!(
@@ -670,7 +561,6 @@ mod tests {
                 model: model.to_owned(),
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
-                model_floor: None,
             };
             let inv = cfg.claude_invocation(false, None);
             assert!(
@@ -694,7 +584,6 @@ mod tests {
                 model: model.to_owned(),
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
-                model_floor: None,
             };
             let inv = cfg.claude_invocation(true, None);
             assert!(
@@ -752,7 +641,6 @@ mod tests {
                     model: model.to_owned(),
                     driver: "claude".to_owned(),
                     prompt_addendum: None,
-                    model_floor: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
                 assert!(
@@ -768,134 +656,37 @@ mod tests {
     }
 
     #[test]
-    fn max_effort_dispatches_on_fable() {
+    fn max_effort_dispatches_on_opus() {
+        // 2026-07-20 model-economy directive: Max no longer defaults to
+        // Fable — the effort table tops out at Opus for every level. Fable
+        // is still reachable, but only via an explicit model_override.
         let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
-        assert_eq!(cfg.model, "fable");
+        assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("max"));
         let inv = cfg.claude_invocation(false, None);
-        assert!(inv.contains("--model fable"), "Max effort must use fable, got: {inv:?}",);
+        assert!(inv.contains("--model opus"), "Max effort must use opus, got: {inv:?}",);
         assert!(
             inv.contains("--permission-mode auto"),
-            "Fable (max effort) must use --permission-mode auto, got: {inv:?}",
+            "Opus (max effort) must use --permission-mode auto, got: {inv:?}",
         );
     }
 
-    // --- design-family Fable-tier dispatch floor (policy addendum, 2026-07-13) ---
-
     #[test]
-    fn effort_is_hand_set_detects_tag_presence_and_absence() {
-        assert!(effort_is_hand_set("plain human-typed description"));
-        assert!(effort_is_hand_set(""));
-        assert!(!effort_is_hand_set(
-            "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
-        ));
-    }
-
-    /// Test-only shorthand for [`resolve_spawn_config_with_family_floor`]:
-    /// none of these tests vary `product_default_model`/`task_driver`/
-    /// `product_default_driver`, so this pins them to `None` and exposes
-    /// only the knobs each case actually varies.
-    fn resolve_family_floor(
-        effort_level: Option<EffortLevel>,
-        model_override: Option<&str>,
-        pool_model_override: Option<&str>,
-        design_family: bool,
-        description: &str,
-    ) -> SpawnConfig {
-        resolve_spawn_config_with_family_floor(
-            FamilyFloorSpawnParams::builder()
-                .maybe_effort_level(effort_level)
-                .maybe_model_override(model_override)
-                .maybe_pool_model_override(pool_model_override)
-                .design_family(design_family)
-                .description(description)
-                .build(),
-        )
-    }
-
-    #[test]
-    fn family_floor_no_explicit_effort_resolves_fable() {
-        // (a) design task, no explicit effort → fable.
-        let cfg = resolve_family_floor(None, None, None, true, "");
+    fn max_effort_with_explicit_fable_override_dispatches_on_fable() {
+        // The hand-set, per-row opt-in: an explicit model_override is the
+        // only way a spawn resolves to Fable now (precedence step 1, ahead
+        // of the effort-level default).
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), Some("fable"), None, None, None, None);
         assert_eq!(cfg.model, "fable");
-        assert_eq!(cfg.model_floor, Some("design_family"));
-        assert_eq!(
-            cfg.claude_effort, None,
-            "the floor changes the model only, not the reasoning-effort knob"
+        let inv = cfg.claude_invocation(false, None);
+        assert!(
+            inv.contains("--model fable"),
+            "explicit override must use fable, got: {inv:?}",
         );
-    }
-
-    #[test]
-    fn family_floor_applies_for_any_design_family_row() {
-        // (b)/(c): the wrapper only consumes the caller-computed
-        // `design_family` bool, so a direct design/investigation task and a
-        // revision-of-a-revision of one resolve identically once the caller
-        // has walked the lineage — that walk is covered separately by
-        // `WorkDb::is_design_family`.
-        let cfg = resolve_family_floor(None, None, None, true, "");
-        assert_eq!(cfg.model, "fable");
-    }
-
-    #[test]
-    fn family_floor_hand_set_demotion_below_large_opts_out() {
-        // (d) design revision with hand-set effort=small → sonnet.
-        let cfg = resolve_family_floor(Some(EffortLevel::Small), None, None, true, "mechanical doc-typo fix");
-        assert_eq!(cfg.model, "sonnet");
-        assert_eq!(cfg.model_floor, None);
-        assert_eq!(cfg.claude_effort, Some("medium"));
-    }
-
-    #[test]
-    fn family_floor_heuristic_demotion_below_large_does_not_opt_out() {
-        // A heuristic/defaulted low effort (the `[effort-classification]`
-        // audit tag is present) must never silently drop a design-family row
-        // below Fable — only an explicit, hand-set demotion opts out.
-        let cfg = resolve_family_floor(
-            Some(EffortLevel::Small),
-            None,
-            None,
-            true,
-            "Rename the helper.\n\n[effort-classification] level=`small` matched-rule=`rule 5 (self-contained)` reasons=\"x\"",
+        assert!(
+            inv.contains("--permission-mode auto"),
+            "Fable must use --permission-mode auto, got: {inv:?}",
         );
-        assert_eq!(cfg.model, "fable");
-        assert_eq!(cfg.model_floor, Some("design_family"));
-    }
-
-    #[test]
-    fn family_floor_hand_set_large_or_max_still_gets_fable() {
-        // Only a hand-set demotion *below* large opts out; large/max are
-        // already at or above the floor's tier and stay on it.
-        for level in [EffortLevel::Large, EffortLevel::Max] {
-            let cfg = resolve_family_floor(Some(level), None, None, true, "");
-            assert_eq!(cfg.model, "fable", "{level:?} must still resolve to fable");
-        }
-    }
-
-    #[test]
-    fn family_floor_ordinary_chore_at_large_unaffected() {
-        // (e) ordinary chore at large → opus, unchanged.
-        let cfg = resolve_family_floor(Some(EffortLevel::Large), None, None, false, "");
-        assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.model_floor, None);
-    }
-
-    #[test]
-    fn family_floor_explicit_model_override_still_wins() {
-        let cfg = resolve_family_floor(None, Some("sonnet"), None, true, "");
-        assert_eq!(
-            cfg.model, "sonnet",
-            "an explicit task-level model override beats the family floor"
-        );
-        assert_eq!(cfg.model_floor, None);
-    }
-
-    #[test]
-    fn family_floor_pool_override_still_wins() {
-        // The automation/review pool's unconditional Opus pin beats the
-        // floor too — it is resolved at precedence step 2, ahead of it.
-        let cfg = resolve_family_floor(None, None, Some("opus"), true, "");
-        assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.model_floor, None);
     }
 
     #[test]

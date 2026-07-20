@@ -145,11 +145,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
                 worker_slots: server_state.worker_pool_size,
                 automation_slots: server_state.automation_pool_size,
                 review_slots: server_state.review_pool_size,
-                coordinator_model: (crate::driver::ClaudeDriver
-                    .descriptor()
-                    .model_menu
-                    .default_model_for_level)(boss_protocol::EffortLevel::Max)
-                .to_owned(),
+                coordinator_model: server_state.coordinator_model.clone(),
             },
         );
     }
@@ -576,17 +572,16 @@ mod tests {
     use crate::test_support::{create_active_chore, create_product};
 
     /// Pins the `EnginePoolConfig.coordinator_model` push (computed in
-    /// `handle_register_app_session` above) to the Max-effort Claude model.
-    /// Guards against the coordinator wiring drifting from the effort tier
-    /// table without a test catching it (e.g. if `default_model_for_level`
-    /// changed but this call site wasn't updated).
+    /// `handle_register_app_session` above) to `ServerState::coordinator_model`
+    /// — sourced from `WorkConfig::coordinator_model`
+    /// (`BOSS_COORDINATOR_MODEL`, default `"opus"`) — rather than the worker
+    /// effort→model table. Per the 2026-07-20 model-economy directive the two
+    /// are deliberately decoupled: a change to the worker dispatch table must
+    /// never silently change what model the coordinator launches on.
     #[test]
-    fn coordinator_model_tracks_max_effort_model() {
-        let coordinator_model = (crate::driver::ClaudeDriver
-            .descriptor()
-            .model_menu
-            .default_model_for_level)(boss_protocol::EffortLevel::Max);
-        assert_eq!(coordinator_model, "fable");
+    fn coordinator_model_defaults_to_opus_independent_of_effort_table() {
+        let (server_state, _temp) = test_server_state();
+        assert_eq!(server_state.coordinator_model, "opus");
     }
 
     fn dispatch_ctx(server_state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {

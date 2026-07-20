@@ -22,8 +22,10 @@ final class BossPaneModel: ObservableObject {
     @Published var session: TerminalPaneSession
     /// The model slug the coordinator session was launched with (or will
     /// use on the next restart). Updated when the engine pushes
-    /// `engine_pool_config` so it always tracks `effort=max` without a
-    /// separately-maintained constant.
+    /// `engine_pool_config`, which carries the engine's `coordinator_model`
+    /// setting (`BOSS_COORDINATOR_MODEL`, default `"opus"` — see the
+    /// 2026-07-20 model-economy directive) rather than the worker
+    /// effort→model table, so it stays a separately-configurable knob.
     private(set) var coordinatorModel: String
     /// The resolved claude command line sent to the Boss-session shell.
     /// Exposed so the UI and debug surfaces can display it without
@@ -31,13 +33,16 @@ final class BossPaneModel: ObservableObject {
     var claudeInvocation: String { coordinatorInvocation(model: coordinatorModel) }
 
     init() {
-        // Seed with the current effort=max model (fable).  The engine will
-        // push the authoritative value via engine_pool_config shortly after
-        // connect; updateCoordinatorModel(_:) picks it up then.
-        self.coordinatorModel = "fable"
+        // Seed with the engine's default coordinator model (opus). The engine
+        // will push the authoritative value via engine_pool_config shortly
+        // after connect; updateCoordinatorModel(_:) picks it up then. Fable
+        // is no longer a default anywhere — an operator opts back into it
+        // explicitly via BOSS_COORDINATOR_MODEL, at which point the pushed
+        // value overrides this seed.
+        self.coordinatorModel = "opus"
         self.runtime = GhosttyRuntime.shared
         let workingDirectory = Self.ensureBossWorkingDirectory()
-        let invocation = coordinatorInvocation(model: "fable")
+        let invocation = coordinatorInvocation(model: "opus")
         // Unset ANTHROPIC_API_KEY before invoking claude so the Boss
         // session authenticates via OAuth (~/.claude/.credentials.json)
         // rather than the engine's API key. The macOS app process still

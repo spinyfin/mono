@@ -248,7 +248,9 @@ pub enum FrontendEvent {
         worker_slots: u8,
         automation_slots: u8,
         review_slots: u8,
-        /// `--model` slug for the Boss coordinator session (from `effort=max`).
+        /// `--model` slug for the Boss coordinator session. Sourced from the
+        /// engine's `coordinator_model` setting (`BOSS_COORDINATOR_MODEL`,
+        /// default `"opus"`) — independent of the worker effort→model table.
         coordinator_model: String,
     },
     /// Engine confirms the Boss session pid was registered.
