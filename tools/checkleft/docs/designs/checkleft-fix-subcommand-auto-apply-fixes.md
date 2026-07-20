@@ -1,18 +1,24 @@
 # Checkleft: `fix` subcommand (auto-apply fixes)
 
+## Status
+
+**Shipped.** The v1 feature landed across twelve PRs (#1621–#1632); this document describes the design **as built**, and the task breakdown at the end records which PR delivered each piece.
+
+Two v1 gaps remain open and are called out where they arise: the WASM `fix-check` host method exists but is not yet reachable from the `checkleft fix` CLI (§D), and the `fix` subcommand is not yet documented in the user-facing CLI reference (§E).
+
 ## Overview
 
 `checkleft run` reports check failures; it never edits the tree. This design adds a companion `checkleft fix` subcommand that **automatically applies fixes** to the files a check is failing on. `fix` reuses `run`'s machinery to discover which files fail which checks, then drives each check's declared fix mechanism over its own failing-file set — a formatter's `--write`, a linter's `--fix`, a WASM check's fix entry point — writing the corrected bytes back to the real working tree.
 
 The hard part is not invoking `prettier --write`; it is doing so **safely**, so that a fixer can only ever modify the files it was told to fix, never produces a partial write on error, and leaves the tree untouched when the fix fails. The chosen mechanism is a per-check **writable copy sandbox** with **atomic copy-back of only the changed files** — an airlock that makes "touch nothing outside the fixable set" a structural guarantee rather than a post-hoc check.
 
-This document is a design only. No feature code is included; the final section is a dependency-ordered, PR-sized implementation breakdown.
+The safety core, the declarative fix tier, and the built-in `suggested_fix` tier are all live and wired into the CLI. The WASM/external tier's host and guest surfaces are complete but not yet connected to the subcommand.
 
 ## Goals
 
 - Add `checkleft fix [PATHS…]` that applies fixes to every file failing a fixable check, as the write-side companion to `run`.
 - Honor `--all` exactly like `run`: default change-scoped file set vs. full-repo scan.
-- Add `--allow_dirty` (default **true**): whether it is acceptable to fix files that already have uncommitted modifications in the working tree. When false, do not fix already-dirty files (never clobber uncommitted work).
+- Add `--allow-dirty` (default **true**): whether it is acceptable to fix files that already have uncommitted modifications in the working tree. When false, do not fix already-dirty files (never clobber uncommitted work).
 - Express the fix mechanism declaratively per check (a fix command in the check YAML) for the declarative tier, and as an SDK entry point for the WASM/external tier. Both are optional per check.
 - Support batch and single-file fix modes, mirroring `run`'s `per_file`/`batch`.
 - **Safety is the headline property:** a fix only ever writes files in its own fixable set; failures leave originals untouched; no partial writes.
@@ -28,14 +34,16 @@ This document is a design only. No feature code is included; the final section i
 - **Inventing fixes for checks that have none.** A failing check with no declared fix is a no-op for `fix` (reported as "no fix available"), never an error.
 - **A general refactoring engine.** `fix` delegates to the check's own tool/logic; it does not implement fixes itself beyond applying the edits/writes those mechanisms produce.
 
-## Current-state audit
+## Starting-state audit
+
+This section records the codebase **as it was before this work**, since the design's shape is largely a consequence of what already existed. Statements here about what "does not exist yet" describe the pre-`fix` tree; the Chosen approach sections below describe what replaced them.
 
 Source: `tools/checkleft/src/main.rs`, `runner.rs`, `check.rs`, `output.rs`, `vcs.rs`, `config.rs`, `external/declarative/{mod,executor,resolve,selector}.rs`, `external/sandbox.rs`, `external/runtime.rs`, `external/component_bindings.rs`, `wit/check.wit`, `sdk/src/lib.rs`, `sdk-macro/src/lib.rs`, `bundled.rs`, and the `checks/{format,lint}/*.yaml` definitions.
 
 ### CLI / `run` dispatch (`main.rs`)
 
 - Subcommands today: `Run(RunArgs)`, `List`, `ShowPlan` (temporary), `Install`, `Uninstall`. A bare `checkleft` is `run`.
-- `RunArgs`: `--all: bool`, `--base_ref: Option<String>`, `--default_branch: Option<String>`, `--format human|json`, `--show_progress: Option<bool>`, plus `ConfigArgs { external_checks_file, external_checks_url }`. There is **no positional path arg** and **no `--allow_dirty`** today.
+- `RunArgs`: `--all: bool`, `--base_ref: Option<String>`, `--default_branch: Option<String>`, `--format human|json`, `--show_progress: Option<bool>`, plus `ConfigArgs { external_checks_file, external_checks_url }`. There is **no positional path arg** and **no `--allow-dirty`** today.
 - `dispatch_run` resolves a `ChangePlan` from CI-env + overrides (`resolve_change_plan`), builds a `Runner`, resolves the `ChangeSet`, optionally wires a `LiveProgress` reporter, calls `runner.run_changeset_with_progress`, sorts results, renders human/JSON, and exits `1` iff any finding is `Severity::Error`.
 
 ### Runner orchestration (`runner.rs`)
@@ -79,7 +87,7 @@ Source: `tools/checkleft/src/main.rs`, `runner.rs`, `check.rs`, `output.rs`, `vc
 ### VCS (`vcs.rs`)
 
 - `Vcs { root, kind: Git|Jujutsu }`. `current_changeset` (working-tree vs HEAD), `changeset_since(base)` (merge-base diff), `all_files_changeset` (tracked files, for `--all`).
-- **No explicit working-tree dirty query exists yet** — `fix` adds one (`git status --porcelain` / `jj` equivalent) for `--allow_dirty`.
+- **No explicit working-tree dirty query exists yet** — `fix` adds one (`git status --porcelain` / `jj` equivalent) for `--allow-dirty`.
 
 ## Alternatives considered (safety mechanism)
 
@@ -123,28 +131,57 @@ Chosen because: it needs **no new write capability** in the WASI sandbox (guest 
 
 Give the fix invocation a **writable** WASI preopen (the forced-copy sandbox from approach B) and let the guest mutate files with `std::fs::write`; the host then copy-backs changed files exactly like the declarative tier.
 
-This is the literal reading of the contract's "capability for the wasm check to write the (sandboxed) file(s)." It is fully supported by the same safety core (B) and is the right escape hatch for a guest that wraps native formatting logic which only knows how to rewrite a file in place. It is **not** the v1 default because it widens the guest capability (WASI write) for no benefit over W1 in the typed-Rust-check sweet spot, and edits are easier to validate, log, and unit-test than opaque file writes. **Decision surfaced for human confirmation** (see attentions + Risks): ship W1 as the SDK default, keep W2 as a declared opt-in (`#[check(fix = …, writable)]`), or require W2 outright.
+This is the literal reading of the contract's "capability for the wasm check to write the (sandboxed) file(s)." It is fully supported by the same safety core (B) and is the right escape hatch for a guest that wraps native formatting logic which only knows how to rewrite a file in place. It is not the v1 shape because it widens the guest capability (WASI write) for no benefit over W1 in the typed-Rust-check sweet spot, and edits are easier to validate, log, and unit-test than opaque file writes.
+
+**Resolved: W1 only.** The design originally proposed shipping W1 as the default _and_ W2 as an opt-in. In the end W2 was not implemented at all — every check that wanted a fix was served by W1, and a second write path with no consumer is surface without a user. W2 stays available as a future addition (D4) since it needs no change to the safety core.
 
 ## Chosen approach
 
 ### A. CLI surface and relationship to `run`
 
 ```
-checkleft fix [PATHS…] [--all] [--allow_dirty[=true|false]]
+checkleft fix [PATHS…] [--all] [--allow-dirty[=true|false]]
               [--base_ref <ref>] [--default_branch <name>]
               [--format human|json] [--show_progress[=BOOL]]
-              [--verify[=BOOL]] [--max_passes <n>]
+              [--verify[=BOOL]] [--max-passes <n>]
 ```
+
+The new flags ship in clap's kebab-case (`--allow-dirty`, `--max-passes`); the underscore spellings used in earlier drafts of this document were never the real surface. `FixArgs` flattens `RunArgs`, so every `run` flag is accepted unchanged.
 
 - **Discovery shares `run`.** `fix` resolves the same `ChangePlan` (honoring `--all`, `--base_ref`, `--default_branch`, and `PATHS…`), builds the same `Runner`, and calls the existing run path to obtain `Vec<CheckResult>`. For each check, the **failing-file set** is the distinct `finding.location.path` values whose severity is `Error` or `Warning` (info findings are advisory and not fixed). No new per-check applicability/failure logic is introduced.
 - **`PATHS…`** further intersect the candidate set with the given paths (a convenience for "just fix this dir"); absent, behavior matches `run`.
 - **Apply phase.** For each check with a declared fix and a non-empty failing set, schedule a _fix run_ (§B). Checks with no declared fix are recorded as "no fix available" and skipped.
-- **Output** (`--format human` default; `json` mirrors structure):
-  - **Fixed:** per check, the files written (count + list).
-  - **Still failing:** files that remained failing after fix + re-verify (unfixable check, or partially fixed).
-  - **No fix available:** checks that failed but declare no fix, with their failing files (so the user knows what to fix by hand).
-  - A summary footer (files fixed, files still failing, checks skipped) and elapsed time, matching `run`'s footer style.
-- **Exit code.** `0` when, after fixing and re-verifying, **no `Error`-severity finding remains**; `1` otherwise. (So `fix` that fully resolves a previously-failing tree exits 0; one that leaves unfixable errors exits 1, like `run` would.) Operational failures (a fixer that errored, a sandbox failure) are `Error` findings and thus also exit 1.
+- **Output** (`--format human` default). The design sketched three result buckets; implementation found a fourth worth separating, so the human renderer reports five states per check:
+  - **Fixed:** the files written (count + list).
+  - **Still failing:** `Error`-severity findings that survived fix + re-verify (unfixable check, or partially fixed).
+  - **Warnings remain (non-blocking):** warning-only residue, split out from "still failing" because it does not affect the exit code and reads very differently to a user.
+  - **No fix available:** checks that failed but declare no fix, listing their files under "needs manual fix".
+  - **Skipped (dirty):** files left alone under `--allow-dirty=false` (§E), surfaced as a footer count.
+  - A summary footer — `N file(s) fixed, M still failing, K error(s), J check(s) with no fix available[, D skipped (dirty)] (in Xs)` — matching `run`'s footer style, plus an explicit `(--verify=false; post-fix state unknown)` marker when verification was skipped.
+- **JSON output** is a distinct schema rather than a literal mirror of the human buckets, because the per-invocation detail has no good human rendering:
+
+  ```json
+  {
+    "verify_ran": true,
+    "checks": [
+      {
+        "check_id": "format/oxc",
+        "failing_files": [],
+        "dirty_skipped": [],
+        "fix_status": "executed",
+        "invocations": [
+          { "invocation_id": "format", "applied": [], "per_file_errors": [], "error": null }
+        ],
+        "distinct_applied_files": [],
+        "still_failing_after_verify": []
+      }
+    ]
+  }
+  ```
+
+  `fix_status` is `executed` or `no_fix_available`. A check that only surfaces during verification (a _different_ check now failing on a file we just fixed) is appended with `fix_status: "no_fix_available"` and an empty `failing_files`. Note that `error` can co-exist with a non-empty `applied` list: that is the copy-back first-error-stop case (§B step 6), where some files were validly written before the failure.
+
+- **Exit code.** `0` when, after fixing and re-verifying, **no `Error`-severity finding remains**; `1` otherwise. Three sources feed that decision: residual errors from the verify pass over applied files, original errors on files that were never applied (nothing fixed them, so their findings stand), and fixer operational errors. This resolved the open question in favour of `run`-consistency — the "auto-fix bot exits 0 whenever it applied something" alternative was not taken, because a green exit on a tree that still has errors is a worse default for the CI use case that motivated the flag.
 
 ### B. Safety core — writable copy sandbox + atomic copy-back
 
@@ -152,14 +189,14 @@ This is the load-bearing mechanism; every fix (declarative tool, WASM W2, and ev
 
 For each fix invocation over a fixable set `F` (repo-relative paths):
 
-1. **Compute `F`** = (failing files of the check) ∩ (`applies_to`) ∩ (`--allow_dirty` filter, §E) ∩ (`PATHS…`). If `F` is empty, the invocation is a no-op.
-2. **Stage a writable sandbox** containing exactly `F`. Reuse `create_sandbox` with `AccessScope::ExplicitFiles(F)` **plus a new "force-copy" flag** so files are always `fs::copy`'d, **never hardlinked** (hardlinks share inodes — an in-place write would escape copy-back; see audit). Record, for each staged file, a **pre-fix content hash** (e.g. blake3) and its mode.
+1. **Compute `F`** = (failing files of the check) ∩ (`applies_to`) ∩ (`--allow-dirty` filter, §E) ∩ (`PATHS…`). If `F` is empty, the invocation is a no-op.
+2. **Stage a writable sandbox** containing exactly `F`, via `AccessScope::ExplicitFiles(F)` and a `CopyMode` selector so files are always `fs::copy`'d, **never hardlinked** (hardlinks share inodes — an in-place write would escape copy-back; see audit). `CopyMode { PreferHardlink, ForceCopy }` threads through a new `create_sandbox_with_mode`; the original `create_sandbox` keeps its signature and delegates with `PreferHardlink`, so the read-only check path is untouched. Record, for each staged file, a **pre-fix content hash**. The hash is **SHA-256**, not blake3 as earlier drafts suggested — `sha2` is already a workspace dependency and the hash is only ever compared for equality, so there was no reason to add a crate for it. File mode is _not_ captured at stage time; it is read from the real target at copy-back, which is equivalent here because copy-back only ever overwrites a still-original file in place.
 3. **Run the fixer** with cwd = sandbox root:
    - _Declarative:_ the fix invocation's tool + args (§C), batch or per-file, files passed as sandbox-relative paths via `{{files}}`/`{{file}}`.
    - _WASM W2:_ preopen the sandbox **writable**, call `fix-check`.
    - _WASM W1 / suggested_fix (§F):_ the "fixer" produces `file-edit`s; apply them to the staged sandbox copies.
 4. **Classify the result** via the fix's exit/`fix-error` semantics (§C/§D). On `error` → **abort: drop the sandbox, real tree untouched.** Report an `Error` finding for the check.
-5. **Detect changed files**: re-hash every staged file; the changed set `C` = files whose hash differs. **Enforce the airlock:** `C ⊆ F` by construction (only `F` was staged and only staged paths are walked); any file the fixer _created_ in the sandbox outside `F` is simply never enumerated for copy-back and dies with the temp dir. Newly-created paths and deletions inside the sandbox are logged but not propagated (a fixer must not create/delete files; doing so is reported, not applied).
+5. **Detect changed files**: re-hash every staged file; the changed set `C` = files whose hash differs. **Enforce the airlock:** `C ⊆ F` by construction (only `F` was staged and only staged paths are walked); any file the fixer _created_ in the sandbox outside `F` is simply never enumerated for copy-back and dies with the temp dir. Copy-back additionally refuses a non-staged path defensively, so the invariant does not rest on the enumeration alone. Newly-created paths and deletions inside the sandbox are logged but not propagated (a fixer must not create/delete files; doing so is reported, not applied).
 6. **Atomic copy-back** of each `c ∈ C`: write the new bytes to a temp file in the **same directory** as the real target (same filesystem → atomic `rename`), preserving mode, then `rename` over the target. Per-file atomicity is guaranteed by POSIX `rename`. Across multiple files there is no kernel multi-file transaction; we copy back in a deterministic order and, **on the first copy-back I/O error, stop and report exactly which files were applied** (the already-renamed ones are valid, complete files — never half-written). The sandbox is dropped last.
 
 **Failure handling guarantees:**
@@ -200,6 +237,8 @@ Schema details:
 
 The bundled YAMLs gain `fix` blocks; because `bundled.rs` embeds them via `include_str!`, the compiled-in defaults update automatically.
 
+**Consequence surfaced during implementation — config discovery under `cwd = sandbox`.** The check path runs tools with `cwd = repo root`, so a tool that discovers its own config (`.prettierrc`, `biome.json`, `.oxfmtrc`) finds it by walking up from the working directory. The fix path deliberately runs with `cwd = sandbox root`, where only the fixable files are staged — no repo-root config is present. A fix block for a config-discovering tool must therefore pass its config explicitly, e.g. `--config {{repo_root}}/…`, or the fixer will silently format against tool defaults. `format/rust` (`--config-path={{repo_root}}`) and `lint/js` (`--no-config-lookup --config {{config.config_file}}`) do this; `format/prettier`, `format/biome`, and `format/oxc` currently do not, which is a live gap for any repo whose config differs from the tool default. The alternative — staging discovered config files into the sandbox alongside `F` — was not pursued in v1 because it widens the staged set beyond the fixable set and so weakens the airlock's simple `C ⊆ F` story.
+
 ### D. WASM/external fix entry point
 
 Add to `wit/check.wit` world `check`:
@@ -209,42 +248,61 @@ variant fix-error { unknown-check(string), failed(string), not-fixable }
 export fix-check: func(name: string, input: check-input) -> result<list<file-edit>, fix-error>;
 ```
 
-- **SDK:** extend `#[check(...)]` with an optional `fix = fn_name` argument; the fixer has signature `fn(CheckInput) -> Vec<FileEdit>` (or `Result<Vec<FileEdit>, String>`). Add `fn fix(&self, input: CheckInput) -> FixResult` to the `__private::CheckEntry` trait (default: `not-fixable`), wired by the macro and dispatched by `export_checks!`. A check without `fix = …` reports `not-fixable` and is a no-op for `fix`.
-- **Runtime invocation:** the host reuses the existing phase-2 component instantiation. For **W1 (default)** the sandbox preopen stays **read-only**; the guest returns `file-edit`s; the host validates each `edit.path ∈ F`, applies them to the staged sandbox copies (or directly via §F apply), then copy-backs (§B). For **W2 (opt-in)** the host builds the sandbox **writable**, calls `fix-check` (the guest mutates files via `std::fs`), then detects-and-copies-back. Both paths share the §B core.
-- **Capability for the WASM check to write:** under W1 the guest needs _no_ write capability (it returns data); under W2 the host grants a writable WASI preopen scoped to the forced-copy sandbox — the only files it can reach are `F`, and only changed ones are copied back.
+**W1 shipped; W2 was not built.** The open question resolved to "W1 only for v1" rather than "W1 default with W2 opt-in": once W1 was working, no bundled or example check wanted an in-place write, so shipping a second, wider-capability path with no consumer was unjustified. W2 remains recorded as D4 in the deferred list, and the §B safety core would support it unchanged if a guest ever needs it.
 
-### E. `--allow_dirty` (default true)
+- **SDK:** `#[check(...)]` takes an optional `fix = fn_name` argument. The fixer may be either `fn(CheckInput) -> Vec<FileEdit>` or `fn(CheckInput) -> Result<Vec<FileEdit>, String>`; a `FixOutcome` enum and an `IntoFixOutcome` trait normalize the two shapes, which is a small surface addition the original design did not anticipate but which keeps the ergonomic honest for infallible fixers. `CheckEntry::fix` has a default returning `FixOutcome::NotFixable`, so a check without `fix = …` is a no-op for `fix` and needs no changes.
+- **Runtime invocation:** the host reuses the existing phase-2 component instantiation with the sandbox preopen **read-only** — W1 needs no guest write capability at all. The guest returns `file-edit`s; the host validates each `edit.path` through `validate_relative_path` and membership in the staged set, applies them to the staged sandbox copies, then copy-backs (§B).
+- **Edit application is strict.** An edit whose path is outside `F` is an **airlock violation and aborts the whole fix** — the tree is left untouched rather than the edit being quietly dropped. Likewise a stale `old_text` (not found in the file) is a hard error, and an empty `old_text` is rejected (pure insertion is unsupported; an edit must anchor to existing text). Matching is first-occurrence `replacen`. This is deliberately less forgiving than the built-in `suggested_fix` path (§F), which filters out-of-set edits silently: a WASM guest is external code whose misbehaviour we want to surface loudly, whereas a built-in check emitting an out-of-scope edit is more likely a scoping artifact than a bug.
+- **v1 read-scope narrowing.** The guest sees only the staged fixable set `F`, not its full declared `access-scope`. A fixer that needs broader read context to compute its edits is out of scope for v1.
 
-- **Dirty detection.** Add `Vcs::dirty_paths() -> Result<HashSet<PathBuf>>`: `git status --porcelain` (paths with worktree modifications, staged or unstaged, plus untracked) for Git; the `jj` working-copy diff for Jujutsu. Repo-relative, normalized to match changeset paths.
-- **`--allow_dirty=true` (default):** dirty files are eligible to be fixed. This is the common local workflow ("I have uncommitted edits; format them").
-- **`--allow_dirty=false`:** subtract `dirty_paths()` from every check's fixable set `F` _before_ staging. Skipped-because-dirty files are reported in the output (distinct from "no fix available"), so the user knows why they were left alone. No file is ever staged or written.
-- **Interaction with `--all`:** `--all` only widens the _candidate_ set (full repo vs. change-scoped); the dirty filter is applied identically afterward. Note a deliberate consequence: in **local change-scoped mode** the failing set _is_ the working-tree diff, i.e. dirty files, so `--allow_dirty=false` there fixes essentially nothing — which is the point: it is the mode for "only fix already-committed/clean files" (e.g. a CI auto-fix bot on a clean checkout) without touching a human's in-flight edits. This is documented in `userdoc/cli.md`.
+**Outstanding: the host method is not wired to the CLI.** `fix_component_check` exists and is tested, but nothing in `dispatch_fix` calls it — only the declarative and `suggested_fix` tiers are wired into the apply phase. A WASM check declaring `fix = fn` therefore compiles, exports `fix-check`, and is never invoked by `checkleft fix`. Closing this is a small piece of orchestration work, not a design question.
+
+### E. `--allow-dirty` (default true)
+
+- **Dirty detection.** `Vcs::dirty_paths() -> Result<HashSet<PathBuf>>`: `git status --porcelain` (paths with worktree modifications, staged or unstaged, plus untracked) for Git; `jj diff --summary` for Jujutsu, reusing the existing summary parser. Repo-relative, normalized to match changeset paths. Both backends insert **both sides of a rename** — a rename dirties its old path as well as its new one, which the original design did not specify but which is the only safe reading of "don't touch uncommitted work".
+- **`--allow-dirty=true` (default):** dirty files are eligible to be fixed. This is the common local workflow ("I have uncommitted edits; format them").
+- **`--allow-dirty=false`:** dirty files are subtracted from every check's fixable set `F` before staging, so no dirty file is ever staged or written. The partition happens inside `compute_fix_plan`, which keeps a check visible in the output even when _all_ of its files were dirty — otherwise a check would silently vanish and the user would have no idea why nothing happened. Skipped-because-dirty files are reported distinctly from "no fix available".
+- **Failure of the dirty query is currently non-fatal:** if `dirty_paths()` errors, the code treats nothing as dirty and proceeds to fix. For a flag whose entire purpose is "don't clobber uncommitted work", failing open is the wrong default; failing closed (or aborting) would better match the flag's intent. Worth revisiting.
+- **Interaction with `--all`:** `--all` only widens the _candidate_ set (full repo vs. change-scoped); the dirty filter is applied identically afterward. Note a deliberate consequence: in **local change-scoped mode** the failing set _is_ the working-tree diff, i.e. dirty files, so `--allow-dirty=false` there fixes essentially nothing — which is the point: it is the mode for "only fix already-committed/clean files" (e.g. a CI auto-fix bot on a clean checkout) without touching a human's in-flight edits.
+
+This behaviour — and the `fix` subcommand generally — is **not yet covered in `userdoc/docs/cli.md`**; the user-facing CLI reference still documents only `run`. That documentation is outstanding.
 
 ### F. Built-in checks and `Finding.suggested_fix`
 
-Built-in (Rust) checks have neither a declarative `fix` block nor a WASM entry point, but `Finding.suggested_fix: Option<SuggestedFix>` **already exists** as an unapplied edit channel. `fix` adopts it as a third fix source: when a built-in check's finding carries `suggested_fix.edits`, the host treats those `FileEdit`s as the fixer output and runs them through the §B apply+copy-back path (validating `edit.path ∈ F`). This gives built-ins a zero-new-surface fix path: a check author simply populates `suggested_fix` on the findings they know how to repair (e.g. `no-usfa-typo` could emit the corrected spelling). v1 wires the _application_ of `suggested_fix`; populating it on specific built-ins is incremental follow-up (task breakdown marks per-check authoring as future).
+Built-in (Rust) checks have neither a declarative `fix` block nor a WASM entry point, but `Finding.suggested_fix: Option<SuggestedFix>` **already exists** as an unapplied edit channel. `fix` adopts it as a third fix source: `Runner::apply_suggested_fixes` collects `FileEdit`s from `Error`/`Warning` findings (Info is advisory and never fixed), restricts them to the check's fixable set, and runs them through the §B apply+copy-back path. It runs after the declarative pass and fills only fix-plan entries the declarative tier left empty, so a check with both sources prefers the declarative one.
+
+Edits outside the fixable set are **silently filtered** here rather than aborting, which is intentionally the opposite of the WASM path's hard failure (§D): a built-in check runs in-process and its out-of-scope edits are far more likely a changeset-scoping artifact than misbehaviour.
+
+**Edits are positionally targeted, not first-occurrence.** The initial implementation used a plain first-occurrence `replacen`, which is wrong whenever `old_text` is a short snippet appearing several times in a file — it would repair the wrong line. Application now sorts a file's edits bottom-up by the finding's line number and applies each at its reported position, so earlier edits do not shift later offsets; an edit whose `old_text` is ambiguous and which carries no position is refused rather than guessed at. A `fixable: bool` field was also added to `Finding` alongside this work, so consumers can tell a fixable finding from an advisory one without inspecting `suggested_fix`.
+
+**No built-in check populates `suggested_fix` yet.** Every check in `src/checks/` still emits `suggested_fix: None`, so this tier is wired but inert — `checkleft fix` applies no built-in fixes today. Populating it per check is incremental follow-up (D2), not framework work.
 
 ### G. Ordering, convergence, concurrency, verification
 
-- **Deterministic cross-check order (same file fixed by multiple checks).** When a file is in the fixable set of more than one check, fixes are applied in a fixed category order: **lint-fix before format-fix, format-fix last.** Rationale: a linter's `--fix` can insert or rewrite code (producing unformatted output), so formatting must run last to normalize it; the reverse can leave a formatted file un-formatted again. Within a category, order is stable by check id. (Concretely for a `.ts` file: `lint/oxc --fix` → `format/oxc --write`.)
-- **Concurrency.** Build a conflict graph keyed by fixable-file overlap. Checks with **disjoint** fixable sets run **concurrently** (independent sandboxes, independent copy-backs — no shared real files). Checks that **share** any file are **serialized** in the category order above, each re-reading the latest real bytes (so the second check sandboxes the output of the first). This makes concurrent fixes provably safe (concurrent ⇒ disjoint).
-- **Convergence.** Default is a single ordered pass (lint→format) per file, which is stable in practice for the bundled checks. `--max_passes <n>` (default 1, or 2 if we choose fixpoint-by-default — open question) re-runs the ordered fix pipeline on files that still change, up to `n`, stopping early when a pass produces no change. A hard cap prevents oscillation between two non-converging fixers.
-- **Verification / idempotency (`--verify`, default on).** After fixing, re-run the _check_ logic (the `run` path) over the fixed files and report any residual findings as "still failing." This confirms resolution, surfaces partially-fixed files, and drives the exit code (§A). `--verify=false` skips the re-run for speed.
+- **Deterministic cross-check order (same file fixed by multiple checks).** When a file is in the fixable set of more than one check, fixes are applied in a fixed category order: **lint-fix before format-fix, format-fix last.** Rationale: a linter's `--fix` can insert or rewrite code (producing unformatted output), so formatting must run last to normalize it; the reverse can leave a formatted file un-formatted again. The shipped ordering is a `FixCategory { Lint, Other, Format }` enum ordered `Lint < Other < Format`, derived from the check id's prefix; the explicit `Other` middle tier gives non-lint, non-format checks a defined slot instead of falling into one of the two named ones by accident. Within a category, order is stable by check id. (Concretely for a `.ts` file: `lint/oxc --fix` → `format/oxc --write`.)
+- **Concurrency.** A conflict graph keyed by fixable-file overlap is built with union-find over check indices: any two checks sharing a file land in the same component, and each connected component becomes a `FixGroup` whose checks are ordered by `(category, check_id)`. Groups are pairwise file-disjoint by construction and run **concurrently** via rayon (independent sandboxes, independent copy-backs); checks _within_ a group run **serially**, each re-staging from disk so the second check sandboxes the output of the first. This makes concurrent fixes provably safe (concurrent ⇒ disjoint).
+- **Convergence.** `--max-passes <n>` re-runs the ordered fix pipeline, stopping early as soon as a pass writes nothing. **The default is 10, i.e. fixpoint-by-default with a hard cap**, resolving the design's open question against the originally-proposed single pass. The single-pass default actually shipped first and was reverted: a formatter needing two passes left files in an intermediate state that the verify pass then reported as "still failing", which is a confusing failure for something `fix` could simply have finished. A compile-time assertion now guards the default at `>= 2` so it cannot regress to one. The hard cap still prevents oscillation between two non-converging fixers.
+- Each pass re-runs the **full original fix plan** rather than narrowing to files that changed in the previous pass. This is more I/O than the design's "re-run on files that still change", but termination is driven by the change detection in §B rather than by the narrowing, so the simpler formulation is correct and was not worth optimizing before there was evidence it mattered.
+- **Verification / idempotency (`--verify`, default on).** After fixing, the check logic is re-run and residual findings are reported as "still failing." Verification is scoped to the files that were **actually written**, not the whole originally-failing set: re-checking a file nothing touched can only reproduce the finding we already have. Files that were never applied keep their original findings, and those feed the exit code through a separate path (§A), so nothing is lost by the narrower re-run. `--verify=false` skips it for speed, and the output says so explicitly since the post-fix state is then unknown.
 
 ### H. Per-check fix coverage
 
-| Check             | Tier                       | Fix mechanism                                      | v1        |
-| ----------------- | -------------------------- | -------------------------------------------------- | --------- |
-| `format/oxc`      | declarative                | `oxfmt --write {{files}}` (batch)                  | ✅        |
-| `format/prettier` | declarative                | `prettier --write {{files}}` (batch)               | ✅        |
-| `format/biome`    | declarative                | `biome format --write {{files}}` (batch)           | ✅        |
-| `format/rust`     | declarative                | `rustfmt {{file}}` (per_file; drop `--check`/`-l`) | ✅        |
-| `format/bazel`    | declarative                | `buildifier -mode=fix {{files}}` (batch)           | ✅        |
-| `lint/oxc`        | declarative                | `oxlint --fix {{files}}` (batch)                   | ✅        |
-| `lint/biome`      | declarative                | `biome lint --write {{files}}` (batch)             | ✅        |
-| `lint/js`         | declarative                | `eslint --fix {{files}}` (batch)                   | ✅        |
-| `lint/bazel`      | declarative                | `buildifier -lint=fix -mode=fix {{files}}` (batch) | ✅        |
-| `lint/rust`       | declarative (bazel_aspect) | `clippy --fix` — **not feasible in v1**            | ❌ future |
+| Check             | Tier                       | Fix mechanism                                                        | v1        |
+| ----------------- | -------------------------- | -------------------------------------------------------------------- | --------- |
+| `format/oxc`      | declarative                | `oxfmt --write {{files}}` (batch)                                    | ✅        |
+| `format/prettier` | declarative                | `prettier --write --ignore-unknown {{files}}` (batch)                | ✅        |
+| `format/biome`    | declarative                | `biome format --files-ignore-unknown=true --write {{files}}` (batch) | ✅        |
+| `format/rust`     | declarative                | `rustfmt --config-path={{repo_root}} {{file}}` (per_file)            | ✅        |
+| `format/bazel`    | declarative                | `buildifier -mode=fix {{files}}` (batch)                             | ✅        |
+| `lint/oxc`        | declarative                | `oxlint --fix --no-error-on-unmatched-pattern {{files}}` (batch)     | ✅        |
+| `lint/biome`      | declarative                | `biome lint --files-ignore-unknown=true --write {{files}}` (batch)   | ✅        |
+| `lint/js`         | declarative                | `eslint --no-config-lookup --config … --fix {{files}}` (batch)       | ✅        |
+| `lint/bazel`      | declarative                | `buildifier -lint=fix -mode=fix {{files}}` (batch)                   | ✅        |
+| `lint/rust`       | declarative (bazel_aspect) | `clippy --fix` — **not feasible in v1**                              | ❌ future |
+
+All nine fix blocks shipped as planned. The linters' exit maps encode the §C nuance directly: exit `1` (fixes applied, unfixable diagnostics remain) maps to `ok`, `2` and above to `error`.
+
+`lint/js` was **kept** rather than dropped, resolving the open question about its impending replacement by `lint/oxc` (#1619): the check is still live, and a fix block for it costs one YAML stanza. It is also the only linter whose fix block passes its config explicitly, so unlike the prettier/biome/oxc formatters it is not exposed to the config-discovery gap described in §C.
 
 `lint/rust` is **not auto-fixed in v1**: clippy is run via the rules*rust \_aspect* (artifact read), not a direct invocation, and `cargo clippy --fix` requires a cargo-driven, writable, single-version workspace and rewrites whole crates (well outside the changeset-scoped fixable set). Deferred (`future / not a v1 blocker`); failing `lint/rust` is reported as "no fix available."
 
@@ -252,83 +310,58 @@ Built-in (Rust) checks have neither a declarative `fix` block nor a WASM entry p
 
 ### I. Progress UI integration
 
-`fix` reuses the existing `ProgressReporter` / `LiveProgress` / `TermRenderer`. The discovery phase reuses `run`'s reporter as-is. The apply phase registers one progress line per scheduled fix run (`register(check_id, file_count)`), ticks per file fixed (`record_progress`) — `create_sandbox`'s parallel population and per-file fix mode both expose natural tick points — and `finish`es with the count copied back. Auto-enabled on an interactive TTY, off for pipes/CI/`--format json`, identical detection to `run`. The final footer is the §A summary.
+`fix` reuses the existing `ProgressReporter` / `LiveProgress` / `TermRenderer`, with a **single reporter instance shared across the discovery and apply phases** so the display is continuous rather than torn down and rebuilt between them. The apply phase registers every check up front (`register(check_id, file_count)`), then per check emits `start` → `record_progress` → `finish(check_id, error_count, elapsed)`. Auto-enabled on an interactive TTY, off for pipes/CI/`--format json`, identical detection to `run`. The final footer is the §A summary.
 
-## Risks / open questions
+Tick granularity differs by fix mode, and only per-file mode matches the design's "tick per file fixed": a **batch** invocation ticks once when the whole invocation completes, jumping the counter by the chunk's file count. A batch formatter over many files therefore shows no intra-batch movement. Finer granularity would require the tool to report per-file progress, which none of the bundled formatters do.
 
-- **WASM fix shape (W1 vs W2).** Recommendation: ship **W1 (guest returns edits, read-only sandbox)** as the SDK default and keep **W2 (writable sandbox)** as an opt-in. The contract's wording leans toward a write capability (W2). Needs a human call — surfaced in attentions.
-- **Convergence default.** Single ordered pass (`--max_passes 1`) vs. converge-to-fixpoint (default 2+). A single lint→format pass is stable for all bundled checks; fixpoint costs extra re-runs for safety against pathological fixers. Surfaced in attentions.
-- **Exit code when unfixable errors remain.** Proposed: exit `1` if any `Error` finding survives re-verify (consistent with `run`). An auto-fix bot might prefer `fix` to exit `0` whenever it _applied_ something regardless of residue. Surfaced in attentions.
-- **`eslint --fix` / `lint/js` provisioning.** `lint/js` is being phased out in favor of `lint/oxc` (#1619). Confirm we still wire its fix, or drop it from the v1 coverage table.
-- **Forced-copy cost.** Fix forfeits the hardlink fast path (correctness requires copies). For large `--all` fixes this is more I/O than `run`; acceptable because fix sets are usually small, but worth measuring.
-- **`fix.run` override surface.** Defaulting `fix.run` to the check's `run` covers every bundled tool; we expose an override for completeness but should confirm no bundled check actually needs a _different_ binary for fix vs. check.
-- **Renames / generated files.** A fixer that wants to _rename_ or _create_ a file (rare for formatters/linters) is intentionally unsupported by copy-back (only in-place content edits propagate). Confirm no target check needs this in v1.
+The verify pass runs under a no-op reporter so its check runs do not redraw over the apply phase's completed display.
 
-## Proposed implementation task breakdown
+## Decisions taken during implementation
 
-Dependency-ordered, PR-sized. Effort hints: `trivial | small | medium | large`. Parallelism noted per depth.
+Four questions were left open by the original design. All four are now settled:
 
-**Depth 0 — may run in parallel (no inter-dependencies):**
+- **WASM fix shape → W1 only.** The plan was W1 as default with W2 as an opt-in; W2 was ultimately not built, because no check needed it and an unused write path is pure surface. See §D.
+- **Convergence default → fixpoint with a cap of 10.** Single-pass shipped first and was reverted after a two-pass formatter left files half-fixed and reported as failing. See §G.
+- **Exit code → `run`-consistent.** `fix` exits 1 if any `Error` survives fix + verify; the friendlier "exit 0 if we applied anything" behaviour was rejected. See §A.
+- **`lint/js` → kept.** Its fix block shipped despite the pending `lint/oxc` migration. See §H.
 
-- **T1. `fix` CLI surface + discovery wiring**
-  Scope: Add the `Fix(FixArgs)` subcommand and `dispatch_fix` to `main.rs`. `FixArgs` mirrors `RunArgs` plus `--allow_dirty` (default true), `--verify` (default true), `--max_passes`, and positional `PATHS…`. Resolve the `ChangePlan`/`Runner` exactly like `run`, execute the run path, and compute per-check failing-file sets from `finding.location.path`. In this PR the apply phase is a **dry plan** that prints what _would_ be fixed (no writes), so the discovery half is reviewable in isolation.
-  Effort: medium. Dependencies: none.
+## Known gaps and residual risks
 
-- **T2. Safety core: writable copy sandbox + atomic copy-back**
-  Scope: Add a force-copy mode to `create_sandbox` (never hardlink) and a new module that, given a fixable set, stages a writable sandbox, records pre-fix content hashes, detects changed files post-fix, enforces the `C ⊆ F` airlock, and copy-backs via same-dir temp + atomic `rename` (mode-preserving), with first-error-stop reporting and full sandbox discard on failure. Pure mechanism + unit tests; no fixers wired yet.
-  Effort: large. Dependencies: none.
+- **WASM fix is unreachable from the CLI.** `fix_component_check` is implemented and tested but has no caller in the apply phase, so `fix = fn` on a WASM check is a functional no-op end to end (§D).
+- **`fix` is undocumented for users.** `userdoc/docs/cli.md` covers only `run` (§E).
+- **Formatter config discovery under `cwd = sandbox`.** `format/prettier`, `format/biome`, and `format/oxc` fix blocks pass no explicit config, so they may fix against tool defaults rather than repo config (§C).
+- **`--allow-dirty=false` has no end-to-end test.** The pure partition function is unit-tested, but nothing verifies that `Vcs::dirty_paths()` actually detects git/jj dirt or that a dirty file is never staged by the real dispatch path — which is the guarantee §E actually makes.
+- **`dirty_paths()` fails open**, treating a VCS query error as "nothing is dirty" (§E).
+- **Forced-copy cost.** Fix forfeits the hardlink fast path (correctness requires copies). For large `--all` fixes this is more I/O than `run`; still unmeasured, and the full-plan-replay convergence loop (§G) multiplies it by the pass count.
+- **`fix.run` override surface.** Defaulting `fix.run` to the check's `run` covered every bundled tool; no bundled check needed a different binary for fix vs. check, so the override remains unexercised.
+- **Renames / generated files.** A fixer that wants to _rename_ or _create_ a file is intentionally unsupported by copy-back (only in-place content edits propagate). No bundled check needed it.
 
-- **T3. Declarative `fix` schema (parse + validate)**
-  Scope: Extend `RawInvocation`/`Invocation` with an optional `fix` block (`run?`, `mode?`, `args`, `exit`) reducing `ExitOutcome` to `{Ok, Error}`; validate backward-compatibly (absent ⇒ no fix). Model only — no execution.
-  Effort: medium. Dependencies: none.
+## Implementation, as delivered
 
-**Depth 1 — may run in parallel once their deps land:**
+The work landed in twelve PRs, following the planned dependency order without resequencing. Each task shipped as scoped; the divergences are described in the sections above rather than repeated here.
 
-- **T4. Declarative fix executor**
-  Scope: Execute a parsed `fix` block inside the T2 sandbox: resolve the binary via `needs`, template/chunk args, run batch or per-file with cwd = sandbox, classify via `fix.exit`, hand changed files to copy-back. Wire into T1's apply phase, replacing the dry plan for declarative checks.
-  Effort: medium. Dependencies: T2, T3, T1.
+| Task | Scope                                                                                                                                            | PR                                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
+| T1   | `Fix(FixArgs)` subcommand, `dispatch_fix`, per-check failing-set computation; apply phase landed as a dry plan so discovery was reviewable alone | [#1621](https://github.com/spinyfin/mono/pull/1621) |
+| T2   | Safety core: `CopyMode::ForceCopy` staging, pre-fix hashing, change detection, `C ⊆ F` airlock, atomic same-dir-rename copy-back                 | [#1623](https://github.com/spinyfin/mono/pull/1623) |
+| T3   | Declarative `fix` block schema (parse + validate), `FixExitOutcome` reduced to `{Ok, Error}`                                                     | [#1622](https://github.com/spinyfin/mono/pull/1622) |
+| T4   | Declarative fix executor; replaced T1's dry plan for declarative checks                                                                          | [#1626](https://github.com/spinyfin/mono/pull/1626) |
+| T5   | `fix` blocks for all nine bundled declarative checks                                                                                             | [#1624](https://github.com/spinyfin/mono/pull/1624) |
+| T6   | `Vcs::dirty_paths()` (git/jj) and `--allow-dirty` threading                                                                                      | [#1625](https://github.com/spinyfin/mono/pull/1625) |
+| T7   | Union-find conflict graph, category ordering, rayon group concurrency, `--max-passes` convergence                                                | [#1629](https://github.com/spinyfin/mono/pull/1629) |
+| T8   | `--verify` re-run, human + JSON output, exit code                                                                                                | [#1628](https://github.com/spinyfin/mono/pull/1628) |
+| T9   | WIT `fix-check`/`fix-error`, SDK `fix = fn`, host `fix_component_check` (not yet CLI-wired)                                                      | [#1627](https://github.com/spinyfin/mono/pull/1627) |
+| T10  | Built-in fix via `Finding.suggested_fix`                                                                                                         | [#1631](https://github.com/spinyfin/mono/pull/1631) |
+| T11  | Progress UI for the apply phase                                                                                                                  | [#1630](https://github.com/spinyfin/mono/pull/1630) |
+| T12  | Safety + behaviour test suite                                                                                                                    | [#1632](https://github.com/spinyfin/mono/pull/1632) |
 
-- **T5. Author `fix` blocks for bundled declarative checks**
-  Scope: Add `fix` blocks to `checks/format/{oxc,prettier,biome,rust,bazel}.yaml` and `checks/lint/{oxc,biome,js,bazel}.yaml` per the coverage table; refresh the bundled snapshot. No Rust changes.
-  Effort: small. Dependencies: T3. (Parallel with T4; T4 needed to _test_ end-to-end.)
-
-- **T6. `--allow_dirty` + dirty-file detection**
-  Scope: Add `Vcs::dirty_paths()` (git/jj), thread `--allow_dirty` through the fixable-set computation (subtract dirty when false), and report skipped-because-dirty distinctly.
-  Effort: small. Dependencies: T1.
-
-- **T9. WASM/external fix entry point**
-  Scope: Add `fix-check` + `fix-error` to `wit/check.wit`; add `fix = fn` to `#[check]` and `fix(...)` to `CheckEntry`; dispatch via `export_checks!`; host runtime invokes `fix-check` (W1 read-only + host-applied edits as the default), routing through T2 copy-back. (W2 writable preopen gated behind the attentions decision.)
-  Effort: large. Dependencies: T2. (Parallel with the declarative track.)
-
-**Depth 2 — may run in parallel:**
-
-- **T7. Ordering, conflict-graph scheduling, convergence**
-  Scope: Build the fixable-file conflict graph; run disjoint checks concurrently and overlapping checks serially in category order (lint→format); implement `--max_passes` re-run-until-stable with a hard cap.
-  Effort: medium. Dependencies: T4.
-
-- **T8. Verification + output (human/JSON)**
-  Scope: Implement `--verify` re-run over fixed files; render the three result buckets (fixed / still failing / no-fix-available) and summary footer in human + JSON; set the exit code per §A.
-  Effort: medium. Dependencies: T4, T1.
-
-**Depth 3 — may run in parallel:**
-
-- **T10. Built-in fix via `Finding.suggested_fix`**
-  Scope: Apply existing `suggested_fix.edits` from built-in checks as a fix source through the T2 copy-back path (path-validated). Framework wiring only; no per-check authoring.
-  Effort: small. Dependencies: T2, T8.
-
-- **T11. Progress UI for fix**
-  Scope: Wire the apply phase into `ProgressReporter`/`LiveProgress` (register/tick/finish per fix run), with the same auto-detect rules as `run`.
-  Effort: small. Dependencies: T1, T8.
-
-- **T12. Safety + behavior test suite**
-  Scope: Tests proving: only-fixable-files are written (sandbox-escape attempt is contained); `--allow_dirty` true vs. false; a check with no fix is a no-op; atomicity — abort on fixer error leaves originals byte-identical; copy-back first-error-stop never half-writes a file; deterministic lint→format ordering; idempotency (second `fix` is a no-op).
-  Effort: medium. Dependencies: T4, T6, T7, T8, T9 (covers each as it lands; final pass after all).
+T12 covers six of its seven target properties with real tests: sandbox-escape containment, no-fix no-op, abort-leaves-originals-byte-identical, copy-back first-error-stop, deterministic lint→format ordering, and idempotency. The seventh — `--allow-dirty` true vs. false — is only unit-tested at the partition-function level and lacks end-to-end coverage (see Known gaps).
 
 **Deferred / not a v1 blocker (recorded so the rejection set is explicit):**
 
 - **D1. `lint/rust` (clippy) auto-fix.** Needs a cargo-driven `clippy --fix` outside the bazel-aspect model and whole-crate rewrites; out of scope for changeset-scoped fixing. Effort: large.
-- **D2. Per-built-in `suggested_fix` authoring** (e.g. `no-usfa-typo` corrected spelling). Incremental, per-check; framework support lands in T10. Effort: small each.
+- **D2. Per-built-in `suggested_fix` authoring** (e.g. `no-usfa-typo` corrected spelling). Framework support shipped in T10, but no built-in check populates the channel yet, so this tier is inert until one does. Effort: small each.
 - **D3. Interactive / partial fixing** (per-hunk, per-finding selection). Explicit non-goal for v1. Effort: medium.
-- **D4. W2 writable-sandbox WASM fix** as a first-class SDK option, pending the attentions decision. Effort: medium.
+- **D4. W2 writable-sandbox WASM fix.** Not built — v1 shipped W1 only (§D). The safety core would support it unchanged if a guest needs in-place writes. Effort: medium.
 - **D5. Rename/create-file fixes** via copy-back. Unsupported by design in v1; revisit only if a real check needs it. Effort: medium.
 - **D6. Declarative-runtime adoption of the sandbox for _checks_ (not just fix).** Orthogonal hardening, separate project. Effort: large.
