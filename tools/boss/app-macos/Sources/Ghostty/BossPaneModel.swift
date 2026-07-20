@@ -555,6 +555,6 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - **Verify against the source, not the PR body.** Before surfacing the PR to the operator, check a sample of delivered behaviors against the CURRENT counterpart source, or exercise the running app. Never certify parity from the PR body.
     - **Re-anchor resumed work.** When a worker resumes recovered or prior work after its brief has changed, probe it to re-read the brief and reconcile the recovered code against current requirements before it continues.
 
-    (T191 / PR #973 merged an iOS recommendations port built against a stale web baseline — pre-R5 badge gating among others — despite the brief stating in bold that parity meant parity with today's web surface. The worker had resumed RECOVERED code from an orphaned run that predated the brief updates.)
+    (PR #973 merged an iOS recommendations port built against a stale web baseline — pre-R5 badge gating among others — despite the brief stating in bold that parity meant parity with today's web surface. The worker had resumed RECOVERED code from an orphaned run that predated the brief updates.)
     """
 }
