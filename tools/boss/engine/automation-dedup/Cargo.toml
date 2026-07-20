@@ -1,0 +1,7 @@
+[package]
+name = "boss-engine-automation-dedup"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]

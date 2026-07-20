@@ -299,6 +299,76 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Everything this automation is already tracking: open tasks, plus
+    /// tasks it resolved within the last [`SIBLING_RESOLVED_WINDOW_SECS`].
+    ///
+    /// Feeds the triage preamble. A triage agent is spawned fresh on every
+    /// fire with no memory of previous fires, so left to itself it will
+    /// re-derive — and re-file — the same finding indefinitely; that is
+    /// what produced the audited duplicate clusters. Handing it this list
+    /// is the difference between "there is a 3000-line file here" and
+    /// "there is a 3000-line file here, and T2861 is already on it".
+    ///
+    /// Resolved rows are included precisely because the hard gate in
+    /// [`Self::create_automation_task`] cannot use them: a finding that
+    /// really has recurred after being fixed must stay fileable, so
+    /// closed siblings inform the agent's judgement rather than binding
+    /// it.
+    pub fn list_automation_sibling_tasks(&self, automation_id: &str) -> Result<Vec<AutomationSiblingTask>> {
+        let conn = self.connect()?;
+        let cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - SIBLING_RESOLVED_WINDOW_SECS;
+        // Open rows always qualify however old they are — an ancient open
+        // task is *more* worth surfacing, not less. Resolved rows are
+        // windowed on completion time, falling back to `updated_at` for
+        // rows that predate the `completed_at` column.
+        let sql = format!(
+            "SELECT short_id, name, status, pr_url
+               FROM tasks
+              WHERE source_automation_id = ?1
+                AND deleted_at IS NULL
+                AND (
+                     status IN ({OPEN_SIBLING_STATUSES})
+                     OR CAST(COALESCE(completed_at, updated_at) AS INTEGER) >= ?2
+                )
+              ORDER BY CAST(created_at AS INTEGER) DESC, id DESC
+              LIMIT ?3"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![automation_id, cutoff, SIBLING_LIST_LIMIT], |row| {
+            Ok(AutomationSiblingTask {
+                short_id: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                name: row.get(1)?,
+                status: row.get(2)?,
+                pr_url: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Every task the dedup gate turned away for this automation, newest
+    /// first. See [`AutomationDedupSuppression`] for why a gate whose
+    /// whole effect is an absence needs a reader.
+    pub fn list_automation_dedup_suppressions(&self, automation_id: &str) -> Result<Vec<AutomationDedupSuppression>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT automation_id, surviving_task_id, attempted_name, matched_on, match_key, created_at
+               FROM automation_dedup_suppressions
+              WHERE automation_id = ?1
+              ORDER BY CAST(created_at AS INTEGER) DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([automation_id], |row| {
+            Ok(AutomationDedupSuppression {
+                automation_id: row.get(0)?,
+                surviving_task_id: row.get(1)?,
+                attempted_name: row.get(2)?,
+                matched_on: row.get(3)?,
+                match_key: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Raw rows examined per [`list_automation_runs`] call, before
     /// retry-chain collapsing. Bounds the query itself (not just what gets
     /// rendered) against an automation with a very long fire history —
@@ -856,14 +926,8 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let automation = query_automation(&tx, automation_id).require("automation", automation_id)?;
 
-        let open: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM tasks
-              WHERE source_automation_id = ?1
-                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
-                AND deleted_at IS NULL",
-            [automation_id],
-            |row| row.get(0),
-        )?;
+        let open_siblings = query_open_sibling_fingerprints(&tx, automation_id)?;
+        let open = open_siblings.len() as i64;
         if open >= automation.open_task_limit {
             anyhow::bail!(
                 "automation {automation_id} is at its open-task limit \
@@ -872,9 +936,36 @@ impl WorkDb {
             );
         }
 
-        // `force_duplicate` so a recurring maintenance instruction that
-        // produces same-named tasks across fires is not blocked by the
-        // 60-second recent-duplicate guard.
+        // Dedup gate. The open-task cap above only counts rows; it is happy
+        // to hold N copies of one finding, which is exactly what filled the
+        // audited duplicate clusters. This compares what the candidate is
+        // *about* against its open siblings.
+        if let Some((sibling, matched)) = find_duplicate_sibling(&open_siblings, name, description) {
+            record_dedup_suppression(&tx, automation_id, sibling, name, &matched)?;
+            tx.commit()?;
+            tracing::warn!(
+                automation_id,
+                surviving_task_id = %sibling.id,
+                surviving_short_id = sibling.short_id,
+                attempted_name = name,
+                matched_on = matched.kind.as_str(),
+                match_key = %matched.key,
+                "automation dedup gate suppressed a duplicate task",
+            );
+            return Err(anyhow::Error::new(AutomationDuplicateTaskError {
+                existing_id: sibling.id.clone(),
+                existing_short_id: sibling.short_id,
+                existing_name: sibling.name.clone(),
+                matched_on: matched.kind.as_str(),
+                match_key: matched.key,
+            }));
+        }
+
+        // `force_duplicate` bypasses the 60-second same-name guard, which
+        // is the wrong tool here in both directions: a cron re-fire lands
+        // long after the window closes, and a legitimately recurring
+        // instruction can produce a same-named task days apart. The gate
+        // above is what actually protects this path.
         let mut task = insert_chore_in_tx(
             &tx,
             CreateChoreInput::builder()
@@ -894,6 +985,118 @@ impl WorkDb {
         task.source_automation_id = Some(automation_id.to_owned());
         Ok(task)
     }
+}
+
+/// How far back [`WorkDb::list_automation_sibling_tasks`] reaches for
+/// already-resolved siblings.
+///
+/// Long enough to span several fires of a ~12h automation, so a finding
+/// that was filed, merged, and re-derived on the next fire is still
+/// visible to the triage agent. Short enough that a finding which has
+/// genuinely recurred weeks later is not silently discouraged — this list
+/// is advice to the agent, not a gate, and stale advice is worse than
+/// none.
+const SIBLING_RESOLVED_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Cap on the sibling list handed to the triage agent. An automation with
+/// a long, churny history would otherwise push its whole backlog into the
+/// preamble and bury the standing instruction.
+const SIBLING_LIST_LIMIT: i64 = 20;
+
+/// An open task belonging to one automation, carrying just enough to
+/// fingerprint it and to name it back to the triage agent.
+struct OpenSibling {
+    id: String,
+    short_id: i64,
+    name: String,
+    fingerprint: boss_engine_automation_dedup::TaskFingerprint,
+}
+
+/// The statuses that make a produced task "still open" — a finding
+/// already being worked, reviewed, or waiting. Kept identical to the
+/// open-task-cap query so the cap and the dedup gate can never disagree
+/// about which siblings exist.
+const OPEN_SIBLING_STATUSES: &str = "'todo', 'ready', 'active', 'in_review', 'blocked'";
+
+/// Load and fingerprint every open task produced by `automation_id`.
+///
+/// Fingerprinting happens here, inside the same immediate transaction as
+/// the subsequent insert, so a second triage agent racing this one cannot
+/// slip a duplicate in between the check and the write.
+fn query_open_sibling_fingerprints(conn: &Connection, automation_id: &str) -> Result<Vec<OpenSibling>> {
+    let sql = format!(
+        "SELECT id, short_id, name, description
+           FROM tasks
+          WHERE source_automation_id = ?1
+            AND status IN ({OPEN_SIBLING_STATUSES})
+            AND deleted_at IS NULL
+          ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([automation_id], |row| {
+        let id: String = row.get(0)?;
+        let short_id: Option<i64> = row.get(1)?;
+        let name: String = row.get(2)?;
+        let description: Option<String> = row.get(3)?;
+        Ok((id, short_id.unwrap_or(0), name, description))
+    })?;
+
+    let mut siblings = Vec::new();
+    for row in rows {
+        let (id, short_id, name, description) = row?;
+        let fingerprint = boss_engine_automation_dedup::fingerprint(&name, description.as_deref());
+        siblings.push(OpenSibling {
+            id,
+            short_id,
+            name,
+            fingerprint,
+        });
+    }
+    Ok(siblings)
+}
+
+/// First open sibling that already tracks this finding, if any.
+///
+/// Siblings arrive oldest-first, so the *original* filing is the one that
+/// survives. That matters for the operator: the surviving row is the one
+/// that already has the history, and possibly a PR.
+fn find_duplicate_sibling<'a>(
+    siblings: &'a [OpenSibling],
+    name: &str,
+    description: Option<&str>,
+) -> Option<(&'a OpenSibling, boss_engine_automation_dedup::DuplicateMatch)> {
+    let candidate = boss_engine_automation_dedup::fingerprint(name, description);
+    siblings
+        .iter()
+        .find_map(|sibling| candidate.duplicate_of(&sibling.fingerprint).map(|m| (sibling, m)))
+}
+
+/// Append the `duplicate_suppressed` trace row. Written inside the
+/// caller's transaction, which then commits *despite* returning an error
+/// to the agent — the whole point is that the suppression outlives the
+/// refused insert.
+fn record_dedup_suppression(
+    conn: &Connection,
+    automation_id: &str,
+    sibling: &OpenSibling,
+    attempted_name: &str,
+    matched: &boss_engine_automation_dedup::DuplicateMatch,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO automation_dedup_suppressions
+             (id, automation_id, surviving_task_id, attempted_name, matched_on, match_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            next_id("adsup"),
+            automation_id,
+            sibling.id,
+            attempted_name,
+            matched.kind.as_str(),
+            matched.key,
+            now_string(),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Collapse consecutive `runs` (newest-first, as returned by the DB query)

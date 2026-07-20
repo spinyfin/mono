@@ -1192,3 +1192,270 @@ fn record_run_holds_schedule_when_next_due_is_none() {
         Some(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
     );
 }
+
+// ── automation dedup gate ────────────────────────────────────────────────────
+//
+// The gate exists because a cron automation re-derives the same finding on
+// every fire and re-files it in different words. The tests below are the
+// audited collision shapes (2026-07-20) plus the near-misses that must stay
+// fileable — a false suppression silently loses real work.
+
+/// A paraphrase of an open sibling is refused, and the refusal names the
+/// surviving task so the triage agent can cite it in a skip marker.
+#[test]
+fn dedup_gate_suppresses_a_paraphrased_duplicate() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-paraphrase")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    // Cap of 3 so the open-task cap cannot be what rejects the second
+    // create — this test must exercise the dedup gate, not the backstop.
+    let automation = make_automation(&db, &product.id, 3);
+
+    let surviving = db
+        .create_automation_task(&automation.id, "Split engine core app.rs (~2548 lines)", None)
+        .unwrap();
+
+    let err = db
+        .create_automation_task(
+            &automation.id,
+            "Split engine/core src/app.rs (nearing 3000-line limit)",
+            None,
+        )
+        .unwrap_err();
+
+    let dup = err
+        .downcast_ref::<crate::work::AutomationDuplicateTaskError>()
+        .unwrap_or_else(|| panic!("expected AutomationDuplicateTaskError, got: {err}"));
+    assert_eq!(dup.existing_id, surviving.id);
+    assert_eq!(dup.matched_on, "file_target");
+    // Neither title carries qualifiers: the first writes the path as prose
+    // ("engine core app.rs") and the second splits it across a space, so
+    // its file token is the bare `src/app.rs` — and `src` is boilerplate.
+    // The basename alone is what the two genuinely share.
+    assert_eq!(dup.match_key, "app.rs");
+
+    // The agent's only channel is this error text: it must name the task to
+    // cite and the marker to emit, or the run ends with no marker at all.
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("T{}", surviving.short_id.unwrap())),
+        "error must name the surviving task: {message}"
+    );
+    assert!(
+        message.contains("automation: skip"),
+        "error must tell the agent which marker to emit: {message}"
+    );
+
+    assert_eq!(
+        db.count_open_tasks_for_automation(&automation.id).unwrap(),
+        1,
+        "a suppressed create must not insert a row"
+    );
+}
+
+/// Suppression is traced: the row survives the refused insert, names the
+/// surviving task, and keeps the rejected title verbatim.
+#[test]
+fn dedup_gate_records_a_suppression_trace() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-trace")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 3);
+
+    let surviving = db
+        .create_automation_task(&automation.id, "Extract pr_review into its own crate", None)
+        .unwrap();
+    assert!(
+        db.list_automation_dedup_suppressions(&automation.id)
+            .unwrap()
+            .is_empty(),
+        "a clean create must not record a suppression"
+    );
+
+    let attempted = "Move the pr_review reviewer out of engine/core into a crate";
+    db.create_automation_task(&automation.id, attempted, None).unwrap_err();
+
+    let traces = db.list_automation_dedup_suppressions(&automation.id).unwrap();
+    assert_eq!(traces.len(), 1, "expected exactly one suppression trace");
+    assert_eq!(traces[0].surviving_task_id, surviving.id);
+    assert_eq!(traces[0].attempted_name, attempted);
+    assert_eq!(traces[0].matched_on, "module_target");
+    assert_eq!(traces[0].match_key, "pr_review");
+}
+
+/// The brief's explicit non-goal: one automation legitimately produces
+/// findings about different files, and the gate must not collapse them.
+#[test]
+fn dedup_gate_allows_genuinely_different_targets() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-distinct")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 3);
+
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs (~2548 lines)", None)
+        .unwrap();
+    db.create_automation_task(&automation.id, "Split engine/core/src/runner.rs (~3100 lines)", None)
+        .unwrap();
+    db.create_automation_task(&automation.id, "Split tools/cube/src/app.rs (~3400 lines)", None)
+        .unwrap();
+
+    assert_eq!(
+        db.count_open_tasks_for_automation(&automation.id).unwrap(),
+        3,
+        "distinct findings must all be fileable"
+    );
+    assert!(
+        db.list_automation_dedup_suppressions(&automation.id)
+            .unwrap()
+            .is_empty(),
+        "no suppression should have been recorded"
+    );
+}
+
+/// Two automations converging on the same file is out of scope and
+/// explicitly allowed — the gate is keyed on `source_automation_id`.
+#[test]
+fn dedup_gate_does_not_suppress_across_automations() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-cross")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let first = make_automation(&db, &product.id, 3);
+    let second = make_automation(&db, &product.id, 3);
+    assert_ne!(first.id, second.id);
+
+    let title = "Split engine/core/src/app.rs";
+    db.create_automation_task(&first.id, title, None).unwrap();
+    db.create_automation_task(&second.id, title, None)
+        .expect("a different automation must be allowed to file the same target");
+
+    assert_eq!(db.count_open_tasks_for_automation(&first.id).unwrap(), 1);
+    assert_eq!(db.count_open_tasks_for_automation(&second.id).unwrap(), 1);
+}
+
+/// Once the sibling is resolved, the gate stops applying: a finding that
+/// genuinely recurs after being fixed must stay fileable. This is the
+/// deliberate seam the triage preamble's recently-resolved list covers —
+/// judgement, not a hard block.
+#[test]
+fn dedup_gate_ignores_resolved_siblings() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-resolved")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 3);
+
+    let first = db
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .unwrap();
+    db.update_task(
+        &first.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..Default::default()
+        },
+        "human",
+    )
+    .unwrap();
+
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs again", None)
+        .expect("a resolved sibling must not block a recurrence");
+}
+
+/// The cap is checked before the dedup gate: at the limit the caller gets
+/// the fan-out error, not a confusing duplicate error naming a task that
+/// may not even be the reason.
+#[test]
+fn dedup_gate_does_not_mask_the_open_task_cap() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-cap-order")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .unwrap();
+    let err = db
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("open-task limit"),
+        "cap must be reported ahead of the dedup gate: {err}"
+    );
+    assert!(
+        db.list_automation_dedup_suppressions(&automation.id)
+            .unwrap()
+            .is_empty(),
+        "a cap rejection is not a dedup suppression"
+    );
+}
+
+// ── list_automation_sibling_tasks (triage preamble input) ────────────────────
+
+/// The preamble list carries open tasks and recently-resolved ones, with
+/// the PR url when a worker has already opened one.
+#[test]
+fn sibling_list_reports_open_and_recently_resolved_tasks() {
+    let db = WorkDb::open(temp_db_path("auto-siblings")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 3);
+
+    let open = db
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .unwrap();
+    let resolved = db
+        .create_automation_task(&automation.id, "Split engine/core/src/runner.rs", None)
+        .unwrap();
+    db.update_task(
+        &resolved.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            pr_url: Some("https://github.com/spinyfin/mono/pull/2144".to_owned()),
+            ..Default::default()
+        },
+        "human",
+    )
+    .unwrap();
+
+    let siblings = db.list_automation_sibling_tasks(&automation.id).unwrap();
+    assert_eq!(siblings.len(), 2, "both the open and the just-resolved task belong");
+
+    let open_entry = siblings
+        .iter()
+        .find(|s| s.short_id == open.short_id.unwrap())
+        .expect("open task missing from sibling list");
+    assert_eq!(open_entry.status, "todo");
+    assert_eq!(open_entry.pr_url, None);
+
+    let resolved_entry = siblings
+        .iter()
+        .find(|s| s.short_id == resolved.short_id.unwrap())
+        .expect("recently-resolved task missing from sibling list");
+    assert_eq!(resolved_entry.status, "done");
+    assert_eq!(
+        resolved_entry.pr_url.as_deref(),
+        Some("https://github.com/spinyfin/mono/pull/2144"),
+        "the PR url is the strongest signal that a finding is in hand"
+    );
+}
+
+/// Only this automation's own tasks appear — a sibling list polluted by
+/// another automation's work would push the agent toward wrong skips.
+#[test]
+fn sibling_list_is_scoped_to_one_automation() {
+    let db = WorkDb::open(temp_db_path("auto-siblings-scope")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let mine = make_automation(&db, &product.id, 3);
+    let theirs = make_automation(&db, &product.id, 3);
+
+    db.create_automation_task(&mine.id, "Split engine/core/src/app.rs", None)
+        .unwrap();
+    db.create_automation_task(&theirs.id, "Split tools/cube/src/main.rs", None)
+        .unwrap();
+
+    let siblings = db.list_automation_sibling_tasks(&mine.id).unwrap();
+    assert_eq!(siblings.len(), 1);
+    assert!(siblings[0].name.contains("engine/core/src/app.rs"));
+}
+
+/// A fresh automation has nothing to report — the preamble renders no
+/// "already tracked" section at all in this case.
+#[test]
+fn sibling_list_is_empty_for_a_fresh_automation() {
+    let db = WorkDb::open(temp_db_path("auto-siblings-empty")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+
+    assert!(db.list_automation_sibling_tasks(&automation.id).unwrap().is_empty());
+}

@@ -165,6 +165,52 @@ impl std::fmt::Display for DuplicateTaskError {
 
 impl std::error::Error for DuplicateTaskError {}
 
+/// Returned by [`WorkDb::create_automation_task`] when the dedup gate
+/// finds an open sibling of the same automation already tracking this
+/// finding.
+///
+/// This is not the same condition as [`DuplicateTaskError`], which is the
+/// 60-second same-name guard on human/agent task creation. That guard is
+/// useless against automations: a cron re-fire lands half a day later and
+/// re-words the title, so neither the window nor the exact-name match
+/// applies. See `boss_engine_automation_dedup` for what is compared.
+///
+/// Surfaces to the triage agent as the error text of its
+/// `boss task create --automation` call, which is the only channel that
+/// reaches it — hence the [`Display`](std::fmt::Display) impl spelling out
+/// the marker it should emit instead. A triage agent that got this far
+/// believes it found real work, so telling it merely "rejected" would
+/// leave it retrying or stopping with no marker at all.
+#[derive(Debug)]
+pub struct AutomationDuplicateTaskError {
+    /// Canonical id of the open sibling that already tracks this finding.
+    pub existing_id: String,
+    /// Friendly `T<n>` number of that sibling, for the agent's marker.
+    pub existing_short_id: i64,
+    /// That sibling's title, so the agent can sanity-check the match.
+    pub existing_name: String,
+    /// Which dedup signal fired (`file_target` / `module_target` /
+    /// `normalized_title`).
+    pub matched_on: &'static str,
+    /// The shared value that fired it — a path, a module name, or the
+    /// normalized title.
+    pub match_key: String,
+}
+
+impl std::fmt::Display for AutomationDuplicateTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "duplicate suppressed: this automation already has an open task \
+             covering {:?} — T{} {:?} (matched on {}). Do NOT file another. \
+             End your run with the marker: `automation: skip — already tracked as T{}`",
+            self.match_key, self.existing_short_id, self.existing_name, self.matched_on, self.existing_short_id,
+        )
+    }
+}
+
+impl std::error::Error for AutomationDuplicateTaskError {}
+
 /// One row demoted by [`WorkDb::heal_ghost_active_chores`]. Carries the
 /// owning `product_id` so the caller can publish a `work_item_changed`
 /// invalidation on the product's topic — the kanban view subscribes on
@@ -387,6 +433,8 @@ pub use mappers::SpeculativeConflictInsertInput;
 // the same as every other row type in this module.
 pub use boss_metrics::MetricsCounterRow;
 pub use boss_metrics::MetricsGaugeRow;
+pub use output_types::AutomationDedupSuppression;
+pub use output_types::AutomationSiblingTask;
 pub use output_types::HostBoundExecution;
 pub use output_types::IdleAbandonmentCompletion;
 pub use output_types::LatePrCandidate;

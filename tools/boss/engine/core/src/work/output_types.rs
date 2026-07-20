@@ -211,3 +211,53 @@ pub struct StrandedCiRemediationAttempt {
     pub product_id: String,
     pub pr_url: String,
 }
+
+/// One task an automation is already tracking, as shown to its triage
+/// agent in [`crate::automation_triage::render_triage_preamble`].
+///
+/// Deliberately minimal: the agent needs to recognise "I was about to
+/// file this" and cite the existing row, nothing more. Full task bodies
+/// would crowd out the standing instruction the agent is there to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomationSiblingTask {
+    /// Friendly `T<n>` number — what the agent cites in its skip marker.
+    pub short_id: i64,
+    pub name: String,
+    /// Raw status string (`todo`, `active`, `in_review`, `done`, …), so
+    /// the agent can tell "someone is on it" from "this was fixed and
+    /// has come back".
+    pub status: String,
+    /// Present once a worker has opened a PR — the strongest signal that
+    /// the finding is genuinely in hand.
+    pub pr_url: Option<String>,
+}
+
+/// One row from `automation_dedup_suppressions`: a task the dedup gate
+/// refused to create because an open sibling already tracked the finding.
+///
+/// The gate's effect is an absence, which is exactly what an operator
+/// cannot see. This is how "why has A3 filed nothing all week?" gets an
+/// answer, and how over-suppression would be caught — a burst of rows all
+/// pointing at one surviving task, matched on `normalized_title`, is the
+/// shape of a gate that has become too eager.
+/// Carries the builder derive per the repo's >5-field convention. The
+/// production reader below still builds it with a struct literal, as the
+/// convention prescribes for DB mappers — a compile error when a new
+/// column goes unmapped is the desirable outcome there.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AutomationDedupSuppression {
+    pub automation_id: String,
+    /// The task that survived and still tracks the finding.
+    pub surviving_task_id: String,
+    /// Title the triage agent tried to file, kept verbatim so a human can
+    /// judge whether the two really were the same work.
+    pub attempted_name: String,
+    /// Which signal fired: `file_target`, `module_target`, or
+    /// `normalized_title`.
+    pub matched_on: String,
+    /// The shared value that fired it.
+    pub match_key: String,
+    /// UTC epoch seconds, as a string (schema-wide convention).
+    pub created_at: String,
+}

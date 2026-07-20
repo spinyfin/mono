@@ -1051,7 +1051,22 @@ pub(crate) async fn compose_worker_spawn(
                     .flatten()
                     .map(|p| p.name)
                     .unwrap_or_else(|| automation.product_id.clone());
-                crate::automation_triage::render_triage_preamble(&automation, &product_name)
+                // Best-effort: a failed sibling lookup degrades the
+                // preamble to its pre-dedup form rather than costing the
+                // spawn. The hard gate at create time still holds.
+                let siblings = work_db
+                    .list_automation_sibling_tasks(&automation.id)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            automation_id = %automation.id,
+                            ?err,
+                            "could not load already-tracked tasks for the triage preamble; \
+                             rendering without the dedup section",
+                        );
+                        Vec::new()
+                    });
+                crate::automation_triage::render_triage_preamble(&automation, &product_name, &siblings)
             }
             other => {
                 tracing::warn!(

@@ -1987,6 +1987,38 @@ pub(crate) fn migrate_conflict_resolutions_mechanical_rung_column(conn: &Connect
     Ok(())
 }
 
+/// `automation_dedup_suppressions` — the durable trace of every task the
+/// automation dedup gate refused to create.
+///
+/// The gate's whole job is to make work *not happen*, which is invisible
+/// by construction: without a record, an operator wondering why an
+/// automation "stopped filing anything" has nothing to look at, and a
+/// gate that starts over-suppressing would be indistinguishable from a
+/// quiet repo. Each row names the surviving task, the title that was
+/// turned away, and the signal that fired, so both questions are
+/// answerable after the fact.
+///
+/// Append-only and never read back by the engine's own logic — this is
+/// telemetry, not state. Purely additive; `CREATE TABLE IF NOT EXISTS`
+/// so ordering against its neighbours is irrelevant.
+pub(crate) fn migrate_automation_dedup_suppressions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_dedup_suppressions (
+             id                 TEXT PRIMARY KEY,
+             automation_id      TEXT NOT NULL REFERENCES automations(id),
+             surviving_task_id  TEXT NOT NULL REFERENCES tasks(id),
+             attempted_name     TEXT NOT NULL,
+             matched_on         TEXT NOT NULL,
+             match_key          TEXT NOT NULL,
+             created_at         TEXT NOT NULL
+         );
+
+         CREATE INDEX IF NOT EXISTS automation_dedup_suppressions_by_automation_idx
+             ON automation_dedup_suppressions(automation_id, created_at);",
+    )?;
+    Ok(())
+}
+
 /// One-time cleanup for orphaned `merge_queue_state = 'queued'` rows left
 /// behind by terminal transitions (done/archived paths in `exec_tail.rs`,
 /// `chain_helpers.rs`, `dispatch_helpers.rs`) that predated clearing
