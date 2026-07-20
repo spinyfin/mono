@@ -13,29 +13,12 @@ fn migration_v6_to_v7_relaxes_work_attention_items() {
     // attention item against an execution row. Everything else
     // the `WorkDb::open` migration touches will be created via
     // the fresh-init path when it doesn't already exist.
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human');
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium');
-             CREATE TABLE work_executions (
+    LegacySchema::new(6)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V4_COLUMNS)
+        .ddl(
+            "CREATE TABLE work_executions (
                  id TEXT PRIMARY KEY,
                  work_item_id TEXT NOT NULL,
                  kind TEXT NOT NULL,
@@ -49,8 +32,11 @@ fn migration_v6_to_v7_relaxes_work_attention_items() {
                  preferred_workspace_id TEXT,
                  created_at TEXT NOT NULL,
                  started_at TEXT,
-                 finished_at TEXT);
-             CREATE TABLE work_attention_items (
+                 finished_at TEXT);",
+        )
+        // The pre-v7 shape under test: NOT NULL execution_id, no work_item_id.
+        .ddl(
+            "CREATE TABLE work_attention_items (
                  id TEXT PRIMARY KEY,
                  execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
                  kind TEXT NOT NULL,
@@ -58,10 +44,11 @@ fn migration_v6_to_v7_relaxes_work_attention_items() {
                  title TEXT NOT NULL,
                  body_markdown TEXT NOT NULL,
                  created_at TEXT NOT NULL,
-                 resolved_at TEXT);
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-                 VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000');
-             INSERT INTO tasks(id, product_id, project_id, kind, name, status,
+                 resolved_at TEXT);",
+        )
+        .seed(&legacy_product_seed("prod_legacy", "L", "l"))
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, status,
                                created_at, updated_at)
                  VALUES ('task_legacy', 'prod_legacy', NULL, 'chore', 'old',
                          'todo', '1700000000', '1700000000');
@@ -72,10 +59,9 @@ fn migration_v6_to_v7_relaxes_work_attention_items() {
              INSERT INTO work_attention_items(id, execution_id, kind, status, title,
                                               body_markdown, created_at)
                  VALUES ('attn_legacy', 'exec_legacy', 'review_required', 'open',
-                         'Legacy item', 'Body.', '1700000000');
-             INSERT INTO metadata(key, value) VALUES ('schema_version','6');",
-    )
-    .unwrap();
+                         'Legacy item', 'Body.', '1700000000');",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -332,36 +318,17 @@ fn fresh_init_includes_merge_conflict_schema() {
 fn migration_renames_auto_rebase_enabled_when_present() {
     let (_dir, path) = disk_db_path("mc-rename-auto-rebase");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 auto_rebase_enabled INTEGER NOT NULL DEFAULT 1);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human');
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium',
-                 created_via TEXT NOT NULL DEFAULT 'unknown');
-             INSERT INTO products(id, name, slug, status, created_at, updated_at,
+    LegacySchema::new(5)
+        // The pre-rename column this migration is about.
+        .products("auto_rebase_enabled INTEGER NOT NULL DEFAULT 1")
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V5_COLUMNS)
+        .seed(
+            "INSERT INTO products(id, name, slug, status, created_at, updated_at,
                                    auto_rebase_enabled)
-             VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000', 0);
-             INSERT INTO metadata(key, value) VALUES ('schema_version','5');",
-    )
-    .unwrap();
+             VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000', 0);",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -406,37 +373,20 @@ fn migration_backfills_blocked_reason_for_active_prereqs() {
     // `'dependency'`) and one whose prereq is already `done`
     // (should stay `NULL`).
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human');
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium',
-                 created_via TEXT NOT NULL DEFAULT 'unknown');
-             CREATE TABLE work_item_dependencies (
+    LegacySchema::new(5)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V5_COLUMNS)
+        .ddl(
+            "CREATE TABLE work_item_dependencies (
                  dependent_id TEXT NOT NULL, prerequisite_id TEXT NOT NULL,
                  relation TEXT NOT NULL DEFAULT 'blocks',
                  created_at TEXT NOT NULL,
-                 PRIMARY KEY (dependent_id, prerequisite_id, relation));
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
-             -- Two dependents already in `blocked` from the engine's
+                 PRIMARY KEY (dependent_id, prerequisite_id, relation));",
+        )
+        .seed(&legacy_product_seed("prod_1", "P", "p"))
+        .seed(
+            "-- Two dependents already in `blocked` from the engine's
              -- pre-Phase-1 auto-block path; both still have edges.
              INSERT INTO tasks(id, product_id, project_id, kind, name,
                                 description, status, created_at, updated_at,
@@ -455,10 +405,9 @@ fn migration_backfills_blocked_reason_for_active_prereqs() {
              INSERT INTO work_item_dependencies(dependent_id, prerequisite_id, relation, created_at)
              VALUES
               ('task_dep_active', 'task_prereq_todo', 'blocks', '1700000000'),
-              ('task_dep_done',   'task_prereq_done', 'blocks', '1700000000');
-             INSERT INTO metadata(key, value) VALUES ('schema_version','5');",
-    )
-    .unwrap();
+              ('task_dep_done',   'task_prereq_done', 'blocks', '1700000000');",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -680,26 +629,13 @@ fn fresh_init_includes_external_tracker_schema() {
 fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
     let (_dir, path) = disk_db_path("ext-tracker-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 priority TEXT NOT NULL DEFAULT 'medium',
-                 created_via TEXT NOT NULL DEFAULT 'unknown');
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
-             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
-    )
-    .unwrap();
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        // No `projects` table and no `last_status_actor` — this DB only
+        // has to be old enough to predate the external-tracker columns.
+        .tasks(TASKS_NO_ACTOR_COLUMNS)
+        .seed(&legacy_product_seed("prod_1", "P", "p"))
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -1068,33 +1004,18 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
     // tables or columns. We seed two blocked rows so the
     // backfill has something to mirror.
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 1);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human');
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium',
-                 created_via TEXT NOT NULL DEFAULT 'unknown',
-                 blocked_reason TEXT,
-                 blocked_attempt_id TEXT);
-             CREATE TABLE conflict_resolutions (
+    LegacySchema::new(7)
+        .products("auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 1")
+        .projects(PROJECTS_V4_COLUMNS)
+        // "MC Phase-1 only": blocked_reason + blocked_attempt_id, but
+        // none of the Phase-7 columns the migration under test adds.
+        .tasks(&format!(
+            "{TASKS_V5_COLUMNS},
+     blocked_reason TEXT,
+     blocked_attempt_id TEXT"
+        ))
+        .ddl(
+            "CREATE TABLE conflict_resolutions (
                  id TEXT PRIMARY KEY, product_id TEXT NOT NULL,
                  work_item_id TEXT NOT NULL, pr_url TEXT NOT NULL,
                  pr_number INTEGER NOT NULL, head_branch TEXT NOT NULL,
@@ -1104,10 +1025,11 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
                  cube_lease_id TEXT, cube_workspace_id TEXT, worker_id TEXT,
                  conflict_diagnosis TEXT,
                  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
-                 UNIQUE (work_item_id, base_sha_at_trigger));
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
-             INSERT INTO tasks(id, product_id, project_id, kind, name, status,
+                 UNIQUE (work_item_id, base_sha_at_trigger));",
+        )
+        .seed(&legacy_product_seed("prod_1", "P", "p"))
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, status,
                                 created_at, updated_at, autostart,
                                 last_status_actor, priority, created_via,
                                 blocked_reason, blocked_attempt_id)
@@ -1128,10 +1050,9 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
                1, 'engine', 'medium', 'cli',
                'merge_conflict', 'conflict_18ab_2');
              -- The soft-deleted row should NOT be backfilled.
-             UPDATE tasks SET deleted_at = '1700000090' WHERE id = 'task_deleted';
-             INSERT INTO metadata(key, value) VALUES ('schema_version','7');",
-    )
-    .unwrap();
+             UPDATE tasks SET deleted_at = '1700000090' WHERE id = 'task_deleted';",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -2175,17 +2096,10 @@ fn fresh_init_includes_editorial_controls_schema() {
 fn migration_adds_editorial_controls_columns() {
     let (_dir, path) = disk_db_path("editorial-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE products (
-             id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-             description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-             status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-         INSERT INTO products(id, name, slug, status, created_at, updated_at)
-         VALUES ('prod_e', 'Editorial', 'editorial', 'active', '1700000000', '1700000000');
-         INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
-    )
-    .unwrap();
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        .seed(&legacy_product_seed("prod_e", "Editorial", "editorial"))
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();

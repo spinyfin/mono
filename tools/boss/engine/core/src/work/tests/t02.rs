@@ -1638,42 +1638,35 @@ fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Minimal schema that satisfies the migration chain up to v9.
-        conn.execute_batch(
-            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE products (
-                     id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                     description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                     status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                     auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 0,
-                     default_model TEXT, dispatch_preamble TEXT,
-                     ci_attempt_budget INTEGER);
-                 CREATE TABLE projects (
-                     id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                     slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                     goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                     priority TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                     last_status_actor TEXT NOT NULL DEFAULT 'human',
-                     design_doc TEXT, design_doc_updated_at TEXT, design_doc_draft TEXT,
-                     short_id INTEGER);
-                 CREATE TABLE tasks (
-                     id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                     kind TEXT NOT NULL DEFAULT 'chore', name TEXT NOT NULL,
-                     description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                     ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                     autostart INTEGER NOT NULL DEFAULT 1,
-                     last_status_actor TEXT NOT NULL DEFAULT 'human',
-                     priority TEXT NOT NULL DEFAULT 'medium',
-                     created_via TEXT NOT NULL DEFAULT 'human',
-                     blocked_reason TEXT, blocked_attempt_id TEXT,
-                     repo_remote_url TEXT,
-                     effort_level TEXT, model_override TEXT,
-                     ci_attempt_budget INTEGER, ci_attempts_used INTEGER NOT NULL DEFAULT 0,
-                     short_id INTEGER);
-                 CREATE TABLE IF NOT EXISTS short_id_sequences (
-                     product_id TEXT PRIMARY KEY, next_value INTEGER NOT NULL DEFAULT 1);
-                 INSERT INTO metadata(key, value) VALUES ('schema_version', '9');
-                 INSERT INTO products VALUES (
+        // The positional `INSERT ... VALUES` seeds below depend on the
+        // exact v9 column order, which is baseline-then-appended.
+        LegacySchema::new(9)
+            .products(
+                "auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 0,
+     default_model TEXT, dispatch_preamble TEXT,
+     ci_attempt_budget INTEGER",
+            )
+            .projects(
+                "last_status_actor TEXT NOT NULL DEFAULT 'human',
+     design_doc TEXT, design_doc_updated_at TEXT, design_doc_draft TEXT,
+     short_id INTEGER",
+            )
+            .tasks(
+                "last_status_actor TEXT NOT NULL DEFAULT 'human',
+     priority TEXT NOT NULL DEFAULT 'medium',
+     created_via TEXT NOT NULL DEFAULT 'human',
+     blocked_reason TEXT, blocked_attempt_id TEXT,
+     repo_remote_url TEXT,
+     effort_level TEXT, model_override TEXT,
+     ci_attempt_budget INTEGER, ci_attempts_used INTEGER NOT NULL DEFAULT 0,
+     short_id INTEGER",
+            )
+            .ddl(
+                "CREATE TABLE IF NOT EXISTS short_id_sequences (
+                     product_id TEXT PRIMARY KEY, next_value INTEGER NOT NULL DEFAULT 1);",
+            )
+            .seed(
+                "INSERT INTO products VALUES (
                      'prod-1', 'Boss', 'boss', '', NULL, 'active',
                      '1700000000', '1700000000', 0, NULL, NULL, NULL);
                  INSERT INTO tasks VALUES (
@@ -1692,8 +1685,8 @@ fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
                      'task-blocked', 'prod-1', NULL, 'chore', 'Blocked task', '', 'blocked',
                      4, NULL, NULL, '1700000004', '1700000004', 1,
                      'human', 'medium', 'human', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL);",
-        )
-        .unwrap();
+            )
+            .create(&conn);
     }
 
     let db = WorkDb::open(path.clone()).unwrap();
