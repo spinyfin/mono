@@ -1,9 +1,10 @@
 //! Per-product merge mechanism: how an approved merge is executed.
 //!
 //! Parses the raw `products.merge_mechanism` setting (`NULL` / `"direct"` /
-//! `"trunk_queue"`) into an engine-side enum. Schema/contract only — the
-//! merge-verb routing that branches on this enum lands in a later task of
-//! `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`.
+//! `"trunk_queue"`) into an engine-side enum. The merge-verb routing that
+//! branches on this enum has not landed yet; see
+//! `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+//! §"Per-product merge mechanism".
 
 use anyhow::{Result, bail};
 

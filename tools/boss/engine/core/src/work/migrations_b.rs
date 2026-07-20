@@ -997,9 +997,9 @@ pub(crate) fn migrate_external_tracker_columns(conn: &Connection) -> Result<()> 
 /// --auto --squash`, which also transparently covers GitHub-native merge
 /// queues) or `'trunk_queue'` (submit to Trunk's merge queue via its REST
 /// API). See `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
-/// §"Per-product merge mechanism". No behavior change — this migration only
-/// adds the column; the engine `MergeMechanism` parse and the merge-verb
-/// routing land in later tasks of that design.
+/// §"Per-product merge mechanism". Additive and idempotent; the merge-verb
+/// routing that branches on this value has not landed yet, so nothing in
+/// the merge path reads this column.
 pub(crate) fn migrate_products_merge_mechanism(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "products", "merge_mechanism")? {
         conn.execute("ALTER TABLE products ADD COLUMN merge_mechanism TEXT", [])?;

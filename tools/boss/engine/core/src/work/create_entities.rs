@@ -81,6 +81,10 @@ impl WorkDb {
         let design_repo = canonicalize_repo_remote_url(input.design_repo);
         let docs_repo = canonicalize_repo_remote_url(input.docs_repo);
         let worker_branch_prefix = canonicalize_worker_branch_prefix(input.worker_branch_prefix);
+        // Reject an invalid merge_mechanism at the single write path rather
+        // than letting it persist silently and only explode later at every
+        // MergeMechanism::parse call site.
+        crate::merge_mechanism::MergeMechanism::parse(input.merge_mechanism.as_deref())?;
 
         tx.execute(
             "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo, docs_repo, worker_branch_prefix, merge_mechanism)

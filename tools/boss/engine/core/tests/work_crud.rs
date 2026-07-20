@@ -2444,3 +2444,119 @@ async fn unlink_external_ref_unknown_id_returns_error() -> Result<()> {
 
     Ok(())
 }
+
+/// A non-NULL `merge_mechanism` set at product-create time survives the
+/// `create_product` -> `query_product` round trip on both `get`
+/// (`ListProducts`) and the freshly-created row returned by `CreateProduct`
+/// itself — guards the `?10` INSERT binding, the added SELECT column, and
+/// `row.get::<_, Option<String>>(17)` in `map_product` against a wrong
+/// column index or a mis-ordered SELECT list.
+#[tokio::test]
+async fn product_merge_mechanism_round_trips_through_create_and_list() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let with_mechanism = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Flunge".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:flunge.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+            merge_mechanism: Some("trunk_queue".to_owned()),
+        },
+    )
+    .await?;
+    assert_eq!(with_mechanism.merge_mechanism.as_deref(), Some("trunk_queue"));
+
+    let without_mechanism = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Boss Core".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:boss-core.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+            merge_mechanism: None,
+        },
+    )
+    .await?;
+    assert_eq!(without_mechanism.merge_mechanism, None);
+
+    let products = list_products(&mut client).await?;
+    let listed_with = products
+        .iter()
+        .find(|p| p.id == with_mechanism.id)
+        .ok_or_else(|| anyhow!("created product with merge_mechanism missing from list_products"))?;
+    assert_eq!(listed_with.merge_mechanism.as_deref(), Some("trunk_queue"));
+
+    let listed_without = products
+        .iter()
+        .find(|p| p.id == without_mechanism.id)
+        .ok_or_else(|| anyhow!("created product without merge_mechanism missing from list_products"))?;
+    assert_eq!(listed_without.merge_mechanism, None);
+
+    Ok(())
+}
+
+/// `SetProductMergeMechanism` writes and clears the column, and rejects an
+/// unknown value rather than persisting it.
+#[tokio::test]
+async fn set_product_merge_mechanism_writes_clears_and_rejects_unknown() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Mechanism Target".to_owned(),
+            description: None,
+            repo_remote_url: None,
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+            merge_mechanism: None,
+        },
+    )
+    .await?;
+
+    let updated = match client
+        .send_request(&FrontendRequest::SetProductMergeMechanism {
+            product_id: product.id.clone(),
+            mechanism: Some("trunk_queue".to_owned()),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item)?,
+        other => return Err(unexpected_event("set-merge-mechanism", other)),
+    };
+    assert_eq!(updated.merge_mechanism.as_deref(), Some("trunk_queue"));
+
+    let cleared = match client
+        .send_request(&FrontendRequest::SetProductMergeMechanism {
+            product_id: product.id.clone(),
+            mechanism: None,
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item)?,
+        other => return Err(unexpected_event("set-merge-mechanism", other)),
+    };
+    assert_eq!(cleared.merge_mechanism, None);
+
+    match client
+        .send_request(&FrontendRequest::SetProductMergeMechanism {
+            product_id: product.id.clone(),
+            mechanism: Some("bogus".to_owned()),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { .. } => {}
+        other => return Err(unexpected_event("expected WorkError for unknown mechanism", other)),
+    }
+
+    Ok(())
+}
