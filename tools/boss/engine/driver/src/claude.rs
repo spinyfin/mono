@@ -48,13 +48,18 @@ fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
 /// for every edit. Trivial work still runs at `--effort low`; only the model floor
 /// is raised to Sonnet. Do not lower it back to Haiku.
 ///
+/// The table tops out at Opus for every level, including `Max` — Fable is
+/// the most expensive model in the menu, so it is never a *default* for any
+/// row regardless of kind or effort. Fable is still a valid model slug, but
+/// only via an explicit, hand-set `--model fable` / `model_override` on the
+/// row (`resolve_spawn_config` precedence step 1), never a table default.
+///
 /// Tier ordering, highest to lowest:
-/// Fable (`fable`) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
+/// Fable (`fable`, opt-in only) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
 fn claude_default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
         EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
-        EffortLevel::Large => "opus",
-        EffortLevel::Max => "fable",
+        EffortLevel::Large | EffortLevel::Max => "opus",
     }
 }
 

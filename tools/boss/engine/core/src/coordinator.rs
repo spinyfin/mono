@@ -5919,7 +5919,6 @@ impl ExecutionCoordinator {
                         "claude_effort": spawn.claude_effort,
                         "model": spawn.model,
                         "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
-                        "model_floor": spawn.model_floor,
                     });
                 }
                 self.dispatch_events
@@ -8937,7 +8936,6 @@ mod tests {
                 model: "sonnet".to_owned(),
                 driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
-                model_floor: None,
             }),
             ..FakeExecutionRunner::default()
         });

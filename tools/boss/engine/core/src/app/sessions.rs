@@ -145,11 +145,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
                 worker_slots: server_state.worker_pool_size,
                 automation_slots: server_state.automation_pool_size,
                 review_slots: server_state.review_pool_size,
-                coordinator_model: (crate::driver::ClaudeDriver
-                    .descriptor()
-                    .model_menu
-                    .default_model_for_level)(boss_protocol::EffortLevel::Max)
-                .to_owned(),
+                coordinator_model: server_state.coordinator_model.clone(),
             },
         );
     }
@@ -575,18 +571,43 @@ mod tests {
     use super::*;
     use crate::test_support::{create_active_chore, create_product};
 
-    /// Pins the `EnginePoolConfig.coordinator_model` push (computed in
-    /// `handle_register_app_session` above) to the Max-effort Claude model.
-    /// Guards against the coordinator wiring drifting from the effort tier
-    /// table without a test catching it (e.g. if `default_model_for_level`
-    /// changed but this call site wasn't updated).
+    /// `ServerState::coordinator_model` — sourced from
+    /// `WorkConfig::coordinator_model` (`BOSS_COORDINATOR_MODEL`, default
+    /// `"opus"`) — is independent of the worker effort→model table: a
+    /// change to the worker dispatch table must never silently change what
+    /// model the coordinator launches on.
     #[test]
-    fn coordinator_model_tracks_max_effort_model() {
-        let coordinator_model = (crate::driver::ClaudeDriver
-            .descriptor()
-            .model_menu
-            .default_model_for_level)(boss_protocol::EffortLevel::Max);
-        assert_eq!(coordinator_model, "fable");
+    fn coordinator_model_defaults_to_opus_independent_of_effort_table() {
+        let (server_state, _temp) = test_server_state();
+        assert_eq!(server_state.coordinator_model, "opus");
+    }
+
+    /// Pins the `EnginePoolConfig.coordinator_model` push itself: driving
+    /// `handle_register_app_session` end-to-end and asserting on the
+    /// `FrontendEvent::EnginePoolConfig` it enqueues, rather than only the
+    /// `ServerState` default the field is read from. Guards against a
+    /// regression that reverts the push's source back to the effort table
+    /// while leaving `ServerState::coordinator_model` (and the test above)
+    /// untouched.
+    #[tokio::test]
+    async fn coordinator_model_push_reflects_server_state() {
+        let (server_state, _temp) = test_server_state();
+        let sink = make_session_sink();
+        let ctx = dispatch_ctx(&server_state, &sink);
+
+        handle_register_app_session(ctx, FrontendRequest::RegisterAppSession).await;
+
+        // First envelope is the AppSessionRegistered response; the pool
+        // config is pushed immediately after.
+        sink.next().await.expect("AppSessionRegistered response");
+        let pushed = sink.next().await.expect("EnginePoolConfig push");
+        match pushed.payload {
+            FrontendEvent::EnginePoolConfig { coordinator_model, .. } => {
+                assert_eq!(coordinator_model, server_state.coordinator_model);
+                assert_eq!(coordinator_model, "opus");
+            }
+            other => panic!("expected EnginePoolConfig, got {other:?}"),
+        }
     }
 
     fn dispatch_ctx(server_state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {

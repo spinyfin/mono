@@ -12,7 +12,7 @@ use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::coordinator::{pool_model_override_for_worker_id, slot_id_from_worker_id};
 use crate::driver::AgentDriver;
-use crate::effort::{SpawnConfig, resolve_spawn_config_with_family_floor};
+use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{
@@ -564,7 +564,6 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .unwrap_or("none"),
             claude_effort = spawn_config.claude_effort.unwrap_or("default"),
             model = %spawn_config.model,
-            model_floor = spawn_config.model_floor.unwrap_or("none"),
             ack_timed_out = started.ack_timed_out,
             "pane spawned for execution",
         );
@@ -994,8 +993,6 @@ pub(crate) async fn compose_worker_spawn(
         product_dispatch_preamble,
         row_driver,
         product_default_driver,
-        row_design_family,
-        row_description,
     ) = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => {
             let product = work_db.get_product(&task.product_id).ok().flatten();
@@ -1003,11 +1000,6 @@ pub(crate) async fn compose_worker_spawn(
             let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
             let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
             let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
-            // Design-family Fable-tier dispatch floor (policy addendum,
-            // 2026-07-13): fails open to `false` on a lookup error so a
-            // transient DB hiccup degrades to the ordinary effort-level
-            // table rather than blocking dispatch.
-            let design_family = work_db.is_design_family(task).unwrap_or(false);
             (
                 editorial_rules,
                 task.effort_level,
@@ -1016,11 +1008,9 @@ pub(crate) async fn compose_worker_spawn(
                 dispatch_preamble,
                 task.driver.clone(),
                 product_default_driver,
-                design_family,
-                task.description.clone(),
             )
         }
-        _ => (None, None, None, None, None, None, None, false, String::new()),
+        _ => (None, None, None, None, None, None, None),
     };
     // Load the PR template for editorial-rules prompt injection.
     let pr_template_product_id = match work_item {
@@ -1243,17 +1233,13 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
-    let spawn_config = resolve_spawn_config_with_family_floor(
-        crate::effort::FamilyFloorSpawnParams::builder()
-            .maybe_effort_level(row_effort)
-            .maybe_model_override(row_model_override.as_deref())
-            .maybe_pool_model_override(pool_model_override_for_worker_id(worker_id))
-            .maybe_product_default_model(product_default_model.as_deref())
-            .maybe_task_driver(row_driver.as_deref())
-            .maybe_product_default_driver(product_default_driver.as_deref())
-            .design_family(row_design_family)
-            .description(&row_description)
-            .build(),
+    let spawn_config = resolve_spawn_config(
+        row_effort,
+        row_model_override.as_deref(),
+        pool_model_override_for_worker_id(worker_id),
+        product_default_model.as_deref(),
+        row_driver.as_deref(),
+        product_default_driver.as_deref(),
     );
 
     // Capability gate: fail closed before the pane spawns when the resolved

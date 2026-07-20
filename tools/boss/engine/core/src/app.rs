@@ -18,7 +18,6 @@ use crate::completion::{
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool};
-use crate::driver::AgentDriver;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::WorkDbOrgStateSink;
 use crate::external_tracker::github_oauth::{
@@ -579,6 +578,13 @@ struct ServerState {
     worker_pool_size: u8,
     automation_pool_size: u8,
     review_pool_size: u8,
+    /// Model slug the Boss coordinator session launches with. Pushed
+    /// verbatim in the same `EnginePoolConfig` payload as the pool sizes
+    /// above. Sourced from [`crate::config::WorkConfig::coordinator_model`]
+    /// (`BOSS_COORDINATOR_MODEL`, default `"opus"`) — independent of the
+    /// worker effort→model table so a coordinator-model change never
+    /// silently changes what workers dispatch on, or vice versa.
+    coordinator_model: String,
     /// Shared verdict from the `syspolicyd` CPU monitor. The sampler loop
     /// (spawned in `serve`) writes it; [`build_engine_health_report`]
     /// reads it to raise a banner when the daemon wedges and stalls all
@@ -964,6 +970,7 @@ impl ServerState {
         let worker_pool_size = cfg.work.worker_pool_size as u8;
         let automation_pool_size = cfg.work.automation_pool_size as u8;
         let review_pool_size = cfg.work.review_pool_size as u8;
+        let coordinator_model = cfg.work.coordinator_model.clone();
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
         let publisher_impl = Arc::new(BrokerExecutionPublisher {
@@ -1226,6 +1233,7 @@ impl ServerState {
                 .worker_pool_size(worker_pool_size)
                 .automation_pool_size(automation_pool_size)
                 .review_pool_size(review_pool_size)
+                .coordinator_model(coordinator_model)
                 .syspolicyd_health(Arc::new(crate::syspolicyd_monitor::SyspolicydHealth::new()))
                 .next_session_id(AtomicU64::new(1))
                 .work_revision(work_revision)

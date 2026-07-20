@@ -187,8 +187,7 @@ pub struct CreateRevisionInput {
     /// typically narrow), EXCEPT when the chain root is design-family
     /// (kind `design`/`investigation`, transitively through a revision
     /// chain), which defaults to `large` — see
-    /// `default_revision_effort_level` and the design-family Fable-tier
-    /// dispatch floor (policy addendum, 2026-07-13).
+    /// `default_revision_effort_level`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<EffortLevel>,
 

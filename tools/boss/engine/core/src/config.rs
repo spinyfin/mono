@@ -67,6 +67,15 @@ pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
 /// machinery) are gated by this flag.
 pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = true;
 
+/// Default value for [`WorkConfig::coordinator_model`]. The Boss coordinator
+/// session (the macOS app's single always-on Claude Code pane) launches on
+/// this model unless overridden. Top-tier models are opt-in only: the
+/// coordinator session is always-on and its token cost dominates, so it
+/// defaults to `opus` independent of the effort table. Set
+/// `BOSS_COORDINATOR_MODEL=fable` to opt an installation back into the
+/// higher tier — no code change required.
+pub const DEFAULT_COORDINATOR_MODEL: &str = "opus";
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -151,6 +160,14 @@ pub struct WorkConfig {
     /// dispatch event on trip — it just never calls `set_dispatch_paused`.
     #[builder(default = DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)]
     pub enable_spawn_capability_breaker: bool,
+    /// Model slug the Boss coordinator session launches with, pushed to the
+    /// macOS app as `EnginePoolConfig.coordinator_model` on every
+    /// `RegisterAppSession`. Configured via `BOSS_COORDINATOR_MODEL`;
+    /// defaults to [`DEFAULT_COORDINATOR_MODEL`] (`"opus"`). Set to `fable`
+    /// (or any other model slug) to opt a given installation back into a
+    /// higher tier without a code change.
+    #[builder(default = DEFAULT_COORDINATOR_MODEL.to_owned())]
+    pub coordinator_model: String,
 }
 
 impl WorkConfig {
@@ -190,6 +207,10 @@ impl WorkConfig {
             .min(MAX_MERGE_ORDER_STAGGER_SECS);
         let enable_spawn_capability_breaker = lookup_bool(&lookup, "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER")?
             .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
+        let coordinator_model = lookup_string(&lookup, "BOSS_COORDINATOR_MODEL")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_COORDINATOR_MODEL.to_owned());
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -202,6 +223,7 @@ impl WorkConfig {
             .enable_revision_triggered_reviews(enable_revision_triggered_reviews)
             .merge_order_stagger_secs(merge_order_stagger_secs)
             .enable_spawn_capability_breaker(enable_spawn_capability_breaker)
+            .coordinator_model(coordinator_model)
             .build())
     }
 }
@@ -228,6 +250,10 @@ fn lookup_u64(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<O
                 .map(Some)
         }
     }
+}
+
+fn lookup_string(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Option<String> {
+    lookup(name).map(|val| val.to_string_lossy().into_owned())
 }
 
 fn lookup_bool(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<bool>> {
@@ -383,7 +409,7 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
+        DEFAULT_COORDINATOR_MODEL, DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
         DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MERGE_ORDER_STAGGER_SECS,
         DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE,
         MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
@@ -657,5 +683,53 @@ mod tests {
         })
         .expect_err("unparseable bool must error");
         assert!(err.to_string().contains("BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS"));
+    }
+
+    /// The coordinator model must default to `opus` (top-tier models are
+    /// opt-in only) and stay overridable via `BOSS_COORDINATOR_MODEL` so an
+    /// installation can opt back into Fable without a code change.
+    #[test]
+    fn coordinator_model_defaults_to_opus_and_reads_from_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.coordinator_model, DEFAULT_COORDINATOR_MODEL);
+        assert_eq!(config.coordinator_model, "opus");
+
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_COORDINATOR_MODEL" => Some(OsString::from("fable")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.coordinator_model, "fable");
+    }
+
+    /// A blank or whitespace-only `BOSS_COORDINATOR_MODEL` must fall back to
+    /// the default rather than producing an empty/blank model slug that
+    /// would fail at pane spawn with no useful diagnostic.
+    #[test]
+    fn coordinator_model_ignores_blank_or_whitespace_env_value() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        for blank in ["", "   "] {
+            let blank_owned = blank.to_owned();
+            let config = WorkConfig::load_from(|k| match k {
+                "BOSS_COORDINATOR_MODEL" => Some(OsString::from(&blank_owned)),
+                "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+                _ => None,
+            })
+            .expect("config loads");
+            assert_eq!(
+                config.coordinator_model, DEFAULT_COORDINATOR_MODEL,
+                "blank env value {blank:?} must fall back to the default"
+            );
+        }
     }
 }
