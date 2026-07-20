@@ -1,0 +1,13 @@
+{
+  "id": "entry_123",
+  "state": "testing",
+  "readiness": "ready",
+  "stateChangedAt": "2026-07-19T10:00:00Z",
+  "priorityValue": 0,
+  "priorityName": "default",
+  "prNumber": 978,
+  "prTitle": "Add retry to the widget client",
+  "prSha": "abc123def456",
+  "prBaseBranch": "main",
+  "prAuthor": "brianduff"
+}

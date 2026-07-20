@@ -1,0 +1,11 @@
+{
+  "state": "PAUSED",
+  "branch": "main",
+  "enqueuedPullRequests": [
+    {
+      "id": "entry_124",
+      "state": "brand_new_state",
+      "prNumber": 979
+    }
+  ]
+}

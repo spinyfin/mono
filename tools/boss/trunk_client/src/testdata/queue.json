@@ -1,0 +1,17 @@
+{
+  "state": "RUNNING",
+  "branch": "main",
+  "concurrency": 2,
+  "testingTimeoutMinutes": 60,
+  "mode": "parallel",
+  "batch": false,
+  "enqueuedPullRequests": [
+    {
+      "id": "entry_123",
+      "state": "testing",
+      "prNumber": 978,
+      "prTitle": "Add retry to the widget client",
+      "prAuthor": "brianduff"
+    }
+  ]
+}

@@ -615,6 +615,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-trunk-client"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "fastrand 2.4.1",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "bossctl"
 version = "0.1.0"
 dependencies = [
