@@ -35,10 +35,137 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use boss_protocol::Automation;
+use boss_protocol::{Automation, Task};
 
 use crate::automation_scheduler::{TriageDispatch, TriageDispatcher};
 use crate::work::WorkDb;
+
+/// How far back the "recently merged" half of the layer-0 context block
+/// looks. Investigation doc open question #2 says thresholds should start
+/// strict and be tuned from telemetry rather than guessed; 3 days comfortably
+/// covers the case-study's ~8-hour file→merge latency with headroom for
+/// slower human review.
+pub const RECENTLY_MERGED_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
+
+/// One automation-sourced task still open (any non-terminal status) on the
+/// firing automation's product, surfaced regardless of *which* automation
+/// produced it. This is the cross-automation visibility the layer-0 context
+/// injection exists to add (automation-duplicate-work investigation,
+/// 2026-07-14, §4 Layer 0): the 2026-07-13 incident happened because triage
+/// runs could only see their own automation's history, never a sibling
+/// automation's in-flight work.
+#[derive(Debug, Clone)]
+pub struct InFlightAutomationTask {
+    /// `T<short_id>` when the task carries one, else its full id.
+    pub short_ref: String,
+    pub name: String,
+    /// Display label, e.g. "in review" (see `TaskStatus::display_label`).
+    pub status_label: String,
+    pub pr_url: Option<String>,
+}
+
+/// One automation-sourced task that reached `done` with a merged PR
+/// recently. Lets a firing run see targets a sibling automation already
+/// swept even after the task row closed (the "stale brief" pattern, §1.4).
+#[derive(Debug, Clone)]
+pub struct RecentlyMergedAutomationTask {
+    pub short_ref: String,
+    pub name: String,
+    pub pr_url: String,
+}
+
+/// Context gathered at fire/spawn time and injected into the triage
+/// preamble so the agent itself can decline an overlapping candidate. See
+/// [`render_triage_preamble`] and `tools/boss/docs/investigations/automation-duplicate-work-2026-07-14.md`
+/// §4 Layer 0. Empty by default (`TriageContext::default()`), which renders
+/// no context block — most runs have nothing in flight to report.
+#[derive(Debug, Clone, Default)]
+pub struct TriageContext {
+    pub in_flight: Vec<InFlightAutomationTask>,
+    pub recently_merged: Vec<RecentlyMergedAutomationTask>,
+}
+
+/// `T<short_id>` when available, else the full task id — the reference form
+/// the skip-duplicate convention (`automation: skip — duplicate of <ref>`)
+/// expects the agent to cite back.
+fn task_short_ref(task: &Task) -> String {
+    match task.short_id {
+        Some(n) => format!("T{n}"),
+        None => task.id.clone(),
+    }
+}
+
+impl TriageContext {
+    /// Build the context from the raw rows [`WorkDb::list_open_automation_tasks_for_product`]
+    /// and [`WorkDb::list_recently_completed_automation_tasks_for_product`] return.
+    /// Tasks with no `pr_url` in the recently-merged list are skipped — the
+    /// query already filters on a non-empty `pr_url`, so this is defensive.
+    pub fn from_rows(open_tasks: Vec<Task>, merged_tasks: Vec<Task>) -> Self {
+        let in_flight = open_tasks
+            .into_iter()
+            .map(|t| InFlightAutomationTask {
+                short_ref: task_short_ref(&t),
+                status_label: t.status.display_label().to_owned(),
+                pr_url: t.pr_url.clone(),
+                name: t.name,
+            })
+            .collect();
+        let recently_merged = merged_tasks
+            .into_iter()
+            .filter_map(|t| {
+                let pr_url = t.pr_url.clone()?;
+                Some(RecentlyMergedAutomationTask {
+                    short_ref: task_short_ref(&t),
+                    name: t.name,
+                    pr_url,
+                })
+            })
+            .collect();
+        Self {
+            in_flight,
+            recently_merged,
+        }
+    }
+}
+
+/// Render the "Recently filed / in-flight automation work" block, or an
+/// empty string when `context` has nothing to report (the common case —
+/// most triage runs have no overlapping sibling activity).
+fn render_context_block(context: &TriageContext) -> String {
+    if context.in_flight.is_empty() && context.recently_merged.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from(
+        "## Recently filed / in-flight automation work\n\n\
+This lists work filed or merged by **any** automation on this product, not just this \
+one — check it before you decide. If your candidate overlaps one of these (same \
+file(s), same symbol, or clearly the same fix), do NOT create a new task. Instead end \
+your final message with:\n\n\
+```\nautomation: skip — duplicate of <ref>\n```\n\n\
+citing the referenced id, e.g. `automation: skip — duplicate of T2572`.\n\n",
+    );
+    if !context.in_flight.is_empty() {
+        block.push_str("Open (in flight):\n\n");
+        for t in &context.in_flight {
+            match &t.pr_url {
+                Some(pr) => block.push_str(&format!(
+                    "- {} ({}, PR {}): {}\n",
+                    t.short_ref, t.status_label, pr, t.name
+                )),
+                None => block.push_str(&format!("- {} ({}): {}\n", t.short_ref, t.status_label, t.name)),
+            }
+        }
+        block.push('\n');
+    }
+    if !context.recently_merged.is_empty() {
+        block.push_str("Recently merged:\n\n");
+        for t in &context.recently_merged {
+            block.push_str(&format!("- {} (PR {}): {}\n", t.short_ref, t.pr_url, t.name));
+        }
+        block.push('\n');
+    }
+    block
+}
 
 /// One decision the triage agent can reach, parsed from its final message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +185,10 @@ pub enum TriageDecision {
 
 /// Compose the per-automation triage preamble (design §"Phase 1 — Triage").
 ///
-/// `product_name` is the display name of the automation's product. The
+/// `product_name` is the display name of the automation's product.
+/// `context` is the layer-0 "recently filed / in-flight automation work"
+/// data gathered at spawn time (see [`TriageContext`]); pass
+/// `&TriageContext::default()` when there is nothing to report. The
 /// `--automation` selector embedded in the create command is the **canonical**
 /// automation id so the agent's `boss task create` resolves unambiguously
 /// without needing a `--product` flag.
@@ -79,6 +209,7 @@ pub fn render_triage_preamble(
     automation: &Automation,
     product_name: &str,
     siblings: &[crate::work::AutomationSiblingTask],
+    context: &TriageContext,
 ) -> String {
     let a_id = automation
         .short_id
@@ -88,6 +219,7 @@ pub fn render_triage_preamble(
         "boss task create --automation {} --name \"<concise title>\" --description \"<what to do>\"",
         automation.id
     );
+    let context_block = render_context_block(context);
     format!(
         "You are a maintenance **triage** agent for automation `{a_id}` on product \
 \"{product_name}\". Your session cwd is already a fresh checkout of this product's \
@@ -99,6 +231,7 @@ targeted, read-only checks (keep it lightweight — see below) to make that call
 You are explicitly allowed to conclude that nothing appropriate \
 exists — that is a normal, expected outcome on most runs.\n\n\
 {already_tracked}\
+{context_block}\
 ## You MUST end this run with exactly one decision marker\n\n\
 Your final message must end with **exactly one** of these two lines, and nothing \
 after it:\n\n\
@@ -155,6 +288,7 @@ is NOT a skip.\n",
         product_name = product_name,
         instruction = automation.standing_instruction.trim(),
         already_tracked = render_already_tracked_section(siblings),
+        context_block = context_block,
         create_cmd = create_cmd,
     )
 }
@@ -700,7 +834,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[]);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
         let lower = preamble.to_lowercase();
         // Decide-then-stop.
         assert!(
@@ -748,7 +882,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[]);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
         // Must explicitly name the Agent tool and explain the hang risk.
         assert!(
             preamble.contains("Agent"),
@@ -787,7 +921,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[]);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
         assert!(preamble.contains("triage"));
         assert!(preamble.contains("A3"));
         assert!(preamble.contains("My Product"));
@@ -901,7 +1035,7 @@ mod tests {
                 Some("https://github.com/spinyfin/mono/pull/9001"),
             ),
         ];
-        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings);
+        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings, &TriageContext::default());
 
         assert!(preamble.contains("Already tracked"), "section heading missing");
         assert!(preamble.contains("T101"), "must cite each sibling by friendly id");
@@ -931,7 +1065,7 @@ mod tests {
     #[test]
     fn preamble_still_permits_distinct_findings() {
         let siblings = [sibling(101, "Split engine/core/src/app.rs", "active", None)];
-        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings);
+        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings, &TriageContext::default());
         assert!(
             preamble.contains("Genuinely different target"),
             "must tell the agent that a different file/crate is still fileable",
@@ -946,7 +1080,7 @@ mod tests {
     /// read as licence to file, which is the opposite of the intent.
     #[test]
     fn preamble_omits_the_section_when_nothing_is_tracked() {
-        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &[]);
+        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &[], &TriageContext::default());
         assert!(
             !preamble.contains("Already tracked"),
             "an empty sibling list must render no section",
