@@ -236,6 +236,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
         return crate::pr_review::render_reviewer_claude_md(
             &input.lease_id,
             &input.workspace_path.display().to_string(),
+            crate::prompt_fragments::boundaries_and_coordinator_fragment(),
         );
     }
     if input.worker_kind == WorkerKind::Triage {

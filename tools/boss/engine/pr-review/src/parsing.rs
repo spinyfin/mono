@@ -4,7 +4,7 @@
 
 use boss_engine_utils::json_extract::extract_balanced_object;
 
-use super::types::*;
+use crate::types::*;
 
 /// Classify a list of changed file paths as docs-only or code.
 ///
@@ -197,7 +197,7 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::pr_review::*;
+    use crate::*;
 
     #[test]
     fn classify_empty_files_returns_code() {

@@ -285,7 +285,7 @@ impl ReviewResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::pr_review::*;
+    use crate::*;
 
     #[test]
     fn review_result_roundtrips_through_json() {

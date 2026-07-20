@@ -2,7 +2,7 @@
 //! initial task prompt, the scope-specific rubric, and the revision
 //! instructions rendered from a [`ReviewResult`].
 
-use super::types::*;
+use crate::types::*;
 
 /// Render qualifying `ReviewResult` findings as human-readable revision
 /// instructions (design §4 of P992, task 8).
@@ -97,7 +97,13 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
 ///
 /// The workspace is already checked out to the PR head SHA, so the reviewer
 /// can read files directly without `gh pr diff` for every lookup.
-pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String {
+///
+/// `boundaries_and_coordinator` is the shared `## Boundaries` + `## Coordinator`
+/// block, supplied by the engine rather than owned here: the same text is used
+/// verbatim by other engine-side agent prompts, and duplicating it in this
+/// crate would let the two copies drift. It is interpolated as the final
+/// section, so it should start at the `## Boundaries` heading.
+pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str, boundaries_and_coordinator: &str) -> String {
     format!(
         "# Boss reviewer rules\n\
          \n\
@@ -164,7 +170,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
          {boundaries_and_coordinator}",
         lease = lease_id,
         workspace_path = workspace_path,
-        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+        boundaries_and_coordinator = boundaries_and_coordinator,
     )
 }
 
@@ -193,7 +199,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
 /// section covers that case.
 ///
 /// `output_path` is the absolute, engine-owned artifact path the reviewer must
-/// write its `ReviewResult` JSON to (see [`crate::structured_output`]). It is
+/// write its `ReviewResult` JSON to (see the engine's structured-output artifact path). It is
 /// the primary output channel; the prompt also asks for a fenced-JSON copy in
 /// the final message as a transitional fallback.
 pub fn render_reviewer_initial_prompt(
@@ -315,7 +321,7 @@ pub fn render_reviewer_initial_prompt(
     // narrative. When present, the reviewer must verify a design-doc citation
     // for each flagged claim.
     let supersession_flag_block = ctx
-        .map(|c| crate::supersession_scan::render_supersession_flag_block(&c.supersession_flags))
+        .map(|c| crate::blocks::render_supersession_flag_block(&c.supersession_flags))
         .unwrap_or_default();
 
     // Mechanical assist for the agent-isms "Boss-construct references"
@@ -323,7 +329,7 @@ pub fn render_reviewer_initial_prompt(
     // diff lines for bare T<n>/P<n> tokens, each forced into an explicit
     // disposition rather than a judgment call the reviewer can reason past.
     let boss_construct_sweep_block = ctx
-        .map(|c| crate::boss_construct_scan::render_boss_construct_sweep_block(&c.boss_construct_refs))
+        .map(|c| crate::blocks::render_boss_construct_sweep_block(&c.boss_construct_refs))
         .unwrap_or_default();
 
     format!(
@@ -752,7 +758,7 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::pr_review::*;
+    use crate::*;
 
     #[test]
     fn reviewer_initial_prompt_contains_rubric_and_pr_url() {

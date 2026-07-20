@@ -363,6 +363,7 @@ dependencies = [
  "boss-github-tracker",
  "boss-log-files",
  "boss-metrics",
+ "boss-pr-review",
  "boss-pr-template",
  "boss-protocol",
  "boss-ssh-transport",
@@ -573,6 +574,16 @@ dependencies = [
  "boss-engine-metrics-registry",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-pr-review"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-engine-utils",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
