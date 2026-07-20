@@ -1,30 +1,40 @@
 # Design: OAuth Device-Flow Auth for Issue Sync
 
-**Status:** Design. No code is written here. Output is this doc plus a
-proposed breakdown into dependent implementation tasks.
-**Parent project:** OAuth device-flow auth for issue sync.
-**Builds on:** investigation T753 —
-[`oauth-device-flow-scopes-vs-issue-sync-2026-05-28.md`](../investigations/oauth-device-flow-scopes-vs-issue-sync-2026-05-28.md)
-(PR spinyfin/mono#897). Adopt its conclusions as constraints.
-**Extends:** [`external-issue-tracker-sync-github-projects.md`](external-issue-tracker-sync-github-projects.md)
-(the issue-sync design this auth work plugs into — Design Question 11,
-"Credentials", is the seam this doc fills in).
+- **Status:** Implemented. Shipped end to end against a registered OAuth App; live org-approval / SSO validation is still outstanding (§9, R5).
+- **Parent project:** OAuth device-flow auth for issue sync.
+- **Shipped:** T-1–T-7, all merged 2026-05-29 — PRs spinyfin/mono#908, #913, #917, #939, #938, #951, #950. The T-0 App registration was done separately as T767.
+- **Builds on:** investigation T753 — [`oauth-device-flow-scopes-vs-issue-sync-2026-05-28.md`](../investigations/oauth-device-flow-scopes-vs-issue-sync-2026-05-28.md) (PR spinyfin/mono#897), whose conclusions are treated as fixed constraints.
+- **Extends:** [`external-issue-tracker-sync-github-projects.md`](external-issue-tracker-sync-github-projects.md) — Design Question 11, "Credentials", is the seam this doc fills in.
+
+This document describes the design **as built**. It was written before
+implementation and revised afterwards against the merged PRs, so it reflects
+what actually shipped rather than what was originally proposed. Points where
+the implementation deliberately diverged from the original plan — or where
+planned behavior did not ship — are called out inline as **As built**.
 
 ---
 
 ## Overview
 
-Boss's GitHub issue-sync reconciler currently authenticates **implicitly**:
-`engine/src/external_tracker/credentials.rs` runs `gh auth status` once and,
-on success, every `gh api` shellout inside `CommandGhRunner`
-(`engine/src/external_tracker/github.rs`) inherits whatever login the user's
-locally-installed `gh` happens to carry. The effective GitHub permissions are
-invisible to Boss and unenforced: they are "whatever scopes the user's
-`gh auth login` happened to grant." `TrackerCredential::ambient()`
-(`external_tracker/mod.rs`) is literally an empty token marker that means
-"use ambient auth."
+Before this project, Boss's GitHub issue-sync reconciler authenticated
+**implicitly**: `credentials.rs` ran `gh auth status` once and, on success,
+every `gh api` shellout inside `CommandGhRunner` inherited whatever login the
+user's locally-installed `gh` happened to carry. The effective GitHub
+permissions were invisible to Boss and unenforced: they were "whatever scopes
+the user's `gh auth login` happened to grant." `TrackerCredential::ambient()`
+is literally an empty token marker that means "use ambient auth."
 
-This project replaces that implicit reliance with an **in-app OAuth device
+> **Code locations.** The implementation landed at the paths this doc cites
+> (`engine/src/external_tracker/…`, `protocol/src/…`). A later engine
+> restructure split these into crates: the device-flow client, state machine,
+> keychain store, and org probe now live in the `boss_github_tracker` crate
+> (`tools/boss/github_tracker/src/{github_oauth.rs, github.rs}`); the engine
+> keeps the orchestration (`engine/core/src/app/{server.rs, github_auth.rs}`)
+> and the reconciler (`engine/core/src/external_tracker/…`), with an
+> `OrgStateSink` port keeping the `boss_engine → boss_github_tracker`
+> dependency edge one-directional.
+
+This project replaced that implicit reliance with an **in-app OAuth device
 authorization flow** that obtains an explicit GitHub **user token** with a
 known scope set, stored securely, owned by the engine, and driven from the
 **existing issue-sync settings** in the product UI (the `ExternalTrackerSection`
@@ -102,9 +112,9 @@ project`), so Boss controls and knows the token's scopes instead of
   deletes the local token; full server-side revocation is a documented
   user-driven step in GitHub settings.
 - **Registering the OAuth App.** Creating the App in the `spinyfin` org,
-  enabling device flow, and obtaining the `client_id` is a human/setup
-  prerequisite (see Provisioning). This design does **not** fabricate a
-  `client_id` or any secret.
+  enabling device flow, and obtaining the `client_id` was a human/setup
+  prerequisite handled outside this design (see §9 — completed as T767). No
+  client secret is shipped.
 - **Refresh-token rotation.** OAuth App user tokens are non-expiring by default
   (see Token lifecycle); there is no refresh token to rotate. Expiring-token
   support is a GitHub App feature we are not using.
@@ -228,11 +238,16 @@ the app; the app only ever receives display-safe fields (`user_code`,
 
 ### 2. Device-flow client (engine)
 
-Lives in a new module `engine/src/external_tracker/github_oauth.rs`. It uses
-the engine's existing `reqwest` HTTP client (already a workspace dependency) —
-**not** `gh` — because the device-flow endpoints are unauthenticated
-`github.com` endpoints, not `api.github.com`, and we want full control over the
-`Accept: application/json` header and the poll timing.
+Shipped in PR #913 as `github_oauth.rs` (now in `boss_github_tracker`). It
+uses `reqwest` directly — **not** `gh` — because the device-flow endpoints are
+unauthenticated `github.com` endpoints, not `api.github.com`, and we want full
+control over the `Accept: application/json` header and the poll timing.
+
+**As built.** `DeviceFlow` takes injectable endpoint URLs so unit tests run
+against `wiremock` (every poll branch, validation, and probe outcome is
+covered without touching github.com). Poll-loop cancellation is a
+`tokio::sync::watch` channel (what `GitHubAuthCancel` flips). The `client_id`
+shipped as an in-tree constant rather than an injected `option_env!` — see §9.
 
 **Step 1 — request device + user code.**
 
@@ -311,13 +326,29 @@ Disconnected
              └─(GitHubAuthCancel)→ Disconnected
    Authorized
         ├─(GitHubAuthDisconnect)→ Disconnected  (delete keychain item)
-        ├─(token rejected 401 during sync)→ Reauthorize  (token revoked/invalid)
         └─(org/SSO probe fails)→ Authorized { org_state: NeedsOrgApproval | NeedsSso }
 ```
 
 `org_state` is a sub-state of `Authorized`: the token is valid for the _user_
 but may not yet reach private `spinyfin` resources. This is what powers the
 distinct UI messaging in §7.
+
+**As built — no `Reauthorize` state.** The original design had a
+`Reauthorize` state entered when sync hit a 401 (token revoked). That state
+was never added to the protocol: the shipped `GitHubAuthStateDto` has exactly
+the seven states above, and a sync-time 401 does **not** transition the auth
+state machine. Instead the reconciler maps 401 to a dedicated
+`TrackerError::TokenRevoked` and raises a distinct
+`external_tracker_token_revoked` attention item prompting the user to
+reconnect (PR #938). The keychain item is left in place and Settings continues
+to show `Authorized` until the user disconnects or re-runs the flow — a known
+gap flagged for follow-up (see §8).
+
+**As built — state survives engine restart.** T-4 (PR #939) added
+`restore_from_store()`: at engine boot the controller rehydrates
+`Authorized { org_state: Unknown }` from the keychain, so connected status
+survives restarts without re-auth. (The original design only said the
+_in-progress_ flow is not persisted — that part is unchanged; see Risk R4.)
 
 ### 4. Engine ↔ App RPC additions
 
@@ -337,8 +368,10 @@ GitHubAuthDisconnect {}            // delete stored token, return to Disconnecte
 GitHubAuthStatus     {}            // request current state (engine replies with an event)
 ```
 
-New **event** (engine → app), pushed on the existing frontend socket the same
-way `WorkItemUpdated` is:
+New **event** (engine → app). As built (PR #939) it is pushed on a dedicated
+global topic, `TOPIC_GITHUB_AUTH` (`"github.auth"`, `protocol/src/wire.rs`),
+which the app subscribes to — a small contract addition over the original
+"same as `WorkItemUpdated`" sketch:
 
 ```rust
 // protocol/src/wire.rs — FrontendEvent variant
@@ -370,7 +403,15 @@ sees the token."
 takes seconds-to-minutes in the browser). Modeling it as request→reply would
 force the UI to poll. Instead the UI fires `GitHubAuthStart` once and then
 re-renders on each `GitHubAuthState` event the engine pushes as the poll loop
-advances — identical in spirit to how work-item updates stream today.
+advances — identical in spirit to how work-item updates stream today. (The
+RPC handlers also reply with the current state, so callers that _do_ want
+request→reply semantics — the CLI, the UI's status-on-connect — get it.)
+
+**As built — `GitHubAuthStatus` doubles as "Re-check."** When a token is
+present, the status handler re-runs the org/SSO probe (§7) before replying.
+This is how the org-approval / SSO banner clears without a full re-auth: the
+UI's "Re-check" button, the UI's status request on connect, and
+`boss github auth status` all route through it.
 
 > **Note on the engine→app `EngineRequest` channel.** The engine-app-rpc design
 > adds a separate `FrontendEvent::EngineRequest` / `FrontendRequest::EngineResponse`
@@ -404,8 +445,14 @@ account: "oauth-user-token@github.com"
 value:   JSON { token, granted_scopes, login, obtained_at }
 ```
 
-A new `KeychainTokenStore` in `external_tracker/github_oauth.rs` wraps
-`keyring::Entry` with `get` / `set` / `delete`. This keeps the entire flow
+`KeychainTokenStore` (shipped in PR #917) wraps `keyring::Entry` with
+`get` / `set` / `delete`, storing the `TokenRecord` (which gained serde
+derives for the JSON round-trip) at exactly the service/account above. The
+backend is abstracted behind a `KeystoreBackend` trait so tests inject a fake
+store and never touch the real keychain in CI. The controller persists the
+token to the keychain **before** broadcasting `Authorized` (PR #939), so a
+reconcile tick firing immediately after auth already resolves it. This keeps
+the entire flow
 self-contained in the engine, with **no dependency on the app being connected**
 to read the token at sync time, and matches the project's "engine owns the
 token" directive and the `TrackerCredentialResolver` extension point that
@@ -430,6 +477,9 @@ impl TrackerCredentialResolver for KeychainOAuthResolver {
 
 `TrackerCredential.token` already exists and already means "non-empty = explicit
 token, empty = ambient" — so the type does not change, only the resolver.
+As built, keychain read errors are logged as warnings and treated as "no
+stored token" — sync degrades to ambient `gh` rather than failing hard, and
+non-GitHub tracker kinds delegate straight to the fallback resolver.
 
 **Token lifecycle.**
 
@@ -443,8 +493,9 @@ token, empty = ambient" — so the type does not change, only the resolver.
   call `DELETE /applications/{client_id}/token` to revoke server-side; the
   disconnect UI therefore also links to GitHub → Settings → Applications →
   Authorized OAuth Apps so a user who wants full server-side revocation can do
-  it. (A token detected as already-revoked during sync — 401 — transitions to
-  `Reauthorize` and the keychain item is cleared.)
+  it. (As built, a token detected as already-revoked during sync — 401 —
+  raises an `external_tracker_token_revoked` attention item but does **not**
+  clear the keychain item or change the auth state; see §3 and §8.)
 - **Clearing on disconnect** is unconditional and local even if the network is
   down.
 
@@ -480,16 +531,20 @@ The reconciler (`external_tracker/reconcile.rs`) already obtains a
    `TrackerCredential.token` is the OAuth token; otherwise it is the ambient
    empty marker.
 
-2. **`GhRunner` honors the token.** `CommandGhRunner`
-   (`external_tracker/github.rs`) currently constructs each `gh` call as
-   `Command::new("gh")` with no explicit env. Change it to carry the credential
-   and, when `token` is non-empty, set `GH_TOKEN=<token>` on each invocation
-   (`gh` honors `GH_TOKEN`). This is the minimal-blast-radius integration T753
-   recommended: the GraphQL and REST call sites are otherwise unchanged, and the
-   scope analysis is identical whether calls go through `gh` or raw HTTP.
-   Concretely, `CommandGhRunner` gains a `token: Option<String>` field set from
-   `TrackerContext.credential`, and each of `graphql` / `rest_get` /
-   `rest_patch` / `rest_post` adds `.env("GH_TOKEN", token)` when present.
+2. **`GhRunner` honors the token.** When `token` is non-empty, set
+   `GH_TOKEN=<token>` on each `gh` invocation (`gh` honors `GH_TOKEN`). This is
+   the minimal-blast-radius integration T753 recommended: the GraphQL and REST
+   call sites are otherwise unchanged, and the scope analysis is identical
+   whether calls go through `gh` or raw HTTP. As built (PR #938) the token is
+   threaded as a **parameter** — all four `GhRunner` trait methods (`graphql` /
+   `rest_get` / `rest_patch` / `rest_post`) take `token: Option<&str>`, and
+   `CommandGhRunner` adds `.env("GH_TOKEN", t)` when present — rather than as a
+   field on `CommandGhRunner` as originally sketched. Resolution is
+   per-product: `run_one_pass` / `spawn_loop` take a `credential_resolver`
+   parameter and resolve the credential before each product's `TrackerContext`
+   is built; `app.rs` wires `KeychainOAuthResolver(KeychainTokenStore::new())`.
+   Tests assert `GH_TOKEN` is set when a token is present and absent when
+   ambient.
 
    > A future hardening (not v1) could drop `gh` for sync entirely and use
    > `reqwest` with an `Authorization: Bearer` header, removing the `gh` binary
@@ -507,8 +562,14 @@ The reconciler (`external_tracker/reconcile.rs`) already obtains a
 - **After connecting:** the OAuth token takes precedence on the very next
   reconcile tick. Disconnecting reverts to the ambient `gh` fallback.
 - The reconciler's existing failure classification (transient / permission /
-  not-found) is reused; a new **401 (token invalid/revoked)** maps to an
-  auth-attention item and flips the auth state to `Reauthorize` (§8).
+  not-found) is reused, extended with a distinct 401 class: as built,
+  `map_graphql_error` maps HTTP **401 → `TrackerError::TokenRevoked`** (revoked
+  or expired OAuth token → `external_tracker_token_revoked` attention item)
+  and HTTP **403 → `TrackerError::Auth`** (org-approval / SSO likely causes,
+  named in the attention-item body). A successful fetch resolves all three
+  stale auth attention kinds (`auth_failed`, `token_revoked`,
+  `transient_errors`). The originally-planned 401 → `Reauthorize` auth-state
+  flip did not ship (§3, §8).
 
 ### 7. Org / SSO handling
 
@@ -517,10 +578,15 @@ T753 established that a valid user token can still be inert against private
 SAML is enforced, the user SSO-authorizes the token. The design surfaces and
 recovers from both:
 
-**Detection (the org/SSO probe, run at Step 4 and on sync 403s).** The engine
-issues a cheap probe against an org-private resource — the bound product's
-`organization(login).projectV2` GraphQL query (the same call `fetch_items`
-makes). It classifies the result:
+**Detection (the org/SSO probe).** The engine issues a cheap probe against an
+org-private resource — the bound product's `organization(login).projectV2`
+GraphQL query (the same call `fetch_items` makes). As built
+(`probe_and_record_org_state`, PR #939) the probe runs for **every
+GitHub-bound product** (org read from each product's stored `GitHubConfig`,
+probed once per distinct org), raises or resolves per-product
+`github_oauth_org_unapproved` / `github_oauth_sso_required` attention items,
+and aggregates the per-org results into the single `org_state` the UI shows.
+It classifies each result:
 
 - **Success** → `OrgAuthState::Ok`.
 - **403 / 200-with-null-org** where the same token can read _public_ resources
@@ -542,37 +608,66 @@ the issue-sync settings:
   [Authorize via SSO] [Re-check]." (The button opens the `sso_url` from the
   header.)
 
-"Re-check" re-runs the probe without re-doing the whole device flow. The
-reconciler also re-probes automatically when a sync call returns 403, so the
-banner clears on its own once the owner approves / the user SSO-authorizes.
+"Re-check" re-runs the probe (via `GitHubAuthStatus`) without re-doing the
+whole device flow. The probe also runs automatically on each freshly-
+`Authorized` transition and when the UI requests status on connect.
+
+**As built — no automatic re-probe from the reconciler.** The design said a
+sync-time 403 would trigger a re-probe so the banner clears on its own. That
+did not ship: the reconciler raises an `external_tracker_auth_failed`
+attention item on 403 but does not call back into the auth controller. The
+banner clears only when the user (or the CLI) requests status. This is a
+follow-up gap, not a deliberate simplification.
 
 ### 8. Failure handling (consolidated)
 
-| Failure                                                    | Where detected     | Engine behavior                          | UI state                             |
-| ---------------------------------------------------------- | ------------------ | ---------------------------------------- | ------------------------------------ |
-| Network error on `device/code`                             | Step 1             | Retry briefly, then abort flow           | `Error{message}` + retry affordance  |
-| Network error / 5xx while polling                          | Step 3             | Keep polling at interval; do not abort   | stays `PendingUserAuth`              |
-| `slow_down`                                                | Step 3             | interval += 5s                           | unchanged                            |
-| `authorization_pending`                                    | Step 3             | keep polling                             | `PendingUserAuth` (spinner)          |
-| Device code expired                                        | Step 3             | stop poll                                | `Expired` → "Start over"             |
-| User denied in browser                                     | Step 3             | stop poll                                | `Denied`                             |
-| Granted scopes < requested                                 | Step 4             | store anyway, record actual scopes       | `Authorized` + "limited scopes" note |
-| Org not approved                                           | Step 4 / sync 403  | `org_state=NeedsOrgApproval`             | org-approval banner                  |
-| SAML SSO required                                          | Step 4 / sync 403  | `org_state=NeedsSso` (capture `sso_url`) | SSO banner                           |
-| Token revoked / invalid                                    | sync 401           | clear keychain item; `Reauthorize`       | "Reconnect" prompt + attention item  |
-| Permission denied on write (403, has scope but org policy) | sync (close/label) | existing attention item; do not retry    | product attention item               |
-| Keychain unavailable                                       | resolve            | log; fall back to ambient `gh`           | "Using local gh login" + warning     |
+| Failure                                                    | Where detected           | Engine behavior                                                                                          | UI state                             |
+| ---------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Network error on `device/code`                             | Step 1                   | Retry briefly, then abort flow                                                                           | `Error{message}` + retry affordance  |
+| Network error / 5xx while polling                          | Step 3                   | Keep polling at interval; do not abort                                                                   | stays `PendingUserAuth`              |
+| `slow_down`                                                | Step 3                   | interval += 5s                                                                                           | unchanged                            |
+| `authorization_pending`                                    | Step 3                   | keep polling                                                                                             | `PendingUserAuth` (spinner)          |
+| Device code expired                                        | Step 3                   | stop poll                                                                                                | `Expired` → "Start over"             |
+| User denied in browser                                     | Step 3                   | stop poll                                                                                                | `Denied`                             |
+| Granted scopes < requested                                 | Step 4                   | store anyway, record actual scopes                                                                       | `Authorized` + "limited scopes" note |
+| Org not approved                                           | Step 4 / status re-check | `org_state=NeedsOrgApproval` + `github_oauth_org_unapproved` attention item                              | org-approval banner                  |
+| SAML SSO required                                          | Step 4 / status re-check | `org_state=NeedsSso` (capture `sso_url`) + `github_oauth_sso_required` attention item                    | SSO banner                           |
+| Token revoked / invalid                                    | sync 401                 | `TrackerError::TokenRevoked`; raise attention item (keychain item **not** cleared, auth state unchanged) | "Reconnect" prompt + attention item  |
+| Permission denied on write (403, has scope but org policy) | sync (close/label)       | existing attention item; do not retry                                                                    | product attention item               |
+| Keychain unavailable                                       | resolve                  | log; fall back to ambient `gh`                                                                           | "Using local gh login" + warning     |
 
 All sync-time auth failures also raise a **`WorkAttentionItem`** on the affected
 product (reusing the existing attention-item surface that
 `ExternalTrackerAttentionTests` already covers), so the problem is visible even
 if the user isn't in the settings sheet.
 
-### 9. OAuth App provisioning prerequisite (human/setup task)
+**Known gap after implementation.** A revoked token leaves the auth state
+stuck at `Authorized` and the keychain item in place: the attention item is
+the only signal, and Settings still reads "Connected as @user." Closing that
+loop — either a `Reauthorize` state or having the reconciler clear the
+keychain item and notify the controller — is deliberate follow-up work, not
+part of what shipped.
 
-**This is a setup prerequisite, not something the implementation can do, and no
-`client_id` or secret is fabricated here.** Before the device-flow code can
-function end to end, a human must:
+### 9. OAuth App provisioning (human/setup task — completed)
+
+**Status: steps (1)–(3) done (T767 / T-0).** The `spinyfin` OAuth App was
+registered with device flow enabled, and the resulting **public** `client_id`
+(`Ov23li9VOztDIjoOA7eW`) shipped in PR #913. Steps (4) and (5) — org-owner
+approval and the SAML SSO authorization — are now documented as an operator
+procedure in `tools/boss/docs/runbooks/github-oauth-org-sso.md` (PR #950)
+rather than performed by this project; nothing in the merged PRs records that
+the approval itself has been granted.
+
+**As built — `client_id` is a plain in-tree constant**, not the
+`option_env!("BOSS_GITHUB_OAUTH_CLIENT_ID")` compile-time injection step (3)
+proposed. A device-flow `client_id` is public by construction and there is one
+production App, so build-time injection bought nothing; the trade-off is that
+pointing a build at a different OAuth App now requires a code edit rather than
+an env var. Consequently the originally-planned "Connect button disabled when
+the build has no `client_id`" affordance was not built — there is no
+unconfigured state to represent.
+
+The original prerequisite, retained for provenance:
 
 1. **Register an OAuth App in the `spinyfin` org** (Settings → Developer
    settings → OAuth Apps → New). Name it (e.g. "Boss"), set a homepage URL. A
@@ -591,57 +686,50 @@ function end to end, a human must:
    hard gate from T753. Document this in a runbook.
 5. **Document the SAML SSO authorization step** if `spinyfin` enforces SSO.
 
-Until (1)–(3) are done, the device-flow code has no `client_id` and the
-"Connect" button should be disabled with an explanatory tooltip ("GitHub OAuth
-App not configured in this build"). The implementation tasks below treat the
-`client_id` as an injected constant and **must not** invent one.
-
 ---
 
-## Proposed Implementation Task Breakdown
+## Implementation Task Breakdown (as shipped)
 
-Each task is one PR. Ordering reflects dependencies; tasks at the same depth can
-proceed in parallel.
+Each task was one PR; all seven merged on 2026-05-29. Ordering reflects
+dependencies.
 
-**T-0 (prerequisite, human/setup — not a code PR).** Register the `spinyfin`
-OAuth App, enable device flow, obtain `client_id`, get org-owner approval,
-write the org-approval + SSO runbook. Blocks end-to-end verification of T2–T5
-but **not** their implementation (which can be developed against a test/personal
-OAuth App `client_id`).
+**T-0 (prerequisite, human/setup — not a code PR). Done as T767.** Registered
+the `spinyfin` OAuth App, enabled device flow, obtained the `client_id`. The
+org-approval + SSO runbook shipped with T-7 rather than T-0.
 
-**T-1 — Protocol additions** (`boss-protocol`). Add the `GitHubAuthStart`,
+**T-1 — Protocol additions** (`boss-protocol`, PR #908). Add the `GitHubAuthStart`,
 `GitHubAuthCancel`, `GitHubAuthDisconnect`, `GitHubAuthStatus` `FrontendRequest`
 variants; the `GitHubAuthState` `FrontendEvent` variant; and the
 `GitHubAuthStateDto` / `OrgAuthState` types with serde + round-trip tests.
 Wire-format only; no behavior. _Depends on: none._
 
-**T-2 — Device-flow client + state machine** (engine). New
+**T-2 — Device-flow client + state machine** (engine, PR #913). New
 `external_tracker/github_oauth.rs`: `DeviceFlow` (device-code request, poll loop
 honoring `interval`/`authorization_pending`/`slow_down`/expiry/`access_denied`),
 token validation (`GET /user`, `X-OAuth-Scopes`), and the `GitHubAuthState`
 machine. `client_id` read from an injected constant/config. Unit tests with a
 mock HTTP server covering each poll branch. _Depends on: T-1._
 
-**T-3 — Keychain token storage** (engine). `KeychainTokenStore` over
+**T-3 — Keychain token storage** (engine, PR #917). `KeychainTokenStore` over
 `keyring::Entry` (service/account from §5); `KeychainOAuthResolver` that prefers
 the stored token and falls back to `GhAuthStatusResolver`. Tests follow the
 `hood`/`APIKeyStore` pattern (inject a fake backend; never touch the real
 keychain in CI). _Depends on: T-2 (consumes the captured token); can develop in
 parallel with T-2 against a stub._
 
-**T-4 — Engine RPC handlers + auth-flow orchestration** (engine, `app.rs`).
+**T-4 — Engine RPC handlers + auth-flow orchestration** (engine, `app.rs`, PR #939).
 Handle the four new requests; own the single per-host `GitHubAuthState`; push
 `GitHubAuthState` events as the flow advances; run the org/SSO probe; raise
 attention items on auth failure. _Depends on: T-1, T-2, T-3._
 
-**T-5 — Sync rewiring** (engine, `external_tracker/github.rs` + reconciler
+**T-5 — Sync rewiring** (engine, PR #938, `external_tracker/github.rs` + reconciler
 construction). Thread `TrackerCredential.token` into `CommandGhRunner` as
 `GH_TOKEN`; swap in `KeychainOAuthResolver`; map sync-time 401 → `Reauthorize` +
 attention item; map 403 → org/SSO re-probe. Tests assert `GH_TOKEN` is set when
 a token is present and unset (ambient) when not. _Depends on: T-3._ _(Can land
 before or after T-4; they touch different engine areas.)_
 
-**T-6 — Settings UI** (`app-macos`). Extend `ExternalTrackerSection` in
+**T-6 — Settings UI** (`app-macos`, PR #951). Extend `ExternalTrackerSection` in
 `ContentView.swift`: a "GitHub account" subsection with Connect / Disconnect /
 Re-authorize, the `user_code` + verification URL display with "Open in
 browser," polling/success/error/expired/denied states, the org-approval and SSO
@@ -651,10 +739,24 @@ methods to `ChatViewModel.swift`; handle the `GitHubAuthState` event. Swift
 tests mirror `ExternalTrackerTests` (DTO decode, state rendering). _Depends on:
 T-1 (wire types), T-4 (engine handlers)._
 
-**T-7 — `boss` CLI parity + runbook** (cli + docs). Optional `boss github auth
+As built, the state→UI mapping was factored into a pure `GitHubAuthPresentation`
+model in `Models.swift` (mirroring `ExternalTrackerAttentionPresentation`) so
+every state's status line, action set, and banner is unit-testable without
+rendering SwiftUI. The app subscribes to the global `github.auth` topic and
+requests status on connect, so a keychain-persisted token restored at engine
+boot shows as connected without waiting for a transition. The "Open in browser"
+action prefers `verification_uri_complete` when GitHub supplies it.
+
+**T-7 — `boss` CLI parity + runbook** (cli + docs, PR #950). `boss github auth
 {login,status,logout}` verbs that drive the same engine RPCs (useful for
 headless/testing), and the org-owner approval + SSO runbook under
-`tools/boss/docs/runbooks/`. _Depends on: T-4._
+`tools/boss/docs/runbooks/github-oauth-org-sso.md`. _Depends on: T-4._
+
+As built, all three verbs support `--json`. `login` polls `GitHubAuthStatus`
+to a terminal state rather than consuming the pushed event stream — the CLI is
+request→reply where the UI is event-driven. Because `status` re-probes org
+state (§4), it doubles as the headless "Re-check." End-to-end validation
+against a live engine was deferred to integration testing.
 
 Critical path: **T-1 → T-2 → T-3 → T-4 → T-6**. T-5 branches off T-3; T-7
 branches off T-4. T-0 gates _acceptance_ (real end-to-end auth against
@@ -664,6 +766,8 @@ branches off T-4. T-0 gates _acceptance_ (real end-to-end auth against
 
 ## Risks / Open Questions
 
+Each risk below carries the outcome the implementation produced.
+
 - **R1 — Engine keychain access reliability.** The engine is a child of the
   app but is a distinct binary without the app's `keychain-access-groups`
   entitlement, so it uses the **login** keychain (generic password) via
@@ -672,45 +776,68 @@ branches off T-4. T-0 gates _acceptance_ (real end-to-end auth against
   on re-read. **Open question:** is engine-direct keychain access stable enough
   across our dev + Developer-ID builds, or should we adopt the app-mediated
   `APIKeyStore` route (§5 alternative) despite the app-online dependency?
-  _Needs a reviewer decision before T-3._
+  **Outcome:** engine-direct keychain shipped as designed (PR #917) and no
+  reliability problem surfaced during implementation. Note this was never
+  exercised against a Developer-ID build in this project, so the risk is
+  unretired rather than disproven; the app-mediated `APIKeyStore` route remains
+  the fallback if it bites.
 
 - **R2 — `gh` vs raw HTTP for sync.** v1 keeps `gh` + `GH_TOKEN` for minimal
   blast radius. Does `gh` reliably prefer `GH_TOKEN` over an ambient `gh auth`
   login in all configurations (e.g. when `gh` has its own keyring entry)? If
   not, we may need `GH_TOKEN` + `GH_CONFIG_DIR` isolation, or to move sync to
-  `reqwest`. _Verify empirically in T-5._
+  `reqwest`. **Outcome:** T-5 (PR #938) threaded `GH_TOKEN` and asserts in
+  tests that it is set when a token is present and absent when ambient — but
+  those are unit tests over the runner, not an empirical check that `gh`
+  prefers `GH_TOKEN` over its own keyring entry. The precedence question this
+  risk actually asks remains unverified against a real `gh` install.
 
 - **R3 — Scope confirmation (carried from T753).** Baseline `repo project`
   assumes private `spinyfin/mono` + Behavior 6 on. If `mono` is public,
   `public_repo` suffices; if Behavior 6 is dropped, `read:project` suffices.
   Also re-confirm `read:org` is genuinely not required against the _real_ org
   project (T753 marked this high-confidence but not empirically verified).
-  _Resolve before T-0 finalizes the App's requested scopes._
+  **Outcome:** the App was provisioned and the flow requests `repo project` as
+  planned. `read:org` was not empirically re-confirmed against the real org
+  project.
 
 - **R4 — In-progress flow not persisted across engine restart.** If the engine
   restarts mid-flow (between device-code issuance and token capture), the
   in-progress state is lost and the user must click "Connect" again; the worst
   case is a dangling unused device code that expires harmlessly. **Decision:**
   acceptable for v1 (the durable thing — the token — _is_ persisted). Flag if a
-  reviewer wants restart-survivable flow state.
+  reviewer wants restart-survivable flow state. **Outcome:** unchanged as
+  designed. T-4 additionally made the _authorized_ state restart-survivable via
+  `restore_from_store()` (§3), which was not in the original plan; the
+  in-progress flow state is still deliberately ephemeral.
 
 - **R5 — Org approval is an existential dependency (T753 §4.4).** If the
   `spinyfin` owner will not approve a third-party OAuth App, this entire
   direction is blocked and we fall back to an org-wide GitHub App install or a
-  member-minted SSO-authorized PAT. **Confirm `spinyfin`'s OAuth App access
-  policy and SSO posture before investing in T-2+.**
+  member-minted SSO-authorized PAT. **Outcome:** partially retired. The App
+  was registered (T767) and the whole stack shipped against it, but none of the
+  merged PRs evidence that a `spinyfin` owner has granted org approval — T-7
+  explicitly deferred live end-to-end validation to integration testing. The
+  approval procedure is documented in
+  [`../runbooks/github-oauth-org-sso.md`](../runbooks/github-oauth-org-sso.md);
+  until it is performed and verified, sync against private `spinyfin`
+  resources is unproven on this path.
 
 - **R6 — Two GitHub identities.** `shake` (GitHub App, issue creation) and sync
   (OAuth App, read/close/status) will both touch the org/project. Keep them
   separate (chosen for v1: simpler, two consents) or consolidate later (T753 §4
-  open decision 6)? _Out of scope here; noted for a future project._
+  open decision 6)? **Outcome:** unchanged — the two identities shipped
+  separately, as planned. Still noted for a future project.
 
 - **R7 — No programmatic revocation.** Because we ship no client secret,
   "Disconnect" only deletes the local token; full server-side revocation is a
   user-driven step in GitHub settings. **Open question:** is local deletion +
   documented manual revoke acceptable, or do we need a tiny server-side
   component holding the client secret to offer one-click revoke? _v1 recommends
-  local-only; confirm with reviewer._
+  local-only; confirm with reviewer._ **Outcome:** shipped local-only.
+  `boss github auth logout` and the Settings "Disconnect" button delete the
+  keychain item; server-side revocation remains a documented manual step in
+  the runbook.
 
 ## References
 
@@ -721,12 +848,20 @@ branches off T-4. T-0 gates _acceptance_ (real end-to-end auth against
   — the sync design this auth work plugs into (esp. §11 Credentials).
 - [`engine-app-rpc.md`](engine-app-rpc.md) — the frontend-socket request/event
   pattern these RPC additions follow.
-- Code touched by the implementation tasks:
-  `engine/src/external_tracker/{credentials.rs, github.rs, reconcile.rs, mod.rs}`,
-  `engine/src/app.rs`, `protocol/src/{wire.rs, types.rs}`,
-  `app-macos/Sources/{ContentView.swift, EngineClient.swift, ChatViewModel.swift,
-Models.swift}`; storage precedents `tools/hood/src/creds.rs` and
-  `app-macos/Sources/Settings/APIKeyStore.swift`; provisioning precedent
+- Org-approval + SSO runbook —
+  [`../runbooks/github-oauth-org-sso.md`](../runbooks/github-oauth-org-sso.md)
+  (PR spinyfin/mono#950).
+- Where the shipped code lives **today** (after the engine crate split):
+  `github_tracker/src/{github_oauth.rs, github.rs, lib.rs}` (device flow,
+  state machine, keychain store, org probe, `GhRunner`/`TrackerError`);
+  `engine/core/src/app/{server.rs, github_auth.rs}` (orchestration, forwarder
+  task, RPC handlers); `engine/core/src/external_tracker/{org_state_sink.rs,
+reconcile/logic.rs}`; `protocol/src/{wire.rs, types/common.rs}`;
+  `app-macos/Sources/{ContentView.swift, EngineClient.swift,
+ChatViewModel+GitHub.swift, Models.swift}` with
+  `app-macos/Tests/BossTests/GitHubAuthTests.swift`; `cli/src/main.rs`.
+- Precedents followed: storage — `tools/hood/src/creds.rs` and
+  `app-macos/Sources/Settings/APIKeyStore.swift`; provisioning —
   `cli/src/github_app.rs`.
 - GitHub docs: [Authorizing OAuth apps — device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow),
   [Scopes for OAuth apps](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps),
