@@ -1,39 +1,39 @@
 # Boss CI: Buildkite Pipeline Mirroring Flunge
 
-## Status (2026-05-14)
+## Status (2026-07-20): shipped and enforcing
 
-Two pieces of the original design have landed independently of the pipeline itself; the rest of this doc still describes work to do.
+The pipeline is live and branch protection on `main` is on. A PR to mono cannot merge while a required buildkite check is red.
 
-- **P1 (bazel engine-lib coverage) has landed.** `tools/boss/engine/BUILD.bazel:86` now declares `rust_test(name = "engine_lib_test", crate = ":engine_lib", ...)`, so `bazel test //tools/boss/engine/...` exercises the engine lib tests that the motivating incident exposed. The doc no longer needs a `cargo test` transitional step in the pipeline; bazel is the canonical rust signal from v1. See "Historical: cargo→bazel transition" below for context.
-- **Kanban CI status indicator has shipped.** `PrCiIndicator` in `tools/boss/app-macos/Sources/ContentView.swift:2683` renders a small badge on Review-lane cards: yellow clock for `in_progress`, green checkmark for `success`, red X for `fail`, hidden for `unknown`. It is fed by the existing `ci_watch` probe path; no new schema column was needed. See "Boss UI integration — shipped" below.
-
-The pipeline itself (the `.buildkite/` skeleton, the per-step shells, the branch-protection ramp) is still pending implementation. Everything below describes that remaining work.
+- **Delivered by:** PR #555 (flunge pipeline audit — `flunge-buildkite-pipeline-reference.md`), PR #563 (`.buildkite/` skeleton), PR #565 (static checks), PR #567 (test steps), PR #599 (per-step `notify` contexts, `REQUIRED_CHECKS.md`, the `no_gh_pr_merge` grep-guard test, branch-protection enablement).
+- **Live required checks** (verified via `gh api .../branches/main/protection`): `buildkite/mono/bazel-build-test`, `buildkite/mono/mac-app-build`, `buildkite/mono/checks`. `strict` is off (no up-to-date-branch requirement), `enforce_admins` is off.
+- **As-built shape diverged from the original plan in several places** — no bootstrap step, no cargo or pnpm steps, build+test consolidated into one step, and a macOS build step that the original design had scoped out. Each divergence is covered inline in the section it affects.
+- Adjacent pipelines have since grown alongside the PR pipeline (a scheduled `mono-integrity` full-repo build/test, checkleft release pipelines, and a `boss-release` step) — noted under "Beyond the original scope" below.
 
 ## Motivating incident
 
-On 2026-05-12, the `#[cfg(test)]` blocks in `tools/boss/engine/src/{completion,merge_poller}.rs` drifted out of sync with their prod signatures. `cargo test -p boss-engine --no-run` reported six compile errors on `main`. The drift sat undetected on `main` for roughly twenty-four hours. La Forge's investigation in closed PR #438 (chore `task_18af35a1e855d7f0_24`) tracked down the cause; the doc didn't land on main, but the findings stand.
+On 2026-05-12, the `#[cfg(test)]` blocks in the engine's `completion.rs` and `merge_poller.rs` drifted out of sync with their prod signatures. `cargo test -p boss-engine --no-run` reported six compile errors on `main`. The drift sat undetected on `main` for roughly twenty-four hours. La Forge's investigation in closed PR #438 (chore `task_18af35a1e855d7f0_24`) tracked down the cause; the doc didn't land on main, but the findings stand.
 
-Why nothing caught it: at the time, `bazel test //tools/boss/engine/...` resolved to only two integration test targets — there was no `rust_test(crate=":engine_lib")`, so bazel silently skipped 561 lib tests. Sibling chore `task_18af3caac58d9748_2c` ("P1") tracked that gap separately and has since landed (see Status above); the rule now lives at `tools/boss/engine/BUILD.bazel:86`. With no other gate, every dispatched worker is a bet that what landed on `main` since the last green check is still buildable.
+Why nothing caught it: at the time, `bazel test //tools/boss/engine/...` resolved to only two integration test targets — there was no `rust_test(crate=":engine_lib")`, so bazel silently skipped 561 lib tests. Sibling chore `task_18af3caac58d9748_2c` ("P1") closed that gap; after the engine's crate split, the rule lives at `//tools/boss/engine/core:engine_lib_test`. With no other gate, every dispatched worker was a bet that what landed on `main` since the last green check was still buildable.
 
-This design proposes the structural fix: a buildkite pipeline for the mono repo, mirroring the shape of the existing flunge pipeline, gating merges on green.
+This design is the structural fix: a buildkite pipeline for the mono repo, mirroring the shape of the existing flunge pipeline, gating merges on green.
 
-## Goals
+## Goals — all met
 
-- A PR to mono cannot be merged while buildkite reports red. GitHub branch protection enforces it; no engine-side gating required.
-- The pipeline runs on every PR open + push + branch update, plus pushes to `main`.
-- The first PR that introduces a `bazel test` failure (or a `cargo check` compile failure) is blocked from merging.
-- Reviewers see a clear pass/fail signal in the GitHub PR UI; the Boss UI surfaces the same signal next to in-review rows.
-- Same shape as flunge's buildkite — same buildkite org, same secrets store, same merge-blocking semantics. Diverge only where the rust + bazel + jj surface forces it.
+- A PR to mono cannot be merged while buildkite reports red. GitHub branch protection enforces it; no engine-side gating required. ✅
+- The pipeline runs on every PR push and on pushes to `main`. ✅
+- A PR that introduces a bazel build or test failure is blocked from merging. ✅ (The compile-drift class of failure from the motivating incident is now caught by `bazel-build-test` via `engine_lib_test`.)
+- Reviewers see a clear pass/fail signal in the GitHub PR UI; the Boss UI surfaces the same signal next to in-review rows (`PrCiIndicator` in `tools/boss/app-macos/Sources/ContentView.swift`, fed by the engine's `ci_watch` probe). ✅
+- Same buildkite org and merge-blocking semantics as flunge, diverging where the rust + bazel surface forces it. ✅
 
 ## Non-goals
 
-- **Engine-side gating.** Today the engine does not call `gh pr merge` (verified: no occurrences in `tools/boss/engine`). Merges happen out-of-band — typically a human types `lgtm` and the worker or human runs `gh pr merge`. The CI gate is enforced by GitHub branch protection, not by the engine refusing to merge. If/when the engine ever auto-merges, it must honour the same status checks; that work is out of scope here.
+- **Engine-side gating.** The engine does not call `gh pr merge`; the `merge_poller` detects merges, it does not perform them. Branch protection is the only enforcement layer. PR #599 locked this assumption with a grep-guard `sh_test` (now at `tools/boss/engine/core/tests/no_gh_pr_merge_test.sh`) that fails if any `gh pr merge` call appears in engine source.
 - **Performance dashboards.** Flunge doesn't have one; nor does this.
-- **macOS app code-signing CI.** Different surface (signing certs, notarisation). Follow-up project.
+- **macOS app code-signing / notarisation CI.** Still out of scope. Note the boundary moved, though: _building and testing_ the macOS app in CI turned out to be necessary and shipped as the required `mac-app-build` step (see below) — only signing/notarisation remains a follow-up.
 - **Engine test-suite perf work.** Tracked separately under P2 (`task_18af3cad1705c0a8_2d`).
-- **Repobin dispatch-cache.** Already landed in PR #439.
-- **Cross-repo CI orchestration.** This pipeline gates the mono repo only. Flunge has its own. The Boss UI can show CI status for both products independently.
-- **Rewriting `ci_watch.rs`.** The engine already models buildkite as a CI provider (`merge-conflict-handling-in-review.md` §Q7, `tools/boss/engine/src/ci_watch.rs:1-60`). Nothing about that module needs to change for v1 — once real checks exist, the existing remediation pipeline picks them up automatically.
+- **Repobin dispatch-cache.** Landed separately in PR #439.
+- **Cross-repo CI orchestration.** This pipeline gates the mono repo only.
+- **Rewriting `ci_watch.rs`.** The engine already modelled buildkite as a CI provider; once real checks existed, the existing remediation pipeline picked them up without changes, as predicted.
 
 ## Alternatives considered
 
@@ -41,202 +41,131 @@ This design proposes the structural fix: a buildkite pipeline for the mono repo,
 
 GitHub Actions is the obvious "free" option: no infra to stand up, no agent fleet to manage, native PR integration. Rejected:
 
-- Flunge runs on buildkite. Mandate is _mirror flunge_, not _re-pick the CI vendor_.
-- The mono build is rust + bazel + node + (eventually) Xcode. Bazel cache hit rate matters — GitHub-hosted runners are ephemeral, so a remote cache is mandatory just to be tolerable; we'd have to stand one up anyway. Self-hosted GH runners would re-introduce the agent-fleet question without buying anything over buildkite.
-- We already have buildkite secrets, an org, an agent fleet, and the engine knows how to parse `buildkite.com` job URLs (`ci_watch.rs`, `merge-conflict-handling-in-review.md:998-1007`). Reusing that surface is materially cheaper than building a parallel actions parser.
+- Flunge runs on buildkite. Mandate was _mirror flunge_, not _re-pick the CI vendor_.
+- The mono build is rust + bazel + Xcode. Bazel cache hit rate matters — GitHub-hosted runners are ephemeral, so a remote cache would be mandatory just to be tolerable. Self-hosted GH runners would re-introduce the agent-fleet question without buying anything over buildkite.
+- We already had buildkite secrets, an org, an agent fleet, and the engine knows how to parse `buildkite.com` job URLs (`ci_watch`). Reusing that surface was materially cheaper than building a parallel actions parser.
 
-### Alternative B — A dedicated mono agent fleet from day one
+This held up in practice; nothing in the rollout suggested revisiting the vendor choice.
 
-Stand up a separate buildkite agent fleet, tagged `mono-only`, provisioned with the rust toolchain, bazel, and node from the start. No interaction with flunge agents. Rejected for v1:
+### Alternative B — install-on-boot toolchains vs pre-provisioned agents
 
-- Doubles the operational surface. Two agent pools, two sets of dashboards, two secret stores, two cost lines.
-- The toolchain bootstrap is the only meaningful difference from flunge's agents. We can install rust + bazel + pnpm into the existing flunge agents (idempotent install scripts at job start) and let the queue tag route mono jobs separately. The agents themselves don't care.
-- If the install-on-boot cost becomes painful (multi-minute toolchain pull every job), the fix is a baked AMI / docker image, not a separate fleet. That's a v2 optimisation, not v1 architecture.
-
-We can split fleets later if real evidence shows mono jobs starving flunge jobs (or vice versa). Until then, one fleet, two queue tags.
+The original design proposed a `bootstrap.sh` step that would install/pin the rust toolchain, bazelisk, and node tooling at the start of every job, so any generic agent could run mono jobs. **As built, we converged on flunge's model instead: agents are pre-provisioned** with the toolchains they need, and there is no bootstrap step. The skeleton's placeholder `bootstrap.sh` never acquired real logic and was removed as dead code in PR #1291. The flunge audit (PR #555) had flagged this exact fork in the road ("there isn't a bootstrap surface in-repo — agents are pre-provisioned"); mono ended up on the same side.
 
 ### Alternative C — `cargo` only, drop `bazel` from CI
 
-Drop bazel from CI entirely. Run only `cargo check` / `cargo test` / `pnpm test`. Rejected:
+Rejected, and in fact the outcome inverted it: **bazel-only, no cargo**. The original v1 kept `cargo check --workspace` as a cheap fast-failing compile guard alongside bazel (and PR #565 wired it), but it was dropped the same day (2026-05-15, commit `8ef4895b`) before checks were ever promoted to required. `bazel build` catches everything cargo-check would, P1 made `bazel test` the canonical rust test signal, and a second build system in CI was pure wall-clock and cache-pressure cost. Bazel is the single build/test authority in CI; per repo policy it is also the only sanctioned local path (no bare `cargo`).
 
-- The motivating incident was caught by `cargo test`, not bazel — so cargo-only CI would have caught it. But the pattern we're guarding against is broader. The repobin dispatch-cache regression that PR #439 fixed wasn't visible to cargo; it was a bazel state bug. We want bazel signals in CI on top of, not instead of, the rust-level signal.
-- `bazel build //...` and `bazel test //...` are cheap once the cache is warm. They expose dependency-graph rot (visibility violations, missing srcs, dropped deps) that cargo cannot.
-- With P1 landed, `bazel test //...` now exercises the engine lib tests too, so the historical concern that bazel-test was "a green box that doesn't catch anything" no longer applies. Bazel is the canonical rust signal in v1; `cargo check` stays as a cheap, fast-failing compile guard that's still useful when the bazel target graph itself is broken.
-
-## Chosen approach
+## As-built pipeline
 
 ### Repo layout
 
-Mirror flunge's `.buildkite/` directory structure verbatim:
-
 ```
 .buildkite/
-  pipeline.yml              # buildkite reads this; defines steps + queue tags
+  pipeline.yml                       # PR/main pipeline: steps, queues, notify contexts
+  pipeline-integrity.yml             # scheduled full-repo integrity pipeline (~30 min cadence)
+  pipeline-checkleft-release.yml     # checkleft release automation
+  pipeline-checkleft-release-builds.yml
   steps/
-    bootstrap.sh            # ensure rust toolchain + bazel + pnpm present; cache restore
-    bazel-build.sh          # bazel build //...
-    bazel-test.sh           # bazel test //... (covers engine lib tests via P1)
-    checks.sh               # checkleft / CHECKS.yaml runner (no-generated-artifacts, etc.)
-  README.md                 # what each step does, how to debug a red build locally
+    ci-env.sh                        # shared CI env: --config=ci-<os>, bazel startup flags, Xcode-drift recovery
+    bazel-build-test.sh              # bazel build //... then bazel test //... (one step, one agent)
+    mac-app-build.sh                 # bazel build+test of the macOS app + installer targets
+    checks.sh                        # CHECKS.yaml runner via checkleft
+    boss-release.sh, checkleft-release.sh, integrity-*.sh
+  README.md
+  REQUIRED_CHECKS.md                 # authoritative required-check list + rename contract
 ```
 
-`.buildkite/pipeline.yml` is the source of truth wired into the buildkite project. Each `steps/*.sh` is a small shell script; logic stays in the repo so it's reviewed and versioned, not in the buildkite UI. The pipeline.yml just declares steps, plugins, queue tags, and dependencies — no inline shell. This matches what flunge does and is also what the existing engine doc (`merge-conflict-handling-in-review.md:998`) assumes when it shells out to `bk job log <id>`.
+As designed, `pipeline.yml` declares steps, queues, and notify blocks only — all logic lives in reviewed, versioned `steps/*.sh` scripts, matching flunge.
 
 ### Pipeline shape
 
-Three logical phases, parallelised where they don't depend on each other:
+Three parallel gating steps, no barrier between them, plus a main-only release step:
 
 ```
-bootstrap (queue=linux-amd64) ─┬──► bazel-build ──┐
-                               ├──► checks       ──┼──► (wait) ──► bazel-test ──► green
+┬──► bazel-build-test (build, then test, one agent) ──┐
+├──► mac-app-build                                    ├──► boss-release (main only)
+└──► checks                                           ┘
 ```
 
-- `bootstrap` is a single step that primes the agent: installs / pins the rust toolchain (read `rust-toolchain.toml`), pins bazelisk, installs pnpm, and restores the bazel disk cache. Subsequent steps inherit a warm checkout.
-- Cheap static checks (`bazel build`, `checks.sh`) run in parallel. Any one failing is enough to redden the build; reviewers don't need to wait for the heavy steps to see compile failures.
-- Test steps (`bazel test`) run after the static checks pass. `bazel test //...` is the canonical rust test step — with P1 landed it covers the engine lib tests as well as the integration test targets.
-- Every step is its own buildkite step (not a sub-target of one umbrella step). When one is red, the buildkite UI shows exactly which, and the engine's `ci_watch` (which already parses required-check names) can route by failing-step name in the future.
+Two structural changes from the designed shape (`bootstrap → [static checks] → wait → [tests]`):
+
+- **No bootstrap step** — see Alternative B; agents are pre-provisioned.
+- **Build and test are one step, and the cross-step wait barrier is gone.** The design ran `bazel build` and `bazel test` as separate buildkite steps so a red step was unambiguous. In practice the `bazel-any` queue mixes darwin and linux hosts, so a test step was not guaranteed to land on the agent that had just built — re-analyzing and rebuilding from scratch. PRs #1889/#1896/#1924 consolidated them into a single `bazel-build-test` step that runs `bazel build //...` then `bazel test //...` back to back on one agent, with per-phase collapsible log groups (`[bazel-build]` / `[bazel-test]`) preserving failure attribution inside the step. The rename to a new required-check context was ramped safely: the step emitted the two legacy contexts plus the new one during the transition, an operator flipped `required_status_checks` on 2026-07-13, then the legacy notify entries were removed. `REQUIRED_CHECKS.md` records the full sequence and the generalized rename contract.
+
+Step details:
+
+- **`bazel-build-test`** excludes `//tools/boss/app-macos/...` and `//tools/boss/installer/...` (Swift; no Linux toolchain) — those belong to `mac-app-build`. Runs with `--keep_going` so one broken target doesn't mask others.
+- **`mac-app-build`** — not in the original design (macOS CI was scoped out wholesale). It became load-bearing because the repo's build surface is genuinely rust + Swift: the macOS app and the installer's `boss_pkg_payload` rule can only build on a macOS agent, and app regressions were otherwise invisible to CI. It bazel-builds and bazel-tests all `app-macos` and `installer` targets on the `macos-arm64` queue and is a required check.
+- **`checks`** — runs the `CHECKS.yaml` suite via `bin/checkleft run` (repobin), auto-scoped to changed paths on PR builds. Invoked via repobin rather than `bazel run` because `bazel run` sets cwd to the runfiles tree, which breaks checkleft's config discovery — resolving old open question R5.
+- **`boss-release`** (added later, outside this project's PRs) — main-branch-only, schedule/UI/API-triggered, depends on all three gating steps, so a release only cuts from a fully green commit.
+
+### The node/pnpm surface that wasn't
+
+The original design (and PRs #563/#565/#567) assumed a "rust + node" repo and wired `pnpm-typecheck` and `pnpm-test` steps, with a soft-fail ramp planned for `pnpm-test`. The mono repo has no node surface — no `package.json`, no `pnpm-workspace.yaml` — so the steps were vacuous and were dropped along with `cargo-check` on 2026-05-15 (commit `8ef4895b`), before promotion to required. The soft-fail/advisory ramp machinery designed for flaky steps was therefore never needed: every surviving step went straight to required.
 
 ### Required checks for branch protection
 
-GitHub branch protection on `main` requires:
+Live on `main` (three, not the five PR #599 initially enabled — `bootstrap` disappeared with the step, `bazel-build` + `bazel-test` merged):
 
-- `buildkite/mono/bootstrap`
-- `buildkite/mono/bazel-build`
-- `buildkite/mono/bazel-test`
+- `buildkite/mono/bazel-build-test`
+- `buildkite/mono/mac-app-build`
 - `buildkite/mono/checks`
 
-The pipeline shape focuses on bazel as the canonical build and test system. Cargo-check and pnpm-based steps have been dropped in favor of bazel's dependency-graph checking and unified rust+node test coverage.
+Two contract decisions from the rollout, both in `.buildkite/REQUIRED_CHECKS.md` (which shipped as this design proposed, answering open question Q2):
 
-The promotion sequence is the only thing in this design that touches GitHub branch protection settings directly; everything else is repo-local.
+- **Per-step contexts, not flunge's single umbrella check.** Flunge gates on one `buildkite/flunge-ci` context; mono gates per step, so the GitHub PR UI names the failing step directly and `ci_watch` can route by check name.
+- **Contexts are pinned explicitly.** Each gating step carries a `notify: github_commit_status: { context: "buildkite/mono/<step-key>" }` block (PR #599), decoupling the context name from the step `label:` (which carries emoji and may change freely). Renames follow the four-step contract in `REQUIRED_CHECKS.md` — update notify + table + branch protection in lockstep, verify the new context posts before dropping the old.
+
+`strict` (require branch up to date) is off, matching flunge. `enforce_admins` is off — flunge has it on; mono deliberately leaves an operator escape hatch.
 
 ### Agent topology
 
-Single buildkite agent fleet, shared with other projects, queue tag:
+The design proposed a single shared `linux-amd64` queue. As built there are two queues, because the Swift surface forces macOS hardware:
 
-- `queue=linux-amd64` — default Linux queue for all projects including mono.
+- `queue=bazel-any` — mixed darwin/linux hosts; runs `bazel-build-test` and `checks` (neither cares about OS).
+- `queue=macos-arm64` — macOS arm64 agents (currently Zakalwe-1); runs `mac-app-build` and `boss-release`.
 
-Agents run a `bootstrap.sh` step that ensures the required toolchain is present:
+Both are env-overridable (`BUILDKITE_ANY_QUEUE` / `BUILDKITE_MACOS_QUEUE`) so new agents can be smoke-tested against a real pipeline without touching production queues.
 
-- `rustup toolchain install` per `rust-toolchain.toml` if not present.
-- `bazelisk` available on `$PATH`.
-- `pnpm` available on `$PATH`.
-- `jj` _not_ installed on agents. Buildkite checks out via git natively; the jj-in-workspace concern is a worker-side issue, not a CI concern (see Risk R3).
+### Bazel cache and daemon hygiene
 
-If contention shows up, we can tag and isolate mono jobs separately. Until then, shared queue.
+The design's two-tier plan (v1 disk cache, remote cache as fast-follow) shipped its v1 half; **there is still no remote cache**, and nothing so far has hit the triggers that would justify one. The as-built disk story is more developed than the design sketch:
 
-### Bazel cache
+- Per-OS cache roots on dedicated SSDs, set in `.ci.bazelrc`: `--disk_cache` + `--repository_cache` under `/mnt/ssd/bazel/` (linux) and `/Volumes/ssd/bazel/` (darwin), selected via `--config=ci-linux` / `--config=ci-darwin` from `.buildkite/steps/ci-env.sh`.
+- Cache GC tuned for CI (`3T` / `60d` / 5-minute idle delay) vs the conservative local defaults in `.bazelrc`.
+- Per-pipeline bazel daemon idle TTLs (`ci-env.sh`): the hot PR pipeline keeps a 2-hour warm daemon; low-cadence pipelines (integrity, checkleft-release) get 15 minutes so their daemons free memory. All CI bazel entry points read startup flags from one `CI_BAZEL_STARTUP_FLAGS` source of truth, because divergent startup flags spawn duplicate daemons.
+- Darwin agents pin the Xcode toolchain (`--xcode_version` + `--repo_env=DEVELOPER_DIR`) after two incidents of in-place Xcode updates corrupting cached toolchain state; `ci-env.sh` also detects Xcode-version drift and auto-expunges the stale output base.
 
-Two-tier:
-
-1. **Per-agent disk cache.** Each agent runs with `--disk_cache=/var/cache/bazel-mono` set via `.bazelrc.ci`. Persists across jobs on the same agent. Warm-cache rebuilds are seconds.
-2. **Remote cache.** A read-write remote cache (BuildBuddy or self-hosted bazel-remote) shared across agents. A cold agent (or a new agent type) reads remote first, falls back to local build, and writes back.
-
-v1 ships **disk cache only**. The remote cache is a fast-follow, not a v1 requirement. Reasoning: a single-fleet setup with sticky agents (buildkite has reasonable agent affinity) gets most of the disk-cache benefit without standing up a separate remote-cache service. We'll know remote is needed when (a) `bazel-test` cold-cache exceeds ~10 minutes, or (b) we split fleets and inter-fleet sharing matters.
-
-Cache keying:
-
-- The disk cache key includes `bazel info release` and a hash of `MODULE.bazel.lock` (matches flunge's approach and what the recent PR #439 dispatch-cache fix established for repobin).
-- `cargo` shares the agent-level `~/.cargo/registry` cache; that's it for cargo. Target dirs are not cached across jobs (they're cheap relative to bazel and the cache-poisoning risk is higher).
-
-### Historical: cargo→bazel transition
-
-The original v1 plan ran `cargo test` and `bazel test` side-by-side until P1 closed the engine-lib coverage gap, and included `cargo check` as a cheap compile guard. **Both are no longer needed.** P1 has landed: `tools/boss/engine/BUILD.bazel:86` declares `rust_test(name = "engine_lib_test", crate = ":engine_lib", ...)`, and `bazel test //tools/boss/engine/...` exercises the lib tests that the May-12 drift exposed. Bazel's dependency-graph checking (`bazel build`) catches what cargo-check would catch, making the extra compile guard redundant.
-
-The implementation now wires `bazel test //...` and `bazel build //...` directly as the canonical rust signal steps, with no transitional `cargo-check` or `cargo-test` steps needed.
-
-Verification for bazel-test:
-
-- Spot-check that the bazel-test wall-clock on a warm cache is within the budget assumed by the sharding decision below.
+Remote cache remains the documented fast-follow, triggered if cold-agent wall-clock becomes painful or the fleet grows enough that inter-agent sharing matters.
 
 ### Sharding
 
-No sharding in v1. The full mono test suite (rust + node) is currently well under ten minutes on a warm cache. Sharding adds buildkite-step orchestration complexity (test discovery, distribution, retry semantics) for an improvement we don't need yet.
+None, as designed. `engine_lib_test` is a single `rust_test` using bazel's native test sharding across cores; the suite is comfortably inside the wall-clock budget. Re-evaluate if the slowest required step exceeds ~15 minutes warm.
 
-Re-evaluate when wall-clock for the slowest required step exceeds 15 minutes on a warm cache. At that point the natural unit is bazel test target groups (one shard per top-level package), not file-level test sharding — bazel already shards across cores within a target.
+### Boss UI integration
 
-### Boss UI integration — shipped
+`PrCiIndicator` (`tools/boss/app-macos/Sources/ContentView.swift`) renders the CI badge on Review-lane kanban cards: yellow clock for `in_progress`, green check for `success`, red X for `fail` (tooltip lists failing check names), hidden for `unknown` so "no signal yet" doesn't read as green. It is fed by the engine's existing `ci_watch` probe (`gh pr view --json statusCheckRollup`); no new schema column was needed. This shipped ahead of the pipeline itself and picked up the real checks automatically once they existed.
 
-This piece has landed ahead of the pipeline itself. `PrCiIndicator` at `tools/boss/app-macos/Sources/ContentView.swift:2683` renders a small `caption2`-weight icon next to the PR link on Review-lane cards:
+### Engine interaction (`ci_watch` remediation)
 
-| Engine-reported state | Icon (SF Symbol)        | Colour | Tooltip                                                |
-| --------------------- | ----------------------- | ------ | ------------------------------------------------------ |
-| `in_progress`         | `clock.fill`            | yellow | "Required CI checks in progress"                       |
-| `success`             | `checkmark.circle.fill` | green  | "All required CI checks passed"                        |
-| `fail`                | `xmark.circle.fill`     | red    | "Required CI check(s) failed: <names from rollup>"     |
-| `unknown` / other     | (hidden)                | —      | hidden, so "no signal yet" doesn't look like all-green |
+`ci_watch` acts only on **required** check failures, so the per-step promotion ramp doubled as the flake-storm control: nothing was required until it was stable. The per-PR remediation budget defaults to 3 fix attempts, configurable per-PR (`tasks.ci_attempt_budget`) or per-product (`products.ci_attempt_budget`); the `auto_pr_maintenance_disabled` product flag and per-PR opt-out label remain the circuit breakers. Documented in `REQUIRED_CHECKS.md` §ci_watch.
 
-State is fed by the engine's existing `ci_watch` probe (`tools/boss/engine/src/ci_watch.rs`), which already polls `gh pr view --json statusCheckRollup` for `in_review` rows. The failure detail payload is the same `failed_checks` JSON shape `ci_watch` uses internally — `PrCiIndicator` parses it for the tooltip so reviewers can see which check name(s) reddened the build without leaving the kanban.
+The jj-vs-git concern (old risk R3) resolved as predicted: buildkite checks out via git, no `jj` exists on agents, and no step or check invokes it — `checkleft` auto-detects git from the working directory.
 
-No new schema column was needed (the original design speculated a `pr_ci_status` text field on `tasks`; in practice the indicator reads from the same `ci_watch`-populated path as the rest of the remediation pipeline, which kept the change additive). Open polish items, if any, belong on a follow-up chore; nothing about this section blocks the pipeline rollout.
+## Beyond the original scope
 
-## Risks / open questions
+The `.buildkite/` directory now hosts more than the PR gate this design covered. Listed for orientation; none of these were deliverables of this project:
 
-### R1 — `auto_pr_maintenance_disabled` interaction
+- **`mono-integrity` pipeline** — scheduled (~every 30 min) full-repo `bazel build+test` + full checkleft run on main, catching whole-repo rot that PR-scoped runs can miss, plus a commit-delta check.
+- **Release pipelines** — `boss-release` (app release from green main) and the checkleft release pipelines (tagging, musl cross-compilation, changelog generation).
 
-The engine's `ci_watch.rs` (and `conflict_watch.rs`) already gate on a per-product `auto_pr_maintenance_disabled` flag. Today nothing red-buttons engine remediation if a flaky CI check fires repeatedly. Once a real pipeline exists, a flake storm could trigger a cascade of CI-remediation workers.
+## Follow-up state
 
-Mitigation:
-
-- The pipeline ramp above keeps flaky steps advisory until they're stable. `ci_watch` only acts on _required_ failures (`merge-conflict-handling-in-review.md` §Q4-Q5).
-- The per-PR opt-out label is already wired (`ci_watch.rs:42`). A human can quiet a remediation loop on a single PR without disabling the product-wide flag.
-- If a product-wide flake storm hits, the user disables the flag, restores green, re-enables. Same playbook as the conflict-watch one.
-
-This is _not_ a v1 blocker — `ci_watch` is already defensive — but the implementation task that promotes a step to required must check `ci_watch`'s remediation-budget config and confirm the per-PR cap is sane (default is 3 attempts).
-
-### R2 — Engine auto-merge path (project description claim)
-
-The parent project description says "Today the engine auto-merges on PR resolved; the CI gate must come BEFORE that path so red PRs are not auto-merged."
-
-Verified by grep — the engine does _not_ call `gh pr merge` anywhere in `tools/boss/engine`. The `merge_poller` _detects_ merges that have already happened; it does not perform them. So there is no engine-side path to gate; branch protection on the GitHub side is the only enforcement layer needed for v1.
-
-If/when the engine grows an auto-merge capability, that design must check the buildkite status before merging. Recommend the implementation task adds a defensive grep-guard test ("no `gh pr merge` calls in engine source") to lock the assumption.
-
-### R3 — jj-vs-git on the CI worker
-
-Buildkite checks out the repo via git, into a path it controls. There is no jj on the agent. The pipeline scripts (`steps/*.sh`) speak git only; they never invoke `jj`. The repo's `jj` workspace surface only matters when Boss workers run inside leased cube workspaces — _that's worker plumbing, unrelated to CI_.
-
-One gotcha: if any of the test code or check scripts assumes a `.jj/` directory exists (e.g., a checkleft check that reads `jj log`), it will fail in CI. None of the current checks do this (verified against `CHECKS.yaml`), but the implementation task should add a grep-guard or accept a `--no-jj` flag where relevant.
-
-### R4 — Secrets and auth
-
-Flunge's buildkite has access to a shared secrets store (BUILDKITE_AGENT_TOKEN, ssh deploy keys, ghcr creds). Mono's pipeline will need:
-
-- Repo read access (already covered if we share the flunge agent fleet's GitHub token).
-- Buildkite API token if any step needs to call back into buildkite (probably not in v1).
-- No write access to anything outside the build directory.
-
-This is a checklist item for the "mirror pipeline shell" implementation task, not a design choice. Listed here so it doesn't get forgotten.
-
-### R5 — How does the `checks.sh` step interact with CHECKS.yaml?
-
-The repo already runs `checkleft` (or equivalent) against `CHECKS.yaml`. In CI the same runner must execute; the implementation task confirms the exact invocation (`bazel run //tools/checkleft -- --against=origin/main`? `pnpm checks`? `cargo run -p checkleft`?). Recommend reading what the worker entrypoint does today (the `.claude/CLAUDE.md` hook chain) and mirroring it in the CI script.
-
-### Q1 — Do we want the pipeline triggered on PR draft → ready transitions, or only on push?
-
-Buildkite's default is "on push to a tracked branch". GitHub-mode triggers can also fire on PR label changes. v1 recommendation: push only. If a human flips draft → ready without pushing, they can re-trigger manually with `bk build create`. Re-evaluate if this turns into a recurring source of stale-CI confusion.
-
-### Q2 — Required-check naming convention
-
-The branch protection rules reference exact check names. Once those names are wired into branch protection, renaming a step in `pipeline.yml` silently breaks the gate (the rule waits forever for `buildkite/mono/cargo-check` to report, but the renamed step now emits `buildkite/mono/cargo-verify`). v1 should:
-
-- Pick names once and treat them as a public contract.
-- Add a `.buildkite/REQUIRED_CHECKS.md` listing the canonical names so a PR that renames a step is forced to update branch protection in lockstep.
-
-Open question for the human reviewer: do you want the name format `buildkite/mono/<step>` (matches flunge?) or `mono / <step>` (matches typical GitHub Actions naming)? Buildkite emits the former by default; flagging in case there's a house style.
-
----
-
-## Follow-up implementation tasks (informational — not part of this PR)
-
-The next project decomposition will likely produce, roughly in this order:
-
-1. Audit flunge's buildkite pipeline; produce a short reference doc.
-2. Land `.buildkite/` skeleton in mono (empty steps, "hello world" green).
-3. Wire the static checks (`cargo check`, `bazel build`, `pnpm typecheck`, `checks.sh`).
-4. Wire the test steps (`bazel test`, `pnpm test`).
-5. Promote checks to required (per ramp above); turn on branch protection.
-6. ~~Surface CI status in Boss UI (kanban badge on in-review cards).~~ **Done** — see "Boss UI integration — shipped" above.
-7. ~~Post-P1 cleanup: drop `cargo-test`; expand bazel coverage signal.~~ **Done in this refresh** — P1 has landed, so the pipeline ships without a `cargo-test` step in the first place; no follow-up trim required.
-8. Bazel remote cache (fast-follow once contention warrants).
-
-Each lands as its own PR. Each remaining item (#1–#5, #8) is gated on the previous within that chain.
+1. ~~Audit flunge's buildkite pipeline~~ — **done**, PR #555 (`flunge-buildkite-pipeline-reference.md`).
+2. ~~Land `.buildkite/` skeleton~~ — **done**, PR #563.
+3. ~~Wire static checks~~ — **done**, PR #565 (cargo-check and pnpm-typecheck subsequently removed; see above).
+4. ~~Wire test steps~~ — **done**, PR #567 (pnpm-test subsequently removed).
+5. ~~Promote checks to required; enable branch protection~~ — **done**, PR #599 + operator enablement; re-ramped through the 2026-07-13 `bazel-build-test` rename.
+6. ~~Surface CI status in Boss UI~~ — **done** (`PrCiIndicator`).
+7. ~~Post-P1 cargo-test cleanup~~ — **moot**; pipeline shipped bazel-only.
+8. Bazel remote cache — **still open as a conditional fast-follow**; no trigger condition met yet.
