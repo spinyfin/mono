@@ -1471,7 +1471,24 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     }
     match execution.kind {
         ExecutionKind::ProjectDesign => {
-            prompt.push_str(&compose_design_directive(parent_project));
+            // A `design_postmortem` task reuses `ProjectDesign` for dispatch/
+            // lifecycle purposes (same doc-PR handling, same repo resolution
+            // — see `exec_status_helpers`), but its remit is the opposite of
+            // an initial design task: update the *existing* doc to reflect
+            // what shipped, not author a new one. Branch on the task's own
+            // `kind` (not `execution.kind`) to give it the right directive.
+            let is_postmortem = matches!(
+                work_item,
+                WorkItem::Task(t) | WorkItem::Chore(t) if t.kind == TaskKind::DesignPostmortem
+            );
+            if is_postmortem {
+                prompt.push_str(&compose_design_postmortem_directive(
+                    parent_project,
+                    &crate::structured_output::default_path_string(&execution.id),
+                ));
+            } else {
+                prompt.push_str(&compose_design_directive(parent_project));
+            }
         }
         ExecutionKind::InvestigationImplementation => {
             prompt.push_str(&compose_investigation_directive());
@@ -2115,6 +2132,79 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("  - This section is what P783's auto-populate will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str(&design_questions_manifest_block());
     out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
+    out
+}
+
+/// Directive block for a `kind = 'design_postmortem'` task, auto-scheduled
+/// by `project_postmortem_sweep` once a project's implementation work
+/// drains to zero. Deliberately the mirror image of
+/// [`compose_design_directive`]: that one says "author a new doc"; this one
+/// says "reconcile the existing doc against what actually shipped." The
+/// task's own `description` (rendered above this block via
+/// `work_item_details`) already carries the remit brief — the project's
+/// design-doc path/branch and the enumerated merged PRs to review — so this
+/// block only needs to state the doc-only scope constraint and the update
+/// method.
+fn compose_design_postmortem_directive(parent_project: Option<&Project>, structured_output_path: &str) -> String {
+    let mut out = String::new();
+    out.push_str("Expected outcome for this run:\n");
+    out.push_str(
+        "- the deliverable is an **update to the project's existing design document**, not a new document and not an implementation. Do not edit code, do not start prototyping, do not open partial implementation PRs.\n",
+    );
+    out.push_str(
+        "- the PR for this run contains **only the design doc update** (edits to the existing markdown file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n",
+    );
+    if let Some(path_line) = canonical_design_doc_path_line(parent_project) {
+        out.push_str(&path_line);
+    }
+    out.push_str(&doc_structure_conventions_block());
+    out.push_str("- review each merged PR listed in the details above (`gh pr view`/`gh pr diff`) alongside the current doc, and update the doc to reflect **as-built reality**:\n");
+    out.push_str("  - decisions that diverged from what the doc originally said, and why (as best you can tell from the PR/commit history).\n");
+    out.push_str("  - scope that was added or dropped relative to the doc's plan.\n");
+    out.push_str("  - contracts, interfaces, or data models that evolved during implementation.\n");
+    out.push_str(
+        "- edit the doc in place — do not append a separate \"postmortem\" or \"changelog\" section unless the doc already uses that structure. The goal is a design doc that reads as if it were written *after* the work, not a diff log bolted onto the original.\n",
+    );
+    out.push_str(
+        "- if the merged PRs matched the doc's plan closely, the update may be small (e.g. a note confirming what shipped matches the design) — that's fine, but still open a PR with that update rather than stopping with no PR at all.\n",
+    );
+    out.push_str("- open a PR with the update regardless of which repo the doc lands in — the PR is the review window, same as any design change.\n");
+    out.push_str(&postmortem_followups_emission_block(structured_output_path));
+    out
+}
+
+/// Required (not optional) structured-output instruction for
+/// `design_postmortem` tasks: uncompleted work the review surfaces —
+/// scope claimed but not delivered, a handoff that fell through (e.g. a
+/// wire field shipped backend-side whose frontend consumption was never
+/// done), or work the design promised that no task ever owned — must
+/// become real follow-up tasks, not just a mention in the doc. A prior
+/// engine feature found that free-text "filed as a follow-up" claims in
+/// worker PR bodies had a 100% miss rate because no write path for them
+/// ever existed; this artifact IS that write path, so it is mandatory: the
+/// engine (`postmortem_followups::reconcile_postmortem_followups`) treats
+/// a missing file as an error, not as "found nothing."
+fn postmortem_followups_emission_block(output_path: &str) -> String {
+    let mut out = String::new();
+    out.push_str("\n## Required: report uncompleted work surfaced by this review\n\n");
+    out.push_str(
+        "While reviewing the project's PRs against the design doc, you may find work the design promised but that no task ever delivered — scope a task claimed but didn't finish, a handoff that fell through (e.g. a backend field shipped with no frontend consumption), or a gap between plan and as-built reality that needs its own follow-up task. This is DIFFERENT from documenting what shipped in the doc itself: these are gaps that need NEW work scheduled.\n\n",
+    );
+    out.push_str(&format!(
+        "You MUST **write** a JSON array to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`) before finishing, even if the array is empty:\n\n`{output_path}`\n\nThis path is outside the repo/workspace, so it never pollutes your PR. Omitting the file entirely is treated by the engine as an error, not as \"no findings\" — writing `[]` is how you report that you found no uncompleted work. Each array element is an object with all three fields **required**:\n",
+    ));
+    out.push_str("- `name` (required): a short, specific task title.\n");
+    out.push_str("- `description` (required): what the task needs to deliver.\n");
+    out.push_str(
+        "- `evidence` (required): the concrete signal that this work is genuinely missing — a PR number, a code/doc reference, a specific gap you observed. Not a vague impression.\n\n",
+    );
+    out.push_str(
+        "File contents example (non-empty):\n\n```json\n[{\"name\": \"Wire the frontend to the new export field\", \"description\": \"PR #142 added `export_format` to the API response but no UI consumes it.\", \"evidence\": \"grep for export_format in app-macos/Sources shows zero references; design doc \\u00a74 calls for a format picker.\"}]\n```\n\n",
+    );
+    out.push_str("File contents example (nothing found):\n\n```json\n[]\n```\n\n");
+    out.push_str(
+        "The engine creates a real task in this project for every entry — these are NOT proposals a human reviews first, so only include genuine gaps you have concrete evidence for, never speculative or restated-scope items.\n",
+    );
     out
 }
 

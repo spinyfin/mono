@@ -1193,6 +1193,18 @@ pub async fn serve_with_merge_probe(
         Arc::new(move || coord_for_dep_unblock.kick()),
     );
 
+    // Project-postmortem sweeper: when a project's implementation work
+    // (project_task/design/investigation, excluding the postmortem kind
+    // itself) drains to zero, auto-schedule a `design_postmortem` task that
+    // reviews the wave's merged PRs against the design doc. Edge-triggered
+    // and re-armable — see project_postmortem_sweep.rs for the full design.
+    let coord_for_postmortem = server_state.execution_coordinator.clone();
+    let _project_postmortem_handle = crate::project_postmortem_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        Duration::from_secs(crate::project_postmortem_sweep::PROJECT_POSTMORTEM_SWEEP_INTERVAL_SECS),
+        Arc::new(move || coord_for_postmortem.kick()),
+    );
+
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,
     // for every enabled `schedule` automation that is due, compute its
     // cron/timezone occurrence, enforce the open-task gate, apply catch-up /

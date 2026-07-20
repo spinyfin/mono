@@ -21,13 +21,16 @@ impl WorkDb {
     }
 
     /// True when `task` is "design-family" for the Fable-tier dispatch
-    /// floor (policy addendum, 2026-07-13): its own kind is `design` or
-    /// `investigation`, or — transitively — it is a `revision` whose chain
-    /// root (the first non-revision ancestor, see [`chain_root`]) has kind
-    /// `design` or `investigation`. Any other kind, or a `revision` with a
-    /// broken/missing parent link, is not design-family.
+    /// floor (policy addendum, 2026-07-13): its own kind is `design`,
+    /// `investigation`, or `design_postmortem`, or — transitively — it is a
+    /// `revision` whose chain root (the first non-revision ancestor, see
+    /// [`chain_root`]) has one of those kinds. Any other kind, or a
+    /// `revision` with a broken/missing parent link, is not design-family.
     pub(crate) fn is_design_family(&self, task: &Task) -> Result<bool> {
-        if matches!(task.kind, TaskKind::Design | TaskKind::Investigation) {
+        if matches!(
+            task.kind,
+            TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem
+        ) {
             return Ok(true);
         }
         if task.kind != TaskKind::Revision {
@@ -44,7 +47,10 @@ impl WorkDb {
                 row.get(0)
             })
             .optional()?;
-        Ok(matches!(root_kind.as_deref(), Some("design") | Some("investigation")))
+        Ok(matches!(
+            root_kind.as_deref(),
+            Some("design") | Some("investigation") | Some("design_postmortem")
+        ))
     }
 }
 
@@ -465,16 +471,16 @@ pub(crate) fn attach_ai_reviewing_flag(
 
 /// Default `effort_level` for a revision the caller didn't supply one for.
 ///
-/// Design-family chain roots (`design`/`investigation`) default to `large`
-/// so the resolved `effort_level` is never a hand-set-looking sub-`large`
-/// value on a row nobody actually demoted — the Fable-tier dispatch floor
-/// (`resolve_spawn_config_with_family_floor`) only treats a sub-`large`
-/// level as an opt-out when it is hand-set, and this default must never be
-/// mistaken for one. Every other chain root keeps the original `small`
-/// default (revision-tasks.md §Q7).
+/// Design-family chain roots (`design`/`investigation`/`design_postmortem`)
+/// default to `large` so the resolved `effort_level` is never a
+/// hand-set-looking sub-`large` value on a row nobody actually demoted — the
+/// Fable-tier dispatch floor (`resolve_spawn_config_with_family_floor`) only
+/// treats a sub-`large` level as an opt-out when it is hand-set, and this
+/// default must never be mistaken for one. Every other chain root keeps the
+/// original `small` default (revision-tasks.md §Q7).
 fn default_revision_effort_level(root_kind: &TaskKind) -> &'static str {
     match root_kind {
-        TaskKind::Design | TaskKind::Investigation => "large",
+        TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem => "large",
         _ => "small",
     }
 }

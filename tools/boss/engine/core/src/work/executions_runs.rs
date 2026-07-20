@@ -563,6 +563,21 @@ impl WorkDb {
                         )?;
                     }
                 }
+                // Design postmortems dispatch independently too — they are
+                // scheduled by `project_postmortem_sweep` only once the
+                // project's ordinal-based task chain is fully drained, so
+                // there is never a chain to serialize against.
+                TaskKind::DesignPostmortem => {
+                    if task_accepts_execution(&task) {
+                        reconcile_work_item_execution(
+                            &tx,
+                            &mut result,
+                            &task.id,
+                            ExecutionKind::ProjectDesign,
+                            ExecutionStatus::Ready,
+                        )?;
+                    }
+                }
                 // Revision tasks dispatch independently like investigations.
                 // Each pushes a new commit to the *parent's* existing PR
                 // branch rather than opening a new PR.  The gate checks
@@ -607,6 +622,11 @@ impl WorkDb {
                 };
                 let execution_kind = match task.kind {
                     TaskKind::Design => ExecutionKind::ProjectDesign,
+                    // Never actually reached: DesignPostmortem rows are
+                    // routed to the independent-dispatch arm above and never
+                    // land in `project_tasks`. Mapped defensively in case
+                    // that invariant ever breaks.
+                    TaskKind::DesignPostmortem => ExecutionKind::ProjectDesign,
                     // All remaining kinds in this bucket are project_task rows;
                     // the other variants are handled before being bucketed here.
                     TaskKind::ProjectTask
@@ -1634,6 +1654,23 @@ impl WorkDb {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![work_item_id, epoch_secs.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Force `completed_at` to an exact epoch-seconds value on an existing
+    /// row, bypassing the normal `COALESCE(completed_at, now)` write-once
+    /// semantics. `completed_at`'s one-second resolution makes tests that
+    /// depend on strict before/after ordering between two rows racy against
+    /// real wall-clock time (two DB writes in the same in-process test can
+    /// easily land in the same second); this lets a test establish a
+    /// deterministic ordering directly instead.
+    #[cfg(test)]
+    pub fn force_completed_at_for_test(&self, work_item_id: &str, epoch_secs: i64) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks SET completed_at = ?2 WHERE id = ?1",
             params![work_item_id, epoch_secs.to_string()],
         )?;
         Ok(())

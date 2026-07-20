@@ -20,7 +20,8 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// their own PR and follow the active → in_review → done lifecycle. Used in
 /// every `kind IN (...)` filter that drives the merge-poller and blocking
 /// sweeps so a new kind only needs to be added here to be wired in everywhere.
-pub(crate) const CHORE_LIKE_KINDS_SQL: &str = "'chore', 'project_task', 'design', 'investigation', 'followup'";
+pub(crate) const CHORE_LIKE_KINDS_SQL: &str =
+    "'chore', 'project_task', 'design', 'investigation', 'followup', 'design_postmortem'";
 
 /// Sliding window for the merge-conflict churn-guard heuristic
 /// (`merge-conflict-handling-in-review.md` Q6 / Phase 6 #16): the
@@ -316,6 +317,7 @@ mod comments;
 mod conflict_res;
 mod create_entities;
 mod dep_helpers;
+mod design_postmortem;
 mod dispatch;
 mod dispatch_class;
 mod dispatch_helpers;
@@ -349,6 +351,7 @@ mod workitems;
 pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;
 pub(crate) use dep_helpers::*;
+pub(crate) use design_postmortem::TriggerTaskSnapshot;
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
 pub(crate) use exec_status_helpers::*;

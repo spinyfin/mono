@@ -17,7 +17,13 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
             match task.kind {
                 TaskKind::Chore | TaskKind::Followup => ExecutionKind::ChoreImplementation,
-                TaskKind::Design => ExecutionKind::ProjectDesign,
+                // Reuses `ProjectDesign`: a postmortem's deliverable is a doc PR
+                // against the project's *existing* design doc, same dispatch/
+                // lifecycle handling as an initial design task. The prompt
+                // composer (`compose_worker_prompt`) branches on the task's own
+                // `kind` to give it the postmortem-specific directive instead of
+                // the "write a new design" one.
+                TaskKind::Design | TaskKind::DesignPostmortem => ExecutionKind::ProjectDesign,
                 TaskKind::Revision => ExecutionKind::RevisionImplementation,
                 TaskKind::Investigation => ExecutionKind::InvestigationImplementation,
                 TaskKind::ProjectTask | TaskKind::Task => ExecutionKind::TaskImplementation,
@@ -169,7 +175,9 @@ pub(crate) fn resolve_repo_for_work_item(conn: &Connection, work_item_id: &str) 
     let product = query_product(conn, &product_id)?
         .with_context(|| format!("orphan task {work_item_id}: parent product {product_id} missing"))?;
     match kind {
-        TaskKind::Design => {
+        // A postmortem edits the project's existing design doc, which lives
+        // in the same repo a `design` task's doc would — same resolution.
+        TaskKind::Design | TaskKind::DesignPostmortem => {
             if let Some(url) = product.design_repo.as_deref().filter(|s| !s.is_empty()) {
                 return Ok(Some(url.to_owned()));
             }
