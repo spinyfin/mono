@@ -4077,6 +4077,7 @@ async fn run_show_leaf(
     let executions = list_executions_for_item(client, &item.id).await?;
     let runtime = get_task_runtime(client, &item.id).await?;
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
+    let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
     let task_json = task_json_with_runtime(&item, &runtime)?;
     print_entity(
         ctx,
@@ -4085,10 +4086,12 @@ async fn run_show_leaf(
             "dependencies": detail,
             "executions": executions,
             "attention_items": attention_items,
+            "attention_groups": attention_groups,
         }),
         || {
             print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
             print_attention_items_section(&attention_items);
+            print_attention_groups_section(&attention_groups);
             print_runtime_section(&runtime);
             print_dependency_section(&detail);
             print_executions_section(&executions);
@@ -7898,6 +7901,26 @@ fn print_attention_items_section(items: &[WorkAttentionItem]) {
     println!("Attention ({}):", open.len());
     for item in &open {
         println!("  [{}] {} (since {})", item.kind, item.title, item.created_at);
+    }
+}
+
+/// Print the newer attention-groups surface (`attention_groups`/`attentions`,
+/// the store `boss attention list` reads) for a task's detail view. Keeps
+/// `boss task show` a complete picture of what's pending against a task even
+/// though writers like `Populator::finish` moved off the legacy
+/// `work_attention_items` table onto this store — see
+/// `list_attention_items_for_work_item` for the older, still-live surface
+/// this section complements. `groups` is pre-filtered to open/partially
+/// answered by the caller's query, so nothing here needs re-filtering.
+fn print_attention_groups_section(groups: &[AttentionGroup]) {
+    if groups.is_empty() {
+        return;
+    }
+    println!();
+    println!("Attention groups ({}):", groups.len());
+    for g in groups {
+        let short = g.short_id.map(|n| format!("A{n}")).unwrap_or_else(|| g.id.clone());
+        println!("  [{short}] {} (kind={}, since {})", g.state, g.kind, g.created_at);
     }
 }
 

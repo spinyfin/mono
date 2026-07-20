@@ -545,12 +545,21 @@ fn assert_graph_matches(db: &WorkDb, product_id: &str, project_id: &str, run_id:
     }
 }
 
-fn open_attention_count(db: &WorkDb, design_id: &str) -> usize {
-    db.list_attention_items_for_work_item(design_id)
+/// Count of open/partially-answered `followup` attention *members* the
+/// Populator raised against `design_id` — the same
+/// `WorkDb::list_attention_groups` query `boss attention list` (and its
+/// `ListAttentionGroups` RPC handler) runs, not the legacy
+/// `work_attention_items` table that surface never reads. Counts members
+/// rather than groups: the group key is stable per design task, so a
+/// second raise against the same task joins the existing group as an
+/// additional member instead of creating a new one — a group count would
+/// stay at 1 even when a duplicate raise happened.
+fn open_attention_count(db: &WorkDb, product_id: &str, design_id: &str) -> usize {
+    db.list_attention_groups(product_id, None, Some(design_id), Some("followup"), None)
         .unwrap()
-        .into_iter()
-        .filter(|item| item.kind == "auto_populate" && item.status == "open")
-        .count()
+        .iter()
+        .map(|group| db.list_attentions_for_group(&group.id).unwrap().len())
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +606,7 @@ async fn run_fixture_and_assert(fixture: &Fixture) {
 
     // Exactly one operator-facing attention item.
     assert_eq!(
-        open_attention_count(&db, &design_id),
+        open_attention_count(&db, &product_id, &design_id),
         1,
         "[{}] attention item",
         fixture.label
@@ -752,7 +761,7 @@ async fn double_fire_is_idempotent_for_every_fixture() {
         );
         // Only one attention item — the skip does not re-raise one.
         assert_eq!(
-            open_attention_count(&db, &design_id),
+            open_attention_count(&db, &product_id, &design_id),
             1,
             "[{}] one attention item",
             fixture.label
@@ -784,7 +793,7 @@ async fn no_breakdown_is_clean_no_op() {
     assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
     // no_breakdown is terminal, not a live outcome — the gate is released.
     assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +827,7 @@ async fn cyclic_proposal_on_real_graph_is_rejected() {
     assert_eq!(outcome, PopulateOutcome::RejectedBadGraph);
     // No partial graph: the rejection happens before any write.
     assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -849,7 +858,7 @@ async fn over_cap_rejects_whole_real_graph() {
     );
     // Nothing is silently truncated — zero tasks created.
     assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +894,7 @@ async fn pre_seeded_project_is_refused() {
     let tasks = materialized_tasks(&db, &product_id, &project_id);
     assert_eq!(tasks.len(), 1);
     assert!(tasks.contains_key("Hand-written task"));
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     // The claimed row went terminal, releasing the gate for a `--force` replan.
     assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
 }
@@ -913,7 +922,7 @@ async fn fetch_failure_is_recorded_no_op() {
 
     assert_eq!(outcome, PopulateOutcome::FetchFailed);
     assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     // Terminal outcome releases the gate so a later `boss project plan` retries.
     assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
 }
@@ -937,7 +946,7 @@ async fn doc_missing_is_recorded_no_op() {
 
     assert_eq!(outcome, PopulateOutcome::DocMissing);
     assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -963,7 +972,7 @@ async fn planner_no_api_key_is_recorded_no_op() {
 
     assert_eq!(outcome, PopulateOutcome::PlannerFailed);
     assert!(materialized_tasks(&db, &product_id, &project_id).is_empty());
-    assert_eq!(open_attention_count(&db, &design_id), 1);
+    assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
 }
 
 // ---------------------------------------------------------------------------

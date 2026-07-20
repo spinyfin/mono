@@ -51,7 +51,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 
 use boss_protocol::{
-    CreateAttentionItemInput, DocRef, FrontendEvent, PLANNER_OUTCOME_DOC_MISSING, PLANNER_OUTCOME_FETCH_FAILED,
+    CreateAttentionInput, DocRef, FrontendEvent, PLANNER_OUTCOME_DOC_MISSING, PLANNER_OUTCOME_FETCH_FAILED,
     PLANNER_OUTCOME_NO_BREAKDOWN, PLANNER_OUTCOME_PLANNER_FAILED, PLANNER_OUTCOME_REJECTED_CYCLE,
     PLANNER_OUTCOME_REJECTED_TOO_MANY, PLANNER_OUTCOME_SKIPPED_PRE_SEEDED, PLANNER_OUTCOME_STAGED, PlannerInput,
     PlannerOutput, ProductContext, ProjectContext, TaskBrief, TaskKind, WorkItem,
@@ -78,10 +78,12 @@ pub const CALLER_MERGE_TRIGGER: &str = "merge_trigger";
 /// command (`boss project plan <project>` / `--dry-run` preview / replan).
 pub const CALLER_OPERATOR: &str = "operator";
 
-/// `kind` of the `WorkAttentionItem` the Populator raises against the design
-/// task. A single kind keeps the surface simple; the outcome-specific text
-/// lives in the title/body.
-const ATTENTION_KIND: &str = "auto_populate";
+/// Stable `group_key` prefix for the `followup`-kind attention group the
+/// Populator raises against the design task. Explicit (rather than the
+/// default `followup|{task_id}` derivation) so a populate outcome never
+/// collapses into — or reopens — a group formed by the design worker's own
+/// `FOLLOWUPS:` block on the same task; the two are unrelated sources.
+const ATTENTION_GROUP_KEY_PREFIX: &str = "followup|populate";
 
 /// Fallback ref when the project's `design_doc_branch` pointer is unset. The
 /// design doc has merged, so it lives on the default branch.
@@ -982,13 +984,22 @@ impl Populator {
     }
 
     /// Update the claimed `planner_runs` row with the terminal patch and raise
-    /// the operator-facing attention item, publishing `AttentionItemCreated` on
-    /// the project's product topic so the operator sees the outcome-specific
-    /// text live rather than only on next poll (design §"Surfacing": "the
-    /// operator learns it happened without watching"). Both the DB write and
-    /// the publish are best-effort: a failure to surface must not itself
-    /// panic or fail the pass (the pass already did the right thing to the
-    /// DB / is no-op).
+    /// the operator-facing attention, publishing `AttentionCreated` on the
+    /// project's product topic so the operator sees the outcome-specific text
+    /// live rather than only on next poll (design §"Surfacing": "the operator
+    /// learns it happened without watching"). Both the DB write and the
+    /// publish are best-effort: a failure to surface must not itself panic or
+    /// fail the pass (the pass already did the right thing to the DB / is
+    /// no-op).
+    ///
+    /// Raised as a `followup`-kind attention (not the legacy
+    /// `work_attention_items` table) so every populate outcome — success,
+    /// low-confidence, oversize-decomposition, or an outright failure —
+    /// lands on the first-class surface `boss attention list` actually reads.
+    /// `title`/`body` double as the followup's `proposed_name` /
+    /// `proposed_description`: actioning the group files a task with that
+    /// name and body, which for a failure outcome is exactly "investigate
+    /// and re-run the populate".
     async fn finish(
         db: &WorkDb,
         ctx: &PopulateContext,
@@ -1001,22 +1012,27 @@ impl Populator {
         if let Err(err) = db.update_planner_run(run_id, patch) {
             tracing::warn!(project_id = %ctx.project_id, run_id, ?err, "populator: failed to update planner run");
         }
-        match db.create_attention_item(
-            CreateAttentionItemInput::builder()
-                .kind(ATTENTION_KIND)
-                .title(title)
-                .body_markdown(body)
-                .work_item_id(ctx.design_task_id.clone())
-                .status("open")
+        match db.create_attention(
+            CreateAttentionInput::builder()
+                .kind("followup")
+                .group_key(format!("{ATTENTION_GROUP_KEY_PREFIX}|{}", ctx.design_task_id))
+                .association_task_id(ctx.design_task_id.clone())
+                .source_kind("manual")
+                .source_task_id(ctx.design_task_id.clone())
+                .proposed_name(title)
+                .proposed_description(body)
                 .build(),
         ) {
-            Ok(item) => {
+            Ok((attention, group)) => {
                 publisher
-                    .publish_frontend_event_on_product(&ctx.product_id, FrontendEvent::AttentionItemCreated { item })
+                    .publish_frontend_event_on_product(
+                        &ctx.product_id,
+                        FrontendEvent::AttentionCreated { attention, group },
+                    )
                     .await;
             }
             Err(err) => {
-                tracing::warn!(project_id = %ctx.project_id, ?err, "populator: failed to raise attention item");
+                tracing::warn!(project_id = %ctx.project_id, ?err, "populator: failed to raise attention");
             }
         }
     }
@@ -1235,12 +1251,40 @@ mod tests {
         }
     }
 
-    fn open_attention_count(db: &WorkDb, design_id: &str) -> usize {
-        db.list_attention_items_for_work_item(design_id)
+    /// Count of open/partially-answered `followup` attention *members* the
+    /// Populator raised against `design_id` — the `boss attention list`
+    /// visible surface, not the legacy `work_attention_items` table.
+    /// Counts members rather than groups: the group key is stable per
+    /// design task, so a duplicate raise against the same task joins the
+    /// existing group as an additional member rather than forming a new
+    /// group, and a group count would not detect it.
+    fn open_attention_count(db: &WorkDb, product_id: &str, design_id: &str) -> usize {
+        db.list_attention_groups(product_id, None, Some(design_id), Some("followup"), None)
             .unwrap()
-            .into_iter()
-            .filter(|a| a.kind == ATTENTION_KIND && a.status == "open")
-            .count()
+            .iter()
+            .map(|group| db.list_attentions_for_group(&group.id).unwrap().len())
+            .sum()
+    }
+
+    /// The single populate-raised followup attention member for `design_id`.
+    /// Exactly one member exists because each test drives a single populate
+    /// pass; in production the group key is stable per design task, so a
+    /// later replan (`boss project plan --force`) against the same task
+    /// appends another member to this same still-open group rather than
+    /// starting a fresh one — used to assert on `proposed_description`
+    /// content.
+    fn populate_attention_member(db: &WorkDb, product_id: &str, design_id: &str) -> boss_protocol::Attention {
+        let groups = db
+            .list_attention_groups(product_id, None, Some(design_id), Some("followup"), None)
+            .unwrap();
+        let group = groups.first().expect("populate attention group raised");
+        let mut members = db.list_attentions_for_group(&group.id).unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "expected exactly one member in the populate followup group"
+        );
+        members.remove(0)
     }
 
     fn project_task_count(db: &WorkDb, product_id: &str, project_id: &str) -> usize {
@@ -1298,11 +1342,11 @@ mod tests {
         assert!(run.raw_output.is_some(), "raw output persisted for audit");
         assert_eq!(run.model.as_deref(), Some(PLANNER_MODEL));
         // An attention item was raised.
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
         // ... and published live on the product topic, alongside a
         // `WorkItemsCreated` batch event carrying both new tasks so the
         // kanban refreshes in one round-trip (design §"Surfacing").
-        assert_eq!(publisher.attention_items_created().await, 1);
+        assert_eq!(publisher.attentions_created().await, 1);
         assert_eq!(publisher.work_items_created_len().await, Some(2));
     }
 
@@ -1332,7 +1376,7 @@ mod tests {
                 low_confidence: true
             }
         );
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     }
 
     /// Observability gap this module closes: when the oversize decomposition
@@ -1375,20 +1419,15 @@ mod tests {
             "result_summary must record the oversize decomposition outcome, got: {summary}"
         );
 
-        let items = db.list_attention_items_for_work_item(&design_id).unwrap();
-        let item = items
-            .iter()
-            .find(|a| a.kind == ATTENTION_KIND)
-            .expect("attention item raised");
+        let member = populate_attention_member(&db, &product_id, &design_id);
+        let description = member.proposed_description.expect("proposed_description set");
         assert!(
-            item.body_markdown.contains("oversize") && item.body_markdown.contains('9'),
-            "attention item must describe the oversize decomposition outcome, got: {}",
-            item.body_markdown
+            description.contains("oversize") && description.contains('9'),
+            "attention must describe the oversize decomposition outcome, got: {description}",
         );
         assert!(
-            item.body_markdown.contains(&run.id),
-            "attention item must point at the planner_runs row, got: {}",
-            item.body_markdown
+            description.contains(&run.id),
+            "attention must point at the planner_runs row, got: {description}",
         );
     }
 
@@ -1418,15 +1457,11 @@ mod tests {
         .await;
         assert!(matches!(outcome, PopulateOutcome::Staged { .. }));
 
-        let items = db.list_attention_items_for_work_item(&design_id).unwrap();
-        let item = items
-            .iter()
-            .find(|a| a.kind == ATTENTION_KIND)
-            .expect("attention item raised");
+        let member = populate_attention_member(&db, &product_id, &design_id);
+        let description = member.proposed_description.expect("proposed_description set");
         assert!(
-            item.body_markdown.contains("decomposition gate"),
-            "attention item must mention the decomposition gate fired even though it resolved cleanly, got: {}",
-            item.body_markdown
+            description.contains("decomposition gate"),
+            "attention must mention the decomposition gate fired even though it resolved cleanly, got: {description}",
         );
     }
 
@@ -1500,12 +1535,12 @@ mod tests {
         assert_eq!(outcome, PopulateOutcome::SkippedPreSeeded { existing: 1 });
         // The planner's task was NOT added; only the pre-seeded one remains.
         assert_eq!(project_task_count(&db, &product_id, &project_id), 1);
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
         // The claimed row went terminal (gate released for a `--force` replan).
         assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
         // Refusal still surfaces an attention item live; no tasks were
         // created, so no `WorkItemsCreated` event should have been published.
-        assert_eq!(publisher.attention_items_created().await, 1);
+        assert_eq!(publisher.attentions_created().await, 1);
         assert_eq!(publisher.work_items_created_len().await, None);
     }
 
@@ -1579,7 +1614,7 @@ mod tests {
         .await;
         assert_eq!(outcome, PopulateOutcome::DocMissing);
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     }
 
     #[tokio::test]
@@ -1617,7 +1652,50 @@ mod tests {
         .await;
         assert_eq!(outcome, PopulateOutcome::PlannerFailed);
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
+    }
+
+    /// The gap this migration closes: a `planner_failed` outcome must land on
+    /// the surface `boss attention list` actually reads
+    /// (`WorkDb::list_attention_groups`, the same query the
+    /// `ListAttentionGroups` RPC handler runs) — not only on the legacy
+    /// `work_attention_items` table, which that CLI surface never queries.
+    #[tokio::test]
+    async fn planner_failed_outcome_is_visible_via_the_attention_list_query_path() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::NoApiKey,
+        );
+        let outcome = Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
+        )
+        .await;
+        assert_eq!(outcome, PopulateOutcome::PlannerFailed);
+
+        // Exactly what `boss attention list` queries: no state filter
+        // defaults to the actionable `open` + `partially_answered` set, so
+        // an item that only lands in `list_attention_groups` output is
+        // guaranteed operator-visible.
+        let groups = db.list_attention_groups(&product_id, None, None, None, None).unwrap();
+        let group = groups
+            .iter()
+            .find(|g| g.association_task_id.as_deref() == Some(design_id.as_str()))
+            .expect("planner_failed raises a group visible via the default (no-filter) attention list query");
+        assert_eq!(group.kind, "followup");
+        assert_eq!(group.state, "open");
+
+        let members = db.list_attentions_for_group(&group.id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].proposed_name.as_deref(),
+            Some("Auto-populate failed: planner error")
+        );
     }
 
     // ---- validation rejections --------------------------------------------
@@ -1666,7 +1744,7 @@ mod tests {
         .await;
         assert_eq!(outcome, PopulateOutcome::RejectedTooMany { count: 3, max: 2 });
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     }
 
     #[tokio::test]
@@ -1702,7 +1780,7 @@ mod tests {
         .await;
         assert_eq!(outcome, PopulateOutcome::RejectedBadGraph);
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
-        assert_eq!(open_attention_count(&db, &design_id), 1);
+        assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
     }
 
     // ---- enqueue is a no-op when not installed -----------------------------
