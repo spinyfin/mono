@@ -54,9 +54,9 @@ const TASKS_NO_ACTOR_COLUMNS: &str = "priority TEXT NOT NULL DEFAULT 'medium',
      created_via TEXT NOT NULL DEFAULT 'unknown'";
 
 /// The v4 task columns plus `created_via`, added in schema v5.
-const TASKS_V5_COLUMNS: &str = "last_status_actor TEXT NOT NULL DEFAULT 'human',
-     priority TEXT NOT NULL DEFAULT 'medium',
-     created_via TEXT NOT NULL DEFAULT 'unknown'";
+fn tasks_v5_columns() -> String {
+    format!("{TASKS_V4_COLUMNS},\n     created_via TEXT NOT NULL DEFAULT 'unknown'")
+}
 
 /// The baseline (schema v3) column list for each legacy table. Later
 /// versions only ever appended columns, so a call site describes its

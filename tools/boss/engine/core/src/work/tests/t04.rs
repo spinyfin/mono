@@ -322,7 +322,7 @@ fn migration_renames_auto_rebase_enabled_when_present() {
         // The pre-rename column this migration is about.
         .products("auto_rebase_enabled INTEGER NOT NULL DEFAULT 1")
         .projects(PROJECTS_V4_COLUMNS)
-        .tasks(TASKS_V5_COLUMNS)
+        .tasks(&tasks_v5_columns())
         .seed(
             "INSERT INTO products(id, name, slug, status, created_at, updated_at,
                                    auto_rebase_enabled)
@@ -376,7 +376,7 @@ fn migration_backfills_blocked_reason_for_active_prereqs() {
     LegacySchema::new(5)
         .products(NO_EXTRA_COLUMNS)
         .projects(PROJECTS_V4_COLUMNS)
-        .tasks(TASKS_V5_COLUMNS)
+        .tasks(&tasks_v5_columns())
         .ddl(
             "CREATE TABLE work_item_dependencies (
                  dependent_id TEXT NOT NULL, prerequisite_id TEXT NOT NULL,
@@ -1007,12 +1007,14 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
     LegacySchema::new(7)
         .products("auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 1")
         .projects(PROJECTS_V4_COLUMNS)
-        // "MC Phase-1 only": blocked_reason + blocked_attempt_id, but
-        // none of the Phase-7 columns the migration under test adds.
+        // Carries the merge-conflict task columns (blocked_reason,
+        // blocked_attempt_id) but none of the CI signal columns the
+        // migration under test adds.
         .tasks(&format!(
-            "{TASKS_V5_COLUMNS},
+            "{},
      blocked_reason TEXT,
-     blocked_attempt_id TEXT"
+     blocked_attempt_id TEXT",
+            tasks_v5_columns()
         ))
         .ddl(
             "CREATE TABLE conflict_resolutions (
