@@ -186,6 +186,7 @@ pub(crate) fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) 
                 TaskKind::Chore | TaskKind::Followup => "chore",
                 TaskKind::Design
                 | TaskKind::Investigation
+                | TaskKind::DesignPostmortem
                 | TaskKind::ProjectTask
                 | TaskKind::Revision
                 | TaskKind::Task => "task",

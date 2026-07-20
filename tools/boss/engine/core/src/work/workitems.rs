@@ -659,7 +659,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation', 'revision') AND deleted_at IS NULL AND status != 'archived'
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation', 'revision', 'design_postmortem') AND deleted_at IS NULL AND status != 'archived'
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;

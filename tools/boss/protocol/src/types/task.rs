@@ -325,6 +325,16 @@ pub enum TaskKind {
     /// UI rendering and provenance tracking.
     Followup,
     Investigation,
+    /// Auto-scheduled by `project_postmortem_sweep` when a project's
+    /// non-terminal task count (`project_task`/`design`/`investigation`,
+    /// deliberately excluding this kind itself — see that module's doc
+    /// comment) drops to zero. Reviews the project's merged PRs since the
+    /// last postmortem and updates the project's design doc to reflect
+    /// what actually shipped. Project-scoped only (always has a
+    /// `project_id`); deliverable is a doc PR against the project's
+    /// existing `design_doc_*` pointer, resolved the same way a `Design`
+    /// task's doc is (see `completion.rs`'s doc-link gate).
+    DesignPostmortem,
     ProjectTask,
     Revision,
     Task,
@@ -337,6 +347,7 @@ impl TaskKind {
             Self::Design => "design",
             Self::Followup => "followup",
             Self::Investigation => "investigation",
+            Self::DesignPostmortem => "design_postmortem",
             Self::ProjectTask => "project_task",
             Self::Revision => "revision",
             Self::Task => "task",
@@ -358,12 +369,13 @@ impl std::str::FromStr for TaskKind {
             "design" => Ok(Self::Design),
             "followup" => Ok(Self::Followup),
             "investigation" => Ok(Self::Investigation),
+            "design_postmortem" => Ok(Self::DesignPostmortem),
             "project_task" => Ok(Self::ProjectTask),
             "revision" => Ok(Self::Revision),
             "task" => Ok(Self::Task),
             other => Err(format!(
                 "unknown task kind: `{other}`; expected one of: \
-                 chore, design, followup, investigation, project_task, revision, task"
+                 chore, design, followup, investigation, design_postmortem, project_task, revision, task"
             )),
         }
     }

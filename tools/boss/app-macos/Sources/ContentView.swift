@@ -1727,14 +1727,15 @@ private struct WorkBoardCardItem: View {
             ? model.dragRefusalNotice?.message
             : nil
         let repoChip = model.repoChip(for: task)
-        let designDocProject: WorkProject? = task.kind == "design"
+        let designDocProject: WorkProject? = (task.kind == "design" || task.kind == "design_postmortem")
             ? task.projectID.flatMap { model.project(withID: $0) }
             : nil
-        // Design cards resolve their doc-link state from the parent PROJECT;
-        // project-less docs-backed items (investigations) carry an
-        // engine-resolved state on the task itself (`docLinkState`). Prefer the
-        // project state when present, else fall back to the per-task state so
-        // investigation cards render the same Review-lane doc-link icon.
+        // Design and design-postmortem cards resolve their doc-link state
+        // from the parent PROJECT; project-less docs-backed items
+        // (investigations) carry an engine-resolved state on the task itself
+        // (`docLinkState`). Prefer the project state when present, else fall
+        // back to the per-task state so investigation cards render the same
+        // Review-lane doc-link icon.
         let designDocState: ProjectDesignDocState? = designDocProject
             .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
             ?? task.docLinkState

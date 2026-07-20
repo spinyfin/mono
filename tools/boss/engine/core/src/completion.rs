@@ -3724,8 +3724,18 @@ must not be asked to open one",
         // silent for them. Detector errors are logged inside the detector —
         // they must not surface here because they'd mask the successful PR
         // transition.
+        //
+        // `design_postmortem` completions skip the generic best-effort
+        // followups mechanism entirely (see the guard below) in favour of
+        // the mandatory, stronger `postmortem_followups` path — computed
+        // once here so both spots agree on the kind check.
+        let is_design_postmortem = matches!(
+            &completion.work_item,
+            WorkItem::Task(t) | WorkItem::Chore(t) if t.kind == TaskKind::DesignPostmortem
+        );
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
-            let produces_project_design = task.kind == TaskKind::Design && task.project_id.is_some();
+            let produces_project_design =
+                matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem) && task.project_id.is_some();
             let uses_task_doc = design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none());
             let decision = if produces_project_design {
                 "project-design-doc"
@@ -3756,10 +3766,12 @@ must not be asked to open one",
             }
         }
 
-        // Per-project design-doc pointer + design-doc questions pipeline,
-        // unchanged: only `kind=design` tasks WITH a project flow here.
+        // Per-project design-doc pointer + design-doc questions pipeline:
+        // `kind=design` tasks WITH a project, and `kind=design_postmortem`
+        // tasks (always project-scoped) which re-sync the same pointer
+        // after editing the project's existing design doc.
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item
-            && task.kind == TaskKind::Design
+            && matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem)
             && let Some(ref project_id) = task.project_id
         {
             if merged {
@@ -3775,6 +3787,24 @@ must not be asked to open one",
                     None,
                 )
                 .await;
+
+                // Postmortem-surfaced uncompleted work must become real
+                // task rows, not a mention in the doc — see
+                // `postmortem_followups` for why this is a stronger,
+                // mandatory-artifact path distinct from the generic
+                // best-effort `FOLLOWUPS:` mechanism below (which is
+                // skipped entirely for this kind, see that block).
+                if task.kind == TaskKind::DesignPostmortem {
+                    crate::postmortem_followups::reconcile_postmortem_followups(
+                        &self.work_db,
+                        &task.id,
+                        &task.product_id,
+                        project_id,
+                        execution_id,
+                        Some(&self.structured_output_dir),
+                    )
+                    .await;
+                }
             } else {
                 design_detector::on_design_pr_detected(&self.work_db, &task.id, &task.product_id, project_id, &pr_url)
                     .await;
@@ -3818,29 +3848,37 @@ must not be asked to open one",
         // a `FOLLOWUPS:` block scraped from the transcript tail. A no-op (no
         // artifact / no transcript / no block) when absent; idempotent across
         // re-runs via the store's content dedup.
-        let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
-        let followups_result = attentions_detector::reconcile_task_followups(
-            &self.work_db,
-            &work_item_id,
-            execution_id,
-            Some(&self.structured_output_dir),
-            transcript_path.as_deref(),
-        )
-        .await;
-        if let Some((ref group, ref created)) = followups_result {
-            self.publish_attentions_created(group, created).await;
-        } else if self.feature_flags.is_enabled("attentions_followups_backstop") {
-            // Primary found no FOLLOWUPS: block; fall back to the supervisor
-            // extraction backstop (flagged `confidence_source = extracted`).
-            if let Some((group, created)) = attentions_detector::extract_followups_backstop(
+        //
+        // Skipped for `design_postmortem`: its worker prompt never asks for
+        // a `FollowupEntry`-shaped artifact (only the stronger
+        // `postmortem_followups` schema above), so this would only ever
+        // find nothing (or, if reusing the same artifact path, fail to
+        // parse it as `FollowupEntry` and log spurious noise).
+        if !is_design_postmortem {
+            let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
+            let followups_result = attentions_detector::reconcile_task_followups(
                 &self.work_db,
                 &work_item_id,
                 execution_id,
+                Some(&self.structured_output_dir),
                 transcript_path.as_deref(),
             )
-            .await
-            {
-                self.publish_attentions_created(&group, &created).await;
+            .await;
+            if let Some((ref group, ref created)) = followups_result {
+                self.publish_attentions_created(group, created).await;
+            } else if self.feature_flags.is_enabled("attentions_followups_backstop") {
+                // Primary found no FOLLOWUPS: block; fall back to the supervisor
+                // extraction backstop (flagged `confidence_source = extracted`).
+                if let Some((group, created)) = attentions_detector::extract_followups_backstop(
+                    &self.work_db,
+                    &work_item_id,
+                    execution_id,
+                    transcript_path.as_deref(),
+                )
+                .await
+                {
+                    self.publish_attentions_created(&group, &created).await;
+                }
             }
         }
         // Reap the engine-owned followups artifact regardless of outcome (it

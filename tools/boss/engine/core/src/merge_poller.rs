@@ -3864,7 +3864,7 @@ async fn mark_merged(
         )
         .await;
     }
-    if updated.kind == TaskKind::Design
+    if matches!(updated.kind, TaskKind::Design | TaskKind::DesignPostmortem)
         && let Some(ref project_id) = updated.project_id
     {
         design_detector::on_design_pr_merged(
@@ -3884,15 +3884,23 @@ async fn mark_merged(
         // multi-second Planner call on a background task so the poller loop
         // never blocks — and a no-op unless the capability was installed at
         // engine startup (so unit tests never reach the network).
-        crate::populator::enqueue_from_merge(
-            work_db,
-            crate::populator::PopulateContext {
-                project_id: project_id.clone(),
-                product_id: candidate.product_id.clone(),
-                design_task_id: updated.id.clone(),
-                pr_url: candidate.pr_url.clone(),
-            },
-        );
+        //
+        // Only the initial `design` task triggers this: a postmortem's PR
+        // updates the *existing* doc to reflect what already shipped, not a
+        // fresh "Proposed implementation task breakdown" the Populator
+        // should materialise into new work — re-running it here would spawn
+        // a duplicate task batch off a doc that was never meant to seed one.
+        if updated.kind == TaskKind::Design {
+            crate::populator::enqueue_from_merge(
+                work_db,
+                crate::populator::PopulateContext {
+                    project_id: project_id.clone(),
+                    product_id: candidate.product_id.clone(),
+                    design_task_id: updated.id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            );
+        }
     }
     true
 }
