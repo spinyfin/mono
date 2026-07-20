@@ -1,9 +1,10 @@
 //! HTTP transport: the process-wide client, retry/backoff policy, and the
 //! six queue endpoints `TrunkClient` exposes.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
+pub use boss_http_retry::RetryPolicy;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -20,49 +21,17 @@ use crate::secret::TrunkTokenProvider;
 pub const TRUNK_API_BASE_URL: &str = "https://api.trunk.io/v1";
 
 // ── Retry policy + per-call config ────────────────────────────────────────────
+//
+// [`RetryPolicy`] itself — the max-attempts/backoff/cap shape — lives in
+// [`boss_http_retry`], shared with `claude_client`. Retries apply only to
+// retryable failures (5xx, transport errors, and 429 without a usable
+// `Retry-After`); backoff is exponential with +/-25% jitter, applied by
+// [`backoff_delay`] below.
 
-/// How many attempts to make and how long to back off between them. Backoff
-/// is exponential (`base_backoff * 2^(attempt-1)`, capped at `max_backoff`)
-/// with +/-25% jitter, applied only to retryable failures (5xx, transport
-/// errors, and 429 without a usable `Retry-After`).
-#[derive(Debug, Clone, Copy)]
-pub struct RetryPolicy {
-    /// Total attempts, `>= 1`. `1` means no retry.
-    pub max_attempts: u32,
-    /// Backoff before the first retry; doubles for each subsequent retry.
-    pub base_backoff: Duration,
-    /// Upper bound on any single backoff, so a long attempt count can't
-    /// balloon into an unbounded wait.
-    pub max_backoff: Duration,
-}
-
-impl RetryPolicy {
-    /// One attempt, no retry.
-    pub const NONE: RetryPolicy = RetryPolicy {
-        max_attempts: 1,
-        base_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
-
-    pub const fn new(max_attempts: u32, base_backoff: Duration, max_backoff: Duration) -> Self {
-        Self {
-            max_attempts,
-            base_backoff,
-            max_backoff,
-        }
-    }
-}
-
-impl Default for RetryPolicy {
-    /// Four attempts, 250ms base doubling up to a 30s cap — enough to ride
-    /// out a Trunk blip without a poller sweep stalling for minutes.
-    fn default() -> Self {
-        RetryPolicy {
-            max_attempts: 4,
-            base_backoff: Duration::from_millis(250),
-            max_backoff: Duration::from_secs(30),
-        }
-    }
+/// Four attempts, 250ms base doubling up to a 30s cap — enough to ride out a
+/// Trunk blip without a poller sweep stalling for minutes.
+fn default_retry_policy() -> RetryPolicy {
+    RetryPolicy::new(4, Duration::from_millis(250), Duration::from_secs(30))
 }
 
 /// Per-call transport configuration: the wall-clock timeout (applied per
@@ -81,7 +50,7 @@ impl CallConfig {
     pub fn new(timeout: Duration) -> Self {
         Self {
             timeout,
-            retry: RetryPolicy::default(),
+            retry: default_retry_policy(),
             base_url: TRUNK_API_BASE_URL.to_owned(),
         }
     }
@@ -101,25 +70,6 @@ impl Default for CallConfig {
     fn default() -> Self {
         Self::new(Duration::from_secs(15))
     }
-}
-
-// ── The single HTTP client ────────────────────────────────────────────────────
-
-/// The process-wide reqwest client shared by every Trunk call. Carries no
-/// default timeout — each request applies its own via [`CallConfig::timeout`].
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // The workspace pins reqwest to `rustls-no-provider`, so a default
-        // crypto provider must be installed before the first TLS handshake.
-        // `install_default` errors if one is already set; that's fine, we
-        // ignore it (this crate may share a process with `claude_client`,
-        // which installs the same provider).
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
 }
 
 // ── Raw transport failure (pre error-taxonomy classification) ────────────────
@@ -162,7 +112,10 @@ impl RawFailure {
                 TrunkError::QueueUnavailable(format!("trunk returned {status}: {body}"))
             }
             RawFailure::Transport(msg) => TrunkError::Transport(msg),
-            RawFailure::Decode(msg) => TrunkError::Transport(msg),
+            // Never retryable — a schema mismatch would just decode the same
+            // way again — so keep it out of `Transport`, which callers
+            // reasonably treat as a transient blip worth retrying.
+            RawFailure::Decode(msg) => TrunkError::Decode(msg),
         }
     }
 }
@@ -170,21 +123,13 @@ impl RawFailure {
 /// Backoff before the `attempt + 1`th try (1-based `attempt`), jittered
 /// +/-25% so many concurrent callers don't retry in lockstep.
 fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
-    let factor = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX).max(1);
-    let capped = policy.base_backoff.saturating_mul(factor).min(policy.max_backoff);
-    jitter(capped)
+    boss_http_retry::jitter(boss_http_retry::backoff_delay(policy, attempt))
 }
 
-fn jitter(delay: Duration) -> Duration {
-    if delay.is_zero() {
-        return delay;
-    }
-    let factor = 0.75 + fastrand::f64() * 0.5;
-    Duration::from_millis((delay.as_millis() as f64 * factor).round() as u64)
-}
-
-/// The delay before retrying `err`: `Retry-After` on a 429 when present,
-/// otherwise the jittered exponential backoff.
+/// The delay before retrying `err`: `Retry-After` on a 429 when present
+/// (clamped to `policy.max_backoff` so a large server-supplied value can't
+/// park the caller — e.g. the queue poller — far past the policy's own
+/// bound), otherwise the jittered exponential backoff.
 fn retry_delay(err: &RawFailure, policy: &RetryPolicy, attempt: u32) -> Duration {
     if let RawFailure::Api {
         status: 429,
@@ -192,7 +137,7 @@ fn retry_delay(err: &RawFailure, policy: &RetryPolicy, attempt: u32) -> Duration
         ..
     } = err
     {
-        return *retry_after;
+        return (*retry_after).min(policy.max_backoff);
     }
     backoff_delay(policy, attempt)
 }
@@ -216,7 +161,7 @@ async fn call_once<T: Serialize + ?Sized>(
     body: &T,
     timeout: Duration,
 ) -> Result<Value, RawFailure> {
-    let response = http_client()
+    let response = boss_http_retry::http_client()
         .post(url)
         .header("x-api-token", token)
         .header("content-type", "application/json")
@@ -241,10 +186,21 @@ async fn call_once<T: Serialize + ?Sized>(
         });
     }
 
-    response
-        .json::<Value>()
+    // Read as text first rather than `response.json()` directly: the three
+    // unit-returning verbs (submit/cancel/restart) discard the body, and
+    // Trunk's success response for those may be a 2xx with an empty body
+    // (e.g. `Content-Length: 0`, or a 204) rather than the documented bare
+    // `{}`. Treating that as a decode failure would surface `Transport` —
+    // exactly the variant a caller is most likely to retry — for a request
+    // Trunk actually accepted, risking a double-submit.
+    let body_text = response
+        .text()
         .await
-        .map_err(|err| RawFailure::Decode(err.to_string()))
+        .map_err(|err| RawFailure::Decode(err.to_string()))?;
+    if body_text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&body_text).map_err(|err| RawFailure::Decode(err.to_string()))
 }
 
 /// Send `body` to `url`, retrying transient failures per `config.retry`.
@@ -306,7 +262,7 @@ impl TrunkClient {
         let url = self.url(path);
         let value = send_with_retry(self.token_provider.as_ref(), &url, request, &self.config).await?;
         serde_json::from_value(value)
-            .map_err(|err| TrunkError::Transport(format!("failed to decode {path} response: {err}")))
+            .map_err(|err| TrunkError::Decode(format!("failed to decode {path} response: {err}")))
     }
 
     /// `POST /v1/submitPullRequest` — enqueue a PR. Success is a bare `{}`.
@@ -481,7 +437,7 @@ mod tests {
         assert!(matches!(transport, TrunkError::Transport(_)), "got {transport:?}");
 
         let decode = RawFailure::Decode("unexpected eof".into()).into_trunk_error();
-        assert!(matches!(decode, TrunkError::Transport(_)), "got {decode:?}");
+        assert!(matches!(decode, TrunkError::Decode(_)), "got {decode:?}");
     }
 
     #[test]
@@ -513,6 +469,19 @@ mod tests {
             retry_after: Some(Duration::from_secs(7)),
         };
         assert_eq!(retry_delay(&err, &policy, 1), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn retry_delay_clamps_retry_after_to_max_backoff() {
+        let policy = RetryPolicy::new(3, Duration::from_millis(100), Duration::from_secs(30));
+        let err = RawFailure::Api {
+            status: 429,
+            body: String::new(),
+            // A server-supplied Retry-After far beyond the policy's own cap
+            // must not park the caller (e.g. the queue poller) for an hour.
+            retry_after: Some(Duration::from_secs(3600)),
+        };
+        assert_eq!(retry_delay(&err, &policy, 1), Duration::from_secs(30));
     }
 
     #[test]
@@ -702,5 +671,86 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, TrunkError::QueueUnavailable(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_pull_requests_posts_to_the_right_path_and_decodes_a_paged_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/listPullRequests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pullRequests": [{ "id": "entry_1", "state": "pending", "prNumber": 1 }],
+                "nextCursor": "cursor-abc",
+            })))
+            .mount(&server)
+            .await;
+
+        let request = ListPullRequestsRequest::builder()
+            .repo(TrunkRepoRef::new("github.com", "brianduff", "flunge"))
+            .target_branch("main")
+            .build();
+        let response = client(server.uri(), RetryPolicy::NONE)
+            .list_pull_requests(&request)
+            .await
+            .expect("success");
+        assert_eq!(response.pull_requests.len(), 1);
+        assert_eq!(response.pull_requests[0].id, "entry_1");
+        assert_eq!(response.next_cursor.as_deref(), Some("cursor-abc"));
+    }
+
+    #[tokio::test]
+    async fn cancel_pull_request_posts_to_the_right_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cancelPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        client(server.uri(), RetryPolicy::NONE)
+            .cancel_pull_request(&lookup())
+            .await
+            .expect("success");
+    }
+
+    #[tokio::test]
+    async fn restart_tests_on_pull_request_posts_to_the_right_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/restartTestsOnPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        client(server.uri(), RetryPolicy::NONE)
+            .restart_tests_on_pull_request(&lookup())
+            .await
+            .expect("success");
+    }
+
+    #[tokio::test]
+    async fn submit_pull_request_succeeds_on_a_2xx_with_an_empty_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let request = SubmitPullRequestRequest::builder()
+            .repo(TrunkRepoRef::new("github.com", "brianduff", "flunge"))
+            .pr(TrunkPrRef::new(978))
+            .target_branch("main")
+            .build();
+        client(server.uri(), RetryPolicy::NONE)
+            .submit_pull_request(&request)
+            .await
+            .expect("a 2xx with an empty body is success, not a decode/transport error");
+    }
+
+    #[test]
+    fn url_trims_a_trailing_slash_on_the_base_url() {
+        let client = client("http://host/".to_owned(), RetryPolicy::NONE);
+        assert_eq!(client.url("getQueue"), "http://host/getQueue");
     }
 }

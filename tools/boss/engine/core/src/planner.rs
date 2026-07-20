@@ -274,7 +274,7 @@ enum RetryFeedback {
 /// best-effort.
 async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
     let config = CallConfig::new(PLANNER_TIMEOUT)
-        .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF))
+        .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF, PLANNER_BACKOFF))
         .with_endpoint(url);
 
     let mut feedback: Option<RetryFeedback> = None;

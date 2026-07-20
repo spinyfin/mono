@@ -23,13 +23,14 @@
 //!
 //! ## What the pipeline owns vs. what the caller owns
 //!
-//! The pipeline owns **transport + protocol**: the process-wide HTTP client
-//! (with the `rustls` provider workaround installed in exactly one place), the
-//! endpoint and `anthropic-version` header, the `x-api-key` header, the
-//! request/response JSON shapes ([`MessagesRequest`] / [`MessagesResponse`]),
-//! the [`ClaudeError`] taxonomy, and a [`RetryPolicy`] that retries transient
-//! failures (HTTP 429, any 5xx including 529 "overloaded", and transport
-//! errors) with exponential backoff.
+//! The pipeline owns **transport + protocol**: the endpoint and
+//! `anthropic-version` header, the `x-api-key` header, the request/response
+//! JSON shapes ([`MessagesRequest`] / [`MessagesResponse`]), and the
+//! [`ClaudeError`] taxonomy. The process-wide HTTP client (with the `rustls`
+//! provider workaround installed in exactly one place) and the
+//! [`RetryPolicy`]/backoff shape that retries transient failures (HTTP 429,
+//! any 5xx including 529 "overloaded", and transport errors) live in
+//! `boss_http_retry`, shared with `trunk_client`.
 //!
 //! The caller owns **its feature**: model selection, system prompt, user
 //! messages, `max_tokens`, temperature, any tool / `output_config` blocks, the
@@ -47,9 +48,9 @@
 //! (`ANTHROPIC_API_KEY`). Features whose key arrives from `Config` rather than
 //! the environment pass it straight to [`send_messages`] and skip this helper.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
+pub use boss_http_retry::RetryPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -254,42 +255,16 @@ impl ClaudeError {
 }
 
 // ── Retry policy + per-call config ────────────────────────────────────────────
+//
+// [`RetryPolicy`] itself — the max-attempts/backoff/cap shape, applied only
+// when the error [`is_retryable`](ClaudeError::is_retryable) — lives in
+// [`boss_http_retry`] and is shared with `trunk_client`; see that crate for
+// the exponential-backoff math.
 
-/// How many attempts to make and how long to back off between them. Backoff is
-/// exponential: `base_backoff * 2^(attempt-1)` before the `attempt+1`th try,
-/// applied only when the error [`is_retryable`](ClaudeError::is_retryable).
-#[derive(Debug, Clone, Copy)]
-pub struct RetryPolicy {
-    /// Total attempts, `>= 1`. `1` means no retry.
-    pub max_attempts: u32,
-    /// Backoff before the first retry; doubles for each subsequent retry.
-    pub base_backoff: Duration,
-}
-
-impl RetryPolicy {
-    /// One attempt, no retry.
-    pub const NONE: RetryPolicy = RetryPolicy {
-        max_attempts: 1,
-        base_backoff: Duration::ZERO,
-    };
-
-    pub const fn new(max_attempts: u32, base_backoff: Duration) -> Self {
-        Self {
-            max_attempts,
-            base_backoff,
-        }
-    }
-}
-
-impl Default for RetryPolicy {
-    /// A sane default for best-effort callers: two attempts with a short
-    /// backoff, so a transient 429/5xx/overloaded is quietly retried once.
-    fn default() -> Self {
-        RetryPolicy {
-            max_attempts: 2,
-            base_backoff: Duration::from_millis(500),
-        }
-    }
+/// A sane default retry policy for best-effort callers: two attempts with a
+/// short backoff, so a transient 429/5xx/overloaded is quietly retried once.
+fn default_retry_policy() -> RetryPolicy {
+    RetryPolicy::new(2, Duration::from_millis(500), Duration::from_secs(30))
 }
 
 /// Per-call transport configuration. Owns the wall-clock timeout (applied
@@ -308,7 +283,7 @@ impl CallConfig {
     pub fn new(timeout: Duration) -> Self {
         Self {
             timeout,
-            retry: RetryPolicy::default(),
+            retry: default_retry_policy(),
             endpoint: None,
         }
     }
@@ -328,30 +303,11 @@ impl CallConfig {
     }
 }
 
-// ── The single HTTP client ────────────────────────────────────────────────────
-
-/// The process-wide reqwest client shared by every Claude call. This is the
-/// ONLY place in the engine that builds one, and the ONLY place that installs
-/// the `rustls` crypto provider.
-///
-/// The client carries no default timeout — each request applies its own via
-/// [`CallConfig::timeout`], so one client serves callers with wildly different
-/// budgets (a 5 s live-status one-liner and a 180 s planning call).
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // The workspace pins reqwest to `rustls-no-provider`, so a default
-        // crypto provider must be installed before the first TLS handshake or
-        // `Client::build` panics. `install_default` errors if one is already
-        // set — that's fine, we ignore it.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
 // ── Sending ───────────────────────────────────────────────────────────────────
+//
+// The process-wide reqwest client — [`boss_http_retry::http_client`] — is
+// shared with `trunk_client`; this is the only crate in the engine that
+// builds one, and the only one that installs the `rustls` crypto provider.
 
 /// Send a typed [`MessagesRequest`] and return the parsed response, retrying
 /// transient failures per `config.retry`.
@@ -378,7 +334,7 @@ pub async fn send_messages_raw(
         match call_once(api_key, url, body, config.timeout).await {
             Ok(response) => return Ok(response),
             Err(err) if err.is_retryable() && attempt < attempts => {
-                let delay = backoff_delay(&config.retry, attempt);
+                let delay = boss_http_retry::backoff_delay(&config.retry, attempt);
                 tracing::warn!(
                     attempt,
                     max_attempts = attempts,
@@ -396,17 +352,9 @@ pub async fn send_messages_raw(
     unreachable!("retry loop always returns on the final attempt")
 }
 
-/// Backoff before the `attempt + 1`th try (1-based `attempt`).
-fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
-    // attempt is always >= 1 here; cap the exponent so the shift can't overflow
-    // even if a caller sets an unreasonable attempt count.
-    let factor = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX).max(1);
-    policy.base_backoff.saturating_mul(factor)
-}
-
 /// One round trip: POST the body and parse the response.
 async fn call_once(api_key: &str, url: &str, body: &Value, timeout: Duration) -> Result<MessagesResponse, ClaudeError> {
-    let response = http_client()
+    let response = boss_http_retry::http_client()
         .post(url)
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_API_VERSION)
@@ -558,13 +506,8 @@ mod tests {
         assert_eq!(ClaudeError::Decode("x".into()).status(), None);
     }
 
-    #[test]
-    fn backoff_is_exponential() {
-        let policy = RetryPolicy::new(4, Duration::from_millis(100));
-        assert_eq!(backoff_delay(&policy, 1), Duration::from_millis(100));
-        assert_eq!(backoff_delay(&policy, 2), Duration::from_millis(200));
-        assert_eq!(backoff_delay(&policy, 3), Duration::from_millis(400));
-    }
+    // Exponential-backoff math (`RetryPolicy`, `backoff_delay`) is owned and
+    // tested by `boss_http_retry`; see that crate's tests.
 
     // ── response extraction ───────────────────────────────────────────────
 
@@ -698,7 +641,7 @@ mod tests {
             .await;
 
         let config = CallConfig::new(Duration::from_secs(5))
-            .with_retry(RetryPolicy::new(2, Duration::from_millis(1)))
+            .with_retry(RetryPolicy::new(2, Duration::from_millis(1), Duration::from_secs(30)))
             .with_endpoint(format!("{}/v1/messages", server.uri()));
         let resp = send_messages("k", &text_request(), &config)
             .await
@@ -724,7 +667,7 @@ mod tests {
             .await;
 
         let config = CallConfig::new(Duration::from_secs(5))
-            .with_retry(RetryPolicy::new(3, Duration::from_millis(1)))
+            .with_retry(RetryPolicy::new(3, Duration::from_millis(1), Duration::from_secs(30)))
             .with_endpoint(format!("{}/v1/messages", server.uri()));
         let err = send_messages("k", &text_request(), &config).await.unwrap_err();
         match err {

@@ -19,10 +19,14 @@ pub enum TrunkError {
     #[error("trunk queue unavailable: {0}")]
     QueueUnavailable(String),
     /// The HTTP client failed before/while getting a response (timeout,
-    /// TLS, DNS, connection reset), or a 2xx response body didn't decode
-    /// into the expected shape.
+    /// TLS, DNS, connection reset). Transient — worth retrying.
     #[error("transport error: {0}")]
     Transport(String),
+    /// A 2xx response body didn't decode into the expected shape. Never
+    /// transient — the same request would just decode the same way again —
+    /// so callers must not retry this the way they would [`Self::Transport`].
+    #[error("failed to decode trunk response: {0}")]
+    Decode(String),
 }
 
 #[cfg(test)]
@@ -46,6 +50,10 @@ mod tests {
         assert_eq!(
             TrunkError::Transport("connection reset".to_owned()).to_string(),
             "transport error: connection reset"
+        );
+        assert_eq!(
+            TrunkError::Decode("unexpected eof".to_owned()).to_string(),
+            "failed to decode trunk response: unexpected eof"
         );
     }
 }

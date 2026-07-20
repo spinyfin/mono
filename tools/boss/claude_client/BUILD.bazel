@@ -13,7 +13,9 @@ rust_library(
     visibility = [
         "//tools/boss:__subpackages__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + [
+        "//tools/boss/http_retry",
+    ],
 )
 
 rust_test(

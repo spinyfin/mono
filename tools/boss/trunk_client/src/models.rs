@@ -196,6 +196,11 @@ pub struct SubmitPullRequestRequest {
 
 /// Response of `getSubmittedPullRequest`, and the shape of each entry in
 /// `listPullRequests.pullRequests` / `getQueue.enqueuedPullRequests`.
+///
+/// `bon::Builder` is kept here even though nothing constructs one today
+/// (this is a `Deserialize`-only wire response): checkleft's
+/// `rust/giant-structs` check mandates the builder derive on any struct
+/// with more than 5 named fields, and this one has more than 5.
 #[derive(Debug, Clone, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 #[serde(rename_all = "camelCase")]
@@ -251,6 +256,10 @@ pub struct ListPullRequestsResponse {
 }
 
 /// Response of `getQueue`: one call returns every enqueued PR.
+///
+/// `bon::Builder` is kept here for the same reason as [`TrunkPullRequest`]:
+/// checkleft's `rust/giant-structs` check mandates it above 5 fields
+/// regardless of whether a construction site exists yet.
 #[derive(Debug, Clone, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 #[serde(rename_all = "camelCase")]

@@ -5,8 +5,7 @@ edition.workspace = true
 workspace = "../../.."
 
 [dependencies]
-reqwest = { workspace = true, features = ["json"] }
-rustls = { workspace = true }
+boss-http-retry = { path = "../http_retry" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
