@@ -222,24 +222,66 @@ impl CiLogReader for UnknownProviderReader {
     }
 }
 
-/// Build a boxed reader for `provider`. Convenience factory the
-/// engine pre-spawn / pre-triage code uses to dispatch on the
-/// provider inferred from `target_url`.
+/// Fallback reader for a *known* provider whose `target_url` didn't carry
+/// the coordinates that provider's reader needs (currently: Buildkite's
+/// pipeline slug + build number). Distinct from [`UnknownProviderReader`]
+/// because the provider itself is known — what failed is parsing the
+/// `target_url` — and the error message should say so rather than
+/// claiming the provider is unknown.
+#[derive(Debug, Clone)]
+pub struct UnparseableCoordinatesReader {
+    reason: String,
+}
+
+impl UnparseableCoordinatesReader {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into() }
+    }
+}
+
+#[async_trait]
+impl CiLogReader for UnparseableCoordinatesReader {
+    async fn read_log_tail(&self, _job_id: &str, _n_lines: usize) -> Result<String> {
+        Err(anyhow!("buildkite log reader unavailable: {}", self.reason))
+    }
+
+    async fn read_log_full(&self, _job_id: &str) -> Result<String> {
+        Err(anyhow!("buildkite log reader unavailable: {}", self.reason))
+    }
+
+    async fn retrigger(&self, _id: &str) -> Result<String> {
+        Err(anyhow!("buildkite log reader unavailable: {}", self.reason))
+    }
+
+    fn worker_cli_invocation_hint(&self, _job_id: &str) -> String {
+        format!("(no CLI available: {})", self.reason)
+    }
+}
+
+/// Build a boxed reader for `provider`. Convenience factory the engine
+/// pre-spawn / pre-triage code uses to dispatch on the provider inferred
+/// from `target_url`.
 ///
-/// `buildkite_coordinates` is the `(pipeline_slug, build_number)` pair
-/// [`BuildkiteLogReader`] needs to resolve its pipeline without a repo
-/// checkout in cwd — required only for `CiProvider::Buildkite`, parsed
-/// by the caller from the failing check's `target_url` via
-/// [`parse_buildkite_pipeline_slug`] / [`parse_buildkite_build_id`].
-/// When the provider is Buildkite but no coordinates are supplied
-/// (e.g. the `target_url` didn't match the canonical shape), falls
-/// back to [`UnknownProviderReader`] rather than constructing a reader
-/// that would fail on every call.
-pub fn reader_for(provider: CiProvider, buildkite_coordinates: Option<(String, String)>) -> Box<dyn CiLogReader> {
+/// `target_url` is the failing check's `target_url` as reported by
+/// GitHub. For `CiProvider::Buildkite`, this function parses the pipeline
+/// slug + build number out of it internally (via
+/// [`parse_buildkite_pipeline_slug`] / [`parse_buildkite_build_id`]) —
+/// [`BuildkiteLogReader`] needs both to resolve its pipeline without a
+/// repo checkout in cwd. When the URL doesn't match the canonical shape,
+/// falls back to [`UnparseableCoordinatesReader`] (naming the real cause)
+/// rather than constructing a reader that would fail on every call with a
+/// misleading "unknown provider" error. Other providers ignore
+/// `target_url`; callers that don't have one may pass `""`.
+pub fn reader_for(provider: CiProvider, target_url: &str) -> Box<dyn CiLogReader> {
     match provider {
-        CiProvider::Buildkite => match buildkite_coordinates {
-            Some((pipeline_slug, build_number)) => Box::new(BuildkiteLogReader::new(pipeline_slug, build_number)),
-            None => Box::new(UnknownProviderReader),
+        CiProvider::Buildkite => match (
+            parse_buildkite_pipeline_slug(target_url),
+            parse_buildkite_build_id(target_url),
+        ) {
+            (Some(pipeline_slug), Some(build_number)) => Box::new(BuildkiteLogReader::new(pipeline_slug, build_number)),
+            _ => Box::new(UnparseableCoordinatesReader::new(format!(
+                "could not parse pipeline slug and build number from target_url {target_url:?}"
+            ))),
         },
         CiProvider::GithubActions => Box::new(GithubActionsLogReader::new()),
         CiProvider::Other => Box::new(UnknownProviderReader),
@@ -514,20 +556,55 @@ mod tests {
 
     #[tokio::test]
     async fn reader_for_unknown_provider_errors_on_every_method() {
-        let r = reader_for(CiProvider::Other, None);
+        let r = reader_for(CiProvider::Other, "");
         assert!(r.read_log_tail("j", 10).await.is_err());
         assert!(r.read_log_full("j").await.is_err());
         assert!(r.retrigger("j").await.is_err());
     }
 
     #[tokio::test]
-    async fn reader_for_buildkite_without_coordinates_falls_back_to_unknown() {
+    async fn reader_for_buildkite_without_coordinates_reports_parse_failure() {
         // No `target_url` match → no (pipeline, build) pair. Falling back to
-        // `UnknownProviderReader` avoids constructing a `BuildkiteLogReader`
-        // that would just fail on every call with "failed to resolve a
-        // pipeline" (the exact bug this coordinate-threading fixes).
-        let r = reader_for(CiProvider::Buildkite, None);
-        assert!(r.read_log_full("j").await.is_err());
+        // `UnparseableCoordinatesReader` avoids constructing a
+        // `BuildkiteLogReader` that would just fail on every call with
+        // "failed to resolve a pipeline" (the exact bug this
+        // coordinate-threading fixes), and names the real failure cause
+        // instead of claiming the provider is unknown.
+        let r = reader_for(CiProvider::Buildkite, "https://example.com/not-a-buildkite-url");
+        let err = r.read_log_full("j").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("buildkite log reader unavailable") && msg.contains("could not parse"),
+            "expected a parse-failure diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_for_buildkite_with_canonical_url_builds_working_reader() {
+        let r = reader_for(
+            CiProvider::Buildkite,
+            "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
+        );
+        // Confirms the canonical URL actually resolves to a `BuildkiteLogReader`
+        // wired with the right coordinates, not just "doesn't error here" —
+        // an unset binary would fail to spawn, proving the coordinates parsed.
+        let err = r.read_log_full("j").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to spawn"),
+            "expected a real BuildkiteLogReader (spawn `bk`), got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_for_github_actions_ignores_target_url() {
+        let r = reader_for(CiProvider::GithubActions, "not a url at all");
+        // GithubActionsLogReader doesn't need target_url; confirm dispatch
+        // still builds a working (non-fallback) reader regardless of its shape.
+        let err = r.read_log_full("j").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to spawn"),
+            "expected a real GithubActionsLogReader (spawn `gh`), got: {err:#}"
+        );
     }
 
     // ---------- integration: fake bk / fake gh ------------------------------
