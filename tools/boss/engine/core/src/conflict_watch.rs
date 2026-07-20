@@ -26,9 +26,9 @@
 //!
 //! [`OpenPrMergeability`]: crate::merge_poller::OpenPrMergeability
 
-use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, EffortLevel, FrontendEvent};
 #[cfg(test)]
-use boss_protocol::{ExecutionKind, TaskKind};
+use boss_protocol::TaskKind;
+use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, EffortLevel, FrontendEvent};
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::conflict_ladder;
