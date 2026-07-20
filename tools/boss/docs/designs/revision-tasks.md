@@ -1,5 +1,8 @@
 # Boss: Revision Tasks
 
+- **Status:** shipped 2026-05-26 across five PRs — [#767](https://github.com/spinyfin/mono/pull/767) (schema + protocol), [#770](https://github.com/spinyfin/mono/pull/770) (CLI + create-time gate), [#778](https://github.com/spinyfin/mono/pull/778) (dispatch + completion), [#782](https://github.com/spinyfin/mono/pull/782) (hard-guard + coordinator prompt), [#775](https://github.com/spinyfin/mono/pull/775) (kanban chrome).
+- **Doc state:** updated 2026-07-20 (design postmortem) to describe as-built reality. Divergences from the original plan are called out inline as **As built** notes; the most significant are the create/dispatch gate split landing inverted (Q4), the worker directive shipping on `gh pr checkout` and then evolving to engine-side workspace pre-positioning (Q3), and the OQ6 tracking comment being dropped.
+
 ## Problem
 
 Every work-item kind Boss has today produces a _new_ artifact. A `chore` / `project_task` produces a new PR; an `investigation` / `design` produces a new markdown doc. The lifecycle plumbing reflects this: a worker pushes to its own engine-supplied bookmark (`boss/exec_<id>_<seq>`), runs `gh pr create`, and the completion detector flips the row to `in_review` when a _new_ PR URL appears (`runner.rs` spawn prelude, `runner.rs:750-758`; `PrDetector` in `completion.rs`).
@@ -86,23 +89,15 @@ Migration mirrors `migrate_tasks_investigation_doc_columns` exactly — a `migra
 
 `kind` gains the value `'revision'`. No enum to extend (it is `TEXT`); the new value is recognized in the dispatch reconcile loop (Q3) and the completion path (Q4).
 
-Sequence number is computed:
+Sequence numbers are computed engine-side in Rust, not SQL (**as built**): `attach_revision_projections` (`work/revision_helpers.rs`) runs during `get_work_tree`, groups all revision tasks by chain root, sorts each group by `created_at`, and stamps a 1-based `revision_seq` plus the chain root's `pr_url` (as `revision_parent_pr_url`) onto the task projection. The kanban consumes the projected `R<n>` and never recomputes the chain.
 
-```sql
--- R<n> for revision task :id, n = its 1-based position among the chain
--- root's revisions ordered by created_at.
-SELECT COUNT(*) + 1
-  FROM tasks
- WHERE kind = 'revision'
-   AND chain_root_id(parent_task_id) = chain_root_id(:parent_task_id_of_id)
-   AND created_at < (SELECT created_at FROM tasks WHERE id = :id);
-```
-
-`chain_root_id` is a small recursive walk (`WITH RECURSIVE`, or a Rust helper `WorkDb::chain_root(task_id)` — preferred, because the walk is short and a Rust helper is easier to test and reuse than a recursive CTE embedded in every query). The kanban receives the computed `R<n>` as a derived field on the task projection so the UI never recomputes it.
+`chain_root` shipped as a Rust helper (`work/chain_helpers.rs`), as this section preferred over a recursive CTE. Both walks are depth-capped (64 in the DB helper, 20 in the projection pass) so corrupt or cyclic parent links terminate instead of looping, and a broken parent link resolves to the deepest reachable ancestor rather than erroring — which is what lets a revision with a missing parent surface as a data-integrity warning instead of crashing a join (Risk R8).
 
 #### Kind-of-revision: column or description?
 
 The brief asks whether review-comment-driven vs operator-driven should be its own enum. **Recommendation: do not add a sub-kind column for v1.** The distinction is provenance, and Boss already records provenance in `tasks.created_via` (`canonicalize_created_via(..., "<kind>")`, `work.rs:7052,7092`). Source A sets `created_via = "operator"` (or the human's actor); Source B will set `created_via = "pr-comment:<repo>#<pr>:<comment-id>"`, which doubles as the `(repo, pr#, comment-id)` pointer [[feedback_github_is_source_of_truth_for_pr_artifacts]] wants without mirroring the comment body into Boss state. No schema change needed when B lands; B just passes a richer `created_via`. If a hard enum is ever wanted, it is an additive `revision_source TEXT` column later.
+
+**As built:** exactly this. No sub-kind column shipped, and `created_via` became the provenance channel sooner than expected — the first non-operator producers were not the Source-B comment-triage UI but engine-spawned fix revisions (added by later projects): merge-conflict resolution attempts create revisions with `created_via = "merge-conflict:<attempt-id>"` (`conflict_watch.rs`) and CI remediation with `"ci-fix:<attempt-id>"` (`ci_watch.rs`), and the dispatcher parses those prefixes to tie a revision back to the attempt that spawned it (and to retire it when the attempt does). The thin-producer substrate works as designed, with zero schema changes per new producer.
 
 ---
 
@@ -145,6 +140,8 @@ boss task create-revision \
 
 `--product`/`--project` are **not** flags: a revision inherits both from its parent (resolved at create time), so passing them would only create disagreement. `--repo` is likewise inherited — a revision must push to the parent's PR branch in the parent's repo; allowing a different repo would violate the one-PR invariant.
 
+**As built (PR #770):** shipped as specified, with one deliberate inheritance nuance — `repo_remote_url` is _not_ copied onto the revision row (a per-task override collides when the product already carries the same URL); the dispatch flow resolves the repo from the chain root at spawn time. The verb has since grown `--name` (a concise card title, keeping the verbatim ask in `--description`), `--driver`, and `--depends-on` (explicit prerequisites on top of the automatic chain-tail gate a later project added to serialise back-to-back revisions on the same PR), plus a `boss task list-revisions` query verb.
+
 #### Error behavior on a bad parent
 
 `create-revision` validates the gate at create time (Q4) and returns a precise `CliError` rather than creating a doomed row:
@@ -154,7 +151,7 @@ boss task create-revision \
 - parent's PR is **closed-unmerged** → `error: T651's PR (#1234) is closed without merging; there is no open PR to revise.`
 - `--parent` resolves to a `revision` itself → allowed (revision chains, Decisions § OQ2); the gate is evaluated against the _chain root's_ PR, and the new revision's sequence number continues the chain-root count (a revision-of-R2 is R3).
 
-These messages come from a single `assert_parent_revisable(parent_chain_root) -> Result<(), RevisionGateError>` helper shared by the create path and the dispatch path (Q4), so the wording is identical wherever the gate fires.
+**As built:** the messages live in a `RevisionGateError` enum produced by `assert_parent_revisable_and_insert` (`work/revision_helpers.rs`), which runs the gate and the row insert in one transaction. The helper is _not_ shared with the dispatch path as originally planned — the two gates diverged in mechanism (see Q4): create-time does the authoritative check (including a live PR-state probe), while dispatch-time trusts engine-cached state.
 
 ---
 
@@ -188,58 +185,35 @@ The spawn prelude (`runner.rs` `spawn_prompt`, matching on `execution.kind` at `
 
 and add `revision_implementation` to the acceptance-criterion `matches!` set (`runner.rs:718-721`) so the worker still gets the "deliverable is a pushed branch" framing — but `compose_revision_directive` supplies the branch name and _suppresses_ the new-PR instructions.
 
-#### `compose_revision_directive` — the worker's marching orders
+#### `compose_revision_directive` — the worker's marching orders (as built)
 
-```
-Expected outcome for this run:
-- This is a REVISION task. Your deliverable is a NEW COMMIT on an EXISTING
-  pull request — the PR produced by the parent task <PARENT_SHORT_ID>. Do NOT
-  open a new PR. Do NOT create a `boss/exec_*` bookmark.
-- The parent PR is #<PR_NUMBER> on branch `<PARENT_BRANCH>` in <REPO>.
-- What this revision should change: <DESCRIPTION>.
+The original draft templated the parent branch name into a `jj git fetch` → `jj edit <PARENT_BRANCH>` recipe and ended with a `[boss-revision] R<n>` tracking comment on the PR. What shipped diverged in three ways:
 
-Steps:
-1. `jj git fetch`   # the parent branch lives on GitHub; this workspace may
-                    # not have it locally even if it was warmed for the parent.
-2. `jj edit <PARENT_BRANCH>`   # move onto the existing branch head.
-3. `jj new @`                  # start a fresh commit on top of it.
-4. Make the requested change.
-5. `jj describe -m "<short message>: <DESCRIPTION>"`.
-6. `jj bookmark set <PARENT_BRANCH> -r @`   # advance the bookmark to your new commit.
-7. `GIT_DIR=.jj/repo/store/git jj git push -b <PARENT_BRANCH>`  # NO --allow-new;
-                                                                # the branch exists.
-8. Confirm the new commit is on the PR:
-   `GIT_DIR=.jj/repo/store/git gh pr view <PR_NUMBER>`.
-9. Post a tracking comment on the PR (Decisions § OQ6 — done unless the
-   editorial-controls gate says otherwise):
-   `gh pr comment <PR_NUMBER> --body "[boss-revision] R<n>: <DESCRIPTION>"`.
-10. Print the parent PR URL on its own line as the final thing in your response.
-```
+- **PR #778 (first cut):** the directive told the worker to `gh pr checkout <PR#>` rather than `jj edit` a templated branch name. The engine resolves the PR number and URL from the chain root (stamped onto `executions.pr_url` at dispatch — see Q4) and the worker discovers the branch from the checkout; `<PARENT_BRANCH>` and `R<n>` are never templated into the directive at all.
+- **Superseded since:** checkout later moved out of the worker entirely. The engine now pre-positions the workspace at the PR head (`cube workspace goto --pr <n>`) before spawn, and the directive explicitly _forbids_ `jj edit` / `gh pr checkout` / `git checkout` (fetched remote commits are immutable in a jj workspace and those tools misbehave there). The worker makes the change, discovers the parent bookmark name (`jj log -r 'parents(@)' -T 'remote_bookmarks'`), advances it, and pushes via `cube pr update --branch <name>`. The directive has also grown a mandatory PR-title/description reconciliation step, pre-push build gates (with a merge-correctness variant for conflict-resolution revisions), and a rebase-only exception — `compose_revision_directive` in `runner.rs` is the living text.
+- **The tracking comment (draft step 9, OQ6) never shipped** — recorded as dropped in Decisions § OQ6.
 
-The `<PARENT_BRANCH>`, `<PR_NUMBER>`, `<REPO>`, and `R<n>` are resolved engine-side at spawn from the chain root's `pr_url` and the computed sequence number, so the worker never has to discover them. Step 9 is conditional: the engine decides whether to include it by consulting the editorial-controls gate (`editorial_controls::should_post_comment(repo, pr)` — Decisions § OQ6), which defaults to "post" until T577 lands, so nothing here blocks on T577.
+Two contracts from the draft survived unchanged: "do NOT open a new PR / do NOT create a `boss/exec_*` bookmark", and "print the parent PR URL on its own line as the final thing in your response" — the latter is what the completion path keys on alongside the sha-delta gate (Q4).
 
-#### Why `jj git fetch` first is load-bearing
+#### Any workspace is correct; warmth is an optimization
 
-The brief flags this explicitly. The parent's branch was pushed to GitHub by the parent worker. The revision worker may land in:
-
-- **the parent's actual warm workspace** (best case — Decisions § OQ5) — the branch is present locally, but may be behind GitHub if anything else pushed; `jj git fetch` reconciles.
-- **a fresh/other workspace** — the branch is not present locally at all; `jj git fetch` is what brings it down so `jj edit <PARENT_BRANCH>` resolves.
-
-Either way `jj git fetch` then `jj edit <PARENT_BRANCH>` works. Step 6 (`jj bookmark set`) + step 7 (push without `--allow-new`) is the jj idiom for "advance an existing remote bookmark", verified against the workspace's own PR-update recipe in `.claude/CLAUDE.md` ("To update an existing PR: `jj git push -b my-feature` — no `--allow-new`").
+The original draft made a worker-side `jj git fetch` the load-bearing first step so a cold workspace could materialise the parent branch. The underlying invariant — a revision's needed state lives on **GitHub**, so _any_ workspace can serve it — held, but as built it is discharged by the engine-side `cube workspace goto --pr <n>` pre-positioning rather than by worker VCS steps. Warm-workspace preference survives purely as a cache-warmth optimisation, per [[feedback_cube_workspaces_are_warmed_caches_no_chore_stickiness]].
 
 #### Cube workspace allocation — the precedence rule
 
 The coordinator already supports `--prefer`: `lease_workspace_with_fallback` (`coordinator.rs:1817`) reads `execution.preferred_workspace_id` and, if set, leases with `--prefer <id>` (`coordinator.rs:1836`). Today the only producer of a non-null `preferred_workspace_id` is the orphan-resume path (`work.rs:671`, reusing an orphaned predecessor's `cube_workspace_id`). Revision dispatch becomes the second producer.
 
-The precedence rule for a revision's `preferred_workspace_id`:
+The precedence rule for a revision's `preferred_workspace_id`, as drafted:
 
 1. **The workspace the chain root's most recent successful execution ran in** (`executions.cube_workspace_id` for the latest non-failed execution of the chain root). This is the warmest cache — it built the parent's branch.
 2. If that execution has no recorded workspace, **any prior revision's workspace** in the same chain (next-warmest — it has the branch too).
 3. If none, **no preference** — lease any free workspace.
 
+**As built (PR #778):** rule 1 and rule 3 only. `preferred_workspace_for_chain_root` (`work/dispatch_helpers.rs`) returns the `cube_workspace_id` of the chain root's most recent non-failed execution, or nothing. Rule 2 was not implemented — with the fallback silent and workspace re-provisioning cheap, the extra chain walk never justified itself.
+
 `--prefer` here is a **nice-to-have for cache warmth only** (Decisions § OQ5); there is no correctness reason to require the parent's workspace, because a revision's needed state lives on **GitHub**, recoverable in any workspace via `jj git fetch`. So a revision uses a **soft prefer**: ask for the preferred workspace, and if it is gone or leased, **fall back silently to any free workspace** — no retries, no warnings, no human-attention surfacing. The fallback is a non-event.
 
-**Divergence from the orphan-resume semantics.** The existing fallback matrix (`coordinator.rs:1801-1804`) says: _preferred set ⇒ terminal failure if the preferred workspace can't be leased_ (to preserve state continuity — the orphan's local commits exist _only_ there). That hard policy is correct for orphan-resume but wrong for revisions, which must degrade quietly. Concretely, this needs a per-execution "prefer is soft" signal so `lease_workspace_with_fallback` picks `fallback_policy = "any_free"` even though a preference is set. The cleanest shape is an additive `executions.prefer_is_soft` boolean (defaulted false; set true for `revision_implementation`), consumed where `fallback_policy` is decided (`coordinator.rs:1825`). The orphan-resume path keeps the hard "none" policy; revisions opt into soft. When a revision lands in a non-preferred workspace, the `jj git fetch` in step 1 of the directive makes it correct regardless. This respects [[feedback_cube_workspaces_are_warmed_caches_no_chore_stickiness]] — warmth is an optimization, never a correctness dependency.
+**Divergence from the orphan-resume semantics.** The existing fallback matrix says: _preferred set ⇒ terminal failure if the preferred workspace can't be leased_ (to preserve state continuity — the orphan's local commits exist _only_ there). That hard policy is correct for orphan-resume but wrong for revisions, which must degrade quietly. **As built (PRs #767 + #778)** this shipped as the additive `work_executions.prefer_is_soft` boolean (defaulted false; set true for `revision_implementation` at dispatch): `lease_workspace_with_fallback` reads it to pick `fallback_policy = "any_free"`, and the hard-fail guard respects it too, so soft-prefer executions never fail on workspace unavailability. The orphan-resume path keeps the hard "none" policy untouched. When a revision lands in a non-preferred workspace, the engine's `cube workspace goto` pre-positioning makes it correct regardless. This respects [[feedback_cube_workspaces_are_warmed_caches_no_chore_stickiness]] — warmth is an optimization, never a correctness dependency.
 
 ---
 
@@ -266,22 +240,22 @@ The merge poller is the single surface that knows a PR's lifecycle: `PrLifecycle
 
 (b) re-polls GitHub twice and adds latency to the CLI create path; it also duplicates the `gh pr view` parsing that the poller owns. (a) is cheapest but risks dispatching a revision against a PR that merged seconds ago and hasn't been re-polled. (c) splits correctly: create time is interactive and a slightly-stale read is fine (the operator just saw the PR in review), while dispatch time is the dangerous moment (the worker is about to edit a possibly-merged branch) and deserves a _fresh, targeted_ check — but routed through the poller's existing probe (`PrLifecycleProbe`), not a bespoke call.
 
-### Recommendation
+### Recommendation — and the inversion that shipped
 
-**Pick (c).**
+The original recommendation was (c): cached read at create, fresh targeted probe at dispatch. **As built (PRs #770 + #778), the split landed inverted:**
 
-- **Create-time gate**: `assert_parent_revisable` reads the chain root's last-known PR lifecycle. If `pr_url` is `NULL` → reject (no PR). If the cached state is `Merged`/`ClosedUnmerged` → reject. If `Open` (or unpolled-but-present) → allow, and let dispatch do the authoritative re-check. The cached reading is derived from the columns the poller already maintains; a present `pr_url` with no terminal state is treated as open.
-- **Dispatch-time gate**: just before the coordinator spawns a `revision_implementation` worker, invoke the poller's existing single-PR probe against the chain root's `pr_url`. On `Merged`/`ClosedUnmerged`, _do not spawn_; instead auto-block the revision (Decisions § OQ1): move it to `blocked` with `blocked_reason = "parent PR merged/closed before this revision dispatched"` and surface a `WorkAttentionItem` so the operator sees it. On `Open`, proceed.
+- **Create-time gate — authoritative, including a live probe.** `assert_parent_revisable_and_insert` first checks cached state (`pr_url` NULL → "no PR" error; chain root `status = 'done'` → "merged" error, no network call), then — because cached columns cannot distinguish an open PR from a closed-unmerged or seconds-ago-merged one — does a targeted live check through a `PrStateChecker` trait (`GhPrStateChecker` shells to `gh pr view` in production; `FakePrStateChecker` keeps the gate fully unit-testable). Create is rare and interactive, so one network round-trip buys a precise error at the moment the operator is watching.
+- **Dispatch-time gate — cached only.** `reconcile_revision_execution` (`work/dispatch_helpers.rs`) runs on every reconcile tick, so a live probe per tick was never viable. It defers (stays `todo`) while the chain root has no `pr_url` yet, and treats chain root `done`/`archived` — state the merge poller maintains — as the merged signal. A merge landing inside one poller cadence is caught by the poller's sweep (`block_pending_revisions_on_parent_close`) or, mid-run, by the worker's push failing/no-op'ing, which is the terminal behaviour OQ1 specifies anyway. The sweep and the dispatch-time catch-up both route through one shared `resolve_revision_on_parent_close`, so the two paths always reach identical verdicts.
 
-The gate logic is engine-owned, reading engine-maintained PR state — consistent with [[feedback_engine_owns_reconciliation_not_ui]]. The UI never evaluates the gate; it only renders what the engine decided.
+The inversion honours the design's actual goal — never spawn against a merged PR without surfacing it — while spending the network call where it is cheap (create) instead of where it is hot (every reconcile tick). The gate logic remains engine-owned, reading engine-maintained PR state — consistent with [[feedback_engine_owns_reconciliation_not_ui]]. The UI never evaluates the gate; it only renders what the engine decided.
 
 ### Completion: how a revision reaches `in_review` and `done`
 
 A revision worker pushes a commit to the parent's branch and prints the **parent's** PR URL. The completion detector (`PrDetector`-family) must handle this:
 
-- For a `revision_implementation` execution, the detector does **not** look for a _new_ PR. It confirms (via `gh pr view <parent#>`) that the parent PR's head advanced (a new commit is present) and that the printed URL matches the chain root's `pr_url`. On success, the revision row flips to `in_review`. It does **not** touch the parent's status.
-- The revision row's own `pr_url` stays `NULL`. The chain root remains the PR's owner.
-- **`done`** (Decisions § OQ7): a revision has **no independent doneness gate** — it rides the parent's lifecycle. A revision transitions to `done` exactly when its parent (chain root) task transitions to `done`, i.e. when the parent PR **merges or is closed**. It does _not_ go `done` when its own commit is pushed, and it does _not_ go `done` when the parent PR returns to `in_review` after the push. The merge poller already flips the chain root to `done` via `mark_chore_pr_merged`; extend that path so that when a chain root reaches `done`, its `in_review` revisions are flipped to `done` in the same transaction (they are rolled up under the parent; their deliverable — the commit — rode the PR to its terminal state). A revision that is still in Backlog/Doing when the parent merges/closes hits the auto-block policy (Decisions § OQ1) instead.
+- For a `revision_implementation` execution, the detector does **not** look for a _new_ PR. **As built (PR #778)**, the chain root's `pr_url` is stamped onto the _execution row_ at dispatch time (`work_executions.pr_url` — an addition relative to the original schema plan, back-filled if the execution was minted before the parent PR opened), `on_execution_started` snapshots the parent PR's HEAD SHA, and the existing **sha-delta gate** in `completion.rs` detects head advancement when the execution stops. On success the revision row flips to `in_review`; the parent's status is untouched. This snapshot-and-compare is exactly the higher-fidelity mechanism Risk R7 sketched as a follow-up — it shipped in v1.
+- The revision row's own `pr_url` stays `NULL` (`record_worker_pr_completion` explicitly preserves this). The chain root remains the PR's owner; the execution row carries the pointer.
+- **`done`** (Decisions § OQ7): a revision has **no independent doneness gate** — it rides the parent's lifecycle. A revision transitions to `done` exactly when its parent (chain root) task transitions to `done`, i.e. when the parent PR **merges or is closed**. It does _not_ go `done` when its own commit is pushed, and it does _not_ go `done` when the parent PR returns to `in_review` after the push. **As built (PR #778):** `mark_chore_pr_merged` calls `flip_in_review_revisions_to_done`, a BFS over `parent_task_id` links (`collect_chain_revision_ids`) that flips every `in_review` revision in the chain to `done` alongside the root. A revision that is still in Backlog/Doing when the parent merges/closes hits the auto-block policy (Decisions § OQ1) instead.
 
 This keeps the revision's lifecycle entirely engine-driven off existing signals: spawn → push commit → `in_review` (detector) → `done` (parent reaches `done` via the merge poller). No new poller, no new status column, no independent doneness gate.
 
@@ -294,6 +268,8 @@ The brief flags that every worker can `gh pr create` today, and a misbehaving re
 - All other Bash commands pass through unchanged, so the guard is a per-execution conditional, not a global block. It is only installed for `revision_implementation`; normal workers are unaffected.
 
 This is cheap insurance: the directive tells the worker not to, and the hook makes "not to" unbreakable without modifying PATH or shipping a binary. The hook keys on the execution kind the engine already knows at spawn time, so registering it is a per-execution decision in the spawn path.
+
+**As built (PR #782):** `execution_kind` is threaded through `WorkerSetupInput`/`StartWorkerInput` from `runner.rs` via `spawn_flow.rs`, and for `revision_implementation` the generated `settings.json` gains a second PreToolUse entry (matcher: `Bash`) whose inline Python guard reads the proposed command from stdin and returns `{"decision":"block","reason":...}` on a `gh pr create` match. Normal executions get the standard single-entry hook unchanged. The pattern later broadened into the editorial-controls hook family (which can also intercept `gh pr edit`/`comment`/`review`), but the revision-specific `gh pr create` denial remains keyed on execution kind exactly as decided in OQ3.
 
 ---
 
@@ -348,6 +324,8 @@ A revision that has reached `done` (parent merged) drops off the Review affordan
 
 Common case: the operator files R1 while T651 sits in review; R1 is in Backlog/Doing (its own card) while T651 is in Review (its card, no R1 line yet). Once R1's worker pushes and R1 flips to `in_review`, R1's standalone card disappears and the `⟳ R1` line appears under T651. The transition is purely status-driven and needs no special handling.
 
+**As built (PR #775):** shipped as specified. `WorkTask` gained `parentTaskId`/`revisionSeq`/`revisionParentPrUrl`, decoded leniently (nil against pre-revision engines, which is why this phase could merge before Phases 3–4 did); `workItems(in: .review)` suppresses `kind == "revision" && status == "in_review"` rows; the rollup lines render one `RevisionRollupLine` per in-review revision ordered by `revisionSeq`; the Backlog/Doing card carries a `RevisionBadge` chip plus "revises T\<n\>" and a parent-PR link row; no "Friendly ID" strings anywhere. A later addition projects `has_in_progress_revision` onto chain roots so the parent's Review card can also hint at revisions still in Backlog/Doing.
+
 ---
 
 ## Design Question 6 — Coordinator System-Prompt Addition
@@ -357,6 +335,8 @@ The Boss coordinator session needs to learn the verb exists and when to reach fo
 > **Revision tasks.** When the operator gives feedback on a task whose PR is already open and in review — asking to change, add to, or fix something in that work _before it merges_ — that is a **revision**, not a new chore. A revision adds a commit to the existing PR rather than opening a new one. Create it with `boss task create-revision --parent <task> --description "<the operator's ask, kept short>"`. Reach for this whenever the operator's intent is "amend the work that produced this open PR" rather than "start something new". Do not use it if the parent has no PR yet, or if the PR is already merged or closed — in those cases a normal `boss task create` (a fresh chore) is correct, and `create-revision` will refuse with a gate error pointing you there. Pass the operator's wording through to `--description` verbatim where it is already concise; summarize only if it is long, because that text is what reviewers see on the kanban.
 
 This teaches recognition (feedback on an in-review PR), the command shape, and the gate boundary, while deferring keyphrase judgment to the model.
+
+**As built (PR #782):** the paragraph ships in `bossSystemPrompt()` (`app-macos/Sources/Ghostty/BossPaneModel.swift`) essentially as drafted. The CLI's guidance later gained a companion note teaching the coordinator that filing a new revision while a prior one is still in flight is safe — the engine serialises same-chain revisions via the automatic chain-tail gate — so it should not defensively queue or `--no-autostart`.
 
 ---
 
@@ -380,6 +360,8 @@ Revisions are usually narrow ("rename the flag", "handle the empty case") — (c
 
 **Pick (b).** `create-revision` defaults `--effort` to `small` when the operator does not pass one. The existing marker scan runs on the description and may _raise_ the level (large/max markers win over the default) but never lowers it below `small`. Document this as the one kind-specific rule in the effort module: revisions start at `small`, escalation patterns still apply. The operator can always override with explicit `--effort`.
 
+**As built (PR #770):** the default landed; the marker-scan escalation half did not. `insert_revision_in_tx` resolves effort as: explicit `--effort` if given, else a kind-aware default — `small`, later amended to `large` when the chain root is design-family (`design`/`investigation`/`design_postmortem`, transitively through the chain; the 2026-07-13 Fable-tier dispatch-floor policy addendum). The marker scan is never consulted on the create path. In practice the coordinator passes `--effort` explicitly when an ask is clearly bigger than a routine revision, and the sanctioned `[effort-escalation]` worker marker covers the misjudged tail, so the missing scan has not been felt.
+
 ---
 
 ## Decisions
@@ -388,7 +370,9 @@ The seven questions this design originally raised have been resolved by the oper
 
 ### OQ1 — Parent PR merges while a revision is in-flight
 
-**Decision: auto-block, worker exits.** Do not convert the revision into a chore-against-`main`; do not keep going. When the dispatch-time gate (Q4) detects the parent PR is `Merged`/`ClosedUnmerged`, do not spawn — move the revision to `blocked` (`blocked_reason = "parent PR merged/closed before this revision dispatched"`) and surface a `WorkAttentionItem`. If the merge happens _mid-run_ (worker already spawned), the worker exits cleanly: the push fast-forwards a no-op or fails, and the revision lands in `blocked` + attention rather than silently opening a new PR. The operator re-targets manually (files a chore) after seeing the attention item. _Why it matters: the rejected alternatives either silently spawn a duplicate PR (worst) or auto-create work the operator didn't ask for._
+**Decision: auto-block, worker exits.** Do not convert the revision into a chore-against-`main`; do not keep going. When the dispatch-time gate (Q4) detects the parent PR is `Merged`/`ClosedUnmerged`, do not spawn — move the revision to `blocked` and surface a `WorkAttentionItem`. If the merge happens _mid-run_ (worker already spawned), the worker exits cleanly: the push fast-forwards a no-op or fails, and the revision lands in `blocked` + attention rather than silently opening a new PR. The operator re-targets manually (files a chore) after seeing the attention item. _Why it matters: the rejected alternatives either silently spawn a duplicate PR (worst) or auto-create work the operator didn't ask for._
+
+**As built:** the shape shipped with two refinements. The `blocked_reason` is the short machine code `parent_pr_closed` rather than the drafted sentence, and both trigger paths — the merge-poller sweep (`block_pending_revisions_on_parent_close`) and the dispatch-time catch-up in `reconcile_revision_execution` (covering engine restarts and created-after-merge edges) — resolve through one shared `resolve_revision_on_parent_close`, so they always reach the same verdict. Later projects extended the resolver's vocabulary (e.g. archiving revisions rendered moot by the close, converting review-driven revisions to follow-ups), but "never silently open a new PR" is unchanged.
 
 ### OQ2 — Revision chains and sequence numbering
 
@@ -404,21 +388,27 @@ The seven questions this design originally raised have been resolved by the oper
 
 ### OQ5 — Cube workspace fallback when the preferred workspace is gone/leased
 
-**Decision: `--prefer` is nice-to-have only; fall back silently with no ceremony.** Try `--prefer <chain-root's-last-workspace>` for cache warmth, and if it is gone or leased, fall back to any free workspace — **no retries, no warnings, no human-attention surfacing**. The branch state is recoverable from GitHub via `jj git fetch`, so any workspace is correct; warmth affects build speed only, and very minorly. Implemented via the additive `executions.prefer_is_soft` signal so the coordinator's fallback matrix (`coordinator.rs:1801`) treats revisions as soft-prefer rather than the hard-prefer orphan-resume uses (Q3). _Why it matters: the existing matrix fails terminally when a preference can't be honored; applied to revisions that would wedge one behind a busy workspace for no reason._
+**Decision: `--prefer` is nice-to-have only; fall back silently with no ceremony.** Try `--prefer <chain-root's-last-workspace>` for cache warmth, and if it is gone or leased, fall back to any free workspace — **no retries, no warnings, no human-attention surfacing**. The branch state is recoverable from GitHub, so any workspace is correct; warmth affects build speed only, and very minorly. _Why it matters: the existing matrix fails terminally when a preference can't be honored; applied to revisions that would wedge one behind a busy workspace for no reason._
+
+**As built (PRs #767 + #778):** shipped exactly so, as `work_executions.prefer_is_soft` (default 0; set for revision dispatch). `lease_workspace_with_fallback` and its hard-fail guard both respect the flag, so soft-prefer executions never fail on workspace unavailability; orphan-resume keeps hard-prefer untouched (Q3).
 
 ### OQ6 — Boss tracking comment on the parent PR
 
-**Decision: yes, but gated by editorial controls (T577's eventual deliverable).** After pushing, the revision worker posts `[boss-revision] R<n>: <description>` on the parent PR (step 9 of the directive, Q3) so reviewers get an in-PR breadcrumb for what each new commit was for. Whether the comment is actually posted is decided by an editorial-controls gate — an `editorial_controls::should_post_comment(repo, pr)` hook point consulted from the revision-completion path. **Nothing in this design blocks on T577 shipping:** the gate is a hook point that **defaults to "post"** until editorial controls land (personal PRs fine; work PRs may later opt out). _Why it matters: low stakes — worst case is mild PR-comment noise; the upside is reviewer clarity — but the gate keeps the behaviour controllable once T577 exists._
+**Decision: yes, but gated by editorial controls — subsequently dropped in implementation.** The plan was for the revision worker to post `[boss-revision] R<n>: <description>` on the parent PR after pushing, behind an `editorial_controls::should_post_comment` hook point defaulting to "post".
+
+**As built: never shipped, and now considered dropped rather than pending.** No phase implemented it — PR #778's directive contained no comment step, and nothing in the engine posts `[boss-revision]`. Two later developments superseded the breadcrumb's purpose and polarity: the revision directive now _requires_ reconciling the parent PR's title and description after each revision (a stronger reviewer breadcrumb than a bot comment, since it keeps the PR's own summary truthful), and editorial controls landed as a PreToolUse hook regime that intercepts and can deny worker `gh pr comment` invocations — the opposite of this decision's "default to post". Reviving the tracking comment would need a fresh decision against that regime; this postmortem records it as dropped.
 
 ### OQ7 — Does a revision ever reach `done` independently of the parent?
 
-**Decision: no.** `done == parent PR merged or closed`. Revisions have no independent doneness gate — they ride the parent's lifecycle. A revision is `in_review` (commit pushed, rolled up under the parent) and transitions to `done` exactly when its parent (chain root) task transitions to `done` — i.e. when the parent PR merges or is closed. Explicitly: _not_ when the revision's commit is pushed, and _not_ when the parent PR returns to `in_review` after the push (see Q4 § Completion). _Why it matters: if revisions could go `done` while the PR stays open, the Review rollup would lose them prematurely and the operator would lose sight of in-flight revision context._
+**Decision: no.** `done == parent PR merged or closed`. Revisions have no independent doneness gate — they ride the parent's lifecycle. A revision is `in_review` (commit pushed, rolled up under the parent) and transitions to `done` exactly when its parent (chain root) task transitions to `done` — i.e. when the parent PR merges or is closed. Explicitly: _not_ when the revision's commit is pushed, and _not_ when the parent PR returns to `in_review` after the push (see Q4 § Completion). _Why it matters: if revisions could go `done` while the PR stays open, the Review rollup would lose them prematurely and the operator would lose sight of in-flight revision context._ **As built (PR #778):** `flip_in_review_revisions_to_done`, called from `mark_chore_pr_merged`, implements exactly this.
 
 ---
 
 ## Schema and Wire Summary
 
 ### Column adds
+
+As shipped in PR #767 (the executions table is `work_executions`, a naming correction from the draft):
 
 ```sql
 -- tasks: parent linkage for revisions.
@@ -428,9 +418,11 @@ ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;   -- soft FK → tasks.id; NUL
                                                     -- kind = 'revision'.
 CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);
 
--- executions: soft-prefer signal for cube lease fallback (OQ5).
-ALTER TABLE executions ADD COLUMN prefer_is_soft INTEGER NOT NULL DEFAULT 0;
+-- work_executions: soft-prefer signal for cube lease fallback (OQ5).
+ALTER TABLE work_executions ADD COLUMN prefer_is_soft INTEGER NOT NULL DEFAULT 0;
 ```
+
+One schema-adjacent addition the draft did not anticipate (PR #778): the execution row carries the revision's target PR — `work_executions.pr_url` is stamped with the chain root's `pr_url` at dispatch (back-filled if the execution was minted before the parent PR opened). It exists so the completion sha-delta gate and the worker directive read the PR pointer from the execution without re-walking the chain, while `tasks.pr_url` stays `NULL` on revision rows.
 
 `tasks.kind` gains the value `'revision'` (no enum/CHECK; validation in the application layer, consistent with every other kind). The "kind = revision ⇒ parent_task_id IS NOT NULL" invariant is enforced in `insert_revision_in_tx` and on task update, not by a DB constraint (Q1).
 
@@ -463,18 +455,18 @@ pub struct CreateRevisionInput {
 //   revision_parent_pr_url: Option<String>  // chain root's pr_url, for the card link
 ```
 
-The `revision_seq` and `revision_parent_pr_url` fields are **engine-computed** projections, not stored columns — the kanban consumes them and never recomputes the chain (Q5, [[feedback_engine_owns_reconciliation_not_ui]]).
+The `revision_seq` and `revision_parent_pr_url` fields are **engine-computed** projections, not stored columns — the kanban consumes them and never recomputes the chain (Q5, [[feedback_engine_owns_reconciliation_not_ui]]). `CreateExecutionInput` also gained `prefer_is_soft: bool` and `pr_url: Option<String>` (both `#[serde(default)]`) so dispatch can stamp the execution row.
 
-### Engine touch-points (for the follow-up chores to target)
+### Engine touch-points (as shipped; the `work.rs` monolith has since been split into `work/*.rs` modules)
 
-- `work.rs` — `insert_revision_in_tx` (mirror `insert_investigation_in_tx` at `work.rs:7074`); `chain_root(task_id)` helper; `assert_parent_revisable`; revision arm in the dispatch reconcile loop (`work.rs:1622-1656`, dispatch `revision_implementation` independently like `investigation`); extend `mark_chore_pr_merged` to flip in-review revisions to `done`; revision-seq projection.
-- `runner.rs` — `revision_implementation` arm in `spawn_prompt` (`runner.rs:700`); `compose_revision_directive` (mirror `compose_investigation_directive` at `runner.rs:809`); add `revision_implementation` to the acceptance `matches!` (`runner.rs:718`).
-- `coordinator.rs` — soft-prefer in `lease_workspace_with_fallback` (`coordinator.rs:1817-1840`); populate `preferred_workspace_id` from the chain root's last workspace for revision dispatch.
-- `merge_poller.rs` / completion — dispatch-time gate via the existing single-PR probe; revision completion detection (parent head advanced, no new PR); the editorial-controls hook point (`editorial_controls::should_post_comment(repo, pr)`, defaulting to "post") consulted before the tracking comment (OQ6).
-- `cli/src/main.rs` — `create-revision` verb + `RevisionCreateArgs` (mirror `create-investigation`); gate-error messages (Q2).
-- `app-macos` — `WorkTask` fields (`Models.swift`); revision card + Review rollup affordance (`ContentView.swift:689-748`, `:1711-1736`).
-- coordinator system prompt — the paragraph from Q6.
-- worker spawn config — register the `gh pr create` PreToolUse hook for `revision_implementation` executions (OQ3); no new binary, no PATH change.
+- `work/` — `insert_revision_in_tx` + `assert_parent_revisable_and_insert` + `attach_revision_projections` (`revision_helpers.rs`); `chain_root` (`chain_helpers.rs`); `reconcile_revision_execution` + `preferred_workspace_for_chain_root` (`dispatch_helpers.rs`); `flip_in_review_revisions_to_done` called from `mark_chore_pr_merged`.
+- `runner.rs` — `revision_implementation` arm in the spawn-prompt kind match; `compose_revision_directive`; acceptance-criterion framing for revisions.
+- `coordinator.rs` — `lease_workspace_with_fallback` reads `prefer_is_soft` to select `fallback_policy = "any_free"`.
+- `completion.rs` — `on_execution_started` / `evaluate_sha_delta_gate` fall back to `execution.pr_url` for `revision_implementation`; `record_worker_pr_completion` preserves `task.pr_url = NULL`. (The drafted dispatch-time poller probe and `should_post_comment` hook point were not built — see Q4 and OQ6.)
+- `cli/src/main.rs` — `create-revision` verb + `RevisionCreateArgs`; gate-error messages (Q2).
+- `app-macos` — `WorkTask` fields (`Models.swift` + `EngineClient` parsing); revision card + Review rollup affordance (`ContentView.swift` and helpers).
+- coordinator system prompt — the Q6 paragraph in `bossSystemPrompt()` (`BossPaneModel.swift`).
+- worker spawn config — `execution_kind` on `WorkerSetupInput`/`StartWorkerInput`; per-kind PreToolUse guard in the generated `settings.json` (OQ3); no new binary, no PATH change.
 
 ---
 
@@ -492,27 +484,27 @@ The `revision_seq` and `revision_parent_pr_url` fields are **engine-computed** p
 
 **R6 — Sequence number drift.** A computed `R<n>` could surprise if a mid-chain revision is deleted. _Mitigation:_ sequence is creation-ordered over surviving revisions (Q1); deleting R1 renumbers R2→R1, which is the intuitive "now there's one revision and it's the first" reading. Stored numbers would have been worse (gaps).
 
-**R7 — Completion detection false-negative.** The detector must distinguish "the parent head advanced because of _my_ push" from "advanced because something else pushed". _Mitigation:_ v1 confirms the printed URL matches the chain root's PR and the head advanced since spawn; if higher fidelity is needed, capture the pushed SHA (deferred `revision_commit_sha`, Q5) and match on it.
+**R7 — Completion detection false-negative.** The detector must distinguish "the parent head advanced because of _my_ push" from "advanced because something else pushed". _Mitigation (shipped):_ the sha-delta gate snapshots the parent PR's HEAD at execution start and compares at stop — the snapshot-and-compare this risk asked for landed in v1 (Q4). The per-commit `revision_commit_sha` capture for Review-lane deep links remains deferred (Q5).
 
 **R8 — Parent linkage outlives the parent.** A parent task is deleted while revisions reference it. _Mitigation:_ `parent_task_id` is a soft FK (no cascade), consistent with `project_id`; a revision whose parent is gone is surfaced as a broken-parent attention item rather than crashing a join. Walking to chain root tolerates a missing link.
 
 ---
 
-## Phased Implementation Plan
+## Phased Implementation Plan — as shipped
 
-Five child tasks, smallest first, each shippable independently. File these as follow-ups after this design is approved.
+All five phases merged on 2026-05-26. Phase 5 landed before Phases 3–4 (its fields decode as nil against a pre-revision engine, so ordering was free).
 
-1. **Schema + protocol (smallest).** Add `tasks.parent_task_id` + index and `executions.prefer_is_soft` migrations (mirror `migrate_tasks_investigation_doc_columns`). Add `CreateRevisionInput`/`CreateRevision` wire types and the `revision`-kind recognition (no behavior yet). Add `chain_root` helper + unit tests. _Acceptance:_ fresh init and migration both yield the new columns; `chain_root` walks chains correctly including the broken-parent case; existing tests green. Ships dark — no kind is dispatchable yet.
+1. **Schema + protocol** — [#767](https://github.com/spinyfin/mono/pull/767). Shipped dark as planned: `tasks.parent_task_id` + index, `work_executions.prefer_is_soft`, `CreateRevisionInput`/`CreateRevision` wire types (handler stubbed), `chain_root` helper with depth cap and broken-parent tolerance, `'revision'` recognized in the work-tree kind filter. Fresh-init, upgrade, and chain-walk tests included.
 
-2. **CLI `create-revision` + create-time gate.** `RevisionCreateArgs`, `insert_revision_in_tx` (parent-required invariant), `assert_parent_revisable` with the precise gate-error messages (Q2). _Acceptance:_ `create-revision --parent <merged>` / `<no-pr>` / `<closed>` each return the right error; `--parent <open>` creates a `revision` row with the parent linkage; revision-of-revision resolves the gate against the chain root.
+2. **CLI `create-revision` + create-time gate** — [#770](https://github.com/spinyfin/mono/pull/770). `RevisionCreateArgs`, real `CreateRevision` handler, `assert_parent_revisable_and_insert` with the three gate errors. Divergence: the gate does a **live** PR-state check via the `PrStateChecker` trait rather than trusting cached state (Q4); `repo_remote_url` deliberately not copied onto the revision row (Q2).
 
-3. **Dispatch + completion.** `revision_implementation` dispatch arm (`work.rs` reconcile loop); `compose_revision_directive` + spawn arm (`runner.rs`); soft-prefer cube lease (`coordinator.rs`); dispatch-time re-gate via the existing poller probe; completion detection (parent head advanced, no new PR); extend `mark_chore_pr_merged` to flip in-review revisions to `done`. _Acceptance:_ end-to-end on a test PR — revision spawns into a (preferably warm) workspace, pushes a commit to the parent branch, opens no new PR, reaches `in_review`; merging the parent flips the revision to `done`. Merged-mid-flight lands the revision in `blocked` + attention (OQ1).
+3. **Dispatch + completion** — [#778](https://github.com/spinyfin/mono/pull/778). `reconcile_revision_execution`, `compose_revision_directive`, soft-prefer lease, done-cascade. Divergences: dispatch-time gate is **cached-only** (Q4 inversion); completion rides the existing sha-delta gate off the new `executions.pr_url` slot instead of a bespoke detector; the drafted `jj edit` worker recipe shipped as `gh pr checkout` (since superseded by engine pre-positioning, Q3); no tracking comment (OQ6).
 
-4. **Permission hard-guard + coordinator prompt.** The PreToolUse hook that denies `gh pr create` for `revision_implementation` executions (OQ3); the coordinator system-prompt paragraph (Q6). _Acceptance:_ a `revision_implementation` worker attempting `gh pr create` is denied by the hook with the contract message; a normal worker is unaffected; the coordinator, given simulated operator feedback on an in-review PR, reaches for `create-revision`.
+4. **Permission hard-guard + coordinator prompt** — [#782](https://github.com/spinyfin/mono/pull/782). Inline-Python PreToolUse guard in the generated `settings.json`, keyed on the new `execution_kind` field of `WorkerSetupInput`/`StartWorkerInput`; coordinator paragraph in `bossSystemPrompt()`. Guard + no-guard tests for revision vs chore executions.
 
-5. **Kanban chrome.** `WorkTask` fields (`parentTaskId`, `revisionSeq`, `revisionParentPrUrl`); distinct revision card in Backlog/Doing; per-revision rollup line on the parent's Review-lane card (Q5). _Acceptance:_ a revision shows a distinct `⟳ R<n>` card in Backlog/Doing and disappears into a single rollup line under the parent in Review; numbering is chain-root-scoped; all UI text uses "R<n>"/"Revision n", never "Friendly ID" ([[feedback_no_friendly_id_in_ui]]).
+5. **Kanban chrome** — [#775](https://github.com/spinyfin/mono/pull/775). Shipped as planned: `WorkTask` fields, distinct `⟳ R<n>` cards, Review-column suppression + per-revision rollup lines ordered by `revisionSeq`, no "Friendly ID" strings ([[feedback_no_friendly_id_in_ui]]). 15 unit tests.
 
-A sixth, explicitly out of scope here: the Source-B comment-triage UI, which becomes a thin producer calling `CreateRevision` with a `created_via` pointer (Q1, OQ4) once this mechanism lands.
+The sixth item — the Source-B comment-triage UI — remains unbuilt as designed, but the thin-producer bet has already been validated from an unexpected direction: engine-spawned merge-conflict-resolution and CI-fix revisions (later projects) create revision tasks through this same substrate, carrying their provenance in `created_via` prefixes exactly as Q1 prescribed for B.
 
 ---
 
