@@ -1029,16 +1029,15 @@ async fn planner_prompt_embeds_real_doc_and_context() {
     let schema = &tool["input_schema"];
     assert_eq!(schema["type"], "object");
     let required = schema["required"].as_array().unwrap();
-    for field in [
-        "tasks",
-        "edges",
-        "confidence",
-        "breakdown_found",
-        "notes",
-        "effort_audit",
-    ] {
+    for field in ["tasks", "edges", "confidence", "breakdown_found", "notes"] {
         assert!(required.iter().any(|value| value == field), "schema requires {field:?}");
     }
+    // `effort_audit` is engine-derived (see `derive_effort_audit`), not part
+    // of the model contract, so it must not appear in `required`.
+    assert!(
+        !required.iter().any(|value| value == "effort_audit"),
+        "schema must not require effort_audit from the model"
+    );
 }
 
 // ---------------------------------------------------------------------------

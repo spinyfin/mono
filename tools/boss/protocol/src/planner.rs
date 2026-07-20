@@ -194,14 +194,18 @@ pub struct PlannerOutput {
     ///
     /// This field is **derived** by `Planner` (`tools/boss/engine/core/src/
     /// planner.rs::derive_effort_audit`) from each task's `description`,
-    /// which the system prompt already requires to end with the identical
-    /// line, and is never read from the model's own JSON. Skipping
-    /// deserialization prevents a type-mismatch serde error when the model
-    /// fills this field with something other than a JSON array of strings
-    /// (observed: a single JSON-encoded string containing the array) —
-    /// mirrors the `suspected_deletions` fix in `pr_review::types::
-    /// RegressionCheck`.
-    #[serde(skip_deserializing, default)]
+    /// which already ends with the identical line — the model is no longer
+    /// asked to emit `effort_audit` at all (see `planner_output_schema`,
+    /// which omits it from both `required` and `properties`), so there is no
+    /// model-controlled shape to guard against here. `PlannerOutput` is a
+    /// bidirectional wire type (also carried in
+    /// `FrontendEvent::PlanProjectResult` and re-decoded/re-emitted by the
+    /// CLI), so this field deserialises normally like every other field —
+    /// only `planner_output_from_response` neutralises the raw JSON key
+    /// before deserialising the model's tool-call input, confining any
+    /// tolerance for a malformed model shape to that one call site instead of
+    /// making the type lossy for every other caller.
+    #[serde(default)]
     #[builder(default)]
     pub effort_audit: Vec<String>,
 }
@@ -249,8 +253,7 @@ pub fn planner_output_schema() -> Value {
             "merge_order_hints",
             "confidence",
             "breakdown_found",
-            "notes",
-            "effort_audit"
+            "notes"
         ],
         "additionalProperties": false,
         "properties": {
@@ -345,13 +348,6 @@ pub fn planner_output_schema() -> Value {
             "notes": {
                 "type": "string",
                 "description": "Free-text rationale persisted in planner_runs for operator review."
-            },
-            "effort_audit": {
-                "type": "array",
-                "description": "One [effort-classification] line per proposed task.",
-                "items": {
-                    "type": "string"
-                }
             }
         }
     })
@@ -403,6 +399,11 @@ mod tests {
         assert_eq!(back.tasks[0].handle, "schema");
         assert_eq!(back.confidence, Confidence::High);
         assert!(back.breakdown_found);
+        // `effort_audit` is a bidirectional wire field (carried in
+        // `FrontendEvent::PlanProjectResult` and re-decoded by the CLI) — it
+        // must round-trip faithfully even though the engine, not the model,
+        // is the one that populates it.
+        assert_eq!(back.effort_audit, output.effort_audit);
     }
 
     #[test]
@@ -519,10 +520,18 @@ mod tests {
     fn schema_top_level_required_matches_planner_output_fields() {
         let schema = planner_output_schema();
         let required = sorted(string_array(&schema, "/required"));
-        let fields = serde_field_names(&sample_output());
+        // `effort_audit` is deliberately excluded: it is engine-derived (see
+        // `derive_effort_audit` in `boss-engine-core`), never emitted by the
+        // model, and therefore absent from both the schema's `required` list
+        // and its `properties` — it is a wire field, not a model contract
+        // field.
+        let fields: Vec<String> = serde_field_names(&sample_output())
+            .into_iter()
+            .filter(|f| f != "effort_audit")
+            .collect();
         assert_eq!(
             required, fields,
-            "top-level `required` must list exactly PlannerOutput's serde fields"
+            "top-level `required` must list exactly PlannerOutput's serde fields, minus the engine-derived `effort_audit`"
         );
     }
 

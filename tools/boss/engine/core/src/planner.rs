@@ -44,14 +44,19 @@
 //! free-form markdown.
 //!
 //! A healthy proposal has nevertheless been observed to fail whole because an
-//! array-typed field (`edges`, or — before the fix below — `effort_audit`)
-//! came back as a single JSON-encoded string rather than a JSON array — model
-//! flakiness on an otherwise-valid result, not a prompt or schema defect.
-//! Mitigations, in order: (1) [`PlannerOutput::effort_audit`] is
-//! `#[serde(skip_deserializing)]` and derived by [`derive_effort_audit`] from
-//! each task's `description` instead — the array is redundant with data
-//! already present there, so its shape can never fail deserialization at all
-//! (mirrors `pr_review`'s `suspected_deletions` fix); (2)
+//! array-typed field came back as a single JSON-encoded string rather than a
+//! JSON array — observed on `effort_audit` in production, and guarded against
+//! on the fields still deserialized from the model (`tasks`, `edges`) as a
+//! precaution — model flakiness on an otherwise-valid result, not a prompt or
+//! schema defect. Mitigations, in order: (1) the model is no longer asked to
+//! emit `effort_audit` at all — [`planner_output_schema`] omits it from both
+//! `required` and `properties`, and [`planner_output_from_response`]
+//! overwrites the raw `effort_audit` key (if the model sends one anyway)
+//! before deserialising, so [`PlannerOutput::effort_audit`] instead comes
+//! from [`derive_effort_audit`], which reads it back out of each task's
+//! `description` — the array was always redundant with data already present
+//! there, so its shape can never fail deserialization at all (mirrors
+//! `pr_review`'s `suspected_deletions` fix); (2)
 //! [`coerce_stringified_array_fields`] rewrites a remaining known-array field
 //! (`tasks`, `edges`) back into an array, when the string itself parses as
 //! one, before schema validation runs; (3) if validation still fails,
@@ -124,10 +129,11 @@ pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 ///
 /// 1. **Schema-invalid output** — a model occasionally emits a tool call that
 ///    violates [`planner_output_schema`] (observed: an array-typed field like
-///    `effort_audit` emitted as a single JSON-encoded string). That is model
-///    flakiness, not a transient transport error, so [`PLANNER_ATTEMPTS`]'s
-///    429/5xx retry never sees it and a single miss used to fail the whole
-///    proposal.
+///    `edges` emitted as a single JSON-encoded string; historically also
+///    `effort_audit`, before the model stopped being asked to emit it — see
+///    the module doc). That is model flakiness, not a transient transport
+///    error, so [`PLANNER_ATTEMPTS`]'s 429/5xx retry never sees it and a
+///    single miss used to fail the whole proposal.
 /// 2. **Oversize tasks (the decomposition gate)** — a schema-valid proposal
 ///    that packs a monolithic "project in disguise" task
 ///    ([`detect_oversize_tasks`]). The retry asks the model to decompose it
@@ -538,6 +544,16 @@ fn planner_output_from_response(response: &MessagesResponse) -> Result<PlannerOu
         .ok_or_else(|| format!("model did not call the {TOOL_NAME} tool"))?;
     let mut input = input.clone();
     coerce_stringified_array_fields(&mut input);
+    // `effort_audit` is no longer part of the model contract (see the module
+    // doc), but `PlannerOutput::effort_audit` deserialises normally now that
+    // it is a bidirectional wire field — so overwrite whatever the raw JSON
+    // holds here (present or not, well-formed or not) with an empty array
+    // before deserialising. This confines tolerance for any shape the model
+    // might still emit to this one call site, then [`derive_effort_audit`]
+    // fills in the real values from each task's `description`.
+    if let Some(obj) = input.as_object_mut() {
+        obj.insert("effort_audit".to_owned(), json!([]));
+    }
     let mut output = serde_json::from_value::<PlannerOutput>(input)
         .map_err(|err| format!("tool input did not match the PlannerOutput schema: {err}"))?;
     normalize_output_text(&mut output);
@@ -547,8 +563,9 @@ fn planner_output_from_response(response: &MessagesResponse) -> Result<PlannerOu
 
 /// Top-level [`PlannerOutput`] fields the schema requires to be a JSON array
 /// and that are still deserialized from the model's JSON (unlike
-/// `effort_audit`, which is `#[serde(skip_deserializing)]` and derived by
-/// [`derive_effort_audit`] instead — see that function's doc comment).
+/// `effort_audit`, which the model is no longer asked to emit at all and
+/// which [`planner_output_from_response`] overwrites before deserialising —
+/// see [`derive_effort_audit`]).
 const ARRAY_TYPED_FIELDS: &[&str] = &["tasks", "edges"];
 
 /// Prefix marking the audit line the system prompt requires at the end of
@@ -557,18 +574,20 @@ const ARRAY_TYPED_FIELDS: &[&str] = &["tasks", "edges"];
 const EFFORT_AUDIT_PREFIX: &str = "[effort-classification]";
 
 /// Derive [`PlannerOutput::effort_audit`] from each task's `description`
-/// instead of trusting a separately-emitted array. The system prompt already
-/// requires the model to write the identical `[effort-classification]` line
-/// at the end of `description` *and* duplicate it into `effort_audit` — the
-/// array is redundant with data that is always present, so deriving it from
-/// that copy removes a whole class of failure the duplicate array invited
-/// (observed in production: `effort_audit` emitted as a single JSON-encoded
-/// string rather than a JSON array, which used to fail deserialization of an
-/// otherwise fully valid proposal). `PlannerOutput::effort_audit` is
-/// `#[serde(skip_deserializing)]`, so whatever shape the model's raw
-/// `effort_audit` JSON took is never even looked at — mirrors
-/// `pr_review::types::RegressionCheck::suspected_deletions`, which is derived
-/// from `findings` for the same reason.
+/// instead of trusting a separately-emitted array. The system prompt requires
+/// the model to write a `[effort-classification]` line at the end of every
+/// task's `description`; the model is no longer asked to also duplicate that
+/// line into an `effort_audit` array — that array was redundant with data
+/// already present in `description`, and duplicating it invited a whole
+/// class of failure (observed in production: `effort_audit` emitted as a
+/// single JSON-encoded string rather than a JSON array, which used to fail
+/// deserialization of an otherwise fully valid proposal). Deriving the field
+/// here instead removes that failure mode entirely: `effort_audit` no longer
+/// depends on anything the model puts in its own JSON —
+/// [`planner_output_from_response`] overwrites the raw key unconditionally
+/// before deserialising — mirrors `pr_review::types::
+/// RegressionCheck::suspected_deletions`, which is derived from `findings`
+/// for the same reason.
 ///
 /// One entry per task, same order as `tasks` (an empty string for a task
 /// whose description has no audit line), so callers that index it against
@@ -627,8 +646,9 @@ fn coerce_stringified_array_fields(input: &mut Value) {
 /// `description`, so every downstream consumer (the `planner_runs` audit
 /// row, the Materializer, the app UI) sees clean text instead of each
 /// display site having to band-aid around it. `effort_audit` itself needs no
-/// entry here — it is `#[serde(skip_deserializing)]` and always empty at
-/// this point, populated afterwards by [`derive_effort_audit`].
+/// entry here — [`planner_output_from_response`] always resets it to an
+/// empty array before this runs, and [`derive_effort_audit`] populates it
+/// afterwards from the (now-clean) task descriptions.
 fn normalize_output_text(output: &mut PlannerOutput) {
     output.notes = unescape_over_escaped(&output.notes);
     for task in &mut output.tasks {
@@ -770,8 +790,6 @@ format (backticks around the level and the rule; double-quoted reasons):\n\
 \n\
 - Put this line at the END of the task's `description`, separated from the \
 rest of the description by a blank line.\n\
-- ALSO add the identical line to the `effort_audit` array — one entry per \
-task, in the same order as `tasks`.\n\
 - The `level` in the line MUST equal the task's `effort`.\n\
 \n\
 ## dependency edges — maximise safe parallelism\n\
@@ -1118,9 +1136,12 @@ mod tests {
 
     #[test]
     fn coerces_a_stringified_edges_array_before_validation() {
-        // The stringified-array slip is not unique to `effort_audit` — `edges`
-        // is still schema-validated (unlike `effort_audit`, which is now
-        // derived), so it still needs the pre-validation coercion.
+        // `edges` is still schema-validated and deserialized from the model's
+        // JSON (unlike `effort_audit`, which is now derived and never
+        // validated), so it still needs the pre-validation coercion —
+        // guarding against the same class of slip observed on
+        // `effort_audit`, even though `edges` itself has not been observed to
+        // flake this way in production.
         let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
