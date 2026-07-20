@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -588,8 +588,14 @@ impl WorkDb {
         // open sibling of the same automation already tracks the finding.
         // Independent of every other table and additive-only.
         migrate_automation_dedup_suppressions_table(conn)?;
+        // `task_targets`: declared (and, later, actual) files/symbols a task
+        // touches. First consumer is the automation pre-file dedup gate
+        // (`WorkDb::create_automation_task`) — additive, independent of
+        // every other table.
+        // Design: tools/boss/docs/investigations/automation-duplicate-work-2026-07-14.md
+        migrate_task_targets_table(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -680,7 +686,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "26");
+        assert_eq!(schema_version, "27");
 
         let boothby_passes_exists: bool = conn
             .query_row(

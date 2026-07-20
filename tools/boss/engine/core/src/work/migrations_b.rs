@@ -2039,3 +2039,35 @@ pub(crate) fn migrate_clear_merge_queue_state_on_terminal_tasks(conn: &Connectio
     )?;
     Ok(())
 }
+
+/// `task_targets`: the files/symbols a task is declared (or later found) to
+/// touch. A side table rather than columns on `tasks` so both the
+/// create-time declaration (`--target-file`/`--target-symbol` on
+/// `boss task create --automation`) and a future post-hoc backfill of
+/// *actual* touched files (layer 2, `merge_poller`) can share it, and so a
+/// task can carry any number of targets.
+///
+/// Purely additive (`CREATE TABLE IF NOT EXISTS`) and independent of every
+/// other table.
+///
+/// Design: `tools/boss/docs/investigations/automation-duplicate-work-2026-07-14.md` §4 Layer 1.
+pub(crate) fn migrate_task_targets_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_targets (
+             id         TEXT PRIMARY KEY,
+             task_id    TEXT NOT NULL REFERENCES tasks(id),
+             kind       TEXT NOT NULL CHECK (kind IN ('file', 'symbol')),
+             value      TEXT NOT NULL,
+             created_at TEXT NOT NULL
+         );
+
+         CREATE INDEX IF NOT EXISTS task_targets_task_id_idx
+             ON task_targets(task_id);
+
+         -- Used by the pre-file dedup gate to find open tasks that declared
+         -- a given file, without scanning every open task's target set.
+         CREATE INDEX IF NOT EXISTS task_targets_kind_value_idx
+             ON task_targets(kind, value);",
+    )?;
+    Ok(())
+}

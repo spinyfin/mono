@@ -406,6 +406,8 @@ pub(super) async fn handle_create_automation_task(ctx: Dispatch, req: FrontendRe
         automation_id,
         name,
         description,
+        target_files,
+        target_symbols,
     } = req
     else {
         unreachable!()
@@ -413,10 +415,17 @@ pub(super) async fn handle_create_automation_task(ctx: Dispatch, req: FrontendRe
     {
         // The triage agent's `boss task create --automation`. Creates
         // the single produced task (with a transactional open-task-cap
-        // re-check as the fan-out backstop), then — because the task is
-        // `autostart` — requests its execution, which the dispatcher
-        // routes to the automations pool on `source_automation_id`.
-        match work_db.create_automation_task(&automation_id, &name, description.as_deref()) {
+        // re-check and pre-file dedup gate as the fan-out backstops), then
+        // — because the task is `autostart` — requests its execution,
+        // which the dispatcher routes to the automations pool on
+        // `source_automation_id`.
+        match work_db.create_automation_task(
+            &automation_id,
+            &name,
+            description.as_deref(),
+            &target_files,
+            &target_symbols,
+        ) {
             Ok(task) => {
                 let item = WorkItem::Chore(task);
                 let work_item_id_for_dispatch = work_item_id(&item);

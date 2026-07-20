@@ -987,15 +987,40 @@ impl WorkDb {
     ///    agent could call this repeatedly within one run; re-checking the
     ///    cap transactionally guarantees at most `open_task_limit` open
     ///    produced tasks regardless of agent behaviour.
-    /// 2. Insert a product-level chore (`kind='chore'`, `project_id=NULL`)
+    /// 2. **Pre-file dedup gate** (investigation
+    ///    `automation-duplicate-work-2026-07-14.md` §4 Layer 1) — when
+    ///    `target_files` is non-empty and is a subset of (or equal to) the
+    ///    declared target files of an open automation-sourced task in this
+    ///    product, with sufficient name/description token overlap, refuse
+    ///    the create instead of dispatching a near-certain duplicate worker.
+    ///    High precision only: an undeclared candidate, or one that merely
+    ///    shares a file without the name/description signal, always passes
+    ///    through. On a gate hit: file a `followup` attention item linking
+    ///    the suppressed candidate to the blocking task, record a
+    ///    standalone `suppressed_duplicate` `automation_runs` row carrying
+    ///    the blocking task's id, and return an error — the triage agent is
+    ///    expected to end its run with `automation: skip — duplicate of
+    ///    <blocking task>` instead of retrying.
+    /// 3. Insert a product-level chore (`kind='chore'`, `project_id=NULL`)
     ///    inheriting the automation's repo override, `autostart=true` so
     ///    phase 2 starts automatically.
-    /// 3. Stamp `source_automation_id` for provenance, backlog exclusion,
-    ///    pool routing, and the open-task-limit denominator.
+    /// 4. Stamp `source_automation_id` for provenance, backlog exclusion,
+    ///    pool routing, and the open-task-limit denominator, and record its
+    ///    declared `target_files`/`target_symbols` in `task_targets` (both
+    ///    for this gate's own future comparisons and for layer 2's
+    ///    `merge_poller` overlap detector).
     ///
-    /// Returns an error (surfaced to the agent) when the cap is already met,
-    /// so the marker the agent then emits can be reconciled by the detector.
-    pub fn create_automation_task(&self, automation_id: &str, name: &str, description: Option<&str>) -> Result<Task> {
+    /// Returns an error (surfaced to the agent) when the cap is already met
+    /// or the dedup gate fires, so the marker the agent then emits can be
+    /// reconciled by the detector.
+    pub fn create_automation_task(
+        &self,
+        automation_id: &str,
+        name: &str,
+        description: Option<&str>,
+        target_files: &[String],
+        target_symbols: &[String],
+    ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let automation = query_automation(&tx, automation_id).require("automation", automation_id)?;
@@ -1035,11 +1060,77 @@ impl WorkDb {
             }));
         }
 
+        let candidate_files: HashSet<String> = target_files
+            .iter()
+            .map(|f| normalize_target_file(f))
+            .filter(|f| !f.is_empty())
+            .collect();
+        if let Some(blocker) = find_duplicate_gate_blocker(
+            &tx,
+            &automation.product_id,
+            name,
+            description.unwrap_or(""),
+            &candidate_files,
+        )? {
+            let blocker_label =
+                boss_protocol::short_id_label(blocker.short_id).unwrap_or_else(|| blocker.task_id.clone());
+            create_attention_in_tx(
+                &tx,
+                CreateAttentionInput::builder()
+                    .kind("followup")
+                    .association_task_id(blocker.task_id.clone())
+                    .source_task_id(blocker.task_id.clone())
+                    .source_kind("automation_dedup_gate")
+                    .proposed_name(format!("Possible duplicate of {blocker_label}: {name}"))
+                    .proposed_description(format!(
+                        "Automation {automation_id} tried to create a task named {name:?} declaring \
+                         target file(s) {candidate_files:?}, which are a subset of (or equal to) \
+                         {blocker_label}'s ({blocker_name:?}) already-declared targets, with matching \
+                         name/description overlap. The create-path dedup gate suppressed it \
+                         (investigation automation-duplicate-work-2026-07-14.md §4 Layer 1) rather than \
+                         dispatch a likely-duplicate worker. Review {blocker_label}: if this really is \
+                         distinct work, re-file it with force_duplicate semantics.",
+                        blocker_name = blocker.name,
+                    ))
+                    .proposed_work_kind("task")
+                    .rationale(format!("pre-file dedup gate: suppressed_duplicate of {blocker_label}"))
+                    .build(),
+            )?;
+
+            let run_id = next_id("autorun");
+            let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+            tx.execute(
+                "INSERT INTO automation_runs
+                     (id, automation_id, scheduled_for, started_at, finished_at,
+                      triage_execution_id, outcome, produced_task_id, detail)
+                 VALUES (?1, ?2, ?3, ?3, ?3, NULL, ?4, NULL, ?5)",
+                params![
+                    run_id,
+                    automation_id,
+                    now_epoch.to_string(),
+                    boss_protocol::AUTOMATION_OUTCOME_SUPPRESSED_DUPLICATE,
+                    format!(
+                        "duplicate-suspect of {blocker_label} ({}): candidate {name:?} declares a subset \
+                         of its target files with matching name/description overlap",
+                        blocker.task_id,
+                    ),
+                ],
+            )?;
+            tx.commit()?;
+            anyhow::bail!(
+                "duplicate-suspect of {blocker_label}: candidate {name:?} declares target file(s) \
+                 {candidate_files:?}, a subset of (or equal to) {blocker_label}'s already-declared \
+                 targets, with matching name/description overlap; refusing to create another task \
+                 (pre-file dedup gate). An attention item was filed on {blocker_label} — end this run \
+                 with `automation: skip — duplicate of {blocker_label}` instead of retrying.",
+            );
+        }
+
         // `force_duplicate` bypasses the 60-second same-name guard, which
         // is the wrong tool here in both directions: a cron re-fire lands
         // long after the window closes, and a legitimately recurring
-        // instruction can produce a same-named task days apart. The gate
-        // above is what actually protects this path.
+        // instruction can produce a same-named task days apart. The gates
+        // above are what actually protect this path.
         let mut task = insert_chore_in_tx(
             &tx,
             CreateChoreInput::builder()
@@ -1055,6 +1146,7 @@ impl WorkDb {
             "UPDATE tasks SET source_automation_id = ?2 WHERE id = ?1",
             params![task.id, automation_id],
         )?;
+        insert_task_targets_in_tx(&tx, &task.id, target_files, target_symbols)?;
         tx.commit()?;
         task.source_automation_id = Some(automation_id.to_owned());
         Ok(task)

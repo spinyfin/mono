@@ -541,7 +541,7 @@ fn create_automation_task_stamps_provenance_and_enforces_cap() {
     let automation = make_automation(&db, &product.id, 1);
 
     let task = db
-        .create_automation_task(&automation.id, "fix clippy in foo", Some("the foo crate"))
+        .create_automation_task(&automation.id, "fix clippy in foo", Some("the foo crate"), &[], &[])
         .unwrap();
     assert_eq!(task.kind, TaskKind::Chore);
     assert_eq!(task.project_id, None);
@@ -551,7 +551,7 @@ fn create_automation_task_stamps_provenance_and_enforces_cap() {
 
     // Second create must be rejected by the transactional cap re-check.
     let err = db
-        .create_automation_task(&automation.id, "fix clippy in bar", None)
+        .create_automation_task(&automation.id, "fix clippy in bar", None, &[], &[])
         .unwrap_err();
     assert!(
         err.to_string().contains("open-task limit"),
@@ -576,10 +576,10 @@ fn create_automation_task_respects_higher_cap() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
-    db.create_automation_task(&automation.id, "t1", None).unwrap();
-    db.create_automation_task(&automation.id, "t2", None).unwrap();
+    db.create_automation_task(&automation.id, "t1", None, &[], &[]).unwrap();
+    db.create_automation_task(&automation.id, "t2", None, &[], &[]).unwrap();
     assert!(
-        db.create_automation_task(&automation.id, "t3", None).is_err(),
+        db.create_automation_task(&automation.id, "t3", None, &[], &[]).is_err(),
         "third create must trip the cap of 2"
     );
 }
@@ -631,7 +631,9 @@ fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
 
     // The triage agent created the produced task (real row — `produced_task_id`
     // is a FK into `tasks`, so a verified id is required).
-    let produced = db.create_automation_task(&automation.id, "fix clippy", None).unwrap();
+    let produced = db
+        .create_automation_task(&automation.id, "fix clippy", None, &[], &[])
+        .unwrap();
 
     // Detector flips the run to produced_task once the worker emitted the marker.
     let updated = db
@@ -697,7 +699,9 @@ fn find_most_recent_open_task_returns_open_task() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
-    let task = db.create_automation_task(&automation.id, "fix clippy", None).unwrap();
+    let task = db
+        .create_automation_task(&automation.id, "fix clippy", None, &[], &[])
+        .unwrap();
 
     let found = db
         .find_most_recent_open_task_for_automation(&automation.id)
@@ -714,7 +718,9 @@ fn find_most_recent_open_task_ignores_done_tasks() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
-    let task = db.create_automation_task(&automation.id, "already done", None).unwrap();
+    let task = db
+        .create_automation_task(&automation.id, "already done", None, &[], &[])
+        .unwrap();
     db.update_work_item(
         &task.id,
         WorkItemPatch {
@@ -741,8 +747,12 @@ fn find_most_recent_open_task_returns_most_recently_created_when_multiple_open()
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 3);
 
-    let t1 = db.create_automation_task(&automation.id, "task one", None).unwrap();
-    let t2 = db.create_automation_task(&automation.id, "task two", None).unwrap();
+    let t1 = db
+        .create_automation_task(&automation.id, "task one", None, &[], &[])
+        .unwrap();
+    let t2 = db
+        .create_automation_task(&automation.id, "task two", None, &[], &[])
+        .unwrap();
 
     // t2 was created after t1 — must be returned.
     let found = db
@@ -779,7 +789,7 @@ fn find_most_recent_open_task_ignores_deleted_tasks() {
     let automation = make_automation(&db, &product.id, 2);
 
     let task = db
-        .create_automation_task(&automation.id, "to be deleted", None)
+        .create_automation_task(&automation.id, "to be deleted", None, &[], &[])
         .unwrap();
     db.delete_work_item(&task.id).unwrap();
 
@@ -789,6 +799,186 @@ fn find_most_recent_open_task_ignores_deleted_tasks() {
             .is_none(),
         "soft-deleted task must not be returned"
     );
+}
+
+// ── pre-file dedup gate (automation-duplicate-work-2026-07-14.md §4 Layer 1) ─
+
+/// A candidate whose declared file set is a subset of an already-open
+/// automation-sourced task's declared files, with matching name/description
+/// overlap, is suppressed — even when the two tasks come from *different*
+/// automations (the cross-automation blindness the gate exists to close,
+/// doc §1.3). The rejection surfaces the blocking task, an attention item
+/// links the two, and a standalone `suppressed_duplicate` `automation_runs`
+/// row is recorded.
+#[test]
+fn create_automation_task_gate_suppresses_subset_file_duplicate_across_automations() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-gate-hit")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation_a = make_automation(&db, &product.id, 3);
+    let automation_b = make_automation(&db, &product.id, 3);
+
+    let seeded = db
+        .create_automation_task(
+            &automation_a.id,
+            "dedup runner extract_pr_number onto boss_github::pr_url",
+            Some("route runner PR-number parsing through the shared helper"),
+            &["engine/core/src/runner.rs".to_owned()],
+            &[],
+        )
+        .unwrap();
+
+    let err = db
+        .create_automation_task(
+            &automation_b.id,
+            "route runner PR-number parsing through boss_github helper",
+            Some("dedup extract_pr_number onto pr_number_from_url"),
+            &["engine/core/src/runner.rs".to_owned()],
+            &[],
+        )
+        .unwrap_err();
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("duplicate-suspect"),
+        "expected duplicate-suspect error, got: {err_text}"
+    );
+    assert!(
+        err_text.contains(&seeded.short_label()),
+        "error must name the blocking task, got: {err_text}"
+    );
+
+    // No task was created for automation_b; automation_a's seeded row is untouched.
+    assert_eq!(db.count_open_tasks_for_automation(&automation_b.id).unwrap(), 0);
+    assert_eq!(db.count_open_tasks_for_automation(&automation_a.id).unwrap(), 1);
+
+    // A standalone suppressed_duplicate automation_runs row was recorded for
+    // automation_b, carrying the blocking task's id.
+    let runs = db.list_automation_runs(&automation_b.id).unwrap();
+    assert!(
+        runs.iter()
+            .any(|r| r.outcome == boss_protocol::AUTOMATION_OUTCOME_SUPPRESSED_DUPLICATE
+                && r.detail.as_deref().is_some_and(|d| d.contains(&seeded.id))),
+        "expected a suppressed_duplicate run row carrying the blocking task id, got: {runs:?}"
+    );
+
+    // An attention item was filed linking the suppressed candidate to the
+    // blocking row (association_task_id = the blocking task).
+    let groups = db
+        .list_attention_groups(&product.id, None, Some(&seeded.id), Some("followup"), None)
+        .unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "expected one followup group on the blocking task, got: {groups:?}"
+    );
+    let members = db.list_attentions_for_group(&groups[0].id).unwrap();
+    assert_eq!(members.len(), 1);
+    assert!(
+        members[0]
+            .proposed_description
+            .as_deref()
+            .is_some_and(|d| d.contains(&seeded.short_label())),
+        "attention body must reference the blocking task"
+    );
+}
+
+/// A candidate whose declared files are NOT a subset of any open row's
+/// declared files (disjoint here) passes straight through, even with
+/// identical name/description — the file-set predicate is the primary,
+/// high-precision signal.
+#[test]
+fn create_automation_task_gate_passes_through_non_subset_files() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-gate-miss-files")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation_a = make_automation(&db, &product.id, 3);
+    let automation_b = make_automation(&db, &product.id, 3);
+
+    db.create_automation_task(
+        &automation_a.id,
+        "fix clippy warnings",
+        Some("clean up lint noise"),
+        &["engine/core/src/runner.rs".to_owned()],
+        &[],
+    )
+    .unwrap();
+
+    // Same name/description, but a disjoint target file: not a subset, so
+    // the gate must not fire.
+    let task = db
+        .create_automation_task(
+            &automation_b.id,
+            "fix clippy warnings",
+            Some("clean up lint noise"),
+            &["work/chain_helpers.rs".to_owned()],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(db.count_open_tasks_for_automation(&automation_b.id).unwrap(), 1);
+    assert_eq!(task.source_automation_id.as_deref(), Some(automation_b.id.as_str()));
+}
+
+/// Same declared file, but genuinely different work (low name/description
+/// token overlap) — the #1945/#1955 pattern (doc §1.4) — passes through.
+/// File-set overlap alone is not enough; the token-overlap tie-breaker
+/// exists precisely to let this case through.
+#[test]
+fn create_automation_task_gate_passes_through_same_file_different_work() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-gate-miss-tokens")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation_a = make_automation(&db, &product.id, 3);
+    let automation_b = make_automation(&db, &product.id, 3);
+
+    db.create_automation_task(
+        &automation_a.id,
+        "extract shared clipping helper",
+        Some("pull the min/max clamp logic into a reusable function"),
+        &["engine/core/src/string_clip.rs".to_owned()],
+        &[],
+    )
+    .unwrap();
+
+    let task = db
+        .create_automation_task(
+            &automation_b.id,
+            "fix off-by-one in unicode boundary handling",
+            Some("multi-byte UTF-8 sequences were split mid-codepoint on the last chunk"),
+            &["engine/core/src/string_clip.rs".to_owned()],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(db.count_open_tasks_for_automation(&automation_b.id).unwrap(), 1);
+    assert_eq!(task.source_automation_id.as_deref(), Some(automation_b.id.as_str()));
+}
+
+/// An undeclared candidate (no `--target-file`) is never gated — high
+/// precision only, per doc §5.2 — even against an identically-named open
+/// row with declared targets.
+#[test]
+fn create_automation_task_gate_never_fires_on_undeclared_candidate() {
+    let db = WorkDb::open(temp_db_path("auto-dedup-gate-undeclared")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation_a = make_automation(&db, &product.id, 3);
+    let automation_b = make_automation(&db, &product.id, 3);
+
+    db.create_automation_task(
+        &automation_a.id,
+        "dedup runner extract_pr_number onto boss_github::pr_url",
+        Some("route runner PR-number parsing through the shared helper"),
+        &["engine/core/src/runner.rs".to_owned()],
+        &[],
+    )
+    .unwrap();
+
+    let task = db
+        .create_automation_task(
+            &automation_b.id,
+            "dedup runner extract_pr_number onto boss_github::pr_url",
+            Some("route runner PR-number parsing through the shared helper"),
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(db.count_open_tasks_for_automation(&automation_b.id).unwrap(), 1);
+    assert_eq!(task.source_automation_id.as_deref(), Some(automation_b.id.as_str()));
 }
 
 // ── scheduler due-selection + run-recording ──────────────────────────────────
@@ -1211,7 +1401,7 @@ fn dedup_gate_suppresses_a_paraphrased_duplicate() {
     let automation = make_automation(&db, &product.id, 3);
 
     let surviving = db
-        .create_automation_task(&automation.id, "Split engine core app.rs (~2548 lines)", None)
+        .create_automation_task(&automation.id, "Split engine core app.rs (~2548 lines)", None, &[], &[])
         .unwrap();
 
     let err = db
@@ -1219,6 +1409,8 @@ fn dedup_gate_suppresses_a_paraphrased_duplicate() {
             &automation.id,
             "Split engine/core src/app.rs (nearing 3000-line limit)",
             None,
+            &[],
+            &[],
         )
         .unwrap_err();
 
@@ -1261,7 +1453,7 @@ fn dedup_gate_records_a_suppression_trace() {
     let automation = make_automation(&db, &product.id, 3);
 
     let surviving = db
-        .create_automation_task(&automation.id, "Extract pr_review into its own crate", None)
+        .create_automation_task(&automation.id, "Extract pr_review into its own crate", None, &[], &[])
         .unwrap();
     assert!(
         db.list_automation_dedup_suppressions(&automation.id)
@@ -1271,7 +1463,8 @@ fn dedup_gate_records_a_suppression_trace() {
     );
 
     let attempted = "Move the pr_review reviewer out of engine/core into a crate";
-    db.create_automation_task(&automation.id, attempted, None).unwrap_err();
+    db.create_automation_task(&automation.id, attempted, None, &[], &[])
+        .unwrap_err();
 
     let traces = db.list_automation_dedup_suppressions(&automation.id).unwrap();
     assert_eq!(traces.len(), 1, "expected exactly one suppression trace");
@@ -1289,12 +1482,30 @@ fn dedup_gate_allows_genuinely_different_targets() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 3);
 
-    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs (~2548 lines)", None)
-        .unwrap();
-    db.create_automation_task(&automation.id, "Split engine/core/src/runner.rs (~3100 lines)", None)
-        .unwrap();
-    db.create_automation_task(&automation.id, "Split tools/cube/src/app.rs (~3400 lines)", None)
-        .unwrap();
+    db.create_automation_task(
+        &automation.id,
+        "Split engine/core/src/app.rs (~2548 lines)",
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    db.create_automation_task(
+        &automation.id,
+        "Split engine/core/src/runner.rs (~3100 lines)",
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    db.create_automation_task(
+        &automation.id,
+        "Split tools/cube/src/app.rs (~3400 lines)",
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(
         db.count_open_tasks_for_automation(&automation.id).unwrap(),
@@ -1320,8 +1531,8 @@ fn dedup_gate_does_not_suppress_across_automations() {
     assert_ne!(first.id, second.id);
 
     let title = "Split engine/core/src/app.rs";
-    db.create_automation_task(&first.id, title, None).unwrap();
-    db.create_automation_task(&second.id, title, None)
+    db.create_automation_task(&first.id, title, None, &[], &[]).unwrap();
+    db.create_automation_task(&second.id, title, None, &[], &[])
         .expect("a different automation must be allowed to file the same target");
 
     assert_eq!(db.count_open_tasks_for_automation(&first.id).unwrap(), 1);
@@ -1339,7 +1550,7 @@ fn dedup_gate_ignores_resolved_siblings() {
     let automation = make_automation(&db, &product.id, 3);
 
     let first = db
-        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
     db.update_task(
         &first.id,
@@ -1351,7 +1562,7 @@ fn dedup_gate_ignores_resolved_siblings() {
     )
     .unwrap();
 
-    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs again", None)
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs again", None, &[], &[])
         .expect("a resolved sibling must not block a recurrence");
 }
 
@@ -1364,10 +1575,10 @@ fn dedup_gate_does_not_mask_the_open_task_cap() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 1);
 
-    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
     let err = db
-        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap_err();
     assert!(
         err.to_string().contains("open-task limit"),
@@ -1392,10 +1603,10 @@ fn sibling_list_reports_open_and_recently_resolved_tasks() {
     let automation = make_automation(&db, &product.id, 3);
 
     let open = db
-        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
     let resolved = db
-        .create_automation_task(&automation.id, "Split engine/core/src/runner.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/runner.rs", None, &[], &[])
         .unwrap();
     db.update_task(
         &resolved.id,
@@ -1439,9 +1650,9 @@ fn sibling_list_is_scoped_to_one_automation() {
     let mine = make_automation(&db, &product.id, 3);
     let theirs = make_automation(&db, &product.id, 3);
 
-    db.create_automation_task(&mine.id, "Split engine/core/src/app.rs", None)
+    db.create_automation_task(&mine.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
-    db.create_automation_task(&theirs.id, "Split tools/cube/src/main.rs", None)
+    db.create_automation_task(&theirs.id, "Split tools/cube/src/main.rs", None, &[], &[])
         .unwrap();
 
     let siblings = db.list_automation_sibling_tasks(&mine.id).unwrap();
@@ -1463,14 +1674,26 @@ fn sibling_list_keeps_open_tasks_ahead_of_resolved_ones_under_the_limit() {
     let mut open_short_ids = Vec::new();
     for i in 0..25 {
         let task = db
-            .create_automation_task(&automation.id, &format!("Split engine/core/src/open{i}.rs"), None)
+            .create_automation_task(
+                &automation.id,
+                &format!("Split engine/core/src/open{i}.rs"),
+                None,
+                &[],
+                &[],
+            )
             .unwrap();
         open_short_ids.push(task.short_id.unwrap());
     }
 
     for i in 0..5 {
         let task = db
-            .create_automation_task(&automation.id, &format!("Split engine/core/src/resolved{i}.rs"), None)
+            .create_automation_task(
+                &automation.id,
+                &format!("Split engine/core/src/resolved{i}.rs"),
+                None,
+                &[],
+                &[],
+            )
             .unwrap();
         db.update_task(
             &task.id,

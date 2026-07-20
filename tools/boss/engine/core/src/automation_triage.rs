@@ -216,7 +216,8 @@ pub fn render_triage_preamble(
         .map(|n| format!("A{n}"))
         .unwrap_or_else(|| automation.id.clone());
     let create_cmd = format!(
-        "boss task create --automation {} --name \"<concise title>\" --description \"<what to do>\"",
+        "boss task create --automation {} --name \"<concise title>\" --description \"<what to do>\" \\\n    \
+         --target-file <path/to/file> [--target-file <path/to/other/file> ...]",
         automation.id
     );
     let context_block = render_context_block(context);
@@ -237,9 +238,21 @@ Your final message must end with **exactly one** of these two lines, and nothing
 after it:\n\n\
 - **If there is work to do** — create exactly **one** task, then emit:\n\n\
   ```\n  {create_cmd}\n  ```\n\n\
+  **Declare every file you expect the task to touch** with one `--target-file <path>` \
+per file (repeatable; paths relative to the repo root). This is not optional prose — \
+the engine uses your declared files as the key for a duplicate-detection gate that \
+compares against every other automation's already-open work on this product. \
+Omitting a file you know you'll touch weakens that gate for every automation on this \
+product, not just this run. Add `--target-symbol <name>` (repeatable, optional) if \
+you can also name the specific function/type you're targeting.\n\n\
   The command prints the new task id (e.g. `T42`). Then end your final message with \
 the line:\n\n\
   ```\n  automation: task T42\n  ```\n\n\
+  **If the create command fails with a `duplicate-suspect of Txxxx` error**, do NOT \
+retry with a different name or description — the engine has already determined your \
+candidate is a near-certain duplicate of open task `Txxxx` and filed an attention item \
+for an operator to review. End your final message instead with:\n\n\
+  ```\n  automation: skip — duplicate of Txxxx\n  ```\n\n\
 - **If there is nothing appropriate to do right now**, end your final message with:\n\n\
   ```\n  automation: skip — <one-line reason>\n  ```\n\n\
 ## Single-shot mandate — no sub-agents, no deferral\n\n\
@@ -380,8 +393,12 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          and nothing after it:\n\
          \n\
          - `automation: task <id>` — after creating **exactly one** task with\n\
-           `boss task create --automation <automation-id> --name \"…\" --description \"…\"`\n\
-           (the command prints the new task id, e.g. `T42`).\n\
+           `boss task create --automation <automation-id> --name \"…\" --description \"…\" \\`\n\
+           `  --target-file <path> [--target-file <path> ...]` (repeat `--target-file`\n\
+           once per file you expect to touch — declaring targets is required, not\n\
+           optional; the command prints the new task id, e.g. `T42`). If this fails\n\
+           with `duplicate-suspect of Txxxx`, do not retry — end with\n\
+           `automation: skip — duplicate of Txxxx` instead.\n\
          - `automation: skip — <one-line reason>` — when nothing appropriate\n\
            exists right now (a normal, expected outcome on most runs).\n\
          \n\
@@ -931,6 +948,44 @@ mod tests {
         assert!(preamble.contains("automation: task"));
         assert!(preamble.contains("automation: skip"));
         assert!(preamble.contains("Do NOT do the work"));
+    }
+
+    /// Layer 1 (pre-file dedup gate): the preamble must require declaring
+    /// target files on the create command, explain why (the gate's key),
+    /// and tell the agent how to react to a `duplicate-suspect` rejection
+    /// instead of retrying.
+    #[test]
+    fn preamble_requires_declaring_target_files() {
+        let automation = Automation::builder()
+            .id("auto_dedup")
+            .short_id(4)
+            .product_id("prod_1")
+            .name("dedup sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("look for duplicated code and extract a helper")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build();
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+        assert!(
+            preamble.contains("--target-file"),
+            "preamble must include --target-file on the create command example",
+        );
+        assert!(
+            preamble.contains("Declare every file"),
+            "preamble must instruct the agent to declare every file it expects to touch",
+        );
+        assert!(
+            preamble.contains("duplicate-suspect"),
+            "preamble must explain the duplicate-suspect rejection",
+        );
+        assert!(
+            preamble.contains("automation: skip — duplicate of"),
+            "preamble must tell the agent to skip with a duplicate-of reason on a gate hit",
+        );
     }
 
     /// Regression test: when the triage agent calls `boss task create` the

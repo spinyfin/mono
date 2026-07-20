@@ -1984,11 +1984,30 @@ struct TaskCreateArgs {
     /// an automation selector — a canonical `auto_…` id (resolves on its
     /// own) or an `A<n>` short id (requires `--product`). The engine stamps
     /// `source_automation_id`, transactionally re-checks the automation's
-    /// open-task cap (the fan-out backstop), inherits the automation's repo,
-    /// and runs the task in the dedicated automations pool. Intended for the
-    /// triage agent; `--project` is ignored when this is set.
+    /// open-task cap and pre-file dedup gate (the fan-out backstops),
+    /// inherits the automation's repo, and runs the task in the dedicated
+    /// automations pool. Intended for the triage agent; `--project` is
+    /// ignored when this is set.
     #[arg(long)]
     automation: Option<String>,
+
+    /// Declare a file this task is expected to touch. Repeatable. Only
+    /// meaningful with `--automation`: the engine stores these in
+    /// `task_targets` and uses them as the high-precision key for the
+    /// pre-file dedup gate — a candidate whose declared files are a subset
+    /// of (or equal to) an already-open automation task's declared files,
+    /// with matching name/description overlap, is refused instead of
+    /// dispatched as a likely duplicate. Omitting this weakens the gate for
+    /// every automation on the product, not just this one.
+    #[arg(long = "target-file", value_name = "PATH")]
+    target_file: Vec<String>,
+
+    /// Declare a symbol (function/type/etc.) this task is expected to
+    /// touch. Repeatable, optional. Only meaningful with `--automation`;
+    /// stored in `task_targets` alongside `--target-file` for future use by
+    /// the dedup gate and layer 2's post-hoc overlap detector.
+    #[arg(long = "target-symbol", value_name = "NAME")]
+    target_symbol: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -3750,11 +3769,24 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 let automation = resolve_automation(&mut client, &selector, product.as_ref()).await?;
                 let name = required_text(args.name, "Task name", ctx)?;
                 let description = optional_text(args.description, "Description", ctx)?;
-                let task = create_automation_task(&mut client, &automation.id, name, description).await?;
+                let task = create_automation_task(
+                    &mut client,
+                    &automation.id,
+                    name,
+                    description,
+                    args.target_file,
+                    args.target_symbol,
+                )
+                .await?;
                 let task = with_display_status(task);
                 return print_entity(ctx, &serde_json::json!({ "task": task }), || {
                     print_task_details("Created automation task", &task, None, false);
                 });
+            }
+            if !args.target_file.is_empty() || !args.target_symbol.is_empty() {
+                return Err(CliError::application(
+                    "--target-file/--target-symbol are only valid with --automation",
+                ));
             }
             let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
@@ -6817,13 +6849,16 @@ async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<
 
 /// Create the single task produced by an automation's triage phase
 /// (`boss task create --automation`). The engine resolves provenance, the
-/// open-task-cap re-check, repo inheritance, and execution dispatch; the CLI
-/// is a thin pass-through. A cap-reached rejection surfaces as a `WorkError`.
+/// open-task-cap re-check, the pre-file dedup gate, repo inheritance, and
+/// execution dispatch; the CLI is a thin pass-through. A cap-reached or
+/// duplicate-suspect rejection surfaces as a `WorkError`.
 async fn create_automation_task(
     client: &mut BossClient,
     automation_id: &str,
     name: String,
     description: Option<String>,
+    target_files: Vec<String>,
+    target_symbols: Vec<String>,
 ) -> Result<Task, CliError> {
     rpc_call!(
         try client,
@@ -6831,6 +6866,8 @@ async fn create_automation_task(
             automation_id: automation_id.to_owned(),
             name,
             description,
+            target_files,
+            target_symbols,
         },
         "automation task create",
         FrontendEvent::WorkItemCreated { item } => expect_chore(item),
