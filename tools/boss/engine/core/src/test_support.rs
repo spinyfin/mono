@@ -875,13 +875,13 @@ impl RecordingPublisher {
             .count()
     }
 
-    /// Count of `AttentionItemCreated` frontend events published.
-    pub async fn attention_items_created(&self) -> usize {
+    /// Count of `AttentionCreated` frontend events published.
+    pub async fn attentions_created(&self) -> usize {
         self.typed_events
             .lock()
             .await
             .iter()
-            .filter(|(_, e)| matches!(e, FrontendEvent::AttentionItemCreated { .. }))
+            .filter(|(_, e)| matches!(e, FrontendEvent::AttentionCreated { .. }))
             .count()
     }
 
