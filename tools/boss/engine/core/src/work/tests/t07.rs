@@ -1401,7 +1401,7 @@ fn dedup_gate_suppresses_a_paraphrased_duplicate() {
     let automation = make_automation(&db, &product.id, 3);
 
     let surviving = db
-        .create_automation_task(&automation.id, "Split engine core app.rs (~2548 lines)", None)
+        .create_automation_task(&automation.id, "Split engine core app.rs (~2548 lines)", None, &[], &[])
         .unwrap();
 
     let err = db
@@ -1409,6 +1409,8 @@ fn dedup_gate_suppresses_a_paraphrased_duplicate() {
             &automation.id,
             "Split engine/core src/app.rs (nearing 3000-line limit)",
             None,
+            &[],
+            &[],
         )
         .unwrap_err();
 
@@ -1451,7 +1453,7 @@ fn dedup_gate_records_a_suppression_trace() {
     let automation = make_automation(&db, &product.id, 3);
 
     let surviving = db
-        .create_automation_task(&automation.id, "Extract pr_review into its own crate", None)
+        .create_automation_task(&automation.id, "Extract pr_review into its own crate", None, &[], &[])
         .unwrap();
     assert!(
         db.list_automation_dedup_suppressions(&automation.id)
@@ -1461,7 +1463,8 @@ fn dedup_gate_records_a_suppression_trace() {
     );
 
     let attempted = "Move the pr_review reviewer out of engine/core into a crate";
-    db.create_automation_task(&automation.id, attempted, None).unwrap_err();
+    db.create_automation_task(&automation.id, attempted, None, &[], &[])
+        .unwrap_err();
 
     let traces = db.list_automation_dedup_suppressions(&automation.id).unwrap();
     assert_eq!(traces.len(), 1, "expected exactly one suppression trace");
@@ -1479,12 +1482,30 @@ fn dedup_gate_allows_genuinely_different_targets() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 3);
 
-    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs (~2548 lines)", None)
-        .unwrap();
-    db.create_automation_task(&automation.id, "Split engine/core/src/runner.rs (~3100 lines)", None)
-        .unwrap();
-    db.create_automation_task(&automation.id, "Split tools/cube/src/app.rs (~3400 lines)", None)
-        .unwrap();
+    db.create_automation_task(
+        &automation.id,
+        "Split engine/core/src/app.rs (~2548 lines)",
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    db.create_automation_task(
+        &automation.id,
+        "Split engine/core/src/runner.rs (~3100 lines)",
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    db.create_automation_task(
+        &automation.id,
+        "Split tools/cube/src/app.rs (~3400 lines)",
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(
         db.count_open_tasks_for_automation(&automation.id).unwrap(),
@@ -1510,8 +1531,8 @@ fn dedup_gate_does_not_suppress_across_automations() {
     assert_ne!(first.id, second.id);
 
     let title = "Split engine/core/src/app.rs";
-    db.create_automation_task(&first.id, title, None).unwrap();
-    db.create_automation_task(&second.id, title, None)
+    db.create_automation_task(&first.id, title, None, &[], &[]).unwrap();
+    db.create_automation_task(&second.id, title, None, &[], &[])
         .expect("a different automation must be allowed to file the same target");
 
     assert_eq!(db.count_open_tasks_for_automation(&first.id).unwrap(), 1);
@@ -1529,7 +1550,7 @@ fn dedup_gate_ignores_resolved_siblings() {
     let automation = make_automation(&db, &product.id, 3);
 
     let first = db
-        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
     db.update_task(
         &first.id,
@@ -1541,7 +1562,7 @@ fn dedup_gate_ignores_resolved_siblings() {
     )
     .unwrap();
 
-    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs again", None)
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs again", None, &[], &[])
         .expect("a resolved sibling must not block a recurrence");
 }
 
@@ -1554,10 +1575,10 @@ fn dedup_gate_does_not_mask_the_open_task_cap() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 1);
 
-    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+    db.create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
     let err = db
-        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap_err();
     assert!(
         err.to_string().contains("open-task limit"),
@@ -1582,10 +1603,10 @@ fn sibling_list_reports_open_and_recently_resolved_tasks() {
     let automation = make_automation(&db, &product.id, 3);
 
     let open = db
-        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
     let resolved = db
-        .create_automation_task(&automation.id, "Split engine/core/src/runner.rs", None)
+        .create_automation_task(&automation.id, "Split engine/core/src/runner.rs", None, &[], &[])
         .unwrap();
     db.update_task(
         &resolved.id,
@@ -1629,9 +1650,9 @@ fn sibling_list_is_scoped_to_one_automation() {
     let mine = make_automation(&db, &product.id, 3);
     let theirs = make_automation(&db, &product.id, 3);
 
-    db.create_automation_task(&mine.id, "Split engine/core/src/app.rs", None)
+    db.create_automation_task(&mine.id, "Split engine/core/src/app.rs", None, &[], &[])
         .unwrap();
-    db.create_automation_task(&theirs.id, "Split tools/cube/src/main.rs", None)
+    db.create_automation_task(&theirs.id, "Split tools/cube/src/main.rs", None, &[], &[])
         .unwrap();
 
     let siblings = db.list_automation_sibling_tasks(&mine.id).unwrap();
@@ -1653,14 +1674,26 @@ fn sibling_list_keeps_open_tasks_ahead_of_resolved_ones_under_the_limit() {
     let mut open_short_ids = Vec::new();
     for i in 0..25 {
         let task = db
-            .create_automation_task(&automation.id, &format!("Split engine/core/src/open{i}.rs"), None)
+            .create_automation_task(
+                &automation.id,
+                &format!("Split engine/core/src/open{i}.rs"),
+                None,
+                &[],
+                &[],
+            )
             .unwrap();
         open_short_ids.push(task.short_id.unwrap());
     }
 
     for i in 0..5 {
         let task = db
-            .create_automation_task(&automation.id, &format!("Split engine/core/src/resolved{i}.rs"), None)
+            .create_automation_task(
+                &automation.id,
+                &format!("Split engine/core/src/resolved{i}.rs"),
+                None,
+                &[],
+                &[],
+            )
             .unwrap();
         db.update_task(
             &task.id,

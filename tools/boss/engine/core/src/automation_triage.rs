@@ -969,7 +969,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product");
+        let preamble = render_triage_preamble(&automation, "My Product", &[]);
         assert!(
             preamble.contains("--target-file"),
             "preamble must include --target-file on the create command example",
