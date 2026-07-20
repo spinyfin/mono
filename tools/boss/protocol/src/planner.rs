@@ -191,6 +191,18 @@ pub struct PlannerOutput {
     pub notes: String,
     /// One `[effort-classification] …` line per proposed task, in the same
     /// format the coordinator and engine emit today.
+    ///
+    /// This field is **derived** by `Planner` (`tools/boss/engine/core/src/
+    /// planner.rs::derive_effort_audit`) from each task's `description`,
+    /// which the system prompt already requires to end with the identical
+    /// line, and is never read from the model's own JSON. Skipping
+    /// deserialization prevents a type-mismatch serde error when the model
+    /// fills this field with something other than a JSON array of strings
+    /// (observed: a single JSON-encoded string containing the array) —
+    /// mirrors the `suspected_deletions` fix in `pr_review::types::
+    /// RegressionCheck`.
+    #[serde(skip_deserializing, default)]
+    #[builder(default)]
     pub effort_audit: Vec<String>,
 }
 
