@@ -1,0 +1,31 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When peer-pid ancestry cannot be resolved for a connection that looks worker-adjacent (double-fork/reparenting edge cases), should worker-tier classification fail closed for writes (deny SubmitProposal with a typed error; worker falls back to the [blocked] marker) or fail open (treat as User tier as today)?",
+    "choices": [
+      "Fail closed for writes, open for reads (design's lean)",
+      "Fail open (status quo User tier)",
+      "Fail closed for everything"
+    ],
+    "anchor": "transport-and-authn-the-worker-rpc-tier"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Automation triage: keep the direct `boss task create --automation` write and mediate only the outcome declaration via `automation_outcome` proposals (design's choice), or fully mediate task creation itself through a proposal kind (couples this project to the T2944 structural dedup gate)?",
+    "choices": [
+      "Keep direct create + outcome proposal (design's choice)",
+      "Fully mediate creation through proposals"
+    ],
+    "anchor": "seam-migration-map"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Retain the [blocked] text marker permanently as the bootstrap channel of last resort (for when the proposal mechanism itself is unreachable), rather than deleting it with the other markers?",
+    "anchor": "failure-semantics-degrade-loudly"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Include engine-enforced read-only worker tier (RpcTier::Worker denying mutating taxonomy verbs, task 3) in v1, rather than shipping the proposal verbs first and keeping mutation-denial prompt-based until a later phase?",
+    "anchor": "transport-and-authn-the-worker-rpc-tier"
+  }
+]
