@@ -944,7 +944,9 @@ mod tests {
     /// Every literal `automation: task`/`automation: skip` example line the
     /// preamble shows the agent must itself parse cleanly, so an edit to
     /// either the preamble's wording or the validator's matching rules
-    /// cannot silently drift the two apart.
+    /// cannot silently drift the two apart. The preamble shows three such
+    /// examples: the task marker, the duplicate-suspect skip marker, and
+    /// the generic skip marker.
     #[test]
     fn preamble_marker_examples_round_trip_through_the_validator() {
         let automation = Automation::builder()
@@ -969,9 +971,9 @@ mod tests {
             .collect();
         assert_eq!(
             marker_lines.len(),
-            2,
-            "preamble must show exactly one task-marker example and one skip-marker \
-             example, found: {marker_lines:?}",
+            3,
+            "preamble must show exactly one task-marker example, one duplicate-skip-marker \
+             example, and one generic-skip-marker example, found: {marker_lines:?}",
         );
 
         assert_eq!(
@@ -981,8 +983,13 @@ mod tests {
         );
         assert_eq!(
             parse_triage_decision(marker_lines[1]),
+            TriageDecision::Skip("duplicate of Txxxx".to_owned()),
+            "the preamble's own duplicate-skip-marker example must parse as the validator expects",
+        );
+        assert_eq!(
+            parse_triage_decision(marker_lines[2]),
             TriageDecision::Skip("<one-line reason>".to_owned()),
-            "the preamble's own skip-marker example must parse as the validator expects",
+            "the preamble's own generic-skip-marker example must parse as the validator expects",
         );
     }
 
