@@ -1401,7 +1401,7 @@ fn sibling_list_reports_open_and_recently_resolved_tasks() {
         &resolved.id,
         WorkItemPatch {
             status: Some("done".to_owned()),
-            pr_url: Some("https://github.com/spinyfin/mono/pull/2144".to_owned()),
+            pr_url: Some("https://github.com/spinyfin/mono/pull/9001".to_owned()),
             ..Default::default()
         },
         "human",
@@ -1425,7 +1425,7 @@ fn sibling_list_reports_open_and_recently_resolved_tasks() {
     assert_eq!(resolved_entry.status, "done");
     assert_eq!(
         resolved_entry.pr_url.as_deref(),
-        Some("https://github.com/spinyfin/mono/pull/2144"),
+        Some("https://github.com/spinyfin/mono/pull/9001"),
         "the PR url is the strongest signal that a finding is in hand"
     );
 }

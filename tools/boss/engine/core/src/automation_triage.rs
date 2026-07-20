@@ -54,12 +54,6 @@ pub enum TriageDecision {
     /// reached a decision. Treated as a transient/ambiguous failure (the run
     /// is left `failed_will_retry`), never as a skip.
     NoDecision,
-    /// No longer produced by [`parse_triage_decision`], which now resolves
-    /// multiple marker lines to the last one rather than refusing to guess —
-    /// see that function's doc for why. Kept as a variant (and still handled
-    /// defensively alongside `NoDecision` in the finalizer) for any future
-    /// producer that genuinely cannot resolve an ordering.
-    Ambiguous(usize),
 }
 
 /// Compose the per-automation triage preamble (design §"Phase 1 — Triage").

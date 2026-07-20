@@ -243,8 +243,8 @@ pub struct AutomationSiblingTask {
 ///
 /// Defined in `boss_protocol` (not here) so it can travel over the wire as
 /// a `ListAutomationDedupSuppressions` / `AutomationDedupSuppressionsList`
-/// request/event pair, exactly like [`boss_protocol::AutomationRun`]. The
-/// production reader below still builds it with a struct literal via the
-/// builder, as the convention prescribes for DB mappers — a compile error
-/// when a new column goes unmapped is the desirable outcome there.
+/// request/event pair, exactly like [`boss_protocol::AutomationRun`]. Built
+/// by the mapper in `work/automations.rs`, which sets every column
+/// explicitly from a struct literal so an unmapped new column is a compile
+/// error.
 pub use boss_protocol::AutomationDedupSuppression;
