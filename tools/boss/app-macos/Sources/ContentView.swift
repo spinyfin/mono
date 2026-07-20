@@ -125,8 +125,11 @@ struct ContentView: View {
                 // syspolicyd wedged, etc.). Surface as a first-class
                 // affordance so operators can't miss it (#699).
                 if model.isConnected, !model.engineHealthIssues.isEmpty {
-                    EngineHealthBanner(issues: model.engineHealthIssues)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                    EngineHealthBanner(
+                        issues: model.engineHealthIssues,
+                        onUnpauseDispatch: { model.resumeDispatch() }
+                    )
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
         }
@@ -5880,7 +5883,19 @@ private struct EngineUnreachableBanner: View {
 /// their remediation bodies.
 private struct EngineHealthBanner: View {
     let issues: [EngineHealthIssue]
+    /// Trigger for the `dispatch_paused` issue's "Unpause" affordance.
+    /// Fires `ChatViewModel.resumeDispatch()`, the same
+    /// `SetDispatchPaused { paused: false }` RPC `bossctl dispatch
+    /// resume` uses — the engine owns the actual state change, this
+    /// button is a thin trigger.
+    let onUnpauseDispatch: () -> Void
     @State private var isExpanded: Bool = false
+
+    /// `true` when the paused-dispatch issue is present, driving the
+    /// banner's "Unpause" button.
+    private var isDispatchPaused: Bool {
+        issues.contains { $0.kind == "dispatch_paused" }
+    }
 
     /// Highest severity in the issue list — drives banner color so a
     /// single `error` row escalates an otherwise-warning banner.
@@ -5902,27 +5917,41 @@ private struct EngineHealthBanner: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Button(action: { withAnimation(.easeInOut(duration: 0.12)) { isExpanded.toggle() } }) {
-                HStack(spacing: 8) {
-                    Image(systemName: iconName)
-                        .foregroundStyle(.white)
-                    Text(headlineText)
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 0)
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .foregroundStyle(.white)
-                        .font(.caption.weight(.semibold))
+            HStack(spacing: 8) {
+                Button(action: { withAnimation(.easeInOut(duration: 0.12)) { isExpanded.toggle() } }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: iconName)
+                            .foregroundStyle(.white)
+                        Text(headlineText)
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 0)
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .foregroundStyle(.white)
+                            .font(.caption.weight(.semibold))
+                    }
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .frame(maxWidth: .infinity)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .help(issues.first?.body ?? "")
+
+                if isDispatchPaused {
+                    Button(action: onUnpauseDispatch) {
+                        Text("Unpause")
+                            .font(.callout.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.white)
+                    .help("Resume global dispatch (same as `bossctl dispatch resume`).")
+                    .accessibilityHint("Resumes global dispatch.")
+                }
             }
-            .buttonStyle(.plain)
-            .help(issues.first?.body ?? "")
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
