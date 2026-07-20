@@ -145,15 +145,15 @@ pub fn hit_lines(hits: &[SupersessionHit]) -> Vec<String> {
         .collect()
 }
 
-/// Re-export of the reviewer-prompt block renderer for these hits. The
-/// rendering moved to `boss-pr-review` (it is reviewer-prompt text, and lives
-/// next to the prompt that interpolates it); the deterministic scan that
-/// produces the hit lines stays here.
-pub use boss_pr_review::render_supersession_flag_block;
+// Rendering of the reviewer-prompt block for these hits lives in
+// `boss-pr-review` (it is reviewer-prompt text, and lives next to the
+// prompt that interpolates it); the deterministic scan that produces the
+// hit lines stays here. See `boss_pr_review::render_supersession_flag_block`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_pr_review::render_supersession_flag_block;
 
     #[test]
     fn flags_the_incident_002_narrative() {

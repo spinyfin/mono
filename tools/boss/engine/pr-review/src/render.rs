@@ -5,7 +5,7 @@
 use crate::types::*;
 
 /// Render qualifying `ReviewResult` findings as human-readable revision
-/// instructions (design §4 of P992, task 8).
+/// instructions.
 ///
 /// Groups all findings by severity (critical first, low last) and formats
 /// each with its title, file, location, and concrete detail. The rendering
@@ -87,7 +87,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
     out
 }
 
-/// Render the CLAUDE.md for a reviewer worker (design §9 of P992).
+/// Render the CLAUDE.md for a reviewer worker.
 ///
 /// Reviewer workers operate **read-only**: they read PR diffs and workspace
 /// files but must not write, push, or post to GitHub. This CLAUDE.md

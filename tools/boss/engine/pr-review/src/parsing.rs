@@ -17,7 +17,7 @@ use crate::types::*;
 /// # Examples
 ///
 /// ```
-/// use boss_engine::pr_review::{classify_changed_files, ReviewScope};
+/// use boss_pr_review::{classify_changed_files, ReviewScope};
 ///
 /// assert_eq!(
 ///     classify_changed_files(&["docs/design.md", "README.md"]),
@@ -51,7 +51,7 @@ fn is_docs_file(path: &str) -> bool {
 }
 
 /// Extract and parse the first `ReviewResult` from a reviewer's final
-/// assistant message (design §3 of P992, task 8).
+/// assistant message.
 ///
 /// Tries three strategies in order, returning the first successful parse:
 ///
@@ -155,7 +155,7 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
     (None, last_error)
 }
 
-/// Engine severity gate (design §3 of P992, task 8).
+/// Engine severity gate.
 ///
 /// Returns `true` when `result` qualifies for a revision:
 /// - any finding with `severity = Critical` or `High`, **or**

@@ -1,6 +1,6 @@
 //! Data model for the reviewer worker: PR context, review scope, findings,
-//! and the `ReviewResult` structured output (design §2/§3 of P992). See
-//! [`super`] for the module role and output contract.
+//! and the `ReviewResult` structured output. See [`super`] for the module
+//! role and output contract.
 
 use serde::{Deserialize, Serialize};
 

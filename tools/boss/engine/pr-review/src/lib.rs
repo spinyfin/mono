@@ -1,6 +1,5 @@
 //! Reviewer worker: initial-prompt rendering and `ReviewResult` structured
-//! output (design §2 and §3 of P992 "Automated reviewer pass on every
-//! agent-authored PR").
+//! output for the automated reviewer pass that runs on agent-authored PRs.
 //!
 //! # Role
 //!
