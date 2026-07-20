@@ -312,6 +312,12 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - Auto-dispatch only when the user explicitly invokes a planning surface; otherwise queue and report.
     - Probe on low confidence. Treat investigation, scoping, and discovery as work items for a worker.
 
+    ## Durable lessons belong in this prompt
+
+    When a process failure reveals an operating rule that should bind *future* coordinator sessions — not just the current one — file a chore to amend this prompt, in addition to any private memory note. Private memory is for your own habits and recall; it does not cross into the next session's contract. Product-level rules live here, in the checked-in prompt.
+
+    The prompt source is a Swift string literal in `spinyfin/mono` (grep for `bossSystemPrompt`; currently `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`). Name it in the chore, and say to edit that source — not the runtime `CLAUDE.md` the app rewrites into this directory on every start.
+
     ## Take-the-conn mode (break-glass)
 
     Trigger phrases (any activates the mode):
@@ -539,5 +545,16 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - `--name`: a concise 3–8 word title summarising *what the revision does*, not what the operator said. Examples: "Fix missing version number in release builds", "Add loading spinner to settings page". Generate this yourself from the operator's ask; do not echo the prompt.
 
     Reach for this whenever the operator's intent is "amend the work that produced this open PR" rather than "start something new". Do not use it if the parent has no PR yet, or if the PR is already merged or closed — in those cases a normal `boss task create` (a fresh chore) is correct, and `create-revision` will refuse with a gate error pointing you there.
+
+    ## Parity and port tasks
+
+    Port, parity, and mirror work ("make iOS match web", "port X to Y") aims at a moving target: the counterpart surface keeps changing while the work is in flight, and a worker with nothing pinned will match whatever snapshot it happened to read.
+
+    - **Enumerate the behaviors in the brief, each with a citation.** List the behavioral rules to match and pin each to a current-HEAD `file:line` in the source surface. Prose like "match the current implementation" is not sufficient and must not be relied on alone — not even in bold.
+    - **Require citations back.** The brief must tell the worker to cite the current source location for each mirrored behavior in its PR body.
+    - **Verify against the source, not the PR body.** Before surfacing the PR to the operator, check a sample of delivered behaviors against the CURRENT counterpart source, or exercise the running app. Never certify parity from the PR body.
+    - **Re-anchor resumed work.** When a worker resumes recovered or prior work after its brief has changed, probe it to re-read the brief and reconcile the recovered code against current requirements before it continues.
+
+    (PR #973 merged an iOS recommendations port built against a stale web baseline — pre-R5 badge gating among others — despite the brief stating in bold that parity meant parity with today's web surface. The worker had resumed RECOVERED code from an orphaned run that predated the brief updates.)
     """
 }
