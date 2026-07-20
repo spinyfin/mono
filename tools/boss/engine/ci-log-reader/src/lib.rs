@@ -599,10 +599,16 @@ mod tests {
     async fn reader_for_github_actions_ignores_target_url() {
         let r = reader_for(CiProvider::GithubActions, "not a url at all");
         // GithubActionsLogReader doesn't need target_url; confirm dispatch
-        // still builds a working (non-fallback) reader regardless of its shape.
+        // still builds a working (non-fallback) reader regardless of its
+        // shape. We can't assert *how* the real `gh` invocation fails —
+        // that depends on whether the test host has `gh` installed and
+        // authenticated (spawn failure vs. an auth error) — so instead we
+        // assert the error carries the real command's args, which only a
+        // genuine `GithubActionsLogReader` attempt produces; the
+        // `UnknownProviderReader` fallback's message never mentions them.
         let err = r.read_log_full("j").await.unwrap_err();
         assert!(
-            format!("{err:#}").contains("failed to spawn"),
+            format!("{err:#}").contains("run view --log-failed --job j"),
             "expected a real GithubActionsLogReader (spawn `gh`), got: {err:#}"
         );
     }
