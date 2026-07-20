@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use console::{Style, style};
 use git_utils::pr_bookmark;
@@ -3124,6 +3124,27 @@ fn workspace_push(
     )
 }
 
+/// Minimum stage duration before a completion line is printed. Fast stages
+/// stay silent so normal runs aren't spammed; slow stages (the whole point
+/// of this instrumentation — see `run_stage`'s doc comment) get an explicit
+/// "done (Ns)" line so a multi-minute gate run doesn't read as a hang.
+const STAGE_ELAPSED_REPORT_THRESHOLD: Duration = Duration::from_secs(3);
+
+/// Run `f`, announcing `label` on stderr before it starts and, if it takes
+/// longer than [`STAGE_ELAPSED_REPORT_THRESHOLD`], announcing completion
+/// with elapsed time afterward. Human-readable progress only — stdout stays
+/// reserved for parseable output (the PR URL), per repobin/cube convention.
+fn run_stage<T>(label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    eprintln!("cube: {label}…");
+    let start = Instant::now();
+    let result = f();
+    let elapsed = start.elapsed();
+    if elapsed >= STAGE_ELAPSED_REPORT_THRESHOLD {
+        eprintln!("cube: {label} done ({:.1}s)", elapsed.as_secs_f64());
+    }
+    result
+}
+
 /// Run the repository's checkleft against the outgoing changes before a
 /// push, refusing the push when checkleft reports errors.
 ///
@@ -3144,7 +3165,9 @@ fn workspace_push(
 /// visible rather than silent. The only refusal is a checkleft that
 /// actually reported errors. Resolution order: see [`resolve_checkleft_bin`].
 fn run_checkleft_gate(cwd: &Path) -> Result<()> {
-    run_checkleft_gate_impl(cwd, resolve_checkleft_bin(cwd))
+    run_stage("running checkleft push-gate", || {
+        run_checkleft_gate_impl(cwd, resolve_checkleft_bin(cwd))
+    })
 }
 
 /// Inner implementation: runs `checkleft run` using the given binary, or
@@ -3346,24 +3369,26 @@ fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<
     // store's snapshot lock for a workspace-local change that has no
     // bearing on this push, shrinking one contributor to the store-wide
     // lock contention under concurrent workers (see [`run_jj_push`]).
-    run_jj_push(
-        runner,
-        &RealCommandRunner::invocation(
-            &ctx.cwd,
-            "jj",
-            &[
-                "git",
-                "push",
-                "-b",
-                &ctx.branch,
-                "--remote",
-                &ctx.github_remote,
-                "--allow-new",
-                "--ignore-working-copy",
-            ],
-        ),
-    )
-    .map_err(|e| CubeError::InvalidArgument(format!("failed to push branch `{}`: {e}", ctx.branch)))?;
+    run_stage(&format!("pushing branch `{}`", ctx.branch), || {
+        run_jj_push(
+            runner,
+            &RealCommandRunner::invocation(
+                &ctx.cwd,
+                "jj",
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    &ctx.branch,
+                    "--remote",
+                    &ctx.github_remote,
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
+            ),
+        )
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to push branch `{}`: {e}", ctx.branch)))
+    })?;
 
     // Verify the push actually reached GitHub. Confirming against the same
     // remote we pushed to (e.g. `git ls-remote origin`) is circular — if
@@ -3458,9 +3483,11 @@ fn gh_create_pr(args: &PrCreateArgs, ctx: &PrContext, runner: &dyn CommandRunner
         create_args.push("--draft");
     }
 
-    let create_output = runner
-        .run(&RealCommandRunner::invocation(&ctx.cwd, "gh", &create_args))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to create PR: {e}")))?;
+    let create_output = run_stage("creating PR", || {
+        runner
+            .run(&RealCommandRunner::invocation(&ctx.cwd, "gh", &create_args))
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to create PR: {e}")))
+    })?;
 
     // Clean up any temp file we created to materialise a piped body source.
     if let Some(ref p) = tmp_body_path {
