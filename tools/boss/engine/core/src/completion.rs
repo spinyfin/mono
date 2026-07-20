@@ -10128,6 +10128,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })),
             "an AttentionItemCreated event must be published; got {typed:?}",
         );
+        // Exactly one legacy AttentionItemCreated event, despite the repeated
+        // trips above — this still-live event surface is distinct from the
+        // newer AttentionCreated/attentions_created path the populator uses.
+        assert_eq!(publisher.attention_items_created().await, 1);
     }
 
     #[tokio::test]

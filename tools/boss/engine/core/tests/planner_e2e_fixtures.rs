@@ -545,15 +545,21 @@ fn assert_graph_matches(db: &WorkDb, product_id: &str, project_id: &str, run_id:
     }
 }
 
-/// Count of open/partially-answered `followup` attention groups the
+/// Count of open/partially-answered `followup` attention *members* the
 /// Populator raised against `design_id` — the same
 /// `WorkDb::list_attention_groups` query `boss attention list` (and its
 /// `ListAttentionGroups` RPC handler) runs, not the legacy
-/// `work_attention_items` table that surface never reads.
+/// `work_attention_items` table that surface never reads. Counts members
+/// rather than groups: the group key is stable per design task, so a
+/// second raise against the same task joins the existing group as an
+/// additional member instead of creating a new one — a group count would
+/// stay at 1 even when a duplicate raise happened.
 fn open_attention_count(db: &WorkDb, product_id: &str, design_id: &str) -> usize {
     db.list_attention_groups(product_id, None, Some(design_id), Some("followup"), None)
         .unwrap()
-        .len()
+        .iter()
+        .map(|group| db.list_attentions_for_group(&group.id).unwrap().len())
+        .sum()
 }
 
 // ---------------------------------------------------------------------------

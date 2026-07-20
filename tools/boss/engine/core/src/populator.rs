@@ -1251,18 +1251,28 @@ mod tests {
         }
     }
 
-    /// Count of open/partially-answered `followup` attention groups the
+    /// Count of open/partially-answered `followup` attention *members* the
     /// Populator raised against `design_id` — the `boss attention list`
     /// visible surface, not the legacy `work_attention_items` table.
+    /// Counts members rather than groups: the group key is stable per
+    /// design task, so a duplicate raise against the same task joins the
+    /// existing group as an additional member rather than forming a new
+    /// group, and a group count would not detect it.
     fn open_attention_count(db: &WorkDb, product_id: &str, design_id: &str) -> usize {
         db.list_attention_groups(product_id, None, Some(design_id), Some("followup"), None)
             .unwrap()
-            .len()
+            .iter()
+            .map(|group| db.list_attentions_for_group(&group.id).unwrap().len())
+            .sum()
     }
 
-    /// The single populate-raised followup attention member for `design_id`
-    /// (there is exactly one group, with exactly one member, per populate
-    /// pass) — used to assert on `proposed_description` content.
+    /// The single populate-raised followup attention member for `design_id`.
+    /// Exactly one member exists because each test drives a single populate
+    /// pass; in production the group key is stable per design task, so a
+    /// later replan (`boss project plan --force`) against the same task
+    /// appends another member to this same still-open group rather than
+    /// starting a fresh one — used to assert on `proposed_description`
+    /// content.
     fn populate_attention_member(db: &WorkDb, product_id: &str, design_id: &str) -> boss_protocol::Attention {
         let groups = db
             .list_attention_groups(product_id, None, Some(design_id), Some("followup"), None)

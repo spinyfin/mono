@@ -885,6 +885,20 @@ impl RecordingPublisher {
             .count()
     }
 
+    /// Count of legacy `AttentionItemCreated` frontend events published.
+    /// `FrontendEvent::AttentionItemCreated` is still a live wire variant
+    /// published from several production sites outside the populator (e.g.
+    /// `completion.rs`, `conflict_ladder.rs`) — this counter stays
+    /// alongside `attentions_created` rather than replacing it.
+    pub async fn attention_items_created(&self) -> usize {
+        self.typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, e)| matches!(e, FrontendEvent::AttentionItemCreated { .. }))
+            .count()
+    }
+
     /// `Some(n)` — a `WorkItemsCreated` event was published carrying `n`
     /// items. `None` if no such event was published.
     pub async fn work_items_created_len(&self) -> Option<usize> {
