@@ -1,5 +1,10 @@
 # Boss: External Issue Tracker Sync (GitHub Projects)
 
+- **Status:** shipped (v1 complete; doc updated post-implementation to reflect as-built reality)
+- **Implementation PRs:** #570, #606, #614, #615, #616, #627, #629, #631, #646, #655, #658, #659, #660 (May 2026), plus follow-on work noted inline (#673 sidebar banner, OAuth device-flow auth, Behaviors 6–8)
+- **Related docs:** [OAuth device-flow auth for issue sync](oauth-device-flow-auth-for-issue-sync.md), [scope investigation (PR #897)](../investigations/oauth-device-flow-scopes-vs-issue-sync-2026-05-28.md), [runbook](../runbooks/external-tracker-sync.md)
+- **Code:** `tools/boss/github_tracker/` (trait + GitHub impl + OAuth), `tools/boss/github/` (`GhRunner` transport), `tools/boss/engine/core/src/external_tracker/` (reconciler), `tools/boss/cli/src/main.rs`, `tools/boss/app-macos/Sources/`
+
 ## Overview
 
 Boss owns a private taxonomy of work — `products`, `projects`, `tasks`, `chores`
@@ -9,16 +14,34 @@ The two systems drift: an issue gets filed upstream and a human re-types it into
 Boss as a chore, or a Boss task is marked `done` while the upstream issue
 stays open. This is the "two pieces of paper" problem.
 
-This design proposes a one-way ingestion layer that pulls upstream tracker
+This design describes a one-way ingestion layer that pulls upstream tracker
 state into Boss's existing taxonomy, plus a **narrow but mandatory write
 surface**: Boss explicitly closes the upstream issue when a linked PR
 merges. The initial backend is **GitHub Projects + Issues** (against
-`spinyfin/mono`'s "Boss" project). The seam is an internal
-`ExternalTracker` trait — with a required `close_issue` capability
-alongside the read-side methods — so that a Jira or Linear implementation
-can land later without re-architecting the engine's reconciler. Sync is
-**product-scoped**: every product can be bound to at most one upstream
-tracker, and every work item under that product inherits the binding.
+`spinyfin/mono`'s "Boss" project). The seam is an `ExternalTracker` trait —
+with a required `close_issue` capability alongside the read-side methods —
+so that a Jira or Linear implementation can land later without
+re-architecting the engine's reconciler. Sync is **product-scoped**: every
+product can be bound to at most one upstream tracker, and every work item
+under that product inherits the binding.
+
+As implemented, the write surface grew past "close only." Three
+additional writeback behaviors landed after the initial reconciler
+shipped, each as a default-no-op trait method so non-GitHub backends are
+unaffected:
+
+- **Behavior 6:** when a Boss work item goes `active`, the upstream
+  project item's "Status" column moves to a configured in-progress column
+  (default `In Progress`, config key `in_progress_column`).
+- **Behavior 7:** imported issues get a `tracked` label stamped upstream,
+  so humans browsing GitHub can see which issues Boss mirrors.
+- **Behavior 8:** title/body drift between Boss and upstream is detected
+  via content checksums and re-synced — reversing this doc's original
+  "mirror on create only" rule (see Q6).
+
+Boss also posts a comment on the upstream issue linking the closing PR
+when a Behavior 5 close fires (idempotent — it checks for an existing
+comment carrying the same PR URL first).
 
 **Boss does not rely on GitHub's `Fixes #N` / `Closes #N` auto-close
 behavior** to close upstream issues on PR-merge. That behavior only fires
@@ -30,8 +53,10 @@ The reconciler therefore issues the close API call itself; the upstream
 auto-close (when it does fire) is just a redundant backstop that the
 idempotent close path tolerates.
 
-The artefact this design produces is the doc itself plus a list of follow-up
-implementation chores. No code is written here.
+The feature shipped across fourteen PRs in May 2026 (see the header
+block). This doc was originally written before implementation; it has
+since been revised to describe the system as built, with divergences
+from the original plan called out inline.
 
 ---
 
@@ -67,22 +92,29 @@ implementation chores. No code is written here.
 
 ## Non-Goals
 
-- **Bidirectional field sync.** Assignees, labels, comments, milestones,
-  custom fields beyond status — none of these mirror in v1. The body of an
-  upstream issue is the description on the Boss row at _create_ time; later
-  edits do not re-sync.
+- **Bidirectional field sync.** Assignees, milestones, custom fields
+  beyond the project "Status" column — none of these mirror. _(Original
+  plan also excluded title/body re-sync and all label writes; both were
+  later revised — Behavior 8 re-syncs title/body drift via checksums,
+  and Behavior 7 writes a single `tracked` label upstream. Full
+  bidirectional field sync remains out of scope.)_
 - **Boss → upstream creation.** A Boss chore created locally does _not_ spawn
-  an upstream GitHub issue. v1 ingestion is one-way for _content_
-  (titles, bodies, descriptions). There are two writeback paths, both
-  narrow:
+  an upstream GitHub issue. Ingestion is one-way for _existence_ of
+  items. The writeback paths that shipped are narrow and enumerated:
   - **Close-on-PR-merge** (Behavior 5): always on for any bound product.
-    When the linked PR merges, Boss closes the upstream issue.
+    When the linked PR merges, Boss closes the upstream issue (and posts
+    a comment linking the closing PR).
   - **Reverse-close** (Behavior 3): opt-in via `reverse_close` flag.
     When a Boss work item is marked `done` _without_ a merged PR driving
     the transition, Boss closes the upstream issue.
+  - **In-progress column** (Behavior 6): moves the project "Status"
+    field when Boss work goes active.
+  - **`tracked` label** (Behavior 7): stamped on import.
 
-  Both paths route through the same `ExternalTracker::close_issue`
-  capability; the difference is what triggers them.
+  The two close paths route through the same
+  `ExternalTracker::close_issue` capability; the difference is what
+  triggers them. Behaviors 6/7 and the closing-PR comment are separate
+  default-no-op trait methods (Q2).
 
 - **Multiple trackers per product.** One product → one tracker. A monorepo
   spanning two tracking surfaces (say, an open-source repo + an internal
@@ -243,12 +275,25 @@ shape is validated against a kind-specific schema at write time:
   "repo": "mono",
   "project_number": 1,
   "label_filter": null, // optional: array of labels; null = all
-  "status_field_mapping": null, // optional: map of project status → boss status
   "reverse_close": false, // optional: opt-in for Behavior 3.
   // Behavior 5 (PR-merge close) is always on
   // and is not a config flag.
+  "in_progress_column": "In Progress", // optional: target project column
+  // for Behavior 6 (added post-v1)
 }
 ```
+
+_(The originally sketched `status_field_mapping` key was never
+implemented; instead of a general column→status mapping, the narrower
+Behavior 6 shipped: Boss `active` → the single configured
+`in_progress_column`.)_
+
+Config validation happens at bind time in the RPC handler. Note an
+as-built wrinkle: although the trait has a `validate_config` method, the
+`SetProductExternalTracker` handler validates via a parallel free
+function (`validate_external_tracker_config` in
+`engine/core/src/app/handler_helpers.rs`) rather than dispatching
+through the trait — two validation paths that must be kept in sync.
 
 The PAT / installation credential is **not** stored here. Resolved out of
 band (Q11).
@@ -303,6 +348,22 @@ pub trait ExternalTracker: Send + Sync {
     /// `Unsupported` is reserved for read-only trackers (none ship in v1;
     /// see "Why not a read-only variant of the trait" below).
     async fn close_issue(&self, ctx: &TrackerContext, ref_: &UpstreamRef, reason: CloseReason) -> Result<()>;
+
+    // ---- Added post-v1 (Behaviors 6/7 + closing-PR comment). All three
+    // have default no-op implementations, so backends that don't support
+    // them (and the EchoTracker test fake) need no changes.
+
+    /// Behavior 6: move the upstream project item's "Status" column to the
+    /// configured in-progress column when Boss work goes active.
+    async fn set_project_status(&self, ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<()> { ... }
+
+    /// Behavior 7: stamp a label (e.g. "tracked") on the upstream issue.
+    /// Cross-repo aware: parses the owning repo out of `canonical_id`.
+    async fn add_label(&self, ctx: &TrackerContext, ref_: &UpstreamRef, label: &str) -> Result<()> { ... }
+
+    /// Post a comment on the upstream issue linking the PR that closed it.
+    /// Idempotent: scans existing comments for the PR URL before posting.
+    async fn post_closing_pr_comment(&self, ctx: &TrackerContext, ref_: &UpstreamRef, pr_url: &str) -> Result<()> { ... }
 }
 
 pub struct TrackerContext {
@@ -329,6 +390,9 @@ pub struct UpstreamItem {
     pub assignees: Vec<String>,
     pub pr_associations: Vec<UpstreamPrAssociation>,
     pub updated_at: i64,          // unix seconds
+    pub project_status: Option<String>, // current board column ("Status"
+                                        // single-select); feeds Behavior 6's
+                                        // don't-regress check
 }
 
 pub enum UpstreamStatus {
@@ -386,12 +450,24 @@ If a read-only need ever materialises, the trait can grow a
 `fn supports_close(&self) -> bool` predicate and the reconciler can
 fall back to "Boss-side only" close behavior — without rearchitecting.
 
-### Recommendation
+### As built
 
-The trait above, with `close_issue` as a required method. One file
-(`engine/src/external_tracker/mod.rs`); the GitHub impl lives at
-`engine/src/external_tracker/github.rs`. No GitHub-specific types leak
-into the reconciler.
+The trait above shipped verbatim in PR #614 (with `close_issue`
+required), initially at `engine/src/external_tracker/mod.rs` as planned.
+It was later extracted into the dedicated `boss_github_tracker` crate
+(`tools/boss/github_tracker/src/lib.rs`) per the repo's
+crates-over-modules convention, alongside `TrackerRegistry` (a
+`HashMap` keyed by `kind`, duplicate-registration is an error) and the
+`EchoTracker` test fake. The engine re-exports the crate's types under
+`crate::external_tracker::*`, and the dependency edge is one-way:
+`boss_engine` → `boss_github_tracker` → `boss_github`.
+
+Two error-taxonomy changes landed after v1: `TrackerError` gained a
+seventh variant, `TokenRevoked` (HTTP 401), distinct from `Auth` (403),
+as part of the OAuth device-flow work (Q11); and `TrackerCredential`
+was concretised as a struct holding an optional token, with
+`ambient()` meaning "no explicit token; use the `gh` login." No
+GitHub-specific types leak into the reconciler.
 
 ---
 
@@ -405,9 +481,16 @@ issue in project N with its current status field," GraphQL is the right
 shape. For "fetch one issue by `(owner, repo, number)`," REST is fine.
 
 Boss already shells out to `gh` heavily (`gh pr view`, `gh pr list`,
-`gh api`). `gh` handles auth transparently via the user's GitHub login.
-Standardising on `gh` (not raw `reqwest`) keeps auth out of Boss's
-problem domain and inherits the user's existing `gh auth status`.
+`gh api`). Standardising on `gh` (not raw `reqwest`) reuses that
+transport and its retry-friendly CLI semantics. As built, all `gh`
+invocations go through a `GhRunner` trait (`graphql`, `rest_get`,
+`rest_patch`, `rest_post`) in the shared `boss_github` crate
+(`tools/boss/github/src/gh_runner.rs`), whose production impl
+`CommandGhRunner` spawns `tokio::process::Command`. Auth is **no longer
+purely ambient**: every `GhRunner` method takes an optional token, and
+when the product resolves to a stored OAuth token (Q11) it is injected
+as `GH_TOKEN` on the subprocess — `gh` is the HTTP transport, but the
+credential may be Boss-owned rather than the user's `gh` login.
 
 ### Concrete `gh` invocations
 
@@ -472,18 +555,27 @@ request suffices.
 
 GitHub's GraphQL rate limit is points-based (5000/hour for users). A
 `fetch_items` for a 100-item project costs ~1 point. Even at a 1-minute
-cadence per product, this is well under budget for ~10 products. The impl
-records the `X-RateLimit-Remaining` header that `gh` exposes and trips an
-exponential backoff if it drops below a threshold (say 100 remaining).
+cadence per product, this is well under budget for ~10 products.
 
-The REST `close_issue` write goes against a _separate_ rate limit (5000
-core/hour for users), so it does not contend with GraphQL reads. Each
-close is one REST request. The per-tick close budget (Q5,
-"Close-write transactionality") caps closes at 20/tick by default; at the
-default 120s cadence that's 600 closes/hour worst-case, well under
-budget.
+The originally planned `X-RateLimit-Remaining` tracking with exponential
+backoff was **not implemented** — the headroom math above made it
+unnecessary for the single-user engine, so it was dropped. A 429 is
+parsed from `gh` stderr and classified `Transient`, which retries on the
+next tick; that per-tick cadence is the only backoff. The one budget
+mechanism that did ship is the per-tick close cap (`CLOSE_BUDGET = 20`
+in `reconcile/logic.rs`): at the 120s cadence that's 600 closes/hour
+worst-case, well under the separate REST core limit the writes count
+against.
 
 ### Failure modes
+
+Error classification as built: `gh` stderr is scanned for an `HTTP NNN`
+status (`parse_http_status_from_stderr`; a non-HTTP failure classifies
+as `Transient`). Read-path mapping: 401 → `TokenRevoked`, 403 → `Auth`,
+404 / missing `projectV2` node → `ConfigInvalid`, ≥500 and everything
+else (including 429) → `Transient`. Write-path mapping: 403 →
+`PermissionDenied`, 404 → `NotFound` (treated as success by
+`close_issue`), ≥500 → `Transient`.
 
 - **Network failure / `gh` unavailable.** Return `Err(TrackerError::Transient)`.
   Reconciler logs, increments a `external_tracker.fetch_failed` counter,
@@ -505,11 +597,26 @@ budget.
   is retried on subsequent ticks until it succeeds or the issue is
   observed already-closed. See "Close-write transactionality" in Q5.
 
-### Recommendation
+### As built
 
-`GitHubTracker` is a struct that owns a `gh` invocation helper (similar to
-the existing `MergeProbe`). All `gh` calls are `tokio::process::Command`
-shellouts. One GraphQL query for list, one REST call for single-item fetch.
+`GitHubTracker` (PR #631, now `tools/boss/github_tracker/src/github.rs`)
+owns a `GhRunner` handle; all `gh` calls are `tokio::process::Command`
+shellouts. One paginated GraphQL query for list (fleshing out the
+`fieldValues` placeholder above to read the "Status" single-select into
+`project_status`), one REST call for single-item fetch, REST PATCH for
+close, plus post-v1 additions: a project-metadata GraphQL query and an
+`updateProjectV2ItemFieldValue` mutation (Behavior 6), and REST POSTs
+for labels and comments (Behavior 7 / closing-PR comment).
+Deserialisation is pinned by a fixture test
+(`src/testdata/github_fetch_items_single_page.json`), per risk R4.
+
+**Known cross-repo inconsistency (open follow-up):** `fetch_items`
+builds `canonical_id` from each issue's own `repository.nameWithOwner`,
+and `add_label` parses the repo back out of the canonical id — both are
+cross-repo correct. But `fetch_item`, `close_issue`, and
+`post_closing_pr_comment` build REST paths from `config.org` /
+`config.repo`, so a project item living in a different repo than the
+binding's would be probed/closed/commented against the wrong repo.
 
 ---
 
@@ -538,11 +645,23 @@ ALTER TABLE tasks ADD COLUMN external_ref_kind          TEXT;  -- 'github' | ...
 ALTER TABLE tasks ADD COLUMN external_ref_canonical_id  TEXT;  -- 'spinyfin/mono#560'
 ALTER TABLE tasks ADD COLUMN external_ref_raw           TEXT;  -- JSON, tracker-specific
 ALTER TABLE tasks ADD COLUMN external_ref_synced_at     TEXT;  -- unix seconds, last upstream→boss reconcile
+ALTER TABLE tasks ADD COLUMN external_ref_unbound_at    TEXT;  -- set when upstream item leaves scope (Q12)
 
 CREATE INDEX tasks_external_ref_idx
     ON tasks (external_ref_kind, external_ref_canonical_id)
  WHERE external_ref_canonical_id IS NOT NULL;
+
+-- Enforces "at most one live binding per upstream item" (risk R6).
+CREATE UNIQUE INDEX tasks_external_ref_bound_uniq
+    ON tasks (external_ref_kind, external_ref_canonical_id)
+ WHERE external_ref_canonical_id IS NOT NULL
+   AND external_ref_unbound_at  IS NULL
+   AND deleted_at               IS NULL;
 ```
+
+Both indices shipped in the schema migration (PR #570). Note the unique
+index adds `deleted_at IS NULL` beyond the R6 sketch, so a soft-deleted
+row doesn't block re-importing its upstream issue.
 
 Three typed columns, not a single JSON blob:
 
@@ -560,15 +679,36 @@ binding don't bloat it.
 
 ### Lookup methods on `WorkDb`
 
+As shipped (PR #616, now in `engine/core/src/work/exec_tail.rs`):
+
 ```rust
 impl WorkDb {
-    fn find_by_external_ref(&self, kind: &str, canonical_id: &str) -> Result<Option<WorkItem>>;
-    fn set_external_ref(&self, work_item_id: &str, ref_: &UpstreamRef) -> Result<()>;
+    // Flattened args rather than taking &UpstreamRef, so WorkDb has no
+    // dependency on the tracker-trait crate's types.
+    fn set_external_ref(&self, work_item_id: &str, kind: &str, canonical_id: &str,
+                        raw: &serde_json::Value) -> Result<()>;
+    // "Unbind": sets unbound_at, NULLs synced_at, RETAINS kind/canonical_id
+    // so re-binding is automatic (Q12).
     fn clear_external_ref(&self, work_item_id: &str) -> Result<()>;
-    fn list_external_refs_for_product(&self, product_id: &str) -> Result<Vec<(String, UpstreamRef)>>;
-    fn touch_external_ref_synced_at(&self, work_item_id: &str, now: i64) -> Result<()>;
+    // Excludes unbound and soft-deleted rows; returns web_url derived
+    // from (kind, canonical_id) in the mapper.
+    fn find_by_external_ref(&self, kind: &str, canonical_id: &str) -> Result<Option<Task>>;
+    // Includes unbound rows (needed for re-bind matching).
+    fn list_external_refs_for_product(&self, product_id: &str) -> Result<Vec<(String, StoredExternalRef)>>;
+    // Timestamps internally; deliberately does NOT touch updated_at.
+    fn touch_external_ref_synced_at(&self, work_item_id: &str) -> Result<()>;
 }
 ```
+
+`StoredExternalRef {kind, canonical_id, raw, synced_at, unbound_at}` is
+a DB-layer type distinct from the wire-facing `WorkItemExternalRef`;
+`web_url` is not stored but derived at read time
+(`derive_external_ref_web_url` in `work/mappers.rs`). The reconciler
+also uses two purpose-built write methods rather than generic updates:
+`reconciler_close_work_item` (its own small transaction + dependency
+unblock cascade) and `reconciler_attach_pr_url` (writes only when
+`pr_url` is NULL/empty, which structurally enforces the Behavior 4
+"don't overwrite `pr_url_capture`" rule).
 
 ### Why not a separate `external_refs` table?
 
@@ -617,12 +757,16 @@ pub fn spawn_loop(
 ```
 
 This mirrors `merge_poller::spawn_loop` exactly — same task structure, same
-metrics shape, same logging convention.
+metrics shape, same logging convention. As built, the loop fires one pass
+immediately on engine boot, then sleeps `interval` between passes.
 
 ### Cadence
 
-**Default 120 seconds** (2 minutes). Configurable via engine settings
-(`reconcile_external_trackers_interval_seconds`). Why 2 min:
+**120 seconds** (2 minutes), hardcoded at the `spawn_loop` call site in
+`engine/core/src/app/server.rs`. The originally planned engine setting
+(`reconcile_external_trackers_interval_seconds`) was never implemented —
+the default was good enough in practice and nobody asked to tune it.
+Why 2 min:
 
 - The lower bound is ~60s (any faster wastes API budget for no perceptual
   benefit; humans don't refresh GitHub more often).
@@ -639,36 +783,51 @@ don't want to wait.
 For each product with `external_tracker_kind IS NOT NULL`:
 
 1. Resolve the credential (Q11). If unresolvable, log + skip; emit
-   `external_tracker.skip_no_credential`.
+   `external_tracker.skip_no_credential`; upsert an auth attention item.
 2. Call `tracker.fetch_items(ctx)` → `Vec<UpstreamItem>`. On error:
-   classify; emit metric; skip.
-3. Open a SQL transaction. Within it:
+   classify; emit metric; upsert an attention item
+   (auth/token-revoked/transient); skip. A later successful fetch
+   auto-resolves these attention items.
+3. Apply Boss-side SQL state:
    a. Build a `HashMap<canonical_id, &UpstreamItem>` from the fetched list.
    b. `list_external_refs_for_product(product_id)` → existing bindings.
    c. For each upstream item:
    - If `find_by_external_ref(kind, canonical_id)` returns `Some(row)`:
      **reconcile_existing** (Q6). This includes the close-on-merge
-     decision: if the Boss row's associated PR has merged and the
-     upstream is still `Open`, queue a `close_issue` call for after
-     the transaction commits (Behavior 5).
+     decision: if a merged PR is associated and the upstream is still
+     `Open`, queue a `close_issue` call for after the SQL writes
+     (Behavior 5). Also queues Behavior 6 (in-progress column) and
+     Behavior 8 (title/body drift) work.
    - Else: **import_new** (Q7).
-     d. For each existing binding whose canonical*id is \_not* in the fetched
-     map: it's been removed from the project upstream. Apply
-     **handle_removed_upstream** (Q12).
-     e. If reverse-close is enabled, for each work item flipped to `done`
-     since its `external_ref_synced_at` whose upstream is still `Open`,
-     queue a `close_issue` call (Behavior 3).
-4. Commit the SQL transaction. Boss-side state is now correct.
-5. **Issue the queued `close_issue` calls** to the upstream tracker, _after_
-   the SQL commit. Each call is independent; failures on one do not roll
+     d. For each existing binding whose canonical*id is \_not* in the
+     fetched map: it's been removed from the project upstream. Unbind
+     per Q12 (inline in `process_product`; there is no separate
+     `handle_removed_upstream` function).
+     e. If reverse-close is enabled, queue `close_issue` for `done` work
+     items whose upstream is still `Open` (Behavior 3).
+4. **Issue the queued upstream writes** (`close_issue`, then the
+   closing-PR comment, `set_project_status`, `add_label`) _after_ all
+   Boss-side SQL. Each call is independent; failures on one do not roll
    back others. See "Close-write transactionality" below.
-6. Emit per-tick metrics (`external_tracker.imported`, `.closed`,
+5. Emit per-tick metrics (`external_tracker.imported`, `.closed`,
    `.pr_attached`, `.pr_merge_close_succeeded`,
    `.pr_merge_close_failed`, etc.).
 
+**As-built note on transactionality:** the original plan wrapped step 3
+in a single per-pass SQL transaction. That was not implemented — each
+WorkDb call opens its own connection (only `reconciler_close_work_item`
+uses a small transaction internally, for the dependency-unblock
+cascade). What _is_ preserved is the load-bearing property: all
+Boss-side SQL happens before any upstream write, and retry intent is
+derived from current SQL + upstream state rather than in-memory queues,
+so a crash mid-pass loses nothing. One real crash window this opened —
+import creating a chore and setting its external ref in two separate
+writes — was later closed with an atomic
+`import_chore_with_external_ref` (`work/create_entities.rs`).
+
 ### Close-write transactionality
 
-The reconcile pass deliberately commits Boss-side state _before_ issuing
+The reconcile pass deliberately applies Boss-side state _before_ issuing
 the upstream `close_issue` calls. This is the right ordering for three
 reasons:
 
@@ -695,10 +854,11 @@ ref pointing at an `Open` issue is a close candidate. This means a Boss
 crash mid-reconcile cannot lose a pending close — the next reconciler
 start-up re-derives the work from current SQL + upstream state.
 
-A per-tick budget (default: 20 close calls per pass) prevents a flood of
-batch-merged PRs from saturating the rate-limit window. Excess closes
-defer to the next tick. Emit
-`external_tracker.close_deferred_rate_budget` when this kicks in.
+A per-tick budget (`CLOSE_BUDGET = 20` close calls per pass) prevents a
+flood of batch-merged PRs from saturating the rate-limit window. Excess
+closes defer to the next tick. (The originally planned
+`close_deferred_rate_budget` metric for observing this truncation was
+never implemented — the cap is silent.)
 
 ### Idempotency
 
@@ -743,48 +903,48 @@ local edits.
 
 ### Status mirroring
 
-Five upstream states map to four Boss statuses:
+As built, the mapping is simpler than originally planned:
 
-| Upstream                              | Boss `tasks.status`       |
-| ------------------------------------- | ------------------------- |
-| Open (no PR associated, no Boss work) | `todo`                    |
-| Open + Boss work in-flight            | (unchanged; Boss owns it) |
-| Open + associated PR exists           | `in_review`               |
-| Closed `completed`                    | `done`                    |
-| Closed `not_planned`                  | `done` _(see below)_      |
+| Upstream                       | Boss `tasks.status`       |
+| ------------------------------ | ------------------------- |
+| Open (no merged PR associated) | (unchanged; Boss owns it) |
+| Open + merged PR associated    | `done` (Behavior 5)       |
+| Closed (either reason)         | `done`                    |
 
 The reconciler **never overwrites a Boss-side status transition that the
 upstream wouldn't reach on its own.** Concrete rules:
 
-- If `upstream_status = Open` and `boss_status ∈ {active, blocked,
-in_review, done}` — leave Boss alone. The user has progressed the work
-  locally; upstream is just catching up.
-- If `upstream_status = Open` and `boss_status = todo` — leave Boss
-  alone (nothing to change).
-- If `upstream_status = Closed{Completed}` and `boss_status != done` —
-  set Boss to `done`. The upstream is the source of truth on completion.
-- If `upstream_status = Closed{NotPlanned}` and `boss_status != done` —
-  set Boss to `done` (with a `last_status_actor = 'external_tracker'`
-  marker so the kanban can render a subtle "not planned" indicator).
-  Open Q below.
+- If `upstream_status = Open` and no merged PR is associated — leave
+  Boss alone, whatever its status. The user progresses work locally;
+  upstream catches up via the close paths.
+- If `upstream_status = Closed{..}` and `boss_status != done` — set Boss
+  to `done`. The upstream is the source of truth on completion.
 
-**Open question for review:** should `not_planned` map to `done` or to a
-new `archived` / `cancelled` status? `tasks.status` doesn't have an
-`archived` variant today (the schema uses `deleted_at` for soft-delete).
-The chosen v1 mapping is `done` to avoid schema churn; the kanban surface
-shows the close-reason in the card tooltip via a new `closed_reason` column
-on the work item _if_ the value adds enough to justify the extra column.
-**Recommendation:** ship without the column; if users miss the
-distinction, add `closed_reason TEXT` in a follow-up.
+Divergences from the original plan, all deliberate simplifications:
+
+- **`in_review` mapping dropped.** The planned "Open + associated PR
+  exists → `in_review`" rule was never implemented; a PR association
+  only attaches `pr_url` (Behavior 4) and, if merged, drives the
+  Behavior 5 close. Boss's `in_review` state comes from Boss's own
+  pipeline.
+- **`not_planned` is not distinguished.** Both close reasons map to
+  `done`; the code matches `Closed { .. }` without reading the reason,
+  and neither the floated `closed_reason` column nor a
+  `last_status_actor = 'external_tracker'` marker shipped. Reconciler
+  closes stamp `last_status_actor = 'engine'`, same as other
+  engine-driven transitions.
 
 ### Title and body
 
-- **Title.** Mirrored on _create only_. Subsequent upstream title edits
-  do not overwrite Boss's `name` — users rename freely in Boss.
-- **Body.** Same: mirrored on create, not re-synced. The non-goal
-  ("bidirectional field sync") covers this. An optional follow-up could
-  add a `description_synced INTEGER NOT NULL DEFAULT 0` flag where
-  `0` means "Boss user edited it, do not re-sync." Out of v1.
+Originally: mirrored on create only, never re-synced. This was
+**reversed post-v1 by Behavior 8**: the reconciler stores SHA-256
+checksums of the title/body it last synced, and on each tick compares
+three states (Boss content, upstream content, last-synced checksum) to
+distinguish "upstream edited" (re-sync into Boss), "Boss edited" (leave
+alone), and "both edited" (conflict — surfaced via the
+`title_body_conflict` metric rather than silently overwriting either
+side). The original one-shot mirror survives as the initial state before
+any checksum exists.
 
 ### `external_ref_synced_at`
 
@@ -792,11 +952,13 @@ Bumped on every successful reconcile, regardless of whether other columns
 changed. Used by the kanban to render "last synced 30s ago" / "synced 4
 days ago — possibly stale" on the upstream-ref affordance.
 
-### Recommendation
+### As built
 
 `reconcile_existing(boss_row, upstream_item)` does status mirroring with
-the table above, never touches title/body, bumps `synced_at`. Conflict
-policy: **upstream wins on close, Boss wins on everything else.**
+the table above, handles title/body drift via Behavior 8's checksum
+protocol, bumps `synced_at`. Conflict policy: **upstream wins on close,
+Boss wins on status otherwise; title/body conflicts are surfaced, not
+resolved.**
 
 ---
 
@@ -813,8 +975,10 @@ been mirrored. We create a Boss row.
   CLI verb `boss work move-to-project <selector> <project>` lets a human
   re-classify chore → project task later.
 - **Product:** the product whose binding produced this fetch.
-- **Status:** `todo`. (Or `in_review` if `upstream_item.pr_associations`
-  shows an open PR; rare for fresh issues, but covered.)
+- **Status:** `todo`, unconditionally. (The originally floated
+  "`in_review` if an open PR is already associated" refinement was not
+  implemented; a pre-existing merged PR still drives a Behavior 5 close
+  on the same tick.)
 - **Name:** upstream title.
 - **Description:** upstream body, prefixed with a one-line
   `> Imported from <upstream_url>` so users can chase the origin.
@@ -842,10 +1006,14 @@ This handles the bootstrap case: turning on the binding doesn't dump
 hundreds of historical closed issues into Boss as `done` chores. Only
 forward-going state mirrors.
 
-### Recommendation
+### As built
 
 Import as `chore` / `todo` with the upstream title / body. Skip
-already-closed items at first-sight. Stamp `created_via`.
+already-closed items at first-sight. Stamp `created_via`. The chore row
+and its external ref are written atomically
+(`import_chore_with_external_ref`) so a crash between the two can't
+strand an unbound duplicate. On import, Behavior 7 queues a `tracked`
+label write back to the upstream issue.
 
 ---
 
@@ -870,8 +1038,9 @@ same `pr_url`.
 ### Behavior 4 — `pr_url` attachment rules
 
 1. On reconcile, if `upstream_item.pr_associations` is non-empty:
-   - Pick the most recent association (sorted by `merged_at` desc, then
-     by `pr_url`).
+   - Pick the best association (`pick_best_pr`): merged PRs win over
+     unmerged, most-recent `merged_at` among merged; the unmerged
+     fallback tiebreaks lexicographically by `pr_url`.
    - If `boss_row.pr_url IS NULL`, write the URL. Emit
      `external_tracker.pr_attached`.
    - If `boss_row.pr_url` is already non-null but came from the
@@ -911,26 +1080,30 @@ later one is a harmless duplicate. If only one fires (e.g. PR has no
 footer → GitHub doesn't auto-close → Boss does), the upstream still ends
 up closed.
 
-#### Trigger conditions
+#### Trigger conditions (as built)
 
-On each reconcile tick, queue a `close_issue` call for the work item if
-_all_ of the following hold:
+The original plan resolved merged-ness "via the existing merge poller's
+view of the PR." **The implementation diverged:** merged-ness comes from
+the _upstream's own_ PR associations
+(`upstream_item.pr_associations[].merged`, i.e. GitHub's
+`closedByPullRequestsReferences`), not from the merge poller. On each
+tick, for a bound work item whose upstream is `Open`, a `close_issue`
+call is queued if either arm holds:
 
-- `work_item.external_ref_canonical_id IS NOT NULL` (it's bound).
-- `work_item.pr_url IS NOT NULL` (a PR is linked).
-- The linked PR's state is `merged` (resolved via the existing merge
-  poller's view of the PR — re-using the same merge signal Boss already
-  trusts elsewhere).
-- The upstream issue's current `UpstreamStatus = Open`.
-- The Boss work item's status flips to `done` as part of this same
-  reconcile, or was already `done` from a prior tick whose close call
-  failed.
+- **Primary arm:** a merged PR appears in the upstream's associations.
+  If the Boss row isn't `done` yet it is flipped to `done` in the same
+  tick.
+- **Retry arm:** the Boss row is already `done` (or archived) and has a
+  non-empty `pr_url`. This re-derives the "close didn't land last tick"
+  case from SQL state alone, so crashes can't lose a pending close.
 
-The first four conditions form the "close decision"; the fifth handles
-the retry case where Boss-side state already advanced but the upstream
-close didn't land. Together they guarantee: every merged-PR-linked Boss
-work item ends up with both Boss `done` _and_ upstream closed, even
-across crashes and transient failures.
+**Known gap in the retry arm:** it does not verify that `pr_url`'s PR
+actually merged — any `done` row with any `pr_url` and an `Open`
+upstream queues a close. This is broader than designed: it weakens the
+"external PR can't drive a close" claim below and the R11 safeguard,
+and it means a bound item marked `done` with an unmerged PR attached
+closes upstream even when `reverse_close` is off. Flagged as a
+follow-up.
 
 #### Why not move the Boss work item to `done` _first_ and let Behavior 3
 
@@ -956,10 +1129,13 @@ not the policy.
 
 Possible if a fork or external PR mentions the issue. Boss still writes
 the PR URL to `pr_url` — `pr_url` is a URL, not a foreign key. The
-merge poller skips PRs whose host repo doesn't match the product's
-`repo_remote_url` (existing behaviour); Behavior 5's close logic also
-gates on "merge poller observed merged = true," so an external PR that
-the merge poller does not track cannot drive a Behavior 5 close. Safe.
+original design gated Behavior 5 on the merge poller (which skips PRs
+whose host repo doesn't match the product's `repo_remote_url`), making
+external PRs unable to drive a close. As built, the primary arm trusts
+GitHub's own `closedByPullRequestsReferences` merged flag — which only
+covers PRs GitHub itself linked, an acceptable signal — but the retry
+arm's missing merged-check (above) means this safety property no longer
+fully holds. Covered by the same follow-up.
 
 ### Failure mode: `close_issue` fails transiently
 
@@ -974,24 +1150,26 @@ human closing it manually).
 
 ### Failure mode: `close_issue` fails with `PermissionDenied`
 
-The credential lacks `issues:write`. The Boss work item is `done`
-(unchanged). The reconciler emits an attention item on the product
-("Boss could not close upstream issue `<canonical_id>` — credential
-lacks write scope. Re-run `gh auth login --scopes repo` to grant write
-permission."). Do not retry on subsequent ticks (the credential won't
-spontaneously gain permission); clear the attention item once a tick
-observes the upstream as `Closed` (someone closed it manually) or once
-the credential is re-resolved with write scope.
+The credential lacks write scope. The Boss work item is `done`
+(unchanged). The reconciler upserts an attention item
+(`external_tracker_permission_denied`, on the work item) with a
+remediation hint. The original plan said "do not retry on subsequent
+ticks"; as built the close **is** re-attempted every tick — the
+candidate is re-derived from SQL state, which hasn't changed, and no
+suppression exists. Harmless (one failing REST call per tick per stuck
+item) but noisier than designed. The attention item is idempotent
+(upsert skips when one is already open).
 
-### Recommendation
+### As built
 
 - Read `closedByPullRequestsReferences` and `pr_url_capture` results;
   attach `pr_url` per the rules above.
 - On observing a merged-PR-linked Boss work item whose upstream is
-  `Open`, call `tracker.close_issue` after SQL commit.
+  `Open`, call `tracker.close_issue` after the Boss-side SQL, then post
+  a comment on the issue linking the closing PR.
 - Tolerate redundancy with GitHub's auto-close (both paths converge
   idempotently).
-- Surface persistent permission failures as product attention items.
+- Surface permission failures as attention items on the work item.
 
 ---
 
@@ -1057,10 +1235,16 @@ is `Open`" to avoid pointless API calls.
   idempotent. Whichever trigger fires the call first wins; the other
   becomes a no-op.
 
-### Recommendation
+### As built
 
-Ship the `reverse_close` flag, gated off by default. Surface as an
-attention item if the flag is on but the credential lacks write scope.
+Shipped in PR #655 as designed: a `CloseTrigger { PrMerge, ReverseClose }`
+discriminator on the queued close candidate, `reverse_close` read from
+config (defaulting false), and an explicit else-branch guarantee that
+Behavior 5 claims a candidate before Behavior 3 can (no double close).
+Write-permission failures surface through the generic
+`external_tracker_permission_denied` attention item — the originally
+sketched dedicated `reverse_close_blocked` attention reason was never
+implemented.
 
 ---
 
@@ -1075,8 +1259,12 @@ upstream issue.** Closes fire from two triggers:
 - **Behavior 3 (opt-in, per product `reverse_close` flag):** Boss work
   item flipped to `done` independent of a merged PR.
 
-No other writes (title edits, body edits, label changes, project-field
-edits, status-field edits, comment posts) leave Boss in v1.
+At v1 no other writes left Boss. The surface has since widened in three
+enumerated, still-narrow ways (see Overview): the Behavior 6
+in-progress-column write, the Behavior 7 `tracked` label, and the
+closing-PR comment. General title/body/assignee/milestone writes to
+upstream remain off the table (Behavior 8 syncs title/body drift
+_into_ Boss, not outward).
 
 ### Why a deliberate write surface (and not zero writes)
 
@@ -1136,15 +1324,20 @@ demand more, the trait's `close_issue` shape generalises naturally to
 
 ## Design Question 11 — Credentials
 
-GitHub access goes through `gh`. v1 does not store any credential in
-`external_tracker_config` (or anywhere else in `state.db`).
+The credential story evolved substantially after v1. The original plan —
+purely ambient auth inherited from the user's `gh` login, nothing stored
+anywhere — shipped first (PR #631), but was then superseded by a
+Boss-owned **OAuth device-flow token**. The scope analysis that drove
+this lives in the
+[PR #897 investigation](../investigations/oauth-device-flow-scopes-vs-issue-sync-2026-05-28.md),
+and the mechanism has its own design doc
+([oauth-device-flow-auth-for-issue-sync](oauth-device-flow-auth-for-issue-sync.md));
+the summary here is what the reconciler sees.
 
-### Resolution path
+### Resolution path (as built)
 
-`TrackerContext.credential` is constructed by a `TrackerCredentialResolver`
-trait whose default impl simply confirms `gh auth status` succeeds for the
-target host (`github.com` for v1). The credential itself is implicit: any
-`gh api` call inherits the user's `gh` login.
+`TrackerContext.credential` is constructed by a
+`TrackerCredentialResolver` trait (`github_tracker/src/credentials.rs`):
 
 ```rust
 pub trait TrackerCredentialResolver: Send + Sync {
@@ -1153,26 +1346,41 @@ pub trait TrackerCredentialResolver: Send + Sync {
 }
 ```
 
-For GitHub, the default impl just runs `gh auth status` once at engine
-startup (per host) and caches the result. If auth is missing, the
-reconciler skips all GitHub-bound products and surfaces an attention item
-on each.
+The production resolver is `KeychainOAuthResolver`: it looks for a
+stored OAuth token in the macOS keychain first, and falls back to
+`GhAuthStatusResolver` (ambient `gh` login, verified via
+`gh auth status --hostname github.com`) when none exists. The resolved
+token, when present, is injected as `GH_TOKEN` on every `gh` subprocess
+(Q3).
 
-### Future PAT support
+Two divergences from the original sketch:
 
-If users want to bind a product to a tracker that the local `gh` is not
-logged into (e.g. an organisation account different from their personal
-login), a future extension lets the binding reference a credential by
-_name_: `"credential_ref": "spinyfin-bot-pat"`. The actual PAT lives in
-the OS keychain (macOS: Keychain Services) and is resolved by a different
-`TrackerCredentialResolver` impl. **Out of v1.** The bare default
-(`gh auth status`) is enough for the Boss-on-mono target.
+- **No startup-once caching.** The plan called for resolving once at
+  engine startup and caching per host. As built, `resolve()` runs
+  per-product per-tick — a keychain lookup or a `gh auth status`
+  subprocess every 120s. Nobody has noticed the cost; the caching idea
+  was simply never picked up.
+- **A token IS stored** — in the OS keychain (`KeychainTokenStore`),
+  not in `state.db`, so "nothing stored in Boss state" survived in
+  letter if not in spirit.
 
-### Recommendation
+If no credential resolves, the reconciler skips the product for that
+tick (`skip_no_credential` metric) and surfaces an attention item; a 401
+mid-fetch classifies as `TokenRevoked` and gets its own attention kind.
 
-Credential plumbing is a trait. v1 ships the `gh auth status` impl;
-nothing is stored in Boss state. Future PAT-in-keychain extensions slot in
-without schema changes.
+### The OAuth device flow (summary; see its own design doc)
+
+`DeviceFlow` (`github_tracker/src/github_oauth.rs`) speaks directly to
+`github.com/login/device/code` via `reqwest` — this is the one deliberate
+exception to the `gh`-as-transport rule, since the whole point is
+acquiring a token independent of `gh`. Scopes requested are
+**`repo project`**, exactly what the PR #897 audit concluded the six
+upstream operations need (no standalone `issues` scope exists; the
+projectV2 status _mutation_ forces writable `project`). A
+`GitHubAuthController` state machine handles polling with `slow_down`
+backoff, expiry grace, granted-scope recording, and an org/SSO
+accessibility probe reported through the `OrgStateSink` port (implemented
+by the engine's `WorkDbOrgStateSink`).
 
 ---
 
@@ -1236,6 +1444,13 @@ Recommendation revised: clear `external_ref_synced_at`, set
 `external_ref_unbound_at` to now, leave `external_ref_canonical_id`
 populated so re-binding is automatic.
 
+**As built:** exactly the revised shape, implemented inline as step 4 of
+`process_product` (there is no named `handle_removed_upstream` function)
+with `WorkDb::clear_external_ref` doing the column dance and
+`set_external_ref` re-binding automatically when the item reappears. The
+attention item (`external_tracker_removed_upstream`, on the work item)
+landed later in PR #660.
+
 ---
 
 ## Design Question 13 — Backfill of Pre-Existing Boss Work Items
@@ -1256,12 +1471,18 @@ reconciler can't auto-link them — title-matching is brittle.
 ### Recommendation
 
 **Pick (q).** Heuristic auto-linking (p) is a precision/recall trap;
-false matches are worse than no matches. v1 ships an explicit CLI verb:
+false matches are worse than no matches. Shipped (PR #629) as an
+explicit, kind-agnostic CLI verb — `--kind` + `--id` rather than the
+originally sketched per-tracker `--github` flag, so new backends don't
+need new flags:
 
 ```sh
-boss task link-external <selector> --github spinyfin/mono#560
+boss task link-external <selector> --kind github --id spinyfin/mono#560
 boss task unlink-external <selector>
 ```
+
+Linking stores `raw = null`; the next reconcile tick populates
+`raw`/`web_url` from upstream.
 
 The reconciler then treats the manually-linked row as if the upstream
 binding had existed all along: status mirroring, PR-association, the
@@ -1275,22 +1496,38 @@ interactive accept step. Out of v1.
 
 ## Design Question 14 — UI / Affordance
 
-Out of scope for the _engine_ design but worth sketching so the schema
-supports it.
+As built on the macOS side:
 
-- **Kanban card.** When `external_ref_canonical_id IS NOT NULL`, render
-  a small "↗ #560" link in the card footer. Click opens
-  `https://github.com/<repo>/issues/<n>`. Tooltip shows last sync time.
-- **Card detail (when shipped).** A "Linked external tracker" row with
-  the canonical_id, sync time, web URL, and a "Refresh now" button that
-  triggers `boss product sync-external-tracker <product>` for just this
-  row.
-- **Attention items.** A new `kind = 'external_tracker'` carrying the
-  product_id, the upstream binding's status (`ok`, `config_invalid`,
-  `auth_failed`, `reverse_close_blocked`), and a remediation hint.
-
-The macOS app side is a follow-up chore once the engine RPC surface is in
-place.
+- **Kanban card** (PR #615). When a work item is bound,
+  `ExternalRefLinkView` renders in the card footer after the `T#N`
+  identifier: an accent-colored "↗ #560" link (via
+  `ExternalRefLinkPresentation`, which shortens GitHub canonical ids to
+  `#N` and falls back to the full id for other kinds) opening the
+  derived web URL, with a tooltip carrying the canonical id and last
+  sync time (currently the raw unix-seconds string, not
+  human-formatted). A stale binding (`unbound_at` set) renders
+  secondary-colored with strikethrough, still clickable, tooltip
+  "Upstream binding cleared."
+- **Attention items** (PR #660 engine + models, PR #673 rendering). The
+  original sketch — a single `kind = 'external_tracker'` with a status
+  enum — became **separate kind strings on the generic
+  `work_attention_items` table**: `external_tracker_auth_failed` and
+  `external_tracker_transient_errors` on the product (fetch failures;
+  auto-resolved on the next successful fetch),
+  `external_tracker_removed_upstream` and
+  `external_tracker_permission_denied` on the work item, plus
+  `external_tracker_token_revoked` from the OAuth work. The sketched
+  `config_invalid` and `reverse_close_blocked` reasons were never
+  implemented. Remediation hints live in the item body plus a Swift
+  presentation layer (`ExternalTrackerAttentionPresentation`) that maps
+  reason → title/hint/SF-symbol and degrades gracefully on unknown
+  `external_tracker_*` kinds. Rendering is a dedicated orange sidebar
+  banner + popover below the product picker (not the general attention
+  list as originally assumed).
+- **Not shipped:** the card-detail "Linked external tracker" row with
+  "Refresh now" button, and the "📡" badge for
+  `created_via = 'external_tracker_sync'` cards (the engine stamps the
+  value; no UI consumes it).
 
 ---
 
@@ -1359,9 +1596,13 @@ ALTER TABLE tasks ADD COLUMN external_ref_unbound_at    TEXT;
 CREATE INDEX tasks_external_ref_idx
     ON tasks (external_ref_kind, external_ref_canonical_id)
  WHERE external_ref_canonical_id IS NOT NULL;
+
+-- plus the unique bound-rows index from R6 (see Q4)
 ```
 
 No backfill required for the new columns; all default to `NULL`.
+Shipped in PR #570 (schema v11; migration now lives in
+`engine/core/src/work/migrations_b.rs`).
 
 ### Protocol additions
 
@@ -1402,12 +1643,22 @@ pub struct LinkExternalRefInput {
     pub canonical_id: String,
 }
 
-// wire.rs
-SetProductExternalTracker      { request_id: String, input: SetProductExternalTrackerInput }
-SyncProductExternalTracker     { request_id: String, product_id: String }
-LinkWorkItemExternalRef        { request_id: String, input: LinkExternalRefInput }
-UnlinkWorkItemExternalRef      { request_id: String, work_item_id: String }
+// wire.rs — request_id lives in the envelope, not the variants
+SetProductExternalTracker      { input: SetProductExternalTrackerInput }
+SyncProductExternalTracker     { product_id: String }
+LinkWorkItemExternalRef        { input: LinkExternalRefInput }
+UnlinkWorkItemExternalRef      { work_item_id: String }
+
+// events.rs — added beyond the original plan: the sync RPC is
+// fire-and-forget; this event acknowledges the pass has started.
+FrontendEvent::ExternalTrackerSyncStarted { product_id: String }
 ```
+
+All shipped in PR #606 (types now split across
+`protocol/src/types/{product,work_item,common}.rs`; Swift mirrors in
+`app-macos/Sources/Models+Products.swift`, holding config/raw JSON as
+strings). `CREATED_VIA_EXTERNAL_TRACKER_SYNC` joined the known
+`created_via` values.
 
 ### CLI
 
@@ -1419,51 +1670,71 @@ boss product set-external-tracker <selector> --unset
 boss product show <selector>            # gains an "External tracker:" block
 boss product sync-external-tracker <selector>   # on-demand reconcile pass
 
-# Per-row manual link
-boss task link-external <selector> --github <owner>/<repo>#<number>
+# Per-row manual link (kind-agnostic --kind/--id, see Q13)
+boss task link-external <selector> --kind github --id <owner>/<repo>#<number>
 boss task unlink-external <selector>
-boss chore link-external <selector> --github <owner>/<repo>#<number>
+boss chore link-external <selector> --kind github --id <owner>/<repo>#<number>
 boss chore unlink-external <selector>
 ```
 
-### Engine module split
+### Code layout (as built)
 
-- `engine/src/external_tracker/mod.rs` — trait, `TrackerRegistry`,
-  `TrackerContext`, error types.
-- `engine/src/external_tracker/github.rs` — `GitHubTracker` impl with
-  `gh` shellouts and GraphQL query construction.
-- `engine/src/external_tracker/reconcile.rs` — the periodic loop and
-  per-product pass.
-- `engine/src/external_tracker/credentials.rs` — `TrackerCredentialResolver`
-  trait and `gh auth status` default impl.
-- `engine/src/work.rs` — `set_external_ref`, `clear_external_ref`,
-  `find_by_external_ref`, `list_external_refs_for_product`.
-- `engine/src/protocol.rs` — RPC additions.
-- `cli/src/main.rs` — new `product set-external-tracker`,
+The doc originally planned everything as modules inside the engine
+crate. Per the repo's crates-over-modules convention, the tracker side
+was extracted into dedicated crates; the engine keeps only
+reconciliation policy. Dependency edges are one-way:
+`boss_engine` → `boss_github_tracker` → `boss_github`.
+
+- `tools/boss/github_tracker/src/lib.rs` — `ExternalTracker` trait,
+  `TrackerRegistry`, `TrackerContext`, error types, `EchoTracker`.
+- `tools/boss/github_tracker/src/github.rs` — `GitHubTracker` impl and
+  GraphQL query/mutation construction.
+- `tools/boss/github_tracker/src/credentials.rs` — resolver trait,
+  `KeychainOAuthResolver`, `GhAuthStatusResolver`.
+- `tools/boss/github_tracker/src/github_oauth.rs` — device flow,
+  keychain token store, `GitHubAuthController`.
+- `tools/boss/github/src/gh_runner.rs` — shared `GhRunner` /
+  `CommandGhRunner` transport.
+- `tools/boss/engine/core/src/external_tracker/` — `reconcile/mod.rs`
+  (loop, metrics, `PassOutcome`), `reconcile/logic.rs` (per-product
+  pass), `org_state_sink.rs`, re-exports.
+- `tools/boss/engine/core/src/work/` — external-ref WorkDb methods
+  (`exec_tail.rs`), atomic import (`create_entities.rs`), migration
+  (`migrations_b.rs`), web-url derivation (`mappers.rs`).
+- `tools/boss/engine/core/src/app/external_tracker.rs` — RPC handlers
+  (validation helper in `app/handler_helpers.rs`).
+- `tools/boss/cli/src/main.rs` — `product set-external-tracker`,
   `product sync-external-tracker`, `task/chore link-external`,
   `task/chore unlink-external` verbs.
 
-### Metrics
+### Metrics (as built)
 
-Counters, registered on the existing `Registry`:
+Plain counters registered on the existing `Registry` — the metrics
+system has no label dimensions, so the originally sketched
+`{reason=...}` labels don't exist; failure reasons are visible in logs
+only. The set grew from 10 (PR #646) to 18 as Behaviors 3/6/7/8 landed:
 
-- `external_tracker.fetch_succeeded`
-- `external_tracker.fetch_failed`
+- `external_tracker.fetch_succeeded` / `.fetch_failed`
 - `external_tracker.imported`
 - `external_tracker.closed` — Boss row flipped to `done` because the
   upstream observed as `Closed` (Behavior 2, close-mirror).
 - `external_tracker.pr_attached`
-- `external_tracker.pr_merge_close_succeeded` — Boss's explicit close
-  API call after a linked PR merge (Behavior 5).
-- `external_tracker.pr_merge_close_failed{reason=transient|permission|notfound}`
-- `external_tracker.close_deferred_rate_budget`
+- `external_tracker.pr_merge_close_succeeded` / `.pr_merge_close_failed`
+  (Behavior 5; a 404 on close counts as success)
 - `external_tracker.unbound`
-- `external_tracker.reverse_close_succeeded`
-- `external_tracker.reverse_close_failed`
+- `external_tracker.reverse_close_succeeded` / `.reverse_close_failed`
 - `external_tracker.skipped_closed_at_first_sight`
 - `external_tracker.skip_no_credential`
+- `external_tracker.in_progress_set_succeeded` / `.in_progress_set_failed`
+  (Behavior 6)
+- `external_tracker.tracked_label_attach_succeeded` / `.tracked_label_attach_failed`
+  (Behavior 7)
+- `external_tracker.title_body_synced` / `.title_body_conflict`
+  (Behavior 8)
 
-Cardinality is bounded by product count; no per-item labels.
+The planned `close_deferred_rate_budget` counter was never implemented
+(the close budget truncates silently). Cardinality is bounded by
+product count; no per-item labels.
 
 ---
 
@@ -1510,30 +1781,39 @@ Cardinality is bounded by product count; no per-item labels.
       │ sleep(interval)                                │            │
 ```
 
+_(Diagram shows the planned shape. As built there is no pass-level
+BEGIN TX/COMMIT — each WorkDb call manages its own connection — but the
+ordering it illustrates, all Boss-side SQL before any upstream write,
+holds. The post-commit phase also issues Behavior 6/7 writes and the
+closing-PR comment, omitted here.)_
+
 ---
 
 ## Risks and Open Questions
 
-**R1 — Auth fragility.** v1 inherits `gh auth status`. If the user is
-logged out, every bound product silently produces zero-update reconciles
-until a human notices. Mitigation: attention items on the product when
-credential resolution fails. _Open Q for review:_ should the engine
-surface a top-level "external tracker auth missing" banner in the macOS
-app, or is the per-product attention item enough?
+**R1 — Auth fragility.** Originally: v1 inherits `gh auth status`, so a
+logged-out user gets silent zero-update reconciles. This risk drove the
+biggest post-v1 change: the OAuth device-flow token (Q11) decouples sync
+auth from the user's `gh` login, and auth failures raise
+`external_tracker_auth_failed` / `external_tracker_token_revoked`
+attention items rendered as a dedicated sidebar banner in the macOS app
+(PR #673) — answering the open question here in favor of a top-level
+surface.
 
 **R2 — Rate limits at scale.** A user with 50 bound products at 120s
 cadence makes ~25 GraphQL requests/min ≈ 25 points/min, well under
 GitHub's 5000/hr GraphQL budget. But the design assumes one engine
 instance per user; a shared engine serving many users would multiply.
 Mitigation: v1 documents the assumption ("single-user engine"); a future
-fan-out engine would need shared rate-limit accounting.
+fan-out engine would need shared rate-limit accounting. _(As built,
+this headroom argument is the whole defense — the planned
+rate-limit-header backoff was dropped; see Q3.)_
 
-**R3 — Two truths on title/body.** v1 mirrors only on create; later
-upstream edits don't propagate. Users may complain "I fixed the issue
-title upstream and Boss still shows the old one." Mitigation: ship as
-documented; if it bites, add a `boss task resync-fields` verb later that
-re-pulls title/body on demand. Auto-resync is bidirectional-sync
-territory and out of scope.
+**R3 — Two truths on title/body.** This bit exactly as predicted: v1
+mirrored only on create, users hit "I fixed the title upstream and Boss
+still shows the old one," and the mitigation escalated past the sketched
+on-demand verb straight to automatic drift sync (Behavior 8, Q6) with
+checksum-based conflict detection. Resolved.
 
 **R4 — Reconciler silently breaks on schema changes.** GitHub's GraphQL
 projectV2 surface is in active development and has changed shape before.
@@ -1543,11 +1823,12 @@ metrics-based alert if `fetch_failed` ratio passes a threshold.
 
 **R5 — Reverse-close gone wrong.** A user enables reverse-close, marks
 ten Boss chores `done` to clean up local mess, and accidentally closes
-ten public GitHub issues. Mitigation: reverse-close stays off by default;
-the CLI prompt on enable surfaces the implication
-("This will close upstream GitHub issues when matching Boss work items
-are marked done. Proceed? [y/N]"); the engine logs every reverse-close
-with the actor.
+ten public GitHub issues. Mitigation: reverse-close stays off by
+default; the engine logs every reverse-close. _(The planned CLI
+confirmation prompt on enable — "This will close upstream GitHub
+issues… Proceed? [y/N]" — was never implemented;
+`set-external-tracker --reverse-close` flips the flag silently. The
+runbook documents the implication instead.)_
 
 **R6 — Re-bind ambiguity.** An upstream item that reappears after
 unbinding rebinds via the still-present `external_ref_canonical_id`. If
@@ -1580,15 +1861,17 @@ item that was imported, then immediately marked `done` by the user
 _before_ the next reconcile tick? The reverse-close handler will try to
 close upstream on the next tick. Correct behaviour, but the user might
 not realise their click closes a GitHub issue 90 seconds later.
-Mitigation: the CLI / UI on `boss task move <selector> --status done`
-notes "this product has reverse-close enabled — upstream issue
-`<canonical_id>` will be closed on the next sync."
+Planned mitigation: a warning on `boss task move --status done` when
+reverse-close is enabled. _(Not implemented — `run_move_leaf` has no
+reverse-close awareness. Accepted risk while reverse-close adoption is
+near-zero; revisit if the flag gets real use.)_
 
 **R9 — `created_via = 'external_tracker_sync'` accounting.** Chores
 created by the reconciler should be obviously machine-imported in the
-UI. Mitigation: the existing `created_via` column already supports this
-shape; the kanban renders a tiny "📡" badge on cards whose
-`created_via = 'external_tracker_sync'`.
+UI. The engine stamps `created_via = 'external_tracker_sync'` on every
+imported chore. _(The planned "📡" kanban badge consuming it was never
+built — no macOS code reads the value. The ↗ link affordance partially
+covers the need, since imported chores are by construction bound.)_
 
 **R10 — Stuck close-on-merge after persistent transient failure.** A
 merged PR linked to a Boss work item triggers a `close_issue` call that
@@ -1597,26 +1880,25 @@ side (`work_item.status = done`) but the upstream stays open. The next
 reconcile tick re-queues the call. This is the desired behavior, but if
 the failure persists for hours (e.g. extended GitHub Issues incident),
 the user sees a Boss work item that says `done` while the upstream issue
-is conspicuously still open. Mitigation: (a) the reconciler emits
-`external_tracker.pr_merge_close_failed{reason=transient}` per failed
-attempt — a rising counter is observable. (b) After N consecutive
-transient failures (default 10, ~20 minutes at the default 120s cadence),
-the reconciler surfaces an attention item on the product
-("Boss has been unable to close `<canonical_id>` after a merged PR.
-Last error: <classified-reason>. The Boss work item is already `done`;
-the upstream issue may be closed manually or Boss will retry
-indefinitely.") which clears once a tick succeeds or observes the
-upstream as `Closed`.
+is conspicuously still open. As built: the reconciler emits
+`external_tracker.pr_merge_close_failed` per failed attempt (a rising
+counter is observable) and retries every tick indefinitely. _(The
+planned escalation — an attention item after ~10 consecutive transient
+failures — was never implemented; no consecutive-failure counter
+exists. Partially compensated on a different path: transient **fetch**
+failures raise an `external_tracker_transient_errors` attention item on
+the first failure, which is stronger than designed.)_
 
 **R11 — Behavior 5 fires for a stale `pr_url`.** Suppose
 `work_item.pr_url` points at a PR that merged, was later force-pushed
-to revert, and re-opened. The merge poller now reports `merged = false`
-again. Behavior 5's trigger gates on `merged = true` from the _current_
-merge poller view, not on a frozen flag — so a re-opened PR un-triggers
-Behavior 5. If the upstream was already closed by an earlier Behavior 5
-firing, Boss does not re-open it. Re-opening is out of scope. Mitigation:
-documented; users who force-push-revert a merged PR should manually
-re-open the upstream issue.
+to revert, and re-opened. The design intended the trigger to gate on
+the _current_ merged state so a re-opened PR un-triggers Behavior 5.
+As built this holds for the primary arm (GitHub's association `merged`
+flag is current), but **not** for the retry arm, which queues a close
+for any `done`-with-`pr_url` row without a merged check (Q8). If the
+upstream was already closed by an earlier firing, Boss does not re-open
+it. Re-opening is out of scope; the retry-arm gap is flagged as a
+follow-up.
 
 **R12 — Worker authors a PR that doesn't reference the upstream issue
 in its body.** This is the directly addressed case from directive D1.
@@ -1625,32 +1907,53 @@ explicit close _does_ fire (it relies on the `pr_url` linkage on the
 work item, not on the PR body). The previous design pass got this
 wrong; the corrected design works regardless of PR body content.
 
-**Open Q1.** Should the reconciler emit an event on every reconcile pass
-even when nothing changed, so the kanban can show a "last refreshed"
-timestamp on the product? Tradeoff: per-tick chatter on a topic vs.
-on-demand RPC. v1 leans toward on-demand
-(`GetProductSyncStatus(product_id)`) plus an event only when something
-changes — matches the existing `work_item_changed` convention. Confirm
-with reviewer.
+**Open Q1 — resolved.** No per-pass event. As built: the on-demand sync
+RPC replies with an `ExternalTrackerSyncStarted` event (fire-and-forget
+acknowledgment), and the reconciler broadcasts work-item invalidations
+via `WorkInvalidationPublisher` only when something actually changed —
+matching the existing `work_item_changed` convention. There is no
+"last refreshed" product timestamp surface; `external_ref_synced_at`
+covers the per-item case.
 
-**Open Q2.** The unique partial index on
-`(external_ref_kind, external_ref_canonical_id) WHERE unbound_at IS NULL`
-prevents double-binding. SQLite supports partial indices since 3.8.0
-(2013), so this is safe. Confirm: any reason to prefer a CHECK constraint
-or application-level guard instead?
+**Open Q2 — resolved.** The unique partial index shipped in PR #570
+(with an additional `deleted_at IS NULL` clause). No CHECK constraint
+needed.
 
-**Open Q3.** `external_tracker_config` is JSON. The CLI presents typed
-flags (`--org`, `--repo`, `--project`); these get serialised to the JSON
-shape. Should we also support `--config-json '<raw json>'` for unusual
-configurations? Inclines toward yes (matches the precedent of
-`product set-default-model` which accepts the slug verbatim) but adds
-surface area for invalid configs. Default: no; add later if asked.
+**Open Q3 — resolved as designed.** Typed flags only; no
+`--config-json` escape hatch shipped, and nobody has asked.
 
 ---
 
-## Follow-up Implementation Chores (to enqueue once approved)
+## Implementation Record
 
-Bite-sized; each fits one worker session. Ordered roughly by dependency.
+The design was implemented as the bite-sized chores below, each one
+worker session. Delivery mapping:
+
+| Chore                                                    | Delivered by                                                         |
+| -------------------------------------------------------- | -------------------------------------------------------------------- |
+| 1. Schema migration                                      | PR #570                                                              |
+| 2. Protocol types + Swift mirror                         | PR #606                                                              |
+| 3. Trait + `TrackerRegistry` + `EchoTracker`             | PR #614                                                              |
+| 4–6. GitHub `fetch_items` / `fetch_item` / `close_issue` | PR #631                                                              |
+| 7. Credential resolver                                   | PR #631 (`gh auth status`); superseded by OAuth device flow (Q11)    |
+| 8. WorkDb external-ref methods                           | PR #616 (4 of 5; `touch_external_ref_synced_at` landed with #646)    |
+| 9. Reconciler core (`run_one_pass`)                      | PR #646                                                              |
+| 10. Spawn loop                                           | PR #658                                                              |
+| 11. CLI `set-external-tracker`                           | PR #627                                                              |
+| 12. CLI `sync-external-tracker`                          | PR #658                                                              |
+| 13. CLI link/unlink-external                             | PR #629                                                              |
+| 14. `product show` extension                             | PR #627                                                              |
+| 15. Kanban ↗ affordance                                  | PR #615 (model unit tests rather than the planned SwiftUI snapshots) |
+| 16. Attention items                                      | PR #660 (engine + Swift models); rendering in PR #673                |
+| 17. Reverse-close handler                                | PR #655                                                              |
+| 18. Runbook                                              | PR #659 (`docs/runbooks/external-tracker-sync.md`)                   |
+| 19–21. Webhook receiver / bulk link / Jira impl          | Not built (remain optional follow-ups)                               |
+
+Post-chore-list scope that shipped with no corresponding chore: OAuth
+device-flow auth (own design doc), Behaviors 6/7/8, the closing-PR
+comment, and the `TokenRevoked` error/attention path.
+
+Original chore list, kept for the acceptance criteria it recorded:
 
 1. **Schema migration** — add the seven new columns
    (`products.external_tracker_*`, `tasks.external_ref_*`) and the partial
@@ -1758,8 +2061,9 @@ link-external-bulk` with title-match heuristic and interactive
 
 ## Out of Scope
 
-- Bidirectional field sync (assignees, labels, comments, milestones,
-  body re-sync, title re-sync).
+- Bidirectional field sync (assignees, comments, milestones). _(Title/
+  body re-sync and one label write later moved in scope via Behaviors
+  8 and 7; see Overview.)_
 - Boss → GitHub issue _creation_. Boss work items created locally do not
   auto-spawn upstream issues. (Boss → GitHub issue _closing_ is in scope;
   see Behavior 5 and Behavior 3.)
