@@ -30,6 +30,7 @@ async fn set_then_show_then_unset_editorial_rules() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;
@@ -102,6 +103,7 @@ async fn editorial_test_produces_correct_decision() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;
@@ -166,6 +168,7 @@ async fn editorial_show_returns_empty_initially() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;

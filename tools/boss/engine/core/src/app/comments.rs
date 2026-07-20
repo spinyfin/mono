@@ -1256,6 +1256,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
         let comment = work_db
@@ -1411,6 +1412,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
         let chore = work_db
@@ -1620,6 +1622,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: docs_repo.map(str::to_owned),
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
         let investigation = work_db

@@ -3174,6 +3174,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     design_repo,
                     docs_repo,
                     worker_branch_prefix: args.worker_branch_prefix,
+                    merge_mechanism: None,
                 },
             )
             .await?;

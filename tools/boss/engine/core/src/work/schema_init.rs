@@ -125,7 +125,8 @@ impl WorkDb {
                 external_tracker_kind TEXT,
                 external_tracker_config TEXT,
                 design_repo TEXT,
-                worker_branch_prefix TEXT
+                worker_branch_prefix TEXT,
+                merge_mechanism TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -594,6 +595,9 @@ impl WorkDb {
         // every other table.
         // Design: tools/boss/docs/investigations/automation-duplicate-work-2026-07-14.md
         migrate_task_targets_table(conn)?;
+        // Per-product merge mechanism (`direct` | `trunk_queue`), schema/contract
+        // only — see trunk-merge-queue-integration-queue-backed-merges-merging-ui.md.
+        migrate_products_merge_mechanism(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

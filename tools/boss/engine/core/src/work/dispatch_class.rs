@@ -131,6 +131,7 @@ mod tests {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap()
         .id

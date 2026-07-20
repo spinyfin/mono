@@ -231,6 +231,7 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");

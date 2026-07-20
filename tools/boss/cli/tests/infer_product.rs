@@ -36,6 +36,7 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;
@@ -79,6 +80,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;
@@ -139,6 +141,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;
@@ -151,6 +154,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await?;

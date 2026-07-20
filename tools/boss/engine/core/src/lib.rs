@@ -66,6 +66,7 @@ pub mod live_status_loop;
 pub mod live_worker_state;
 pub mod lost_workspace_sweep;
 pub mod materializer;
+pub mod merge_mechanism;
 pub mod merge_parent_deletion;
 pub mod merge_poller;
 pub mod merge_when_ready;

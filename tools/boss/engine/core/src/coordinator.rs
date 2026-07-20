@@ -9144,6 +9144,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
         let chore = create_test_chore(&db, product.id.clone(), "Ensure Failure");
@@ -10308,6 +10309,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
 
@@ -10392,6 +10394,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
 
@@ -14837,6 +14840,7 @@ mod tests {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             })
             .unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";

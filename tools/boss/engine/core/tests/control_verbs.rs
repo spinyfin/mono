@@ -70,6 +70,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             },
         })
         .await?
@@ -788,6 +789,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             },
         })
         .await?
@@ -894,6 +896,7 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             },
         })
         .await?
@@ -981,6 +984,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             },
         })
         .await?
@@ -1218,6 +1222,7 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
                 design_repo: None,
                 docs_repo: None,
                 worker_branch_prefix: None,
+                merge_mechanism: None,
             },
         })
         .await?
@@ -1304,6 +1309,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
@@ -1412,6 +1418,7 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
@@ -1560,6 +1567,7 @@ async fn mark_ci_remediation_succeeded_via_rebase_pre_probe_guards() -> Result<(
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
@@ -1724,6 +1732,7 @@ async fn seed_and_claim_via_rebase(
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
@@ -1882,6 +1891,7 @@ async fn mark_ci_remediation_succeeded_via_rebase_rejects_merge_queue_rebounce()
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
@@ -2196,6 +2206,7 @@ async fn seed_two_conflict_resolutions(
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()

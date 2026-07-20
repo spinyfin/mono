@@ -76,6 +76,7 @@ pub fn create_test_product_with_repo(db: &WorkDb, name: &str, repo_remote_url: O
         design_repo: None,
         docs_repo: None,
         worker_branch_prefix: None,
+        merge_mechanism: None,
     })
     .unwrap()
 }

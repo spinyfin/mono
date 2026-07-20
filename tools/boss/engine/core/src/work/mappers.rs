@@ -65,6 +65,7 @@ pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
         default_driver: row.get::<_, Option<String>>(16)?.filter(|s| !s.is_empty()),
+        merge_mechanism: row.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty()),
     })
 }
 

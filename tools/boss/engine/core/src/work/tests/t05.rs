@@ -477,6 +477,7 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
             design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     // Project creation seeds a `kind = 'design'` task.
@@ -583,6 +584,7 @@ fn resolve_repo_task_override_wins_over_design_repo() {
             design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     let project = db
@@ -637,6 +639,7 @@ fn product_design_repo_set_and_clear() {
             design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     assert_eq!(
@@ -683,6 +686,7 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
             design_repo: None,
             docs_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
 
@@ -737,6 +741,7 @@ fn product_docs_repo_set_and_clear() {
             design_repo: None,
             docs_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     assert_eq!(

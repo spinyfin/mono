@@ -110,6 +110,7 @@ pub async fn create_product(client: &mut BossClient, name: &str) -> Result<Produ
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         },
     )
     .await

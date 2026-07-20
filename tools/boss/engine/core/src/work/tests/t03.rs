@@ -1624,6 +1624,7 @@ fn redispatch_preserves_investigation_execution_kind() {
             design_repo: None,
             docs_repo: Some("git@github.com:spinyfin/docs.git".to_owned()),
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     let investigation = db

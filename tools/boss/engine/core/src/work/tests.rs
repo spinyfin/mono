@@ -63,6 +63,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: worker_branch_prefix.map(str::to_owned),
+            merge_mechanism: None,
         })
         .unwrap();
     let project = db

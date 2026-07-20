@@ -40,6 +40,7 @@ fn creates_tree_and_soft_deletes_chores() {
             design_repo: None,
             docs_repo: None,
             worker_branch_prefix: None,
+            merge_mechanism: None,
         })
         .unwrap();
     let project = db
