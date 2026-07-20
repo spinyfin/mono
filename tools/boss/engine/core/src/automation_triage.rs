@@ -17,20 +17,32 @@
 //!   [`parse_triage_decision`] and finalises the matching `automation_runs`
 //!   row, rather than running PR detection.
 //!
-//! ## The marker protocol (design Risk #3)
+//! ## The marker protocol (design Risk #3) — and why it is not the primary signal
 //!
-//! The whole value of phase 1 hinges on the triage agent reliably emitting
-//! exactly one decision marker and **not** doing the work itself. The
-//! preamble states that contract, but [`parse_triage_decision`] does not
-//! enforce it strictly: the transcript it scans is every assistant turn
-//! joined together, so a marker-shaped line the agent narrated earlier (e.g.
-//! quoting the preamble's own example format) can precede the real,
-//! final decision. The parser resolves multiple marker lines to the last
-//! one rather than refusing to guess, since "last line wins" matches how a
-//! human reading the transcript top-to-bottom would resolve it. The
-//! transactional cap re-check at `boss task create --automation` (see
-//! [`crate::work::WorkDb::create_automation_task`]) is the backstop against
-//! a misbehaving agent fanning out.
+//! The design's original bet was that the triage agent would reliably emit
+//! *exactly one* decision marker and **not** do the work itself. In practice
+//! it does not: a 2026-07-20 coordinator audit found 0 of 67 recent
+//! `produced_task` finalizations contained a marker the parser accepted —
+//! every one was decided by
+//! [`crate::work::WorkDb::find_most_recent_open_task_for_automation`]'s
+//! DB-state recovery instead. This is not a parser bug (the parser accepts
+//! exactly the marker text the preamble instructs, see the
+//! `preamble_marker_examples_round_trip_through_the_validator` test below,
+//! and every known transcript-reading edge case — multi-turn concatenation,
+//! Stop-boundary flush races — already has a fix and regression test in
+//! `completion.rs`). It is that a single-shot agent asked to both
+//! investigate *and* end its very last line with an exact, bare, no-prose-
+//! after-it string essentially never complies literally, even when it
+//! reaches the right decision. So the contract has been inverted in
+//! practice: [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`]
+//! treats the DB-derived decision (a task actually created, or a final
+//! message that plainly concludes "nothing to do") as the primary signal,
+//! and the marker — when it *does* parse — as a same-answer fast-path
+//! override, not the thing recovery falls back to. The marker parser still
+//! enforces "exactly one"; the transactional cap re-check at
+//! `boss task create --automation` (see
+//! [`crate::work::WorkDb::create_automation_task`]) remains the backstop
+//! against a misbehaving agent fanning out.
 
 use std::sync::Arc;
 
@@ -926,6 +938,54 @@ mod tests {
         assert!(
             preamble.to_lowercase().contains("defer") || preamble.contains("later turn"),
             "preamble must warn against deferring intent to a later turn",
+        );
+    }
+
+    /// Round-trip check closing the loop the module doc describes: every
+    /// literal `automation: task`/`automation: skip` example line the
+    /// preamble shows the agent must itself parse cleanly, so a future edit
+    /// to either the preamble's wording or the validator's matching rules
+    /// can't silently drift the two apart again (the failure mode this test
+    /// would have caught immediately if it were the actual root cause of the
+    /// 0/67 marker rate — see the module doc).
+    #[test]
+    fn preamble_marker_examples_round_trip_through_the_validator() {
+        let automation = Automation::builder()
+            .id("auto_rt")
+            .short_id(9i64)
+            .product_id("prod_1")
+            .name("clippy sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("fix any clippy warnings")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build();
+        let preamble = render_triage_preamble(&automation, "My Product");
+
+        let marker_lines: Vec<&str> = preamble
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.to_lowercase().starts_with("automation:"))
+            .collect();
+        assert_eq!(
+            marker_lines.len(),
+            2,
+            "preamble must show exactly one task-marker example and one skip-marker \
+             example, found: {marker_lines:?}",
+        );
+
+        assert_eq!(
+            parse_triage_decision(marker_lines[0]),
+            TriageDecision::ProducedTask("T42".to_owned()),
+            "the preamble's own task-marker example must parse as the validator expects",
+        );
+        assert_eq!(
+            parse_triage_decision(marker_lines[1]),
+            TriageDecision::Skip("<one-line reason>".to_owned()),
+            "the preamble's own skip-marker example must parse as the validator expects",
         );
     }
 

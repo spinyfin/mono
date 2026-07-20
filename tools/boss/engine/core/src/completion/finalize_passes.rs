@@ -87,27 +87,38 @@ impl WorkerCompletionHandler {
                 // Build the base detail for the no-marker case (used when
                 // recovery fails or is inapplicable).
                 let base_detail = triage_no_decision_detail(&transcript);
-                // Recovery path: if the worker ran `boss task create --automation`
-                // but forgot to emit the decision marker (or emitted it in a turn
-                // the Stop hook raced past), the open-task record is the ground
-                // truth. Treat the most recently created open task as the
-                // produced outcome rather than recording `failed_will_retry`.
+                // Primary decision-derivation path: a valid marker is the
+                // exception, not the rule (2026-07-20 coordinator audit: 0/67
+                // recent `produced_task` finalizations found one), so this is
+                // not a rare "recovery" — it is how almost every triage run is
+                // actually decided. Derive the outcome from what the run
+                // provably did: if it called `boss task create --automation`,
+                // the open-task record is ground truth for that; if it didn't,
+                // but its own final words plainly concluded there is nothing
+                // to do, that conclusion stands in for the missing marker.
+                // Bounding the task lookup to tasks created no earlier than
+                // this execution started (`not_before_epoch`) keeps a task
+                // left open by an *earlier* run (e.g. stuck in review) from
+                // being misattributed to this one.
                 //
                 // Without this, every retry creates another task until the
                 // open-task cap fills, then loops as `failed_will_retry` forever
                 // — the exact "Fix compilation warnings: at limit 3/3" wedge in
                 // the field evidence.
-                match self.work_db.find_most_recent_open_task_for_automation(&automation_id) {
+                match self
+                    .work_db
+                    .find_most_recent_open_task_for_automation(&automation_id, execution.created_epoch())
+                {
                     Ok(Some(task)) => {
-                        tracing::warn!(
+                        tracing::info!(
                             execution_id = %execution.id,
                             automation_id = %automation_id,
                             recovered_task_id = %task.id,
                             base_detail,
                             "triage run ended without a valid decision marker but \
-                             found an open task produced by this automation; \
-                             recording as produced_task (marker-recovery path \
-                             prevents duplicate tasks on retry)",
+                             found an open task produced by this run; recording as \
+                             produced_task (marker-recovery is the primary decision \
+                             path — see find_most_recent_open_task_for_automation)",
                         );
                         (
                             AUTOMATION_OUTCOME_PRODUCED_TASK,
@@ -128,13 +139,13 @@ impl WorkerCompletionHandler {
                         // `failed_will_retry` forever, re-running a full session
                         // to re-prove an already-clean repo.
                         Some(reason) => {
-                            tracing::warn!(
+                            tracing::info!(
                                 execution_id = %execution.id,
                                 automation_id = %automation_id,
                                 base_detail,
                                 "triage run created no task and emitted no skip marker, but its \
                                  final message plainly concluded there is nothing to do; recording \
-                                 as skipped (skip marker-recovery) instead of failed_will_retry",
+                                 as skipped (skip marker-recovery is the primary decision path)",
                             );
                             (
                                 AUTOMATION_OUTCOME_SKIPPED,
@@ -145,7 +156,22 @@ impl WorkerCompletionHandler {
                                 )),
                             )
                         }
-                        None => (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail)),
+                        // Neither a task nor a recoverable skip conclusion: a
+                        // genuine failure, distinct from the two paths above —
+                        // this is the only case that should still read as
+                        // `failed_will_retry` / "Failed (retrying)" to an
+                        // operator.
+                        None => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                automation_id = %automation_id,
+                                base_detail,
+                                "triage run ended with no valid decision marker, no task \
+                                 created, and no recoverable skip conclusion; recording as \
+                                 failed_will_retry (genuine failure, not marker-recovery)",
+                            );
+                            (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail))
+                        }
                     },
                     Err(err) => {
                         tracing::warn!(
