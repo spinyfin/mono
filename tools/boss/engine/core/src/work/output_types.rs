@@ -211,3 +211,40 @@ pub struct StrandedCiRemediationAttempt {
     pub product_id: String,
     pub pr_url: String,
 }
+
+/// One task an automation is already tracking, as shown to its triage
+/// agent in [`crate::automation_triage::render_triage_preamble`].
+///
+/// Deliberately minimal: the agent needs to recognise "I was about to
+/// file this" and cite the existing row, nothing more. Full task bodies
+/// would crowd out the standing instruction the agent is there to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomationSiblingTask {
+    /// Friendly `T<n>` number — what the agent cites in its skip marker.
+    pub short_id: i64,
+    pub name: String,
+    /// Raw status string (`todo`, `active`, `in_review`, `done`, …), so
+    /// the agent can tell "someone is on it" from "this was fixed and
+    /// has come back".
+    pub status: String,
+    /// Present once a worker has opened a PR — the strongest signal that
+    /// the finding is genuinely in hand.
+    pub pr_url: Option<String>,
+}
+
+/// One row from `automation_dedup_suppressions`: a task the dedup gate
+/// refused to create because an open sibling already tracked the finding.
+///
+/// The gate's effect is an absence, which is exactly what an operator
+/// cannot see. This is how "why has A3 filed nothing all week?" gets an
+/// answer, and how over-suppression would be caught — a burst of rows all
+/// pointing at one surviving task, matched on `normalized_title`, is the
+/// shape of a gate that has become too eager.
+///
+/// Defined in `boss_protocol` (not here) so it can travel over the wire as
+/// a `ListAutomationDedupSuppressions` / `AutomationDedupSuppressionsList`
+/// request/event pair, exactly like [`boss_protocol::AutomationRun`]. Built
+/// by the mapper in `work/automations.rs`, which sets every column
+/// explicitly from a struct literal so an unmapped new column is a compile
+/// error.
+pub use boss_protocol::AutomationDedupSuppression;

@@ -242,6 +242,31 @@ pub(super) async fn handle_list_automation_runs(ctx: Dispatch, req: FrontendRequ
     }
 }
 
+pub(super) async fn handle_list_automation_dedup_suppressions(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListAutomationDedupSuppressions { automation_id } = req else {
+        unreachable!()
+    };
+    {
+        match work_db.list_automation_dedup_suppressions(&automation_id) {
+            Ok(suppressions) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::AutomationDedupSuppressionsList {
+                    automation_id,
+                    suppressions,
+                },
+            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
+        }
+    }
+}
+
 pub(super) async fn handle_list_automation_tasks(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

@@ -20,11 +20,17 @@
 //! ## The marker protocol (design Risk #3)
 //!
 //! The whole value of phase 1 hinges on the triage agent reliably emitting
-//! *exactly one* decision marker and **not** doing the work itself. The
-//! preamble states the contract; the marker parser enforces "exactly one";
-//! and the transactional cap re-check at `boss task create --automation`
-//! (see [`crate::work::WorkDb::create_automation_task`]) is the backstop
-//! against a misbehaving agent fanning out.
+//! exactly one decision marker and **not** doing the work itself. The
+//! preamble states that contract, but [`parse_triage_decision`] does not
+//! enforce it strictly: the transcript it scans is every assistant turn
+//! joined together, so a marker-shaped line the agent narrated earlier (e.g.
+//! quoting the preamble's own example format) can precede the real,
+//! final decision. The parser resolves multiple marker lines to the last
+//! one rather than refusing to guess, since "last line wins" matches how a
+//! human reading the transcript top-to-bottom would resolve it. The
+//! transactional cap re-check at `boss task create --automation` (see
+//! [`crate::work::WorkDb::create_automation_task`]) is the backstop against
+//! a misbehaving agent fanning out.
 
 use std::sync::Arc;
 
@@ -48,9 +54,6 @@ pub enum TriageDecision {
     /// reached a decision. Treated as a transient/ambiguous failure (the run
     /// is left `failed_will_retry`), never as a skip.
     NoDecision,
-    /// More than one marker line — the contract was violated. Treated like
-    /// `NoDecision`: we refuse to guess which decision the agent meant.
-    Ambiguous(usize),
 }
 
 /// Compose the per-automation triage preamble (design §"Phase 1 — Triage").
@@ -59,7 +62,24 @@ pub enum TriageDecision {
 /// `--automation` selector embedded in the create command is the **canonical**
 /// automation id so the agent's `boss task create` resolves unambiguously
 /// without needing a `--product` flag.
-pub fn render_triage_preamble(automation: &Automation, product_name: &str) -> String {
+///
+/// `siblings` is what this automation is already tracking (open tasks plus
+/// recently-resolved ones — see
+/// [`crate::work::WorkDb::list_automation_sibling_tasks`]). Without it a
+/// triage agent has no way to know a sibling row exists: it is spawned
+/// fresh on every fire against the same instruction and the same repo, so
+/// it re-derives the same finding and files it again, in slightly
+/// different words each time. That is the mechanism behind every audited
+/// duplicate cluster. The hard gate in
+/// [`crate::work::WorkDb::create_automation_task`] is the backstop; this
+/// list is what lets the agent make the right call on its own — and, when
+/// it does, skip with a citation instead of burning a worker on a
+/// duplicate that then has to be closed by hand.
+pub fn render_triage_preamble(
+    automation: &Automation,
+    product_name: &str,
+    siblings: &[crate::work::AutomationSiblingTask],
+) -> String {
     let a_id = automation
         .short_id
         .map(|n| format!("A{n}"))
@@ -78,6 +98,7 @@ instruction **right now** in this repository. Investigate the repo with a few \
 targeted, read-only checks (keep it lightweight — see below) to make that call. \
 You are explicitly allowed to conclude that nothing appropriate \
 exists — that is a normal, expected outcome on most runs.\n\n\
+{already_tracked}\
 ## You MUST end this run with exactly one decision marker\n\n\
 Your final message must end with **exactly one** of these two lines, and nothing \
 after it:\n\n\
@@ -133,8 +154,61 @@ is NOT a skip.\n",
         a_id = a_id,
         product_name = product_name,
         instruction = automation.standing_instruction.trim(),
+        already_tracked = render_already_tracked_section(siblings),
         create_cmd = create_cmd,
     )
+}
+
+/// Render the "already tracked" block, or the empty string when this
+/// automation has no siblings to report.
+///
+/// Empty is the common case on a healthy automation, and an empty section
+/// would be worse than none: "Already tracked: (none)" reads as licence to
+/// file, which is not the nudge this is for.
+fn render_already_tracked_section(siblings: &[crate::work::AutomationSiblingTask]) -> String {
+    if siblings.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from(
+        "## Already tracked by this automation — check before filing\n\n\
+         These tasks were filed by **this** automation and are either still open or \
+were resolved in the last few days. You are a fresh session with no memory of the \
+runs that filed them:\n\n",
+    );
+    for sibling in siblings {
+        let pr = sibling
+            .pr_url
+            .as_deref()
+            .map(|url| format!(" — {url}"))
+            .unwrap_or_default();
+        section.push_str(&format!(
+            "- **T{}** [{}] {}{}\n",
+            sibling.short_id, sibling.status, sibling.name, pr
+        ));
+    }
+    section.push_str(
+        "\n\
+        **If the work you are about to file is already one of these, do NOT file it \
+again** — even if you would word the title differently, and even if the existing \
+task is only partly done. Re-filing is the single most expensive failure mode here: \
+it dispatches a second worker onto work already in progress, produces a competing \
+PR, and leaves a human to untangle which one to keep. End the run with:\n\n\
+        ```\n  automation: skip — already tracked as T<n>\n  ```\n\n\
+        Judgement calls:\n\n\
+        - **Same file or module, different angle** (\"split it\" vs \"add tests to \
+it\") — treat as already tracked and skip. The open task's worker is in that file \
+already.\n\
+        - **Resolved days ago and the problem is plainly back** — filing again is \
+correct. Say so in the description, and reference the earlier task.\n\
+        - **Genuinely different target** (a different file, a different crate) — \
+file it. This list is not a cap; distinct findings are exactly what this automation \
+is for.\n\n\
+        A task creation that collides with an open sibling is rejected outright by \
+the engine, so filing a duplicate does not even succeed — it just costs you the \
+run.\n\n",
+    );
+    section
 }
 
 /// Render the CLAUDE.md for a triage worker ([`crate::worker_setup::WorkerKind::Triage`]).
@@ -248,23 +322,34 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
 /// Parse the triage agent's final assistant message into a [`TriageDecision`].
 ///
 /// Scans every line for a decision marker (`automation: task <id>` /
-/// `automation: skip — <reason>`) and enforces the "exactly one" contract:
+/// `automation: skip — <reason>`) and resolves to the **last** one found:
 ///
-/// - exactly one valid marker → that decision,
-/// - zero markers → [`TriageDecision::NoDecision`],
-/// - two or more markers → [`TriageDecision::Ambiguous`].
+/// - one or more markers → the last marker, in line order,
+/// - zero markers → [`TriageDecision::NoDecision`].
+///
+/// The caller (`read_final_triage_message`) joins every assistant turn in the
+/// transcript before handing it here, because the real decision marker can
+/// land in a turn after the `boss task create` tool call. That join means a
+/// marker-shaped line the agent narrated earlier — quoting the format while
+/// explaining what it's about to do, or an "already tracked" preamble
+/// example — can appear before the actual decision. Taking the last marker
+/// rather than requiring exactly one avoids reading that kind of narration
+/// as ambiguity: the agent's real, final decision is always the one closest
+/// to the end of its transcript. A single turn that itself contains two
+/// contradictory markers is vanishingly rare next to the narration case, and
+/// still resolves deterministically (last wins) rather than falling back to
+/// the no-marker retry path.
 ///
 /// Matching is lenient on case and on the skip separator (em-dash `—`, hyphen
 /// `-`, or colon `:` all accepted) but strict on the `automation:` prefix and
 /// on the `task` / `skip` keyword having a word boundary, so prose that merely
 /// *mentions* the protocol does not trip it.
 pub fn parse_triage_decision(final_message: &str) -> TriageDecision {
-    let markers: Vec<TriageDecision> = final_message.lines().filter_map(parse_marker_line).collect();
-    match markers.len() {
-        0 => TriageDecision::NoDecision,
-        1 => markers.into_iter().next().unwrap(),
-        n => TriageDecision::Ambiguous(n),
-    }
+    final_message
+        .lines()
+        .rev()
+        .find_map(parse_marker_line)
+        .unwrap_or(TriageDecision::NoDecision)
 }
 
 /// Parse a single line into a marker, or `None` if it is not one. A `task`
@@ -452,10 +537,31 @@ mod tests {
         );
     }
 
+    /// A multi-turn transcript can carry a narrated marker example ahead of
+    /// the agent's real, final decision — `read_final_triage_message` joins
+    /// every assistant turn, so this is the realistic shape, not a
+    /// same-turn contradiction. The last marker wins.
     #[test]
-    fn two_markers_is_ambiguous() {
+    fn two_markers_resolves_to_the_last_one() {
         let msg = "automation: task T1\nautomation: skip — changed my mind";
-        assert_eq!(parse_triage_decision(msg), TriageDecision::Ambiguous(2));
+        assert_eq!(
+            parse_triage_decision(msg),
+            TriageDecision::Skip("changed my mind".to_owned())
+        );
+    }
+
+    /// The "Already tracked" preamble example line
+    /// (`automation: skip — already tracked as T<n>`) is itself
+    /// marker-shaped; if the agent quotes it while narrating and then emits
+    /// its real decision afterward, the real decision must still win.
+    #[test]
+    fn narrated_marker_example_does_not_shadow_the_real_decision() {
+        let msg = "automation: skip — already tracked as T<n>\n\
+                   automation: task T9";
+        assert_eq!(
+            parse_triage_decision(msg),
+            TriageDecision::ProducedTask("T9".to_owned())
+        );
     }
 
     #[test]
@@ -594,7 +700,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product");
+        let preamble = render_triage_preamble(&automation, "My Product", &[]);
         let lower = preamble.to_lowercase();
         // Decide-then-stop.
         assert!(
@@ -642,7 +748,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product");
+        let preamble = render_triage_preamble(&automation, "My Product", &[]);
         // Must explicitly name the Agent tool and explain the hang risk.
         assert!(
             preamble.contains("Agent"),
@@ -681,7 +787,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product");
+        let preamble = render_triage_preamble(&automation, "My Product", &[]);
         assert!(preamble.contains("triage"));
         assert!(preamble.contains("A3"));
         assert!(preamble.contains("My Product"));
@@ -755,5 +861,98 @@ mod tests {
             TriageDecision::ProducedTask("T1330".to_owned()),
             "concatenating all turns finds the marker in the post-tool turn"
         );
+    }
+
+    fn sibling(short_id: i64, name: &str, status: &str, pr_url: Option<&str>) -> crate::work::AutomationSiblingTask {
+        crate::work::AutomationSiblingTask {
+            short_id,
+            name: name.to_owned(),
+            status: status.to_owned(),
+            pr_url: pr_url.map(str::to_owned),
+        }
+    }
+
+    fn dedup_automation() -> Automation {
+        Automation::builder()
+            .id("auto_dd")
+            .short_id(7i64)
+            .product_id("prod_1")
+            .name("file size sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("split any file over the size limit")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build()
+    }
+
+    /// The whole point of the section: a memory-less triage agent must be
+    /// able to see what it already filed, by id, status, and PR.
+    #[test]
+    fn preamble_lists_already_tracked_tasks() {
+        let siblings = [
+            sibling(101, "Split engine/core/src/app.rs", "active", None),
+            sibling(
+                102,
+                "Extract pr_review into its own crate",
+                "in_review",
+                Some("https://github.com/spinyfin/mono/pull/9001"),
+            ),
+        ];
+        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings);
+
+        assert!(preamble.contains("Already tracked"), "section heading missing");
+        assert!(preamble.contains("T101"), "must cite each sibling by friendly id");
+        assert!(preamble.contains("T102"));
+        assert!(
+            preamble.contains("Split engine/core/src/app.rs"),
+            "titles must be shown"
+        );
+        assert!(preamble.contains("[active]"), "status tells the agent someone is on it");
+        assert!(
+            preamble.contains("https://github.com/spinyfin/mono/pull/9001"),
+            "a PR url is the strongest in-hand signal and must be shown",
+        );
+        // The instruction that turns the list into a decision.
+        assert!(
+            preamble.contains("do NOT file it again"),
+            "the list is useless without the instruction not to re-file",
+        );
+        assert!(
+            preamble.contains("automation: skip — already tracked as T<n>"),
+            "must show the exact marker to emit instead of re-filing",
+        );
+    }
+
+    /// The section must still leave room for genuinely new findings — this
+    /// is a dedup nudge, not a cap.
+    #[test]
+    fn preamble_still_permits_distinct_findings() {
+        let siblings = [sibling(101, "Split engine/core/src/app.rs", "active", None)];
+        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings);
+        assert!(
+            preamble.contains("Genuinely different target"),
+            "must tell the agent that a different file/crate is still fileable",
+        );
+        assert!(
+            preamble.contains("not a cap"),
+            "must say explicitly that the list does not cap what can be filed",
+        );
+    }
+
+    /// No siblings means no section at all. "Already tracked: (none)" would
+    /// read as licence to file, which is the opposite of the intent.
+    #[test]
+    fn preamble_omits_the_section_when_nothing_is_tracked() {
+        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &[]);
+        assert!(
+            !preamble.contains("Already tracked"),
+            "an empty sibling list must render no section",
+        );
+        // The rest of the contract is unaffected.
+        assert!(preamble.contains("automation: skip"));
+        assert!(preamble.contains("A7"));
     }
 }

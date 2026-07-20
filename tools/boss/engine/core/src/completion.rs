@@ -2455,16 +2455,10 @@ must not be asked to open one",
                 };
                 (AUTOMATION_OUTCOME_SKIPPED, None, Some(reason))
             }
-            TriageDecision::NoDecision | TriageDecision::Ambiguous(_) => {
+            TriageDecision::NoDecision => {
                 // Build the base detail for the no-marker case (used when
                 // recovery fails or is inapplicable).
-                let base_detail = match &decision {
-                    TriageDecision::NoDecision => triage_no_decision_detail(&transcript),
-                    TriageDecision::Ambiguous(n) => {
-                        format!("triage emitted {n} decision markers; expected exactly one")
-                    }
-                    _ => unreachable!(),
-                };
+                let base_detail = triage_no_decision_detail(&transcript);
                 // Recovery path: if the worker ran `boss task create --automation`
                 // but forgot to emit the decision marker (or emitted it in a turn
                 // the Stop hook raced past), the open-task record is the ground
@@ -6591,8 +6585,7 @@ const SKIP_RECOVERY_NO_WORK_SIGNALS: &[&str] = &[
 /// Deliberately conservative — a *false* skip merely defers to the automation's
 /// next scheduled fire (cheap), whereas a false `failed_will_retry` re-runs a
 /// whole session. It fires ONLY when:
-/// - the decision is [`TriageDecision::NoDecision`] (not `Ambiguous`: two
-///   markers is a real contract violation, not a forgotten marker), and
+/// - the decision is [`TriageDecision::NoDecision`], and
 /// - a final assistant message exists (not a `NoPath`/`Unreadable`/no-prose
 ///   state — there is nothing to conclude from), and
 /// - the *tail* of that message affirmatively concludes "no work" AND shows no
@@ -6790,11 +6783,6 @@ mod tests {
         // No affirmative no-work signal → no recovery (ambiguous silence, not a skip).
         let vague = TriageTranscript::FinalMessage("I looked around the repository.".to_owned());
         assert_eq!(recover_skip_reason(&TriageDecision::NoDecision, &vague), None);
-
-        // Ambiguous (two markers) is a real contract violation, never skip-recovered
-        // even if the surrounding prose reads clean.
-        let clean2 = TriageTranscript::FinalMessage("no warnings anywhere; the repo is clean".to_owned());
-        assert_eq!(recover_skip_reason(&TriageDecision::Ambiguous(2), &clean2), None);
 
         // Non-FinalMessage transcript states carry no prose to conclude from.
         assert_eq!(

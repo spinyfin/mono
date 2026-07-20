@@ -38,6 +38,7 @@ rust_library(
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/claude_client",
+        "//tools/boss/engine/automation-dedup",
         "//tools/boss/engine/automation-schedule",
         "//tools/boss/engine/ci-log-reader",
         "//tools/boss/engine/conflict-diagnosis",

@@ -1145,6 +1145,11 @@ pub enum FrontendEvent {
         automation_id: String,
         runs: Vec<AutomationRun>,
     },
+    /// Response to [`FrontendRequest::ListAutomationDedupSuppressions`].
+    AutomationDedupSuppressionsList {
+        automation_id: String,
+        suppressions: Vec<AutomationDedupSuppression>,
+    },
     /// Response to [`FrontendRequest::ListAutomationTasks`].
     AutomationTasksList {
         automation_id: String,

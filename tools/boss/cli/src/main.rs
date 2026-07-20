@@ -7,17 +7,17 @@ use boss_client::{
     BossClient, Discovery, engine_socket_reachable, ensure_engine_running, running_engine_pid, stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
-    CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictHotspotReport, ConflictResolution, CreateAttentionInput,
-    CreateAutomationInput, CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge,
-    DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry,
-    ExecutionKind, FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    OrgAuthState, PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
-    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
-    WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationDedupSuppression, AutomationPatch,
+    AutomationRun, AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictHotspotReport,
+    ConflictResolution, CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules,
+    EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FrontendEvent, FrontendRequest,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun,
+    PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    Task, TaskRuntime, UnpopulatePreservedTask, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Table};
@@ -697,6 +697,11 @@ enum AutomationCommand {
     Runs(AutomationSelectorArgs),
     /// List the tasks produced by an automation and their current status.
     Tasks(AutomationSelectorArgs),
+    /// List the dedup gate's suppression trace for an automation — every
+    /// candidate task it refused to create because an open sibling already
+    /// tracked the finding. Answers "why has this automation filed nothing
+    /// in a while?".
+    Suppressions(AutomationSelectorArgs),
 }
 
 /// Subcommands under `boss attention …`.
@@ -4670,6 +4675,20 @@ async fn list_automation_runs(client: &mut BossClient, automation_id: &str) -> R
     )
 }
 
+async fn list_automation_dedup_suppressions(
+    client: &mut BossClient,
+    automation_id: &str,
+) -> Result<Vec<AutomationDedupSuppression>, CliError> {
+    rpc_call!(
+        client,
+        FrontendRequest::ListAutomationDedupSuppressions {
+            automation_id: automation_id.to_owned(),
+        },
+        "automation suppressions",
+        FrontendEvent::AutomationDedupSuppressionsList { suppressions, .. } => suppressions,
+    )
+}
+
 async fn list_automation_tasks(client: &mut BossClient, automation_id: &str) -> Result<Vec<Task>, CliError> {
     rpc_call!(
         client,
@@ -4822,6 +4841,20 @@ fn print_automation_runs_table(runs: &[AutomationRun]) {
             r.started_at.as_str(),
             produced,
             detail,
+        ]);
+    }
+    print_table(table);
+}
+
+fn print_automation_dedup_suppressions_table(suppressions: &[AutomationDedupSuppression]) {
+    let mut table = new_dynamic_table(["ATTEMPTED", "MATCHED ON", "MATCH KEY", "SURVIVING TASK", "CREATED"]);
+    for s in suppressions {
+        table.add_row([
+            s.attempted_name.as_str(),
+            s.matched_on.as_str(),
+            s.match_key.as_str(),
+            s.surviving_task_id.as_str(),
+            s.created_at.as_str(),
         ]);
     }
     print_table(table);
@@ -5114,6 +5147,19 @@ async fn run_automation_command(command: AutomationCommand, ctx: &RunContext) ->
                     println!("No tasks produced by automation {}.", automation.id);
                 } else {
                     print_tasks_table(&tasks, false);
+                }
+            })
+        }
+
+        AutomationCommand::Suppressions(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let suppressions = list_automation_dedup_suppressions(&mut client, &automation.id).await?;
+            print_entity(ctx, &serde_json::json!({ "suppressions": suppressions }), || {
+                if suppressions.is_empty() {
+                    println!("No suppressions recorded for automation {}.", automation.id);
+                } else {
+                    print_automation_dedup_suppressions_table(&suppressions);
                 }
             })
         }
@@ -12335,6 +12381,17 @@ mod tests {
             cli_tasks.command,
             Commands::Automation {
                 command: AutomationCommand::Tasks(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_automation_suppressions_command() {
+        let cli = Cli::parse_from(["boss", "automation", "suppressions", "A1", "--product", "boss"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Automation {
+                command: AutomationCommand::Suppressions(_)
             }
         ));
     }

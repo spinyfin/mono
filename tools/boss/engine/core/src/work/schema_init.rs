@@ -583,6 +583,11 @@ impl WorkDb {
         // agent lands; the actor-boothby capture in the mutation layer
         // is inert until a caller passes `LAST_STATUS_ACTOR_BOOTHBY`.
         migrate_boothby_tables(conn)?;
+        // Automation dedup gate: `automation_dedup_suppressions`, the
+        // append-only trace of tasks the gate refused to create because an
+        // open sibling of the same automation already tracks the finding.
+        // Independent of every other table and additive-only.
+        migrate_automation_dedup_suppressions_table(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '26')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

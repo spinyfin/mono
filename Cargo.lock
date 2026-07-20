@@ -349,6 +349,7 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-deterministic-resolvers",
  "boss-editorial",
+ "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
  "boss-engine-day-rotated-log",
  "boss-engine-driver",
@@ -389,6 +390,10 @@ dependencies = [
  "tracing-subscriber",
  "wiremock",
 ]
+
+[[package]]
+name = "boss-engine-automation-dedup"
+version = "0.1.0"
 
 [[package]]
 name = "boss-engine-automation-schedule"

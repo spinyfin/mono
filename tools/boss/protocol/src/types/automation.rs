@@ -241,3 +241,26 @@ pub struct CreateAutomationInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
 }
+
+/// One recorded refusal from the automation dedup gate — the wire shape of
+/// an `automation_dedup_suppressions` row. Written every time
+/// `create_automation_task` refuses a candidate as a duplicate of an open
+/// sibling, so an operator asking "why has this automation filed nothing
+/// all week?" has a trail to read instead of just an absence.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AutomationDedupSuppression {
+    pub automation_id: String,
+    /// The task that survived and still tracks the finding.
+    pub surviving_task_id: String,
+    /// Title the triage agent tried to file, kept verbatim so a human can
+    /// judge whether the two really were the same work.
+    pub attempted_name: String,
+    /// Which signal fired: `file_target`, `module_target`, or
+    /// `normalized_title`.
+    pub matched_on: String,
+    /// The shared value that fired it.
+    pub match_key: String,
+    /// UTC epoch seconds, as a string (schema-wide convention).
+    pub created_at: String,
+}

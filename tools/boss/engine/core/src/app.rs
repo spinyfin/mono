@@ -2402,6 +2402,9 @@ async fn handle_frontend_connection(
                 attentions::handle_list_attention_items_for_work_item(ctx, r).await
             }
             r @ FrontendRequest::ListAttentionMerges { .. } => attentions::handle_list_attention_merges(ctx, r).await,
+            r @ FrontendRequest::ListAutomationDedupSuppressions { .. } => {
+                automations::handle_list_automation_dedup_suppressions(ctx, r).await
+            }
             r @ FrontendRequest::ListAutomationRuns { .. } => automations::handle_list_automation_runs(ctx, r).await,
             r @ FrontendRequest::ListAutomations { .. } => automations::handle_list_automations(ctx, r).await,
             r @ FrontendRequest::ListAutomationTasks { .. } => automations::handle_list_automation_tasks(ctx, r).await,
