@@ -569,6 +569,19 @@ final class ChatViewModel: ObservableObject {
         engine.sendGetEngineHealth()
     }
 
+    /// User-initiated resume from the `dispatch_paused` health-banner
+    /// issue. Drives the same `SetDispatchPaused { paused: false }`
+    /// RPC `bossctl dispatch resume` uses; the engine owns the actual
+    /// state change, this is a thin trigger. The engine has no push
+    /// event for a health-state change, so this re-polls
+    /// `get_engine_health` right behind the resume request (requests
+    /// on one socket are processed in order) so the banner clears
+    /// without waiting for the next reconnect.
+    func resumeDispatch() {
+        engine.sendSetDispatchPaused(paused: false)
+        engine.sendGetEngineHealth()
+    }
+
     /// Toggle one per-installation setting. Optimistically patches the
     /// cached snapshot so the UI feels instantaneous; the engine's
     /// `setting_set` echo reconciles state once the on-disk write

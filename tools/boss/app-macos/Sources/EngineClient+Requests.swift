@@ -47,6 +47,14 @@ extension EngineClient {
         sendLine(["type": "get_engine_health"])
     }
 
+    /// Pause or resume global dispatch — the same `SetDispatchPaused`
+    /// RPC `bossctl dispatch resume` drives. Replies with
+    /// `FrontendEvent::DispatchStateResult`; the caller re-polls
+    /// engine health afterward to clear the paused banner.
+    func sendSetDispatchPaused(paused: Bool) {
+        sendLine(["type": "set_dispatch_paused", "paused": paused])
+    }
+
     /// Set one per-installation setting. Engine persists to
     /// `settings.toml` and replies with `setting_set` once the
     /// in-memory store is updated.
