@@ -56,6 +56,20 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 /// which bypasses the guard entirely since it only lives in the sweeps).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
+/// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
+/// when a dispatch timeline sits stuck in one stage past
+/// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`]. The
+/// underlying `stage_stalled` dispatch event (`dispatch_events.rs`) is
+/// deliberately write-only telemetry with no alert behind it; this kind
+/// escalates a *persistent* stall (minutes, not the ~30-120s per-stage
+/// thresholds that drive `stage_stalled` itself) onto the operator-visible
+/// attention surface. Resolved the next time the execution successfully
+/// claims a worker slot (`Coordinator::dispatch_claimed_execution`) —
+/// mirrors how [`CHURN_GUARD_PARKED_ATTENTION_KIND`] resolves on the work
+/// item's next successful dispatch attempt rather than being proactively
+/// cleared by the sweep that raised it.
+pub const DISPATCH_STAGE_STALLED_ATTENTION_KIND: &str = "dispatch_stage_stalled";
+
 /// Attention-item `kind` raised when the engine stops auto-resuming a
 /// worker because its Claude API error is non-retryable (permanent or
 /// unrecognised). See [`crate::transient_recovery`].

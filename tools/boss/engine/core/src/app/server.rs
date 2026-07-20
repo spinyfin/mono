@@ -1277,6 +1277,19 @@ pub async fn serve_with_merge_probe(
         Duration::from_secs(15),
     );
 
+    // Persistent-stall escalation: on a slower cadence than the detector
+    // above, re-scan the same per-execution dispatch.jsonl mirrors for
+    // stages stuck past a much larger threshold and file a durable
+    // `dispatch_stage_stalled` attention item — the `stage_stalled` event
+    // above is write-only telemetry with nothing surfacing it to an
+    // operator. See `dispatch_stall_escalation.rs`.
+    let _dispatch_stall_escalation_handle = crate::dispatch_stall_escalation::spawn_loop(
+        server_state.dispatch_event_root.clone(),
+        server_state.work_db.clone(),
+        crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD,
+        crate::dispatch_stall_escalation::DEFAULT_INTERVAL,
+    );
+
     // Periodic metrics flush — snapshots the in-memory counter /
     // gauge registry into `state.db` every 30s so monotonic totals
     // survive engine restarts (see

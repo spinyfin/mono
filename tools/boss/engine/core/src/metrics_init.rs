@@ -39,6 +39,9 @@ pub fn init_all(registry: &Registry) {
     crate::speculative_conflict::init(registry);
     // Layer 4 / T11: stacked-PR auto-structuring offer counters.
     crate::stacked_pr_structuring::init(registry);
+    // Queue-level dispatch telemetry: per-pool depth/oldest-wait gauges,
+    // dispatch-completed counter, drain-pass-duration gauge.
+    crate::dispatch_metrics::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -136,18 +139,32 @@ mod tests {
             names.contains(&"stacked_pr_structuring.offered".to_owned()),
             "init_all must register stacked_pr_structuring.offered"
         );
+        // Queue-level dispatch telemetry: dispatch-completed counter.
+        assert!(
+            names.contains(&"dispatch.completed".to_owned()),
+            "init_all must register dispatch.completed"
+        );
         assert_eq!(
             names.len(),
-            48,
+            49,
             "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
-             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring counters"
+             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring + 1 dispatch_metrics counters"
         );
-        // Phase 3: dep_unblock gauge.
+        // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
         assert_eq!(
             gauge_names,
-            vec!["dependency_unblock.longest_stale_seconds"],
-            "init_all must register the dep_unblock gauge",
+            vec![
+                "dependency_unblock.longest_stale_seconds",
+                "dispatch.drain_pass_duration_ms",
+                "dispatch.queue_depth.automation",
+                "dispatch.queue_depth.main",
+                "dispatch.queue_depth.review",
+                "dispatch.queue_oldest_wait_seconds.automation",
+                "dispatch.queue_oldest_wait_seconds.main",
+                "dispatch.queue_oldest_wait_seconds.review",
+            ],
+            "init_all must register the dep_unblock gauge and the queue-level dispatch gauges",
         );
     }
 }
