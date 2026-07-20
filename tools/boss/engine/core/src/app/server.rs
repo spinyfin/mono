@@ -1198,11 +1198,16 @@ pub async fn serve_with_merge_probe(
     // itself) drains to zero, auto-schedule a `design_postmortem` task that
     // reviews the wave's merged PRs against the design doc. Edge-triggered
     // and re-armable — see project_postmortem_sweep.rs for the full design.
+    // Gated by the `project_postmortem_sweep` flag (default ON, re-checked
+    // every pass) so the sweep — which autonomously creates dispatchable
+    // work — can be killed without a rebuild or restart; see incident
+    // postmortem-archived-fanout-2026-07-20.
     let coord_for_postmortem = server_state.execution_coordinator.clone();
     let _project_postmortem_handle = crate::project_postmortem_sweep::spawn_loop(
         server_state.work_db.clone(),
         Duration::from_secs(crate::project_postmortem_sweep::PROJECT_POSTMORTEM_SWEEP_INTERVAL_SECS),
         Arc::new(move || coord_for_postmortem.kick()),
+        server_state.feature_flags.clone(),
     );
 
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,

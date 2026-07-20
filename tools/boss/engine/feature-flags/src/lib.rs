@@ -202,6 +202,19 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "project_postmortem_sweep",
+        description: "Run the project-postmortem sweep (project_postmortem_sweep.rs), which \
+             auto-schedules a design_postmortem task — and dispatches a worker for it — whenever a \
+             project's implementation work drains to zero. Kill switch for incident \
+             `postmortem-archived-fanout-2026-07-20`, where the sweep's boot-time backfill pass fanned \
+             out across archived projects with no operator visibility. DEFAULT ON: the archived-project \
+             filter, bounded backfill, and delete-safe dedup gate this flag guards are the actual fix; \
+             disable only if the sweep needs to be stopped again without a rebuild.",
+        category: "postmortem",
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "stacked_pr_auto_structuring",
         description: "Piggyback on the merge poller's sweep to detect pairs of in-flight (in-review) PR branches \
              whose changed-file sets overlap on non-mechanical files — i.e. two branches predicted to conflict \

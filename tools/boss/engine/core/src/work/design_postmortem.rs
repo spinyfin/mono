@@ -76,19 +76,27 @@ impl WorkDb {
 }
 
 impl WorkDb {
-    /// Most recently created (non-deleted) `design_postmortem` task for
-    /// `project_id`, or `None` if the project has never had one.
+    /// Most recently created `design_postmortem` task for `project_id`
+    /// (deleted or not), or `None` if the project has never had one.
     ///
     /// Used by `project_postmortem_sweep` both as the dedup gate (skip
-    /// scheduling while the returned task is still open) and as the
-    /// timestamp cutoff for "implementation work completed since the last
-    /// postmortem" (a wave of zero net work must not spawn another one).
+    /// scheduling while the returned task is live and still open) and as
+    /// the timestamp cutoff for "implementation work completed since the
+    /// last postmortem" (a wave of zero net work must not spawn another
+    /// one). Deliberately includes soft-deleted rows: excluding them would
+    /// let deleting an unwanted postmortem erase its "already reviewed up
+    /// to here" boundary, re-arming the trigger and causing the sweep to
+    /// immediately re-backfill the very history the deletion was meant to
+    /// dismiss — the caller (`project_postmortem_sweep::evaluate_project`)
+    /// is responsible for treating a deleted row as not gating (only a
+    /// live, non-terminal postmortem blocks scheduling) while still using
+    /// it as a cutoff anchor.
     pub fn last_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
         let conn = self.connect()?;
         let id: Option<String> = conn
             .query_row(
                 "SELECT id FROM tasks
-                 WHERE project_id = ?1 AND kind = 'design_postmortem' AND deleted_at IS NULL
+                 WHERE project_id = ?1 AND kind = 'design_postmortem'
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1",
                 params![project_id],
@@ -112,6 +120,19 @@ impl WorkDb {
     /// via the same product-level resolution
     /// (`exec_status_helpers::resolve_repo_for_work_item`'s `Design |
     /// DesignPostmortem` arm).
+    ///
+    /// `effort_level` is stamped explicitly to `Medium` rather than left
+    /// `NULL` — see incident postmortem-archived-fanout-2026-07-20: an
+    /// unclassified engine-created row silently falls through to
+    /// `resolve_spawn_config`'s untagged-row fallback with no operator
+    /// visibility into why. That fallback is `engine_default = "opus"` at
+    /// HEAD (never Fable — see `claude.rs`'s `ModelMenu` doc comment), but
+    /// an explicit level makes the choice visible on the row itself
+    /// (`boss task show`) and stops it drifting with whatever the fallback
+    /// happens to be in a future refactor. `Medium` matches the task's
+    /// actual shape — reviewing a bounded set of already-merged PRs and
+    /// updating one doc, not an open-ended design or large implementation
+    /// — and resolves to Sonnet, not Opus.
     pub fn create_design_postmortem(
         &self,
         product_id: &str,
@@ -139,9 +160,19 @@ pub(crate) fn insert_design_postmortem_in_tx(
     let name = format!("Design postmortem: {project_name}");
     let short_id = allocate_short_id(conn, product_id)?;
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
-         VALUES (?1, ?2, ?3, 'design_postmortem', ?6, ?7, 'todo', NULL, NULL, NULL, ?4, ?4, 1, 'medium', ?5, ?8)",
-        params![id, product_id, project_id, now, CREATED_VIA_ENGINE_AUTO, name, description, short_id],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, effort_level)
+         VALUES (?1, ?2, ?3, 'design_postmortem', ?6, ?7, 'todo', NULL, NULL, NULL, ?4, ?4, 1, 'medium', ?5, ?8, ?9)",
+        params![
+            id,
+            product_id,
+            project_id,
+            now,
+            CREATED_VIA_ENGINE_AUTO,
+            name,
+            description,
+            short_id,
+            EffortLevel::Medium.as_str()
+        ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design postmortem task after insert: {id}"))
 }
@@ -175,6 +206,12 @@ mod tests {
         assert!(task.autostart);
         assert_eq!(task.description, "review these PRs");
         assert_eq!(task.created_via, CREATED_VIA_ENGINE_AUTO);
+        assert_eq!(
+            task.effort_level,
+            Some(EffortLevel::Medium),
+            "must be classified at creation, not left null to fall through to whatever the \
+             untagged-row model fallback happens to be — incident postmortem-archived-fanout-2026-07-20"
+        );
     }
 
     #[test]

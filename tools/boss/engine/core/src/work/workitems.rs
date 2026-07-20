@@ -18,6 +18,57 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Whether `WorkDb::list_tasks` — the general task-listing surface behind
+/// `boss task list` and the frontend's `ListTasks` RPC — includes `kind` in
+/// its result set. Exhaustive match: adding a new [`TaskKind`] variant is a
+/// compile error here until this function says whether the new kind
+/// belongs in `list_tasks`'s result, instead of a hand-maintained SQL
+/// string list silently missing it (see incident
+/// postmortem-archived-fanout-2026-07-20, where `design_postmortem` and
+/// `followup` were invisible on every listing surface because of exactly
+/// that).
+///
+/// A kind is excluded only when it has a compensating listing surface of
+/// its own (`Chore` → `list_chores`) or is deliberately non-listed by
+/// design (`Revision` → rolls up onto its parent's card, never a
+/// standalone row — see `project_postmortem_sweep.rs`'s "rule 2" and the
+/// kanban design doc). Every other kind belongs here by default.
+fn kind_returned_by_list_tasks(kind: &TaskKind) -> bool {
+    match kind {
+        TaskKind::Chore => false,
+        TaskKind::Revision => false,
+        TaskKind::Design
+        | TaskKind::Followup
+        | TaskKind::Investigation
+        | TaskKind::DesignPostmortem
+        | TaskKind::ProjectTask
+        | TaskKind::Task => true,
+    }
+}
+
+/// `... IN (...)` fragment for [`WorkDb::list_tasks`]'s kind filter,
+/// generated from [`kind_returned_by_list_tasks`] rather than hand-
+/// maintained as a literal SQL string. Built from a fixed, compile-time-
+/// known set of `TaskKind` variants (never user input), so formatting it
+/// directly into the query string is safe.
+fn list_tasks_kind_filter_sql() -> String {
+    [
+        TaskKind::Chore,
+        TaskKind::Design,
+        TaskKind::Followup,
+        TaskKind::Investigation,
+        TaskKind::DesignPostmortem,
+        TaskKind::ProjectTask,
+        TaskKind::Revision,
+        TaskKind::Task,
+    ]
+    .into_iter()
+    .filter(kind_returned_by_list_tasks)
+    .map(|kind| format!("'{}'", kind.as_str()))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
@@ -1028,13 +1079,14 @@ impl WorkDb {
         // default `--deleted` view shows live and tombstoned tasks
         // together. Restore acts on the tombstoned ones.
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
+        let kind_clause = list_tasks_kind_filter_sql();
 
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver
                  FROM tasks
-                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design', 'investigation'){deleted_clause}
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             ))?;
             let rows = stmt.query_map(params![product_id, project_id], map_task)?;
@@ -1043,7 +1095,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation'){deleted_clause}
+                 WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             ))?;
             let rows = stmt.query_map([product_id], map_task)?;
