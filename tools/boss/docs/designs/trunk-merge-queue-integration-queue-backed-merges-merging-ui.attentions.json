@@ -1,0 +1,17 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "After a queue eviction is fixed by an engine-triggered revision and head-branch CI is green again, may the engine auto-resubmit the PR to the Trunk queue without a fresh merge click (budget-capped by the existing ci_attempt_budget)? Answering no makes each resubmission an attention item + a manual merge re-click.",
+    "anchor": "eviction-a-first-class-failure-signal"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When should the flunge queue-only enforcement flip happen relative to the engine work?",
+    "choices": [
+      "Immediately after task 10's pre-enforcement validation (one merge + one eviction cycle)",
+      "After a bake period of several organic queue-backed merges with enforcement off",
+      "Only on my explicit go-ahead, no predefined trigger"
+    ],
+    "anchor": "misconfiguration-detection-and-enforcement-flag-day"
+  }
+]
