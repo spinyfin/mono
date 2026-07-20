@@ -571,17 +571,43 @@ mod tests {
     use super::*;
     use crate::test_support::{create_active_chore, create_product};
 
-    /// Pins the `EnginePoolConfig.coordinator_model` push (computed in
-    /// `handle_register_app_session` above) to `ServerState::coordinator_model`
-    /// — sourced from `WorkConfig::coordinator_model`
-    /// (`BOSS_COORDINATOR_MODEL`, default `"opus"`) — rather than the worker
-    /// effort→model table. Per the 2026-07-20 model-economy directive the two
-    /// are deliberately decoupled: a change to the worker dispatch table must
-    /// never silently change what model the coordinator launches on.
+    /// `ServerState::coordinator_model` — sourced from
+    /// `WorkConfig::coordinator_model` (`BOSS_COORDINATOR_MODEL`, default
+    /// `"opus"`) — is independent of the worker effort→model table: a
+    /// change to the worker dispatch table must never silently change what
+    /// model the coordinator launches on.
     #[test]
     fn coordinator_model_defaults_to_opus_independent_of_effort_table() {
         let (server_state, _temp) = test_server_state();
         assert_eq!(server_state.coordinator_model, "opus");
+    }
+
+    /// Pins the `EnginePoolConfig.coordinator_model` push itself: driving
+    /// `handle_register_app_session` end-to-end and asserting on the
+    /// `FrontendEvent::EnginePoolConfig` it enqueues, rather than only the
+    /// `ServerState` default the field is read from. Guards against a
+    /// regression that reverts the push's source back to the effort table
+    /// while leaving `ServerState::coordinator_model` (and the test above)
+    /// untouched.
+    #[tokio::test]
+    async fn coordinator_model_push_reflects_server_state() {
+        let (server_state, _temp) = test_server_state();
+        let sink = make_session_sink();
+        let ctx = dispatch_ctx(&server_state, &sink);
+
+        handle_register_app_session(ctx, FrontendRequest::RegisterAppSession).await;
+
+        // First envelope is the AppSessionRegistered response; the pool
+        // config is pushed immediately after.
+        sink.next().await.expect("AppSessionRegistered response");
+        let pushed = sink.next().await.expect("EnginePoolConfig push");
+        match pushed.payload {
+            FrontendEvent::EnginePoolConfig { coordinator_model, .. } => {
+                assert_eq!(coordinator_model, server_state.coordinator_model);
+                assert_eq!(coordinator_model, "opus");
+            }
+            other => panic!("expected EnginePoolConfig, got {other:?}"),
+        }
     }
 
     fn dispatch_ctx(server_state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {

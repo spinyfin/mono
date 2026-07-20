@@ -159,6 +159,22 @@ pub fn resolve_spawn_config(
     }
 }
 
+/// Heuristic-classification audit marker the Planner/materializer appends
+/// to a task's `description` when its `effort_level` was derived by the
+/// coordinator's heuristic pass (see `materializer.rs`, `planner.rs`). Its
+/// *absence* means any `effort_level` on the row was typed explicitly by a
+/// human/coordinator rather than heuristically classified.
+pub const EFFORT_CLASSIFICATION_TAG: &str = "[effort-classification]";
+
+/// True when the row's `effort_level` was typed by a human rather than
+/// derived by the Planner's heuristic pass — i.e. `description` carries no
+/// heuristic classification audit tag. Used by `boss product audit-effort`
+/// (design doc `boothby.md`, action 8) to scope its drifted-row re-run to
+/// rows a human never hand-set.
+pub fn effort_is_hand_set(description: &str) -> bool {
+    !description.contains(EFFORT_CLASSIFICATION_TAG)
+}
+
 // ---------------------------------------------------------------------------
 // Marker corpus + audit thresholds — design §Q4 + Q4 follow-up
 // ---------------------------------------------------------------------------
@@ -396,8 +412,8 @@ mod tests {
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
         let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
-        // 2026-07-20 model-economy directive: the table tops out at Opus for
-        // every level, including Max — Fable is opt-in only via an explicit
+        // The effort-level→model table tops out at Opus for every level,
+        // including Max — Fable is opt-in only via an explicit
         // model_override, never a table default.
         assert_eq!(max.model, "opus");
         assert_eq!(max.claude_effort, Some("max"));
@@ -657,9 +673,9 @@ mod tests {
 
     #[test]
     fn max_effort_dispatches_on_opus() {
-        // 2026-07-20 model-economy directive: Max no longer defaults to
-        // Fable — the effort table tops out at Opus for every level. Fable
-        // is still reachable, but only via an explicit model_override.
+        // The effort-level→model table tops out at Opus for every level,
+        // including Max. Fable is still reachable, but only via an explicit
+        // model_override.
         let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("max"));
@@ -669,6 +685,15 @@ mod tests {
             inv.contains("--permission-mode auto"),
             "Opus (max effort) must use --permission-mode auto, got: {inv:?}",
         );
+    }
+
+    #[test]
+    fn effort_is_hand_set_detects_tag_presence_and_absence() {
+        assert!(effort_is_hand_set("plain human-typed description"));
+        assert!(effort_is_hand_set(""));
+        assert!(!effort_is_hand_set(
+            "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
+        ));
     }
 
     #[test]

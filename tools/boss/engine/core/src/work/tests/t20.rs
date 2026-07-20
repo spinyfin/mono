@@ -1685,8 +1685,7 @@ fn reconcile_does_not_create_duplicate_when_pr_review_live() {
 // chain roots (kind `design`/`investigation`, transitively through a
 // revision chain) — unrelated to worker dispatch model selection, which
 // resolves via the ordinary effort-level→model table (`effort.rs`) for
-// every kind since the 2026-07-20 model-economy directive removed the
-// Fable-tier dispatch floor.
+// every kind.
 
 /// Create a project (auto-creating its `kind=design` seed task), mark that
 /// design task "in review" with `pr_url`, and return the design task's id —

@@ -442,9 +442,9 @@ pub(crate) fn attach_ai_reviewing_flag(
 /// default to `large` (→ Opus) rather than the ordinary `small` default: a
 /// revision to a design or investigation doc is judgment-heavy, low-volume
 /// work whose errors compound into every downstream implementation task, so
-/// it warrants the higher tier by default even when the operator didn't
-/// think to ask for it explicitly. Every other chain root keeps the
-/// original `small` default (revision-tasks.md §Q7).
+/// it warrants the higher tier by default rather than only when explicitly
+/// requested. Every other chain root keeps the original `small` default
+/// (revision-tasks.md §Q7).
 fn default_revision_effort_level(root_kind: &TaskKind) -> &'static str {
     match root_kind {
         TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem => "large",

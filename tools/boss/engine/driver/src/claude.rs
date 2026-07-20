@@ -48,8 +48,8 @@ fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
 /// for every edit. Trivial work still runs at `--effort low`; only the model floor
 /// is raised to Sonnet. Do not lower it back to Haiku.
 ///
-/// The table tops out at Opus for every level, including `Max` — per the
-/// 2026-07-20 model-economy directive, Fable is never a *default* for any
+/// The table tops out at Opus for every level, including `Max` — Fable is
+/// the most expensive model in the menu, so it is never a *default* for any
 /// row regardless of kind or effort. Fable is still a valid model slug, but
 /// only via an explicit, hand-set `--model fable` / `model_override` on the
 /// row (`resolve_spawn_config` precedence step 1), never a table default.

@@ -23,26 +23,37 @@ final class BossPaneModel: ObservableObject {
     /// The model slug the coordinator session was launched with (or will
     /// use on the next restart). Updated when the engine pushes
     /// `engine_pool_config`, which carries the engine's `coordinator_model`
-    /// setting (`BOSS_COORDINATOR_MODEL`, default `"opus"` — see the
-    /// 2026-07-20 model-economy directive) rather than the worker
-    /// effort→model table, so it stays a separately-configurable knob.
+    /// setting (`BOSS_COORDINATOR_MODEL`, default `"opus"`) rather than the
+    /// worker effort→model table, so it stays a separately-configurable
+    /// knob.
     private(set) var coordinatorModel: String
+    /// The model slug the *currently live* surface was actually launched
+    /// with. Diverges from `coordinatorModel` only in the window between an
+    /// `engine_pool_config` push and the next surface restart —
+    /// `updateCoordinatorModel(_:)` uses this to decide whether a live
+    /// restart is needed to apply the new value immediately, rather than
+    /// waiting for Claude to exit on its own.
+    private var launchedModel: String
     /// The resolved claude command line sent to the Boss-session shell.
     /// Exposed so the UI and debug surfaces can display it without
     /// inspecting pane scrollback.
     var claudeInvocation: String { coordinatorInvocation(model: coordinatorModel) }
 
     init() {
-        // Seed with the engine's default coordinator model (opus). The engine
-        // will push the authoritative value via engine_pool_config shortly
-        // after connect; updateCoordinatorModel(_:) picks it up then. Fable
-        // is no longer a default anywhere — an operator opts back into it
-        // explicitly via BOSS_COORDINATOR_MODEL, at which point the pushed
-        // value overrides this seed.
+        // Seed with the engine's default coordinator model (opus). The
+        // engine pushes the authoritative value via engine_pool_config
+        // shortly after connect; if that value differs from this seed,
+        // updateCoordinatorModel(_:) restarts the live surface immediately
+        // rather than waiting for Claude to exit on its own (see
+        // launchedModel above). Fable is no longer a default anywhere — an
+        // installation opts back into it explicitly via
+        // BOSS_COORDINATOR_MODEL, at which point the pushed value overrides
+        // this seed.
         self.coordinatorModel = "opus"
+        self.launchedModel = "opus"
         self.runtime = GhosttyRuntime.shared
         let workingDirectory = Self.ensureBossWorkingDirectory()
-        let invocation = coordinatorInvocation(model: "opus")
+        let invocation = coordinatorInvocation(model: coordinatorModel)
         // Unset ANTHROPIC_API_KEY before invoking claude so the Boss
         // session authenticates via OAuth (~/.claude/.credentials.json)
         // rather than the engine's API key. The macOS app process still
@@ -88,25 +99,40 @@ final class BossPaneModel: ObservableObject {
             self.session.statusMessage = "Picard restarting…"
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
-                let latest = coordinatorInvocation(model: self.coordinatorModel)
-                self.session.hostView?.launchSpec = TerminalLaunchSpec(
-                    fontSize: 11.0,
-                    workingDirectory: Self.ensureBossWorkingDirectory(),
-                    initialInput: Self.buildInitialInput(invocation: latest),
-                    env: Self.bossSessionEnv()
-                )
-                self.session.hostView?.restartSurface()
+                self.restartLiveSurface()
             }
         }
     }
 
+    /// Rebuild `launchSpec` for the current `coordinatorModel` and restart
+    /// the live surface, recording that model as `launchedModel`. Shared by
+    /// the `onChildExited` restart path and by `updateCoordinatorModel(_:)`
+    /// when it needs to apply a model change immediately.
+    private func restartLiveSurface() {
+        let latest = coordinatorInvocation(model: coordinatorModel)
+        session.hostView?.launchSpec = TerminalLaunchSpec(
+            fontSize: 11.0,
+            workingDirectory: Self.ensureBossWorkingDirectory(),
+            initialInput: Self.buildInitialInput(invocation: latest),
+            env: Self.bossSessionEnv()
+        )
+        session.hostView?.restartSurface()
+        launchedModel = coordinatorModel
+    }
+
     /// Called by `ContentView` when the engine pushes `engine_pool_config`
-    /// with an updated coordinator model.  Stores the new model; the next
-    /// coordinator restart (after Claude exits) will pick it up automatically.
+    /// with an updated coordinator model. Stores the new model; if it
+    /// differs from the model the live surface actually launched with, the
+    /// surface is restarted immediately so the change takes effect without
+    /// waiting for Claude to exit on its own — otherwise an installation
+    /// that sets `BOSS_COORDINATOR_MODEL` would still run its first
+    /// coordinator session on the stale seed value for the entire session.
     func updateCoordinatorModel(_ model: String) {
         guard !model.isEmpty, model != coordinatorModel else { return }
         coordinatorModel = model
         logger.info("Coordinator model updated to: \(model, privacy: .public)")
+        guard model != launchedModel else { return }
+        restartLiveSurface()
     }
 
     private static func buildInitialInput(invocation: String) -> String {

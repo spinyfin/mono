@@ -69,12 +69,11 @@ pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = true;
 
 /// Default value for [`WorkConfig::coordinator_model`]. The Boss coordinator
 /// session (the macOS app's single always-on Claude Code pane) launches on
-/// this model unless overridden. Historically this tracked whatever the
-/// effort-table's `max` tier resolved to (`fable`); per the 2026-07-20
-/// model-economy directive, top-tier models are opt-in only, so the
-/// coordinator now defaults to `opus` independent of the effort table.
-/// Operators who want the coordinator back on Fable set
-/// `BOSS_COORDINATOR_MODEL=fable` explicitly — no code change required.
+/// this model unless overridden. Top-tier models are opt-in only: the
+/// coordinator session is always-on and its token cost dominates, so it
+/// defaults to `opus` independent of the effort table. Set
+/// `BOSS_COORDINATOR_MODEL=fable` to opt an installation back into the
+/// higher tier — no code change required.
 pub const DEFAULT_COORDINATOR_MODEL: &str = "opus";
 
 // Bare name used as the PATH fallback. In installed Boss.app the engine
@@ -208,8 +207,10 @@ impl WorkConfig {
             .min(MAX_MERGE_ORDER_STAGGER_SECS);
         let enable_spawn_capability_breaker = lookup_bool(&lookup, "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER")?
             .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
-        let coordinator_model =
-            lookup_string(&lookup, "BOSS_COORDINATOR_MODEL").unwrap_or_else(|| DEFAULT_COORDINATOR_MODEL.to_owned());
+        let coordinator_model = lookup_string(&lookup, "BOSS_COORDINATOR_MODEL")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_COORDINATOR_MODEL.to_owned());
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -684,10 +685,9 @@ mod tests {
         assert!(err.to_string().contains("BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS"));
     }
 
-    /// The coordinator model must default to `opus` (2026-07-20 model-economy
-    /// directive: top-tier models are opt-in only) and stay overridable via
-    /// `BOSS_COORDINATOR_MODEL` so an installation can opt back into Fable
-    /// without a code change.
+    /// The coordinator model must default to `opus` (top-tier models are
+    /// opt-in only) and stay overridable via `BOSS_COORDINATOR_MODEL` so an
+    /// installation can opt back into Fable without a code change.
     #[test]
     fn coordinator_model_defaults_to_opus_and_reads_from_env() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -708,5 +708,28 @@ mod tests {
         })
         .expect("config loads");
         assert_eq!(config.coordinator_model, "fable");
+    }
+
+    /// A blank or whitespace-only `BOSS_COORDINATOR_MODEL` must fall back to
+    /// the default rather than producing an empty/blank model slug that
+    /// would fail at pane spawn with no useful diagnostic.
+    #[test]
+    fn coordinator_model_ignores_blank_or_whitespace_env_value() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        for blank in ["", "   "] {
+            let blank_owned = blank.to_owned();
+            let config = WorkConfig::load_from(|k| match k {
+                "BOSS_COORDINATOR_MODEL" => Some(OsString::from(&blank_owned)),
+                "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+                _ => None,
+            })
+            .expect("config loads");
+            assert_eq!(
+                config.coordinator_model, DEFAULT_COORDINATOR_MODEL,
+                "blank env value {blank:?} must fall back to the default"
+            );
+        }
     }
 }
