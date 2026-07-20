@@ -65,32 +65,47 @@ pub trait CiLogReader: Send + Sync {
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String;
 }
 
-/// `CiLogReader` for Buildkite. Wraps `bk job log <job-uuid>` (for
-/// reads) and `bk build retry <build-id>` (for the retrigger path).
-/// The binary path defaults to `"bk"`; tests substitute a fake script
-/// via [`Self::with_binary`].
+/// `CiLogReader` for Buildkite. Wraps `bk job log --pipeline <slug>
+/// --build-number <n> <job-uuid>` (for reads) and `bk build retry
+/// <build-id>` (for the retrigger path). The binary path defaults to
+/// `"bk"`; tests substitute a fake script via [`Self::with_binary`].
+///
+/// `bk job log` resolves its pipeline from the process cwd when no
+/// `--pipeline`/`--build-number` flags are given, which fails with
+/// `Error: failed to resolve a pipeline` unless cwd is a checkout of
+/// that pipeline's repo. The engine never runs with cwd inside a
+/// checkout, so the coordinates must be passed explicitly — callers
+/// supply them at construction time (parsed from the failing check's
+/// `target_url` via [`parse_buildkite_pipeline_slug`] /
+/// [`parse_buildkite_build_id`]).
 #[derive(Debug, Clone)]
 pub struct BuildkiteLogReader {
     binary: String,
-}
-
-impl Default for BuildkiteLogReader {
-    fn default() -> Self {
-        Self::new()
-    }
+    pipeline_slug: String,
+    build_number: String,
 }
 
 impl BuildkiteLogReader {
-    pub fn new() -> Self {
+    pub fn new(pipeline_slug: impl Into<String>, build_number: impl Into<String>) -> Self {
         Self {
             binary: "bk".to_owned(),
+            pipeline_slug: pipeline_slug.into(),
+            build_number: build_number.into(),
         }
     }
 
     /// Override the `bk` binary path. Used in tests to inject a fake
     /// script that returns canned responses.
-    pub fn with_binary(binary: impl Into<String>) -> Self {
-        Self { binary: binary.into() }
+    pub fn with_binary(
+        binary: impl Into<String>,
+        pipeline_slug: impl Into<String>,
+        build_number: impl Into<String>,
+    ) -> Self {
+        Self {
+            binary: binary.into(),
+            pipeline_slug: pipeline_slug.into(),
+            build_number: build_number.into(),
+        }
     }
 }
 
@@ -102,7 +117,19 @@ impl CiLogReader for BuildkiteLogReader {
     }
 
     async fn read_log_full(&self, job_id: &str) -> Result<String> {
-        run_capture(&self.binary, &["job", "log", job_id]).await
+        run_capture(
+            &self.binary,
+            &[
+                "job",
+                "log",
+                "--pipeline",
+                &self.pipeline_slug,
+                "--build-number",
+                &self.build_number,
+                job_id,
+            ],
+        )
+        .await
     }
 
     async fn retrigger(&self, id: &str) -> Result<String> {
@@ -111,7 +138,10 @@ impl CiLogReader for BuildkiteLogReader {
     }
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
-        format!("bk job log {job_id}")
+        format!(
+            "bk job log --pipeline {} --build-number {} {job_id}",
+            self.pipeline_slug, self.build_number
+        )
     }
 }
 
@@ -195,9 +225,22 @@ impl CiLogReader for UnknownProviderReader {
 /// Build a boxed reader for `provider`. Convenience factory the
 /// engine pre-spawn / pre-triage code uses to dispatch on the
 /// provider inferred from `target_url`.
-pub fn reader_for(provider: CiProvider) -> Box<dyn CiLogReader> {
+///
+/// `buildkite_coordinates` is the `(pipeline_slug, build_number)` pair
+/// [`BuildkiteLogReader`] needs to resolve its pipeline without a repo
+/// checkout in cwd — required only for `CiProvider::Buildkite`, parsed
+/// by the caller from the failing check's `target_url` via
+/// [`parse_buildkite_pipeline_slug`] / [`parse_buildkite_build_id`].
+/// When the provider is Buildkite but no coordinates are supplied
+/// (e.g. the `target_url` didn't match the canonical shape), falls
+/// back to [`UnknownProviderReader`] rather than constructing a reader
+/// that would fail on every call.
+pub fn reader_for(provider: CiProvider, buildkite_coordinates: Option<(String, String)>) -> Box<dyn CiLogReader> {
     match provider {
-        CiProvider::Buildkite => Box::new(BuildkiteLogReader::new()),
+        CiProvider::Buildkite => match buildkite_coordinates {
+            Some((pipeline_slug, build_number)) => Box::new(BuildkiteLogReader::new(pipeline_slug, build_number)),
+            None => Box::new(UnknownProviderReader),
+        },
         CiProvider::GithubActions => Box::new(GithubActionsLogReader::new()),
         CiProvider::Other => Box::new(UnknownProviderReader),
     }
@@ -447,9 +490,12 @@ mod tests {
     // ---------- worker_cli_invocation_hint ----------------------------------
 
     #[test]
-    fn buildkite_invocation_hint_embeds_job_id() {
-        let r = BuildkiteLogReader::new();
-        assert_eq!(r.worker_cli_invocation_hint("abc-uuid"), "bk job log abc-uuid");
+    fn buildkite_invocation_hint_embeds_job_id_and_coordinates() {
+        let r = BuildkiteLogReader::new("mypipeline", "1329");
+        assert_eq!(
+            r.worker_cli_invocation_hint("abc-uuid"),
+            "bk job log --pipeline mypipeline --build-number 1329 abc-uuid"
+        );
     }
 
     #[test]
@@ -468,10 +514,20 @@ mod tests {
 
     #[tokio::test]
     async fn reader_for_unknown_provider_errors_on_every_method() {
-        let r = reader_for(CiProvider::Other);
+        let r = reader_for(CiProvider::Other, None);
         assert!(r.read_log_tail("j", 10).await.is_err());
         assert!(r.read_log_full("j").await.is_err());
         assert!(r.retrigger("j").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reader_for_buildkite_without_coordinates_falls_back_to_unknown() {
+        // No `target_url` match → no (pipeline, build) pair. Falling back to
+        // `UnknownProviderReader` avoids constructing a `BuildkiteLogReader`
+        // that would just fail on every call with "failed to resolve a
+        // pipeline" (the exact bug this coordinate-threading fixes).
+        let r = reader_for(CiProvider::Buildkite, None);
+        assert!(r.read_log_full("j").await.is_err());
     }
 
     // ---------- integration: fake bk / fake gh ------------------------------
@@ -501,14 +557,23 @@ mod tests {
 
         const FAKE_BK: &str = r#"#!/bin/sh
 # Synthetic `bk` for tests. Matches a subset of the real CLI:
-#   bk job log <job-id>
+#   bk job log --pipeline <slug> --build-number <n> <job-id>
 #   bk build retry <build-id>
 if [ "$1" = "job" ] && [ "$2" = "log" ]; then
-    cat <<'LOG'
+    # Reject the bare form (no --pipeline/--build-number): this is the
+    # exact shape that fails with "Error: failed to resolve a pipeline"
+    # against the real CLI when cwd isn't a repo checkout, so the fake
+    # enforces that callers always supply the coordinate flags.
+    if [ "$3" != "--pipeline" ] || [ "$5" != "--build-number" ]; then
+        echo "missing --pipeline/--build-number flags: $@" 1>&2
+        exit 3
+    fi
+    cat <<LOG
 preamble line 1
 preamble line 2
 TEST FAILED at frob_bar_test.rs:42
 last meaningful line
+coordinates: pipeline=$4 build=$6 job=$7
 LOG
     exit 0
 fi
@@ -528,26 +593,44 @@ exit 2
         async fn buildkite_read_log_full_returns_stdout() {
             let dir = tempfile::tempdir().unwrap();
             let bk = write_script(dir.path(), "bk", FAKE_BK);
-            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap());
+            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap(), "mypipeline", "1329");
             let log = reader.read_log_full("any-job-uuid").await.unwrap();
             assert!(log.contains("TEST FAILED at frob_bar_test.rs:42"));
             assert!(log.contains("preamble line 1"));
         }
 
         #[tokio::test]
+        async fn buildkite_read_log_full_passes_pipeline_and_build_number() {
+            // Regression test for the "failed to resolve a pipeline" defect:
+            // confirms the coordinates given at construction time actually
+            // reach the `bk` invocation, not just that some command runs.
+            let dir = tempfile::tempdir().unwrap();
+            let bk = write_script(dir.path(), "bk", FAKE_BK);
+            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap(), "mypipeline", "1329");
+            let log = reader.read_log_full("job-uuid-456").await.unwrap();
+            assert!(
+                log.contains("coordinates: pipeline=mypipeline build=1329 job=job-uuid-456"),
+                "pipeline/build coordinates missing from invocation: {log}"
+            );
+        }
+
+        #[tokio::test]
         async fn buildkite_read_log_tail_trims_to_n_lines() {
             let dir = tempfile::tempdir().unwrap();
             let bk = write_script(dir.path(), "bk", FAKE_BK);
-            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap());
+            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap(), "mypipeline", "1329");
             let tail = reader.read_log_tail("any-job-uuid", 2).await.unwrap();
-            assert_eq!(tail, "TEST FAILED at frob_bar_test.rs:42\nlast meaningful line");
+            assert_eq!(
+                tail,
+                "last meaningful line\ncoordinates: pipeline=mypipeline build=1329 job=any-job-uuid"
+            );
         }
 
         #[tokio::test]
         async fn buildkite_retrigger_returns_new_build_id() {
             let dir = tempfile::tempdir().unwrap();
             let bk = write_script(dir.path(), "bk", FAKE_BK);
-            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap());
+            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap(), "mypipeline", "1329");
             let id = reader.retrigger("123").await.unwrap();
             assert_eq!(id, "new-build-id-123-retried");
         }
@@ -560,7 +643,7 @@ exit 2
             // through the multi-arg script.
             let body = "#!/bin/sh\necho 'unauthorized' 1>&2\nexit 7\n";
             let bk = write_script(dir.path(), "bk-fails", body);
-            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap());
+            let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap(), "mypipeline", "1329");
             let err = reader.read_log_full("j").await.unwrap_err();
             let msg = format!("{err:#}");
             assert!(msg.contains("exit"), "missing exit code in: {msg}");
@@ -569,7 +652,7 @@ exit 2
 
         #[tokio::test]
         async fn buildkite_missing_binary_errors() {
-            let reader = BuildkiteLogReader::with_binary("/definitely/not/a/real/bk-xyz");
+            let reader = BuildkiteLogReader::with_binary("/definitely/not/a/real/bk-xyz", "mypipeline", "1329");
             let err = reader.read_log_full("j").await.unwrap_err();
             assert!(format!("{err:#}").contains("failed to spawn"));
         }

@@ -807,7 +807,24 @@ async fn fetch_and_store_log_excerpt(work_db: &WorkDb, attempt: &CiRemediation, 
     else {
         return;
     };
-    let reader = crate::ci_log_reader::reader_for(first_with_job.provider);
+    // `BuildkiteLogReader` needs pipeline + build number to avoid `bk`
+    // resolving its pipeline from cwd (which fails outside a repo
+    // checkout — the engine never runs with cwd inside one). Parse
+    // both from the failing check's `target_url`; `reader_for` falls
+    // back to a reader that errors cleanly if either is unparseable.
+    let buildkite_coordinates = match first_with_job.provider {
+        crate::ci_log_reader::CiProvider::Buildkite => {
+            match (
+                crate::ci_log_reader::parse_buildkite_pipeline_slug(&first_with_job.target_url),
+                crate::ci_log_reader::parse_buildkite_build_id(&first_with_job.target_url),
+            ) {
+                (Some(pipeline), Some(build)) => Some((pipeline, build)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let reader = crate::ci_log_reader::reader_for(first_with_job.provider, buildkite_coordinates);
     match reader.read_log_tail(job_id, 100).await {
         Ok(log) if !log.is_empty() => {
             if let Err(err) = work_db.set_ci_remediation_log_excerpt(&attempt.id, &log) {
