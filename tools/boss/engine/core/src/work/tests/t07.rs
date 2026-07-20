@@ -1449,6 +1449,48 @@ fn sibling_list_is_scoped_to_one_automation() {
     assert!(siblings[0].name.contains("engine/core/src/app.rs"));
 }
 
+/// With more than the sibling list limit (20) worth of qualifying rows,
+/// the open ones must survive truncation ahead of resolved ones: the
+/// hard gate only ever refuses against open siblings, so those are
+/// exactly the rows the preamble must not drop, however old they are
+/// relative to a pile of recently-resolved rows.
+#[test]
+fn sibling_list_keeps_open_tasks_ahead_of_resolved_ones_under_the_limit() {
+    let db = WorkDb::open(temp_db_path("auto-siblings-truncation")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 30);
+
+    let mut open_short_ids = Vec::new();
+    for i in 0..25 {
+        let task = db
+            .create_automation_task(&automation.id, &format!("Split engine/core/src/open{i}.rs"), None)
+            .unwrap();
+        open_short_ids.push(task.short_id.unwrap());
+    }
+
+    for i in 0..5 {
+        let task = db
+            .create_automation_task(&automation.id, &format!("Split engine/core/src/resolved{i}.rs"), None)
+            .unwrap();
+        db.update_task(
+            &task.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..Default::default()
+            },
+            "human",
+        )
+        .unwrap();
+    }
+
+    let siblings = db.list_automation_sibling_tasks(&automation.id).unwrap();
+    assert_eq!(siblings.len(), 20, "capped at the sibling list limit");
+    assert!(
+        siblings.iter().all(|s| open_short_ids.contains(&s.short_id)),
+        "recently-resolved rows must not displace older open ones: {siblings:?}"
+    );
+}
+
 /// A fresh automation has nothing to report — the preamble renders no
 /// "already tracked" section at all in this case.
 #[test]

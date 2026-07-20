@@ -6,7 +6,7 @@
 //! out the handful of tokens that identify *what the finding is about*,
 //! not in parsing the sentence.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// Path segments that say nothing about *which* file is meant — they
 /// appear in every path in the repo. Dropping them lets a title that
@@ -111,26 +111,41 @@ pub(crate) fn normalize_token(token: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Collect the crate / module identifiers a title names.
+/// Collect the crate / module identifiers a title names, each tagged with
+/// whether its shape is strong evidence of an identifier or merely
+/// recovered from position.
 ///
-/// Four shapes count, and every one of them is a deliberate signal that
-/// the author meant a specific code unit rather than an English word:
+/// Four shapes count:
 ///
 /// - **backtick-quoted** — `` `metrics` ``; the author marked it as code.
+///   Strong: no English word is wrapped in backticks by accident.
 /// - **`::`-qualified** — `work::automations`, reduced to its last segment
-///   so `crate::work` and `work` converge.
-/// - **`snake_case`** — `pr_review`; no English word carries an underscore.
-/// - **anchor-adjacent** — the word beside "crate"/"module".
+///   so `crate::work` and `work` converge. Strong: `::` cannot appear in
+///   prose.
+/// - **`snake_case`** — `pr_review`; no English word carries an
+///   underscore. Strong.
+/// - **anchor-adjacent** — the word beside "crate"/"module", e.g. the
+///   `metrics` in "the `metrics` module" recovered from `module`'s
+///   neighbour rather than its own shape. Weak: ordinary English function
+///   words ("out", "up") pass the same identifier shape check and sit in
+///   exactly this position ("pull the module out").
 ///
-/// Returned as a set and matched by intersection, so a title naming two
-/// units matches another naming either of them.
+/// Returned as a map from identifier to "is this occurrence strong",
+/// merged so that if the same title also shapes the word strongly
+/// elsewhere (e.g. `` `metrics` module ``) the strong reading wins.
 ///
 /// Title-only by design: descriptions are long enough that these shapes
 /// appear incidentally (in a quoted error, a path, a code sample), and a
 /// single stray `snake_case` word shared by two unrelated descriptions
 /// would suppress a real finding.
-pub(crate) fn module_candidates_in(tokens: &[String]) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
+pub(crate) fn module_candidates_in(tokens: &[String]) -> BTreeMap<String, bool> {
+    let mut found: BTreeMap<String, bool> = BTreeMap::new();
+    let mut insert = |identifier: String, strong: bool| {
+        found
+            .entry(identifier)
+            .and_modify(|existing| *existing |= strong)
+            .or_insert(strong);
+    };
 
     for (index, token) in tokens.iter().enumerate() {
         let cleaned = strip_token_edges(token);
@@ -145,7 +160,7 @@ pub(crate) fn module_candidates_in(tokens: &[String]) -> BTreeSet<String> {
         if token.starts_with('`')
             && let Some(identifier) = as_identifier(cleaned)
         {
-            found.insert(identifier);
+            insert(identifier, true);
             continue;
         }
 
@@ -153,19 +168,21 @@ pub(crate) fn module_candidates_in(tokens: &[String]) -> BTreeSet<String> {
             && let Some(last) = cleaned.rsplit("::").next()
             && let Some(identifier) = as_identifier(last)
         {
-            found.insert(identifier);
+            insert(identifier, true);
             continue;
         }
 
         if cleaned.contains('_')
             && let Some(identifier) = as_identifier(cleaned)
         {
-            found.insert(identifier);
+            insert(identifier, true);
             continue;
         }
 
         if MODULE_ANCHOR_WORDS.contains(&normalize_token(cleaned).as_str()) {
-            found.extend(anchor_neighbours(tokens, index));
+            for identifier in anchor_neighbours(tokens, index) {
+                insert(identifier, false);
+            }
         }
     }
 

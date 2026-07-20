@@ -240,24 +240,11 @@ pub struct AutomationSiblingTask {
 /// answer, and how over-suppression would be caught — a burst of rows all
 /// pointing at one surviving task, matched on `normalized_title`, is the
 /// shape of a gate that has become too eager.
-/// Carries the builder derive per the repo's >5-field convention. The
-/// production reader below still builds it with a struct literal, as the
-/// convention prescribes for DB mappers — a compile error when a new
-/// column goes unmapped is the desirable outcome there.
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-pub struct AutomationDedupSuppression {
-    pub automation_id: String,
-    /// The task that survived and still tracks the finding.
-    pub surviving_task_id: String,
-    /// Title the triage agent tried to file, kept verbatim so a human can
-    /// judge whether the two really were the same work.
-    pub attempted_name: String,
-    /// Which signal fired: `file_target`, `module_target`, or
-    /// `normalized_title`.
-    pub matched_on: String,
-    /// The shared value that fired it.
-    pub match_key: String,
-    /// UTC epoch seconds, as a string (schema-wide convention).
-    pub created_at: String,
-}
+///
+/// Defined in `boss_protocol` (not here) so it can travel over the wire as
+/// a `ListAutomationDedupSuppressions` / `AutomationDedupSuppressionsList`
+/// request/event pair, exactly like [`boss_protocol::AutomationRun`]. The
+/// production reader below still builds it with a struct literal via the
+/// builder, as the convention prescribes for DB mappers — a compile error
+/// when a new column goes unmapped is the desirable outcome there.
+pub use boss_protocol::AutomationDedupSuppression;

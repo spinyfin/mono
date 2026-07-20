@@ -6,16 +6,16 @@ use crate::host_registry_wire::HostSnapshot;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
-    AddDependencyInput, Attention, AttentionGroup, AttentionMerge, Automation, AutomationPatch, AutomationRun,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
-    ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
-    CreateCommentInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
-    DeferredScopeAttention, DependencyFilter, EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto,
-    LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    AddDependencyInput, Attention, AttentionGroup, AttentionMerge, Automation, AutomationDedupSuppression,
+    AutomationPatch, AutomationRun, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentWithThread,
+    CommentsBannerState, ConflictHotspotReport, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
+    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, EditorialAction, EngineAttemptListEntry,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
+    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
@@ -837,6 +837,14 @@ pub enum FrontendRequest {
     /// creation/sweep paths (P1203 tasks 5/7) start writing rows.
     ListAttentionMerges {
         attention_id: String,
+    },
+
+    /// List the `automation_dedup_suppressions` trace for an automation,
+    /// newest first — every candidate task the dedup gate refused because
+    /// an open sibling already tracked the finding. Replies with
+    /// [`FrontendEvent::AutomationDedupSuppressionsList`].
+    ListAutomationDedupSuppressions {
+        automation_id: String,
     },
 
     /// List the `automation_runs` history for an automation, newest first.

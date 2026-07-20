@@ -250,14 +250,13 @@ impl WorkDb {
     /// Used by the scheduler to enforce `open_task_limit` at fire time.
     pub fn count_open_tasks_for_automation(&self, automation_id: &str) -> Result<i64> {
         let conn = self.connect()?;
-        let count: i64 = conn.query_row(
+        let sql = format!(
             "SELECT COUNT(*) FROM tasks
               WHERE source_automation_id = ?1
-                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
-                AND deleted_at IS NULL",
-            [automation_id],
-            |row| row.get(0),
-        )?;
+                AND status IN ({OPEN_SIBLING_STATUSES})
+                AND deleted_at IS NULL"
+        );
+        let count: i64 = conn.query_row(&sql, [automation_id], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -278,7 +277,7 @@ impl WorkDb {
         automation_id: &str,
     ) -> Result<Option<boss_protocol::Task>> {
         let conn = self.connect()?;
-        conn.query_row(
+        let sql = format!(
             "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
                     pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
@@ -288,15 +287,14 @@ impl WorkDb {
                     source_automation_id
                FROM tasks
               WHERE source_automation_id = ?1
-                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
+                AND status IN ({OPEN_SIBLING_STATUSES})
                 AND deleted_at IS NULL
               ORDER BY created_at DESC, id DESC
-              LIMIT 1",
-            [automation_id],
-            map_task_with_source_automation_id,
-        )
-        .optional()
-        .map_err(Into::into)
+              LIMIT 1"
+        );
+        conn.query_row(&sql, [automation_id], map_task_with_source_automation_id)
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Everything this automation is already tracking: open tasks, plus
@@ -307,7 +305,8 @@ impl WorkDb {
     /// re-derive — and re-file — the same finding indefinitely; that is
     /// what produced the audited duplicate clusters. Handing it this list
     /// is the difference between "there is a 3000-line file here" and
-    /// "there is a 3000-line file here, and T2861 is already on it".
+    /// "there is a 3000-line file here, and an open task already covers
+    /// it".
     ///
     /// Resolved rows are included precisely because the hard gate in
     /// [`Self::create_automation_task`] cannot use them: a finding that
@@ -320,7 +319,12 @@ impl WorkDb {
         // Open rows always qualify however old they are — an ancient open
         // task is *more* worth surfacing, not less. Resolved rows are
         // windowed on completion time, falling back to `updated_at` for
-        // rows that predate the `completed_at` column.
+        // rows that predate the `completed_at` column. Open rows are
+        // ordered ahead of resolved ones before the LIMIT is applied, so a
+        // long-standing open task can never be pushed out by a pile of
+        // recently-resolved ones — the hard gate in
+        // `Self::create_automation_task` only ever refuses against open
+        // rows, so those are exactly the ones truncation must not drop.
         let sql = format!(
             "SELECT short_id, name, status, pr_url
                FROM tasks
@@ -330,7 +334,7 @@ impl WorkDb {
                      status IN ({OPEN_SIBLING_STATUSES})
                      OR CAST(COALESCE(completed_at, updated_at) AS INTEGER) >= ?2
                 )
-              ORDER BY CAST(created_at AS INTEGER) DESC, id DESC
+              ORDER BY (status IN ({OPEN_SIBLING_STATUSES})) DESC, CAST(created_at AS INTEGER) DESC, id DESC
               LIMIT ?3"
         );
         let mut stmt = conn.prepare(&sql)?;

@@ -164,6 +164,25 @@ fn different_crate_extractions_are_distinct() {
     );
 }
 
+/// Regression: "out" is an anchor-adjacent neighbour of "module" in both
+/// titles, but neither occurrence is a backtick/`::`/`snake_case` shape —
+/// it is weak on both sides. A shared weak identifier must not suppress
+/// two titles that are about different code.
+#[test]
+fn weak_anchor_neighbour_alone_does_not_match() {
+    let metrics = fingerprint("Pull the `metrics` module out into a separate crate", None);
+    assert_eq!(
+        metrics.module_targets.get("out"),
+        Some(&false),
+        "'out' should be a weak target only: {:?}",
+        metrics.module_targets
+    );
+    assert_distinct(
+        ("Pull the `metrics` module out into a separate crate", None),
+        ("Move the bar module out of engine/core", None),
+    );
+}
+
 /// A file-targeted finding and a module-targeted one are not comparable.
 /// Rather than guess, the gate declines to match — a missed duplicate is
 /// the cheap error.

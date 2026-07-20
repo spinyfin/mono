@@ -30,9 +30,15 @@
 //!    `tools/cube/src/app.rs` does not.
 //! 2. **Module target** — crate / module identifiers named in the title:
 //!    backtick-quoted words, `a::b` paths, `snake_case` words, and words
-//!    adjacent to "crate"/"module". Collected as a *set*; two fingerprints
-//!    match when the sets intersect. This is what catches the `pr_review`
-//!    and `metrics` crate-extraction clusters, which name no file at all.
+//!    adjacent to "crate"/"module". Collected as a set, each tagged
+//!    *strong* (backtick/`::`/`snake_case` — a shape no English word has)
+//!    or *weak* (recovered only from sitting next to "crate"/"module",
+//!    a position ordinary words like "out" or "up" also occupy). Two
+//!    fingerprints match on a shared identifier only when at least one
+//!    side's occurrence is strong, so two titles that share nothing but a
+//!    weak/weak grammar word ("module out" / "crate out") do not collide.
+//!    This is what catches the `pr_review` and `metrics` crate-extraction
+//!    clusters, which name no file at all.
 //! 3. **Normalized title** — the secondary, per the brief. Lowercased
 //!    content words with sizes/counts and stopwords stripped, compared as
 //!    sets so word order does not matter. Deliberately exact set equality
@@ -51,7 +57,7 @@
 //! the same file is out of scope and explicitly allowed — see
 //! `WorkDb::create_automation_task`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod extract;
 
@@ -143,7 +149,8 @@ fn qualifiers_compatible(a: &[String], b: &[String]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFingerprint {
     file_target: Option<FileTarget>,
-    module_targets: BTreeSet<String>,
+    /// Identifier -> is this occurrence strong (see [`module_candidates_in`]).
+    module_targets: BTreeMap<String, bool>,
     title_tokens: BTreeSet<String>,
 }
 
@@ -183,10 +190,18 @@ impl TaskFingerprint {
             });
         }
 
-        if let Some(shared) = self.module_targets.intersection(&other.module_targets).next() {
+        // A shared identifier only counts when at least one side's shape is
+        // strong (backtick, `::`, or `snake_case`) — a weak/weak match means
+        // both sides recovered it from sitting next to "crate"/"module",
+        // which ordinary English words ("out", "up") do too.
+        let strong_shared = self.module_targets.iter().find_map(|(identifier, &self_strong)| {
+            let other_strong = *other.module_targets.get(identifier)?;
+            (self_strong || other_strong).then(|| identifier.clone())
+        });
+        if let Some(shared) = strong_shared {
             return Some(DuplicateMatch {
                 kind: MatchKind::ModuleTarget,
-                key: shared.clone(),
+                key: shared,
             });
         }
 

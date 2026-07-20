@@ -1463,6 +1463,14 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "automation_runs_list",
         },
         TagCase {
+            label: "AutomationDedupSuppressionsList",
+            event: FrontendEvent::AutomationDedupSuppressionsList {
+                automation_id: "aut_1".into(),
+                suppressions: vec![],
+            },
+            expected_tag: "automation_dedup_suppressions_list",
+        },
+        TagCase {
             label: "AutomationTasksList",
             event: FrontendEvent::AutomationTasksList {
                 automation_id: "aut_1".into(),
@@ -1647,6 +1655,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::EditorialActionsList { .. }
         | FrontendEvent::EditorialRulesEvaluated { .. }
         | FrontendEvent::AutomationRunsList { .. }
+        | FrontendEvent::AutomationDedupSuppressionsList { .. }
         | FrontendEvent::AutomationTasksList { .. }
         | FrontendEvent::AutomationRunEnqueued { .. }
         | FrontendEvent::AutomationStateResult { .. } => {}

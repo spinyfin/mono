@@ -20,11 +20,17 @@
 //! ## The marker protocol (design Risk #3)
 //!
 //! The whole value of phase 1 hinges on the triage agent reliably emitting
-//! *exactly one* decision marker and **not** doing the work itself. The
-//! preamble states the contract; the marker parser enforces "exactly one";
-//! and the transactional cap re-check at `boss task create --automation`
-//! (see [`crate::work::WorkDb::create_automation_task`]) is the backstop
-//! against a misbehaving agent fanning out.
+//! exactly one decision marker and **not** doing the work itself. The
+//! preamble states that contract, but [`parse_triage_decision`] does not
+//! enforce it strictly: the transcript it scans is every assistant turn
+//! joined together, so a marker-shaped line the agent narrated earlier (e.g.
+//! quoting the preamble's own example format) can precede the real,
+//! final decision. The parser resolves multiple marker lines to the last
+//! one rather than refusing to guess, since "last line wins" matches how a
+//! human reading the transcript top-to-bottom would resolve it. The
+//! transactional cap re-check at `boss task create --automation` (see
+//! [`crate::work::WorkDb::create_automation_task`]) is the backstop against
+//! a misbehaving agent fanning out.
 
 use std::sync::Arc;
 
@@ -48,8 +54,11 @@ pub enum TriageDecision {
     /// reached a decision. Treated as a transient/ambiguous failure (the run
     /// is left `failed_will_retry`), never as a skip.
     NoDecision,
-    /// More than one marker line — the contract was violated. Treated like
-    /// `NoDecision`: we refuse to guess which decision the agent meant.
+    /// No longer produced by [`parse_triage_decision`], which now resolves
+    /// multiple marker lines to the last one rather than refusing to guess —
+    /// see that function's doc for why. Kept as a variant (and still handled
+    /// defensively alongside `NoDecision` in the finalizer) for any future
+    /// producer that genuinely cannot resolve an ordering.
     Ambiguous(usize),
 }
 
@@ -319,23 +328,34 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
 /// Parse the triage agent's final assistant message into a [`TriageDecision`].
 ///
 /// Scans every line for a decision marker (`automation: task <id>` /
-/// `automation: skip — <reason>`) and enforces the "exactly one" contract:
+/// `automation: skip — <reason>`) and resolves to the **last** one found:
 ///
-/// - exactly one valid marker → that decision,
-/// - zero markers → [`TriageDecision::NoDecision`],
-/// - two or more markers → [`TriageDecision::Ambiguous`].
+/// - one or more markers → the last marker, in line order,
+/// - zero markers → [`TriageDecision::NoDecision`].
+///
+/// The caller (`read_final_triage_message`) joins every assistant turn in the
+/// transcript before handing it here, because the real decision marker can
+/// land in a turn after the `boss task create` tool call. That join means a
+/// marker-shaped line the agent narrated earlier — quoting the format while
+/// explaining what it's about to do, or an "already tracked" preamble
+/// example — can appear before the actual decision. Taking the last marker
+/// rather than requiring exactly one avoids reading that kind of narration
+/// as ambiguity: the agent's real, final decision is always the one closest
+/// to the end of its transcript. A single turn that itself contains two
+/// contradictory markers is vanishingly rare next to the narration case, and
+/// still resolves deterministically (last wins) rather than falling back to
+/// the no-marker retry path.
 ///
 /// Matching is lenient on case and on the skip separator (em-dash `—`, hyphen
 /// `-`, or colon `:` all accepted) but strict on the `automation:` prefix and
 /// on the `task` / `skip` keyword having a word boundary, so prose that merely
 /// *mentions* the protocol does not trip it.
 pub fn parse_triage_decision(final_message: &str) -> TriageDecision {
-    let markers: Vec<TriageDecision> = final_message.lines().filter_map(parse_marker_line).collect();
-    match markers.len() {
-        0 => TriageDecision::NoDecision,
-        1 => markers.into_iter().next().unwrap(),
-        n => TriageDecision::Ambiguous(n),
-    }
+    final_message
+        .lines()
+        .rev()
+        .find_map(parse_marker_line)
+        .unwrap_or(TriageDecision::NoDecision)
 }
 
 /// Parse a single line into a marker, or `None` if it is not one. A `task`
@@ -523,10 +543,31 @@ mod tests {
         );
     }
 
+    /// A multi-turn transcript can carry a narrated marker example ahead of
+    /// the agent's real, final decision — `read_final_triage_message` joins
+    /// every assistant turn, so this is the realistic shape, not a
+    /// same-turn contradiction. The last marker wins.
     #[test]
-    fn two_markers_is_ambiguous() {
+    fn two_markers_resolves_to_the_last_one() {
         let msg = "automation: task T1\nautomation: skip — changed my mind";
-        assert_eq!(parse_triage_decision(msg), TriageDecision::Ambiguous(2));
+        assert_eq!(
+            parse_triage_decision(msg),
+            TriageDecision::Skip("changed my mind".to_owned())
+        );
+    }
+
+    /// The "Already tracked" preamble example line
+    /// (`automation: skip — already tracked as T<n>`) is itself
+    /// marker-shaped; if the agent quotes it while narrating and then emits
+    /// its real decision afterward, the real decision must still win.
+    #[test]
+    fn narrated_marker_example_does_not_shadow_the_real_decision() {
+        let msg = "automation: skip — already tracked as T<n>\n\
+                   automation: task T9";
+        assert_eq!(
+            parse_triage_decision(msg),
+            TriageDecision::ProducedTask("T9".to_owned())
+        );
     }
 
     #[test]
@@ -858,26 +899,26 @@ mod tests {
     #[test]
     fn preamble_lists_already_tracked_tasks() {
         let siblings = [
-            sibling(2861, "Split engine/core/src/app.rs", "active", None),
+            sibling(101, "Split engine/core/src/app.rs", "active", None),
             sibling(
-                2937,
+                102,
                 "Extract pr_review into its own crate",
                 "in_review",
-                Some("https://github.com/spinyfin/mono/pull/2144"),
+                Some("https://github.com/spinyfin/mono/pull/9001"),
             ),
         ];
         let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings);
 
         assert!(preamble.contains("Already tracked"), "section heading missing");
-        assert!(preamble.contains("T2861"), "must cite each sibling by friendly id");
-        assert!(preamble.contains("T2937"));
+        assert!(preamble.contains("T101"), "must cite each sibling by friendly id");
+        assert!(preamble.contains("T102"));
         assert!(
             preamble.contains("Split engine/core/src/app.rs"),
             "titles must be shown"
         );
         assert!(preamble.contains("[active]"), "status tells the agent someone is on it");
         assert!(
-            preamble.contains("https://github.com/spinyfin/mono/pull/2144"),
+            preamble.contains("https://github.com/spinyfin/mono/pull/9001"),
             "a PR url is the strongest in-hand signal and must be shown",
         );
         // The instruction that turns the list into a decision.
@@ -895,7 +936,7 @@ mod tests {
     /// is a dedup nudge, not a cap.
     #[test]
     fn preamble_still_permits_distinct_findings() {
-        let siblings = [sibling(2861, "Split engine/core/src/app.rs", "active", None)];
+        let siblings = [sibling(101, "Split engine/core/src/app.rs", "active", None)];
         let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings);
         assert!(
             preamble.contains("Genuinely different target"),
