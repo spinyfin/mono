@@ -1,67 +1,76 @@
 # Boss: Comments in the Markdown Viewer
 
-Design doc for an in-app comment system that lets the user highlight a
-region of any rendered markdown surface in Boss — work-item
-descriptions, the popped-out design-doc viewer, anything else that
-renders markdown — attach a comment, see it in a sidebar, and (via a
-"magic wand" affordance) dispatch a doc-editing agent that acts on the
-comment.
+Design doc for the in-app comment system (P529) that lets the user
+highlight a region of any rendered markdown surface in Boss — work-item
+descriptions, the popped-out design-doc viewer — attach a comment, see
+it in a sidebar, and have the engine act on it. This revision is the
+**as-built** record: the project shipped in four phases plus a UI
+refinement pass, and its original "magic wand" dispatch path was
+subsequently built, found wanting, and retired in favour of
+[`comment-triggered-document-revisions`](comment-triggered-document-revisions.md).
+
+- **Status:** shipped; magic-wand portion retired and superseded.
+- **Shipped in:** [#605](https://github.com/spinyfin/mono/pull/605)
+  (Phase 1 UI shell), [#622](https://github.com/spinyfin/mono/pull/622)
+  (UI refinements), [#915](https://github.com/spinyfin/mono/pull/915)
+  (Phase 2 engine persistence + anchoring; renderer wiring followed in
+  a separate PR — `CommentWire.swift`),
+  [#970](https://github.com/spinyfin/mono/pull/970) (Phase 3 magic
+  wand, engine-owned docs), [#1106](https://github.com/spinyfin/mono/pull/1106)
+  (Phase 4 magic wand, PR-backed docs).
+- **Superseded parts:** the per-comment magic wand (Phases 3–4) was
+  removed by the intent-classifier design; see
+  [Magic wand — built, then retired](#magic-wand--built-then-retired).
 
 ## Goals
 
 - Any markdown surface the macOS app renders can be commented on. The
-  primary surfaces in scope today are the expanded work-item description
+  surfaces shipped are the expanded work-item description
   (`MarkdownViewerView` in `tools/boss/app-macos/Sources/DesignsView.swift`)
-  and the design-doc viewer (`DesignRendererView`); the contract is
-  written so that adding the affordance to a future surface is a
-  one-line change.
-- Selecting a span of rendered text exposes an authoring affordance.
-  Hitting enter creates a comment. The commented region stays visually
-  highlighted in the doc.
-- Comments persist in the engine. They survive app restarts, doc
-  edits, and view re-opens.
+  and the design-doc viewer (`DesignRendererView`); each opts in with a
+  one-line `.withComments()` modifier, preserving the "adding a future
+  surface is a one-line change" contract.
+- Selecting a span of rendered text exposes an authoring affordance;
+  the commented region stays visually highlighted in the doc.
+- Comments persist in the engine and survive app restarts, doc edits,
+  and view re-opens.
 - Comments stay anchored to the originally selected text even when the
-  underlying markdown is edited (lines added, paragraphs reflowed,
-  words inserted near the anchor). Line-number-only anchoring is
+  underlying markdown is edited. Line-number-only anchoring is
   explicitly rejected as too fragile.
-- A right-side sidebar lists comments for the open doc with author,
-  timestamp, snippet, dismiss action, and a magic-wand button. The
-  doc highlight and the sidebar entry are bidirectionally linked:
-  hovering one highlights the other; clicking a sidebar entry scrolls
-  the doc.
-- The magic wand dispatches a doc-editing agent. Two dispatch paths:
-  - **Engine-owned doc** (e.g. a work-item description): a
-    _specialised, isolated Claude instance_ with a deliberately narrow
-    tool surface — see [Magic-wand sandbox](#magic-wand-sandbox).
-  - **PR-backed doc** (e.g. a design doc on a `boss/exec_*` branch):
-    the existing Boss chore-worker path, given a directive that
-    encodes the comment's intent against the PR's branch.
-- The interaction model is validated end-to-end on real docs _before_
-  the engine learns to persist comments or dispatch agents. Phase 1
-  ships UI only.
+- A right-side sidebar lists comments for the open doc with snippet,
+  timestamp, dismiss action, and click-to-jump back to the anchored
+  text in the doc.
+- Comments drive engine-owned handling of the operator's intent. As
+  originally designed this was a per-comment "magic wand" dispatch
+  (isolated Claude for engine-owned docs, chore worker for PR-backed
+  docs); as-built that path shipped and was then replaced by intent
+  classification and the revision/answer-agent flow (successor design).
+- The interaction model was validated end-to-end on real docs before
+  the engine learned to persist comments or dispatch agents; Phase 1
+  shipped UI only.
 
 ## Non-goals
 
 - Commenting on PR diff views, chat panes, or the kanban-card preview
-  text. These surfaces have their own UX questions and are out of
-  scope.
-- Threaded replies (replies-to-replies, nesting). Single-level only
-  in v1; thread later if real usage demands it.
+  text.
+- Free-form threaded replies. v1 shipped single-level comments; the
+  successor design later added _structured_ thread entries
+  (`comment_thread_entries` — engine nudges, answer-agent replies,
+  operator follow-ups), which is narrower than general nesting.
 - A general "show me previous versions of this work-item description"
-  feature. Comment-anchor versioning (the narrow CAS needed to keep
-  the magic wand safe) is in scope; full description history is a
-  separate project (see [Versioning](#versioning)).
-- Inline diff rendering of the magic-wand result. v1 shows a
-  side-by-side preview built from the returned markdown; a real
-  intra-paragraph diff renderer can come later.
-- Multi-user permissions. Boss is a single-user tool today; anyone
-  can dismiss any comment. The schema records `author` so a future
-  ACL layer has a hook to grow into.
-- Realtime collaboration (live presence, OT/CRDT). Two simultaneous
-  comments at the same anchor just produce two separate comment rows.
-- Auto-applying magic-wand output. Every magic-wand result lands in a
-  _preview_ state and requires explicit user accept before the source
-  is overwritten.
+  feature. Only the narrow doc-version CAS needed for safe applies is
+  in scope (see [Versioning](#versioning)).
+- Inline diff rendering of agent-proposed changes. The Phase 3 preview
+  showed two full renders side-by-side; no intra-paragraph diff ever
+  shipped (and the preview sheet itself was deleted with the wand).
+- Multi-user permissions. Boss is single-user; anyone can dismiss any
+  comment. The schema records `author` so a future ACL layer has a
+  hook — as-built, the UI never grew an author field, so authorship is
+  effectively constant.
+- Realtime collaboration (live presence, OT/CRDT).
+- Auto-applying agent output. This held throughout: the magic wand
+  required explicit Apply, and the successor design goes further —
+  it only _nudges_ toward a revision, never applies.
 
 ## Alternatives considered
 
@@ -75,11 +84,11 @@ tuple, the way GitHub PR review comments do.
   GitHub path would be easy.
 - **Cons**: any non-trivial edit invalidates every comment below the
   edit point. The motivating use case for this feature is exactly the
-  case where the doc keeps changing — the human comments, the magic
-  wand or the worker edits, the human re-reads. Line-anchored
-  comments would re-attach to the wrong text on every edit. The
-  problem is well-studied: the W3C Web Annotation Data Model exists
-  specifically because line-anchoring fails on edited docs.
+  case where the doc keeps changing — the human comments, an agent
+  edits, the human re-reads. Line-anchored comments would re-attach to
+  the wrong text on every edit. The problem is well-studied: the W3C
+  Web Annotation Data Model exists specifically because line-anchoring
+  fails on edited docs.
 - Rejected.
 
 ### Alternative B: Per-doc inline `<!-- comment: ... -->` markers stored in the markdown source
@@ -93,710 +102,469 @@ itself.
   workers, which would pollute their prompts. Comments aren't really
   the doc's content; mixing them in violates the separation between
   artifact and conversation. Dismissed comments leave residue.
-  Anchoring is still required (a marker placed mid-paragraph still
-  drifts when the surrounding text is rewritten). Worst of all: the
-  magic-wand instance would see its own comment in the markdown it's
-  asked to edit, creating a self-referential mess.
+  Anchoring is still required. Worst of all: a doc-editing agent would
+  see its own comment in the markdown it's asked to edit.
 - Rejected.
 
 ### Alternative C: W3C Web Annotation `TextQuoteSelector` anchoring in the engine, comments stored as engine rows
 
-What this design recommends. Comments live in a new `work_comments`
-table keyed to the artifact (work-item id, or PR-doc ref). Each
-comment carries a `TextQuoteSelector`-shaped anchor (`exact`,
-`prefix`, `suffix`). The renderer re-resolves the anchor against the
-current doc text on every load; resilience falls out of the selector
-model. Dispatch routes through the engine's existing execution path
-(or a new sibling for the specialised-Claude case).
+What shipped. Comments live in a `work_comments` table keyed to the
+artifact (work-item id, or PR-doc ref). Each comment carries a
+`TextQuoteSelector`-shaped anchor (`exact`, `prefix`, `suffix`),
+re-resolved against the current doc text on load.
 
 - **Pros**: anchoring is robust to most realistic edits because the
   prefix/suffix context disambiguates even when the exact text recurs.
   Comments are first-class engine objects so they show up in the
   subscription stream, survive crashes, and feed naturally into the
-  existing attention/inbox plumbing. The magic-wand path becomes a
-  small addition rather than a rewrite of the dispatch surface.
-- **Cons**: anchoring isn't free — the renderer has to do a quote
-  match on every load, and the engine has to store ~80–200 bytes of
-  selector per comment instead of a 4-byte line number. The renderer
-  needs to walk the rendered AST to map matched text back to layout
-  coordinates. Both costs are bounded and well-understood.
+  existing attention/inbox plumbing.
+- **Cons**: anchoring isn't free — each load runs a quote match, and
+  the engine stores ~80–200 bytes of selector per comment. Both costs
+  proved bounded in practice.
 - **Chosen.** Detailed below.
 
 ## Chosen approach
 
-### Phasing
+### Phasing (as shipped)
 
-The user has called for the UI interaction model to be validated
-_before_ the agent path is built. The design adopts that explicitly:
+The UI interaction model was validated before the agent path was
+built, as planned — though the phases interleaved differently than the
+strict 1→2→3→4 ladder the plan assumed:
 
-- **Phase 1 — UI shell.** Selection → comment author → sidebar render
-  → highlight → dismiss. **No engine persistence** (comments live in
-  in-memory state on the viewer window, lost on close). **No magic
-  wand.** Anchoring is line+offset since comments don't survive.
-  Goal: prove the interaction is good on real docs before paying the
-  cost of persistence.
-- **Phase 2 — Persistence + resilient anchoring.** New engine schema,
-  RPCs, subscription topic, re-anchoring on load. W3C-style
-  `TextQuoteSelector`. Soft-dismiss with a history surface.
-- **Phase 3 — Magic wand (engine-owned docs).** The specialised
-  isolated-Claude dispatch path. Comment-anchor CAS for safety.
-- **Phase 4 — Magic wand (PR-backed docs).** Routes to a Boss chore
-  worker against the PR's branch.
-
-Each phase is filed as its own implementation task under the parent
-project, with Phase N+1 depending on Phase N via the dependency graph
-(`work-dependencies.md`). Phase 1's deliverable is a working
-prototype the user can drive against the existing markdown viewer;
-phases 2–4 each ship their slice independently.
+- **Phase 1 — UI shell** ([#605](https://github.com/spinyfin/mono/pull/605)):
+  selection → comment → sidebar → dismiss, in-memory only. Shipped
+  _without_ the planned `(line, offset, length)` anchoring — Phase 1
+  stored only the verbatim quoted text — and with the doc highlight
+  stubbed (see [macOS app](#macos-app-architecture)). Also added the
+  first Swift test target run in CI
+  (`//tools/boss/app-macos:BossTests`), unplanned scope.
+- **UI refinement pass** ([#622](https://github.com/spinyfin/mono/pull/622)):
+  a validation-driven pass the original phasing didn't anticipate —
+  entry triggers, popover, Return-to-submit, persistent highlight,
+  click-to-jump, dismiss placement. This is where several sidebar/
+  popover decisions below diverged from the original spec.
+- **Phase 2 — persistence + resilient anchoring**
+  ([#915](https://github.com/spinyfin/mono/pull/915)): engine schema,
+  `comments_*` RPCs, subscription topic, resolver, soft-dismiss,
+  cross-doc migration. #915 deliberately shipped only the
+  engine/protocol half to stay independently reviewable; the macOS
+  wiring (`CommentWire.swift` + `EngineClient` support) followed in a
+  separate PR.
+- **Phase 3 — magic wand, engine-owned docs**
+  ([#970](https://github.com/spinyfin/mono/pull/970)): the specialised
+  no-tools Claude call, dispatch table, preview sheet, CAS apply.
+  Landed engine-first _before_ the app's Phase 2 wiring existed, so it
+  was never operable end-to-end from the app — a dependency inversion
+  the phasing didn't anticipate. A 13-line attribution follow-up
+  ([#1102](https://github.com/spinyfin/mono/pull/1102)) was still open
+  when the wand was retired.
+- **Phase 4 — magic wand, PR-backed docs**
+  ([#1106](https://github.com/spinyfin/mono/pull/1106)): `pr_doc`
+  dispatch arm creating a chore. Shipped without the PR-resume
+  integration or the completion feedback loop (see
+  [Magic wand](#magic-wand--built-then-retired)).
 
 ### Anchoring model
 
 Comments anchor with a [W3C Web Annotation Data Model][wadm]
-`TextQuoteSelector`, serialised inline on the comment row:
+`TextQuoteSelector`, serialised inline on the comment row
+(`CommentAnchor {exact, prefix, suffix}` in
+`tools/boss/protocol/src/types/comment.rs`):
 
 ```json
 {
   "type": "TextQuoteSelector",
   "exact": "the rendered markdown source already pushes commented spans",
-  "prefix": "Each comment carries a `TextQuoteSelector`-shaped anchor (`exact`, `prefix`, `suffix`). ",
+  "prefix": "Each comment carries a `TextQuoteSelector`-shaped anchor. ",
   "suffix": " through to the macOS app via the existing subscription"
 }
 ```
 
 [wadm]: https://www.w3.org/TR/annotation-model/#text-quote-selector
 
-The anchor's three fields are **strings taken from the rendered
-plain-text projection of the markdown** (not the raw markdown source).
-Rationale: the user selects on rendered text, so what they see is what
-gets stored. The renderer maintains a `[(plainTextRange, sourceRange,
-nodeId)]` mapping (built once per render pass) so the engine never has
-to know about layout, and the macOS app never has to round-trip raw
-markdown back through the parser to compute selection.
+The anchor's three fields are strings taken from the **rendered
+plain-text projection** of the markdown, not the raw source: the user
+selects on rendered text, so what they see is what gets stored.
+Prefix/suffix are 64 characters each, trimmed at word boundaries —
+enough to disambiguate in Boss-sized docs, short enough that
+collisions on edited docs are rare.
 
-**Prefix/suffix length.** Fixed 64 characters each, trimmed at word
-boundaries where possible. 64 is enough to disambiguate within any
-realistic Boss-sized doc (work-item descriptions are typically
-<10kB, design docs <100kB) and short enough that prefix/suffix
-collisions on edited docs are rare. The schema permits longer values
-for callers that want them — a future "comment on a function name in
-a code block" affordance might need more context — but the default
-authoring path writes 64.
+**Resolution is engine-owned.** This is the largest divergence from
+the original design, which had the _renderer_ re-resolve anchors on
+every load and merely report orphans. As-built, the renderer sends the
+doc's plain-text projection to the engine via the `CommentsResolve`
+RPC, and the engine (`engine/core/src/work/comments_anchor.rs`, a pure
+module) resolves every anchor, persists fuzzy re-anchors, and flips
+orphan status itself. Rationale (per #915): the algorithmic core stays
+authoritative and testable in the engine, while the renderer still
+supplies the plain text — the engine never parses markdown. The
+resolution ladder:
 
-**Re-anchoring on load.** When the renderer loads a doc with comments
-attached, it runs each anchor through this resolution:
+1. **Exact match** — search for `prefix + exact + suffix` verbatim;
+   anchored if found exactly once.
+2. **Fuzzy match** — sliding-window scoring using a self-contained
+   **Sørensen–Dice character-bigram coefficient** (the doc originally
+   pointed at `fastdiff`; Dice was chosen to avoid a new crate
+   dependency). Accepted when the best window scores ≥0.8 _and_ the
+   best non-overlapping runner-up scores <0.7 (uniqueness). A fuzzy
+   hit re-extracts a fresh 64/exact/64 anchor from the matched text
+   and persists it with `last_resolved_with = 'fuzzy'`, so the next
+   load exact-matches and the sidebar can show a ⚠ re-anchored glyph.
+3. **Orphan** — neither resolves: the comment's status flips to
+   `orphaned`; it still appears in the sidebar with its original
+   snippet but paints no highlight.
 
-1. **Exact match** — search the rendered plain text for `prefix + exact + suffix`
-   verbatim. If found exactly once, the comment is anchored.
-2. **Fuzzy match** — if the exact form is not found, attempt a
-   fuzzy match with [`fastdiff`][fastdiff]-style scoring across
-   sliding windows. A comment is considered re-anchored if the best
-   match scores ≥0.8 against the original `exact + prefix + suffix`
-   _and_ is uniquely the best (the second-best match scores <0.7).
-3. **Orphan** — if neither exact nor fuzzy resolution succeeds, the
-   comment is _orphaned_: it still appears in the sidebar with an
-   "anchor lost" badge and the original snippet, but does not paint
-   a highlight in the doc. Orphans can be dismissed normally; a
-   future "re-attach to current selection" affordance is a natural
-   follow-up.
-
-[fastdiff]: https://docs.rs/fastdiff/
-
-The fuzzy threshold is tunable per-product via the existing engine
-config surface; 0.8 / 0.7 are starting values borrowed from
-[Hypothes.is's annotation re-anchoring][hypo-anchor] which has the
-most real-world miles on this exact problem.
+The 0.8 / 0.7 thresholds (starting values from
+[Hypothes.is's re-anchoring work][hypo-anchor]) are tunable via the
+`BOSS_COMMENT_FUZZY_SCORE` / `BOSS_COMMENT_FUZZY_SECOND_BEST`
+environment variables — process-wide, not the per-product config knob
+originally sketched; nothing has needed per-product tuning.
 
 [hypo-anchor]: https://web.hypothes.is/blog/fuzzy-anchoring/
 
-**Why not `RangeSelector` or DOM-path-style anchors.** The W3C model
-also defines `RangeSelector` (start/end paths into a structured tree)
-and `XPathSelector`. Both bind to the _rendered DOM_, which means
-any structural change to the document (a new heading inserted before
-the anchor, a paragraph split, a list re-bulleted) breaks them. A
-plain `TextQuoteSelector` is content-addressed: it survives any edit
-that doesn't touch the immediate text around the anchor. For Boss's
-needs that's strictly better.
+**Why not `RangeSelector` or DOM-path-style anchors.** Both bind to
+the rendered structure, so any structural edit (a new heading, a split
+paragraph) breaks them. A plain `TextQuoteSelector` is
+content-addressed: it survives any edit that doesn't touch the
+immediate text around the anchor.
 
 ### Engine schema
 
-One new table:
+One table, `work_comments`
+(`migrate_work_comments_table`, `engine/core/src/work/migrations_b.rs`):
 
 ```sql
 CREATE TABLE work_comments (
-  id              TEXT PRIMARY KEY,         -- e.g. "comment_18b...ef"
-  artifact_kind   TEXT NOT NULL,            -- 'work_item' | 'pr_doc'
-  artifact_id     TEXT NOT NULL,            -- work_items.id, OR
-                                            -- "pr_doc:<repo>:<branch>:<path>"
-  doc_version     TEXT NOT NULL,            -- SHA-256 of the doc text
-                                            -- the comment was authored against
-  anchor_json     TEXT NOT NULL,            -- {exact, prefix, suffix}
-  body            TEXT NOT NULL,            -- the comment text
-  author          TEXT NOT NULL,            -- 'user:<email>' or
-                                            -- 'magic_wand:<comment_id>'
-  status          TEXT NOT NULL,            -- 'active' | 'dismissed' |
-                                            -- 'orphaned' | 'resolved'
-  status_actor    TEXT,                     -- who flipped status last
-  created_at      INTEGER NOT NULL,
-  updated_at      INTEGER NOT NULL,
-  dismissed_at    INTEGER
+  id                            TEXT PRIMARY KEY,  -- "comment_…"
+  artifact_kind                 TEXT NOT NULL,     -- 'work_item' | 'pr_doc'
+  artifact_id                   TEXT NOT NULL,     -- work item id, OR
+                                                   -- "pr_doc:<repo>:<branch>:<path>"
+  doc_version                   TEXT NOT NULL,     -- SHA-256 of the plain-text
+                                                   -- projection at authoring time
+  anchor_json                   TEXT NOT NULL,     -- {exact, prefix, suffix}
+  body                          TEXT NOT NULL,
+  author                        TEXT NOT NULL,
+  status                        TEXT NOT NULL,
+  status_actor                  TEXT,
+  last_resolved_with            TEXT,              -- 'exact' | 'fuzzy' | 'orphan'
+  plain_text_projection_version INTEGER NOT NULL DEFAULT 0,
+  created_at                    TEXT NOT NULL,     -- ISO timestamps (not epoch ints)
+  updated_at                    TEXT NOT NULL,
+  dismissed_at                  TEXT
 );
 CREATE INDEX work_comments_by_artifact ON
   work_comments(artifact_kind, artifact_id, status);
 ```
 
-Notes:
+Differences from the originally sketched DDL, all additive:
 
-- `artifact_kind = 'work_item'` is the engine-owned case: a comment
-  on a `tasks.description` or a project's description. `artifact_id`
-  is the work-item id.
-- `artifact_kind = 'pr_doc'` covers the PR-backed case: a comment on
-  a markdown file under a PR's `boss/exec_*` branch. `artifact_id`
-  is the synthetic composite key — repo, branch, path — that uniquely
-  identifies the file. This means a single design doc on a PR carries
-  its comments as long as the PR's branch lives.
-- `doc_version` is the SHA-256 of the _plain-text projection_ of the
-  doc at authoring time, not the raw markdown SHA. The plain-text
-  projection is what the anchor lives in, so this is the right
-  invariant for CAS (Q below).
-- `status = 'orphaned'` is a derived state — the engine doesn't
-  flip rows to orphaned itself; instead the renderer reports orphans
-  to the engine as a side-effect of the load, and the engine stores
-  the flip for surfacing in the sidebar. This keeps the engine from
-  having to itself parse markdown.
-- `status = 'resolved'` is the soft-dismiss outcome: the comment is
-  hidden from the active sidebar but remains in the history surface.
-  Hard delete is not exposed in v1.
-- Author is `user:<email>` for human-authored comments. The
-  magic-wand path may produce _replies_ in v2; reserved syntax is
-  `magic_wand:<comment_id>` to keep them visually distinct.
+- `last_resolved_with` — drives the sidebar's fuzzy-re-anchor ⚠ glyph.
+- `plain_text_projection_version` — originally listed as a Phase 2
+  "worth spec'ing" risk mitigation; it shipped in Phase 2.
+- Timestamps are ISO-8601 `TEXT`, matching the rest of the engine
+  schema, rather than the sketched `INTEGER`.
 
-The work-items themselves do not gain any columns; comments are
-strictly auxiliary state. This means a work item's PR detection,
-ready-to-spawn check, attention items, and dispatch flow are
-unaffected by the addition of comments.
+**Status vocabulary (as evolved).** The original set was
+`active | dismissed | orphaned | resolved`. As-built:
+
+- `active`, `resolved`, `orphaned` work as designed; `orphaned` is
+  written by the engine's resolver (see above), not reported by the
+  renderer.
+- **Soft-dismiss lands on `resolved`, not `dismissed`**: the
+  `CommentsDismiss` RPC transitions to `resolved`, and `dismissed` is
+  reserved for a future hard-dismiss that has never been needed.
+- Phase 4 added a `dispatched` status (not in the original design) for
+  comments handed to a chore; the retirement migration
+  (`migrate_retire_magic_wand_dispatched_comments`) later removed it,
+  retiring any stranded rows.
+- The successor design added `in_revision`, `answering`, `answered`,
+  and `awaiting_followup` for the classifier/answer-agent flow.
+
+Work items themselves gained no columns; comments are strictly
+auxiliary state, so PR detection, ready-to-spawn checks, and dispatch
+flow were untouched by this project.
+
+`WorkComment`, `CreateCommentInput`, `CommentResolution`, and
+`ResolvedComment` live in `boss-protocol` (`types/comment.rs`), with
+`WorkComment` on the repo's `bon::Builder` convention.
 
 ### Doc-version invariant
 
-`doc_version` is a SHA-256 of the doc's _current plain-text
-projection_ at authoring time. The engine computes it; the renderer
-provides the plain text inline in the create RPC (so the engine and
-renderer agree on the input).
-
-The version is used in two places:
-
-1. **Magic-wand CAS** (Phase 3 / 4) — when the magic-wand result is
-   ready to apply, the engine compares the doc's current
-   plain-text hash against the comment's `doc_version`. Mismatch
-   triggers a conflict surface ("the doc changed since you
-   commented; reload and re-attach"), not a silent overwrite.
-2. **Anchor-resolution diagnostic** — the renderer can report "the
-   doc version stored on this comment doesn't match the version I
-   loaded" as a non-fatal warning; orphans become expected when this
-   happens. Useful telemetry.
-
-No general "history of doc versions" is stored. The version field is
-opaque, used only for equality comparison.
+`doc_version` is a SHA-256 of the doc's plain-text projection at
+authoring time; the renderer provides the plain text inline in the
+create RPC so engine and renderer agree on the input. It served two
+purposes as designed: the magic-wand apply CAS (mismatch → conflict
+surface, never a silent overwrite — this worked, and the CAS pattern
+carried into the successor design's revise flow) and an
+anchor-resolution diagnostic. No general history of doc versions is
+stored; the field is opaque and compared only for equality.
 
 ### RPCs and subscription topics
 
-New RPCs on the engine, served on the existing control socket and
-following the conventions in
-[`work-subscriptions`](work-subscriptions.md) and
-[`engine-app-rpc`](engine-app-rpc.md):
+As-built RPC surface (`protocol/src/wire.rs`; handlers in
+`engine/core/src/app/comments.rs`), all user-tier:
 
-- `comments_create(artifact_kind, artifact_id, doc_version,
-anchor, body) → Comment` — creates an `active` comment. Returns
-  the row.
-- `comments_list(artifact_kind, artifact_id, include_dismissed?)
-→ [Comment]` — fetches all comments for an artifact. Default
-  excludes `dismissed` and `resolved`.
-- `comments_update_anchor(comment_id, new_anchor, new_doc_version)
-→ Comment` — called by the renderer after re-anchoring on a fresh
-  load, when the anchor resolved fuzzy-match rather than exact-match.
-  Lets the engine learn the new shape so subsequent loads exact-match.
-- `comments_set_status(comment_id, status, actor) → Comment` —
-  dismiss / resolve / re-activate transitions. Resolves are
-  recoverable (`active` accepted as a transition); hard delete is
-  not exposed.
-- `comments_dispatch_magic_wand(comment_id) → DispatchHandle` — the
-  magic-wand entry point. Returns an execution-handle the UI can
-  subscribe to for status.
-- `comments_fetch_with_doc_version(artifact_kind, artifact_id) →
-{doc_text, doc_version, comments}` — convenience: one round-trip
-  to load both the doc text the engine has on record (for
-  work-item descriptions) and its current comments. PR-backed docs
-  return `doc_text = null` because the source-of-truth is the git
-  branch, not the engine.
+- `CommentsCreate` — creates an `active` comment.
+- `CommentsList` — comments for an artifact; default excludes
+  `resolved` and `dismissed`, but **orphans are always shown** so lost
+  anchors stay visible.
+- `CommentsResolve` — **not in the original design.** The renderer
+  posts the doc's plain-text projection; the engine resolves every
+  anchor (exact/fuzzy/orphan), persists re-anchors and orphan flips,
+  and returns per-comment `CommentResolution`s with character offsets
+  for highlight painting. This RPC subsumed both the planned
+  renderer-side resolver callback _and_ the planned
+  `comments_fetch_with_doc_version` convenience RPC, which was never
+  built.
+- `CommentsDismiss` — soft-dismiss (→ `resolved`).
+- `CommentsSetStatus` — explicit transitions among
+  `active`/`resolved`/`orphaned`.
+- `CommentsUpdateAnchor` — manual anchor rewrite; largely superseded
+  by `CommentsResolve` persisting fuzzy re-anchors itself.
 
-New subscription topic, following the invalidation-not-patch shape
-used everywhere else:
+The three magic-wand RPCs (`CommentsDispatchMagicWand`,
+`CommentsApplyMagicWand`, `CommentsDiscardMagicWand` — the single
+sketched RPC grew explicit apply/discard verbs during implementation)
+existed from Phase 3 until the retirement removed them. The successor
+design's RPCs (`CommentsReviseDoc`, answer-agent surface) are
+documented there.
 
-- `comments.artifact.<artifact_kind>:<artifact_id>` — fires
-  whenever any comment row on the artifact changes. Clients
-  refetch via `comments_list`.
+Subscription topic, exactly as designed
+(invalidation-not-patch, helper `comment_topic()` in `wire.rs`):
 
-Auth: `comments_*` RPCs are user-tier — both the SwiftUI app and
-worker sessions can read and write. The `comments_dispatch_magic_wand`
-RPC is gated to the Boss-session subtree (it spawns an agent;
-workers must not be able to trigger that themselves). See
-[control-plane tiers](main.md#control-plane).
+- `comments.artifact.<artifact_kind>:<artifact_id>` — fires on any
+  comment-row change; clients refetch via `CommentsList`. Publishing
+  uses a light invalidation path that skips work-graph reconcile.
 
 ### Comments on PR-backed docs
 
-When the doc being commented on is a markdown file under an active
-PR's branch (the design-doc viewer's primary case), the
-`artifact_id` is `"pr_doc:<repo_remote_url>:<branch>:<path>"`. The
-engine stores comments against that key directly.
+`artifact_id = "pr_doc:<repo_remote_url>:<branch>:<path>"`, parsed by
+right-splitting on `:` (SSH remote URLs contain colons).
 
-**Migration when a doc graduates from work-item description to
-PR.** When a design-task worker pushes its doc and a PR appears,
-existing comments attached to the work item's description should
-travel with it. The migration is a one-time operation triggered by
-`DesignDetector`'s `in_review` transition: every active comment
-with `artifact_kind = 'work_item'` and `artifact_id = <task_id>`
-is re-keyed to the new `pr_doc:<repo>:<branch>:<path>` artifact and
-re-anchored against the PR's doc text. Re-anchoring uses the
-existing fuzzy resolution; comments that can't re-anchor become
-orphans on the PR-doc side. The original work-item comments stay
-around at status `resolved` so the trail is visible.
+**Migration when a doc graduates from work-item description to PR.**
+`DesignDetector::on_design_pr_detected` (the `in_review` transition)
+calls `migrate_work_item_comments_to_pr_doc`: every active
+`work_item` comment for the task is _copied_ to a new row keyed to the
+`pr_doc:*` artifact, and the original is soft-resolved (actor
+`engine_design_detector`) so the trail is visible. The operation is
+idempotent across repeated detector polls. One divergence from the
+original plan: migrated comments are **not re-anchored at migration
+time** — the engine can't render markdown to plain text, so the new
+rows carry their old anchors and re-anchor naturally on the renderer's
+next `CommentsResolve` load.
 
-**Branch lifecycle.** When the PR's branch is deleted (merge,
-abandon), the `pr_doc:*` artifact id becomes stale. Comments on
-deleted branches transition to `orphaned` automatically (background
-sweep); the sidebar groups them under the artifact for archival
-viewing. They are never deleted server-side in v1.
+**Branch lifecycle.** The designed background sweep — transitioning
+`pr_doc` comments to `orphaned` when their branch is deleted — was
+never implemented; `orphaned` is only ever written by the anchor
+resolver. Comments on dead branches simply become unreachable (their
+viewer no longer opens). The successor design's reconciliation
+hooks (resolve-on-merge via `mark_chore_pr_merged`) cover the merge
+case; closed-without-merge remains an open gap tracked there.
 
 ### macOS app architecture
 
-A small new module under `tools/boss/app-macos/Sources/Comments/`
-hosts the comment overlay. Pieces:
+The module is `tools/boss/app-macos/Sources/Comments/`. The shipped
+shape differs from the original component sketch in several ways worth
+recording — most were deliberate refinements out of the #622
+validation pass.
 
-1. **`CommentLayer`** — a `ViewModifier` applied to a
-   `StructuredText` view. It owns:
-   - The `[Comment]` for the current artifact (loaded from engine).
-   - A `SelectionTracker` observing the underlying selection state.
-     SwiftUI's `.textSelection(.enabled)` exposes selections via
-     `NSTextView`-bridged callbacks on macOS; the tracker reflects
-     them into a SwiftUI `@StateObject` we can drive UI from.
-   - The rendered-plain-text → source-range → AST-node mapping
-     emitted by the markdown renderer (one walk per load).
-   - A computed `[(commentId, NSRange in plain text)]` derived by
-     resolving each comment's anchor against the plain-text
-     projection.
+1. **`CommentLayer`** — `@MainActor ObservableObject` owning the
+   comment list, popover state, resolution results, and flash state;
+   applied via the `.withComments()` ViewModifier (one line per
+   surface, as designed). Engine persistence flows through
+   **`CommentWire.swift`** (Codable mirrors of the protocol types +
+   `EngineClient` calls — the deferred half of #915).
 
-2. **`CommentPopover`** — a transient SwiftUI popover that appears
-   anchored to the current selection's bounding rect. Contains the
-   author field, the body editor, and a "Comment" submit button
-   (cmd-return). Submits via `comments_create`.
+2. **Selection capture** — the designed `SelectionTracker` over
+   NSTextView-bridged callbacks never materialised. As-built the app
+   probes for a selection non-destructively via an
+   `NSUserInterfaceValidations` "copy" validation check, and captures
+   the selected text by sending `copy:` to the first responder and
+   reading the pasteboard — an explicit trade-off accepted in Phase 1
+   (pasteboard clobber at explicit-click granularity) that the
+   refinement pass kept, only making the probe non-destructive.
 
-3. **`CommentHighlightOverlay`** — a `Canvas`-backed overlay sibling
-   to the `StructuredText` view that paints subtle background tints
-   for each `(commentId, NSRange)` pair. Uses
-   `NSLayoutManager.boundingRect(forGlyphRange:in:)` via a small AppKit
-   bridge to translate ranges into rects. Hover state on a highlight
-   bumps the tint and notifies the sidebar; click scrolls the sidebar
-   entry into view.
+3. **Entry triggers** (#622, all added beyond the original design):
+   typing any printable character while text is selected opens the
+   form with that character seeded into the body; right-clicking a
+   selection offers an "Add Comment" context menu; ⌘⇧K is the
+   keyboard shortcut (⌘⇧M was taken by the Metrics panel).
 
-4. **`CommentSidebar`** — a fixed-280pt right-side panel that
-   `MarkdownViewerView` and `DesignRendererView` opt into via a new
-   `.commentSidebar(artifact:)` modifier. Lists comments in document
-   order (sorted by anchor position). Each row shows author,
-   timestamp, snippet, the comment body, and three controls: dismiss,
-   resolve, magic-wand. Hovering a row scrolls and tints the
-   corresponding doc highlight (bidirectional cursor).
+4. **`CommentPopover`** — as-built a 320pt `.popover` anchored to a
+   fixed point near the top-left of the content area, not to the
+   selection's bounding rect as designed (Phase 1 had shipped a
+   centered modal sheet; #622 moved to the popover). **Return
+   submits, Shift+Return inserts a newline** via `CommentTextEditor`
+   (an NSTextView wrapper distinguishing `insertNewline` from
+   `insertNewlineIgnoringFieldEditor`) — the designed ⌘-return submit
+   was judged too much friction. The designed author field never
+   shipped; the selected-text echo in the form was removed once the
+   in-doc highlight showed the target.
 
-5. **`MagicWandResultSheet`** — modal sheet shown when a magic-wand
-   dispatch completes. Renders the _current_ doc and the _proposed_
-   doc side-by-side via two `StructuredText` views, with a single
-   "Apply" / "Discard" pair below. v1 does not implement an
-   intra-paragraph diff; the user is reading two renders of the
-   markdown and judging by eye. A real diff renderer is on the
-   post-v1 list.
+5. **Highlighting** — the designed Canvas-based
+   `CommentHighlightOverlay` with an `NSLayoutManager` rect bridge
+   was never built (the file exists but is vestigial). Instead,
+   **`HighlightingMarkdownParser`** wraps the markdown parser and
+   injects a yellow (0.45-opacity) background attribute on commented
+   spans, located by substring search against the plain-text
+   projection. Anchor offsets come from `CommentsResolve`.
 
-The sidebar appears only when the artifact has at least one comment
-_or_ the user has explicitly toggled it on; toggle state is per-view,
-not persisted. This keeps the chrome out of the way of users who
-aren't using the feature.
+6. **`CommentSidebar`** — fixed 280pt right panel, appearing only
+   when the artifact has ≥1 comment. The designed manual show/hide
+   toggle never shipped (the entry triggers made it unnecessary for
+   authoring the first comment); the only toggle is **"Show
+   resolved"** for the soft-dismiss history surface. Dismiss is an
+   `xmark.circle` at the card's top-right (macOS convention), moved
+   there in #622. Clicking a row **flashes the anchored span orange
+   for ~900 ms** (`CommentLayer.jumpTo`); the designed bidirectional
+   hover tint and scroll-to-anchor never shipped — precise
+   scroll-to-glyph needs the `NSLayoutManager` bridge that was
+   deferred and never picked up.
 
-### Magic-wand dispatch
+7. **Thread rendering** — `CommentThreadEntry.swift` renders the
+   successor design's engine-authored thread entries (nudges, answers,
+   operator follow-ups); documented there.
 
-Two routes, decided at dispatch time by the artifact kind.
+`MagicWandResultSheet` (side-by-side preview, Apply/Discard, conflict
+banner) shipped in Phase 3 and was deleted with the wand.
 
-#### Engine-owned doc → specialised isolated Claude
+### Magic wand — built, then retired
 
-For `artifact_kind = 'work_item'` (the doc lives in the engine's
-work-item description, not a PR branch), the engine spawns a
-**specialised Claude instance** — distinct from a Boss worker.
+Both dispatch routes shipped as designed in outline, then the whole
+mechanism was removed by
+[`comment-triggered-document-revisions`](comment-triggered-document-revisions.md).
+The as-built record, and why it died:
 
-**Where it runs.** A new engine module
-`tools/boss/engine/src/magic_wand.rs` makes a one-shot
-`messages.create` call against the Anthropic API directly (via the
-existing `anthropic-sdk` crate — same SDK Boss uses for its other
-direct-API calls). **No Claude Agent SDK, no tools, no system
-prompt beyond the inlined instructions.** The prompt is:
+#### Engine-owned docs → specialised isolated Claude (#970)
 
-````text
-You are editing a markdown document. The user has highlighted a
-section and left a comment. Apply their intent to the document and
-return the entire updated markdown verbatim.
+- `engine/core/src/magic_wand.rs` (the doc's sketched
+  `engine/src/magic_wand.rs` predated the engine's split into crates)
+  made a one-shot, non-streaming `messages.create` call —
+  `claude-sonnet-4-6`, `max_tokens` 8192, 120 s timeout — with **no
+  tools and no system prompt** beyond the inlined instructions, using
+  the same prompt shape this doc originally specified. The sandboxing
+  argument held: no filesystem, no environment, no memory between
+  invocations; worst case is garbage markdown caught by validation.
+- Transport was a hand-rolled `reqwest` client (pattern copied from
+  `pane_summary.rs`) — the doc's assumed `anthropic-sdk` crate did not
+  exist, and this predated the `claude_client` extraction.
+- Validation shipped with the designed values: hard-reject outside
+  [0.25×, 4×] source length; hard-reject when >60% of lines changed;
+  anchor-preservation _warning_ when the anchor text vanished **and**
+  > 30% of lines changed (the 30% is an implementation-chosen
+  > threshold).
+- `BOSS_MAGIC_WAND_API_KEY` with `ANTHROPIC_API_KEY` fallback shipped
+  exactly as designed; token counts recorded on
+  `magic_wand_dispatches` (as-designed schema plus an
+  `anchor_warning` column and, later, `chore_id`). The table survives
+  today as an unread historical record.
+- Dispatch was gated `RpcTier::AppOrBoss`; apply/discard were
+  deliberately left user-tier.
+- Apply ran the doc-version CAS exactly as designed: match →
+  overwrite description, dispatch → `applied`, comment → `resolved`;
+  mismatch → `conflict` + reload affordance. #970 attributed the
+  apply to `"user"` rather than the designed
+  `magic_wand:<comment_id>`; the follow-up fixing that (#1102) was
+  still unmerged when the wand was retired.
+- **The app-side dispatch button remained a stub** — #970 landed
+  before the app's Phase 2 persistence wiring, so the engine-owned
+  wand was never operable end-to-end from the UI.
 
-Document:
-```markdown
-<doc_text>
-````
+#### PR-backed docs → Boss chore worker (#1106)
 
-Highlighted section:
+- The dispatch handler grew a `match` on `artifact_kind`; the
+  `pr_doc` arm resolved the owning product from the repo remote URL
+  and created a chore directly via `WorkDb::create_chore` (in-process,
+  not the RPC round-trip the doc sketched), titled
+  ``Address comment on `<path>`: `<short_quote>` `` with a directive
+  embedding file, branch, quoted anchor, and comment body.
+- The designed PR-resume integration did not exist yet (T520); the
+  stopgap was steering the worker entirely through the directive
+  ("push to the existing PR branch. Do not open a new PR").
+- Attribution landed as chore provenance
+  (`created_via = "comment_dispatch:<comment_id>"`) rather than an
+  owner field. The comment moved to the new `dispatched` status at
+  spawn time; the designed close of the loop — flipping to `resolved`
+  when the worker finished — was never wired, so dispatched comments
+  parked until the retirement migration cleaned them up.
 
-> <anchor.exact>
+#### Why it was retired
 
-Comment:
-
-> <comment.body>
-
-Respond with only the updated markdown. Do not include any
-explanation, header, or trailing prose.
-
-````
-
-**No tool surface.** The model's response is the entire updated
-markdown as a single message. No `Bash`, no `Read`, no `Edit`, no
-`WebFetch`, no MCP — none of these tools are passed to the call.
-The instance literally cannot do anything except return text.
-
-**Sandboxing properties this gives us:**
-
-- No filesystem access of any kind.
-- No environment access.
-- No way to read or write outside the prompt/response.
-- No conversation memory between invocations (one-shot).
-- A bounded blast radius: the worst the model can do is return
-  garbage markdown; the diff sanity check below catches obviously
-  broken responses before they reach the user.
-
-**Validation before showing the preview:**
-
-1. **Length sanity** — the returned markdown must be within
-   [0.25×, 4×] the source length. Outside that envelope: surface an
-   error and discard.
-2. **Diff sanity** — compute the line-diff between source and
-   returned text; reject if >60% of lines changed. (Tunable; the
-   point is to catch "the model rewrote the whole doc" failures.)
-3. **Anchor preservation** — the source's `anchor.exact` text need
-   not survive verbatim in the result (the whole point of the magic
-   wand is sometimes to edit the highlighted section). But if the
-   result eliminates the section the comment was about *and* makes
-   wholesale changes elsewhere too, surface a warning in the
-   preview. The user decides.
-
-Validations 1 and 2 are hard rejects; 3 is a warning displayed in the
-preview sheet.
-
-**Billing and observability.** Magic-wand calls run against a
-dedicated Anthropic API key configured via the existing engine env
-surface (`BOSS_MAGIC_WAND_API_KEY`, falls back to the standard
-`ANTHROPIC_API_KEY` if unset — but the user can configure two keys
-to bucket spend separately). Token counts are recorded against a new
-`magic_wand_dispatches` table for observability:
-
-```sql
-CREATE TABLE magic_wand_dispatches (
-  id            TEXT PRIMARY KEY,
-  comment_id    TEXT NOT NULL REFERENCES work_comments(id),
-  artifact_kind TEXT NOT NULL,
-  artifact_id   TEXT NOT NULL,
-  doc_version   TEXT NOT NULL,            -- the version CAS'd on apply
-  status        TEXT NOT NULL,            -- 'in_flight' | 'returned' |
-                                          -- 'applied' | 'discarded' |
-                                          -- 'conflict' | 'failed'
-  input_tokens  INTEGER,
-  output_tokens INTEGER,
-  result_md     TEXT,                     -- the returned markdown
-                                          -- (null on failure)
-  error_kind    TEXT,
-  created_at    INTEGER NOT NULL,
-  resolved_at   INTEGER
-);
-````
-
-This table is the audit trail for "what did the magic wand do." It
-also feeds a future per-comment history surface.
-
-**Apply step.** When the user clicks "Apply" in the preview sheet,
-the engine compares the current `work_items.description`'s
-plain-text-projection SHA against the comment's `doc_version`. On
-match: the description is overwritten with the returned markdown,
-the dispatch row transitions to `applied`, the comment transitions
-to `resolved`. On mismatch: the dispatch row transitions to
-`conflict`, the comment stays `active`, and the preview sheet
-shows a "the doc changed since you commented" reload affordance.
-
-#### PR-backed doc → Boss chore worker
-
-For `artifact_kind = 'pr_doc'` (the doc lives on a PR branch), the
-engine instead dispatches a regular Boss chore worker.
-
-**Mechanism.** The engine creates a chore via the existing
-`create_chore` RPC with `repo_remote_url` and a synthetic title
-("Address comment on `<path>`: `<short_quote>`"). The chore's
-description (rendered into the worker's CLAUDE.md by the existing
-runner) encodes the comment intent:
-
-```text
-A reviewer left a comment on this PR's design doc.
-
-File: <path>
-Branch: <branch>
-PR: <pr_url>
-
-Quoted section:
-> <anchor.exact>
-
-Comment:
-> <comment.body>
-
-Please update the file accordingly and push to the existing PR
-branch. Do not open a new PR; this branch already has one.
-```
-
-The worker uses the existing PR-resume mechanism: the runner
-notices the branch already has an open PR and resumes the
-conversation on that branch rather than starting fresh. The
-worker's behaviour is then identical to addressing a GitHub review
-comment.
-
-**Why not the specialised path here too.** Two reasons. First, a
-PR-backed doc is, by definition, a doc whose changes go through
-review — the human is already going to see the diff on GitHub
-before merge, so the safety case for the specialised
-no-tools instance is weaker. Second, design docs and PR-tracked
-markdown often live next to code (a worker's CLAUDE.md, a config
-file, a snippet of bazel BUILD that the doc references) that the
-worker may need to read to understand the comment. The specialised
-instance, by design, can't do that.
-
-**Identity.** The dispatched chore is owned by a synthetic actor
-`comment_dispatch:<comment_id>` for audit-log purposes. The chore
-appears in the kanban under the parent product like any other; the
-sidebar's "the magic wand dispatched a worker" row links to the
-chore card.
+The wand assumed every comment wanted a mechanical edit. In practice
+comments carry three intents — directives, questions, and
+larger-change requests — and a single-comment auto-edit path serves
+none of them well: questions get over-applied, batches get
+under-specified. The successor design classifies every comment's
+intent and routes directives/larger-changes into the existing
+revision-task machinery (nudge, never auto-apply) and questions to a
+read-only answer agent. `magic_wand.rs`, the three RPCs, and
+`MagicWandResultSheet` are deleted; stranded `dispatched` comments
+were retired by migration.
 
 ### Versioning
 
-The narrow scope picked here is **comment-anchor CAS** only.
+The narrow scope held: **comment-anchor CAS only**. Each comment
+records the `doc_version` it was authored against; the apply step
+compared it before overwriting. No history, no rollback, no diff-view
+of past versions. Broader description history remains a separate
+project (`Work-item description history`).
 
-- Each comment records the `doc_version` it was authored against.
-- The magic-wand apply step compares that version against the doc's
-  current plain-text SHA. Mismatch → conflict, no overwrite.
-- That's it. No history, no rollback, no diff-view of past versions.
+## Decisions as-built (formerly "open questions")
 
-Broader description history — "show me the work-item description as
-it was last Tuesday" — is a separate project. The user has flagged it
-as a possible decompose target; it remains out of scope here and is
-filed as a follow-up project (`Work-item description history`) for
-the human to schedule independently. The choice is deliberate:
-introducing a general history mechanism alongside the comment system
-would couple two features whose UX and storage shapes are different.
+- **Prefix/suffix length**: 64 chars, word-boundary trimmed — shipped.
+- **Fuzzy thresholds**: ≥0.8 best / <0.7 runner-up — shipped, tunable
+  via env vars rather than per-product config.
+- **Deleted anchor element**: orphan, shown in the sidebar with its
+  original snippet, no highlight — shipped (engine flips the status).
+  Manual re-attach remains unbuilt.
+- **Sidebar**: 280pt fixed, right side — shipped. Appears only when
+  comments exist; the explicit toggle was dropped in favour of the
+  three authoring entry triggers. No auto-scroll; navigation is
+  click-to-flash (hover linkage and scroll-to-anchor never shipped).
+- **Threading**: single-level in this project; structured thread
+  entries arrived with the successor design.
+- **Cross-doc migration**: copy + soft-resolve originals on
+  `in_review`, re-anchor on next load — shipped.
+- **Magic-wand result UX**: side-by-side preview with explicit
+  Apply/Discard — shipped, then deleted with the wand. The successor
+  replaces preview-and-apply with nudge-toward-revision.
+- **Streaming**: non-streaming, as recommended; never revisited before
+  retirement.
+- **Concurrent commenters / permissions**: as designed — separate
+  rows, no locking; anyone can dismiss; `author`/`status_actor`
+  recorded but unused by UI.
 
-The user's stated phasing note — "rudimentary versioning of work item
-comments" — fits this CAS scope exactly. Anything broader is a
-separate project.
+## Risks — what materialised
 
-### Phase-N implementation breakdown
-
-Each phase is one implementation task under this project, with the
-phase ordering encoded as dependencies in the task graph.
-
-**Phase 1: UI shell.**
-
-- New `tools/boss/app-macos/Sources/Comments/` module.
-- `CommentLayer` + `CommentPopover` + `CommentHighlightOverlay` +
-  `CommentSidebar` over an in-memory `[Comment]` array on
-  `MarkdownViewerView` and `DesignRendererView`.
-- Selection → comment → sidebar → highlight → dismiss flow.
-- Naive `(line, offset, length)` anchoring (we throw it away on
-  view close).
-- No engine RPCs.
-- Acceptance: user can open any markdown viewer, select text,
-  attach a comment, see it in the sidebar, dismiss it. Closing
-  the window loses comments — acceptable for this phase.
-
-**Phase 2: Persistence + resilient anchoring.**
-
-- `work_comments` table migration in the engine.
-- `comments_*` RPCs and `comments.artifact.*` subscription topic.
-- Renderer plumbing for the plain-text-projection mapping and the
-  `TextQuoteSelector` resolver (exact + fuzzy + orphan).
-- `comments_update_anchor` callback for fuzzy re-resolves.
-- Soft-dismiss with a "show resolved" toggle in the sidebar.
-- Migration on `DesignDetector` `in_review` to re-key work-item
-  comments to `pr_doc:*` artifacts.
-- Acceptance: comments survive app restart and doc edits;
-  fuzzy-re-anchored comments update the engine; dismiss flows
-  through soft-resolve.
-
-**Phase 3: Magic wand (engine-owned docs).**
-
-- `magic_wand_dispatches` table.
-- `tools/boss/engine/src/magic_wand.rs` — the specialised
-  one-shot Claude call with no tools.
-- `comments_dispatch_magic_wand` RPC, gated to Boss-session subtree
-  auth tier.
-- `MagicWandResultSheet` side-by-side preview + apply/discard.
-- Doc-version CAS on apply.
-- Acceptance: clicking magic-wand on a comment against a work-item
-  description produces a preview sheet within ~30s; applying
-  overwrites the description; rejecting closes the sheet cleanly;
-  CAS conflicts surface a reload affordance.
-
-**Phase 4: Magic wand (PR-backed docs).**
-
-- Dispatch-branch logic in `comments_dispatch_magic_wand` for
-  `artifact_kind = 'pr_doc'`.
-- Synthetic chore creation with the comment-intent directive.
-- Hook into the existing PR-resume mechanism (worker resumes the
-  existing branch's conversation, doesn't open a new PR).
-- Audit-log linkage: the dispatch row references the spawned chore
-  id; the chore is owned by `comment_dispatch:<comment_id>`.
-- Acceptance: clicking magic-wand on a comment against a PR-tracked
-  design doc spawns a worker against the PR's branch, the worker
-  pushes a commit addressing the comment, the comment transitions
-  to `resolved` when the worker reports it's done.
-
-The four phases are filed as four implementation tasks under this
-project. Phase 1's task is `independent`; phases 2, 3, 4 each depend
-on the previous via the dependency graph. This way the human can
-pause after any phase and assess before committing to the next slice.
-
-## Open questions (answers)
-
-The brief raised a set of open questions. Resolved here, with the
-reasoning visible so the human can override on review.
-
-- **Anchoring detail.**
-  - Prefix/suffix length: **64 chars each**, trimmed at word
-    boundaries. Rationale above.
-  - Fuzzy threshold: **≥0.8 score** for the match, **<0.7** for the
-    second-best (uniqueness). Starting values from Hypothes.is;
-    tunable in engine config.
-  - Anchor's containing element deleted entirely: **orphan with
-    "anchor lost" badge** in the sidebar, no doc highlight. Manual
-    re-attach is a post-v1 affordance.
-- **Sidebar layout.**
-  - Fixed 280pt width, right side.
-  - Appears only when comments exist on the artifact or the user
-    explicitly toggles it. Toggle state per-view, not persisted.
-  - Does not auto-scroll to follow viewport in v1; the bidirectional
-    hover cursor is the navigation primitive. Auto-scroll-on-scroll
-    is a post-v1 consideration.
-- **Comment threading.** Single-level only in v1. Add threading
-  later if real usage demands it.
-- **Cross-doc comments.** Work-item-description comments migrate to
-  the PR's `pr_doc:*` artifact on `in_review` transition, via the
-  re-anchoring path. Originals stay at `status = 'resolved'` for
-  the trail. Detailed in [Comments on PR-backed docs](#comments-on-pr-backed-docs).
-- **Magic-wand result UX.** Side-by-side preview with explicit
-  Apply / Discard. Strongly recommended over one-click-apply for
-  v1; one-click is a possible future toggle once the failure modes
-  are well understood.
-- **Concurrent commenters.** Both comments attach as separate rows;
-  the sidebar lists both in document order. No locking, no merge.
-  (Single-user system today; this is forward-looking only.)
-- **Permissions.** Anyone can dismiss any comment. The `author`
-  column records the trail; a future ACL layer can grow into the
-  `status_actor` field.
-- **Magic-wand instance identity.** Engine-owned-doc dispatches
-  attribute the edit to `magic_wand:<comment_id>` on the
-  `magic_wand_dispatches` row. PR-backed dispatches attribute the
-  spawned chore to `comment_dispatch:<comment_id>` on the
-  worker-side audit log.
-
-### Constraint compliance
-
-- **Engine owns reconciliation; UI is a thin client.** Comments
-  live in the engine. The renderer reads them, paints them, and
-  reports anchor-resolution outcomes; it does not own truth.
-- **Use `T<n>` / `P<n>` short-id forms** — comments use prefix
-  `cmt_` internally (no short-id form in scope for v1, since
-  comments are scoped to the doc they're attached to and don't
-  need to be referenced from a CLI). No `C<n>` form is introduced.
-- **No invented CLI verbs.** This design adds RPCs but not CLI
-  verbs. A future `boss comment list <task-id>` is plausible but
-  out of scope here.
-- **Specialised-Claude path: in-band or out-of-band?** It runs
-  **in-band**, in the engine, via a direct one-shot
-  `messages.create` against a separate API key (or budget bucket).
-  Observability lands in the new `magic_wand_dispatches` table.
-  Decision rationale: keeping it in the engine keeps reconciliation
-  simple (same SQLite, same subscription stream) and the
-  no-tools-no-system-prompt sandboxing is strong enough that a
-  separate runtime would not materially raise the security bar.
-
-## Risks and open questions
-
-- **Risk: anchoring on rendered plain text means the renderer is in
-  the trust path for selectors.** If the renderer's plain-text
-  projection ever drifts between versions (e.g. a future Textual
-  upgrade changes how a code-block fence is rendered), existing
-  anchors may all silently start orphaning. _Mitigation_: the
-  `doc_version` field will catch coarse drift (the hash changes when
-  the projection changes), and the renderer can emit a "projection
-  algorithm version" header alongside the plain text so the engine
-  knows to re-anchor everything once on a renderer upgrade. Worth
-  spec'ing a `plain_text_projection_version` field; deferred to
-  Phase 2 implementation.
-- **Risk: fuzzy re-anchor false positives.** A 0.8 threshold will
-  occasionally re-anchor a comment to the wrong piece of text on
-  heavily edited docs. _Mitigation_: the fuzzy outcome is recorded
-  on `comments_update_anchor` so the user sees "this comment
-  re-anchored fuzzily" in the sidebar (e.g. a small ⚠ glyph) and
-  can sanity-check.
-- **Risk: magic-wand instance returning subtly broken markdown
-  (mis-indented code, dropped fence).** The diff-sanity check
-  rejects gross failures, but subtle ones reach the preview sheet
-  and rely on the human to spot. _Mitigation_: the side-by-side
-  preview is the explicit checkpoint; the human is in the loop.
-  If we see this fail in practice, add a "the result fails to
-  parse as markdown" reject (parse with Textual's underlying parser
-  before showing the sheet).
-- **Risk: cost / token budget on magic-wand calls.** Long docs
-  consume non-trivial input tokens, and a chatty user can ring up
-  many dispatches. _Mitigation_: separate API key allows budget
-  bucketing; the `magic_wand_dispatches` table makes per-comment
-  cost trivially reportable. A per-day budget cap is a v2 add if
+- **Renderer in the trust path for selectors**: mitigated as
+  spec'd — `plain_text_projection_version` shipped in Phase 2.
+- **Fuzzy false positives**: the `last_resolved_with = 'fuzzy'` marker
+  and sidebar ⚠ glyph shipped as the designed mitigation.
+- **Wand returning subtly broken markdown**: the human-in-the-loop
+  preview was the checkpoint; the deeper problem turned out to be
+  upstream — the wand couldn't tell whether an edit was wanted at all.
+  This risk section under-scoped the real failure mode, which is what
+  killed the feature.
+- **Cost/budget on wand calls**: never became real before retirement;
+  the separate-key bucketing shipped and the per-day cap was never
   needed.
-- **Open question for human review: should the specialised-Claude
-  path run a non-streaming or streaming call?** Streaming would
-  let the preview sheet render progressively; non-streaming is
-  simpler and gets validated-or-rejected as one atomic result.
-  Recommend non-streaming for v1; revisit if latency feels bad.
-- **Open question: do orphaned comments contribute to the sidebar's
-  comment count, or render in a collapsed "lost anchors" group?**
-  Recommend collapsed group; keeps the main sidebar clean.
-
-## Follow-up implementation tasks
-
-Once this design is approved, file the four implementation tasks
-sketched in [Phase-N breakdown](#phase-n-implementation-breakdown) as
-dependent siblings under this project (Phase 1 independent; Phases 2,
-3, 4 each depending on the previous).
-
-Also file the separate project **`Work-item description history`** —
-distinct from this work, scoped to a general "show me prior versions
-of a description" feature — for the human to schedule independently.
 
 ## Related designs
 
+- [`comment-triggered-document-revisions`](comment-triggered-document-revisions.md)
+  — the successor: intent classification, revision nudges, the
+  read-only answer agent, and the magic-wand retirement migration.
+- [`revision-tasks`](revision-tasks.md) — the revision substrate the
+  successor routes directive comments into.
 - [`markdown-renderer-migration`](markdown-renderer-migration.md) —
   the renderer this overlay attaches to.
-- [`design-producing-tasks`](design-producing-tasks.md) — design
-  doc lifecycle, including the `in_review` transition that triggers
-  the work-item→pr_doc comment migration.
+- [`design-producing-tasks`](design-producing-tasks.md) — design-doc
+  lifecycle, including the `in_review` transition that triggers the
+  work-item→pr_doc comment migration.
 - [`project-design-doc-pointer`](project-design-doc-pointer.md) —
-  how a project's design doc is located, used to resolve the
-  artifact id for `pr_doc:*` comments.
-- [`work-execution`](work-execution.md) — the execution / run /
-  attention plumbing the magic-wand-via-chore path leans on.
-- [`engine-app-rpc`](engine-app-rpc.md) — RPC conventions the new
+  how a project's design doc is located, used to resolve the artifact
+  id for `pr_doc:*` comments.
+- [`engine-app-rpc`](engine-app-rpc.md) — RPC conventions the
   `comments_*` calls follow.
 - [`work-subscriptions`](work-subscriptions.md) — the topic shape
-  the new `comments.artifact.*` topic follows.
+  `comments.artifact.*` follows.
