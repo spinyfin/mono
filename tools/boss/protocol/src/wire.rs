@@ -1798,9 +1798,11 @@ pub enum FrontendRequest {
         token: String,
     },
 
-    /// Report whether a Trunk org API token is configured (env override
-    /// or keychain) and, when one is, run a live smoke check against
-    /// Trunk's queue API. Replies with [`FrontendEvent::TrunkStatus`].
+    /// Report whether a Trunk org API token is configured (env override or
+    /// keychain). Once a `trunk_queue`-mechanism product exists, the reply
+    /// will also carry a live `getQueue` smoke-check result in
+    /// `queue_check`; until then that field is always unset. Replies with
+    /// [`FrontendEvent::TrunkStatus`].
     TrunkStatus,
 
     /// Remove the external-tracker binding from a work item. Clears the

@@ -10,6 +10,7 @@ members = [
   "tools/boss/github",
   "tools/boss/github_tracker",
   "tools/boss/http_retry",
+  "tools/boss/keychain",
   "tools/boss/engine/automation-dedup",
   "tools/boss/engine/automation-schedule",
   "tools/boss/engine/ci-log-reader",

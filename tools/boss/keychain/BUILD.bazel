@@ -4,35 +4,30 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "trunk_auth",
+    name = "keychain",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_trunk_auth",
+    crate_name = "boss_keychain",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    # Minimal visibility: only the engine provisions/reads the Trunk token.
+    # Minimal visibility: only the two OS-keychain-backed token stores use this.
     visibility = [
-        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/github_tracker:__pkg__",
+        "//tools/boss/trunk_auth:__pkg__",
     ],
-    deps = [
-        "//tools/boss/keychain",
-        "//tools/boss/trunk_client",
-    ] + all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "trunk_auth_test",
+    name = "keychain_test",
     size = "small",
-    crate = ":trunk_auth",
+    crate = ":keychain",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [
-        "//tools/boss/keychain",
-        "//tools/boss/trunk_client",
-    ] + all_crate_deps(
+    deps = all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
