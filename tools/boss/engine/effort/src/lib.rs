@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use boss_protocol::EffortLevel;
+use boss_protocol::{EffortLevel, TaskKind};
 
 use boss_engine_driver::AgentDriver;
 
@@ -111,22 +111,46 @@ fn menu_for_driver(_driver_slug: &str) -> &'static boss_engine_driver::ModelMenu
     &boss_engine_driver::ClaudeDriver.descriptor().model_menu
 }
 
+/// True iff `kind` belongs to the design family — `Design`, `DesignPostmortem`,
+/// or `Investigation` — which [`resolve_spawn_config`] floors to Opus at every
+/// effort level, independent of the effort-level table. These three kinds are
+/// non-review, non-answer-agent design/investigation work (see
+/// `work_item_task_kind_enum` callers in `engine/core`'s `runner.rs`); they
+/// share the same floor because they share the same failure mode — a
+/// medium-or-lower effort classification on genuinely open-ended design work
+/// otherwise silently dispatches to Sonnet.
+pub fn is_design_family_kind(kind: &TaskKind) -> bool {
+    matches!(
+        kind,
+        TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem
+    )
+}
+
 /// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
-/// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5):
+/// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5, and
+/// the design-family kind floor):
 /// 1. `tasks.model_override` (when non-empty after trim).
 /// 2. `pool_model_override` — the owning pool's override (when non-empty
 ///    after trim). Both the automation pool and the review pool set this to
 ///    `"opus"` unconditionally, so reviewer agents and automation agents are
 ///    always Opus regardless of the row's effort level. Pass `None` for
 ///    main-pool executions.
-/// 3. Effort-level default — from the selected driver's model menu.
-/// 4. `products.default_model` (when non-empty after trim).
-/// 5. Driver's engine-default model (from [`boss_engine_driver::ModelMenu::engine_default`]).
+/// 3. Design-family kind floor — `kind` is `Design`, `DesignPostmortem`, or
+///    `Investigation` ([`is_design_family_kind`]) → `"opus"`, regardless of
+///    `effort_level`. This is a genuine model floor, not an effort bump: a
+///    `medium`-effort design_postmortem must not fall through to the
+///    effort-level table's Sonnet row. An explicit `tasks.model_override`
+///    (step 1) still wins over the floor — it is the sanctioned escape
+///    hatch, mirroring how the pool override composes.
+/// 4. Effort-level default — from the selected driver's model menu.
+/// 5. `products.default_model` (when non-empty after trim).
+/// 6. Driver's engine-default model (from [`boss_engine_driver::ModelMenu::engine_default`]).
 ///
 /// The effort value and prompt addendum follow `effort_level` only via the
-/// driver's menu; neither `model_override` nor `pool_model_override` changes
-/// them (design §Q3: "a user who overrides to Haiku on a `medium` row is asking
-/// 'use Haiku for this one,' not 'treat this as a trivial.'").
+/// driver's menu; neither `model_override`, `pool_model_override`, nor the
+/// kind floor changes them (design §Q3: "a user who overrides to Haiku on a
+/// `medium` row is asking 'use Haiku for this one,' not 'treat this as a
+/// trivial.'").
 pub fn resolve_spawn_config(
     effort_level: Option<EffortLevel>,
     model_override: Option<&str>,
@@ -134,6 +158,7 @@ pub fn resolve_spawn_config(
     product_default_model: Option<&str>,
     task_driver: Option<&str>,
     product_default_driver: Option<&str>,
+    kind: Option<&TaskKind>,
 ) -> SpawnConfig {
     let driver = resolve_driver(task_driver, product_default_driver);
     let menu = menu_for_driver(&driver);
@@ -142,6 +167,8 @@ pub fn resolve_spawn_config(
         m.to_owned()
     } else if let Some(m) = pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
+    } else if kind.is_some_and(is_design_family_kind) {
+        "opus".to_owned()
     } else if let Some(level) = effort_level {
         (menu.default_model_for_level)(level).to_owned()
     } else if let Some(pd) = product_default_model.map(str::trim).filter(|s| !s.is_empty()) {
@@ -356,7 +383,7 @@ mod tests {
 
     #[test]
     fn null_row_falls_through_to_engine_default() {
-        let cfg = resolve_spawn_config(None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None, None);
         assert_eq!(cfg.effort_level, None);
         assert_eq!(cfg.claude_effort, None);
         // Falls through to Claude driver's engine_default ("opus").
@@ -369,14 +396,14 @@ mod tests {
 
     #[test]
     fn null_row_with_product_default_uses_product_default() {
-        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"), None, None);
+        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"), None, None, None);
         assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.claude_effort, None);
     }
 
     #[test]
     fn empty_product_default_does_not_satisfy_precedence_step_3() {
-        let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None);
+        let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None, None);
         // Falls through to Claude driver's engine_default ("opus").
         assert_eq!(
             cfg.model,
@@ -388,17 +415,17 @@ mod tests {
     fn effort_level_alone_picks_level_default_model() {
         // #746: Trivial maps to Sonnet, not Haiku — only the effort
         // value stays `low`.
-        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None);
+        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None);
         assert_eq!(trivial.model, "sonnet");
         assert_eq!(trivial.claude_effort, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
-        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None, None, None);
+        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None, None, None, None);
         assert_eq!(small.model, "sonnet");
         assert_eq!(small.claude_effort, Some("medium"));
         assert_eq!(small.prompt_addendum, None);
 
-        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None);
+        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, None);
         assert_eq!(medium.model, "sonnet");
         assert_eq!(medium.claude_effort, Some("high"));
         assert!(
@@ -406,12 +433,12 @@ mod tests {
             "medium addendum should be the 'sketch a plan' nudge",
         );
 
-        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None, None, None);
+        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None, None, None, None);
         assert_eq!(large.model, "opus");
         assert_eq!(large.claude_effort, Some("xhigh"));
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
-        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
+        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None);
         // The effort-level→model table tops out at Opus for every level,
         // including Max — Fable is opt-in only via an explicit
         // model_override, never a table default.
@@ -455,6 +482,7 @@ mod tests {
             Some("claude-sonnet-4-6"),
             None,
             None,
+            None,
         );
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("high"));
@@ -470,6 +498,7 @@ mod tests {
             Some("claude-opus-4-7"),
             None,
             None,
+            None,
         );
         assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
         assert_eq!(cfg.claude_effort, None);
@@ -483,7 +512,7 @@ mod tests {
         // canonicalises empty → NULL on insert, but the dispatcher
         // tolerates the looser shape so a hand-edited DB row doesn't
         // produce `claude --model ""`.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None, None, None, None);
         assert_eq!(cfg.model, "opus");
     }
 
@@ -491,7 +520,7 @@ mod tests {
     fn null_row_invocation_matches_today_plus_explicit_model() {
         // Untagged rows fall through to the driver's engine_default (Opus for Claude).
         // Must carry --permission-mode auto (Opus) and no --effort.
-        let cfg = resolve_spawn_config(None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -504,7 +533,7 @@ mod tests {
         // `--settings '<path>'`, positioned before the trailing prompt
         // arg so claude parses it as a flag, and single-quoted so a
         // path with spaces survives the pane shell.
-        let cfg = resolve_spawn_config(None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None, None);
         let path = Path::new("/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json");
         let inv = cfg.claude_invocation(false, Some(path));
         assert!(
@@ -523,7 +552,7 @@ mod tests {
     fn trivial_invocation_includes_both_flags() {
         // #746: Trivial spawns Sonnet (never Haiku) at --effort low.
         // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model sonnet --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -533,7 +562,7 @@ mod tests {
     #[test]
     fn medium_with_override_uses_override_model_and_medium_effort() {
         // model_override = "opus" → Opus family → --permission-mode auto.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -676,7 +705,7 @@ mod tests {
         // The effort-level→model table tops out at Opus for every level,
         // including Max. Fable is still reachable, but only via an explicit
         // model_override.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("max"));
         let inv = cfg.claude_invocation(false, None);
@@ -701,7 +730,7 @@ mod tests {
         // The hand-set, per-row opt-in: an explicit model_override is the
         // only way a spawn resolves to Fable now (precedence step 1, ahead
         // of the effort-level default).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), Some("fable"), None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), Some("fable"), None, None, None, None, None);
         assert_eq!(cfg.model, "fable");
         let inv = cfg.claude_invocation(false, None);
         assert!(
@@ -814,12 +843,20 @@ mod tests {
         // the pool override, but a task-level model_override still wins.
 
         // Pool override beats effort default (Small → Sonnet normally, Opus via pool).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None, None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("medium"));
 
         // Task model_override beats pool override.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), Some("sonnet"), Some("opus"), None, None, None);
+        let cfg = resolve_spawn_config(
+            Some(EffortLevel::Small),
+            Some("sonnet"),
+            Some("opus"),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(cfg.model, "sonnet");
         assert_eq!(cfg.claude_effort, Some("medium"));
     }
@@ -827,11 +864,11 @@ mod tests {
     #[test]
     fn pool_override_beats_product_default_and_engine_default() {
         // Pool override beats product default_model.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"), None, None);
+        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"), None, None, None);
         assert_eq!(cfg.model, "opus");
 
         // Pool override beats engine default.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), None, None, None);
+        let cfg = resolve_spawn_config(None, None, Some("opus"), None, None, None, None);
         assert_eq!(cfg.model, "opus");
     }
 
@@ -839,7 +876,7 @@ mod tests {
     fn empty_pool_override_falls_through_to_effort_default() {
         // An empty/whitespace pool override is the same as no override — the
         // effort default still applies.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None, None, None, None);
         assert_eq!(cfg.model, "sonnet");
     }
 
@@ -847,9 +884,114 @@ mod tests {
     fn pool_override_does_not_change_effort_or_addendum() {
         // Pool override changes the model only; effort + addendum still follow
         // effort_level (mirrors the task-level model_override rule in §Q3).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None, None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
+    }
+
+    // --- design-family kind floor ---
+
+    #[test]
+    fn design_family_kinds_floor_to_opus_at_every_effort_level() {
+        // T711 regression: design_postmortem at medium must not fall through
+        // to the effort table's Sonnet row. All three design-family kinds
+        // float to Opus at trivial/small/medium (where the table would
+        // otherwise pick Sonnet) and stay Opus at large/max (where the table
+        // already picks Opus).
+        for kind in [TaskKind::Design, TaskKind::DesignPostmortem, TaskKind::Investigation] {
+            for level in [
+                EffortLevel::Trivial,
+                EffortLevel::Small,
+                EffortLevel::Medium,
+                EffortLevel::Large,
+                EffortLevel::Max,
+            ] {
+                let cfg = resolve_spawn_config(Some(level), None, None, None, None, None, Some(&kind));
+                assert_eq!(
+                    cfg.model, "opus",
+                    "kind {kind:?} at effort {level:?} must floor to opus, got {:?}",
+                    cfg.model
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn design_family_kind_floor_does_not_change_effort_or_addendum() {
+        // The floor changes the model only; effort value + prompt addendum
+        // still follow `effort_level` (same contract as model_override and
+        // pool_model_override).
+        let cfg = resolve_spawn_config(
+            Some(EffortLevel::Medium),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&TaskKind::DesignPostmortem),
+        );
+        assert_eq!(cfg.model, "opus");
+        assert_eq!(cfg.claude_effort, Some("high"));
+        assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
+    }
+
+    #[test]
+    fn non_design_family_kind_is_unaffected_by_the_floor() {
+        // Regression guard: a non-design kind (e.g. a plain Chore) at medium
+        // must still resolve to Sonnet from the effort table — the floor is
+        // scoped to the design family only.
+        for kind in [TaskKind::Chore, TaskKind::Task, TaskKind::Revision, TaskKind::Followup] {
+            let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, Some(&kind));
+            assert_eq!(
+                cfg.model, "sonnet",
+                "kind {kind:?} at medium must still resolve to sonnet"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_model_override_beats_the_design_family_floor() {
+        // Per the PR's stated precedence: an explicit tasks.model_override
+        // is the sanctioned escape hatch and still wins over the kind floor,
+        // even when it names a lower tier than Opus.
+        let cfg = resolve_spawn_config(
+            Some(EffortLevel::Medium),
+            Some("sonnet"),
+            None,
+            None,
+            None,
+            None,
+            Some(&TaskKind::DesignPostmortem),
+        );
+        assert_eq!(cfg.model, "sonnet");
+    }
+
+    #[test]
+    fn design_family_floor_beats_product_default_model() {
+        // The floor must override step 4 (products.default_model), not just
+        // step 3 (the effort table).
+        let cfg = resolve_spawn_config(
+            Some(EffortLevel::Trivial),
+            None,
+            None,
+            Some("claude-sonnet-4-6"),
+            None,
+            None,
+            Some(&TaskKind::Investigation),
+        );
+        assert_eq!(cfg.model, "opus");
+    }
+
+    #[test]
+    fn is_design_family_kind_partitions_task_kind() {
+        assert!(is_design_family_kind(&TaskKind::Design));
+        assert!(is_design_family_kind(&TaskKind::DesignPostmortem));
+        assert!(is_design_family_kind(&TaskKind::Investigation));
+        assert!(!is_design_family_kind(&TaskKind::Chore));
+        assert!(!is_design_family_kind(&TaskKind::Task));
+        assert!(!is_design_family_kind(&TaskKind::Revision));
+        assert!(!is_design_family_kind(&TaskKind::Followup));
+        assert!(!is_design_family_kind(&TaskKind::ProjectTask));
     }
 }
