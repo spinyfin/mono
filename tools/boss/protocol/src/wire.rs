@@ -19,6 +19,14 @@ use crate::types::{
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
+/// Outcome of the live `getQueue` smoke check `boss engine trunk status`
+/// runs against a `trunk_queue`-mechanism product's queue, once one exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkQueueCheckDto {
+    pub ok: bool,
+    pub detail: String,
+}
+
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 
 /// Global topic carrying GitHub OAuth auth-state pushes
@@ -1780,6 +1788,20 @@ pub enum FrontendRequest {
         #[serde(default)]
         repo: Option<String>,
     },
+
+    /// Store the Trunk org API token, provisioned by `boss engine trunk
+    /// set-token` (read from stdin/prompt on the CLI side — never argv).
+    /// Persisted to the OS keychain; never logged, never written to the
+    /// DB or repo. Replies with [`FrontendEvent::TrunkStatus`] reflecting
+    /// the newly stored token.
+    TrunkSetToken {
+        token: String,
+    },
+
+    /// Report whether a Trunk org API token is configured (env override
+    /// or keychain) and, when one is, run a live smoke check against
+    /// Trunk's queue API. Replies with [`FrontendEvent::TrunkStatus`].
+    TrunkStatus,
 
     /// Remove the external-tracker binding from a work item. Clears the
     /// `external_ref_*` columns without touching other fields. Replies with

@@ -63,6 +63,7 @@ rust_library(
         "//tools/boss/github_tracker",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
+        "//tools/boss/trunk_auth",
     ] + all_crate_deps(normal = True),
 )
 

@@ -36,6 +36,7 @@ members = [
   "tools/boss/engine/transcript-tail",
   "tools/boss/engine/transient-error",
   "tools/boss/engine/utils",
+  "tools/boss/trunk_auth",
   "tools/boss/trunk_client",
   "tools/hood",
   "tools/checkleft",

@@ -4,34 +4,33 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "trunk_client",
+    name = "trunk_auth",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = glob(["src/testdata/**"]),
-    crate_name = "boss_trunk_client",
+    crate_name = "boss_trunk_auth",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    # Minimal visibility: only the engine talks to Trunk's queue API, plus
-    # the sibling token-storage crate that implements TrunkTokenProvider.
+    # Minimal visibility: only the engine provisions/reads the Trunk token.
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/trunk_auth:__pkg__",
     ],
-    deps = all_crate_deps(normal = True) + [
-        "//tools/boss/http_retry",
-    ],
+    deps = [
+        "//tools/boss/trunk_client",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "trunk_client_test",
+    name = "trunk_auth_test",
     size = "small",
-    crate = ":trunk_client",
+    crate = ":trunk_auth",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/trunk_client",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
