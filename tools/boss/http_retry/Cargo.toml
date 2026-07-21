@@ -1,0 +1,10 @@
+[package]
+name = "boss-http-retry"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+fastrand = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rustls = { workspace = true }

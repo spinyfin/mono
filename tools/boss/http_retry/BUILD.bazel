@@ -4,24 +4,22 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "claude_client",
+    name = "http_retry",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_claude_client",
+    crate_name = "boss_http_retry",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss:__subpackages__",
     ],
-    deps = all_crate_deps(normal = True) + [
-        "//tools/boss/http_retry",
-    ],
+    deps = all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "claude_client_test",
+    name = "http_retry_test",
     size = "small",
-    crate = ":claude_client",
+    crate = ":http_retry",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

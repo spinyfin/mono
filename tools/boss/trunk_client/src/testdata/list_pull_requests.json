@@ -1,0 +1,18 @@
+{
+  "pullRequests": [
+    {
+      "id": "entry_100",
+      "state": "merged",
+      "prNumber": 970,
+      "prTitle": "Fix flaky test",
+      "prAuthor": "brianduff"
+    },
+    {
+      "id": "entry_101",
+      "state": "quarantined",
+      "prNumber": 971,
+      "prTitle": "A PR in a state this client doesn't know about yet"
+    }
+  ],
+  "nextCursor": "cursor-abc"
+}

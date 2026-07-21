@@ -279,8 +279,7 @@ name = "boss-claude-client"
 version = "0.1.0"
 dependencies = [
  "bon",
- "reqwest",
- "rustls",
+ "boss-http-retry",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -550,6 +549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-http-retry"
+version = "0.1.0"
+dependencies = [
+ "fastrand 2.4.1",
+ "reqwest",
+ "rustls",
+]
+
+[[package]]
 name = "boss-log-files"
 version = "0.1.0"
 dependencies = [
@@ -612,6 +620,21 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "boss-trunk-client"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-http-retry",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
