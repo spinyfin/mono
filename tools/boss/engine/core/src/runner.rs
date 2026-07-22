@@ -1249,6 +1249,11 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
+    // Products and projects do not have a TaskKind; only Task/Chore rows
+    // carry one. Threaded into `resolve_spawn_config` so design-family kinds
+    // (`Design` / `DesignPostmortem` / `Investigation`) floor to Opus
+    // regardless of effort level, and reused below for the capability gate.
+    let work_item_kind = work_item_task_kind_enum(work_item);
     let spawn_config = resolve_spawn_config(
         row_effort,
         row_model_override.as_deref(),
@@ -1256,12 +1261,13 @@ pub(crate) async fn compose_worker_spawn(
         product_default_model.as_deref(),
         row_driver.as_deref(),
         product_default_driver.as_deref(),
+        work_item_kind,
     );
 
     // Capability gate: fail closed before the pane spawns when the resolved
     // driver cannot satisfy the work-item kind's requirements. Products and
     // projects do not have a TaskKind; only Task/Chore rows are gated.
-    if let Some(kind) = work_item_task_kind_enum(work_item) {
+    if let Some(kind) = work_item_kind {
         let registry = crate::driver::DriverRegistry::default();
         match registry.resolver(&spawn_config.driver) {
             Some(resolver) => {
