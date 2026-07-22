@@ -150,51 +150,15 @@ pub fn hit_lines(hits: &[BossConstructHit]) -> Vec<String> {
         .collect()
 }
 
-/// Render an authoritative reviewer-prompt block for a set of deterministic
-/// Boss-construct-id sweep lines (from [`hit_lines`]). Returns an empty
-/// string when there are no hits, so the caller can unconditionally
-/// interpolate it.
-///
-/// The block converts each hit into a forced disposition: the reviewer must
-/// either raise it as an `agent_isms` finding or explicitly state why it is
-/// not one. It does not decide the disposition itself — like
-/// [`crate::supersession_scan`], it guarantees the candidate is not silently
-/// overlooked.
-pub fn render_boss_construct_sweep_block(flag_lines: &[String]) -> String {
-    if flag_lines.is_empty() {
-        return String::new();
-    }
-    let mut out = String::new();
-    out.push_str("## Boss work-item id sweep (engine-computed) — CRITICAL\n\n");
-    out.push_str(
-        "The engine's deterministic scan found bare Boss work-item id tokens \
-         (`T<n>`/`P<n>`) in this PR's added diff lines and/or its title or \
-         description. In a Boss-managed repo every such bare token IS a Boss \
-         work-item id — there is no other tracker using this format. \
-         Pre-existing `T<n>`/`P<n>` references already in the repo are \
-         earlier leaks and never legitimize new ones, and an id appearing in \
-         this prompt's own Task description is evidence FOR a violation if \
-         the worker echoed it into the PR, not evidence the id is ordinary \
-         project vocabulary — see the agent-isms rubric's Boss-construct \
-         sub-rule above.\n\n\
-         For EACH candidate below you MUST either raise it as an \
-         `agent_isms` finding, or explicitly state in your review why it is \
-         not one. Silently skipping a candidate is not an acceptable \
-         disposition.\n\n\
-         Candidates:\n\n",
-    );
-    for line in flag_lines {
-        out.push_str(&format!(
-            "- candidate Boss-construct reference {line} — you must either flag it as a finding or state why it is not one.\n"
-        ));
-    }
-    out.push('\n');
-    out
-}
+// Rendering of the reviewer-prompt block for these hits lives in
+// `boss-pr-review` (it is reviewer-prompt text, and lives next to the
+// prompt that interpolates it); the deterministic scan that produces the
+// hit lines stays here. See `boss_pr_review::render_boss_construct_sweep_block`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_pr_review::render_boss_construct_sweep_block;
 
     #[test]
     fn scans_added_diff_lines_and_resolves_file_line() {

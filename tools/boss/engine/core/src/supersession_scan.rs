@@ -145,50 +145,15 @@ pub fn hit_lines(hits: &[SupersessionHit]) -> Vec<String> {
         .collect()
 }
 
-/// Render an authoritative reviewer-prompt block for a set of deterministic
-/// supersession flag lines (from [`hit_lines`]). Returns an empty string when
-/// there are no flags, so the caller can unconditionally interpolate it.
-///
-/// The block is phrased so the reviewer must *verify a design-doc citation*
-/// for each flagged claim — the reviewer's job is verification, the engine's
-/// job (this scan) is to guarantee the claim is not silently overlooked.
-pub fn render_supersession_flag_block(flag_lines: &[String]) -> String {
-    if flag_lines.is_empty() {
-        return String::new();
-    }
-    let mut out = String::new();
-    out.push_str("## Supersession-claim citation check (engine-flagged) — CRITICAL\n\n");
-    out.push_str(
-        "The engine's deterministic scan found **supersession / obsolescence \
-         language** in this PR's body, commits, or comments. A claim that one \
-         surface \"supersedes\", \"obsoletes\", \"replaces\", is \"now-dead\", \
-         or is \"orphaned\" is a **design decision** the worker is not \
-         authorised to make unilaterally — in incident-002 exactly such a \
-         narrative laundered the deletion of a merged feature that the design \
-         doc specified as a sibling surface.\n\n\
-         For EACH flagged phrase below you MUST verify:\n\n\
-         1. Does the PR cite a specific **design doc + section** that authorises \
-         the supersession? (A clean build, \"it looks dead\", or \"this same PR \
-         removed its only caller\" are NOT authorisation.)\n\
-         2. Read the cited section. Does it **actually support** the claim (say \
-         the surface is replaced), or does it contradict it (specify the \
-         surface as still-required / a sibling)?\n\n\
-         If a flagged claim has no design-doc citation, or the citation does not \
-         support it, raise a `regression` finding: the removal it justifies is \
-         presumptively wrong and must be restored or escalated. Do not accept \
-         the narrative at face value.\n\n\
-         Flagged phrases:\n\n",
-    );
-    for line in flag_lines {
-        out.push_str(&format!("- {line}\n"));
-    }
-    out.push('\n');
-    out
-}
+// Rendering of the reviewer-prompt block for these hits lives in
+// `boss-pr-review` (it is reviewer-prompt text, and lives next to the
+// prompt that interpolates it); the deterministic scan that produces the
+// hit lines stays here. See `boss_pr_review::render_supersession_flag_block`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_pr_review::render_supersession_flag_block;
 
     #[test]
     fn flags_the_incident_002_narrative() {

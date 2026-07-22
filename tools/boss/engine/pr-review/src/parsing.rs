@@ -4,7 +4,7 @@
 
 use boss_engine_utils::json_extract::extract_balanced_object;
 
-use super::types::*;
+use crate::types::*;
 
 /// Classify a list of changed file paths as docs-only or code.
 ///
@@ -17,7 +17,7 @@ use super::types::*;
 /// # Examples
 ///
 /// ```
-/// use boss_engine::pr_review::{classify_changed_files, ReviewScope};
+/// use boss_pr_review::{classify_changed_files, ReviewScope};
 ///
 /// assert_eq!(
 ///     classify_changed_files(&["docs/design.md", "README.md"]),
@@ -51,7 +51,7 @@ fn is_docs_file(path: &str) -> bool {
 }
 
 /// Extract and parse the first `ReviewResult` from a reviewer's final
-/// assistant message (design §3 of P992, task 8).
+/// assistant message.
 ///
 /// Tries three strategies in order, returning the first successful parse:
 ///
@@ -155,7 +155,7 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
     (None, last_error)
 }
 
-/// Engine severity gate (design §3 of P992, task 8).
+/// Engine severity gate.
 ///
 /// Returns `true` when `result` qualifies for a revision:
 /// - any finding with `severity = Critical` or `High`, **or**
@@ -197,7 +197,7 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::pr_review::*;
+    use crate::*;
 
     #[test]
     fn classify_empty_files_returns_code() {
