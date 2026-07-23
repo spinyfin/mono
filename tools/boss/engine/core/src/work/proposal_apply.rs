@@ -684,12 +684,16 @@ mod tests {
         let product = crate::test_support::create_test_product(&db);
         let chore = crate::test_support::create_test_chore(&db, product.id, "Ship it");
         let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
-        let before = query_task(&db.connect().unwrap(), &chore.id)
+        // Back-date so `now_string()`'s second-resolution stamp is guaranteed
+        // to differ from `before`, without burning wall-clock on a sleep.
+        let before = "2020-01-01T00:00:00Z".to_owned();
+        db.connect()
             .unwrap()
-            .unwrap()
-            .updated_at;
-
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+            .execute(
+                "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+                params![chore.id, before],
+            )
+            .unwrap();
 
         let outcome = db
             .submit_worker_proposal(SubmitWorkerProposalInput {

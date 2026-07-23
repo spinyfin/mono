@@ -163,12 +163,12 @@ pub struct AttentionGroup {
 
 /// Per-member edit the human applies at the batch-accept gesture, before
 /// task creation — the "filed-with-modifications" half of the
-/// per-proposal disposition vocabulary (design §"Data model", P383 table:
-/// "the accept gesture must let the human edit name/scope/effort and
-/// re-parent an out-of-scope proposal before creation, recording what
-/// changed in `decision_reason`"). Every field is optional: `None` keeps
-/// the member's stored `proposed_*` value, or (for `product_id`/
-/// `project_id`) the originating task's own product/project.
+/// per-proposal disposition vocabulary (design §"Disposition of the folded
+/// follow-up-proposal project": "the accept gesture must let the human edit
+/// name/scope/effort and re-parent an out-of-scope proposal before creation,
+/// recording what changed in `decision_reason`"). Every field is optional:
+/// `None` keeps the member's stored `proposed_*` value, or (for
+/// `product_id`/`project_id`) the originating task's own product/project.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct FollowupMemberOverride {

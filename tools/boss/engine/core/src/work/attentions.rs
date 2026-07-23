@@ -635,6 +635,13 @@ impl WorkDb {
             ),
             _ => {}
         }
+        // A group dismissed outright (never actioned) never runs
+        // `action_followup_group`'s write-back loop, so any member staged
+        // from a `worker_proposals` row (e.g. the common "reject every
+        // followup" outcome) would otherwise sit `proposed` forever. Stamp
+        // them `rejected` here instead.
+        let members = members_in_tx(&tx, &group.id)?;
+        mark_followup_group_proposals_rejected_in_tx(&tx, &group.id, &members)?;
         let now = now_string();
         tx.execute(
             "UPDATE attention_groups SET state = 'dismissed', dismissed_at = ?2 WHERE id = ?1",
@@ -725,6 +732,28 @@ fn members_in_tx(conn: &Connection, group_id: &str) -> Result<Vec<Attention>> {
         "SELECT {ATTN_COLS} FROM attentions WHERE group_id = ?1 ORDER BY ordinal ASC, id ASC"
     ))?;
     collect_rows(stmt.query_map([group_id], map_attention)?)
+}
+
+/// Stamp every member's staged proposal (if any) `rejected` when a whole
+/// group is dismissed outright — the path a followup group takes when every
+/// member is skipped/dismissed and it never reaches
+/// [`action_followup_group`]'s own write-back loop. Members with no
+/// `source_proposal_id` are untouched (nothing to mark); calling this on a
+/// non-followup group is inert for the same reason.
+fn mark_followup_group_proposals_rejected_in_tx(
+    conn: &Connection,
+    group_id: &str,
+    members: &[Attention],
+) -> Result<()> {
+    for m in members {
+        mark_followup_proposal_decided_in_tx(
+            conn,
+            m.source_proposal_id.as_deref(),
+            None,
+            &format!("human dismissed attention group {group_id} without actioning"),
+        )?;
+    }
+    Ok(())
 }
 
 /// Map a `proposed_effort` hint (`"trivial"`…`"max"`) to an [`EffortLevel`].
@@ -901,11 +930,16 @@ fn action_question_group(
 /// Describe what a [`FollowupMemberOverride`] changed relative to a
 /// member's stored `proposed_*` values, for `decision_reason`. `None` when
 /// the override is empty (every field `None`) — the caller substitutes its
-/// own "accepted as proposed" text in that case.
+/// own "accepted as proposed" text in that case. `origin` is the followup
+/// group's originating task, i.e. the product/project a member re-parents
+/// *from*: an override that merely echoes it back (a UI pre-filling the
+/// override form with current values, say) is not a re-parent and must not
+/// be reported as one.
 fn describe_followup_override(
     member: &Attention,
     effective_name: &str,
     override_: &FollowupMemberOverride,
+    origin: &Task,
 ) -> Option<String> {
     let mut changes = Vec::new();
     if let Some(name) = override_.name.as_deref().filter(|s| !s.is_empty())
@@ -926,10 +960,14 @@ fn describe_followup_override(
     {
         changes.push(format!("work_kind -> {work_kind}"));
     }
-    if let Some(product_id) = override_.product_id.as_deref() {
+    if let Some(product_id) = override_.product_id.as_deref()
+        && product_id != origin.product_id
+    {
         changes.push(format!("re-parented to product {product_id}"));
     }
-    if let Some(project_id) = override_.project_id.as_deref() {
+    if let Some(project_id) = override_.project_id.as_deref()
+        && Some(project_id) != origin.project_id.as_deref()
+    {
         changes.push(format!("re-parented to project {project_id}"));
     }
     if changes.is_empty() {
@@ -1022,8 +1060,15 @@ fn action_followup_group(
             }
             // Re-parenting to a different product with no explicit project
             // files a product-level chore there, mirroring the no-override
-            // "task has no project" case below.
-            None if override_.product_id.is_some() => None,
+            // "task has no project" case below — unless the human explicitly
+            // asked for a `task`, in which case silently downgrading to a
+            // chore would contradict their gesture; refuse instead.
+            None if override_.product_id.is_some() => {
+                if work_kind == Some("task") {
+                    bail!("re-parenting to product {product_id} as a task requires an explicit project_id");
+                }
+                None
+            }
             None => origin.project_id.clone(),
         };
 
@@ -1067,8 +1112,8 @@ fn action_followup_group(
             "kind": created.kind,
         }));
 
-        let decision_reason =
-            describe_followup_override(m, &name, override_).unwrap_or_else(|| "accepted as proposed".to_owned());
+        let decision_reason = describe_followup_override(m, &name, override_, &origin)
+            .unwrap_or_else(|| "accepted as proposed".to_owned());
         mark_followup_proposal_decided_in_tx(
             conn,
             m.source_proposal_id.as_deref(),

@@ -568,6 +568,81 @@ fn action_followup_group_override_reparents_to_a_different_product() {
     );
 }
 
+/// Re-parenting to a product with no explicit project, while the human
+/// explicitly asked for a `task`, must refuse rather than silently
+/// downgrading to a product-level chore.
+#[test]
+fn action_followup_group_reparent_to_product_as_task_without_project_bails() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let other_product = create_test_product_named(&db, "Other Product");
+    let (a, _g) = db.create_attention(followup(&task_id, "belongs elsewhere")).unwrap();
+    let g = db.answer_attention(&a.id, None, false, false).unwrap();
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        a.id.clone(),
+        FollowupMemberOverride {
+            product_id: Some(other_product.id.clone()),
+            work_kind: Some("task".to_owned()),
+            ..Default::default()
+        },
+    );
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let err = db
+        .action_attention_group(&g.id, false, &overrides, &checker)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires an explicit project_id"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Echoing the originating task's own product/project back in an override
+/// (e.g. a UI pre-filling the form with current values) must not be
+/// reported as a re-parent in `decision_reason` — nothing moved.
+#[test]
+fn action_followup_group_override_echoing_origin_is_not_a_reparent() {
+    let (db, product_id, project_id, task_id) = fixture();
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let submitted = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &task_id,
+            kind: boss_protocol::ProposalKind::FollowupTask,
+            payload_json: r#"{"proposed_name":"noise","proposed_description":"d","rationale":"r"}"#,
+            idempotency_key: "k-echo",
+        })
+        .unwrap()
+        .unwrap();
+    let member = submitted.staged_followup.as_ref().unwrap().0.clone();
+    let g = db.answer_attention(&member.id, None, false, false).unwrap();
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        member.id.clone(),
+        FollowupMemberOverride {
+            product_id: Some(product_id.clone()),
+            project_id: Some(project_id.clone()),
+            ..Default::default()
+        },
+    );
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.action_attention_group(&g.id, false, &overrides, &checker).unwrap();
+
+    let proposals = db.list_worker_proposals_for_work_item(&task_id, None, None).unwrap();
+    let updated = proposals
+        .into_iter()
+        .find(|p| p.id == submitted.proposal.id)
+        .expect("the staged proposal must still exist");
+    let reason = updated.decision_reason.unwrap_or_default();
+    assert!(
+        !reason.contains("re-parented"),
+        "echoing the origin's own product/project must not be reported as a re-parent: {reason}"
+    );
+}
+
 /// A followup group member the human skips (never accepted) must still get
 /// its staged proposal stamped `rejected` on action, not left `proposed`
 /// forever.
@@ -609,6 +684,50 @@ fn action_followup_group_writes_back_rejected_for_a_skipped_member() {
             .as_deref()
             .unwrap_or_default()
             .contains("skipped"),
+        "unexpected decision_reason: {:?}",
+        updated.decision_reason
+    );
+}
+
+/// Rejecting every followup in a group is the most common human outcome and
+/// never reaches `action_attention_group` (it bails on an empty accepted
+/// set) — it goes through `dismiss_attention` instead, mirroring the app's
+/// "all followups rejected" auto-dismiss. That path must still stamp any
+/// staged proposal `rejected`, not leave it `proposed` forever.
+#[test]
+fn dismissing_a_followup_group_with_everything_rejected_writes_back_rejected() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let submitted = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &task_id,
+            kind: boss_protocol::ProposalKind::FollowupTask,
+            payload_json: r#"{"proposed_name":"noise","proposed_description":"d","rationale":"r"}"#,
+            idempotency_key: "k-dismiss-all",
+        })
+        .unwrap()
+        .unwrap();
+    let rejected_member = submitted.staged_followup.as_ref().unwrap().0.clone();
+
+    let g = db.answer_attention(&rejected_member.id, None, true, false).unwrap();
+    let dismissed = db.dismiss_attention(&g.id, None).unwrap();
+    assert_eq!(dismissed.state, "dismissed");
+
+    let proposals = db.list_worker_proposals_for_work_item(&task_id, None, None).unwrap();
+    let updated = proposals
+        .into_iter()
+        .find(|p| p.id == submitted.proposal.id)
+        .expect("the staged proposal must still exist");
+    assert_eq!(updated.state, boss_protocol::ProposalState::Rejected);
+    assert_eq!(updated.decided_by, Some(boss_protocol::ProposalDecider::Human));
+    assert_eq!(updated.applied_ref, None);
+    assert!(
+        updated
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dismissed"),
         "unexpected decision_reason: {:?}",
         updated.decision_reason
     );
