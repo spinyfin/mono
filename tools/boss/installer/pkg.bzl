@@ -85,7 +85,12 @@ def _boss_pkg_unsigned_impl(ctx):
     # install time on the target machine.
     command = (
         "set -euo pipefail\n" +
-        "SHA=$(grep STABLE_BOSS_GIT_SHA " + info_file.path +
+        # Anchored on '^STABLE_BOSS_GIT_SHA ' (trailing space) so this does not
+        # also match the STABLE_BOSS_GIT_SHA_FULL line below it — an
+        # unanchored grep would return both lines, giving $SHA an embedded
+        # newline that word-splits the unquoted Boss-${SHA}.pkg argument
+        # further down and breaks productbuild's argv.
+        "SHA=$(grep '^STABLE_BOSS_GIT_SHA ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
         # Step 1: component package (intermediate; named to match distribution.xml pkg-ref)
