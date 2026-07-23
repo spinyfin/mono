@@ -186,7 +186,7 @@ def _build_info_rs_impl(ctx):
     # Info.plist by boss_short_version_plist. So nothing of value is lost here.
     command = (
         "set -euo pipefail\n" +
-        "VERSION=$(grep STABLE_BOSS_BASE_VERSION " + info_file.path +
+        "VERSION=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
         "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
@@ -229,13 +229,16 @@ when a new boss-v* release tag is cut, so this file stays byte-stable across
 commits and the crates that compile it in keep hitting the Bazel action cache.
 
 BOSS_GIT_SHA and BOSS_BUILD_TIME are emitted as the literal "unknown" on purpose:
-stamping per-commit / per-build values here forced a full recompile of engine_lib
-on every CI build. The reliable runtime build identity is
+stamping per-commit / per-build values directly into this file — which is
+`include!`d straight into engine_lib's own source — forced a full recompile of
+engine_lib on every CI build. The reliable runtime build identity is
 engine::build_info::binary_fingerprint(); the user-facing release version is
 stamped separately into Info.plist by boss_short_version_plist. The real,
 checkable build sha/dirty/build-time DO get stamped — see `build_provenance_rs`
-below, which deliberately stamps them into a separate, dedicated crate instead
-of here.
+below, which stamps them into a separate, dedicated crate instead of here for
+logical separation. NOTE: that separate crate does NOT achieve the same cache
+isolation this file achieves — engine_lib still recompiles on every commit
+because of it; see `build_provenance_rs`'s own doc comment below.
 """,
 )
 
@@ -249,18 +252,20 @@ def _build_provenance_rs_impl(ctx):
     # ctx.version_file (volatile-status.txt) carries the wall-clock build
     # time, which Bazel already regenerates on every build regardless of
     # what else changed. Both are read here — and ONLY here, never by
-    # build_info_rs above — specifically because this is its own small,
-    # dedicated crate (`boss-build-provenance`): a value that changes on
-    # every commit or every build invalidates just this crate's compile
-    # action, not engine_lib's. See that crate's own doc comment for the
-    # full rationale, and the `LiveStatusDebugReport.engine_build_sha`
-    # doc comment for how this is surfaced to an operator.
+    # build_info_rs above — so this per-commit/per-build stamping stays out
+    # of engine_lib's own source and lives in its own small, dedicated
+    # crate (`boss-build-provenance`) instead. NOTE: that crate boundary is
+    # for logical separation only — it does NOT protect engine_lib's Bazel
+    # action cache; engine_lib still recompiles whenever the commit sha
+    # changes. See that crate's own doc comment for the verified detail,
+    # and the `LiveStatusDebugReport.engine_build_sha` doc comment for how
+    # this is surfaced to an operator.
     command = (
         "set -euo pipefail\n" +
-        "SHA=$(grep STABLE_BOSS_GIT_SHA_FULL " + ctx.info_file.path +
+        "SHA=$(grep '^STABLE_BOSS_GIT_SHA_FULL ' " + ctx.info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
-        "DIRTY=$(grep STABLE_BOSS_GIT_DIRTY " + ctx.info_file.path +
+        "DIRTY=$(grep '^STABLE_BOSS_GIT_DIRTY ' " + ctx.info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ \"$DIRTY\" = \"true\" ] && DIRTY=true || DIRTY=false\n" +
         "BUILD_TIME=$(grep '^BOSS_BUILD_TIME ' " + ctx.version_file.path +
@@ -301,10 +306,14 @@ Emits:
 Unlike `build_info_rs` (which deliberately stamps "unknown" for these same
 concepts to protect engine_lib's compile cache), this rule feeds a dedicated,
 otherwise-empty `boss-build-provenance` crate — see that crate's BUILD.bazel
-and doc comment. A value that changes on every commit or every build only
-invalidates that tiny crate's own compile action; engine_lib depends on its
-compiled interface, not its generated source, so engine_lib's own recompile
-cache is unaffected.
+and doc comment. This keeps the per-commit/per-build stamping logically
+separate from engine_lib's own source, but it does NOT protect engine_lib's
+Bazel action cache: engine_lib still recompiles whenever the commit sha
+changes, because rustc's compiled interface (`.rmeta`) for this crate's
+trivial getter functions embeds the constant values they return. Verified
+empirically (build twice with only the commit sha changed; `engine_lib`
+recompiles both times, with `pipelined_compilation` enabled). See that
+crate's own doc comment for detail.
 """,
 )
 
@@ -326,9 +335,9 @@ def _boss_short_version_plist_impl(ctx):
     # version string. When not stamped, fallbacks are "0.0.0" / "dev" respectively.
     command = (
         "set -euo pipefail\n" +
-        "V=$(grep STABLE_BOSS_VERSION " + info_file.path +
+        "V=$(grep '^STABLE_BOSS_VERSION ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "B=$(grep STABLE_BOSS_BASE_VERSION " + info_file.path +
+        "B=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$V\" ] && V=dev\n" +
         "[ -z \"$B\" ] && B=0.0.0\n" +

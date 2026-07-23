@@ -12,15 +12,17 @@
 //! build.rs.
 //!
 //! [`git_sha`], [`git_dirty`], and [`build_time`] are backed by the
-//! separate `boss_build_provenance` crate instead — a real commit sha
-//! stamped directly into `build_info_stamp` (via the same `include!`
-//! mechanism BOSS_VERSION uses) would change on every commit and force a
-//! full recompile of engine_lib on every CI build (see installer/pkg.bzl's
-//! `build_info_rs` doc comment for the history). `boss_build_provenance`
-//! is its own tiny, dedicated crate for exactly this reason: engine_lib
-//! depends on its compiled interface, not its generated source, so a
-//! changed commit sha invalidates only that crate's own (near-instant)
-//! compile, not engine_lib's.
+//! separate `boss_build_provenance` crate instead of being stamped
+//! directly into `build_info_stamp` (via the same `include!` mechanism
+//! BOSS_VERSION uses) — that keeps the per-commit/per-build values, and
+//! the `include!(env!(...))` machinery that reads them, out of this
+//! crate's own source. It does NOT protect engine_lib's Bazel action
+//! cache: engine_lib still recompiles whenever the commit sha changes,
+//! because `boss_build_provenance`'s compiled interface embeds those
+//! constant values. See `boss_build_provenance`'s own doc comment for
+//! the verified detail and installer/pkg.bzl's `build_info_rs` doc
+//! comment for why `BOSS_GIT_SHA`/`BOSS_BUILD_TIME` are left as the
+//! literal `"unknown"` in this crate's own stamp instead.
 //!
 //! Two more runtime signals round out "am I running the binary I think I
 //! am":

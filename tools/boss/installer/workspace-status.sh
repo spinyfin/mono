@@ -105,9 +105,12 @@ fi
 #
 # STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY are read ONLY by
 # `build_provenance_rs`, which stamps its own dedicated, single-purpose
-# `boss-build-provenance` crate — never `build_info_rs`/engine_lib directly
-# — so a value that changes every commit only invalidates that tiny crate,
-# not a recompile of engine_lib itself. See that crate's doc comment.
+# `boss-build-provenance` crate — never `build_info_rs`/engine_lib directly.
+# That keeps the stamping logically separate from engine_lib's own source,
+# but does NOT protect engine_lib's action cache the way build_info_rs's
+# byte-stable output does: engine_lib still recompiles whenever the commit
+# sha changes, because engine_lib depends on this crate's compiled output.
+# See that crate's own doc comment for the verified detail.
 echo "STABLE_BOSS_VERSION $BOSS_VERSION"
 echo "STABLE_BOSS_BASE_VERSION $BOSS_BASE_VERSION"
 echo "STABLE_BOSS_GIT_SHA $SHA"

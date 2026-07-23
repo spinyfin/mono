@@ -33,8 +33,12 @@ pub struct LiveStatusDebugReport {
     /// on the built commit). `false` for a clean build, and for a Cargo
     /// (non-Bazel) build where provenance isn't stamped at all.
     pub engine_build_dirty: bool,
-    /// ISO-8601 UTC timestamp the engine binary was built at, baked
-    /// in at compile time.
+    /// ISO-8601 UTC timestamp of the build that last produced this
+    /// commit's provenance stamp, baked in at compile time. Bazel does
+    /// not re-run the stamping action just because wall-clock time
+    /// passed, so this may lag behind a later rebuild of the *same*
+    /// commit — use `engine_binary_fingerprint` to tell two builds of
+    /// the same commit apart.
     pub engine_build_time: String,
     /// Runtime fingerprint of the engine binary's on-disk content
     /// (short SHA-256 of `current_exe()` bytes). Survives a bazel

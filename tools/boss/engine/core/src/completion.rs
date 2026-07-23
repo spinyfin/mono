@@ -1563,8 +1563,7 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        // Worker escalation/blocker detection (incident 2026-07-02,
-        // exec_18b5243e65ff188_2d / T2085): a worker that emitted an
+        // Worker escalation/blocker detection: a worker that emitted an
         // `[effort-escalation]` or `[blocked]` marker on this Stop gets
         // an attention item filed for the coordinator *before* any
         // status-gate or nudge decision below is made — `nudge_or_park`
@@ -1573,8 +1572,7 @@ impl WorkerCompletionHandler {
         // logged loudly (see `file_worker_signal_attention`) and
         // swallowed, never block completion.
         //
-        // Deliberately runs BEFORE the running-status gate below
-        // (T3098 follow-up incident, exec_18c3e96f68d7cc18_f3a): a pane
+        // Deliberately runs BEFORE the running-status gate below: a pane
         // worker's Stop can land while `execution.status` is still
         // `running` rather than `waiting_human` — the coordinator flips
         // it to `waiting_human` only after `PaneSpawnRunner::run_execution`
@@ -1589,8 +1587,27 @@ impl WorkerCompletionHandler {
         // race the gate below guards against.
         self.detect_and_file_worker_signals(&execution).await;
 
-        // Flunge T308 (exec_18c1c0a92f0bda38_570, 2026-07-13): a probe
-        // minted on an earlier Stop can still be sitting undelivered in
+        // Deferred-scope detection: a worker that deliberately narrowed
+        // its task's scope and declared it via a `[deferred-scope]`
+        // marker gets that recorded durably — both on the work item's
+        // own description and as a coordinator-visible attention item —
+        // so the deferral is a tracked decision
+        // rather than a prose sentence that dies with the transcript. Unlike
+        // the escalation/blocker pair above, this never suppresses the
+        // "produce a PR" nudge: the worker already produced its (narrower)
+        // deliverable.
+        //
+        // Runs BEFORE the running-status gate below for the same reason
+        // `detect_and_file_worker_signals` does: it only reads the
+        // transcript and records an attention item, never touches PR
+        // state, so a `[deferred-scope]` marker emitted while `running`
+        // (the same narrow pane-startup window, or for the whole
+        // lifetime of a `pr_review` reviewer pane) is still captured
+        // instead of being silently dropped — and unlike `[blocked]`,
+        // a deferred-scope marker is never re-emitted on a later Stop.
+        self.detect_and_record_deferred_scope(&execution).await;
+
+        // A probe minted on an earlier Stop can still be sitting undelivered in
         // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
         // `SendToPane` failed and was requeued for retry on the next
         // Stop). `dispatch_probe_on_stop` pops whatever is queued for a
@@ -1621,9 +1638,10 @@ impl WorkerCompletionHandler {
         // `pr_review` reviewer pane, which the design deliberately keeps
         // in `running` — see `RunWaitState::ReviewerPaneAlive`) never
         // falls through to `detect_pr`/the nudge loop. Marker detection
-        // above already ran regardless of this gate, so a `[blocked]`
-        // signal from a `running` worker is still filed and visible to
-        // the coordinator even though this Stop parks here as a no-op.
+        // above already ran regardless of this gate, so a `[blocked]` or
+        // `[deferred-scope]` signal from a `running` worker is still filed
+        // and visible to the coordinator even though this Stop parks here
+        // as a no-op.
         if execution.status != ExecutionStatus::WaitingHuman {
             tracing::debug!(
                 execution_id,
@@ -1632,17 +1650,6 @@ impl WorkerCompletionHandler {
             );
             return StopOutcome::RunningNoStagedPr;
         }
-
-        // Deferred-scope detection (T222/PR #765, recovered as Flunge T254):
-        // a worker that deliberately narrowed its task's scope and declared
-        // it via a `[deferred-scope]` marker gets that recorded durably —
-        // both on the work item's own description and as a coordinator-
-        // visible attention item — so the deferral is a tracked decision
-        // rather than a prose sentence that dies with the transcript. Unlike
-        // the escalation/blocker pair above, this never suppresses the
-        // "produce a PR" nudge: the worker already produced its (narrower)
-        // deliverable.
-        self.detect_and_record_deferred_scope(&execution).await;
 
         // Resume-bounce SHA-delta gate: when the chore already has a
         // PR bound to it (`task.pr_url` populated by an earlier run's
@@ -5137,8 +5144,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 }
             }
             Err(err) => {
-                // Loud on purpose (2026-07-23 incident, exec_18c3e96f68d7cc18_f3a):
-                // a worker's `[blocked]` marker was correctly recognized and
+                // Loud on purpose: a worker's `[blocked]` marker was correctly recognized and
                 // parsed, but the attention item never landed and the
                 // failure sat at `warn` — invisible enough that root-causing
                 // the missed suppression cost a full trace reconstruction.
@@ -10785,13 +10791,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     #[tokio::test]
     async fn blocked_marker_files_attention_even_while_execution_still_running() {
-        // T3098 follow-up incident (exec_18c3e96f68d7cc18_f3a, 2026-07-23): a
-        // worker emitted the sanctioned `[blocked]` marker and was auto-nudged
-        // 2.5 seconds later anyway. `execution.status` is `running` for a
-        // brief window between `start_execution_run` and the coordinator's
-        // post-spawn-ack flip to `waiting_human` — and unconditionally for a
-        // `pr_review` reviewer pane (`RunWaitState::ReviewerPaneAlive` keeps
-        // it in `running` for the pane's whole lifetime, by design). A
+        // A worker can emit the sanctioned `[blocked]` marker while
+        // `execution.status` is still `running` — briefly between
+        // `start_execution_run` and the coordinator's post-spawn-ack flip
+        // to `waiting_human`, and unconditionally for a `pr_review`
+        // reviewer pane (`RunWaitState::ReviewerPaneAlive` keeps it in
+        // `running` for the pane's whole lifetime, by design). A
         // `[blocked]` marker emitted in either state must still be filed as
         // an attention item; it must not sit behind the `waiting_human`-only
         // gate that used to skip `detect_and_file_worker_signals` entirely
@@ -10850,8 +10855,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     #[tokio::test]
     async fn blocked_marker_on_first_stop_clears_any_stale_queued_probe() {
-        // Flunge T308 (exec_18c1c0a92f0bda38_570, 2026-07-13): the
-        // completion handler correctly refuses to *queue a new*
+        // The completion handler correctly refuses to *queue a new*
         // produce-a-PR nudge once `[blocked]` is detected (the case
         // above), but `dispatch_probe_on_stop` in the real event loop
         // pops and delivers whatever is already sitting in the run's
@@ -11251,9 +11255,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     // -----------------------------------------------------------
-    // Deferred-scope declaration (Flunge T254, root-caused to T222/PR #765):
-    // a worker that emits a `[deferred-scope]` marker must get a durable
-    // audit line on the work item's description AND a coordinator-visible
+    // Deferred-scope declaration: a worker that emits a `[deferred-scope]`
+    // marker must get a durable audit line on the work item's description
+    // AND a coordinator-visible
     // attention item — but, unlike escalation/blocker markers, must NOT
     // suppress the "produce a PR" nudge: the worker already produced its
     // (narrower) deliverable.
