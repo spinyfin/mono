@@ -63,6 +63,7 @@ pub(super) fn make_session_sink() -> Arc<SessionSink> {
 
 mod app_channel;
 mod engine_health_report;
+mod proposals;
 mod session_sink_queue;
 mod t02;
 mod t03;

@@ -74,6 +74,7 @@ mod planner_ops;
 mod probes;
 mod products;
 mod projects;
+mod proposals;
 mod review;
 mod server;
 mod sessions;
@@ -1726,6 +1727,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListPlannerRuns { .. } => planner_ops::handle_list_planner_runs(ctx, r).await,
             r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
             r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
+            r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
             r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
             r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
             r @ FrontendRequest::ListRevisions { .. } => work_items::handle_list_revisions(ctx, r).await,
@@ -1813,6 +1815,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::Shutdown { .. } => sessions::handle_shutdown(ctx, r).await,
             r @ FrontendRequest::SpawnCapabilityRestored => sessions::handle_spawn_capability_restored(ctx, r).await,
             r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
+            r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
             r @ FrontendRequest::Subscribe { .. } => subscriptions::handle_subscribe(ctx, r).await,
             r @ FrontendRequest::SyncProductExternalTracker { .. } => {
                 external_tracker::handle_sync_product_external_tracker(ctx, r).await

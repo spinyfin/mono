@@ -21,7 +21,7 @@ use super::*;
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
     AutomationTrigger, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState,
-    TaskKind, TaskStatus,
+    ProposalFieldError, TaskKind, TaskStatus,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -61,6 +61,18 @@ fn task() -> Task {
         .name("A task")
         .status(TaskStatus::Todo)
         .updated_at("1747000000")
+        .build()
+}
+
+fn worker_proposal() -> WorkerProposal {
+    WorkerProposal::builder()
+        .id("prp_1")
+        .execution_id("exec_1")
+        .created_at("1747000000")
+        .idempotency_key("auto:blocked:abc")
+        .kind(ProposalKind::Blocked)
+        .payload_json(r#"{"reason":"stuck"}"#)
+        .work_item_id("task_1")
         .build()
 }
 
@@ -1129,6 +1141,33 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "unpopulate_project_result",
         },
+        // --- Worker proposals ---
+        TagCase {
+            label: "ProposalSubmitted",
+            event: FrontendEvent::ProposalSubmitted {
+                proposal: worker_proposal(),
+                already_submitted: false,
+            },
+            expected_tag: "proposal_submitted",
+        },
+        TagCase {
+            label: "ProposalRejected",
+            event: FrontendEvent::ProposalRejected {
+                error: ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                    "reason",
+                    "required field is missing",
+                )]),
+            },
+            expected_tag: "proposal_rejected",
+        },
+        TagCase {
+            label: "ProposalsList",
+            event: FrontendEvent::ProposalsList {
+                work_item_id: "task_1".into(),
+                proposals: vec![worker_proposal()],
+            },
+            expected_tag: "proposals_list",
+        },
         // --- Feature flags & settings ---
         TagCase {
             label: "FeatureFlagsList",
@@ -1619,6 +1658,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }
+        | FrontendEvent::ProposalSubmitted { .. }
+        | FrontendEvent::ProposalRejected { .. }
+        | FrontendEvent::ProposalsList { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }
         | FrontendEvent::FeatureFlagSet { .. }

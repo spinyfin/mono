@@ -12,11 +12,12 @@ use crate::types::{
     CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, EditorialAction, EngineAttemptListEntry,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project, ProposalKind,
+    ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem,
+    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch, WorkRun, WorkerProposal,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -1040,6 +1041,33 @@ pub enum FrontendRequest {
         dep_filter: Option<DependencyFilter>,
     },
 
+    /// Worker → engine, read-only: every `worker_proposals` row filed
+    /// against the caller's own work item, **across executions**, with its
+    /// current disposition (`state`, `decision_reason`, `applied_ref`).
+    ///
+    /// Scope is the work item, not the execution, deliberately: a resumed or
+    /// successor run must be able to see "rejected: duplicate of T123" from
+    /// a prior execution and adjust, rather than re-proposing into the same
+    /// wall (design §"Disposition of P383", P383's Q4). The caller cannot
+    /// widen the scope — the work item is derived from the socket peer's
+    /// attributed execution, never from a field on this request.
+    ///
+    /// `run_id` is the caller's own `BOSS_RUN_ID` (i.e. `work_executions.id`)
+    /// and is a **cross-check, not a credential** — see [`Self::SubmitProposal`].
+    /// Replies with [`FrontendEvent::ProposalsList`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails.
+    ListProposals {
+        run_id: String,
+        /// Restrict to one kind. `None` returns every kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ProposalKind>,
+        /// Restrict to one disposition. `None` returns every state,
+        /// including `rejected` / `expired` history — which is the point of
+        /// the verb.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<ProposalState>,
+    },
+
     /// Read-only: enumerate `kind = 'revision'` rows for a product. Revisions
     /// are excluded from `ListTasks` and `ListChores` by design; this request
     /// is the only way to list them in bulk. Replies with
@@ -1737,6 +1765,47 @@ pub enum FrontendRequest {
     /// on the second pass.
     StopRun {
         run_id: String,
+    },
+
+    /// Worker → engine: submit one typed proposal, synchronously validated
+    /// and persisted before the reply.
+    ///
+    /// This is the mediated replacement for the marker/fenced-block seams.
+    /// Its defining property is that a malformed submission comes back as a
+    /// typed, field-level [`FrontendEvent::ProposalRejected`] *while the
+    /// worker is still running*, so it can fix and retry — rather than
+    /// failing a transcript scrape at Stop, when nothing can be done about it.
+    ///
+    /// **Attribution is verified identity.** The engine derives which
+    /// execution is proposing from the socket peer's pid (walked up to a
+    /// registered worker run), never from a field on this request.
+    /// `run_id` — the caller's own `BOSS_RUN_ID`, i.e. `work_executions.id` —
+    /// is a **cross-check, not a credential**: the engine rejects when it
+    /// disagrees with the peer-resolved run, which catches a misconfigured
+    /// env or a command copy-pasted between worker panes. A connection with
+    /// no local peer pid (a remote SSH worker) is rejected outright in v1.
+    ///
+    /// **Idempotent** on `(execution_id, idempotency_key)`: a resubmission
+    /// returns the existing row with `already_submitted: true` rather than
+    /// erroring or duplicating, so a retried command and a resumed run are
+    /// both safe. Omit `idempotency_key` and the engine derives one from the
+    /// execution id, kind, and a content hash of the canonicalised payload.
+    ///
+    /// Rate-capped per execution (32 total, 8 per kind) — runaway-loop
+    /// protection, not scarcity. Replies with
+    /// [`FrontendEvent::ProposalSubmitted`] or
+    /// [`FrontendEvent::ProposalRejected`].
+    SubmitProposal {
+        run_id: String,
+        kind: ProposalKind,
+        /// The kind-matched payload object (see the per-kind payload structs
+        /// in `boss_protocol::types::proposal`). Carried as raw JSON rather
+        /// than a typed enum so validation happens in the engine, where a
+        /// missing/misspelled/mistyped key becomes a per-field complaint
+        /// instead of one positional serde error at the wire boundary.
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
 
     Subscribe {
