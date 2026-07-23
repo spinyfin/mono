@@ -67,6 +67,12 @@ mod github_auth;
 // `pub(super)`; only the module path is widened.
 pub(crate) mod handler_helpers;
 mod hosts;
+/// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
+/// directly. The previous incarnation of this guard was private, and the
+/// integration test named for it only ever exercised `serve()`'s arguments —
+/// the derivation itself shipped with zero coverage, which is how the
+/// stand-on-any-override bug survived.
+pub mod isolation;
 mod live_status;
 mod metrics;
 mod pane_delivery;
@@ -90,6 +96,8 @@ mod worker_events;
 
 // Re-export public items from server module for external callers.
 pub use server::{process_is_alive, run, serve, serve_with_merge_probe};
+
+use isolation::IsolationPaths;
 
 // Re-import server-internal helpers so child modules can access them via `use super::*`.
 use server::{
@@ -168,8 +176,7 @@ struct Dispatch {
     decode_ms: f64,
 }
 
-const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
-const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
+pub use isolation::{DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH};
 
 /// Shared HTTP client for the GitHub OAuth device flow. Installs the rustls
 /// ring crypto provider lazily (the first TLS handshake panics otherwise,
@@ -987,7 +994,11 @@ impl ServerState {
         // dir, and a config handle. Resolved out here so the move-closure
         // below can consume them.
         let cfg_for_provider = cfg.clone();
-        let provider_events_socket = crate::runner::engine_events_socket_path();
+        // The socket this engine actually bound (stamped on the config by
+        // `serve`), not a fresh read of `$BOSS_EVENTS_SOCKET` — an isolated
+        // fixture that re-resolved here would point every remote worker's
+        // reverse forward at the production engine.
+        let provider_events_socket = crate::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
         // Create the live per-slot worker registry up front so the
         // coordinator's lease-time occupancy guard (defect 3) and
@@ -1450,90 +1461,6 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
 
 mod session_queue;
 use session_queue::*;
-
-/// Paths derived from a non-default `--socket-path` to ensure a
-/// test-fixture engine never touches production state.
-///
-/// When `socket_path` equals `DEFAULT_SOCKET_PATH` every field is `None` and
-/// the engine resolves paths through its normal env-var / home-dir logic.
-/// When `socket_path` is non-default, each field is `Some(derived_path)`
-/// **unless** the corresponding env override is already set by the caller, in
-/// which case the caller's choice wins and that field is `None`.
-///
-/// The struct is computed once in [`run`] and threaded through to
-/// [`run_server`] so both the `WorkConfig` DB path and the socket/pid paths
-/// inside [`serve`] use the same derived roots without touching env vars.
-struct IsolationPaths {
-    /// True when the engine is operating as a test fixture (non-default socket).
-    is_test_fixture: bool,
-    /// Isolated SQLite DB path derived from the socket stem.
-    db_path: Option<std::path::PathBuf>,
-    /// Isolated events socket derived from the socket stem.
-    events_socket: Option<std::path::PathBuf>,
-    /// Isolated pid file derived from the socket stem.
-    pid_path: Option<std::path::PathBuf>,
-    /// Isolated engine-control token path derived from the socket stem.
-    ///
-    /// Without this, `default_token_path()` resolved the production
-    /// token path unconditionally, entirely outside this struct — a
-    /// test-fixture engine would write, and on shutdown delete, the
-    /// production control token. See `crate::engine_control` for the
-    /// write/delete-time hardening layered on top of this derivation.
-    token_path: Option<std::path::PathBuf>,
-}
-
-impl IsolationPaths {
-    /// Derive isolation paths from `socket_path`.
-    ///
-    /// Non-default socket → derive paths from the socket's directory and
-    /// file-stem (e.g. `/tmp/boss-test-UUID.sock` → `/tmp/boss-test-UUID.db`,
-    /// `/tmp/boss-test-UUID.events.sock`, `/tmp/boss-test-UUID.pid`).
-    ///
-    /// Each derived path is suppressed (left as `None`) when the corresponding
-    /// env override is already set, so an explicit `BOSS_DB_PATH=…` in the
-    /// environment always wins.
-    fn derive(socket_path: &str) -> Self {
-        if socket_path == DEFAULT_SOCKET_PATH {
-            return Self {
-                is_test_fixture: false,
-                db_path: None,
-                events_socket: None,
-                pid_path: None,
-                token_path: None,
-            };
-        }
-
-        let path = std::path::Path::new(socket_path);
-        let dir = path.parent().unwrap_or(std::path::Path::new("/tmp"));
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "boss-test".to_owned());
-
-        // Honour explicit env overrides: only set a derived path when the
-        // caller hasn't already pointed this socket at an explicit location.
-        let db_path = std::env::var_os("BOSS_DB_PATH")
-            .is_none()
-            .then(|| dir.join(format!("{stem}.db")));
-        let events_socket = std::env::var_os("BOSS_EVENTS_SOCKET")
-            .is_none()
-            .then(|| dir.join(format!("{stem}.events.sock")));
-        let pid_path = std::env::var_os("BOSS_ENGINE_PID_PATH")
-            .is_none()
-            .then(|| dir.join(format!("{stem}.pid")));
-        let token_path = std::env::var_os(crate::engine_control::TOKEN_PATH_ENV)
-            .is_none()
-            .then(|| dir.join(format!("{stem}.token")));
-
-        Self {
-            is_test_fixture: true,
-            db_path,
-            events_socket,
-            pid_path,
-            token_path,
-        }
-    }
-}
 
 async fn handle_frontend_connection(
     stream: UnixStream,

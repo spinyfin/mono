@@ -9,33 +9,19 @@ pub async fn run(cli: Cli) -> Result<()> {
     let socket_str = cli.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH);
     let isolation = IsolationPaths::derive(socket_str);
 
-    // Build WorkConfig, overriding db_path when the isolation guard derived one.
-    // This must happen before RuntimeConfig so the DB the engine opens is
-    // already the isolated one — not the production state.db that
-    // WorkConfig::load_from_env() would resolve from $HOME.
+    // Build WorkConfig, overriding the paths the isolation guard derived.
+    // This must happen before RuntimeConfig so both the DB the engine opens
+    // and the events socket it binds (and hands to every worker) are already
+    // the isolated ones — not the production state.db / events.sock that
+    // WorkConfig::load_from_env() resolves from $HOME and $BOSS_EVENTS_SOCKET.
     let mut work = crate::config::WorkConfig::load_from_env()?;
-    if let Some(ref iso_db) = isolation.db_path {
+    if let Some(ref iso_db) = isolation.derived.db {
         work.db_path = iso_db.clone();
     }
-    let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
-
-    if isolation.is_test_fixture {
-        tracing::info!(
-            cwd = %cfg.work.cwd.display(),
-            db_path = %cfg.work.db_path.display(),
-            events_socket = ?isolation.events_socket,
-            pid_path = ?isolation.pid_path,
-            token_path = ?isolation.token_path,
-            "test-fixture mode: isolated paths derived from non-default socket; \
-             production state (events.sock, state.db, pid file, control token) will not be touched"
-        );
-    } else {
-        tracing::info!(
-            cwd = %cfg.work.cwd.display(),
-            db_path = %cfg.work.db_path.display(),
-            "starting boss-engine runtime",
-        );
+    if let Some(ref iso_events) = isolation.derived.events_socket {
+        work.events_socket_path = Some(iso_events.clone());
     }
+    let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
 
     run_server(cli, cfg, isolation).await
 }
@@ -45,22 +31,64 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
 
     // Use the isolation-derived pid path, falling back to env / hard default.
     let pid_file_path = isolation
-        .pid_path
-        .or_else(|| std::env::var("BOSS_ENGINE_PID_PATH").ok().map(std::path::PathBuf::from))
+        .derived
+        .pid
+        .clone()
+        .or_else(|| std::env::var_os(crate::config::PID_PATH_ENV).map(std::path::PathBuf::from))
         .unwrap_or_else(|| DEFAULT_PID_PATH.into());
 
-    // Use the isolation-derived events socket, falling back to env / home default.
-    let events_socket_path = isolation
-        .events_socket
-        .map(Ok)
-        .unwrap_or_else(default_events_socket_path)?;
+    // The events socket was resolved into the config in `run` (isolation-derived
+    // when this is a fixture, `$BOSS_EVENTS_SOCKET` / the production default
+    // otherwise). Nothing here re-reads the environment.
+    let Some(events_socket_path) = cfg.work.events_socket_path.clone() else {
+        bail!("HOME must be set to derive the default events socket path");
+    };
 
-    // Use the isolation-derived token path, falling back to env / home
-    // default. Without this, a test-fixture engine would resolve the
-    // production control-token path unconditionally — see
-    // `crate::engine_control` for the write/delete-time hardening
-    // layered on top as defense in depth.
-    let control_token_path = isolation.token_path.or_else(crate::engine_control::default_token_path);
+    // The control token is resolved through the isolation guard too. Before
+    // this it was resolved outside the guard entirely, so a fixture overwrote
+    // production's token file and deleted it again on shutdown.
+    let control_token_path = isolation
+        .derived
+        .control_token
+        .clone()
+        .or_else(crate::engine_control::default_token_path);
+
+    // Hard gate, before anything is bound, written, or unlinked: a fixture
+    // whose resolved paths still land on production refuses to start. The
+    // derivation above is what makes the ordinary case work; this is what
+    // makes a miss loud instead of a 50-minute production outage.
+    isolation.ensure_isolated(&crate::app::isolation::EnginePaths {
+        db: Some(cfg.work.db_path.clone()),
+        events_socket: Some(events_socket_path.clone()),
+        pid: Some(pid_file_path.clone()),
+        control_token: control_token_path.clone(),
+    })?;
+
+    // Log the paths the engine is actually about to use, now that every
+    // fallback has been applied. The previous version of this line ran before
+    // resolution and printed the pre-fallback `Option`s, so it contradicted
+    // itself: `events_socket="None" pid_path="None"` under a claim that
+    // production would not be touched — where `None` meant *will use
+    // production*. It also promised a guarantee it did not enforce; the
+    // guarantee now lives in `ensure_isolated` above, which has already run.
+    if isolation.is_test_fixture {
+        tracing::info!(
+            cwd = %cfg.work.cwd.display(),
+            db_path = %cfg.work.db_path.display(),
+            events_socket = %events_socket_path.display(),
+            pid_path = %pid_file_path.display(),
+            control_token_path = ?control_token_path.as_ref().map(|p| p.display().to_string()),
+            "test-fixture mode: resolved paths verified distinct from production state",
+        );
+    } else {
+        tracing::info!(
+            cwd = %cfg.work.cwd.display(),
+            db_path = %cfg.work.db_path.display(),
+            events_socket = %events_socket_path.display(),
+            pid_path = %pid_file_path.display(),
+            "starting boss-engine runtime",
+        );
+    }
 
     // Orphan watcher: when the engine is a test fixture (non-default socket),
     // watch the parent process pid.  If the parent exits (e.g. a `bazel test`
@@ -83,16 +111,6 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
         watched_parent_pid,
     )
     .await
-}
-
-fn default_events_socket_path() -> Result<std::path::PathBuf> {
-    if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
-        return Ok(override_path.into());
-    }
-    let Some(home) = std::env::var_os("HOME") else {
-        bail!("HOME must be set to derive the default events socket path");
-    };
-    Ok(std::path::PathBuf::from(home).join("Library/Application Support/Boss/events.sock"))
 }
 
 /// Return `true` if the process at `pid` is still alive on this machine.
@@ -264,6 +282,21 @@ pub async fn serve_with_merge_probe(
     merge_probe_override: Option<Arc<dyn crate::merge_poller::MergeProbe>>,
 ) -> Result<()> {
     let app_pid = current_parent_pid();
+
+    // The socket this call is about to bind is the one every worker's
+    // `settings.json` must name. Stamp it onto the config so downstream
+    // resolvers read the binding instead of re-deriving it from the
+    // environment. In production `run` already set this and the swap is a
+    // no-op; it matters for in-process callers that pass an explicit socket
+    // path alongside a config built without one.
+    let cfg = if cfg.work.events_socket_path == events_socket_path {
+        cfg
+    } else {
+        let mut work = cfg.work.clone();
+        work.events_socket_path = events_socket_path.clone();
+        Arc::new(cfg.with_work(work))
+    };
+
     let (control_token, _control_token_guard) = match control_token_path {
         Some(path) => {
             let token = crate::engine_control::generate_token();
@@ -1108,7 +1141,9 @@ pub async fn serve_with_merge_probe(
     // dispatch / `hosts probe`.
     {
         let coordinator = server_state.execution_coordinator.clone();
-        let engine_socket = crate::runner::engine_events_socket_path().display().to_string();
+        // The socket this engine bound, not a fresh `$BOSS_EVENTS_SOCKET`
+        // read — a restored reverse forward must terminate at *this* engine.
+        let engine_socket = crate::runner::bound_events_socket_path(&cfg).display().to_string();
         tokio::spawn(async move {
             coordinator.reattach_remote_runs(&engine_socket).await;
         });

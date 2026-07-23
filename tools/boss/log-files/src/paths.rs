@@ -15,6 +15,15 @@ pub const ENGINE_TRACE_FILENAME: &str = "engine-trace.jsonl";
 /// Filename of the engine lifecycle audit log under the state root.
 pub const ENGINE_AUDIT_FILENAME: &str = "engine-audit.log";
 
+/// Filename of the SQLite state database under the state root.
+pub const STATE_DB_FILENAME: &str = "state.db";
+
+/// Filename of the worker events socket under the state root.
+pub const EVENTS_SOCKET_FILENAME: &str = "events.sock";
+
+/// Filename of the engine-control token under the state root.
+pub const CONTROL_TOKEN_FILENAME: &str = "engine-control.token";
+
 /// Which engine log file a reader is targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSource {
@@ -39,6 +48,29 @@ impl LogSource {
 pub fn default_state_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join("Library/Application Support/Boss"))
+}
+
+/// Production location of the SQLite state database:
+/// `<default_state_root>/state.db`. `None` when `HOME` is unset.
+///
+/// This and its siblings below exist so that "what path does production
+/// own?" has exactly one answer. The engine's test-fixture isolation guard
+/// compares resolved paths against these to tell a deliberate operator
+/// override apart from a production path inherited through the environment.
+pub fn default_state_db_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(STATE_DB_FILENAME))
+}
+
+/// Production location of the worker events socket:
+/// `<default_state_root>/events.sock`. `None` when `HOME` is unset.
+pub fn default_events_socket_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(EVENTS_SOCKET_FILENAME))
+}
+
+/// Production location of the engine-control token:
+/// `<default_state_root>/engine-control.token`. `None` when `HOME` is unset.
+pub fn default_control_token_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(CONTROL_TOKEN_FILENAME))
 }
 
 /// The audit-path override from [`AUDIT_PATH_ENV`], if set to a non-empty

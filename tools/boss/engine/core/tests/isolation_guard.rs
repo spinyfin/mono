@@ -5,28 +5,46 @@
 //! was overridden, the test engine silently bound to the *production*
 //! `events.sock`, DB, and pid file — causing corrupted state on T651.
 //!
-//! The fix: when `--socket-path` is non-default, `run_server` derives
-//! isolated paths for `BOSS_EVENTS_SOCKET`, `BOSS_DB_PATH`, and
-//! `BOSS_ENGINE_PID_PATH` from the socket's directory + stem.  This module
-//! validates that derivation and the resulting isolation at the `serve()` level.
+//! The fix: when `--socket-path` is non-default, `IsolationPaths::derive`
+//! derives isolated paths for the DB, events socket, pid file, and
+//! engine-control token from the socket's directory + stem, and
+//! `ensure_isolated` refuses to start if any resolved path still lands on
+//! production.
 //!
 //! Issue from 2026-07: the engine-control token was resolved via
 //! `default_token_path()` entirely outside this isolation machinery, so a
 //! worker-launched fixture engine wrote — and then, on its own shutdown,
 //! deleted — the production control token. The token is now derived
-//! alongside pid/db/events-socket (see the `token_*` tests below), and
-//! `write_token_file` independently refuses to clobber a token still owned
-//! by a live engine (see `fixture_cannot_overwrite_live_production_token`)
+//! alongside pid/db/events-socket (see the `token` tests below), and
+//! `write_token_file` independently refuses to clobber a token still owned by
+//! a live engine (see `fixture_cannot_overwrite_or_delete_live_production_token`)
 //! as defense in depth for the case where derivation is bypassed or
 //! misconfigured.
+//!
+//! ## What this file used to *not* test
+//!
+//! Until 2026-07-23 every test here handed explicit paths straight to
+//! `serve()` and asserted those explicit paths differed — i.e. it tested that
+//! `serve` uses its arguments. `IsolationPaths::derive` was never called, so
+//! the derivation shipped with zero coverage on any field, and the
+//! stand-down-on-any-override bug survived into a production outage: a fixture
+//! launched from inside a worker pane inherited `BOSS_EVENTS_SOCKET` pointing
+//! at production, the guard read that as operator intent, and the fixture
+//! unlinked and rebound the live engine's socket.
+//!
+//! The `derive` section below closes that gap at the integration boundary;
+//! `app::isolation`'s own unit tests cover the derivation matrix exhaustively.
 
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
+use boss_engine::app::isolation::{
+    DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH, EnginePaths, IsolationOverrides, IsolationPaths,
+};
 use boss_engine::app::{process_is_alive, run, serve};
 use boss_engine::cli::Cli;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
@@ -88,7 +106,119 @@ impl Drop for TestEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests — IsolationPaths derivation (no engine started)
+// IsolationPaths derivation (no engine started)
+// ---------------------------------------------------------------------------
+
+const FIXTURE_SOCKET: &str = "/tmp/boss-test-guard-1234.sock";
+
+/// A model of the production engine's paths that does not depend on the
+/// harness's real `$HOME` (the bazel sandbox pins it to `/tmp`).
+fn production() -> EnginePaths {
+    EnginePaths::under_state_root(
+        Path::new("/Users/tester/Library/Application Support/Boss"),
+        Path::new(DEFAULT_PID_PATH),
+    )
+}
+
+fn derive(overrides: IsolationOverrides) -> IsolationPaths {
+    IsolationPaths::derive_from(FIXTURE_SOCKET, &overrides, &production())
+}
+
+/// The four paths the fixture socket above derives when nothing stands in
+/// its way. The control token is included, which the pre-2026-07-23 guard
+/// resolved outside itself and therefore clobbered.
+fn all_derived() -> EnginePaths {
+    EnginePaths {
+        db: Some(PathBuf::from("/tmp/boss-test-guard-1234.db")),
+        events_socket: Some(PathBuf::from("/tmp/boss-test-guard-1234.events.sock")),
+        pid: Some(PathBuf::from("/tmp/boss-test-guard-1234.pid")),
+        control_token: Some(PathBuf::from("/tmp/boss-test-guard-1234.control-token")),
+    }
+}
+
+/// The production socket derives nothing — a production engine resolves its
+/// paths through the ordinary env / home-dir logic.
+#[test]
+fn derive_stands_down_entirely_for_the_production_socket() {
+    let paths = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+    assert!(!paths.is_test_fixture);
+    assert_eq!(paths.derived, EnginePaths::default());
+}
+
+#[test]
+fn derive_isolates_all_four_paths_when_no_env_is_set() {
+    let paths = derive(IsolationOverrides::default());
+    assert!(paths.is_test_fixture);
+    assert_eq!(paths.derived, all_derived());
+}
+
+/// **The 2026-07-23 regression.** A fixture started from inside a worker pane
+/// inherits `BOSS_EVENTS_SOCKET` pointing at the production socket. That is
+/// inherited environment, not operator intent: derive over it.
+#[test]
+fn derive_ignores_env_that_merely_repeats_the_production_default() {
+    let prod = production();
+    let paths = derive(IsolationOverrides {
+        db_path: prod.db,
+        events_socket: prod.events_socket,
+        pid_path: prod.pid,
+        control_token_path: prod.control_token,
+    });
+    assert_eq!(
+        paths.derived,
+        all_derived(),
+        "inherited production paths must not suppress derivation on any field"
+    );
+}
+
+/// The other half of the rule: a developer who deliberately points
+/// `BOSS_EVENTS_SOCKET` at a private path still gets that path. This is why
+/// the fix is an equality test and not a blanket refusal.
+#[test]
+fn derive_honours_env_that_names_a_private_path() {
+    let paths = derive(IsolationOverrides {
+        events_socket: Some(PathBuf::from("/tmp/my-own-events.sock")),
+        ..IsolationOverrides::default()
+    });
+    assert_eq!(paths.derived.events_socket, None, "the caller's explicit choice wins");
+}
+
+/// A fixture whose resolved paths still collide with production refuses to
+/// start, and says which environment variable to fix.
+#[test]
+fn fixture_refuses_to_start_when_a_resolved_path_is_production() {
+    let prod = production();
+    let paths = derive(IsolationOverrides::default());
+
+    paths
+        .ensure_isolated(&all_derived())
+        .expect("fully isolated fixture starts");
+
+    let stolen_socket = EnginePaths {
+        events_socket: prod.events_socket,
+        ..all_derived()
+    };
+    let err = paths
+        .ensure_isolated(&stolen_socket)
+        .expect_err("a fixture must never bind production's events socket");
+    let msg = format!("{err}");
+    assert!(msg.contains("BOSS_EVENTS_SOCKET"), "must name the env var; got: {msg}");
+
+    let stolen_token = EnginePaths {
+        control_token: prod.control_token,
+        ..all_derived()
+    };
+    let err = paths
+        .ensure_isolated(&stolen_token)
+        .expect_err("a fixture must never overwrite production's control token");
+    assert!(
+        format!("{err}").contains("BOSS_ENGINE_CONTROL_TOKEN_PATH"),
+        "must name the control-token env var; got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — process liveness helper
 // ---------------------------------------------------------------------------
 
 /// `process_is_alive` reports true for this running process and false for

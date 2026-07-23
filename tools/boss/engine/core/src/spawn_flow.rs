@@ -17,7 +17,7 @@
 //! This module is just the helper; the pane-driven runner that drives
 //! it lives in `runner::PaneSpawnRunner`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
 use boss_protocol::WorkItemBinding;
@@ -441,19 +441,6 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         written_files: written,
         ack_timed_out,
     })
-}
-
-/// Stub helper used by [`Path`] callers that want a default events
-/// socket path; mirrors the resolver in `app.rs::default_events_socket_path`.
-/// Kept here so callers outside `app.rs` (tests) don't need to depend
-/// on `app.rs` private internals.
-#[allow(dead_code)]
-pub fn default_events_socket_path() -> Option<PathBuf> {
-    if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
-        return Some(override_path.into());
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join("Library/Application Support/Boss/events.sock"))
 }
 
 #[cfg(test)]

@@ -6,6 +6,17 @@ use anyhow::{Context, Result, bail};
 
 use crate::coordinator::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
+/// Environment override for the SQLite state database path.
+pub const DB_PATH_ENV: &str = "BOSS_DB_PATH";
+
+/// Environment override for the worker events socket path. Read here (to
+/// seed [`WorkConfig::events_socket_path`]) and by the `boss-event` shim;
+/// nothing else in the engine may re-read it — see the field's doc comment.
+pub const EVENTS_SOCKET_ENV: &str = "BOSS_EVENTS_SOCKET";
+
+/// Environment override for the engine pid-file path.
+pub const PID_PATH_ENV: &str = "BOSS_ENGINE_PID_PATH";
+
 /// Default value for [`WorkConfig::max_review_cycles`]. Matches the
 /// "~3 cycles at worst" mental model from P992 design §7.
 pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
@@ -93,6 +104,22 @@ pub struct CubeConfig {
 pub struct WorkConfig {
     pub cwd: PathBuf,
     pub db_path: PathBuf,
+    /// The worker events socket this engine binds — and therefore the path
+    /// baked into every worker's `settings.json` so its `boss-event` hook
+    /// shim dials *this* engine.
+    ///
+    /// Resolved once (from `BOSS_EVENTS_SOCKET`, else the production default)
+    /// and, for a test fixture, overwritten by the isolation guard in
+    /// [`crate::app::run`] before the config is frozen — exactly the way
+    /// `db_path` is handled. Everything downstream that needs to know where
+    /// the engine is listening reads it from here rather than re-deriving it
+    /// from the environment: a fixture that isolated its own socket but
+    /// handed workers `$BOSS_EVENTS_SOCKET` would send every hook to the
+    /// production engine.
+    ///
+    /// `None` means "this engine binds no events socket" — the in-process
+    /// `serve(..., None, ...)` shape used by tests.
+    pub events_socket_path: Option<PathBuf>,
     /// Defaults to 1 so test call sites don't need updating when new pool
     /// fields are added.
     #[builder(default = 1)]
@@ -179,9 +206,13 @@ impl WorkConfig {
     /// environment. Tests call this directly so they never mutate global state.
     pub fn load_from(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
         let cwd = resolve_runtime_cwd_with(&lookup)?;
-        let db_path = match lookup("BOSS_DB_PATH") {
+        let db_path = match lookup(DB_PATH_ENV) {
             Some(path) => PathBuf::from(path),
             None => default_db_path()?,
+        };
+        let events_socket_path = match lookup(EVENTS_SOCKET_ENV) {
+            Some(path) => Some(PathBuf::from(path)),
+            None => boss_log_files::default_events_socket_path(),
         };
         // Default to the hard cap so the engine pool tracks the macOS
         // app's slot count (`WorkersWorkspaceModel.workerSlotCount = 8`).
@@ -214,6 +245,7 @@ impl WorkConfig {
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
+            .maybe_events_socket_path(events_socket_path)
             .worker_pool_size(worker_pool_size)
             .automation_pool_size(automation_pool_size)
             .review_pool_size(review_pool_size)
@@ -321,6 +353,20 @@ impl RuntimeConfig {
         Self { work, agent_cell: cell }
     }
 
+    /// Return a copy of this config with `work` replaced, carrying over any
+    /// already-resolved [`AgentConfig`] so the swap doesn't force a second
+    /// (fallible, env-reading) agent load.
+    ///
+    /// Used by `serve` to stamp the events-socket path it actually bound onto
+    /// the config an in-process caller supplied without one.
+    pub fn with_work(&self, work: WorkConfig) -> Self {
+        let cell = OnceLock::new();
+        if let Some(agent) = self.agent_cell.get() {
+            let _ = cell.set(agent.clone());
+        }
+        Self { work, agent_cell: cell }
+    }
+
     pub fn agent(&self) -> Result<Arc<AgentConfig>> {
         if let Some(agent) = self.agent_cell.get() {
             return Ok(agent.clone());
@@ -399,11 +445,11 @@ fn resolve_runtime_cwd_with(lookup: impl Fn(&str) -> Option<OsString>) -> Result
 }
 
 fn default_db_path() -> Result<PathBuf> {
-    let Some(root) = boss_log_files::default_state_root() else {
+    let Some(path) = boss_log_files::default_state_db_path() else {
         bail!("HOME must be set to derive the default Boss database path");
     };
 
-    Ok(root.join("state.db"))
+    Ok(path)
 }
 
 #[cfg(test)]
