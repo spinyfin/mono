@@ -1217,6 +1217,19 @@ pub async fn serve_with_merge_probe(
         crate::execution_retention_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic proposal-expiry sweep: expires undecided (`proposed`)
+    // `effort_escalation` / `blocked` worker proposals whose owning
+    // execution has reached a terminal status — their sole effect (a
+    // worker-signal attention + auto-nudge pause on the live run) is
+    // meaningless once the run is over. `followup_task` is never touched —
+    // its pending proposals outlive their execution by design. See
+    // `crate::work::WorkDb::expire_stale_in_flight_proposals` and
+    // implementation task 6 of the worker-proposal-api design.
+    let _proposal_expiry_sweep_handle = crate::proposal_expiry_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        crate::proposal_expiry_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`
     // daemon wedges in a ~100% CPU spin. While it is stuck it stops
     // servicing code-signing assessments, so every `dlopen` of a

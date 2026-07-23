@@ -33,7 +33,7 @@ const GROUP_COLS: &str = "id, product_id, short_id, kind, \
 const ATTN_COLS: &str = "id, group_id, ordinal, source_anchor, answer_state, \
      created_at, answered_at, question_type, prompt_text, choice_options, answer, \
      proposed_name, proposed_description, proposed_effort, proposed_work_kind, \
-     rationale, confidence_source, score, linked_work_item_id";
+     rationale, confidence_source, score, linked_work_item_id, source_proposal_id";
 
 /// A group in `actioned`/`dismissed` is terminal: members can no longer be
 /// changed and new attentions for the same key form a fresh generation.
@@ -318,12 +318,12 @@ fn insert_member(conn: &Connection, group_id: &str, ordinal: i64, input: &Create
              id, group_id, ordinal, source_anchor, answer_state, created_at, answered_at,
              question_type, prompt_text, choice_options, answer,
              proposed_name, proposed_description, proposed_effort, proposed_work_kind,
-             rationale, confidence_source
+             rationale, confidence_source, source_proposal_id
          ) VALUES (
              ?1, ?2, ?3, ?4, 'open', ?5, NULL,
              ?6, ?7, ?8, NULL,
              ?9, ?10, ?11, ?12,
-             ?13, ?14
+             ?13, ?14, ?15
          )",
         params![
             id,
@@ -340,6 +340,7 @@ fn insert_member(conn: &Connection, group_id: &str, ordinal: i64, input: &Create
             input.proposed_work_kind,
             input.rationale,
             confidence_source,
+            input.source_proposal_id,
         ],
     )?;
 

@@ -145,7 +145,7 @@ impl WorkDb {
         // `WorkDb::connect`'s docs) is dropped before the post-commit
         // best-effort audit-line append below, which goes through `self`
         // and would otherwise deadlock trying to re-lock it.
-        let (id, now, state, applied_ref, decided_by, decided_at, post_commit_audit_line) = {
+        let (id, now, state, applied_ref, decided_by, decision_reason, decided_at, post_commit_audit_line) = {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -178,35 +178,58 @@ impl WorkDb {
             let id = next_id("prp");
             let now = now_string();
 
-            // Apply-before-insert: for an AutoApply kind, the produced
-            // `work_attention_items` row and the `worker_proposals` row it
-            // is `applied_ref`-linked from land in the same `INSERT`, so a
-            // reader can never observe one without the other.
-            let apply_outcome = match apply_policy(input.kind) {
+            // `followup_task` is Gated (task creation always waits for the
+            // human batch-accept gesture) but its group *membership* is not:
+            // the design requires the member to be visible in the
+            // Notifications window from the moment of submission, so this
+            // runs unconditionally alongside (not through) the
+            // AutoApply/Gated dispatch below. The proposal row itself stays
+            // `proposed` either way — nothing is "applied" until a human
+            // acts on the group.
+            if input.kind == ProposalKind::FollowupTask {
+                proposal_apply::stage_followup_task_in_transaction(&tx, input.work_item_id, &id, input.payload_json)?;
+            }
+
+            // Apply-before-insert: for an AutoApply kind, the produced row
+            // and the `worker_proposals` row it is `applied_ref`-linked from
+            // land in the same `INSERT`, so a reader can never observe one
+            // without the other.
+            let apply_decision = match apply_policy(input.kind) {
                 ProposalApplyPolicy::AutoApply => Some(apply_in_transaction(
                     &tx,
                     input.execution_id,
                     input.payload_json,
                     input.kind,
+                    &id,
                 )?),
                 ProposalApplyPolicy::Gated => None,
             };
-            let (state, applied_ref, decided_by, decided_at, post_commit_audit_line) = match apply_outcome {
-                Some(outcome) => (
-                    ProposalState::Applied,
-                    Some(outcome.applied_ref),
-                    Some(ProposalDecider::Policy),
-                    Some(now.clone()),
-                    outcome.post_commit_audit_line,
-                ),
-                None => (ProposalState::Proposed, None, None, None, None),
-            };
+            let (state, applied_ref, decided_by, decision_reason, decided_at, post_commit_audit_line) =
+                match apply_decision {
+                    Some(ApplyDecision::Applied(outcome)) => (
+                        ProposalState::Applied,
+                        outcome.applied_ref,
+                        Some(ProposalDecider::Policy),
+                        None,
+                        Some(now.clone()),
+                        outcome.post_commit_audit_line,
+                    ),
+                    Some(ApplyDecision::Rejected(reason)) => (
+                        ProposalState::Rejected,
+                        None,
+                        Some(ProposalDecider::Policy),
+                        Some(reason),
+                        Some(now.clone()),
+                        None,
+                    ),
+                    None => (ProposalState::Proposed, None, None, None, None, None),
+                };
 
             tx.execute(
                 "INSERT INTO worker_proposals
                      (id, execution_id, work_item_id, kind, payload_json,
-                      idempotency_key, state, applied_ref, decided_by, decided_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      idempotency_key, state, applied_ref, decided_by, decision_reason, decided_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     id,
                     input.execution_id,
@@ -217,6 +240,7 @@ impl WorkDb {
                     state.as_str(),
                     applied_ref,
                     decided_by.map(ProposalDecider::as_str),
+                    decision_reason,
                     decided_at,
                     now,
                 ],
@@ -229,6 +253,7 @@ impl WorkDb {
                 state,
                 applied_ref,
                 decided_by,
+                decision_reason,
                 decided_at,
                 post_commit_audit_line,
             )
@@ -257,6 +282,7 @@ impl WorkDb {
                 .work_item_id(input.work_item_id)
                 .maybe_applied_ref(applied_ref)
                 .maybe_decided_by(decided_by)
+                .maybe_decision_reason(decision_reason)
                 .maybe_decided_at(decided_at)
                 .build(),
             already_submitted: false,
@@ -353,7 +379,58 @@ impl WorkDb {
         let rows = stmt.query_map(params![execution_id, kind.as_str()], map_worker_proposal)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
+
+    /// Expire undecided (`state = 'proposed'`) proposals of an in-flight-only
+    /// kind whose owning execution has reached a terminal status. Called by
+    /// the periodic [`crate::proposal_expiry_sweep`]. Returns the number of
+    /// rows expired.
+    ///
+    /// [`IN_FLIGHT_ONLY_PROPOSAL_KINDS`] is exactly `effort_escalation` and
+    /// `blocked` per the design's state semantics (`ProposalState::Expired`'s
+    /// doc comment): their sole effect (a worker-signal attention + nudge
+    /// pause on the *live* run) is meaningless once the execution is over.
+    /// `followup_task` is never touched — a pending followup proposal
+    /// outlives its execution by design, sitting in the `followup` attention
+    /// group until the human batch-accept gesture decides it.
+    ///
+    /// In today's policy both in-flight-only kinds auto-apply synchronously
+    /// at submission ([`proposal_apply::apply_policy`]), so a `proposed` row
+    /// of either kind normally does not exist and this sweep has nothing to
+    /// find in production. It exists as the durable backstop the design's
+    /// state semantics call for regardless — a `proposed` row of these kinds
+    /// becomes reachable the moment either kind's policy is ever flipped to
+    /// `Gated` (a one-line change per that module's own doc), and this sweep
+    /// is exercised directly against hand-crafted `proposed` rows in tests.
+    pub fn expire_stale_in_flight_proposals(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let placeholders = IN_FLIGHT_ONLY_PROPOSAL_KINDS
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE worker_proposals
+                SET state = 'expired', decided_by = 'policy', decided_at = ?,
+                    decision_reason = 'execution reached a terminal state while this proposal was still undecided'
+              WHERE state = 'proposed'
+                AND kind IN ({placeholders})
+                AND execution_id IN (
+                    SELECT id FROM work_executions
+                     WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                )"
+        );
+        let kind_strs: Vec<&str> = IN_FLIGHT_ONLY_PROPOSAL_KINDS.iter().map(|k| k.as_str()).collect();
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&now];
+        for kind in &kind_strs {
+            sql_params.push(kind);
+        }
+        Ok(conn.execute(&sql, sql_params.as_slice())?)
+    }
 }
+
+/// See [`WorkDb::expire_stale_in_flight_proposals`].
+const IN_FLIGHT_ONLY_PROPOSAL_KINDS: [ProposalKind; 2] = [ProposalKind::EffortEscalation, ProposalKind::Blocked];
 
 /// Count this execution's committed proposals, total and for one kind.
 ///
@@ -426,8 +503,12 @@ mod tests {
             ProposalKind::FollowupTask => {
                 format!(r#"{{"proposed_name":"N{i}","proposed_description":"D{i}","rationale":"R{i}"}}"#)
             }
-            ProposalKind::AutomationOutcome => r#"{"outcome":"skip","reason":"clean"}"#.to_owned(),
-            ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/o/r/pull/{}"}}"#, i + 1),
+            ProposalKind::AutomationOutcome => format!(r#"{{"outcome":"skip","reason":"n{i}"}}"#),
+            // `spinyfin/mono` matches `TEST_REPO_REMOTE_URL`, the repo every
+            // `create_test_product` call in this module uses, so this
+            // auto-applies rather than being rejected on a repo-slug
+            // mismatch.
+            ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/{}"}}"#, i + 1),
         }
     }
 
@@ -1074,5 +1155,403 @@ mod tests {
             .count_worker_proposals_for_execution(&execution_id, ProposalKind::Blocked)
             .unwrap();
         assert_eq!(counts, ProposalCounts { total: 0, for_kind: 0 });
+    }
+
+    // ---- task 6: followup_task staging (gated, but the group member is
+    // written synchronously at submission) ----
+
+    /// A `followup_task` submission stays `proposed` (task creation still
+    /// needs the human batch-accept gesture) but its member is written into
+    /// the originating task's `followup` attention group immediately, with
+    /// `source_proposal_id` stamped for provenance.
+    #[test]
+    fn followup_task_stages_a_group_member_with_source_proposal_id() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::FollowupTask,
+            r#"{"proposed_name":"Add retries","proposed_description":"d","rationale":"r","proposed_effort":"small"}"#,
+            "key-1",
+        )
+        .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Proposed);
+        assert_eq!(outcome.proposal.applied_ref, None);
+
+        let all_open = db
+            .list_attention_groups(
+                &chore_product_id(&db, &chore_id),
+                None,
+                Some(&chore_id),
+                Some("followup"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(all_open.len(), 1);
+        let group = &all_open[0];
+        assert_eq!(group.association_task_id.as_deref(), Some(chore_id.as_str()));
+
+        let members = db.list_attentions_for_group(&group.id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].proposed_name.as_deref(), Some("Add retries"));
+        assert_eq!(members[0].proposed_effort.as_deref(), Some("small"));
+        assert_eq!(members[0].confidence_source, "structured");
+        assert_eq!(
+            members[0].source_proposal_id.as_deref(),
+            Some(outcome.proposal.id.as_str())
+        );
+        assert_eq!(members[0].answer_state, "open");
+    }
+
+    fn chore_product_id(db: &WorkDb, chore_id: &str) -> String {
+        match db.get_work_item(chore_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.product_id,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        }
+    }
+
+    /// A second `followup_task` submission for the same originating task
+    /// joins the same group as a second member — the group reconciliation
+    /// path (`resolve_or_create_group`) is shared with the legacy
+    /// `FOLLOWUPS:` sentinel path, so both land in one card.
+    #[test]
+    fn a_second_followup_task_for_the_same_origin_joins_the_same_group() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::FollowupTask,
+            r#"{"proposed_name":"First","proposed_description":"d","rationale":"r"}"#,
+            "key-1",
+        )
+        .unwrap();
+        submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::FollowupTask,
+            r#"{"proposed_name":"Second","proposed_description":"d","rationale":"r"}"#,
+            "key-2",
+        )
+        .unwrap();
+
+        let groups = db
+            .list_attention_groups(
+                &chore_product_id(&db, &chore_id),
+                None,
+                Some(&chore_id),
+                Some("followup"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(groups.len(), 1, "both submissions must reconcile into one group");
+        let members = db.list_attentions_for_group(&groups[0].id).unwrap();
+        assert_eq!(members.len(), 2);
+    }
+
+    // ---- task 6: automation_outcome (auto-apply with provenance check) ----
+
+    fn automation_triage_execution(db: &WorkDb, product_id: &str) -> (boss_protocol::Automation, String) {
+        let automation = seed_daily_automation(db, product_id);
+        let execution = db
+            .create_automation_triage_execution(&automation.id, TEST_REPO_REMOTE_URL)
+            .unwrap();
+        (automation, execution.id)
+    }
+
+    /// `produced_task` applies when the named task exists and carries this
+    /// automation's provenance — the same check
+    /// `finalize_automation_triage`'s legacy marker path performs today
+    /// (`completion.rs:2414`).
+    #[test]
+    fn automation_outcome_produced_task_applies_when_provenance_matches() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let (automation, execution_id) = automation_triage_execution(&db, &product.id);
+        let task = db
+            .create_automation_task(&automation.id, "Fix it", None, &[], &[])
+            .unwrap();
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &automation.id,
+            ProposalKind::AutomationOutcome,
+            &format!(r#"{{"outcome":"produced_task","task_id":"{}"}}"#, task.id),
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            outcome.proposal.decided_by,
+            Some(boss_protocol::ProposalDecider::Policy)
+        );
+    }
+
+    /// `skip` carries no task to check and always applies, with no
+    /// `applied_ref` (there is nothing produced to point at).
+    #[test]
+    fn automation_outcome_skip_always_applies_with_no_applied_ref() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let (automation, execution_id) = automation_triage_execution(&db, &product.id);
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &automation.id,
+            ProposalKind::AutomationOutcome,
+            r#"{"outcome":"skip","reason":"repo is clean"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(outcome.proposal.applied_ref, None);
+    }
+
+    /// A `produced_task` naming a task that does not exist is rejected with
+    /// a readable reason, not an engine error.
+    #[test]
+    fn automation_outcome_produced_task_rejects_a_nonexistent_task() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let (automation, execution_id) = automation_triage_execution(&db, &product.id);
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &automation.id,
+            ProposalKind::AutomationOutcome,
+            r#"{"outcome":"produced_task","task_id":"task_does_not_exist"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+        assert_eq!(
+            outcome.proposal.decided_by,
+            Some(boss_protocol::ProposalDecider::Policy)
+        );
+        let reason = outcome.proposal.decision_reason.expect("rejection must carry a reason");
+        assert!(reason.contains("task_does_not_exist"), "{reason}");
+    }
+
+    /// A `produced_task` naming a real task with the *wrong* provenance
+    /// (some other automation's task, or a manually-created one) is rejected
+    /// — a triage run cannot claim credit for work it did not produce.
+    #[test]
+    fn automation_outcome_produced_task_rejects_a_provenance_mismatch() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let (automation, execution_id) = automation_triage_execution(&db, &product.id);
+        let unrelated = create_test_chore(&db, product.id, "Unrelated chore");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &automation.id,
+            ProposalKind::AutomationOutcome,
+            &format!(r#"{{"outcome":"produced_task","task_id":"{}"}}"#, unrelated.id),
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+        let reason = outcome.proposal.decision_reason.expect("rejection must carry a reason");
+        assert!(reason.contains("source_automation_id"), "{reason}");
+    }
+
+    /// A second `automation_outcome` submission for the same execution
+    /// supersedes the first — the worker revised its decision, so only the
+    /// latest outcome stands as operative.
+    #[test]
+    fn a_second_automation_outcome_supersedes_the_first() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let (automation, execution_id) = automation_triage_execution(&db, &product.id);
+
+        let first = submit(
+            &db,
+            &execution_id,
+            &automation.id,
+            ProposalKind::AutomationOutcome,
+            r#"{"outcome":"skip","reason":"nothing yet"}"#,
+            "key-1",
+        )
+        .unwrap();
+        assert_eq!(first.proposal.state, ProposalState::Applied);
+
+        let task = db
+            .create_automation_task(&automation.id, "Fix it", None, &[], &[])
+            .unwrap();
+        let second = submit(
+            &db,
+            &execution_id,
+            &automation.id,
+            ProposalKind::AutomationOutcome,
+            &format!(r#"{{"outcome":"produced_task","task_id":"{}"}}"#, task.id),
+            "key-2",
+        )
+        .unwrap();
+        assert_eq!(second.proposal.state, ProposalState::Applied);
+
+        let all = db
+            .list_worker_proposals_for_work_item(&automation.id, None, None)
+            .unwrap();
+        let refetched_first = all.iter().find(|p| p.id == first.proposal.id).unwrap();
+        assert_eq!(refetched_first.state, ProposalState::Superseded);
+        assert_eq!(refetched_first.decided_by, Some(boss_protocol::ProposalDecider::Policy));
+        assert!(refetched_first.decided_at.is_some());
+        assert!(refetched_first.decision_reason.is_some());
+
+        let refetched_second = all.iter().find(|p| p.id == second.proposal.id).unwrap();
+        assert_eq!(refetched_second.state, ProposalState::Applied);
+    }
+
+    // ---- task 6: pr_created (auto-apply with verification) ----
+
+    /// A PR URL matching the product's repo applies and binds `pr_url` onto
+    /// the task.
+    #[test]
+    fn pr_created_applies_and_binds_pr_url_to_the_task() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::PrCreated,
+            r#"{"pr_url":"https://github.com/spinyfin/mono/pull/42"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(chore_id.as_str()));
+
+        let pr_url = match db.get_work_item(&chore_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.pr_url,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert_eq!(pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/42"));
+    }
+
+    /// A PR URL for a different repo than the product's is rejected with a
+    /// readable reason, mirroring `pr_url_capture::validate_pr_url`.
+    #[test]
+    fn pr_created_rejects_a_url_for_a_different_repo() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::PrCreated,
+            r#"{"pr_url":"https://github.com/someoneelse/otherrepo/pull/1"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+        assert!(outcome.proposal.decision_reason.is_some());
+
+        let pr_url = match db.get_work_item(&chore_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.pr_url,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert_eq!(pr_url, None, "a rejected proposal must not bind pr_url");
+    }
+
+    /// A branch that does not match the execution's expected branch name is
+    /// rejected even though the URL/repo are otherwise valid.
+    #[test]
+    fn pr_created_rejects_a_branch_that_does_not_match_the_execution() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::PrCreated,
+            r#"{"pr_url":"https://github.com/spinyfin/mono/pull/42","branch":"totally-unrelated-branch"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
+        let reason = outcome.proposal.decision_reason.expect("rejection must carry a reason");
+        assert!(reason.contains("branch"), "{reason}");
+    }
+
+    /// A branch that matches the execution's expected branch name (computed
+    /// the same way the legacy `verified_staged_pr_url` path does) applies.
+    #[test]
+    fn pr_created_applies_when_the_supplied_branch_matches_the_execution() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        let execution = db.get_execution(&execution_id).unwrap();
+        let expected_branch = crate::completion::expected_branch_name(
+            &execution_id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::PrCreated,
+            &format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/42","branch":"{expected_branch}"}}"#),
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+    }
+
+    /// An already-bound `pr_url` is left alone (opportunistic "set if not
+    /// set" semantics, mirroring `WorkDb::reconciler_attach_pr_url`) — the
+    /// proposal still applies, since the URL/repo/branch it declared were
+    /// themselves valid.
+    #[test]
+    fn pr_created_does_not_overwrite_an_already_bound_pr_url() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/1' WHERE id = ?1",
+                params![chore_id],
+            )
+            .unwrap();
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::PrCreated,
+            r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
+            "key-1",
+        )
+        .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+
+        let pr_url = match db.get_work_item(&chore_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.pr_url,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert_eq!(pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/1"));
     }
 }

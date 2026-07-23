@@ -753,6 +753,7 @@ pub(crate) fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
         confidence_source: row.get(16)?,
         score: row.get(17)?,
         linked_work_item_id: row.get(18)?,
+        source_proposal_id: row.get(19)?,
     })
 }
 

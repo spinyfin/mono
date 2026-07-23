@@ -69,6 +69,14 @@ pub struct Attention {
     /// detected work-item duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_work_item_id: Option<String>,
+    /// Id (`prp_…`) of the `worker_proposals` row this member was staged
+    /// from, when it came in via `boss propose followup-task` rather than a
+    /// detector/manifest. Follows the same provenance pattern as
+    /// [`Self::confidence_source`]: `None` for members created any other
+    /// way. Drives the Notifications-window proposal badge + provenance
+    /// jump link (design §"UI visibility and provenance").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_proposal_id: Option<String>,
 }
 
 /// One attention group — the human-actionable unit of the Attentions
@@ -280,6 +288,9 @@ pub struct CreateAttentionInput {
     /// omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_source: Option<String>,
+    /// See [`Attention::source_proposal_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_proposal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
