@@ -3356,8 +3356,9 @@ private struct PlannerResultSummaryView: View {
 
     /// `true` only for a `planner_failed` run's diagnostic — the only case
     /// with a non-nil `headline` (see `PlannerRun.plannerFailureHeadline`).
-    /// Successful-run summaries (e.g. "created 5 tasks, 3 edges") render as
-    /// plain prose with no monospace/copy chrome, matching their pre-PR look.
+    /// Successful-run summaries (e.g. "created 5 tasks, 3 edges") are short
+    /// prose, not diagnostics, so they render plain with no monospace or
+    /// copy chrome.
     private var isFailure: Bool { headline != nil }
 
     private var displayText: String { raw.unescapedForDisplay }
