@@ -965,6 +965,19 @@ pub async fn serve_with_merge_probe(
         crate::dead_pane_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic stranded-`answering` recovery. Every sweep above reconciles
+    // `work_executions`; none of them know `work_comments` exists. So an
+    // answer-agent execution that dies without a Stop hook is correctly
+    // reaped while the comment it was answering stays `answering` forever —
+    // showing "Thinking…" in the sidebar, and excluded from both the
+    // `[Revise]` banner's count and its candidate query. This sweep is
+    // comment-driven and DB-backed, so it clears strandings left by a
+    // previous engine process on boot.
+    let _stranded_answering_sweep_handle = crate::stranded_answering_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        crate::stranded_answering_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic remote-lease reconciler: the cross-host analogue of the
     // lost-workspace sweep above. `lost_workspace_sweep` deliberately only
     // judges LOCAL runs (a `.exists()` probe is meaningless for a workspace

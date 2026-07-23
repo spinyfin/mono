@@ -119,6 +119,7 @@ pub mod ssh_spawn;
 pub use boss_ssh_transport as ssh_transport;
 pub mod stacked_pr_structuring;
 pub mod stale_worker_sweep;
+pub mod stranded_answering_sweep;
 pub mod structured_output;
 pub mod supersession_scan;
 pub(crate) mod sweep_loop;

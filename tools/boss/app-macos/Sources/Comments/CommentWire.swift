@@ -233,7 +233,13 @@ struct ResolvedComment: Codable, Equatable, Sendable {
 enum ReviseDocOutcome: Equatable, Sendable {
     /// A revision (open PR) or chore (merged/closed/no-PR) was created and
     /// the addressed comments were flipped to `in_revision`.
-    case created(taskId: String, taskKind: String, addressedCommentIds: [String], prUrl: String?)
+    ///
+    /// `excludedCommentIds` are comments the sidebar badges
+    /// `directive`/`larger_change` that the batch did NOT address because
+    /// their `status` disqualified them. The badge renders `intent` alone, so
+    /// without surfacing these the operator sees an unqualified success for a
+    /// batch that dropped comments they can see marked as revisable.
+    case created(taskId: String, taskKind: String, addressedCommentIds: [String], excludedCommentIds: [String], prUrl: String?)
     /// No `active` comment on the artifact carries a `directive`/`larger_change`
     /// intent — idempotent no-op.
     case noUnresolvedComments
@@ -250,6 +256,7 @@ extension ReviseDocOutcome: Decodable {
         case taskId = "task_id"
         case taskKind = "task_kind"
         case addressedCommentIds = "addressed_comment_ids"
+        case excludedCommentIds = "excluded_comment_ids"
         case prUrl = "pr_url"
         case reason
     }
@@ -262,6 +269,10 @@ extension ReviseDocOutcome: Decodable {
                 taskId: try c.decode(String.self, forKey: .taskId),
                 taskKind: try c.decode(String.self, forKey: .taskKind),
                 addressedCommentIds: try c.decode([String].self, forKey: .addressedCommentIds),
+                // The engine omits the key entirely when nothing was excluded
+                // (`skip_serializing_if = "Vec::is_empty"`), which is the
+                // common case.
+                excludedCommentIds: try c.decodeIfPresent([String].self, forKey: .excludedCommentIds) ?? [],
                 prUrl: try c.decodeIfPresent(String.self, forKey: .prUrl)
             )
         case "no_unresolved_comments":

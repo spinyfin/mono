@@ -360,10 +360,20 @@ pub struct CommentWithThread {
 // --- Answer-agent runs (P3a: read-only mini-coordinator answer agent) ---
 
 /// `answer_agent_runs.status` values. The run is created `running`, then flips
-/// exactly once to a terminal `replied` (posted its thread reply) or `failed`.
+/// exactly once to a terminal `replied` (posted its thread reply), `failed`, or
+/// [`ANSWER_AGENT_RUN_STATUS_SUPERSEDED`].
 pub const ANSWER_AGENT_RUN_STATUS_RUNNING: &str = "running";
 pub const ANSWER_AGENT_RUN_STATUS_REPLIED: &str = "replied";
 pub const ANSWER_AGENT_RUN_STATUS_FAILED: &str = "failed";
+/// Terminal: the operator reclassified the comment away from `question` while
+/// this run was still in flight, so the engine stood the run down (see
+/// `handle_comments_set_intent`). Deliberately distinct from `failed` — nothing
+/// went wrong, the question was retracted — and load-bearing in two places:
+/// the run is no longer `running`, so a late `CommentsPostAnswer` from the
+/// stood-down agent is rejected instead of resurrecting `answering`; and it
+/// carries no `reply_body`, so `compose_doc_comment_directive` never feeds a
+/// retracted question's answer into a revision.
+pub const ANSWER_AGENT_RUN_STATUS_SUPERSEDED: &str = "superseded";
 
 /// An engine-persisted comment row (`work_comments` table). Anchored to an
 /// artifact (`work_item:<id>` or `pr_doc:<repo>:<branch>:<path>`) via a
