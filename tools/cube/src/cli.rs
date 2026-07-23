@@ -102,6 +102,14 @@ pub enum WorkspaceCommand {
         /// falls back: if the named workspace is missing, leased, or has
         /// no repo, the lease fails loudly rather than routing the
         /// recovering worker away from the only copy of the work.
+        ///
+        /// A successful `--allow-dirty` lease does NOT by itself mean
+        /// anything was recovered — a workspace that had already been reset
+        /// is handed over just as happily. The lease payload therefore
+        /// reports `health_check[0].dirty_verified`: `true` when the
+        /// working copy still held work that exists on no remote, `false`
+        /// when there was nothing to recover and the caller must fall back
+        /// to its own recovery artifact.
         #[arg(long, requires = "prefer")]
         allow_dirty: bool,
         /// Workspace ids to skip even if they are otherwise free and healthy.
@@ -143,12 +151,27 @@ pub enum WorkspaceCommand {
         /// Recorded in the workspaces row's `last_release_reason`.
         #[arg(long)]
         reason: Option<String>,
-        /// Skip the `jj git fetch && jj new main@origin` reset on release.
-        /// The slot is freed in cube's registry but the workspace's
-        /// working copy is left as-is for forensics. Pair with
+        /// Skip the `jj git fetch && jj new main@origin` reset on release
+        /// unconditionally. The slot is freed in cube's registry but the
+        /// workspace's working copy is left as-is for forensics. Pair with
         /// `--reason crash` for crash recovery.
+        ///
+        /// Note that release is *already* non-destructive when the working
+        /// copy holds unpushed work — see `--force-reset`. This flag only
+        /// adds "keep the tree even when it is provably safe to reset it".
         #[arg(long)]
         keep_dirty: bool,
+        /// Run the destructive reset even when the release-time reuse guard
+        /// says `@` holds non-empty work that exists on no remote.
+        ///
+        /// Release preserves such a working copy by default: a crashed
+        /// worker's uncommitted work is only in that tree, and every caller
+        /// having to remember `--keep-dirty` is the bug that lost it. Pass
+        /// this when you know the tree is disposable (e.g. reclaiming a
+        /// workspace full of build junk) and want a pristine checkout back
+        /// in the pool immediately.
+        #[arg(long, conflicts_with = "keep_dirty")]
+        force_reset: bool,
     },
     /// Refresh a lease's expiry so it isn't reclaimed by the TTL sweep.
     ///
