@@ -48,19 +48,31 @@ fn needs_remediation(last_trunk_state: Option<&str>) -> bool {
 }
 
 /// Called once the fix for an evicted or conflict-superseded Trunk intent
-/// has genuinely landed (see call sites: `ci_watch::on_ci_resolved` gates
-/// on the spawned revision reaching `done`; `conflict_watch::on_resolved`
-/// gates on GitHub reporting the PR mergeable again). Flips the intent's
-/// `last_trunk_state` sentinel to [`TRUNK_INTENT_AWAITING_RESUBMIT`] so the
-/// next `TrunkQueueProbe` pass calls `submitPullRequest` again.
+/// has genuinely landed. Flips the intent's `last_trunk_state` sentinel to
+/// [`TRUNK_INTENT_AWAITING_RESUBMIT`] so the next `TrunkQueueProbe` pass
+/// calls `submitPullRequest` again.
+///
+/// `allowed_from` scopes which sub-state this caller is entitled to advance
+/// out of: an eviction episode (`ci_watch::on_ci_resolved`, gated on the
+/// spawned revision reaching `done`) and a conflict episode
+/// (`conflict_watch::on_resolved`, gated on GitHub reporting the PR
+/// mergeable again) can both be live on the same work item at once — see
+/// `on_conflict_detected`'s takeover of a `blocked: ci_failure` row — so
+/// each caller must only ever advance the sub-state it actually owns the
+/// fix for. Without this, an unrelated conflict resolution could resubmit a
+/// PR whose eviction fix hasn't landed yet, or vice versa. Callers pass
+/// exactly the state(s) they own:
+/// `mark_trunk_intent_awaiting_resubmit(db, id, &["failed", "pending_failure"])` for
+/// `ci_watch`, `&[TRUNK_INTENT_SUPERSEDED_BY_CONFLICT]` for `conflict_watch`.
 ///
 /// A no-op — not an error — when the work item has no active Trunk merge
 /// intent (not a `trunk_queue` product, or the intent already retired) or
-/// the intent isn't in a [`needs_remediation`] sub-state (e.g. it's still
-/// live in the queue, or a resubmit is already in flight). Best-effort:
-/// failures are logged, not propagated, mirroring every other side-table
-/// write in the `ci_watch`/`conflict_watch` retire paths.
-pub fn mark_trunk_intent_awaiting_resubmit(work_db: &WorkDb, work_item_id: &str) {
+/// the intent's current state isn't one of `allowed_from` (e.g. it's still
+/// live in the queue, a resubmit is already in flight, or a different
+/// episode owns it). Best-effort: failures are logged, not propagated,
+/// mirroring every other side-table write in the `ci_watch`/`conflict_watch`
+/// retire paths.
+pub fn mark_trunk_intent_awaiting_resubmit(work_db: &WorkDb, work_item_id: &str, allowed_from: &[&str]) {
     let intent = match work_db.get_active_trunk_merge_intent(work_item_id) {
         Ok(Some(intent)) => intent,
         Ok(None) => return,
@@ -73,7 +85,8 @@ pub fn mark_trunk_intent_awaiting_resubmit(work_db: &WorkDb, work_item_id: &str)
             return;
         }
     };
-    if !needs_remediation(intent.last_trunk_state.as_deref()) {
+    let current = intent.last_trunk_state.as_deref();
+    if !current.is_some_and(|state| allowed_from.contains(&state)) {
         return;
     }
     if let Err(err) = work_db.record_trunk_merge_intent_state(&intent.id, TRUNK_INTENT_AWAITING_RESUBMIT) {
@@ -123,6 +136,18 @@ pub fn mark_trunk_intent_superseded_by_conflict(work_db: &WorkDb, work_item_id: 
             "trunk_merge: failed to mark intent superseded_by_conflict",
         );
     }
+}
+
+/// The `merge_queue_detail` JSON written for an optimistic "just submitted,
+/// haven't heard back from `getQueue` yet" card placement — used both by
+/// `app::review::handle_merge_when_ready`'s initial submit and by
+/// `trunk_queue_poller::resubmit_intent`'s auto-resubmit, so the
+/// `{source, state}` shape can only drift in one place if it ever gains a
+/// field. Deliberately minimal: `TrunkQueueProbe::write_live_entry`
+/// overwrites this with the full shape (`position`, `enqueued_at`, …) on
+/// the next successful `getQueue` sweep.
+pub fn optimistic_pending_detail_json() -> String {
+    serde_json::json!({"source": "trunk", "state": "pending"}).to_string()
 }
 
 /// Repo/PR coordinates Trunk's queue API addresses, parsed from a task's
@@ -246,7 +271,7 @@ mod tests {
         let intent = db.get_active_trunk_merge_intent(&work_item_id).unwrap().unwrap();
         db.record_trunk_merge_intent_state(&intent.id, "failed").unwrap();
 
-        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id);
+        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id, &["failed", "pending_failure"]);
 
         assert_eq!(
             last_trunk_state(&db, &work_item_id).as_deref(),
@@ -262,11 +287,34 @@ mod tests {
         db.record_trunk_merge_intent_state(&intent.id, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
             .unwrap();
 
-        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id);
+        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id, &[TRUNK_INTENT_SUPERSEDED_BY_CONFLICT]);
 
         assert_eq!(
             last_trunk_state(&db, &work_item_id).as_deref(),
             Some(TRUNK_INTENT_AWAITING_RESUBMIT)
+        );
+    }
+
+    /// Regression guard: a caller must not be able to advance a sub-state it
+    /// doesn't own — e.g. `conflict_watch::on_resolved`'s call (scoped to
+    /// `TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`) must not clobber an active
+    /// eviction episode, and vice versa. Without the `allowed_from` scoping
+    /// this would resubmit a PR whose eviction fix hasn't landed yet.
+    #[test]
+    fn awaiting_resubmit_does_not_advance_a_sub_state_the_caller_does_not_own() {
+        let db = test_db();
+        let work_item_id = seed_active_intent(&db, "eviction-owned");
+        let intent = db.get_active_trunk_merge_intent(&work_item_id).unwrap().unwrap();
+        db.record_trunk_merge_intent_state(&intent.id, "failed").unwrap();
+
+        // conflict_watch::on_resolved's call — scoped to the conflict
+        // sub-state only, so it must not touch an eviction-owned intent.
+        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id, &[TRUNK_INTENT_SUPERSEDED_BY_CONFLICT]);
+
+        assert_eq!(
+            last_trunk_state(&db, &work_item_id).as_deref(),
+            Some("failed"),
+            "an unrelated conflict resolution must not resubmit a PR whose eviction fix hasn't landed",
         );
     }
 
@@ -277,11 +325,11 @@ mod tests {
         let intent = db.get_active_trunk_merge_intent(&work_item_id).unwrap().unwrap();
         db.record_trunk_merge_intent_state(&intent.id, "testing").unwrap();
 
-        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id);
+        mark_trunk_intent_awaiting_resubmit(&db, &work_item_id, &["failed", "pending_failure"]);
         assert_eq!(last_trunk_state(&db, &work_item_id).as_deref(), Some("testing"));
 
         // No active intent at all — must not panic or error.
-        mark_trunk_intent_awaiting_resubmit(&db, "no_such_work_item");
+        mark_trunk_intent_awaiting_resubmit(&db, "no_such_work_item", &["failed", "pending_failure"]);
     }
 
     #[test]

@@ -199,12 +199,14 @@ pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_
 /// the whole state machine without a mock HTTP server.
 ///
 /// Deliberately narrower than [`boss_trunk_client::TrunkClient`]: the
-/// poller only ever issues the entry-level writes the auto-resubmit /
+/// poller issues only the entry-level writes the auto-resubmit /
 /// conflict-during-queue coordination needs (`submitPullRequest`,
-/// `cancelPullRequest`) — never queue-lifecycle administration
-/// (`restartTestsOnPullRequest` and friends stay out of this trait
-/// deliberately, mirroring the design's "the only write verbs it ever
-/// issues are entry-level" non-goal).
+/// `cancelPullRequest`) — never queue-lifecycle administration (creating,
+/// deleting, or pausing a queue, concurrency-mode changes,
+/// `setImpactedTargets`). `restartTestsOnPullRequest` is also an
+/// entry-level verb per the design's non-goals section, and is the
+/// flake-retrigger action the brief calls for on a still-live entry, but it
+/// is not wired up in this trait yet.
 #[async_trait]
 pub trait TrunkQueueApi: Send + Sync {
     async fn get_queue(&self, request: &GetQueueRequest) -> Result<TrunkQueue, TrunkError>;
@@ -583,6 +585,19 @@ impl TrunkQueueProbe {
 
         let mut tier = TrunkPollTier::Pending;
         for member in members {
+            // Checked before the queue-membership lookup below: a conflict
+            // detected mid-queue sets this sentinel while the entry is
+            // still LIVE in `enqueuedPullRequests`, so if this check ran
+            // after the lookup the live-entry arm would win every time,
+            // overwrite the sentinel with Trunk's observed state via
+            // `record_observed_state`, and `cancelPullRequest` would never
+            // fire. Cancelling first and `continue`-ing also skips writing
+            // a live-entry snapshot for a slot the conflict resolver now
+            // owns.
+            if is_superseded_by_conflict(member) {
+                cancel_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
+                continue;
+            }
             let observed = match by_pr_number.get(&(member.intent.pr_number as u64)) {
                 Some((position, entry)) if !is_terminal_trunk_state(&entry.state) => {
                     write_live_entry(ctx, member, entry, *position, &queue.state, outcome).await;
@@ -604,14 +619,6 @@ impl TrunkQueueProbe {
                 // next `getQueue` response.
                 None if is_awaiting_resubmit(member) => {
                     resubmit_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
-                    None
-                }
-                // A conflict was detected while this entry was still live —
-                // `conflict_watch::on_conflict_detected` marked it for
-                // cancellation. The conflict resolver owns the slot; no
-                // eviction remediation.
-                None if is_superseded_by_conflict(member) => {
-                    cancel_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
                     None
                 }
                 // Already resolved on an earlier pass and deliberately
@@ -1183,8 +1190,9 @@ async fn resolve_missing_entry(
 /// sentinel (so the live-tracking arm in [`TrunkQueueProbe::probe_queue`]
 /// picks the entry back up once the next `getQueue` reports it), and
 /// optimistically moves the card back into the Merging lane ahead of that
-/// probe — mirrors `app::review::handle_trunk_queue_merge`'s initial-submit
-/// optimistic write. On failure, the sentinel is left in place so the next
+/// probe, via the same [`crate::trunk_merge::optimistic_pending_detail_json`]
+/// shape `app::review::handle_merge_when_ready`'s initial-submit optimistic
+/// write uses. On failure, the sentinel is left in place so the next
 /// due cycle retries; Trunk's documented lack of rate limits is what makes
 /// that an acceptable retry cadence rather than a backoff ladder of its own.
 async fn resubmit_intent(
@@ -1210,7 +1218,7 @@ async fn resubmit_intent(
                     "trunk queue poller: resubmit succeeded but failed to record submit_count",
                 );
             }
-            let detail = serde_json::json!({"source": "trunk", "state": "pending"}).to_string();
+            let detail = crate::trunk_merge::optimistic_pending_detail_json();
             match ctx.work_db.set_task_merge_queue_state(
                 &member.intent.work_item_id,
                 Some(MERGE_QUEUE_STATE_QUEUED),

@@ -2308,7 +2308,7 @@ async fn trunk_eviction_budget_exhaustion_retires_the_intent() {
 }
 
 #[tokio::test]
-/// Regression guard for PR #1404 / issue T1431: a new CI-fix revision must
+/// Regression guard for PR #1404: a new CI-fix revision must
 /// not spawn while a prior attempt's revision worker is still in flight (status
 /// `todo` or `active`), even when the `ci_remediations` row was prematurely
 /// retired by `ci_attempt_signal_cleared` (the originally-failing checks are

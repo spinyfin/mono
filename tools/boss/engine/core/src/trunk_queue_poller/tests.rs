@@ -846,6 +846,54 @@ async fn a_failed_resubmit_leaves_the_sentinel_for_the_next_cycle() {
     );
 }
 
+/// Covers the case the feature actually exists for: the conflict was
+/// detected while the entry was STILL LIVE in Trunk's `getQueue` snapshot,
+/// so `by_pr_number` carries a non-terminal entry for it on this pass. The
+/// superseded check must win over the live-entry match arm, or
+/// `record_observed_state` clobbers the sentinel before `cancelPullRequest`
+/// is ever issued.
+#[tokio::test]
+async fn a_live_intent_superseded_by_conflict_is_cancelled_before_its_sentinel_can_be_clobbered() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "superseded-live", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(
+        TrunkQueueState::Running,
+        vec![entry_of(978, TrunkPrState::Pending)],
+    ))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.queue_cancellations, 1);
+    assert_eq!(api.cancel_call_count(), 1);
+    let calls = api.cancel_calls.lock().unwrap().clone();
+    assert_eq!(calls[0], (REPO.to_owned(), 978, "main".to_owned()));
+
+    // The sentinel must survive: a live-entry write here would mean
+    // `cancelPullRequest` is unreachable in production.
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("still active");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+    );
+    assert!(db.active_ci_remediation_for_work_item(&task_id).unwrap().is_none());
+}
+
+/// The entry-absent case: the conflict resolver already pulled it, or Trunk
+/// failed it independently, before this pass ran.
 #[tokio::test]
 async fn an_intent_superseded_by_conflict_is_cancelled_and_the_sentinel_persists() {
     let (_tmp, db) = crate::test_support::open_db();

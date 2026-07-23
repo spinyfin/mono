@@ -79,6 +79,54 @@ async fn conflict_detection_does_not_clobber_an_intent_already_evicted() {
     );
 }
 
+/// Regression guard: on a path where `on_conflict_detected` declines to
+/// take ownership of the row (here, a genuinely higher-priority foreign
+/// block — design §Q2: dependency > review_feedback > merge_conflict), the
+/// Trunk intent's sentinel must NOT be set. Marking it here — as the
+/// original placement ahead of every early return used to do — would
+/// strand the intent in `boss:superseded_by_conflict` forever: no
+/// `conflict_resolutions` row exists to eventually clear it via
+/// `on_resolved`, so the poller would cancel the entry out of the queue
+/// and never resubmit it.
+#[tokio::test]
+async fn conflict_detection_that_declines_ownership_does_not_strand_the_trunk_intent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/9004";
+    let (product, chore) = make_in_review(&db, "C-trunk-declined", pr);
+    seed_trunk_intent(&db, &chore, pr, 9004);
+    db.update_work_item(
+        &chore,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some("dependency".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let took_over = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(
+        !took_over,
+        "conflict_watch must not steal a higher-priority foreign block"
+    );
+
+    let intent = db.get_active_trunk_merge_intent(&chore).unwrap().expect("still active");
+    assert_eq!(
+        intent.last_trunk_state, None,
+        "a slot conflict_watch never took ownership of must not carry the superseded sentinel",
+    );
+}
+
 #[tokio::test]
 async fn conflict_resolution_clears_a_superseded_intent_for_resubmit() {
     let dir = tempdir().unwrap();

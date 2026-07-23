@@ -1927,8 +1927,16 @@ pub async fn on_ci_resolved(
     if is_trunk_eviction && attempt_transitioned {
         // The fix landed and this attempt just retired — tell the
         // TrunkQueueProbe it's clear to resubmit (design §"Eviction: a
-        // first-class failure signal", step 4).
-        crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(work_db, &candidate.work_item_id);
+        // first-class failure signal", step 4). Scoped to the eviction
+        // sub-state only: a conflict episode
+        // (`TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`) can be live on the same
+        // work item at once, and only `conflict_watch::on_resolved` owns
+        // clearing that one.
+        crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(
+            work_db,
+            &candidate.work_item_id,
+            &["failed", "pending_failure"],
+        );
     }
     tracing::info!(
         work_item_id = %candidate.work_item_id,

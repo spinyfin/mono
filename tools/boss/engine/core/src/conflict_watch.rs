@@ -125,15 +125,6 @@ pub async fn on_conflict_detected(
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
         return false;
     }
-    // Trunk merge-queue coordination (design §"Coordination with
-    // conflict_watch / ci_watch"): a conflict detected while a Trunk merge
-    // intent is still live in the queue is real — Trunk will fail it too —
-    // so the conflict resolver takes over the slot. Best-effort and
-    // idempotent (a no-op for a non-`trunk_queue` product, or an intent
-    // that's already evicted/superseded/awaiting resubmit); runs
-    // unconditionally ahead of every early-return branch below so a
-    // repeated detection on the same live intent still gets recorded.
-    crate::trunk_merge::mark_trunk_intent_superseded_by_conflict(work_db, &candidate.work_item_id);
     // Q7: when `auto-rebase-stacked-prs` is already chasing this PR,
     // step aside. Auto-rebase escalation owns the slot until it
     // hits a terminal status; the next conflict-watch sweep will
@@ -266,6 +257,25 @@ pub async fn on_conflict_detected(
             );
         }
     }
+
+    // Trunk merge-queue coordination (design §"Coordination with
+    // conflict_watch / ci_watch"): a conflict detected while a Trunk merge
+    // intent is still live in the queue is real — Trunk will fail it too —
+    // so the conflict resolver takes over the slot. Best-effort and
+    // idempotent (a no-op for a non-`trunk_queue` product, or an intent
+    // that's already evicted/superseded/awaiting resubmit).
+    //
+    // Placed here — after the auto-rebase-active and foreign-bucket-owned
+    // early returns above, not before them — so the sentinel is only ever
+    // set on a path where conflict_watch is actually about to take
+    // ownership of the slot (attempt the `in_review` → `blocked` flip
+    // below). Marking it on the auto-rebase or foreign-bucket-owned paths
+    // (where this function returns without creating a `conflict_resolutions`
+    // row or flipping the parent) would strand the intent in the sentinel
+    // forever: `on_resolved` only clears it once `conflict_watch` itself
+    // observes the PR mergeable again, which never happens for a slot it
+    // never took over.
+    crate::trunk_merge::mark_trunk_intent_superseded_by_conflict(work_db, &candidate.work_item_id);
 
     // Try to flip the parent from `in_review` → `blocked: merge_conflict`.
     // The WHERE guard (`status = 'in_review'`) is load-bearing: it protects
@@ -1314,9 +1324,17 @@ pub async fn on_resolved(
     // GitHub reporting the PR mergeable again is a trustworthy signal here
     // (unlike a bare CI-clean probe for a queue-side CI failure) — mergeable
     // genuinely reflects the rebase the conflict-resolution revision just
-    // pushed. If a Trunk merge intent was superseded by this conflict, it's
-    // now clear to resubmit.
-    crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(work_db, &candidate.work_item_id);
+    // pushed. If a Trunk merge intent was superseded by THIS conflict, it's
+    // now clear to resubmit. Scoped to only that sub-state: an eviction
+    // episode (`last_trunk_state` `failed`/`pending_failure`) can be live on
+    // the same work item at once (see `on_conflict_detected`'s takeover of a
+    // `blocked: ci_failure` row) and must not be advanced by an unrelated
+    // conflict resolving — only `ci_watch::on_ci_resolved` owns that fix.
+    crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(
+        work_db,
+        &candidate.work_item_id,
+        &[crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT],
+    );
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
