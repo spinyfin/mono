@@ -55,6 +55,7 @@ mod comments;
 mod conflict_resolution;
 mod context;
 mod dependencies;
+mod design_docs;
 mod effort;
 mod engine_meta;
 mod executions;
@@ -447,6 +448,14 @@ struct ServerState {
     /// run lacks the field. See [`TranscriptPathCache`] for why this
     /// is the structural fix for the 2026-05-12 incident.
     transcript_path_cache: Arc<crate::live_status_loop::TranscriptPathCache>,
+    /// Reads product markdown trees and documents from GitHub for the
+    /// Designs tab. Holds the HEAD-validated per-repo listing cache, so
+    /// it lives on `ServerState` (process lifetime) rather than being
+    /// constructed per request — a per-request instance would have an
+    /// empty cache every time and refetch the full tree on every
+    /// keystroke-speed product switch. See
+    /// [`boss_engine_design_docs`] for why the cache cannot go stale.
+    design_docs: Arc<boss_engine_design_docs::DesignDocsService>,
     /// Primary-path `execution_id → pr_url` staging cache. Populated
     /// by [`dispatch_live_worker_state`] from `PostToolUse` Bash
     /// hooks that surface a `gh pr create` (or `view` / `edit`)
@@ -1057,6 +1066,7 @@ impl ServerState {
                     metrics_for_dispatcher,
                 )))
                 .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
+                .design_docs(Arc::new(boss_engine_design_docs::DesignDocsService::new()))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
@@ -1785,6 +1795,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
             r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
             r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
+            r @ FrontendRequest::GetProductDesignDoc { .. } => design_docs::handle_get_product_design_doc(ctx, r).await,
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
@@ -1839,6 +1850,9 @@ async fn handle_frontend_connection(
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }
             r @ FrontendRequest::ListPlannerRuns { .. } => planner_ops::handle_list_planner_runs(ctx, r).await,
+            r @ FrontendRequest::ListProductDesignDocs { .. } => {
+                design_docs::handle_list_product_design_docs(ctx, r).await
+            }
             r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
             r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
             r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,

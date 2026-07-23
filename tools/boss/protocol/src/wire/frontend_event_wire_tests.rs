@@ -20,8 +20,8 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AutomationTrigger, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState,
-    ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
+    AutomationTrigger, DesignDocEntry, DesignDocTree, EffortLevel, ExecutionKind, ExecutionStatus,
+    ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -854,6 +854,38 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "project_design_doc_resolved",
         },
+        TagCase {
+            label: "ProductDesignDocsList",
+            event: FrontendEvent::ProductDesignDocsList {
+                product_id: "prod_1".into(),
+                state: DesignDocTreeState::Loaded {
+                    tree: DesignDocTree::builder()
+                        .repo_remote_url("git@github.com:brianduff/flunge.git")
+                        .owner_repo("brianduff/flunge")
+                        .branch("main")
+                        .git_ref("b95bd654ec91f84f70f62127ef8d53317bd52ebb")
+                        .entries(vec![DesignDocEntry {
+                            path: "docs/design-docs/backend-preview-environments.md".into(),
+                            size: Some(4096),
+                        }])
+                        .fetched_at("2026-07-23T12:00:00Z")
+                        .build(),
+                },
+            },
+            expected_tag: "product_design_docs_list",
+        },
+        TagCase {
+            label: "ProductDesignDocContent",
+            event: FrontendEvent::ProductDesignDocContent {
+                repo_remote_url: "git@github.com:brianduff/flunge.git".into(),
+                path: "docs/design-docs/backend-preview-environments.md".into(),
+                git_ref: "b95bd654ec91f84f70f62127ef8d53317bd52ebb".into(),
+                content: DesignDocContent::Loaded {
+                    markdown: "# Backend preview environments".into(),
+                },
+            },
+            expected_tag: "product_design_doc_content",
+        },
         // --- Conflict-resolution receipts ---
         TagCase {
             label: "ConflictResolutionMarkedFailed",
@@ -1668,6 +1700,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
+        | FrontendEvent::ProductDesignDocsList { .. }
+        | FrontendEvent::ProductDesignDocContent { .. }
         | FrontendEvent::ConflictResolutionMarkedFailed { .. }
         | FrontendEvent::CiRemediationClassified { .. }
         | FrontendEvent::CiRemediationMarkedFailed { .. }

@@ -1,0 +1,15 @@
+[package]
+name = "boss-engine-design-docs"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+async-trait = { workspace = true }
+boss-engine-utils = { path = "../utils" }
+boss-github = { path = "../../github" }
+boss-protocol = { path = "../../protocol" }
+git-utils = { path = "../../../../lib/rust/git_utils" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

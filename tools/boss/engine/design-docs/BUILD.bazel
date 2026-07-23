@@ -3,36 +3,36 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
+_DEPS = [
+    "//lib/rust/git_utils",
+    "//tools/boss/engine/utils",
+    "//tools/boss/github",
+    "//tools/boss/protocol",
+]
+
 rust_library(
-    name = "git_utils",
-    srcs = [
-        "src/gh_cli.rs",
-        "src/lib.rs",
-        "src/pr_bookmark.rs",
-        "src/repo_slug.rs",
-    ],
-    crate_name = "git_utils",
+    name = "design-docs",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_engine_design_docs",
+    crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
-        "//tools/boss/cli:__pkg__",
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/design-docs:__pkg__",
-        "//tools/cube:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = _DEPS + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "git_utils_test",
+    name = "design-docs_test",
     size = "small",
-    crate = ":git_utils",
+    crate = ":design-docs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = _DEPS + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

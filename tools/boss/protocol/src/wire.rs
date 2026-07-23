@@ -11,13 +11,14 @@ use crate::types::{
     CommentsBannerState, ConflictHotspotReport, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
     CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, EditorialAction, EngineAttemptListEntry,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project, ProposalKind,
-    ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState,
+    EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
+    WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -723,6 +724,20 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Read-only: fetch one markdown document's body from GitHub.
+    ///
+    /// Identified by the `(repo, path, ref)` triple
+    /// [`Self::ListProductDesignDocs`] handed out — `git_ref` is the
+    /// commit sha that listing was read at, so the body returned is the
+    /// one the operator saw listed even if the branch has moved since.
+    /// Bodies are always read through to GitHub; Boss never caches them.
+    /// Replies with [`FrontendEvent::ProductDesignDocContent`].
+    GetProductDesignDoc {
+        repo_remote_url: String,
+        path: String,
+        git_ref: String,
+    },
+
     GetRun {
         id: String,
     },
@@ -1046,6 +1061,27 @@ pub enum FrontendRequest {
     /// §"Durable audit trail". Replies with [`FrontendEvent::PlannerRunsList`].
     ListPlannerRuns {
         project_id: String,
+    },
+
+    /// Read-only: list the markdown files at HEAD of the repo
+    /// configured on `product_id`, for the Designs tab.
+    ///
+    /// The engine resolves the repo from the product's
+    /// `repo_remote_url` (never from its name), reads the tree from
+    /// GitHub, and classifies the outcome into
+    /// [`DesignDocTreeState`] so the UI never has to interpret a raw
+    /// GitHub error. No local checkout is consulted at any point.
+    ///
+    /// The engine keeps a per-repo listing cache validated against the
+    /// repo's current HEAD sha on every call, so a normal request is
+    /// cheap but never stale. `refresh` additionally evicts the cached
+    /// entry (including the memoised default branch) before resolving —
+    /// it is the "reload" affordance, not a staleness workaround.
+    /// Replies with [`FrontendEvent::ProductDesignDocsList`].
+    ListProductDesignDocs {
+        product_id: String,
+        #[serde(default)]
+        refresh: bool,
     },
 
     ListProducts,

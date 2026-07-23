@@ -147,6 +147,22 @@ fn design_worker_design_doc_pointer_stays_allowed() {
 }
 
 #[test]
+fn product_design_doc_browsing_stays_allowed() {
+    // The Designs-tab reads. Read-only against the product's own repo,
+    // and equivalent to a `gh api` call the worker can already make from
+    // its shell — so gating them would buy no isolation.
+    assert_allowed(FrontendRequest::ListProductDesignDocs {
+        product_id: "prod_1".into(),
+        refresh: false,
+    });
+    assert_allowed(FrontendRequest::GetProductDesignDoc {
+        repo_remote_url: "git@github.com:brianduff/flunge.git".into(),
+        path: "docs/design-docs/thing.md".into(),
+        git_ref: "b95bd654ec91f84f70f62127ef8d53317bd52ebb".into(),
+    });
+}
+
+#[test]
 fn answer_agent_reply_stays_allowed() {
     // `boss comment reply`. The handler resolves comment and run from the
     // caller's own BOSS_RUN_ID, so it cannot target another thread.

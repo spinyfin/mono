@@ -137,12 +137,21 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // sibling tasks in its project, which is the entire point (design
         // §"Goals": "ending stale-brief confusion and duplicated effort from
         // workers that cannot see sibling tasks").
+        //
+        // `ListProductDesignDocs` / `GetProductDesignDoc` join this group
+        // for the same reason `ResolveProjectDesignDoc` is here: they are
+        // read-only reads of a product's *own* repo, and they expose
+        // nothing a worker could not already get by running `gh api` in
+        // its own shell. Denying them would gate design-doc reading behind
+        // a capability the worker demonstrably already has.
         FrontendRequest::FindWorkItemsByPr { .. }
+        | FrontendRequest::GetProductDesignDoc { .. }
         | FrontendRequest::GetWorkItem { .. }
         | FrontendRequest::GetWorkItemByShortId { .. }
         | FrontendRequest::GetWorkTree { .. }
         | FrontendRequest::GetWorkerContext { .. }
         | FrontendRequest::ListChores { .. }
+        | FrontendRequest::ListProductDesignDocs { .. }
         | FrontendRequest::ListProducts
         | FrontendRequest::ListProjects { .. }
         | FrontendRequest::ListRevisions { .. }

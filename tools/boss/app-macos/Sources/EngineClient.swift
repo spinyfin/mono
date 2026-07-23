@@ -446,6 +446,34 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.projectDesignDocResolved(output: output))
+            case "product_design_docs_list":
+                guard let statePayload = payload["state"] as? [String: Any],
+                      let stateData = try? JSONSerialization.data(withJSONObject: statePayload),
+                      let state = try? JSONDecoder().decode(DesignDocTreeState.self, from: stateData)
+                else {
+                    emit(.error(message: "received invalid product_design_docs_list payload"))
+                    break
+                }
+                emit(.productDesignDocsList(
+                    productID: payload["product_id"] as? String ?? "",
+                    state: state
+                ))
+            case "product_design_doc_content":
+                guard let contentPayload = payload["content"] as? [String: Any],
+                      let contentData = try? JSONSerialization.data(withJSONObject: contentPayload),
+                      let content = try? JSONDecoder().decode(DesignDocContent.self, from: contentData)
+                else {
+                    emit(.error(message: "received invalid product_design_doc_content payload"))
+                    break
+                }
+                emit(.productDesignDocContent(
+                    ref: DesignDocRef(
+                        repoRemoteURL: payload["repo_remote_url"] as? String ?? "",
+                        path: payload["path"] as? String ?? "",
+                        gitRef: payload["git_ref"] as? String ?? ""
+                    ),
+                    content: content
+                ))
             case "conflict_resolutions_list":
                 let raw = payload["attempts"] as? [[String: Any]] ?? []
                 let attempts = raw.compactMap(parseConflictResolution)
