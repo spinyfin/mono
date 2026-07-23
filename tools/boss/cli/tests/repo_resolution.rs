@@ -30,19 +30,7 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     // Product has NO repo (multi-repo product). The known-repo set is
     // bootstrapped from the seed chore's row-level override.
-    let product = create_product_with(
-        &mut client,
-        CreateProductInput {
-            name: "Work".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
-    )
-    .await?;
+    let product = create_product_with(&mut client, CreateProductInput::builder().name("Work").build()).await?;
     create_chore_with(
         &mut client,
         CreateChoreInput::builder()
@@ -84,15 +72,10 @@ async fn chore_create_on_single_repo_product_stores_null_repo_remote_url() -> Re
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Work".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/console.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name("Work")
+            .repo_remote_url("git@github.com:foo/console.git")
+            .build(),
     )
     .await?;
 
@@ -124,19 +107,7 @@ async fn chore_create_on_single_repo_product_stores_null_repo_remote_url() -> Re
 async fn chore_create_no_input_with_no_resolution_errors_clearly() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product_with(
-        &mut client,
-        CreateProductInput {
-            name: "Greenfield".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
-    )
-    .await?;
+    let product = create_product_with(&mut client, CreateProductInput::builder().name("Greenfield").build()).await?;
 
     let stderr = run_boss_expect_failure(
         engine.socket_str(),
@@ -175,15 +146,10 @@ async fn chore_create_explicit_repo_rejected_on_single_repo_product() -> Result<
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Work".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/console.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name("Work")
+            .repo_remote_url("git@github.com:foo/console.git")
+            .build(),
     )
     .await?;
 
@@ -223,19 +189,7 @@ async fn chore_create_explicit_repo_rejected_on_single_repo_product() -> Result<
 async fn chore_create_explicit_repo_accepted_on_multi_repo_product() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let product = create_product_with(
-        &mut client,
-        CreateProductInput {
-            name: "Greenfield".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
-    )
-    .await?;
+    let product = create_product_with(&mut client, CreateProductInput::builder().name("Greenfield").build()).await?;
 
     let created = run_boss(
         engine.socket_str(),

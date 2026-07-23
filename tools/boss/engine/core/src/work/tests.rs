@@ -56,15 +56,14 @@ fn complete_design_for_project(db: &WorkDb, project_id: &str) {
 #[cfg(test)]
 fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<&str>) -> (Product, WorkExecution) {
     let product = db
-        .create_product(CreateProductInput {
-            name: "Prefix Co".to_owned(),
-            description: Some("desc".to_owned()),
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: worker_branch_prefix.map(str::to_owned),
-            merge_mechanism: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Prefix Co")
+                .description("desc")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .maybe_worker_branch_prefix(worker_branch_prefix.map(str::to_owned))
+                .build(),
+        )
         .unwrap();
     let project = db
         .create_project(CreateProjectInput {

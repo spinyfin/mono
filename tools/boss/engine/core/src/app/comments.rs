@@ -1249,15 +1249,12 @@ mod tests {
     /// execution_id)`.
     fn seed_answering_comment(work_db: &Arc<WorkDb>) -> (String, String) {
         let product = work_db
-            .create_product(crate::work::CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let comment = work_db
             .create_comment(boss_protocol::CreateCommentInput {
@@ -1405,15 +1402,12 @@ mod tests {
         // regular chore run) must be rejected up front — this RPC is only
         // ever valid for an `answer_agent` execution.
         let product = work_db
-            .create_product(crate::work::CreateProductInput {
-                name: "Other".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Other")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let chore = work_db
             .create_chore(
@@ -1615,15 +1609,13 @@ mod tests {
         repo_remote_url: Option<&str>,
     ) -> WorkComment {
         let product = work_db
-            .create_product(crate::work::CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: repo_remote_url.map(str::to_owned),
-                design_repo: None,
-                docs_repo: docs_repo.map(str::to_owned),
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Boss")
+                    .maybe_repo_remote_url(repo_remote_url.map(str::to_owned))
+                    .maybe_docs_repo(docs_repo.map(str::to_owned))
+                    .build(),
+            )
             .unwrap();
         let investigation = work_db
             .create_investigation(

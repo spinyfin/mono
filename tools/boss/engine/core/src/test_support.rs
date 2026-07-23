@@ -69,15 +69,12 @@ pub fn create_test_product_named(db: &WorkDb, name: &str) -> Product {
 /// remote (`None` for a repo-less product). All other fields default to
 /// `None`.
 pub fn create_test_product_with_repo(db: &WorkDb, name: &str, repo_remote_url: Option<&str>) -> Product {
-    db.create_product(CreateProductInput {
-        name: name.to_owned(),
-        description: None,
-        repo_remote_url: repo_remote_url.map(str::to_owned),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-        merge_mechanism: None,
-    })
+    db.create_product(
+        CreateProductInput::builder()
+            .name(name)
+            .maybe_repo_remote_url(repo_remote_url.map(str::to_owned))
+            .build(),
+    )
     .unwrap()
 }
 

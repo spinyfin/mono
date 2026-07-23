@@ -9137,15 +9137,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let chore = create_test_chore(&db, product.id.clone(), "Ensure Failure");
         db.reconcile_product_executions(&product.id).unwrap();
@@ -10302,15 +10299,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
 
         // Older, ordinary chore — created (and thus ready) first.
@@ -10387,15 +10381,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
 
         let _chore = create_test_chore(&db, product.id.clone(), "Ordinary chore");
@@ -14833,15 +14824,12 @@ mod tests {
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
         let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
         let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");

@@ -20,15 +20,10 @@ async fn bind_then_show_renders_external_tracker_block() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
 
@@ -94,15 +89,10 @@ async fn bind_with_reverse_close_flag_persists() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "ReverseCloseProd".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name("ReverseCloseProd")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
 
@@ -139,15 +129,10 @@ async fn missing_org_for_github_is_rejected() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "NoBind".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name("NoBind")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
 
@@ -180,15 +165,10 @@ async fn missing_kind_without_unset_is_rejected() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "NoKind".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name("NoKind")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
 

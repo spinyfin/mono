@@ -7203,15 +7203,12 @@ mod tests {
         let path = dir.path().join("boss.db");
         let db = Arc::new(WorkDb::open(path).unwrap());
         let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-                merge_mechanism: None,
-            })
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let comment = db
             .create_comment(boss_protocol::CreateCommentInput {

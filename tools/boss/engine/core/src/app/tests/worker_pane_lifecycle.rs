@@ -224,15 +224,12 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
     let (server_state, _dir) = test_server_state();
     let product = server_state
         .work_db
-        .create_product(CreateProductInput {
-            name: "p".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:p.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("p")
+                .repo_remote_url("git@example.com:p.git")
+                .build(),
+        )
         .unwrap();
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
     let execution = server_state

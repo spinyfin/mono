@@ -3193,15 +3193,14 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
 
             let product = create_product(
                 &mut client,
-                CreateProductInput {
-                    name,
-                    description,
-                    repo_remote_url,
-                    design_repo,
-                    docs_repo,
-                    worker_branch_prefix: args.worker_branch_prefix,
-                    merge_mechanism: None,
-                },
+                CreateProductInput::builder()
+                    .name(name)
+                    .maybe_description(description)
+                    .maybe_repo_remote_url(repo_remote_url)
+                    .maybe_design_repo(design_repo)
+                    .maybe_docs_repo(docs_repo)
+                    .maybe_worker_branch_prefix(args.worker_branch_prefix)
+                    .build(),
             )
             .await?;
 

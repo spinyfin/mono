@@ -17,7 +17,7 @@ const DEFAULT_TRUNK_TARGET_BRANCH: &str = "main";
 /// How an approved merge on a product's PR is executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeMechanism {
-    /// `gh pr merge --auto --squash` — today's behavior. Also transparently
+    /// `gh pr merge --auto --squash` — the default behavior. Also transparently
     /// covers repos with a GitHub-native merge queue (GitHub enqueues the
     /// PR itself; the engine's verb is unchanged).
     Direct,

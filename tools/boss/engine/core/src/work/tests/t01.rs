@@ -33,15 +33,13 @@ fn creates_tree_and_soft_deletes_chores() {
     let db = WorkDb::open(path.clone()).unwrap();
 
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: Some("desc".to_owned()),
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .description("desc")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
         .unwrap();
     let project = db
         .create_project(CreateProjectInput {

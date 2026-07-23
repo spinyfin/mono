@@ -103,15 +103,10 @@ pub async fn create_product_with(client: &mut BossClient, input: CreateProductIn
 pub async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> {
     create_product_with(
         client,
-        CreateProductInput {
-            name: name.to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-            merge_mechanism: None,
-        },
+        CreateProductInput::builder()
+            .name(name)
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
     )
     .await
 }

@@ -183,7 +183,7 @@ pub struct Product {
     pub worker_branch_prefix: Option<String>,
 
     /// Per-product merge mechanism: how an approved merge is executed.
-    /// `None` (stored `NULL`) means `"direct"` — today's `gh pr merge
+    /// `None` (stored `NULL`) means `"direct"` — the default `gh pr merge
     /// --auto --squash`, which also transparently covers GitHub-native
     /// merge queues. `"trunk_queue"` submits the PR to Trunk's merge
     /// queue instead. Stored verbatim as the raw setting string; the
