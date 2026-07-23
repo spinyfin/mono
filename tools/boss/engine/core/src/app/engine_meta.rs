@@ -586,16 +586,27 @@ pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendReq
                  applied in-memory but will revert on engine restart",
             );
         }
+        // Both transitions notify the automation scheduler, which now consults
+        // this flag before evaluating anything. Pausing lets it drop straight
+        // into its idle sleep instead of finishing out the current interval.
+        //
+        // Resuming is the load-bearing one: a paused scheduler sleeps up to
+        // AUTOMATION_SCHEDULER_MAX_SLEEP_SECS (one hour), so without this kick
+        // `bossctl automation resume` would appear to do nothing for up to an
+        // hour. `coordinator.kick()` alone is not enough — that wakes the
+        // execution dispatcher, which is a different loop.
+        server_state.automation_scheduler_kick.notify_one();
         if paused {
             tracing::info!(
-                "automation: globally paused (operator) — new triage passes and automation-pool \
-                 spawns are held; already-running automation workers finish normally",
+                "automation: globally paused (operator) — the scheduler stops evaluating \
+                 occurrences, new triage passes and automation-pool spawns are held; \
+                 already-running automation workers finish normally",
             );
         } else {
             // Re-kick the scheduler so anything that queued while paused is
             // drained immediately without waiting for the next external event.
             coordinator.kick();
-            tracing::info!("automation: resumed — scheduler kicked to drain queued executions");
+            tracing::info!("automation: resumed — automation scheduler and execution dispatcher both kicked",);
         }
         let paused_since_epoch_s = coordinator.automation_paused_since_epoch_s();
         send_response(
