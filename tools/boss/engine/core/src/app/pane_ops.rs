@@ -1,6 +1,6 @@
 //! `ServerState` methods for the small, uniformly-shaped engine→app
 //! pane RPCs: focus / send-input / interrupt / reveal-work-item /
-//! retire-pane / list-husk-panes. Split out of `app.rs` for file-size
+//! retire-pane / list-husk-panes / open-document. Split out of `app.rs` for file-size
 //! hygiene; behavior is unchanged from when these lived inline. See
 //! [`super::panes`] for the `FrontendRequest` handlers that call into
 //! most of these (`reveal_work_item` is called from `app/work_items.rs`
@@ -85,10 +85,11 @@ pub enum OpenDocumentError {
     NotReadable(String),
     #[error("not a markdown file (expected .md or .markdown): {0}")]
     NotMarkdown(String),
-    /// Distinguished from the generic [`SendToAppError::NotRegistered`]
-    /// Display text so `bossctl open` fails with an actionable remedy
-    /// instead of a bare "no app session is registered" — the operator
-    /// can't act on that alone.
+    /// Distinguished from the generic [`SendToAppError::NotRegistered`] /
+    /// [`SendToAppError::AppDisconnected`] / [`SendToAppError::SessionWedged`]
+    /// Display text so `bossctl open` fails with an actionable remedy;
+    /// the bare "no app session is registered" text doesn't say what to
+    /// do about it.
     #[error("no Boss app session is registered — launch (or relaunch) the Boss app and try again")]
     NoAppSession,
     #[error("app reported error: {0:?}")]
@@ -257,7 +258,10 @@ impl ServerState {
     /// note in [`crate::protocol::FrontendRequest::OpenDocument`].
     /// Powers `bossctl open`.
     pub async fn open_document(&self, path: &str) -> Result<(), OpenDocumentError> {
-        let metadata = std::fs::metadata(path).map_err(|_| OpenDocumentError::NotFound(path.to_owned()))?;
+        let metadata = std::fs::metadata(path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => OpenDocumentError::NotFound(path.to_owned()),
+            _ => OpenDocumentError::NotReadable(path.to_owned()),
+        })?;
         if !metadata.is_file() {
             return Err(OpenDocumentError::NotAFile(path.to_owned()));
         }
@@ -276,7 +280,9 @@ impl ServerState {
             Ok(EngineToAppResponse::OpenDocument { result: Ok(_) }) => Ok(()),
             Ok(EngineToAppResponse::OpenDocument { result: Err(err) }) => Err(OpenDocumentError::App(err)),
             Ok(other) => Err(OpenDocumentError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(SendToAppError::NotRegistered) => Err(OpenDocumentError::NoAppSession),
+            Err(SendToAppError::NotRegistered | SendToAppError::AppDisconnected | SendToAppError::SessionWedged) => {
+                Err(OpenDocumentError::NoAppSession)
+            }
             Err(err) => Err(OpenDocumentError::Send(err)),
         }
     }

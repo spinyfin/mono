@@ -258,10 +258,9 @@ pub(super) async fn handle_open_document(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        // `bossctl open` is a coordinator verb that puts a document in
-        // front of the operator, same authority tier as `reveal` /
-        // `focus_worker_pane` (both are also UI-steering RPCs invoked
-        // from the Boss pane or app shell).
+        // `bossctl open` displays a document in the app, same authority
+        // tier as `reveal` / `focus_worker_pane` (both are also
+        // UI-steering RPCs invoked from the Boss pane or app shell).
         if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
             tracing::warn!(
                 peer_pid = ?peer_pid,

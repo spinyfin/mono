@@ -2,7 +2,7 @@
 //! focus, send, interrupt, stop, reap, retire-pane, transcript,
 //! launch, list, pools), the reference-resolution helpers shared with
 //! `bossctl probe`, and the small neighboring `work start` / `work
-//! cancel` / `reveal` verbs that were interleaved with them in
+//! cancel` / `reveal` / `open` verbs that were interleaved with them in
 //! `main.rs`.
 //!
 //! Split out of `main.rs` for file-size hygiene; behavior is
@@ -609,13 +609,20 @@ pub(crate) async fn reveal_work_item(socket_path: &Option<String>, json: bool, i
 /// engine's rejection responses (not found, not markdown, no app
 /// session registered — the last one arrives with an actionable
 /// "launch/relaunch Boss" message baked in by the engine).
-pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path: String) -> Result<()> {
-    let resolved = if Path::new(&path).is_absolute() {
-        path
+/// Resolve `path` against `cwd` if it isn't already absolute. Split out
+/// of [`open_document`] so the relative-path case can be tested
+/// headlessly, without a socket connection.
+pub(crate) fn resolve_document_path(cwd: &Path, path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        path.to_owned()
     } else {
-        let cwd = std::env::current_dir().context("resolving current directory for a relative path")?;
-        cwd.join(&path).to_string_lossy().into_owned()
-    };
+        cwd.join(path).to_string_lossy().into_owned()
+    }
+}
+
+pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path: String) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving current directory for a relative path")?;
+    let resolved = resolve_document_path(&cwd, &path);
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::OpenDocument { path: resolved.clone() })
@@ -1135,6 +1142,23 @@ mod tests {
             .created_at("")
             .updated_at("")
             .build()
+    }
+
+    // ---- resolve_document_path ---------------------------------------------
+
+    #[test]
+    fn resolve_document_path_leaves_absolute_path_untouched() {
+        let cwd = Path::new("/some/other/dir");
+        assert_eq!(resolve_document_path(cwd, "/abs/path/notes.md"), "/abs/path/notes.md");
+    }
+
+    #[test]
+    fn resolve_document_path_joins_relative_path_against_cwd() {
+        let cwd = Path::new("/home/user/project");
+        assert_eq!(
+            resolve_document_path(cwd, "docs/notes.md"),
+            "/home/user/project/docs/notes.md"
+        );
     }
 
     // ---- resolve_agent_ref -------------------------------------------------

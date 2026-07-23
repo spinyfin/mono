@@ -101,7 +101,7 @@ use server::{
 // `ServerState` methods and matches on the returned error with `{err}`/`{err:?}`,
 // never the concrete type — so this import is dead outside `#[cfg(test)]`.
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, RetirePaneError, SendInputError};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SendInputError};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{

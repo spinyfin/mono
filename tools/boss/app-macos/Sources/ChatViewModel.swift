@@ -1846,13 +1846,7 @@ final class ChatViewModel: ObservableObject {
     /// disallowed and the renderer isn't wired, the open is dropped with
     /// a log line rather than silently lost.
     func openLocalMarkdownFile(url: URL, allowOSFallback: Bool = true) {
-        let content = DesignRendererContent(
-            title: url.deletingPathExtension().lastPathComponent,
-            filePath: url.path,
-            webURL: "",
-            repoLabel: "",
-            projectID: ""
-        )
+        let content = DesignRendererContent.forLocalFile(path: url.path)
         if let opener = designRendererOpener {
             opener(content)
         } else if allowOSFallback {
