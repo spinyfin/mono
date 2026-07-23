@@ -232,6 +232,43 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "worker_proposals",
+        description: "Master kill switch for the mediated worker-proposal API (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md). Every per-seam \
+             migration flag (e.g. `worker_signal_proposals_seam`) is read as `worker_proposals && \
+             <seam flag>` by both halves of its gate — the engine's proposals-first read path and \
+             the worker-facing prompt text that teaches the `boss propose` verbs — so this one \
+             switch takes every seam back to its pre-migration marker-only behavior at once, \
+             independent of each seam's individual rollout state. DEFAULT OFF: flip on only once \
+             `SubmitProposal`/`ListProposals` themselves are validated in \
+             staging. Kill switch: set false to disable every proposal-backed seam immediately, \
+             regardless of their individual flags.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: "worker_signal_proposals_seam",
+        description: "Read worker_proposals rows before falling back to the legacy [effort-escalation]/ \
+             [blocked] marker parsers in detect_and_file_worker_signals (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md — the seam migration for \
+             effort-escalation + blocked signals — the first seam migration, establishing the recipe later \
+             seams follow). When on, an execution that already carries a worker_proposals row for a given \
+             kind (effort_escalation or blocked) skips that kind's legacy marker parser entirely — \
+             SubmitProposal's synchronous apply pipeline already filed the attention item at submission \
+             time, so re-parsing would just re-file the same event. When no such proposal exists, the \
+             legacy parser still runs exactly as before, and every time it does the matching \
+             worker_proposals.fallback_hit.{effort_escalation,blocked} counter increments and a WARN logs \
+             — the counter is this seam's explicit exit criterion for eventually deleting the marker \
+             parser. The [blocked] marker itself is never deleted (bootstrap fallback of last resort); only \
+             its role as the *primary* channel goes away once this flag is on and fallback goes quiet. \
+             DEFAULT OFF: enable per operator once the proposal path is validated in staging. Kill switch: \
+             set false to restore the pre-migration marker-only detection exactly.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_rpc_tier",
         description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
              worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
@@ -634,6 +671,30 @@ mod tests {
         assert!(on_disk.contains("false"));
         // Temp file must have been cleaned up by the rename.
         assert!(!tmp.path().join("feature-flags.toml.tmp").exists());
+    }
+
+    #[test]
+    fn worker_signal_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("worker_signal_proposals_seam"),
+            "worker_signal_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "worker_signal_proposals_seam")
+            .expect("worker_signal_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "completion");
+
+        store.set("worker_signal_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("worker_signal_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("worker_signal_proposals_seam"));
     }
 
     #[test]

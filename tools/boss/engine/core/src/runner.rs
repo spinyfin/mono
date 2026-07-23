@@ -399,6 +399,14 @@ impl ExecutionRunner for PaneSpawnRunner {
         // collaborator lookups (parent project, conflict / CI attempt,
         // crash-recovery branch, automation-triage preamble).
         let editorial_enabled = self.feature_flags.is_enabled("editorial_controls");
+        // `worker_proposals` is the master kill switch for every proposal-backed
+        // seam; `worker_signal_proposals_seam` is this seam's own flag. Both
+        // must be on for the worker prompt to teach the `boss propose` verbs —
+        // mirrors the read-path gate in
+        // `completion::WorkerCompletionHandler::detect_and_file_worker_signals`
+        // so the two halves of the migration move together.
+        let worker_signal_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("worker_signal_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -409,7 +417,11 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            (editorial_enabled, self.cfg.work.max_review_embed_diff_lines),
+            (
+                editorial_enabled,
+                self.cfg.work.max_review_embed_diff_lines,
+                worker_signal_proposals_seam_enabled,
+            ),
         )
         .await?;
 
@@ -871,11 +883,11 @@ pub(crate) async fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
-    // (editorial_enabled, max_embed_diff_lines) — bundled to keep the
-    // parameter count under clippy::too_many_arguments.
-    editorial_opts: (bool, u64),
+    // (editorial_enabled, max_embed_diff_lines, worker_signal_proposals_seam_enabled)
+    // — bundled to keep the parameter count under clippy::too_many_arguments.
+    editorial_opts: (bool, u64, bool),
 ) -> anyhow::Result<ComposedWorkerSpawn> {
-    let (editorial_enabled, max_embed_diff_lines) = editorial_opts;
+    let (editorial_enabled, max_embed_diff_lines, worker_signal_proposals_seam_enabled) = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -1095,6 +1107,7 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
                         .pr_template_set(&pr_template_set)
                         .editorial_enabled(editorial_enabled)
+                        .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                         .build(),
                 )
             }
@@ -1126,6 +1139,7 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
                     .pr_template_set(&pr_template_set)
                     .editorial_enabled(editorial_enabled)
+                    .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                     .build(),
             )
         } else {
@@ -1245,6 +1259,7 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
                 .pr_template_set(&pr_template_set)
                 .editorial_enabled(editorial_enabled)
+                .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                 .merge_order_preservation(&merge_order_preservation)
                 .build(),
         )
@@ -1330,6 +1345,21 @@ struct ExecutionPromptParams<'a> {
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
     #[builder(default)]
     editorial_enabled: bool,
+    /// Whether `worker_signal_proposals_seam` is on — gates the worker-facing
+    /// prompt half of this seam
+    /// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md`):
+    /// [`worker_escalation_protocol_directive`], the two Bazel pre-push gate
+    /// blurbs, and [`no_op_completion_directive`]'s pointer. `false` (the
+    /// flag's registry default) reproduces the exact marker-only
+    /// text; `true` teaches the `boss propose` verbs instead — see those
+    /// functions' docs. This is the OTHER half of the flag: the engine's
+    /// read path (`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`)
+    /// is gated by the same flag name read directly from
+    /// `FeatureFlagsStore`; gating the prompt too is what makes "flag off"
+    /// restore today's behavior exactly, prompt included — a worker must
+    /// never be taught a verb the engine won't yet read proposals-first for.
+    #[builder(default)]
+    worker_signal_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -1350,6 +1380,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         editorial_rules,
         pr_template_set,
         editorial_enabled,
+        worker_signal_proposals_seam_enabled,
         merge_order_preservation,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
@@ -1524,6 +1555,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 conflict_attempt,
                 ci_attempt,
                 merge_order_preservation,
+                worker_signal_proposals_seam_enabled,
             ));
         }
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation => {
@@ -1562,7 +1594,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
-    ) && let Some(gate) = bazel_prepush_gate_block(workspace_path)
+    ) && let Some(gate) = bazel_prepush_gate_block(workspace_path, worker_signal_proposals_seam_enabled)
     {
         prompt.push_str(&gate);
     }
@@ -1622,10 +1654,12 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
         prompt.push_str(&ci_monitoring_directive(execution));
-        // Incident 2026-07-02 (exec_18b5243e65ff188_2d / T2085): teach the
+        // Incident 2026-07-02 (exec_18b5243e65ff188_2d): teach the
         // full escalation/blocker marker syntax so a well-formed marker is
         // the default, not a lucky accident — see the function doc for why.
-        prompt.push_str(&worker_escalation_protocol_directive());
+        prompt.push_str(&worker_escalation_protocol_directive(
+            worker_signal_proposals_seam_enabled,
+        ));
         // Flunge T254 (root-caused to T222/PR #765): teach chore/task workers
         // the `[deferred-scope]` marker so a deliberate scope narrowing is
         // recorded, not just claimed in prose ("filed as a followup") that
@@ -1649,7 +1683,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
             )
         {
-            prompt.push_str(&no_op_completion_directive());
+            prompt.push_str(&no_op_completion_directive(worker_signal_proposals_seam_enabled));
         }
     }
     // Attentions creation pipeline (design: attentions.md): implementation
@@ -1692,12 +1726,14 @@ fn is_bazel_workspace(workspace_path: &Path) -> bool {
 /// this states the requirement as a hard gate in the worker prompt.
 ///
 /// Returns `None` for non-Bazel repos so the block is only injected when
-/// bazel actually owns the workspace.
-fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
+/// bazel actually owns the workspace. `seam_enabled` selects which failure-
+/// escalation sentence [`bazel_prepush_gate_text`] renders — see that
+/// function's doc.
+fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option<String> {
     if !is_bazel_workspace(workspace_path) {
         return None;
     }
-    Some(bazel_prepush_gate_text())
+    Some(bazel_prepush_gate_text(seam_enabled))
 }
 
 /// The Bazel pre-push build-gate prompt block, independent of any
@@ -1706,8 +1742,20 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
 /// only probes the local filesystem, so a remote workspace path never
 /// matches and the gate has to be injected from the result of an
 /// over-SSH marker probe instead.
-pub(crate) fn bazel_prepush_gate_text() -> String {
-    "\n## Pre-push build gate (Bazel workspace)\n\
+///
+/// `seam_enabled` mirrors `worker_signal_proposals_seam` (see
+/// [`worker_escalation_protocol_directive`]): `true` points a build-gate
+/// failure at `boss propose blocked`; `false` reproduces the pre-migration
+/// `[blocked]` marker sentence, so a worker on the flag-off path is never
+/// told to call a verb the engine won't yet honor proposals-first.
+pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
+    let failure_sentence = if seam_enabled {
+        "If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Call `boss propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+    } else {
+        "If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+    };
+    format!(
+        "\n## Pre-push build gate (Bazel workspace)\n\
          \n\
          This repository is a Bazel workspace (a `MODULE.bazel`/`WORKSPACE` marker was found at the workspace root). Before you push a branch or update a PR with code changes, you MUST run a clean local build and test of what you touched and confirm both pass. \"I think it should work\" or \"the change looks correct\" is NOT a substitute for running the build — repeated rounds of CI breakage have come from workers skipping this step.\n\
          \n\
@@ -1719,8 +1767,8 @@ pub(crate) fn bazel_prepush_gate_text() -> String {
          \n\
          Run the build gate in the FOREGROUND and read its exit code directly. Do NOT background bazel (no `&`, no `run_in_background`, no redirecting to a log file you then poll) and then idle in a self-paced wait-loop \"until the gate is green\". If the bazel server wedges (host contention, a hung toolchain), those log files may never appear and the completion notification never arrives — you will wait forever with no way out, stranding your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle.\n\
          \n\
-         If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
-        .to_string()
+         {failure_sentence}"
+    )
 }
 
 /// Pre-push gate for a **conflict-resolution** revision, when the
@@ -1738,19 +1786,26 @@ pub(crate) fn bazel_prepush_gate_text() -> String {
 /// (`bazel build` of the touched/upstream targets) and any rebase-
 /// invalidated generated artifact (e.g. `MODULE.bazel.lock`) must be
 /// regenerated before pushing. Tests run post-push in CI.
-fn bazel_conflict_resolution_gate_block(workspace_path: &Path) -> Option<String> {
+fn bazel_conflict_resolution_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option<String> {
     if !is_bazel_workspace(workspace_path) {
         return None;
     }
-    Some(bazel_conflict_resolution_gate_text())
+    Some(bazel_conflict_resolution_gate_text(seam_enabled))
 }
 
 /// The conflict-resolution pre-push gate prompt block, independent of any
 /// filesystem probe (so the SSH remote adapter can inject it after an
 /// over-SSH marker probe). See [`bazel_conflict_resolution_gate_block`]
-/// for why this is build-before-push rather than build-and-test-before-push.
-pub(crate) fn bazel_conflict_resolution_gate_text() -> String {
-    "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
+/// for why this is build-before-push rather than build-and-test-before-push,
+/// and [`bazel_prepush_gate_text`] for what `seam_enabled` selects.
+pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
+    let failure_sentence = if seam_enabled {
+        "If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `boss propose blocked --reason \"...\"` naming the failure and stop.\n"
+    } else {
+        "If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
+    };
+    format!(
+        "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
          \n\
          This repository is a Bazel workspace. For a conflict-resolution revision the gate you MUST clear before pushing is **merge correctness**, not the full test suite.\n\
          \n\
@@ -1765,8 +1820,8 @@ pub(crate) fn bazel_conflict_resolution_gate_text() -> String {
          \n\
          After pushing you MAY run `bazel test` on the affected targets as a courtesy and report what you saw, but the push must not wait on it.\n\
          \n\
-         If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
-        .to_string()
+         {failure_sentence}"
+    )
 }
 
 /// Hard constraint text forbidding check/CI bypasses. Injected into every
@@ -1904,32 +1959,51 @@ fn pr_terminal_directive() -> String {
     out
 }
 
-/// Worker Stop-boundary escalation/blocker protocol directive. Documents
-/// the two sanctioned markers a worker emits on its Stop boundary when it
-/// cannot proceed unassisted: `[effort-escalation]` (the work is bigger
-/// than estimated) and `[blocked]` (a human/coordinator decision is needed).
-///
-/// Before this directive, workers were only ever told to "emit an
-/// `[effort-escalation]` marker" (the bazel pre-push gate text) without
-/// being taught the required fields. Incident 2026-07-02
-/// (`exec_18b5243e65ff188_2d`, T2085): a worker hit a bazel blocker it
-/// could not resolve, did the right thing by stopping instead of pushing
-/// broken code, and emitted a bare `[effort-escalation]` line with neither
-/// `requested_level` nor `reason` — which the coordinator's documented
-/// parser treats as malformed. This block states the full syntax so a
-/// well-formed marker is the default. It also introduces `[blocked]`: prior
-/// prompt text only ever said "if you are blocked, say what you need" with
-/// no concrete mechanism, so a worker with no PR to push and nothing to
-/// escalate the *effort* on had no sanctioned way to ask for help.
-///
-/// See [`crate::worker_escalation`] for the parser and
+/// Worker Stop-boundary escalation/blocker protocol directive. `seam_enabled`
+/// mirrors the `worker_signal_proposals_seam` feature flag — the same flag
 /// [`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`]
-/// for what the engine does with either marker: files a coordinator-visible
+/// reads for the engine's read path, threaded here so the two halves of the
+/// migration move together: a worker must never be taught a verb the engine
+/// won't yet read proposals-first for, and flipping the flag off must
+/// restore today's behavior exactly, prompt included, not just the engine's
+/// read side.
+///
+/// `seam_enabled = true` documents the two sanctioned `boss propose` verbs a
+/// worker calls when it cannot proceed unassisted: `effort-escalation` (the
+/// work is bigger than estimated) and `blocked` (a human/coordinator
+/// decision is needed), plus the `[blocked]` marker retained as a bootstrap
+/// fallback of last resort. `boss propose` validates synchronously, so a
+/// malformed call fails with a typed error the worker can fix and retry
+/// in-run, instead of a marker whose fields are only checked long after the
+/// worker could do anything about it. The `[blocked]` marker itself is not
+/// deleted — the design keeps it indefinitely as "the channel of last
+/// resort, precisely because it must work when the mechanism itself is
+/// broken" — but it is documented here as exactly that: a bootstrap
+/// fallback, not a second normal-path channel. `[effort-escalation]` has no
+/// such carve-out and is not taught here at all; the engine still accepts
+/// it as a counted legacy fallback (`crate::worker_escalation`) so a stray
+/// marker from an older transcript or a worker that ignores this directive
+/// is still surfaced, never silently dropped, but new workers are only ever
+/// taught the verb.
+///
+/// `seam_enabled = false` reproduces the pre-migration directive verbatim:
+/// both `[effort-escalation]` and `[blocked]` as markers, no `boss propose`
+/// mention. Incident 2026-07-02 (`exec_18b5243e65ff188_2d`) is why
+/// the marker syntax is spelled out explicitly rather than left implicit —
+/// a worker hit a bazel blocker it could not resolve, did the right thing
+/// by stopping instead of pushing broken code, and emitted a bare
+/// `[effort-escalation]` line with neither `requested_level` nor `reason`,
+/// which the coordinator's documented parser treats as malformed.
+///
+/// See [`crate::worker_escalation`] for the legacy marker parser and
+/// [`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`]
+/// for what the engine does with either channel: files a coordinator-visible
 /// attention item and pauses the "produce a PR" auto-nudge until it is
 /// resolved (a coordinator probe on this run resolves it — see
 /// [`crate::work::WorkDb::resolve_worker_signal_attentions_for_execution`]).
-fn worker_escalation_protocol_directive() -> String {
-    "\n## If you are blocked or the work is bigger than estimated\n\n\
+fn worker_escalation_protocol_directive(seam_enabled: bool) -> String {
+    if !seam_enabled {
+        return "\n## If you are blocked or the work is bigger than estimated\n\n\
      Two sanctioned markers, each on its own line in your final response, tell the coordinator \
      you need help. Emitting one is always the right move over pushing broken/unvalidated work \
      or idling silently:\n\n\
@@ -1952,6 +2026,39 @@ fn worker_escalation_protocol_directive() -> String {
      emit the marker instead. The engine files it as an attention item for the coordinator and \
      pauses the auto-nudge loop for this run until it acks, so you will not be re-prompted to \
      \"produce a PR\" while a marker is pending.\n"
+            .to_string();
+    }
+    "\n## If you are blocked or the work is bigger than estimated\n\n\
+     Two verbs on the `boss` CLI tell the coordinator you need help. Calling one is always the \
+     right move over pushing broken/unvalidated work or idling silently. Submission is synchronous \
+     and validated immediately, so a malformed call fails right away with a typed error you can fix \
+     and retry — unlike a marker line, which the engine only reads long after you've moved on:\n\n\
+     - **`boss propose effort-escalation --level <level> --reason \"<why>\"`** — the assigned work \
+     needs more effort than it was classified at. `<level>` is one of \
+     `trivial|small|medium|large|max`. Example:\n\n\
+     ```\n\
+     boss propose effort-escalation --level large --reason \"ran into a multi-subsystem race; description didn't mention the engine/app boundary\"\n\
+     ```\n\n\
+     - **`boss propose blocked --reason \"<why>\"`** — you cannot proceed without a \
+     human/coordinator decision: a build failure you can't resolve, an ambiguous requirement, \
+     conflicting instructions, a missing credential. Example:\n\n\
+     ```\n\
+     boss propose blocked --reason \"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
+     ```\n\n\
+     Either call files a coordinator-visible attention item immediately and pauses the \"produce a \
+     PR\" auto-nudge loop for this run until a coordinator acks it, so you will not be re-prompted \
+     to \"produce a PR\" while one is pending. Do NOT stop silently or push code you know is broken \
+     to work around a blocker: call `boss propose` instead.\n\n\
+     **Bootstrap fallback only:** if `boss propose` itself is unreachable (the mechanism is down, \
+     the socket is gone, or you are a remote worker with no local peer to attribute the call to), \
+     fall back to a bare `[blocked] reason=\"<why>\"` line on its own line in your final response — \
+     the one marker kept specifically because it must still work when the mechanism itself is \
+     broken. If the underlying problem is an effort escalation rather than a blocker, state the \
+     requested level in the reason (e.g. `[blocked] reason=\"boss propose unreachable; requesting \
+     effort escalation to large — <why>\"`) — this bootstrap channel is the only one guaranteed to \
+     work when `boss propose` itself is down, so it carries both signal kinds rather than teaching \
+     a second marker grammar back. Do not use it once `boss propose` has already succeeded for this \
+     signal; it is a last resort, not a second channel.\n"
         .to_string()
 }
 
@@ -2022,8 +2129,13 @@ fn deferred_scope_directive() -> String {
 /// marker is the *only* sanctioned way to signal this; a worker that simply
 /// stops without it is still nudged, so this must NOT be used to bail out of
 /// work that is merely hard or blocked.
-fn no_op_completion_directive() -> String {
+fn no_op_completion_directive(seam_enabled: bool) -> String {
     let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
+    let blocked_pointer = if seam_enabled {
+        "call `boss propose blocked --reason \"...\"` instead"
+    } else {
+        "emit a `[blocked] reason=\"...\"` marker instead"
+    };
     let mut out = String::new();
     out.push_str("\n## If the work is already done: signal a sanctioned no-op\n\n");
     out.push_str(
@@ -2042,9 +2154,8 @@ fn no_op_completion_directive() -> String {
         "This replaces the generic \"stop and explain what went wrong\" for the already-done case: \
          an empty diff because the work is done is a success terminal, not an error. Do NOT emit \
          `{marker}` to abandon work you simply found hard or are blocked on — if you are blocked, \
-         emit `[blocked] reason=\"...\"` instead (see \"If you are blocked or the work is bigger \
-         than estimated\" above), and the engine will route it to the coordinator without nudging \
-         you to produce a PR.\n"
+         {blocked_pointer} (see \"If you are blocked or the work is bigger than estimated\" above), \
+         and the engine will route it to the coordinator without nudging you to produce a PR.\n"
     ));
     out
 }
@@ -2474,6 +2585,7 @@ fn compose_revision_directive(
     conflict_attempt: Option<&ConflictResolution>,
     ci_attempt: Option<&CiRemediation>,
     merge_order_preservation: &[String],
+    worker_signal_proposals_seam_enabled: bool,
 ) -> String {
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
@@ -2509,9 +2621,9 @@ fn compose_revision_directive(
     // the PR's CI after the push) so a correct resolution is never
     // stranded behind a slow/flaky full-suite run.
     let prepush_gate = if is_conflict_resolution {
-        bazel_conflict_resolution_gate_block(workspace_path)
+        bazel_conflict_resolution_gate_block(workspace_path, worker_signal_proposals_seam_enabled)
     } else {
-        bazel_prepush_gate_block(workspace_path)
+        bazel_prepush_gate_block(workspace_path, worker_signal_proposals_seam_enabled)
     };
     if let Some(gate) = prepush_gate {
         out.push_str(&gate);
@@ -4299,7 +4411,42 @@ mod compose_prompt_tests {
     }
 
     #[test]
-    fn bazel_gate_present_for_chore_on_bazel_workspace() {
+    fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
+        let ws = bazel_workspace();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .worker_signal_proposals_seam_enabled(true)
+                .build(),
+        );
+        assert!(
+            prompt.contains("## Pre-push build gate (Bazel workspace)"),
+            "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("bazel build") && prompt.contains("bazel test"),
+            "gate must require both bazel build and bazel test:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("boss propose blocked"),
+            "with the seam flag on, the gate must direct failures to the boss propose blocked \
+             verb:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("FOREGROUND") && prompt.contains("run_in_background"),
+            "gate must mandate foreground execution and forbid the background-and-idle anti-pattern (issue #976):\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn bazel_gate_present_for_chore_on_bazel_workspace_seam_off() {
+        // Flag off (the builder default, matching the registry default):
+        // the gate must point failures at the legacy `[blocked]` marker, not
+        // `boss propose` — a worker on the flag-off path must never be
+        // taught a verb the engine's read path won't yet honor.
         let ws = bazel_workspace();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
@@ -4314,16 +4461,73 @@ mod compose_prompt_tests {
             "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
         );
         assert!(
-            prompt.contains("bazel build") && prompt.contains("bazel test"),
-            "gate must require both bazel build and bazel test:\n{prompt}",
+            !prompt.contains("boss propose"),
+            "with the seam flag off, the gate must not mention boss propose at all:\n{prompt}",
         );
         assert!(
-            prompt.contains("[effort-escalation]"),
-            "gate must direct failures to an effort-escalation marker:\n{prompt}",
+            prompt.contains("[blocked] reason=\"...\""),
+            "with the seam flag off, the gate must direct failures to the legacy [blocked] \
+             marker:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn worker_escalation_directive_teaches_boss_propose_verbs_when_seam_is_on() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .worker_signal_proposals_seam_enabled(true)
+                .build(),
         );
         assert!(
-            prompt.contains("FOREGROUND") && prompt.contains("run_in_background"),
-            "gate must mandate foreground execution and forbid the background-and-idle anti-pattern (issue #976):\n{prompt}",
+            prompt.contains("boss propose effort-escalation --level"),
+            "seam on: the prompt must teach the effort-escalation verb with a worked example:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("boss propose blocked --reason"),
+            "seam on: the prompt must teach the blocked verb with a worked example:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Bootstrap fallback only:") && prompt.contains("[blocked] reason="),
+            "seam on: [blocked] must be documented as the bootstrap-only fallback, not a \
+             normal-path channel:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("[effort-escalation] requested_level="),
+            "seam on: new workers must no longer be taught the [effort-escalation] marker \
+             grammar at all:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn worker_escalation_directive_teaches_legacy_markers_when_seam_is_off() {
+        // Flag off (builder default = registry default): the directive must
+        // reproduce the pre-migration marker-only text byte-for-byte in
+        // spirit — no `boss propose` verb anywhere, both markers taught.
+        let ws = tempfile::TempDir::new().unwrap();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains("boss propose"),
+            "seam off: the directive must not mention boss propose at all:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("[effort-escalation] requested_level=<level> reason=\"<why>\""),
+            "seam off: the directive must teach the full [effort-escalation] marker grammar:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("[blocked] reason=\"<why>\""),
+            "seam off: the directive must teach the [blocked] marker grammar:\n{prompt}",
         );
     }
 
@@ -5380,7 +5584,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0),
+            (false, 0, false),
         )
         .await
         .unwrap();
@@ -5416,7 +5620,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0),
+            (false, 0, false),
         )
         .await
         .unwrap();
@@ -5455,7 +5659,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0),
+            (false, 0, false),
         )
         .await
         .unwrap();
@@ -5494,7 +5698,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0),
+            (false, 0, false),
         )
         .await
         .unwrap();
