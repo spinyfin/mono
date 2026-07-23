@@ -2815,6 +2815,67 @@ fn canonical_design_doc_path_line(parent_project: Option<&Project>) -> Option<St
 /// is already covered by the shared revision directive, so this fragment
 /// covers only the signal-specific parts: the diagnosis block, rebase
 /// instructions, stop conditions, and post-resolution PR comment template.
+/// The two commands a conflict-resolution worker must run, in order,
+/// before it is allowed to form any opinion about whether the conflict
+/// still exists — plus the `jj` divergence hazard that makes local
+/// reasoning unsound in a shared cube object store.
+///
+/// Exists because a worker gave up 26 seconds into its run, asserting
+/// "this conflict was already resolved and pushed in a prior attempt",
+/// having run neither of these commands (incident 2026-07-23,
+/// `exec_18c50a0a900baa40_54` / spinyfin/mono#2070). GitHub reported
+/// `mergeable: CONFLICTING` / `mergeStateStatus: DIRTY` the whole time.
+/// Divergent `jj` change ids made two diagnostic revsets resolve to two
+/// *different* commits — one conflict-free but stacked on stale `main`,
+/// one on current `main` but conflicted — and the worker ANDed the two
+/// answers into a conclusion no single commit supported. `jj` flagged the
+/// hazard with a `??` suffix from its first line of output; nothing in
+/// the brief told the worker what that meant.
+///
+/// The engine enforces this independently at the Stop boundary
+/// ([`crate::conflict_stop_gate`]) — this fragment is the cooperative
+/// half, not the guarantee.
+fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> String {
+    format!(
+        "### Ground truth: run these FIRST, in this order (HARD GATE)\n\n\
+         Before `jj log`, before `jj st`, before forming any opinion about whether this \
+         conflict still exists:\n\n\
+         **1. Ask GitHub — it is the only authority on whether this PR conflicts:**\n\n\
+         ```\n\
+         gh pr view {pr_url} --json mergeable,mergeStateStatus,headRefOid\n\
+         ```\n\n\
+         `mergeable: CONFLICTING` means the conflict is real and unresolved, no matter what \
+         your local `jj` state suggests. `mergeable: UNKNOWN` means GitHub is still \
+         recomputing — it is **not** a clean bill of health; re-run the query after the \
+         rebase below. Only `mergeable: MERGEABLE` supports a claim that the conflict is \
+         already resolved.\n\n\
+         **2. Rebase — this is step 3 of your brief and it is not optional:**\n\n\
+         ```\n\
+         cube workspace rebase\n\
+         ```\n\n\
+         Its output (`REBASED_CLEAN` / `REBASED_WITH_CONFLICTS`) is the local ground truth. \
+         Quote it in your final response.\n\n\
+         **3. You may NOT conclude \"already resolved\" from local `jj` state alone.** \
+         `conflicts=false` on some revset, \"the branch is a descendant of `main@origin`\", \
+         and `jj git fetch` reporting \"Nothing changed\" are **not** evidence the conflict \
+         is gone — a branch can satisfy all three while GitHub still reports `CONFLICTING`. \
+         If you believe there is nothing to do, you must show the `gh pr view` output saying \
+         `MERGEABLE` and the `cube workspace rebase` output saying `REBASED_CLEAN`. Without \
+         both, keep working.\n\n\
+         **4. Divergent change ids make local revsets lie.** Cube workspaces share one `jj` \
+         object store, so the same change id can name several commits. If any `jj` output \
+         shows a `??` suffix (e.g. `qtltpmoy??`), or `jj bookmark list` reports the \
+         branch \"ahead by N commits, behind by M commits\" against `@git`, that change is \
+         **DIVERGENT**: change-id revsets resolve to an arbitrary copy, so every \
+         `conflicts=` and `descendants()` answer you get is unsound, and two revsets in the \
+         same session can silently answer about two different commits. Re-run every check \
+         using **full commit ids**, never change ids; `jj edit <change-id>` will also \
+         hard-fail with \"resolved to more than one revision\". Abandon the stale duplicates \
+         by full commit id before continuing.\n\n",
+        pr_url = attempt.pr_url,
+    )
+}
+
 fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String {
     let mut out = String::new();
     out.push_str("\n---\n\n");
@@ -2839,6 +2900,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          the current `main` does not apply cleanly. Your task in step 3 above is to\n\
          resolve the conflicts — **you are not adding new work to this PR.**\n\n",
     );
+    out.push_str(&compose_conflict_ground_truth_fragment(attempt));
     out.push_str(
         "### Preservation rule (HARD CONSTRAINT — read before resolving)\n\n\
          A merge/forward-port resolution is a **reconciliation**, not an authoring surface. \
@@ -4798,6 +4860,69 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("OMIT that line"),
             "comment guidance must tell the worker to omit the approvals line when no review existed:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn conflict_fragment_hard_gates_the_ground_truth_commands_before_local_jj_reasoning() {
+        // 2026-07-23 incident (exec_18c50a0a900baa40_54 /
+        // spinyfin/mono#2070): the worker went straight to `jj log`, never
+        // queried `mergeable`, never ran `cube workspace rebase`, and
+        // concluded "already resolved" from two divergent-change-id revsets
+        // that answered about two different commits. The brief must order
+        // the two authoritative commands first, forbid the local-state-only
+        // conclusion, and name the `??` divergence hazard.
+        let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+        let attempt = sample_conflict_attempt();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .conflict_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+
+        let gh_query = prompt
+            .find("--json mergeable,mergeStateStatus")
+            .unwrap_or_else(|| panic!("brief must mandate the mergeable query:\n{prompt}"));
+        let rebase = prompt
+            .find("cube workspace rebase")
+            .unwrap_or_else(|| panic!("brief must mandate the rebase:\n{prompt}"));
+        assert!(
+            gh_query < rebase,
+            "the mergeable query must be ordered before the rebase:\n{prompt}",
+        );
+        // Both must precede the local-inspection recipe the worker jumped to.
+        let jj_recipe = prompt
+            .find("List every conflicted commit on the branch")
+            .unwrap_or_else(|| panic!("brief must still carry the jj recipe:\n{prompt}"));
+        assert!(
+            rebase < jj_recipe,
+            "the two ground-truth commands must be ordered before local jj inspection:\n{prompt}",
+        );
+
+        assert!(
+            prompt.contains("You may NOT conclude \"already resolved\" from local `jj` state alone"),
+            "brief must forbid concluding 'already resolved' from local jj state:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Only `mergeable: MERGEABLE` supports a claim"),
+            "brief must name MERGEABLE as the only validating value:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("`mergeable: UNKNOWN` means GitHub is still")
+                && prompt.contains("not** a clean bill of health"),
+            "brief must deny that UNKNOWN clears the conflict:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("`qtltpmoy??`") && prompt.contains("DIVERGENT"),
+            "brief must teach the `??` divergent-change-id hazard:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("full commit ids"),
+            "divergence guidance must direct the worker to full commit ids:\n{prompt}",
         );
     }
 

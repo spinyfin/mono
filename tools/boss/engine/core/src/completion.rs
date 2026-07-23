@@ -56,6 +56,7 @@ use crate::attentions_detector;
 use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
+use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
 use crate::merge_poller::{
@@ -909,6 +910,12 @@ pub struct WorkerCompletionHandler {
     /// Defaults to [`NoopMergeProbe`]; production wires in the shared
     /// [`CommandMergeProbe`] via [`Self::with_merge_probe`].
     merge_probe: Arc<dyn MergeProbe>,
+    /// Base backoff between the conflict stop gate's `mergeable=UNKNOWN`
+    /// re-probes (see [`crate::conflict_stop_gate`]). Defaults to
+    /// [`conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF`]; tests set it
+    /// to zero via [`Self::with_conflict_unknown_backoff`] so the
+    /// indeterminate path doesn't sleep.
+    conflict_unknown_backoff: std::time::Duration,
     /// Circuit breaker for the auto-nudge loop. Every nudge site routes
     /// through [`Self::nudge_or_park`], which records the nudge against
     /// this breaker; once `max_unproductive_nudges` consecutive nudges
@@ -1055,6 +1062,7 @@ impl WorkerCompletionHandler {
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
             merge_probe: Arc::new(NoopMergeProbe),
+            conflict_unknown_backoff: conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF,
             nudge_breaker: Arc::new(NudgeBreaker::new()),
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
             build_wait_tracker: Arc::new(BuildWaitTracker::new()),
@@ -1223,6 +1231,16 @@ impl WorkerCompletionHandler {
     /// [`NoopMergeProbe`].
     pub fn with_merge_probe(mut self, probe: Arc<dyn MergeProbe>) -> Self {
         self.merge_probe = probe;
+        self
+    }
+
+    /// Shrink the conflict stop gate's `mergeable=UNKNOWN` re-probe
+    /// backoff. Tests pass [`std::time::Duration::ZERO`] so exercising the
+    /// indeterminate path costs no wall clock; production keeps the
+    /// default.
+    #[cfg(test)]
+    fn with_conflict_unknown_backoff(mut self, backoff: std::time::Duration) -> Self {
+        self.conflict_unknown_backoff = backoff;
         self
     }
 
@@ -1701,6 +1719,19 @@ impl WorkerCompletionHandler {
                     {
                         return outcome;
                     }
+                    // The parent's push is not this revision's conflict
+                    // resolution — verify against GitHub before the generic
+                    // nudge invites a "nothing left to do" reply.
+                    let (probe_text, fingerprint) = match self
+                        .conflict_revision_stop_refusal(execution_id, &execution, &_pr_url_for_nudge)
+                        .await
+                    {
+                        Some(refusal) => refusal,
+                        None => (
+                            probe_push_to_existing_pr(&_pr_url_for_nudge),
+                            format!("nocontribution:{_pr_url_for_nudge}"),
+                        ),
+                    };
                     tracing::info!(
                         execution_id,
                         bound_pr_url = %_pr_url_for_nudge,
@@ -1709,8 +1740,8 @@ impl WorkerCompletionHandler {
                     return self
                         .nudge_or_park(
                             &execution,
-                            &probe_push_to_existing_pr(&_pr_url_for_nudge),
-                            &format!("nocontribution:{_pr_url_for_nudge}"),
+                            &probe_text,
+                            &fingerprint,
                             Some(&_pr_url_for_nudge),
                             StopOutcome::AwaitingInput,
                         )
@@ -1753,6 +1784,29 @@ impl WorkerCompletionHandler {
                     .await
                 {
                     return outcome;
+                }
+                // GitHub-authoritative conflict gate. A merge-conflict
+                // revision that pushed nothing is claiming, implicitly or
+                // explicitly, that the conflict is already gone. That claim
+                // is objectively checkable and the engine holds the bound PR
+                // URL — so check it here, BEFORE the satisfied-deliverable
+                // gate and the generic nudge, and refuse the claim outright
+                // when GitHub still reports the PR conflicting (or has not
+                // finished deciding). Placed ahead of the satisfied gate so
+                // a refusal costs one probe round rather than two.
+                let conflict_refusal = self
+                    .conflict_revision_stop_refusal(execution_id, &execution, &pr_url)
+                    .await;
+                if let Some((probe_text, fingerprint)) = conflict_refusal {
+                    return self
+                        .nudge_or_park(
+                            &execution,
+                            &probe_text,
+                            &fingerprint,
+                            Some(&pr_url),
+                            StopOutcome::AwaitingInput,
+                        )
+                        .await;
                 }
                 // Deliverable-satisfied gate (zombie-worker fix): if the
                 // bound PR is already in a satisfactory state at this Stop
@@ -4541,6 +4595,103 @@ must not be asked to open one",
         )
     }
 
+    /// True when `execution` is a merge-conflict revision whose parent
+    /// chore still owns a live (`pending` / `running`) `conflict_resolutions`
+    /// row — i.e. the engine's own ledger still believes this conflict needs
+    /// resolving.
+    ///
+    /// Requiring a live attempt is what keeps [`Self::conflict_revision_stop_refusal`]
+    /// from second-guessing a worker that correctly escalated: a worker that
+    /// ran `boss engine conflicts mark-failed … --reason product_decision_required`
+    /// leaves the attempt terminal, and dogging it about GitHub's `mergeable`
+    /// after it deliberately declined to resolve would be exactly the
+    /// pointless nudging this change exists to reduce.
+    fn has_active_conflict_attempt(&self, execution: &crate::work::WorkExecution) -> bool {
+        let Ok(WorkItem::Task(task)) = self.work_db.get_work_item(&execution.work_item_id) else {
+            return false;
+        };
+        let Some(parent_id) = task.parent_task_id else {
+            return false;
+        };
+        self.work_db
+            .active_conflict_resolution_for_work_item(&parent_id)
+            .unwrap_or(None)
+            .is_some()
+    }
+
+    /// GitHub-authoritative refusal gate for a merge-conflict revision that
+    /// reached a Stop boundary without moving the bound PR's head.
+    ///
+    /// The generic [`probe_push_to_existing_pr`] nudge ends with *"if there
+    /// is nothing left to do, say so"*. For a conflict revision that is the
+    /// wrong contract — whether a conflict remains is objectively checkable
+    /// and the engine already holds the bound PR URL, so it must check
+    /// rather than take the worker's word. (Incident 2026-07-23,
+    /// `exec_18c50a0a900baa40_54` / spinyfin/mono#2070: the worker declared
+    /// the conflict "already resolved and pushed in a prior attempt" off
+    /// divergent local `jj` state, having never queried `mergeable` at all;
+    /// GitHub said `CONFLICTING` / `DIRTY` throughout, and only a manual
+    /// operator message unstuck the run.)
+    ///
+    /// Returns `Some((probe_text, fingerprint))` when the engine must refuse
+    /// the "nothing left to do" reading, or `None` when the claim is
+    /// corroborated (GitHub reports the PR mergeable), the gate does not
+    /// apply, or GitHub could not be reached — in which case the caller
+    /// falls through to its ordinary handling.
+    async fn conflict_revision_stop_refusal(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+    ) -> Option<(String, String)> {
+        if !self.is_merge_conflict_revision(execution) || !self.has_active_conflict_attempt(execution) {
+            return None;
+        }
+        match conflict_stop_gate::verify_conflict_cleared(
+            self.merge_probe.as_ref(),
+            bound_pr_url,
+            self.conflict_unknown_backoff,
+        )
+        .await
+        {
+            ConflictClearance::StillConflicting {
+                raw_mergeable,
+                raw_merge_state_status,
+            } => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url,
+                    %raw_mergeable,
+                    %raw_merge_state_status,
+                    "stop event: merge-conflict revision pushed nothing but GitHub still reports the \
+                     PR conflicting — refusing the 'already resolved' reading and probing with the \
+                     live values",
+                );
+                Some((
+                    conflict_stop_gate::probe_conflict_still_present(
+                        bound_pr_url,
+                        &raw_mergeable,
+                        &raw_merge_state_status,
+                    ),
+                    format!("conflict_unresolved:{bound_pr_url}:{raw_mergeable}"),
+                ))
+            }
+            ConflictClearance::Indeterminate => {
+                tracing::info!(
+                    execution_id,
+                    bound_pr_url,
+                    "stop event: merge-conflict revision pushed nothing and GitHub's mergeability is \
+                     still UNKNOWN — refusing to read that as resolved",
+                );
+                Some((
+                    conflict_stop_gate::probe_conflict_mergeability_unknown(bound_pr_url),
+                    format!("conflict_mergeable_unknown:{bound_pr_url}"),
+                ))
+            }
+            ConflictClearance::Cleared | ConflictClearance::Unavailable => None,
+        }
+    }
+
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
     /// against the circuit breaker (keyed by `fingerprint`, which must
     /// encode the work state so an unchanged state counts as
@@ -6082,7 +6233,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 .await
             }
             PrLifecycleState::Open(ref open)
-                if open.mergeability != OpenPrMergeability::Conflict
+                if mergeability_satisfies_deliverable(open.mergeability, merge_conflict_revision)
                     && (matches!(open.ci, OpenPrCiStatus::Clean) || merge_conflict_revision || queued_for_merge) =>
             {
                 tracing::info!(
@@ -6408,6 +6559,27 @@ fn ci_attempt_signal_cleared(attempt_failed_checks: &str, ci: &OpenPrCiStatus) -
             let failing_names: std::collections::HashSet<&str> = failures.iter().map(|f| f.name.as_str()).collect();
             !targeted.iter().any(|name| failing_names.contains(name.as_str()))
         }
+    }
+}
+
+/// Whether an open PR's mergeability is good enough to call a worker's
+/// deliverable satisfied at a Stop boundary where the head never moved.
+///
+/// `Clean` always qualifies and `Conflict` never does. `Unknown` — GitHub
+/// still recomputing mergeability — is the interesting case: for an
+/// ordinary execution it is tolerated (CI cleanliness carries the
+/// decision there, and the merge poller re-blocks the PR later if the
+/// recompute settles on CONFLICTING). For a **merge-conflict revision**
+/// it must not qualify: clearing the conflict is that revision's entire
+/// deliverable, `merge_conflict_revision` already waives the CI half of
+/// the test, so accepting `Unknown` would finalize the run on no
+/// evidence at all — precisely the "took the worker's word" failure
+/// (spinyfin/mono#2070, 2026-07-23) this gate exists to prevent.
+fn mergeability_satisfies_deliverable(mergeability: OpenPrMergeability, merge_conflict_revision: bool) -> bool {
+    match mergeability {
+        OpenPrMergeability::Clean => true,
+        OpenPrMergeability::Conflict => false,
+        OpenPrMergeability::Unknown => !merge_conflict_revision,
     }
 }
 
@@ -13411,7 +13583,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
         let handler = handler
             .with_branch_verifier(verifier)
-            .with_merge_probe(Arc::new(UnknownMergeProbe));
+            .with_merge_probe(Arc::new(UnknownMergeProbe))
+            .with_conflict_unknown_backoff(std::time::Duration::ZERO);
 
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -13427,6 +13600,199 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert_eq!(
             attempt.status, "pending",
             "conflict_resolutions attempt must NOT be retired as succeeded on mergeable=UNKNOWN",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // GitHub-authoritative conflict stop gate (2026-07-23 incident,
+    // exec_18c50a0a900baa40_54 / spinyfin/mono#2070).
+    //
+    // A merge-conflict revision worker stopped 26s in without pushing,
+    // declaring "this conflict was already resolved and pushed in a prior
+    // attempt". It had never queried `mergeable`, and never ran the
+    // mandatory `cube workspace rebase`. GitHub reported CONFLICTING /
+    // DIRTY throughout. The only guard was the generic SHA-delta nudge,
+    // whose text invites exactly that reply ("if there is nothing left to
+    // do, say so"). These tests pin the engine-side enforcement: the
+    // claim is checked against GitHub, not accepted.
+    // -----------------------------------------------------------
+
+    /// [`MergeProbe`] reporting an open PR with a fixed mergeability and
+    /// the raw GitHub strings the probe text quotes back at the worker.
+    struct FixedMergeabilityProbe {
+        mergeability: crate::merge_poller::OpenPrMergeability,
+    }
+
+    #[async_trait]
+    impl MergeProbe for FixedMergeabilityProbe {
+        async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+            use crate::merge_poller::{OpenPrMergeability, OpenPrStatus};
+            let (status, raw_mergeable, raw_state) = match self.mergeability {
+                OpenPrMergeability::Conflict => (OpenPrStatus::conflict_only(), "CONFLICTING", "DIRTY"),
+                OpenPrMergeability::Unknown => (OpenPrStatus::unknown_mergeability(), "UNKNOWN", "UNKNOWN"),
+                OpenPrMergeability::Clean => (OpenPrStatus::clean(), "MERGEABLE", "CLEAN"),
+            };
+            Ok(PrLifecycleProbe::builder()
+                .url(url.to_owned())
+                .state(PrLifecycleState::Open(status))
+                .labels(Vec::new())
+                .review(crate::merge_poller::PrReviewState::Unknown)
+                .raw_mergeable(raw_mergeable)
+                .raw_merge_state_status(raw_state)
+                .build())
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_still_conflicting_gets_targeted_probe_not_the_generic_escape_hatch() {
+        // Incident replay: head unchanged (worker pushed nothing) and
+        // GitHub says CONFLICTING. The engine must refuse the implicit
+        // "already resolved" claim with a probe that quotes the live
+        // GitHub values — and must NOT send the generic nudge, whose
+        // "or there is nothing left to do" clause is the escape hatch the
+        // worker took.
+        use crate::merge_poller::OpenPrMergeability;
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/2070";
+        let head = "39f8adcdfe055f98d1d2ebc56431f376ebbed683";
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None);
+        // SHA-delta gate: head unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+                mergeability: OpenPrMergeability::Conflict,
+            }));
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "a still-conflicting PR must keep the revision awaiting input, not finalize it",
+        );
+
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "exactly one probe must fire; got {queued:?}");
+        let text = &queued[0].1;
+        assert!(
+            text.contains("CONFLICTING") && text.contains("DIRTY"),
+            "probe must quote the live GitHub values so the worker cannot argue with local jj state: {text}",
+        );
+        assert!(
+            text.contains("cube workspace rebase"),
+            "probe must name the mandatory command the worker skipped: {text}",
+        );
+        assert!(
+            !text.contains("or there is nothing left to do"),
+            "probe must NOT offer the generic nudge's escape hatch: {text}",
+        );
+
+        // The attempt stays live — nothing about a refused claim retires it.
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "pending",
+            "a refused claim must not touch the attempt ledger"
+        );
+        // And the execution must NOT be finalized off an unverified claim.
+        assert_ne!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Completed,
+            "a conflict revision that pushed nothing against a CONFLICTING PR must not complete",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_unknown_mergeability_is_never_read_as_resolved() {
+        // `mergeable: UNKNOWN` is an unanswered question, not a clean bill
+        // of health. Before this gate, the satisfied-deliverable check
+        // accepted any `mergeability != Conflict` and — because a
+        // merge-conflict revision also waives the CI half of the test —
+        // finalized the run on no evidence whatsoever.
+        use crate::merge_poller::OpenPrMergeability;
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/2071";
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, _attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None);
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+                mergeability: OpenPrMergeability::Unknown,
+            }))
+            .with_conflict_unknown_backoff(std::time::Duration::ZERO);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "mergeable=UNKNOWN must not finalize a merge-conflict revision; got {outcome:?}",
+        );
+        assert_ne!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Completed,
+            "UNKNOWN mergeability is not evidence the conflict cleared — the run must not complete",
+        );
+
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "exactly one probe must fire; got {queued:?}");
+        assert!(
+            queued[0].1.contains("UNKNOWN") && queued[0].1.contains("cube workspace rebase"),
+            "probe must name the indeterminate value and the command that settles it: {}",
+            queued[0].1,
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_with_terminal_attempt_is_not_second_guessed() {
+        // A worker that correctly escalated — `boss engine conflicts
+        // mark-failed … --reason product_decision_required` — leaves the
+        // attempt terminal and deliberately does not push. The gate must
+        // not dog it about GitHub's `mergeable`: with no live attempt the
+        // engine no longer believes this conflict is its to resolve, so
+        // the ordinary nudge path applies unchanged.
+        use crate::merge_poller::OpenPrMergeability;
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/2072";
+        let head = "dddddddddddddddddddddddddddddddddddddddd";
+        let (_dir, db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+        db.mark_conflict_resolution_failed(&attempt_id, "product_decision_required")
+            .unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(FixedMergeabilityProbe {
+                mergeability: OpenPrMergeability::Conflict,
+            }));
+
+        let _ = handler.on_stop(&execution_id).await;
+
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "exactly one probe must fire; got {queued:?}");
+        assert_eq!(
+            queued[0].1,
+            probe_push_to_existing_pr(parent_pr_url),
+            "with no live conflict attempt the generic nudge must be used unchanged",
         );
     }
 

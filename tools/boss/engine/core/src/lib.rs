@@ -23,6 +23,7 @@ pub mod completion;
 pub mod config;
 pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_ladder;
+pub mod conflict_stop_gate;
 pub mod conflict_watch;
 pub mod coordinator;
 pub mod cube_commands;
