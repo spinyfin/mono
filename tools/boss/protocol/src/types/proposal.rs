@@ -9,9 +9,10 @@
 //! matching the design's "Data model" kinds table exactly.
 //!
 //! Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
-//! §"Data model". This module ships types + schema only — no engine
-//! behavior (submission, validation, apply pipeline) lands until the
-//! follow-on implementation tasks.
+//! §"Data model". This module ships the wire types only; the engine
+//! behavior lives elsewhere — submission/validation/attribution in
+//! `boss_engine::app::proposals` / `boss_engine_proposal_validation`, and
+//! the auto-apply pipeline in `boss_engine::work::proposal_apply`.
 
 use super::common::EffortLevel;
 use serde::{Deserialize, Serialize};

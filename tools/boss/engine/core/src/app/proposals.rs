@@ -28,8 +28,10 @@
 //!
 //! ## What this module does not do
 //!
-//! No apply pipeline: every accepted row lands in `state = proposed` and
-//! nothing consumes it yet. Tier enforcement now exists: worker-classified
+//! The apply pipeline itself is not here: `WorkDb::submit_worker_proposal`
+//! (`crate::work::proposals`) runs it, inside the same transaction as the
+//! insert, before this handler ever sees the returned row — see
+//! `crate::work::proposal_apply`. Tier enforcement now exists: worker-classified
 //! connections are gated by `worker_verb_decision` before dispatch when
 //! `worker_rpc_tier` is on, and `SubmitProposal`/`ListProposals` are on the
 //! worker allowlist. Their own peer-pid attribution is what additionally
