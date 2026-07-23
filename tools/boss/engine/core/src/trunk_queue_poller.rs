@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 use boss_trunk_client::{
-    GetQueueRequest, TrunkError, TrunkPrLookup, TrunkPrRef, TrunkPrState, TrunkPullRequest, TrunkQueue,
-    TrunkQueueState, TrunkRepoRef,
+    GetQueueRequest, ListPullRequestsRequest, ListPullRequestsResponse, TrunkError, TrunkPrLookup, TrunkPrRef,
+    TrunkPrState, TrunkPullRequest, TrunkQueue, TrunkQueueState, TrunkRepoRef,
 };
 
 use crate::coordinator::ExecutionPublisher;
@@ -128,6 +128,16 @@ const BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// requests/hour per queue rather than compounding to hours of silence.
 const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
+/// Cadence of the `listPullRequests since=<last sweep>` reconciliation
+/// backstop, independent of the 15 s/30 s point-probe cadence above.
+/// Catches transitions the point probes (`getQueue` plus a per-missing-
+/// entry `getSubmittedPullRequest`) missed — e.g. an entry that both
+/// joined and left the queue between two `getQueue` calls. Ten minutes
+/// matches the design's stated backstop cadence: frequent enough that a
+/// missed transition doesn't strand a card indefinitely, infrequent
+/// enough to add negligible Trunk API traffic on top of the point probes.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// How long a queue must be continuously unreachable, while entries are
 /// being tracked, before the operator gets told. Short enough to catch a
 /// real outage during a merge, long enough that a Trunk blip riding out
@@ -156,6 +166,10 @@ pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_
 pub trait TrunkQueueApi: Send + Sync {
     async fn get_queue(&self, request: &GetQueueRequest) -> Result<TrunkQueue, TrunkError>;
     async fn get_submitted_pull_request(&self, request: &TrunkPrLookup) -> Result<TrunkPullRequest, TrunkError>;
+    async fn list_pull_requests(
+        &self,
+        request: &ListPullRequestsRequest,
+    ) -> Result<ListPullRequestsResponse, TrunkError>;
 }
 
 #[async_trait]
@@ -166,6 +180,13 @@ impl TrunkQueueApi for boss_trunk_client::TrunkClient {
 
     async fn get_submitted_pull_request(&self, request: &TrunkPrLookup) -> Result<TrunkPullRequest, TrunkError> {
         boss_trunk_client::TrunkClient::get_submitted_pull_request(self, request).await
+    }
+
+    async fn list_pull_requests(
+        &self,
+        request: &ListPullRequestsRequest,
+    ) -> Result<ListPullRequestsResponse, TrunkError> {
+        boss_trunk_client::TrunkClient::list_pull_requests(self, request).await
     }
 }
 
@@ -311,17 +332,27 @@ struct QueueRuntime {
     /// filed for. `None` while the queue is `RUNNING` — that is what makes
     /// the item one-per-episode rather than one-per-sweep.
     queue_state_attention: Option<TrunkQueueState>,
+    /// When the `listPullRequests` reconciliation backstop is next due for
+    /// this queue. Independent of `next_due_at`'s point-probe cadence.
+    next_reconcile_due_at: Instant,
+    /// The `since` cursor for the next reconciliation call — the wall-clock
+    /// time (RFC 3339) the previous one ran, or `None` before the first.
+    last_reconciled_since: Option<String>,
 }
 
 impl QueueRuntime {
     /// A newly-discovered queue is due immediately: the merge click that
     /// created its first intent should surface a queue position within
-    /// seconds, not after a full tier interval.
+    /// seconds, not after a full tier interval. The reconciliation
+    /// backstop is not: it exists to catch what the point probes missed,
+    /// so a queue with no prior observations has nothing to reconcile yet.
     fn due_at(now: Instant) -> Self {
         Self {
             next_due_at: now,
             failure: QueueFailureState::default(),
             queue_state_attention: None,
+            next_reconcile_due_at: now + RECONCILE_INTERVAL,
+            last_reconciled_since: None,
         }
     }
 }
@@ -366,9 +397,13 @@ impl TrunkQueueProbe {
 
         // `BTreeMap` (not `HashMap`): probe order across queues is then
         // deterministic, which keeps the tests — and any trace read
-        // afterwards — reproducible.
+        // afterwards — reproducible. `BTreeSet` likewise for the products
+        // touched this pass, so the renumbering pass below runs in a
+        // reproducible order too.
         let mut groups: BTreeMap<QueueKey, Vec<ActiveTrunkMergeIntent>> = BTreeMap::new();
+        let mut product_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for intent in intents {
+            product_ids.insert(intent.product_id.clone());
             if is_terminal_task_status(&intent.task_status) {
                 retire_moot_intent(ctx, &intent, &mut outcome);
                 continue;
@@ -395,6 +430,14 @@ impl TrunkQueueProbe {
                 continue;
             }
             self.probe_queue(ctx, &key, &members, now, &mut outcome).await;
+        }
+
+        // Mirrors `merge_poller::renumber_merge_queue`'s "recompute the
+        // whole product's ranking after every probe-driven write" shape
+        // for the Trunk path — see `renumber_trunk_merge_queue`'s doc
+        // comment for why it can't just call that function directly.
+        for product_id in product_ids {
+            renumber_trunk_merge_queue(ctx, &product_id, &mut outcome).await;
         }
         outcome
     }
@@ -479,6 +522,9 @@ impl TrunkQueueProbe {
             }
         }
 
+        self.reconcile_missed_transitions(ctx, key, &repo_ref, members, now, outcome)
+            .await;
+
         self.set_next_due(key, now + tier.interval());
         tracing::debug!(
             repo = %key.repo,
@@ -494,6 +540,70 @@ impl TrunkQueueProbe {
     fn set_next_due(&mut self, key: &QueueKey, at: Instant) {
         if let Some(runtime) = self.queues.get_mut(key) {
             runtime.next_due_at = at;
+        }
+    }
+
+    /// The low-frequency `listPullRequests since=<last sweep>` backstop:
+    /// catches a transition the point probes (`getQueue` plus a per-
+    /// missing-entry `getSubmittedPullRequest`) missed entirely — e.g. an
+    /// entry that both joined and left the real queue between two
+    /// `getQueue` calls, so it never showed up as "present" or "newly
+    /// missing" to either point probe. Runs at most once per
+    /// [`RECONCILE_INTERVAL`] per queue, piggybacking on whatever cadence
+    /// already calls [`Self::probe_queue`] rather than adding its own
+    /// wakeup.
+    async fn reconcile_missed_transitions(
+        &mut self,
+        ctx: &TrunkSweepContext<'_>,
+        key: &QueueKey,
+        repo_ref: &TrunkRepoRef,
+        members: &[ActiveTrunkMergeIntent],
+        now: Instant,
+        outcome: &mut TrunkSweepOutcome,
+    ) {
+        let Some(runtime) = self.queues.get(key) else {
+            return;
+        };
+        if runtime.next_reconcile_due_at > now {
+            return;
+        }
+        let since = runtime.last_reconciled_since.clone();
+
+        let request = ListPullRequestsRequest::builder()
+            .repo(repo_ref.clone())
+            .target_branch(key.target_branch.clone())
+            .maybe_since(since)
+            .build();
+        match ctx.api.list_pull_requests(&request).await {
+            Ok(response) => {
+                for pr in &response.pull_requests {
+                    if !is_terminal_trunk_state(&pr.state) {
+                        continue;
+                    }
+                    if let Some(member) = members
+                        .iter()
+                        .find(|member| member.intent.pr_number as u64 == pr.pr_number)
+                    {
+                        apply_resolved_state(ctx, member, &pr.state, outcome).await;
+                    }
+                }
+            }
+            Err(err) => {
+                outcome.probe_failures += 1;
+                tracing::warn!(
+                    repo = %key.repo,
+                    target_branch = %key.target_branch,
+                    error = %err,
+                    "trunk queue poller: listPullRequests reconciliation failed",
+                );
+            }
+        }
+
+        if let Some(runtime) = self.queues.get_mut(key) {
+            runtime.next_reconcile_due_at = now + RECONCILE_INTERVAL;
+            runtime.last_reconciled_since = Some(boss_engine_utils::iso8601::format_epoch_iso8601(
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            ));
         }
     }
 
@@ -669,7 +779,20 @@ async fn write_live_entry(
     outcome: &mut TrunkSweepOutcome,
 ) {
     let state = String::from(entry.state.clone());
-    let detail = live_entry_detail_json(member, &state, position, queue_state);
+    // Seed `section_order` from whatever the last renumbering pass settled
+    // on rather than this probe's raw `position` — see
+    // `get_task_merge_queue_detail`'s doc comment for why re-deriving it
+    // from `position` here would fight the renumbering pass on every
+    // cycle once the two disagree.
+    let previous_section_order = ctx
+        .work_db
+        .get_task_merge_queue_detail(&member.intent.work_item_id)
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(|json| parse_stored_trunk_queue_detail(Some(json)))
+        .and_then(|detail| detail.section_order);
+    let detail = live_entry_detail_json(member, &state, position, queue_state, previous_section_order);
     match ctx.work_db.set_task_merge_queue_state(
         &member.intent.work_item_id,
         Some(MERGE_QUEUE_STATE_QUEUED),
@@ -707,14 +830,18 @@ async fn write_live_entry(
 /// and a pre-task-8 app renders position + clock rather than breaking.
 ///
 /// `section_order` is the queue position: without it `mergingSection()`
-/// sorts every Trunk card at `.max` and the lane is unordered. Deriving it
-/// straight from `position` here keeps the two consistent for a single
-/// product; the cross-product renumbering pass is a separate task.
+/// sorts every Trunk card at `.max` and the lane is unordered.
+/// `previous_section_order` — the value the last renumbering pass wrote,
+/// if any — is carried forward as-is so this write doesn't reintroduce a
+/// stale provisional value on every cycle; a brand-new entry with no
+/// stored value yet falls back to `position`, corrected to the canonical
+/// per-product ranking by [`renumber_trunk_merge_queue`] right after.
 fn live_entry_detail_json(
     member: &ActiveTrunkMergeIntent,
     state: &str,
     position: i64,
     queue_state: &TrunkQueueState,
+    previous_section_order: Option<i64>,
 ) -> Option<String> {
     serde_json::to_string(&serde_json::json!({
         "source": "trunk",
@@ -722,9 +849,143 @@ fn live_entry_detail_json(
         "position": position,
         "enqueued_at": enqueued_at(member),
         "queue_state": String::from(queue_state.clone()),
-        "section_order": position,
+        "section_order": previous_section_order.unwrap_or(position),
     }))
     .ok()
+}
+
+/// Fields pulled back out of a stored Trunk `merge_queue_detail` JSON blob
+/// — the read-side counterpart to [`live_entry_detail_json`]'s write. Used
+/// only by [`renumber_trunk_merge_queue`] to re-derive `section_order`
+/// across every currently-queued Trunk member of a product while
+/// preserving the rest of the blob's fields byte-for-byte in meaning
+/// (`source`/`queue_state` included) — the reason this can't just call
+/// `merge_poller::renumber_merge_queue` directly, whose rewritten blob
+/// only knows the GitHub-native `{position, state, enqueued_at,
+/// section_order}` shape and would silently drop `source`/`queue_state`.
+struct StoredTrunkQueueDetail {
+    state: Option<String>,
+    position: Option<i64>,
+    enqueued_at: Option<String>,
+    queue_state: Option<String>,
+    section_order: Option<i64>,
+}
+
+/// Parse a stored `merge_queue_detail` blob as a Trunk entry, or `None` if
+/// it isn't one (unparsable, or `source != "trunk"` — a GitHub-native row,
+/// which `list_queued_merge_queue_members` returns indiscriminately since
+/// `merge_queue_state = "queued"` is shared between the two mechanisms).
+fn parse_stored_trunk_queue_detail(json: Option<&str>) -> Option<StoredTrunkQueueDetail> {
+    let parsed: serde_json::Value = json.and_then(|s| serde_json::from_str(s).ok())?;
+    if parsed.get("source").and_then(|v| v.as_str()) != Some("trunk") {
+        return None;
+    }
+    Some(StoredTrunkQueueDetail {
+        state: parsed.get("state").and_then(|v| v.as_str()).map(str::to_owned),
+        position: parsed.get("position").and_then(|v| v.as_i64()),
+        enqueued_at: parsed.get("enqueued_at").and_then(|v| v.as_str()).map(str::to_owned),
+        queue_state: parsed.get("queue_state").and_then(|v| v.as_str()).map(str::to_owned),
+        section_order: parsed.get("section_order").and_then(|v| v.as_i64()),
+    })
+}
+
+/// Sort key for [`renumber_trunk_merge_queue`]: ascending queue `position`
+/// as the last `getQueue` response reported it. Unlike the GitHub path
+/// (`merge_poller::merge_queue_sort_key`), there is no cross-probe
+/// staleness to correct for here — every tracked member of one Trunk
+/// queue is rewritten together from the same `getQueue` response
+/// (`probe_queue`'s per-member loop) — so `position` is always as fresh
+/// as this pass itself. A missing position (a member not yet observed
+/// this pass) sorts after every present value; `task_id` breaks ties
+/// deterministically.
+fn trunk_queue_sort_key(detail: &StoredTrunkQueueDetail, task_id: &str) -> (u8, i64, String) {
+    match detail.position {
+        Some(position) => (0, position, task_id.to_owned()),
+        None => (1, i64::MAX, task_id.to_owned()),
+    }
+}
+
+/// Recompute a canonical `section_order` for every Trunk-sourced member of
+/// `product_id` currently in the Merging lane (`merge_queue_state =
+/// "queued"`), and re-broadcast for every member whose value actually
+/// changed — the Trunk-shaped mirror of
+/// [`crate::merge_poller::renumber_merge_queue`] the design calls for
+/// (`trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+/// §"Queue state ingestion: polling").
+///
+/// `section_order` is not optional chrome: the macOS app's
+/// `mergingSection()` sorts the lane by `MergeQueueDetail.parse(...)?
+/// .sectionOrder ?? .max`, so a detail JSON without it ties every Trunk
+/// card at `.max` and the lane goes unordered. Called once per product at
+/// the end of every [`TrunkQueueProbe::run_pass`], after every queue that
+/// product's members belong to has been probed, so it always sees this
+/// pass's freshest positions.
+async fn renumber_trunk_merge_queue(ctx: &TrunkSweepContext<'_>, product_id: &str, outcome: &mut TrunkSweepOutcome) {
+    let members = match ctx.work_db.list_queued_merge_queue_members(product_id) {
+        Ok(members) => members,
+        Err(err) => {
+            tracing::warn!(
+                product_id,
+                ?err,
+                "trunk queue poller: failed to list queued members for renumbering",
+            );
+            return;
+        }
+    };
+
+    let mut parsed: Vec<(String, StoredTrunkQueueDetail)> = members
+        .into_iter()
+        .filter_map(|member| {
+            let detail = parse_stored_trunk_queue_detail(member.merge_queue_detail.as_deref())?;
+            Some((member.task_id, detail))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return;
+    }
+    parsed.sort_by(|(a_id, a_detail), (b_id, b_detail)| {
+        trunk_queue_sort_key(a_detail, a_id).cmp(&trunk_queue_sort_key(b_detail, b_id))
+    });
+
+    for (rank, (task_id, detail)) in parsed.iter().enumerate() {
+        let section_order = (rank + 1) as i64;
+        // "Only touch what changed" — same invariant as
+        // `merge_poller::renumber_merge_queue`.
+        if detail.section_order == Some(section_order) {
+            continue;
+        }
+        let Ok(json) = serde_json::to_string(&serde_json::json!({
+            "source": "trunk",
+            "state": detail.state,
+            "position": detail.position,
+            "enqueued_at": detail.enqueued_at,
+            "queue_state": detail.queue_state,
+            "section_order": section_order,
+        })) else {
+            continue;
+        };
+        match ctx.work_db.update_task_merge_queue_detail(task_id, &json) {
+            Ok(true) => {
+                outcome.state_writes += 1;
+                ctx.publisher
+                    .publish_work_item_changed(product_id, task_id, "trunk_queue_renumbered")
+                    .await;
+                tracing::debug!(
+                    work_item_id = %task_id,
+                    product_id,
+                    section_order,
+                    "trunk queue poller: renumbered merge-queue section_order",
+                );
+            }
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                work_item_id = %task_id,
+                product_id,
+                ?err,
+                "trunk queue poller: failed to renumber merge-queue position",
+            ),
+        }
+    }
 }
 
 /// RFC 3339 rendering of when Boss submitted this PR to the queue.

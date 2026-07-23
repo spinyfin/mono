@@ -43,6 +43,10 @@ struct StubTrunkApi {
     /// run as many passes as it likes.
     queue_replies: Mutex<VecDeque<Result<TrunkQueue, StubError>>>,
     entry_replies: Mutex<HashMap<u64, Result<TrunkPullRequest, StubError>>>,
+    /// Replies for successive `listPullRequests` calls, same sticky-last
+    /// convention as `queue_replies`. Empty by default (no reconciliation
+    /// hits), tracked separately from `queue_calls`/`entry_calls` below.
+    list_pull_requests_replies: Mutex<VecDeque<Result<ListPullRequestsResponse, StubError>>>,
     queue_calls: Mutex<Vec<(String, String)>>,
     entry_calls: Mutex<Vec<u64>>,
 }
@@ -57,6 +61,10 @@ impl StubTrunkApi {
 
     fn set_entry(&self, pr_number: u64, reply: Result<TrunkPullRequest, StubError>) {
         self.entry_replies.lock().unwrap().insert(pr_number, reply);
+    }
+
+    fn set_list_pull_requests(&self, replies: Vec<Result<ListPullRequestsResponse, StubError>>) {
+        *self.list_pull_requests_replies.lock().unwrap() = replies.into();
     }
 
     fn queue_call_count(&self) -> usize {
@@ -94,6 +102,26 @@ impl TrunkQueueApi for StubTrunkApi {
             Some(Ok(pr)) => Ok(pr.clone()),
             Some(Err(err)) => Err(err.into_trunk()),
             None => Err(TrunkError::NotFound("no stub reply".to_owned())),
+        }
+    }
+
+    async fn list_pull_requests(
+        &self,
+        _request: &ListPullRequestsRequest,
+    ) -> Result<ListPullRequestsResponse, TrunkError> {
+        let mut replies = self.list_pull_requests_replies.lock().unwrap();
+        let reply = if replies.len() > 1 {
+            replies.pop_front()
+        } else {
+            replies.front().cloned()
+        };
+        match reply {
+            Some(Ok(response)) => Ok(response),
+            Some(Err(err)) => Err(err.into_trunk()),
+            None => Ok(ListPullRequestsResponse {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
         }
     }
 }
@@ -340,7 +368,11 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
         )
         .await;
 
-    assert_eq!(outcome.state_writes, 1);
+    // One write from `write_live_entry` (position 2, the real queue index)
+    // plus one from `renumber_trunk_merge_queue` — 978 isn't a Boss-tracked
+    // member, so the product's only tracked entry re-ranks to section_order
+    // 1 even though its raw `position` stays 2.
+    assert_eq!(outcome.state_writes, 2);
     let (state, _) = stored_queue_state(&db, &task_id);
     assert_eq!(state.as_deref(), Some("queued"));
 
@@ -348,18 +380,26 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
     assert_eq!(detail["source"], "trunk");
     assert_eq!(detail["state"], "pending");
     assert_eq!(detail["position"], 2);
-    assert_eq!(detail["section_order"], 2);
+    assert_eq!(detail["section_order"], 1);
     assert_eq!(detail["queue_state"], "RUNNING");
     // `enqueued_at` is RFC 3339, per the field's documented contract on
     // the app side, derived from when Boss submitted the PR.
     let enqueued_at = detail["enqueued_at"].as_str().expect("an enqueued_at timestamp");
     assert!(enqueued_at.contains('T') && enqueued_at.ends_with('Z'), "{enqueued_at}");
 
-    // The card only reaches the Merging lane via a pushed event.
+    // The card only reaches the Merging lane via a pushed event — one for
+    // the live-entry write, one for the renumbering pass right after it.
     let events = publisher.events.lock().await.clone();
     assert_eq!(
         events,
-        vec![(product_id, task_id, "trunk_queue_state_updated".to_owned())]
+        vec![
+            (
+                product_id.clone(),
+                task_id.clone(),
+                "trunk_queue_state_updated".to_owned()
+            ),
+            (product_id, task_id, "trunk_queue_renumbered".to_owned()),
+        ]
     );
 
     // And the intent remembers what the queue said.
@@ -822,4 +862,178 @@ async fn an_unparseable_repo_slug_parks_the_queue_instead_of_calling_trunk() {
     probe.run_pass(&ctx, t0 + Duration::from_secs(60)).await;
 
     assert_eq!(api.queue_call_count(), 0, "never issue a request Trunk would reject");
+}
+
+// ── section_order renumbering ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn section_order_is_a_contiguous_rank_across_only_the_boss_tracked_members() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = create_test_product_named(&db, "Product-renumber");
+    // Three Boss-tracked entries, deliberately not contiguous in the real
+    // queue: a non-Boss PR (500) sits between 978 and 979.
+    let task_a = create_test_chore_manual(&db, product.id.clone(), "a");
+    let task_b = create_test_chore_manual(&db, product.id.clone(), "b");
+    for (task, pr_number) in [(&task_a, 978), (&task_b, 979)] {
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url(pr_number)),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.insert_trunk_merge_intent(
+            TrunkMergeIntentInsertInput::builder()
+                .work_item_id(task.id.clone())
+                .pr_url(pr_url(pr_number))
+                .pr_number(pr_number)
+                .repo(REPO)
+                .target_branch("main")
+                .build(),
+        )
+        .unwrap();
+    }
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(
+        TrunkQueueState::Running,
+        vec![
+            entry_of(978, TrunkPrState::TestsPassed),
+            entry_of(500, TrunkPrState::Testing),
+            entry_of(979, TrunkPrState::Pending),
+        ],
+    ))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+
+    probe
+        .run_pass(
+            &TrunkSweepContext {
+                work_db: &db,
+                publisher: &publisher,
+                api: &api,
+            },
+            Instant::now(),
+        )
+        .await;
+
+    let detail_a = stored_detail(&db, &task_a.id);
+    let detail_b = stored_detail(&db, &task_b.id);
+    // Raw `position` keeps the real (gappy) queue index...
+    assert_eq!(detail_a["position"], 1);
+    assert_eq!(detail_b["position"], 3);
+    // ...but `section_order` is the contiguous rank among tracked members
+    // only, so the Merging lane orders them back-to-back.
+    assert_eq!(detail_a["section_order"], 1);
+    assert_eq!(detail_b["section_order"], 2);
+}
+
+#[tokio::test]
+async fn a_stable_queue_does_not_re_renumber_every_pass() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "renumber-stable", 979);
+    // 978 is a phantom, non-Boss-tracked entry ahead of the tracked one —
+    // the gap scenario that makes `position` (2) diverge from the
+    // contiguous `section_order` (1).
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(
+        TrunkQueueState::Running,
+        vec![
+            entry_of(978, TrunkPrState::Testing),
+            entry_of(979, TrunkPrState::Pending),
+        ],
+    ))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    let first = probe.run_pass(&ctx, t0).await;
+    assert_eq!(stored_detail(&db, &task_id)["section_order"], 1);
+    assert!(first.state_writes >= 1);
+
+    // Same shape next cycle: nothing actually moved, so nothing should be
+    // rewritten or republished by either the live-entry write or the
+    // renumbering pass — the provisional-then-corrected churn is a
+    // one-time cost on first entry, not a steady-state one.
+    let second = probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await;
+    assert_eq!(second.state_writes, 0);
+}
+
+// ── listPullRequests reconciliation backstop ────────────────────────────────
+
+#[tokio::test]
+async fn the_reconciliation_backstop_catches_a_transition_the_point_probes_missed() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "missed", 978);
+    // The entry is gone from every `getQueue` response the point probe
+    // sees, and `getSubmittedPullRequest` never resolves it either (as if
+    // Trunk hadn't indexed it yet) — nothing but the backstop can close
+    // this out.
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    api.set_entry(978, Err(StubError::NotFound));
+    api.set_list_pull_requests(vec![Ok(ListPullRequestsResponse {
+        pull_requests: vec![entry_of(978, TrunkPrState::Cancelled)],
+        next_cursor: None,
+    })]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    probe.run_pass(&ctx, t0).await;
+    assert!(
+        db.get_active_trunk_merge_intent(&task_id).unwrap().is_some(),
+        "still active — nothing has resolved it yet"
+    );
+
+    // The backstop is due only after RECONCILE_INTERVAL (10 min).
+    let outcome = probe.run_pass(&ctx, t0 + Duration::from_secs(10 * 60 + 1)).await;
+
+    assert_eq!(outcome.intents_retired, 1, "the backstop resolved the cancellation");
+    assert!(db.get_active_trunk_merge_intent(&task_id).unwrap().is_none());
+    assert_eq!(
+        attention_kinds(&db, &task_id),
+        vec![TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND.to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn the_reconciliation_backstop_does_not_fire_before_its_own_cadence() {
+    let (_tmp, db) = crate::test_support::open_db();
+    seed_intent(&db, "not-due-yet", 978);
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(
+        TrunkQueueState::Running,
+        vec![entry_of(978, TrunkPrState::Pending)],
+    ))]);
+    api.set_list_pull_requests(vec![Ok(ListPullRequestsResponse {
+        pull_requests: vec![entry_of(978, TrunkPrState::Cancelled)],
+        next_cursor: None,
+    })]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    probe.run_pass(&ctx, t0).await;
+    // Well within the 30 s Pending-tier cadence, but nowhere near the 10
+    // minute reconciliation cadence.
+    let second = probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await;
+
+    assert_eq!(
+        second.intents_retired, 0,
+        "a stale listPullRequests reply must not fire early"
+    );
 }

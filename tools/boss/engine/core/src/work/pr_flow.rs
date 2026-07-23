@@ -964,6 +964,29 @@ impl WorkDb {
         )?;
         Ok(changed > 0)
     }
+
+    /// The currently stored `merge_queue_detail` blob for `work_item_id`,
+    /// if any.
+    ///
+    /// Used by the Trunk queue poller to seed a fresh write's
+    /// `section_order` from the value the last renumbering pass settled
+    /// on, rather than a provisional one derived fresh from this probe's
+    /// raw queue position — which, whenever the real Trunk queue has any
+    /// non-Boss-tracked member ahead of a tracked one, differs from the
+    /// renumbered value and would otherwise be immediately overwritten
+    /// (and republished) again every single pass.
+    pub fn get_task_merge_queue_detail(&self, work_item_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let detail = conn
+            .query_row(
+                "SELECT merge_queue_detail FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(detail)
+    }
 }
 
 /// Argument bundle for [`WorkDb::update_task_pr_poll_state`] — grouped to
