@@ -5,6 +5,7 @@ import AppKit
 #endif
 
 private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "DesignDocTiming")
+private let markdownOpenLog = Logger(subsystem: "com.boss.app", category: "MarkdownOpen")
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -379,7 +380,27 @@ final class ChatViewModel: ObservableObject {
     /// affordance from `$EDITOR` to the in-app Textual renderer —
     /// chore #12 of [[project-design-doc-pointer.md]] and Q9's
     /// renderer-reuse acceptance.
-    var designRendererOpener: ((DesignRendererContent) -> Void)?
+    ///
+    /// `didSet` notifies [[onDesignRendererWired]] the moment this
+    /// becomes non-nil so observers (namely `AppDelegate`'s pending
+    /// open-document buffer) can gate on "the renderer is actually
+    /// wired" rather than on an unrelated signal like `chatModel`
+    /// merely existing. `ContentView`'s `.task` and the `.task` that
+    /// assigns `AppDelegate.chatModel` are two independent SwiftUI
+    /// tasks with no ordering guarantee between them.
+    var designRendererOpener: ((DesignRendererContent) -> Void)? {
+        didSet {
+            if designRendererOpener != nil {
+                onDesignRendererWired?()
+            }
+        }
+    }
+
+    /// Fired once [[designRendererOpener]] is first wired to a non-nil
+    /// closure. `AppDelegate` observes this to flush its pending
+    /// markdown-open buffer at the correct time instead of racing on
+    /// `chatModel` assignment.
+    var onDesignRendererWired: (() -> Void)?
 
     /// Indirection for opening the markdown-viewer window with fetched
     /// content. Installed by [[ContentView]] using
@@ -1799,6 +1820,47 @@ final class ChatViewModel: ObservableObject {
             }
             designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=webURL")
             urlOpener(url)
+        }
+    }
+
+    /// Open a local `.md`/`.markdown` file in the in-app design renderer,
+    /// reusing [[designRendererOpener]] — the same window and rendering
+    /// path as [[openProjectDesignDoc]] and File ▸ Open (⌘O). This is the
+    /// shared entry point for every "open a markdown file" surface: the
+    /// File ▸ Open panel, `open -a Boss foo.md` from the shell, and
+    /// Finder's "Open With ▸ Boss" (both routed through the app's
+    /// `application(_:open:)` delegate callback, which calls this after
+    /// [[designRendererOpener]] is wired).
+    ///
+    /// `allowOSFallback` controls what happens when the renderer isn't
+    /// wired: the File ▸ Open panel path (the default, `true`) falls
+    /// back to `urlOpener` (the OS-registered handler) — safe there
+    /// because the user explicitly picked the file from within Boss, not
+    /// because the OS handed it to Boss. The OS open-document path
+    /// (`AppDelegate.application(_:open:)`) passes `false`: an event
+    /// that arrived *from* LaunchServices must never be handed back to
+    /// `NSWorkspace.shared.open`, since Boss can itself be the
+    /// OS-registered `.md` handler after this change — falling back
+    /// would re-dispatch the file to Boss's own open-document handler
+    /// (or silently bounce it to a different app). When the fallback is
+    /// disallowed and the renderer isn't wired, the open is dropped with
+    /// a log line rather than silently lost.
+    func openLocalMarkdownFile(url: URL, allowOSFallback: Bool = true) {
+        let content = DesignRendererContent(
+            title: url.deletingPathExtension().lastPathComponent,
+            filePath: url.path,
+            webURL: "",
+            repoLabel: "",
+            projectID: ""
+        )
+        if let opener = designRendererOpener {
+            opener(content)
+        } else if allowOSFallback {
+            urlOpener(url)
+        } else {
+            markdownOpenLog.warning(
+                "Dropped OS-delivered markdown open for \(url.path, privacy: .public) — design renderer not wired yet"
+            )
         }
     }
 

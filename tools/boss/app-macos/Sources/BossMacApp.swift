@@ -5,6 +5,7 @@ import UpdateCore
 import os.log
 
 private let appUpdateLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
+private let appOpenLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "open-document")
 
 @main
 struct BossMacApp: App {
@@ -16,6 +17,7 @@ struct BossMacApp: App {
             ContentView()
                 .task {
                     appDelegate.liveWorkerStates = chatModel.liveWorkerStates
+                    appDelegate.chatModel = chatModel
                     appDelegate.updateModel.startPollingIfNeeded()
                 }
         }
@@ -26,7 +28,7 @@ struct BossMacApp: App {
         .commands {
             TextEditingCommands()
             CommandGroup(after: .newItem) {
-                OpenMarkdownFileCommand()
+                OpenMarkdownFileCommand(chatModel: chatModel)
             }
             // Show BossFullVersion (e.g. "1.0.4-dev-f3be785") in the About panel
             // rather than CFBundleShortVersionString (numeric-only — plisttool
@@ -184,10 +186,11 @@ private struct CheckForUpdatesCommand: View {
 }
 
 /// File ▸ Open (⌘O): shows an NSOpenPanel filtered to .md/.markdown and
-/// opens the chosen file in the design-renderer window, reusing the same
-/// markdown rendering path as project design docs.
+/// opens the chosen file via [[ChatViewModel.openLocalMarkdownFile(url:)]]
+/// — the same entry point used by the OS-registered open-document path
+/// (see `AppDelegate.application(_:open:)`).
 private struct OpenMarkdownFileCommand: View {
-    @Environment(\.openWindow) private var openWindow
+    let chatModel: ChatViewModel
 
     var body: some View {
         Button("Open…") {
@@ -204,18 +207,10 @@ private struct OpenMarkdownFileCommand: View {
         panel.allowedContentTypes = [
             UTType(filenameExtension: "md") ?? .plainText,
             UTType(filenameExtension: "markdown") ?? .plainText,
+            UTType(filenameExtension: "mdown") ?? .plainText,
         ]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        openWindow(
-            id: "design-renderer",
-            value: DesignRendererContent(
-                title: url.deletingPathExtension().lastPathComponent,
-                filePath: url.path,
-                webURL: "",
-                repoLabel: "",
-                projectID: ""
-            )
-        )
+        chatModel.openLocalMarkdownFile(url: url)
     }
 }
 
@@ -319,6 +314,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
     /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp()
+
+    /// Set by `BossMacApp.task` once `ContentView` has appeared. The
+    /// flush that matters is gated on
+    /// [[ChatViewModel.onDesignRendererWired]], not on this assignment —
+    /// this setter and the `.task` that wires
+    /// `chatModel.designRendererOpener` (in `ContentView`) are two
+    /// independent SwiftUI tasks with no ordering guarantee, so gating
+    /// the flush here could fire before the renderer is wired and fall
+    /// through to the `NSWorkspace.shared.open` fallback — which, since
+    /// Boss can now be the OS-registered `.md` handler, would bounce the
+    /// file straight back to Boss's own `application(_:open:)`.
+    var chatModel: ChatViewModel? {
+        didSet {
+            chatModel?.onDesignRendererWired = { [weak self] in
+                self?.flushPendingMarkdownOpens()
+            }
+            // The renderer may already have been wired by the time
+            // `chatModel` lands here (the inner `.task` won the race) —
+            // in that case `onDesignRendererWired` already fired once
+            // and won't fire again, so flush directly too.
+            if chatModel?.designRendererOpener != nil {
+                flushPendingMarkdownOpens()
+            }
+        }
+    }
+    private var pendingMarkdownOpenURLs: [URL] = []
+
+    /// Handles the open-document Apple Event — delivered when the app is
+    /// launched via `open -a Boss foo.md`, double-clicking a `.md` file
+    /// with Boss set as its handler, or Finder's "Open With ▸ Boss".
+    /// Routes every markdown URL through
+    /// [[ChatViewModel.openLocalMarkdownFile(url:)]], the same entry point
+    /// File ▸ Open (⌘O) uses, so both surfaces render in the same
+    /// design-renderer window. Passes `allowOSFallback: false` — an
+    /// event that arrived from LaunchServices must never be handed back
+    /// to `NSWorkspace.shared.open`.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let markdownURLs = urls.filter(Self.isMarkdownFile)
+        let rejectedURLs = urls.filter { !Self.isMarkdownFile($0) }
+        for url in rejectedURLs {
+            appOpenLog.notice("Ignoring non-markdown open-document URL: \(url.path, privacy: .public)")
+        }
+        guard !markdownURLs.isEmpty else { return }
+        guard let chatModel, chatModel.designRendererOpener != nil else {
+            pendingMarkdownOpenURLs.append(contentsOf: markdownURLs)
+            return
+        }
+        for url in markdownURLs {
+            chatModel.openLocalMarkdownFile(url: url, allowOSFallback: false)
+        }
+    }
+
+    private func flushPendingMarkdownOpens() {
+        guard let chatModel, chatModel.designRendererOpener != nil, !pendingMarkdownOpenURLs.isEmpty else { return }
+        let urls = pendingMarkdownOpenURLs
+        pendingMarkdownOpenURLs.removeAll()
+        for url in urls {
+            chatModel.openLocalMarkdownFile(url: url, allowOSFallback: false)
+        }
+    }
+
+    private static func isMarkdownFile(_ url: URL) -> Bool {
+        let markdownExtensions: Set<String> = ["md", "markdown", "mdown"]
+        if markdownExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+        guard let markdownType = UTType("net.daringfireball.markdown"),
+              let type = UTType(filenameExtension: url.pathExtension)
+        else { return false }
+        return type.conforms(to: markdownType)
+    }
 
     /// App Nap opt-out token (App Nap incident, 2026-07-15): held for the
     /// process lifetime so `ProcessInfo`/`NSApp` never throttles the main

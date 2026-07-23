@@ -23,5 +23,40 @@
     <string>15.0</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <!-- net.daringfireball.markdown is already a system-declared UTI on
+         macOS 15+ (imported by Notes/Xcode), but the *active* owner of
+         that declaration (Notes) only tags .md/.markdown — the
+         declaration that also tags .mdown belongs to Xcode and is
+         inactive per `lsregister -dump`. So LSItemContentTypes alone
+         does not cover .mdown. CFBundleTypeExtensions lists the
+         extensions explicitly so all three (md, markdown, mdown) are
+         claimed regardless of which UTI declaration wins arbitration.
+         Boss only renders markdown (Textual) and never writes back to
+         the file, so CFBundleTypeRole is Viewer. LSHandlerRank is
+         Alternate: Boss should be selectable from Finder's "Open With"
+         and settable as the user's default, but must not auto-claim
+         default status away from the user's existing markdown app on
+         install. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Markdown Document</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>net.daringfireball.markdown</string>
+            </array>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>md</string>
+                <string>markdown</string>
+                <string>mdown</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
