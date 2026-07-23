@@ -843,6 +843,14 @@ pub enum FrontendEvent {
         work_item_id: String,
         proposals: Vec<WorkerProposal>,
     },
+    /// Reply for [`FrontendRequest::GetWorkerContext`]: the sanitized
+    /// one-call bundle for the caller's own work item, resolved from its
+    /// attributed execution. Boxed: an inline `WorkerContextBundle` here
+    /// would make this variant far larger than its siblings
+    /// (clippy::large_enum_variant) — serializes identically.
+    WorkerContextResult {
+        bundle: Box<WorkerContextBundle>,
+    },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)

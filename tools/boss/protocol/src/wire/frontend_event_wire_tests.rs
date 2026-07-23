@@ -76,6 +76,22 @@ fn worker_proposal() -> WorkerProposal {
         .build()
 }
 
+fn worker_context_bundle() -> WorkerContextBundle {
+    WorkerContextBundle {
+        task: task(),
+        project: None,
+        product: product(),
+        sibling_tasks: vec![],
+        own_dependencies: WorkItemDependencyDetail {
+            work_item_id: "task_1".into(),
+            dependents: vec![],
+            prerequisites: vec![],
+        },
+        attention_groups: vec![],
+        proposals: vec![worker_proposal()],
+    }
+}
+
 fn work_execution() -> WorkExecution {
     WorkExecution::builder()
         .id("exec_1")
@@ -1169,6 +1185,13 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "proposals_list",
         },
         TagCase {
+            label: "WorkerContextResult",
+            event: FrontendEvent::WorkerContextResult {
+                bundle: Box::new(worker_context_bundle()),
+            },
+            expected_tag: "worker_context_result",
+        },
+        TagCase {
             label: "WorkerTierDenied",
             event: FrontendEvent::WorkerTierDenied {
                 denial: WorkerTierDenial::redirect(
@@ -1672,6 +1695,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProposalSubmitted { .. }
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }
+        | FrontendEvent::WorkerContextResult { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }

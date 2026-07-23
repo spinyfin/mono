@@ -24,6 +24,7 @@ use comfy_table::{Cell, ContentArrangement, Table};
 use serde::Serialize;
 
 mod buildkite_release;
+mod context;
 mod propose;
 mod repo_resolution;
 use boss_github as github_app;
@@ -212,6 +213,18 @@ enum Commands {
     ///
     /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
     Propose(propose::ProposeArgs),
+    /// Print the sanitized one-call context bundle for this worker
+    /// session: your own task + project + product, sibling tasks in the
+    /// project (with dependency edges), edges touching your own task,
+    /// open attention groups on your work item, and your work item's
+    /// proposals across executions with dispositions.
+    ///
+    /// Takes no arguments — your identity is resolved from the worker
+    /// session, the same way `boss propose --list` works. Pass the global
+    /// `--json` flag for machine-readable output.
+    ///
+    /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
+    Context,
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
@@ -3066,6 +3079,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Propose(args) => {
             let ctx = RunContext::from_flags(&cli.global)?;
             propose::run_propose_command(args, &ctx).await
+        }
+        Commands::Context => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            context::run_context_command(&ctx).await
         }
         Commands::Engine { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
