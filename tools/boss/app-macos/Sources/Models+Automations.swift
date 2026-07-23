@@ -102,7 +102,14 @@ struct AppAutomationRun: Identifiable, Hashable {
     var producedTaskID: String?
     var detail: String?
     /// How many consecutive same-outcome runs this row represents (engine-side
-    /// retry-chain collapsing). `1` for an ungrouped run.
+    /// collapsing). `1` for an ungrouped run.
+    ///
+    /// This counts **occurrences**, not attempts. `automation_runs` is keyed
+    /// `(automation_id, scheduled_for)`, so each collapsed row is one distinct
+    /// cron occurrence that happened to land on the same outcome as its
+    /// neighbours — an hourly automation showing 22 here means 22 separate
+    /// hours, each recorded once. Labelling it "retried 22x" claimed it was an
+    /// attempt counter for a single occurrence, which it never was.
     var repeatCount: Int = 1
 
     var outcomeLabel: String {
@@ -117,7 +124,7 @@ struct AppAutomationRun: Identifiable, Hashable {
         case "failed_gave_up": base = "Failed"
         default: base = outcome.replacingOccurrences(of: "_", with: " ").capitalized
         }
-        return repeatCount > 1 ? "\(base), retried \(repeatCount)x" : base
+        return repeatCount > 1 ? "\(base), \(repeatCount) occurrences" : base
     }
 }
 

@@ -544,20 +544,31 @@ impl WorkDb {
     }
 
     /// Return scheduling data for the automation scheduler's sleep computation:
-    /// the minimum `next_due_at` epoch across all enabled `schedule` automations
-    /// whose `next_due_at` has been initialized, and whether any enabled
-    /// `schedule` automations are still uninitialized (`next_due_at IS NULL`).
+    /// the minimum **future** `next_due_at` epoch (strictly after `now_epoch`)
+    /// across all enabled `schedule` automations whose `next_due_at` has been
+    /// initialized, and whether any enabled `schedule` automations are still
+    /// uninitialized (`next_due_at IS NULL`).
     ///
     /// Used by the scheduler after each pass to compute how long to sleep before
     /// the next evaluation: sleep until `min_next_due`, capped at a maximum,
     /// but use a short poll interval when uninitialized automations are present.
-    pub fn list_min_next_due_at_for_scheduler(&self) -> Result<(Option<i64>, bool)> {
+    ///
+    /// **Future-only is deliberate.** An occurrence still sitting at or before
+    /// `now_epoch` *after* a pass has just run is one the pass could not act on
+    /// — it is held for retry, or its cron/timezone is unparseable. Including it
+    /// here would pin the sleep to its floor of one second and spin the loop at
+    /// 1 Hz for as long as the blocker lasts (the paused-scheduler defect: ~0.96
+    /// passes/s and ~2.4 `automation_runs` write transactions/s, sustained for
+    /// the whole pause). The scheduler paces those cases explicitly instead, via
+    /// [`crate::automation_scheduler::AutomationSchedulerPass::wake_hint`].
+    pub fn list_min_future_next_due_at_for_scheduler(&self, now_epoch: i64) -> Result<(Option<i64>, bool)> {
         let conn = self.connect()?;
         let min_next_due: Option<i64> = conn.query_row(
             "SELECT MIN(CAST(next_due_at AS INTEGER))
                FROM automations
-              WHERE enabled = 1 AND trigger_kind = 'schedule' AND next_due_at IS NOT NULL",
-            [],
+              WHERE enabled = 1 AND trigger_kind = 'schedule' AND next_due_at IS NOT NULL
+                AND CAST(next_due_at AS INTEGER) > ?1",
+            [now_epoch],
             |row| row.get(0),
         )?;
         let uninitialized_count: i64 = conn.query_row(

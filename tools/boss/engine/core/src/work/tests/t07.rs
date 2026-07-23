@@ -1087,20 +1087,21 @@ fn list_due_automations_orders_by_created_at_ascending() {
     assert_eq!(order, vec![oldest, middle, newest], "sorted by created_at ASC");
 }
 
-/// `list_min_next_due_at_for_scheduler()` on an empty automation set returns
-/// `(None, false)`: no minimum, and no uninitialised rows.
+/// `list_min_future_next_due_at_for_scheduler()` on an empty automation set
+/// returns `(None, false)`: no minimum, and no uninitialised rows.
 #[test]
 fn list_min_next_due_returns_none_false_when_empty() {
     let db = WorkDb::open(temp_db_path("auto-min-empty")).unwrap();
-    let (min_next_due, has_uninitialized) = db.list_min_next_due_at_for_scheduler().unwrap();
+    let (min_next_due, has_uninitialized) = db.list_min_future_next_due_at_for_scheduler(0).unwrap();
     assert_eq!(min_next_due, None);
     assert!(!has_uninitialized);
 }
 
-/// `list_min_next_due_at_for_scheduler()` returns MIN(next_due_at) over enabled
-/// `schedule` rows with a non-NULL `next_due_at`, and `true` for the uninitialised
-/// flag when any enabled `schedule` row still has `next_due_at IS NULL`. Disabled
-/// and non-schedule rows are ignored for both the minimum and the flag.
+/// `list_min_future_next_due_at_for_scheduler()` returns MIN(next_due_at) over
+/// enabled `schedule` rows with a non-NULL `next_due_at`, and `true` for the
+/// uninitialised flag when any enabled `schedule` row still has `next_due_at
+/// IS NULL`. Disabled and non-schedule rows are ignored for both the minimum
+/// and the flag.
 #[test]
 fn list_min_next_due_computes_min_and_uninitialized_flag() {
     let db = WorkDb::open(temp_db_path("auto-min-flag")).unwrap();
@@ -1116,7 +1117,7 @@ fn list_min_next_due_computes_min_and_uninitialized_flag() {
     insert_raw_automation(&db, &product.id, false, "schedule", Some(100), "1700000004");
     insert_raw_automation(&db, &product.id, true, "manual", None, "1700000005");
 
-    let (min_next_due, has_uninitialized) = db.list_min_next_due_at_for_scheduler().unwrap();
+    let (min_next_due, has_uninitialized) = db.list_min_future_next_due_at_for_scheduler(0).unwrap();
     assert_eq!(min_next_due, Some(300), "MIN over enabled schedule initialised rows");
     assert!(has_uninitialized, "an enabled schedule row is still uninitialised");
 }
@@ -1133,9 +1134,34 @@ fn list_min_next_due_flag_false_when_all_schedule_rows_initialized() {
     insert_raw_automation(&db, &product.id, false, "schedule", None, "1700000002");
     insert_raw_automation(&db, &product.id, true, "manual", None, "1700000003");
 
-    let (min_next_due, has_uninitialized) = db.list_min_next_due_at_for_scheduler().unwrap();
+    let (min_next_due, has_uninitialized) = db.list_min_future_next_due_at_for_scheduler(0).unwrap();
     assert_eq!(min_next_due, Some(700));
     assert!(!has_uninitialized, "no enabled schedule row is uninitialised");
+}
+
+/// Occurrences at or before `now_epoch` are excluded from the minimum. This is
+/// what stops a held occurrence — whose `next_due_at` never advances out of the
+/// past — from pinning the scheduler's sleep to its one-second floor and
+/// spinning the loop at 1 Hz for the life of the blocker.
+#[test]
+fn list_min_next_due_excludes_occurrences_at_or_before_now() {
+    let db = WorkDb::open(temp_db_path("auto-min-future-only")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+
+    // 300 is held in the past, 900 is genuinely upcoming.
+    insert_raw_automation(&db, &product.id, true, "schedule", Some(300), "1700000001");
+    insert_raw_automation(&db, &product.id, true, "schedule", Some(900), "1700000002");
+
+    let (min_next_due, _) = db.list_min_future_next_due_at_for_scheduler(500).unwrap();
+    assert_eq!(min_next_due, Some(900), "a past-due occurrence must not set the sleep");
+
+    // Exactly-now is past too: the pass that just ran already saw it.
+    let (at_now, _) = db.list_min_future_next_due_at_for_scheduler(900).unwrap();
+    assert_eq!(at_now, None);
+
+    // With every occurrence still ahead, the earliest one wins as before.
+    let (all_future, _) = db.list_min_future_next_due_at_for_scheduler(100).unwrap();
+    assert_eq!(all_future, Some(300));
 }
 
 /// `initialize_automation_next_due_at` parks `next_due_at` without disturbing
