@@ -1100,6 +1100,43 @@ fn write_workspace_files_purges_leaked_in_tree_settings() {
     }
 }
 
+/// Workers must be told jj is the VCS, not git. A worker that reaches for raw
+/// `git` in a cube workspace hits a bare-repo surprise (there is no `.git/` at
+/// the workspace root), so the jj-first mandate is load-bearing rather than
+/// stylistic.
+#[test]
+fn claude_md_mandates_jj_first_vcs() {
+    let input = sample_input();
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("Use `jj` for all VCS"),
+        "CLAUDE.md must state the jj-first mandate; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("Do not invoke `git` directly"),
+        "CLAUDE.md must steer workers off raw git; got:\n{rendered}",
+    );
+}
+
+/// The sibling-workspace boundary is a containment property, not prose polish:
+/// every worker shares `~/Documents/dev/workspaces/` with other live workers,
+/// and an edit that strays outside this workspace corrupts someone else's
+/// in-flight task. The deny rules fence this at the permission layer; this
+/// assertion pins the matching instruction the worker actually reads.
+#[test]
+fn claude_md_forbids_touching_sibling_workspaces() {
+    let input = sample_input();
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("Do not modify files outside this workspace"),
+        "CLAUDE.md must fence workers into their own workspace; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("Sibling workspaces"),
+        "CLAUDE.md must call out sibling workspaces as off-limits; got:\n{rendered}",
+    );
+}
+
 #[test]
 fn claude_md_warns_against_force_tracking_dot_claude() {
     let input = sample_input();
