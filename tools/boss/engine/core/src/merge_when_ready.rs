@@ -16,16 +16,24 @@ use boss_github::gh_runner::pr_in_merge_queue;
 
 use boss_engine_gh_invocation::gh_output;
 
-/// Outcome of a successful [`gh_merge_when_ready`] call.
+/// Outcome of a successful merge-when-ready call, whichever mechanism
+/// produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeAction {
-    /// The PR was enqueued in the repository's merge queue.
+    /// The PR was enqueued in the repository's (GitHub-native) merge queue.
     Enqueued,
     /// Auto-merge was enabled; the PR will merge once required checks pass.
     AutoMergeEnabled,
     /// The PR was merged directly (all checks were already passing and no
     /// merge queue was configured for this PR).
     Merged,
+    /// The PR was submitted to a `trunk_queue`-mechanism product's Trunk
+    /// merge queue (`POST submitPullRequest`). Produced by
+    /// `app::review::handle_merge_when_ready`'s `MergeMechanism::TrunkQueue`
+    /// branch, not by [`gh_merge_when_ready`] — see
+    /// `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+    /// §"The merge verb: submit + standing merge intent".
+    TrunkEnqueued,
 }
 
 impl MergeAction {
@@ -36,6 +44,7 @@ impl MergeAction {
             Self::Enqueued => "enqueued",
             Self::AutoMergeEnabled => "auto_merge_enabled",
             Self::Merged => "merged",
+            Self::TrunkEnqueued => "trunk_enqueued",
         }
     }
 }
@@ -109,6 +118,11 @@ mod tests {
     #[test]
     fn merge_action_merged_as_str() {
         assert_eq!(MergeAction::Merged.as_str(), "merged");
+    }
+
+    #[test]
+    fn merge_action_trunk_enqueued_as_str() {
+        assert_eq!(MergeAction::TrunkEnqueued.as_str(), "trunk_enqueued");
     }
 
     // --- derive_action (mirrors the if/else in gh_merge_when_ready) ---

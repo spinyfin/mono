@@ -65,6 +65,7 @@ rust_library(
         "//tools/boss/log-files",
         "//tools/boss/protocol",
         "//tools/boss/trunk_auth",
+        "//tools/boss/trunk_client",
     ] + all_crate_deps(normal = True),
 )
 

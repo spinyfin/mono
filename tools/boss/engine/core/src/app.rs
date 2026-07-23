@@ -611,6 +611,13 @@ struct ServerState {
     /// (`boss engine trunk set-token` / `boss engine trunk status`). See
     /// the Trunk merge-queue integration design's "Auth" section.
     trunk_token_store: Arc<dyn trunk_auth::TrunkTokenSource>,
+    /// Typed client for Trunk's merge-queue REST API, built from the same
+    /// org API token as `trunk_token_store` (env override or OS keychain).
+    /// `handle_merge_when_ready` uses it to `submitPullRequest` for a
+    /// `trunk_queue`-mechanism product. Cheap to clone — see
+    /// `boss_trunk_client::TrunkClient`'s doc comment. See the Trunk
+    /// merge-queue integration design's "The merge verb" section.
+    trunk_client: boss_trunk_client::TrunkClient,
     /// Resolves credentials for external-tracker sync. Uses
     /// `KeychainOAuthResolver` in production so a stored OAuth token
     /// takes precedence over ambient `gh` auth.
@@ -653,21 +660,26 @@ struct ServerState {
 }
 
 impl ServerState {
-    /// Construct `ServerState` with optional `MergeProbe` and Trunk
-    /// token-store overrides. Production (via [`server::serve`]) passes
-    /// `None` for both and gets the real `CommandMergeProbe` (shell out to
-    /// `gh`) and `boss_trunk_auth::TrunkTokenStore` (OS keychain); tests
+    /// Construct `ServerState` with optional `MergeProbe`, Trunk
+    /// token-store, and Trunk client overrides. Production (via
+    /// [`server::serve`]) passes `None` for all three and gets the real
+    /// `CommandMergeProbe` (shell out to `gh`), `boss_trunk_auth::TrunkTokenStore`
+    /// (OS keychain), and a `TrunkClient` built from that same store; tests
     /// that need to exercise the CI-remediation validation gates (green /
-    /// pending / red) or the `TrunkSetToken`/`TrunkStatus` handlers without
-    /// a live `gh` call or the real OS keychain inject a fake for either —
-    /// see `MergeProbe`'s doc comment ("test doubles can stub it directly")
-    /// and `trunk_auth::TrunkTokenSource`.
+    /// pending / red), the `TrunkSetToken`/`TrunkStatus` handlers, or the
+    /// `trunk_queue` merge-when-ready path without a live `gh` call, the
+    /// real OS keychain, or a live Trunk API call inject a fake/mock for
+    /// any of the three — see `MergeProbe`'s doc comment ("test doubles can
+    /// stub it directly"), `trunk_auth::TrunkTokenSource`, and
+    /// `boss_trunk_client::TrunkClient::new` (point `CallConfig::base_url`
+    /// at a `wiremock::MockServer`).
     fn new_arc_with_app_pid_and_merge_probe(
         cfg: Arc<RuntimeConfig>,
         app_pid: Option<libc::pid_t>,
         control_token: Option<Arc<String>>,
         merge_probe_override: Option<Arc<dyn MergeProbe>>,
         trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
+        trunk_client_override: Option<boss_trunk_client::TrunkClient>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
@@ -875,6 +887,18 @@ impl ServerState {
         let trunk_token_store_for_state: Arc<dyn trunk_auth::TrunkTokenSource> =
             trunk_token_store_override.unwrap_or_else(|| Arc::new(boss_trunk_auth::TrunkTokenStore::new()));
 
+        // Trunk queue REST client. Production shares the same keychain-backed
+        // token store as `trunk_token_store` above (it implements
+        // `boss_trunk_client::TrunkTokenProvider` directly); tests point
+        // `trunk_client_override` at a `wiremock::MockServer` via
+        // `CallConfig::with_base_url`.
+        let trunk_client_for_state: boss_trunk_client::TrunkClient = trunk_client_override.unwrap_or_else(|| {
+            boss_trunk_client::TrunkClient::new(
+                Arc::new(boss_trunk_auth::TrunkTokenStore::new()),
+                boss_trunk_client::CallConfig::default(),
+            )
+        });
+
         let tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver> =
             Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
                 crate::external_tracker::github_oauth::KeychainTokenStore::new(),
@@ -1037,6 +1061,7 @@ impl ServerState {
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)
+                .trunk_client(trunk_client_for_state)
                 .tracker_credential_resolver(tracker_credential_resolver)
                 .maybe_control_token(control_token_for_state)
                 .shutdown_trigger(shutdown_trigger_for_state)

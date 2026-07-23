@@ -1007,6 +1007,40 @@ pub(crate) fn migrate_products_merge_mechanism(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+/// Create the `trunk_merge_intents` side table — one row per merge-button
+/// click on a `trunk_queue`-mechanism product's PR, tracking the Trunk
+/// queue submission through to a terminal state. The partial unique index
+/// on `(work_item_id) WHERE status = 'active'` is the duplicate-click dedup
+/// gate: [`crate::work::WorkDb::insert_trunk_merge_intent`] uses `INSERT OR
+/// IGNORE`, mirroring the `ci_remediations` idiom. See
+/// `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+/// §"The merge verb: submit + standing merge intent".
+pub(crate) fn migrate_trunk_merge_intents_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS trunk_merge_intents (
+             id                   TEXT PRIMARY KEY,
+             work_item_id         TEXT NOT NULL,
+             pr_url               TEXT NOT NULL,
+             pr_number            INTEGER NOT NULL,
+             repo                 TEXT NOT NULL,
+             target_branch        TEXT NOT NULL,
+             status               TEXT NOT NULL,
+             last_trunk_state     TEXT,
+             last_trunk_state_at  TEXT,
+             submit_count         INTEGER NOT NULL DEFAULT 1,
+             created_at           TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS trunk_merge_intents_active_work_item_idx
+             ON trunk_merge_intents(work_item_id)
+             WHERE status = 'active';
+         CREATE INDEX IF NOT EXISTS trunk_merge_intents_work_item_idx
+             ON trunk_merge_intents(work_item_id);
+         CREATE INDEX IF NOT EXISTS trunk_merge_intents_status_idx
+             ON trunk_merge_intents(status);",
+    )?;
+    Ok(())
+}
+
 /// Create the `metrics_counter` / `metrics_gauge` tables for the
 /// engine counter-metrics framework (phase 1). Idempotent — the
 /// framework upserts on every flush, so re-running the migration is

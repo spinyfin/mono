@@ -33,8 +33,10 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        let (pr_url, task_status) = match &item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => (task.pr_url.clone(), task.status.clone()),
+        let (pr_url, task_status, product_id) = match &item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => {
+                (task.pr_url.clone(), task.status.clone(), task.product_id.clone())
+            }
             _ => {
                 send_response(
                     &sink,
@@ -69,42 +71,220 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        // Spawn the GitHub interaction so the main loop isn't blocked.
-        let sink2 = sink.clone();
-        let request_id2 = request_id.clone();
-        let work_item_id2 = work_item_id.clone();
-        let pr_url2 = pr_url.clone();
-        let kick = server_state.pr_reconciler_kick.clone();
-        tokio::spawn(async move {
-            match merge_when_ready::gh_merge_when_ready(&pr_url2).await {
-                Ok(action) => {
-                    // Kick the PR reconciler so the kanban state
-                    // reflects the new merge-queue / auto-merge
-                    // state promptly without waiting for the next
-                    // periodic sweep.
-                    kick.notify_one();
-                    send_response(
-                        &sink2,
-                        &request_id2,
-                        FrontendEvent::MergeWhenReadyAccepted {
-                            work_item_id: work_item_id2,
-                            pr_url: pr_url2,
-                            action: action.as_str().to_owned(),
-                        },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink2,
-                        &request_id2,
-                        FrontendEvent::WorkError {
-                            message: format!("merge_when_ready failed: {err:#}"),
-                        },
-                    );
-                }
+        let product = match work_db.get_product(&product_id) {
+            Ok(Some(product)) => product,
+            Ok(None) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("merge_when_ready: unknown product: {product_id}"),
+                    },
+                );
+                return;
             }
-        });
+            Err(err) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("merge_when_ready: failed to load product: {err}"),
+                    },
+                );
+                return;
+            }
+        };
+        let mechanism = match crate::merge_mechanism::MergeMechanism::parse(product.merge_mechanism.as_deref()) {
+            Ok(mechanism) => mechanism,
+            Err(err) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("merge_when_ready: {err}"),
+                    },
+                );
+                return;
+            }
+        };
+        match mechanism {
+            crate::merge_mechanism::MergeMechanism::Direct => {
+                // Spawn the GitHub interaction so the main loop isn't blocked.
+                let sink2 = sink.clone();
+                let request_id2 = request_id.clone();
+                let work_item_id2 = work_item_id.clone();
+                let pr_url2 = pr_url.clone();
+                let kick = server_state.pr_reconciler_kick.clone();
+                tokio::spawn(async move {
+                    match merge_when_ready::gh_merge_when_ready(&pr_url2).await {
+                        Ok(action) => {
+                            // Kick the PR reconciler so the kanban state
+                            // reflects the new merge-queue / auto-merge
+                            // state promptly without waiting for the next
+                            // periodic sweep.
+                            kick.notify_one();
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::MergeWhenReadyAccepted {
+                                    work_item_id: work_item_id2,
+                                    pr_url: pr_url2,
+                                    action: action.as_str().to_owned(),
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::WorkError {
+                                    message: format!("merge_when_ready failed: {err:#}"),
+                                },
+                            );
+                        }
+                    }
+                });
+            }
+            crate::merge_mechanism::MergeMechanism::TrunkQueue { target_branch } => {
+                handle_trunk_queue_merge(
+                    server_state,
+                    work_db,
+                    sink,
+                    request_id,
+                    work_item_id,
+                    pr_url,
+                    target_branch,
+                )
+                .await;
+            }
+        }
     }
+}
+
+/// The `trunk_queue` branch of [`handle_merge_when_ready`]: submit the PR
+/// to the product's Trunk merge queue and record a standing merge intent.
+///
+/// See `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+/// §"The merge verb: submit + standing merge intent". No step here ever
+/// falls back to `gh pr merge` — a submission failure (including a
+/// missing/rejected Trunk API token) is a loud [`FrontendEvent::WorkError`]
+/// and the task stays exactly as it was.
+async fn handle_trunk_queue_merge(
+    server_state: Arc<ServerState>,
+    work_db: Arc<WorkDb>,
+    sink: Arc<SessionSink>,
+    request_id: String,
+    work_item_id: String,
+    pr_url: String,
+    target_branch: String,
+) {
+    let coords = match crate::trunk_merge::parse_trunk_pr_coordinates(&pr_url) {
+        Ok(coords) => coords,
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("merge_when_ready: {err}"),
+                },
+            );
+            return;
+        }
+    };
+    let insert_input = crate::work::TrunkMergeIntentInsertInput::builder()
+        .work_item_id(work_item_id.clone())
+        .pr_url(pr_url.clone())
+        .pr_number(coords.number as i64)
+        .repo(format!("{}/{}", coords.owner, coords.repo))
+        .target_branch(target_branch.clone())
+        .build();
+    let intent = match work_db.insert_trunk_merge_intent(insert_input) {
+        Ok(Some(intent)) => intent,
+        Ok(None) => {
+            // Duplicate click: an intent is already active for this work
+            // item. No-op — re-report success without re-submitting to
+            // Trunk (design: "a second merge click on an already-active
+            // intent is a no-op that re-reports current queue state").
+            server_state.pr_reconciler_kick.notify_one();
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::MergeWhenReadyAccepted {
+                    work_item_id,
+                    pr_url,
+                    action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
+                },
+            );
+            return;
+        }
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("merge_when_ready: failed to record trunk merge intent: {err}"),
+                },
+            );
+            return;
+        }
+    };
+
+    let trunk_client = server_state.trunk_client.clone();
+    let kick = server_state.pr_reconciler_kick.clone();
+    tokio::spawn(async move {
+        let request = boss_trunk_client::SubmitPullRequestRequest::builder()
+            .repo(boss_trunk_client::TrunkRepoRef::new(
+                "github.com",
+                coords.owner,
+                coords.repo,
+            ))
+            .pr(boss_trunk_client::TrunkPrRef::new(coords.number))
+            .target_branch(target_branch)
+            .build();
+        match trunk_client.submit_pull_request(&request).await {
+            Ok(()) => {
+                // Optimistically move the card into the Merging UI ahead of
+                // the queue poller's first sweep.
+                let detail = serde_json::json!({"source": "trunk", "state": "pending"}).to_string();
+                if let Err(err) = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail)) {
+                    tracing::error!(
+                        %work_item_id,
+                        ?err,
+                        "merge_when_ready: trunk submit succeeded but optimistic merge_queue_state write failed",
+                    );
+                }
+                kick.notify_one();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::MergeWhenReadyAccepted {
+                        work_item_id,
+                        pr_url,
+                        action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
+                    },
+                );
+            }
+            Err(err) => {
+                // Loud, no fallback to `gh pr merge`: no intent row
+                // survives a failed submission.
+                if let Err(del_err) = work_db.delete_trunk_merge_intent(&intent.id) {
+                    tracing::error!(
+                        %work_item_id,
+                        intent_id = %intent.id,
+                        ?del_err,
+                        "merge_when_ready: failed to roll back trunk merge intent after a failed submit",
+                    );
+                }
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("merge_when_ready: trunk queue submission failed for {pr_url}: {err}"),
+                    },
+                );
+            }
+        }
+    });
 }
 
 pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequest) {
@@ -404,5 +584,243 @@ pub(super) async fn handle_trigger_pr_review(ctx: Dispatch, req: FrontendRequest
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod trunk_queue_tests {
+    use std::time::Duration;
+
+    use boss_trunk_client::{CallConfig, StaticTokenProvider, TrunkClient};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::test_support::{create_test_chore_manual, create_test_product_with_repo};
+    use crate::work::WorkItemPatch;
+
+    fn test_server_state(trunk_client: TrunkClient) -> (Arc<ServerState>, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(temp.path().to_path_buf())
+                .db_path(temp.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        let state =
+            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, Some(trunk_client)).unwrap();
+        (state, temp)
+    }
+
+    fn dispatch_ctx(server_state: &Arc<ServerState>, sink: &Arc<SessionSink>) -> Dispatch {
+        Dispatch::builder()
+            .server_state(server_state.clone())
+            .work_db(server_state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("s1")
+            .request_id("req-1")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build()
+    }
+
+    fn make_session_sink() -> Arc<SessionSink> {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        Arc::new(SessionSink::new(shutdown_tx))
+    }
+
+    fn trunk_client_for(base_url: String) -> TrunkClient {
+        TrunkClient::new(
+            Arc::new(StaticTokenProvider::new("test-token")),
+            CallConfig::new(Duration::from_secs(5)).with_base_url(base_url),
+        )
+    }
+
+    /// Seed a `trunk_queue`-mechanism product and an `in_review` chore with
+    /// `pr_url` bound to it — the state `handle_merge_when_ready` requires
+    /// before it will route through the Trunk submission branch. Returns
+    /// `(product_id, work_item_id)`.
+    fn seed_trunk_queue_chore(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
+        let product = create_test_product_with_repo(db, name, Some("git@github.com:brianduff/flunge.git"));
+        db.set_product_merge_mechanism(&product.id, Some("trunk_queue"))
+            .unwrap();
+        let chore = create_test_chore_manual(db, product.id.clone(), name);
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        (product.id, chore.id)
+    }
+
+    #[tokio::test]
+    async fn trunk_queue_merge_submits_and_marks_task_queued() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let (_product_id, work_item_id) = seed_trunk_queue_chore(
+            &state.work_db,
+            "trunk-chore",
+            "https://github.com/brianduff/flunge/pull/978",
+        );
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, pr_url, .. } => {
+                assert_eq!(action, "trunk_enqueued");
+                assert_eq!(pr_url, "https://github.com/brianduff/flunge/pull/978");
+            }
+            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
+        }
+
+        let intent = state
+            .work_db
+            .get_active_trunk_merge_intent(&work_item_id)
+            .unwrap()
+            .expect("an active trunk merge intent should exist");
+        assert_eq!(intent.repo, "brianduff/flunge");
+        assert_eq!(intent.pr_number, 978);
+        assert_eq!(intent.submit_count, 1);
+        assert_eq!(intent.status, "active");
+
+        let item = state.work_db.get_work_item(&work_item_id).unwrap();
+        let WorkItem::Chore(task) = item else {
+            panic!("expected a chore");
+        };
+        assert_eq!(task.merge_queue_state.as_deref(), Some("queued"));
+        assert!(
+            task.merge_queue_detail.as_deref().unwrap_or("").contains("trunk"),
+            "expected merge_queue_detail to carry source=trunk, got: {:?}",
+            task.merge_queue_detail
+        );
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn trunk_queue_merge_duplicate_click_is_a_no_op() {
+        let server = MockServer::start().await;
+        // `.expect(1)`: a second merge click must NOT re-submit — verified by
+        // `server.verify()` failing if `submitPullRequest` is called twice.
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let (_product_id, work_item_id) = seed_trunk_queue_chore(
+            &state.work_db,
+            "trunk-chore-dup",
+            "https://github.com/brianduff/flunge/pull/979",
+        );
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+        let first = sink.next().await.expect("first response");
+        assert!(matches!(first.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+        let second = sink.next().await.expect("second response");
+        match second.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "trunk_enqueued"),
+            other => panic!("expected a no-op MergeWhenReadyAccepted, got {other:?}"),
+        }
+
+        // Still exactly one intent row, unincremented — the duplicate click
+        // did not insert a second row or re-submit.
+        let intent = state
+            .work_db
+            .get_active_trunk_merge_intent(&work_item_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.submit_count, 1);
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn trunk_queue_merge_auth_failure_is_loud_with_no_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad token"))
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let (_product_id, work_item_id) = seed_trunk_queue_chore(
+            &state.work_db,
+            "trunk-chore-auth",
+            "https://github.com/brianduff/flunge/pull/980",
+        );
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("trunk"),
+                    "expected a trunk-specific error, got: {message}"
+                );
+            }
+            other => panic!("expected WorkError, got {other:?}"),
+        }
+
+        // No intent row survives a failed submission — the loud-failure path
+        // never falls back to `gh pr merge` and leaves no dangling state.
+        assert!(
+            state
+                .work_db
+                .get_active_trunk_merge_intent(&work_item_id)
+                .unwrap()
+                .is_none()
+        );
+        let item = state.work_db.get_work_item(&work_item_id).unwrap();
+        let WorkItem::Chore(task) = item else {
+            panic!("expected a chore");
+        };
+        assert_eq!(task.merge_queue_state, None);
     }
 }
