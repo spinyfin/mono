@@ -115,8 +115,9 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let work_item_id2 = work_item_id.clone();
                 let pr_url2 = pr_url.clone();
                 let kick = server_state.pr_reconciler_kick.clone();
+                let direct_merge_executor = server_state.direct_merge_executor.clone();
                 tokio::spawn(async move {
-                    match merge_when_ready::gh_merge_when_ready(&pr_url2).await {
+                    match direct_merge_executor.execute(&pr_url2).await {
                         Ok(action) => {
                             // Kick the PR reconciler so the kanban state
                             // reflects the new merge-queue / auto-merge
@@ -151,14 +152,27 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                     work_db,
                     sink,
                     request_id,
-                    work_item_id,
-                    pr_url,
-                    target_branch,
+                    TrunkQueueMergeRequest {
+                        product_id,
+                        work_item_id,
+                        pr_url,
+                        target_branch,
+                    },
                 )
                 .await;
             }
         }
     }
+}
+
+/// Bundles the per-call arguments [`handle_trunk_queue_merge`] needs beyond
+/// its shared server/session handles — kept as a single struct so adding a
+/// field there doesn't grow the function's argument list.
+struct TrunkQueueMergeRequest {
+    product_id: String,
+    work_item_id: String,
+    pr_url: String,
+    target_branch: String,
 }
 
 /// The `trunk_queue` branch of [`handle_merge_when_ready`]: submit the PR
@@ -174,10 +188,14 @@ async fn handle_trunk_queue_merge(
     work_db: Arc<WorkDb>,
     sink: Arc<SessionSink>,
     request_id: String,
-    work_item_id: String,
-    pr_url: String,
-    target_branch: String,
+    req: TrunkQueueMergeRequest,
 ) {
+    let TrunkQueueMergeRequest {
+        product_id,
+        work_item_id,
+        pr_url,
+        target_branch,
+    } = req;
     let coords = match crate::trunk_merge::parse_trunk_pr_coordinates(&pr_url) {
         Ok(coords) => coords,
         Err(err) => {
@@ -278,6 +296,7 @@ async fn handle_trunk_queue_merge(
     };
 
     let trunk_client = server_state.trunk_client.clone();
+    let publisher = server_state.publisher.clone();
     tokio::spawn(async move {
         let request = boss_trunk_client::SubmitPullRequestRequest::builder()
             .repo(boss_trunk_client::TrunkRepoRef::new(
@@ -292,14 +311,16 @@ async fn handle_trunk_queue_merge(
             Ok(()) => {
                 // Optimistically move the card into the Merging UI ahead of
                 // the queue poller's first sweep. Deliberately does NOT kick
-                // `pr_reconciler_kick`: that wakes the GitHub merge poller,
-                // which for a trunk_queue product always observes
-                // in_merge_queue=false / auto_merge_enabled=false and would
-                // immediately clobber this write back to NULL — see
+                // `pr_reconciler_kick`: that wakes the GitHub merge poller to
+                // refresh GitHub-native auto-merge / merge-queue state,
+                // which never applies to a trunk_queue product, so it would
+                // do nothing useful here (and
                 // `merge_poller::update_pr_poll_state`'s
-                // `preserve_merge_queue_state` gate, which is what actually
-                // protects this write once the poller does run on its own
-                // schedule.
+                // `preserve_merge_queue_state` gate is what keeps the
+                // poller's own scheduled sweeps off these two columns).
+                // The app is push-only, so the optimistic write needs its
+                // own `work_item_changed` publish to reach the Merging UI —
+                // nothing else emits one for this write.
                 let detail = serde_json::json!({"source": "trunk", "state": "pending"}).to_string();
                 if let Err(err) = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail)) {
                     tracing::error!(
@@ -307,6 +328,10 @@ async fn handle_trunk_queue_merge(
                         ?err,
                         "merge_when_ready: trunk submit succeeded but optimistic merge_queue_state write failed",
                     );
+                } else {
+                    publisher
+                        .publish_work_item_changed(&product_id, &work_item_id, "trunk_merge_submitted")
+                        .await;
                 }
                 send_response(
                     &sink,
@@ -654,6 +679,17 @@ mod trunk_queue_tests {
     use crate::work::WorkItemPatch;
 
     fn test_server_state(trunk_client: TrunkClient) -> (Arc<ServerState>, tempfile::TempDir) {
+        test_server_state_with_direct_executor(trunk_client, None)
+    }
+
+    /// Like [`test_server_state`], but also lets the caller inject a fake
+    /// [`crate::merge_when_ready::DirectMergeExecutor`] — used by the
+    /// Direct-branch routing tests so they never shell out to a real `gh`
+    /// process.
+    fn test_server_state_with_direct_executor(
+        trunk_client: TrunkClient,
+        direct_merge_executor: Option<Arc<dyn crate::merge_when_ready::DirectMergeExecutor>>,
+    ) -> (Arc<ServerState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let cfg = Arc::new(RuntimeConfig::from_parts(
             crate::config::WorkConfig::builder()
@@ -662,8 +698,16 @@ mod trunk_queue_tests {
                 .build(),
             None,
         ));
-        let state =
-            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, Some(trunk_client)).unwrap();
+        let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            Some(trunk_client),
+            direct_merge_executor,
+        )
+        .unwrap();
         (state, temp)
     }
 
@@ -723,12 +767,24 @@ mod trunk_queue_tests {
             .await;
 
         let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
-        let (_product_id, work_item_id) = seed_trunk_queue_chore(
+        let (product_id, work_item_id) = seed_trunk_queue_chore(
             &state.work_db,
             "trunk-chore",
             "https://github.com/brianduff/flunge/pull/978",
         );
         let sink = make_session_sink();
+
+        // Register + subscribe this session on the work item's product
+        // topic so we can assert the optimistic `merge_queue_state="queued"`
+        // write actually reaches the (push-only) app as a
+        // `work_item_changed`/`WorkInvalidated` event, not just a DB row —
+        // see the doc comment on the `publisher.publish_work_item_changed`
+        // call in `handle_trunk_queue_merge`.
+        state.topic_broker.register_session("s1", sink.clone()).await;
+        state
+            .topic_broker
+            .subscribe("s1", &[crate::protocol::work_product_topic(&product_id)])
+            .await;
 
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
@@ -737,6 +793,20 @@ mod trunk_queue_tests {
             },
         )
         .await;
+
+        // The topic push is enqueued (and awaited) before the RPC response
+        // in `handle_trunk_queue_merge`, so it arrives first.
+        let invalidation = sink.next().await.expect("a work-item-changed push should be enqueued");
+        match invalidation.payload {
+            FrontendEvent::TopicEvent {
+                event: crate::protocol::TopicEventPayload::WorkInvalidated { reason, item_ids, .. },
+                ..
+            } => {
+                assert_eq!(reason, "trunk_merge_submitted");
+                assert_eq!(item_ids, vec![work_item_id.clone()]);
+            }
+            other => panic!("expected a WorkInvalidated topic push naming the work item, got {other:?}"),
+        }
 
         let envelope = sink.next().await.expect("a response should be enqueued");
         match envelope.payload {
@@ -854,11 +924,10 @@ mod trunk_queue_tests {
         let envelope = sink.next().await.expect("a response should be enqueued");
         match envelope.payload {
             FrontendEvent::WorkError { message } => {
-                // Tightened from a bare `.contains("trunk")` (which the
-                // wrapper string `"trunk queue submission failed for ..."`
-                // would satisfy for ANY `TrunkError` variant, not just an
-                // auth failure) to pin the actual 401 -> TrunkError::Auth
-                // mapping via its `Display` text.
+                // Matches `TrunkError::Auth`'s `Display` text rather than
+                // the handler's `"trunk queue submission failed for ..."`
+                // wrapper, which every `TrunkError` variant shares — this
+                // pins the 401 -> `TrunkError::Auth` mapping specifically.
                 assert!(
                     message.contains("trunk authentication failed"),
                     "expected the 401 to map to TrunkError::Auth, got: {message}"
@@ -948,10 +1017,30 @@ mod trunk_queue_tests {
         server.verify().await;
     }
 
+    /// [`crate::merge_when_ready::DirectMergeExecutor`] fake for the
+    /// Direct-branch routing tests below — records the PR URLs it was
+    /// invoked with instead of shelling out to a real `gh` process, so
+    /// these tests can pin the routing decision without any risk of
+    /// issuing a live, mutating `gh pr merge` call.
+    #[derive(Default)]
+    struct FakeDirectMergeExecutor {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::merge_when_ready::DirectMergeExecutor for FakeDirectMergeExecutor {
+        async fn execute(&self, pr_url: &str) -> anyhow::Result<crate::merge_when_ready::MergeAction> {
+            self.calls.lock().unwrap().push(pr_url.to_owned());
+            Ok(crate::merge_when_ready::MergeAction::Merged)
+        }
+    }
+
     /// A product with `merge_mechanism` `NULL` still routes through the
     /// `gh pr merge` (Direct) path: no trunk merge intent is created and
     /// the Trunk server is never contacted, even though the new
-    /// product/mechanism preflight runs ahead of the Direct branch.
+    /// product/mechanism preflight runs ahead of the Direct branch. The
+    /// Direct executor is a fake (see [`FakeDirectMergeExecutor`]) so this
+    /// never shells out to a real `gh` process.
     #[tokio::test]
     async fn merge_mechanism_null_still_routes_direct() {
         let server = MockServer::start().await;
@@ -962,7 +1051,9 @@ mod trunk_queue_tests {
             .mount(&server)
             .await;
 
-        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::default());
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
         let product = create_test_product_with_repo(
             &state.work_db,
             "direct-null-product",
@@ -990,6 +1081,17 @@ mod trunk_queue_tests {
         )
         .await;
 
+        // Wait for the spawned Direct-branch task to complete before
+        // asserting on the fake — `handle_merge_when_ready` fires it via
+        // `tokio::spawn` and replies once it resolves.
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        assert!(matches!(envelope.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+        assert_eq!(
+            direct_executor.calls.lock().unwrap().as_slice(),
+            ["https://github.com/brianduff/flunge/pull/990"],
+            "a NULL-mechanism product must route through the Direct executor"
+        );
+
         assert!(
             state
                 .work_db
@@ -1003,7 +1105,8 @@ mod trunk_queue_tests {
 
     /// A product with `merge_mechanism` explicitly `"direct"` also routes
     /// through the Direct path — mirrors the NULL case above, pinning that
-    /// the explicit value behaves identically.
+    /// the explicit value behaves identically. Also uses the fake Direct
+    /// executor, never a real `gh` process.
     #[tokio::test]
     async fn merge_mechanism_explicit_direct_still_routes_direct() {
         let server = MockServer::start().await;
@@ -1014,7 +1117,9 @@ mod trunk_queue_tests {
             .mount(&server)
             .await;
 
-        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::default());
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
         let product = create_test_product_with_repo(
             &state.work_db,
             "direct-explicit-product",
@@ -1045,6 +1150,14 @@ mod trunk_queue_tests {
             },
         )
         .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        assert!(matches!(envelope.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+        assert_eq!(
+            direct_executor.calls.lock().unwrap().as_slice(),
+            ["https://github.com/brianduff/flunge/pull/991"],
+            "an explicit direct-mechanism product must route through the Direct executor"
+        );
 
         assert!(
             state

@@ -388,6 +388,13 @@ struct ServerState {
     /// without shelling out to `gh`. Defaults to `CommandMergeProbe::new()`
     /// in production (see [`Self::new_arc_with_app_pid_and_merge_probe`]).
     merge_probe: Arc<dyn MergeProbe>,
+    /// Executes the Direct merge-mechanism side effect (`gh pr merge --auto
+    /// --squash`) for `handle_merge_when_ready`'s `MergeMechanism::Direct`
+    /// branch. Defaults to `CommandDirectMergeExecutor` in production (see
+    /// [`Self::new_arc_with_app_pid_and_merge_probe`]); tests inject a fake
+    /// so exercising the Direct routing decision never shells out to a real
+    /// `gh` process.
+    direct_merge_executor: Arc<dyn merge_when_ready::DirectMergeExecutor>,
     /// Shared dispatch-event sink. The execution coordinator emits
     /// the per-stage events into this sink during dispatch; the
     /// `UpdateWorkItem` handler emits a `StatusTransition` event
@@ -680,6 +687,7 @@ impl ServerState {
         merge_probe_override: Option<Arc<dyn MergeProbe>>,
         trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
         trunk_client_override: Option<boss_trunk_client::TrunkClient>,
+        direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
@@ -911,6 +919,8 @@ impl ServerState {
             ));
         let ci_probe: Arc<dyn MergeProbe> = merge_probe_override.unwrap_or_else(|| Arc::new(CommandMergeProbe::new()));
         let merge_probe_for_state = ci_probe.clone();
+        let direct_merge_executor_for_state: Arc<dyn merge_when_ready::DirectMergeExecutor> =
+            direct_merge_executor_override.unwrap_or_else(|| Arc::new(merge_when_ready::CommandDirectMergeExecutor));
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -1024,6 +1034,7 @@ impl ServerState {
                 .cube_client(cube_client_for_state)
                 .publisher(publisher_for_state)
                 .merge_probe(merge_probe_for_state)
+                .direct_merge_executor(direct_merge_executor_for_state)
                 .dispatch_events(dispatch_events_for_state)
                 .dispatch_event_root(dispatch_event_root_for_state)
                 .topic_broker(topic_broker)

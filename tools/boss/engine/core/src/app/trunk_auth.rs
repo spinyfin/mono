@@ -176,7 +176,7 @@ mod tests {
             None,
         ));
         let state =
-            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, Some(store), None).unwrap();
+            ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, Some(store), None, None).unwrap();
         (state, temp)
     }
 

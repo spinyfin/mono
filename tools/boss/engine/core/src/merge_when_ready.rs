@@ -11,6 +11,7 @@
 //! status label (`enqueued` / `merged` / `auto_merge_enabled`).
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 
 use boss_github::gh_runner::pr_in_merge_queue;
 
@@ -85,6 +86,32 @@ pub(crate) fn derive_action(is_in_queue: bool, is_merged: bool) -> MergeAction {
         MergeAction::Merged
     } else {
         MergeAction::AutoMergeEnabled
+    }
+}
+
+/// Executes the Direct merge-mechanism side effect (`gh pr merge --auto
+/// --squash`, via [`gh_merge_when_ready`]) for a PR. `app::review`'s
+/// `handle_merge_when_ready` calls this instead of the free function
+/// directly so test doubles can stub the live `gh` call — see
+/// `CommandDirectMergeExecutor` for the production impl and
+/// `app::review`'s `trunk_queue_tests` for a fake used by the Direct-branch
+/// routing tests.
+#[async_trait]
+pub trait DirectMergeExecutor: Send + Sync {
+    async fn execute(&self, pr_url: &str) -> Result<MergeAction>;
+}
+
+/// `DirectMergeExecutor` that shells out to `gh pr merge --auto --squash`
+/// via [`gh_merge_when_ready`]. The production default everywhere except
+/// tests that inject a fake through `ServerState`'s
+/// `direct_merge_executor_override`.
+#[derive(Debug, Default)]
+pub struct CommandDirectMergeExecutor;
+
+#[async_trait]
+impl DirectMergeExecutor for CommandDirectMergeExecutor {
+    async fn execute(&self, pr_url: &str) -> Result<MergeAction> {
+        gh_merge_when_ready(pr_url).await
     }
 }
 
