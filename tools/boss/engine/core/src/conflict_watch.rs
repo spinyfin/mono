@@ -125,6 +125,15 @@ pub async fn on_conflict_detected(
     if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
         return false;
     }
+    // Trunk merge-queue coordination (design §"Coordination with
+    // conflict_watch / ci_watch"): a conflict detected while a Trunk merge
+    // intent is still live in the queue is real — Trunk will fail it too —
+    // so the conflict resolver takes over the slot. Best-effort and
+    // idempotent (a no-op for a non-`trunk_queue` product, or an intent
+    // that's already evicted/superseded/awaiting resubmit); runs
+    // unconditionally ahead of every early-return branch below so a
+    // repeated detection on the same live intent still gets recorded.
+    crate::trunk_merge::mark_trunk_intent_superseded_by_conflict(work_db, &candidate.work_item_id);
     // Q7: when `auto-rebase-stacked-prs` is already chasing this PR,
     // step aside. Auto-rebase escalation owns the slot until it
     // hits a terminal status; the next conflict-watch sweep will
@@ -1302,6 +1311,12 @@ pub async fn on_resolved(
             )
             .await;
     }
+    // GitHub reporting the PR mergeable again is a trustworthy signal here
+    // (unlike a bare CI-clean probe for a queue-side CI failure) — mergeable
+    // genuinely reflects the rebase the conflict-resolution revision just
+    // pushed. If a Trunk merge intent was superseded by this conflict, it's
+    // now clear to resubmit.
+    crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(work_db, &candidate.work_item_id);
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,

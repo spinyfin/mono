@@ -47,7 +47,7 @@ use crate::merge_poller::{
 };
 use crate::work::{
     CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
-    StrandedCiRemediationAttempt, WorkDb,
+    StrandedCiRemediationAttempt, TaskStatus, WorkDb, WorkItem,
 };
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
@@ -1011,6 +1011,9 @@ async fn on_queue_side_failure_detected(
                 // failing SHA is a synthetic/ephemeral commit, not the PR
                 // head); pass an empty slice so the body omits the list.
                 emit_exhausted_attention(work_db, publisher, candidate, used, budget, &[]).await;
+                if failure_kind == "trunk_queue_eviction" {
+                    retire_exhausted_trunk_intent(work_db, publisher, candidate).await;
+                }
                 tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
@@ -1216,6 +1219,61 @@ async fn on_queue_side_failure_detected(
         true
     } else {
         false
+    }
+}
+
+/// Retire a `trunk_queue_eviction` episode's Trunk merge intent to
+/// `exhausted` once the shared CI-attempt budget runs out, and clear the
+/// Merging-lane columns so the card doesn't sit showing a stale "queued"
+/// badge while the parent is `blocked: ci_failure_exhausted` (design
+/// §"Failure surfacing": "the card leaves Merging, snaps back to Review").
+/// Best-effort and silent on a missing intent — a `merge_queue_rebounce`
+/// (GitHub-native) episode has no intent row to retire, and callers already
+/// gate this on `failure_kind == "trunk_queue_eviction"`.
+async fn retire_exhausted_trunk_intent(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+) {
+    let intent = match work_db.get_active_trunk_merge_intent(&candidate.work_item_id) {
+        Ok(Some(intent)) => intent,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "ci_watch: failed to look up active trunk merge intent for budget exhaustion",
+            );
+            return;
+        }
+    };
+    if let Err(err) = work_db.retire_trunk_merge_intent(&intent.id, "exhausted") {
+        tracing::warn!(
+            intent_id = %intent.id,
+            work_item_id = %candidate.work_item_id,
+            ?err,
+            "ci_watch: failed to retire trunk merge intent after budget exhaustion",
+        );
+        return;
+    }
+    match work_db.set_task_merge_queue_state(&candidate.work_item_id, None, None) {
+        Ok(true) => {
+            publisher
+                .publish_work_item_changed(
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    "trunk_queue_intent_exhausted",
+                )
+                .await;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "ci_watch: failed to clear merge-queue columns after budget exhaustion",
+            );
+        }
     }
 }
 
@@ -1663,23 +1721,46 @@ pub async fn on_ci_resolved(
     };
 
     // A queue-side failure (merge-queue rebounce or a Trunk queue eviction)
-    // must not be cleared by a clean head-branch CI probe. The PR's own CI
-    // is always green in this case — the failure is on a synthetic/
-    // ephemeral commit the queue assembled, not on the PR's head ref.
-    // Clearing here would immediately undo detection and create a
+    // must not be cleared by a bare clean head-branch CI probe. The PR's own
+    // CI is always green in this case — the failure is on a synthetic/
+    // ephemeral commit the queue assembled, not on the PR's head ref — so a
+    // naive `ci_clean` gate would immediately undo detection and create a
     // flip-flop loop where every sweep detects the failure and the next
-    // probe clears it. The block is released only when the ci_remediation
-    // worker marks the attempt succeeded (at which point
-    // `active_ci_remediation_for_work_item` returns None and this guard
-    // doesn't fire).
-    if is_queue_side_failure_kind(attempt.as_ref().and_then(|a| a.failure_kind.as_deref())) {
-        tracing::debug!(
-            work_item_id = %candidate.work_item_id,
-            pr_url = %candidate.pr_url,
-            "ci_watch: skipping on_ci_resolved — active queue-side-failure attempt; \
-             head-branch CI clean is not the clearing signal for queue failures",
-        );
-        return false;
+    // probe clears it.
+    //
+    // `trunk_queue_eviction` is the one exception, and only once its fix has
+    // genuinely landed: Trunk has no automatic retry, so Boss must
+    // auto-resubmit once the spawned revision reaches `done` — see
+    // `trunk_merge::mark_trunk_intent_awaiting_resubmit`, which the fall-
+    // through below calls. Gating on `done` (not merely on this sweep's
+    // `ci_clean`) is what prevents the flip-flop: right after eviction
+    // detection the revision is freshly spawned and not yet `done`, so this
+    // check fails until the revision's own push-and-review cycle actually
+    // concludes. `merge_queue_rebounce` (GitHub-native) has no such hook —
+    // GitHub's own queue automatically re-tries an evicted-but-still-armed
+    // PR once its checks pass again, so the block there stays released only
+    // when the ci_remediation worker marks the attempt succeeded (at which
+    // point `active_ci_remediation_for_work_item` returns None and this
+    // guard doesn't fire).
+    let failure_kind = attempt.as_ref().and_then(|a| a.failure_kind.as_deref());
+    let is_trunk_eviction = failure_kind == Some("trunk_queue_eviction");
+    if is_queue_side_failure_kind(failure_kind) {
+        let revision_landed = is_trunk_eviction
+            && attempt
+                .as_ref()
+                .and_then(|a| a.revision_task_id.as_deref())
+                .and_then(|id| work_db.get_work_item(id).ok())
+                .is_some_and(|item| matches!(item, WorkItem::Task(t) if t.status == TaskStatus::Done));
+        if !revision_landed {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                is_trunk_eviction,
+                "ci_watch: skipping on_ci_resolved — active queue-side-failure attempt; \
+                 head-branch CI clean is not the clearing signal for queue failures",
+            );
+            return false;
+        }
     }
 
     let task_result = work_db.clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url);
@@ -1842,6 +1923,12 @@ pub async fn on_ci_resolved(
         if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
             tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used after revision retire");
         }
+    }
+    if is_trunk_eviction && attempt_transitioned {
+        // The fix landed and this attempt just retired — tell the
+        // TrunkQueueProbe it's clear to resubmit (design §"Eviction: a
+        // first-class failure signal", step 4).
+        crate::trunk_merge::mark_trunk_intent_awaiting_resubmit(work_db, &candidate.work_item_id);
     }
     tracing::info!(
         work_item_id = %candidate.work_item_id,

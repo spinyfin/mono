@@ -201,6 +201,28 @@ impl WorkDb {
         Ok(changed > 0)
     }
 
+    /// Record a Boss-driven resubmit: bump `submit_count` and clear
+    /// `last_trunk_state`/`last_trunk_state_at` back to their pre-observation
+    /// state, so the next `getQueue` probe treats the entry as freshly
+    /// enqueued rather than still carrying the sentinel
+    /// (`trunk_queue_poller::TRUNK_INTENT_AWAITING_RESUBMIT`) or terminal
+    /// (`failed`/`pending_failure`) state that triggered the resubmit.
+    /// Only ever touches an `active` row — mirrors
+    /// [`Self::record_trunk_merge_intent_state`]'s guard.
+    pub fn record_trunk_merge_intent_resubmit(&self, id: &str) -> Result<Option<TrunkMergeIntent>> {
+        let conn = self.connect()?;
+        let rows = conn.execute(
+            "UPDATE trunk_merge_intents
+             SET submit_count = submit_count + 1, last_trunk_state = NULL, last_trunk_state_at = NULL
+             WHERE id = ?1 AND status = 'active'",
+            params![id],
+        )?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        query_trunk_merge_intent(&conn, id)
+    }
+
     /// Retire an intent into a terminal `status` (`merged` | `cancelled` |
     /// `exhausted`), freeing the `(work_item_id) WHERE status = 'active'`
     /// dedup slot for a future merge click.
@@ -401,6 +423,36 @@ mod tests {
         let stored = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
         assert_eq!(stored.last_trunk_state.as_deref(), Some("testing"));
         assert!(stored.last_trunk_state_at.is_some());
+    }
+
+    #[test]
+    fn resubmit_bumps_submit_count_and_clears_the_sentinel() {
+        let db = test_db();
+        let (_, task_id) = seed_task(&db, "resubmit");
+        let intent = db.insert_trunk_merge_intent(input_for(&task_id)).unwrap().unwrap();
+        assert_eq!(intent.submit_count, 1);
+        db.record_trunk_merge_intent_state(&intent.id, "failed").unwrap();
+
+        let resubmitted = db
+            .record_trunk_merge_intent_resubmit(&intent.id)
+            .unwrap()
+            .expect("active intent");
+        assert_eq!(resubmitted.submit_count, 2);
+        assert!(resubmitted.last_trunk_state.is_none());
+        assert!(resubmitted.last_trunk_state_at.is_none());
+
+        let stored = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+        assert_eq!(stored.submit_count, 2);
+    }
+
+    #[test]
+    fn resubmit_ignores_an_already_retired_intent() {
+        let db = test_db();
+        let (_, task_id) = seed_task(&db, "resubmit-retired");
+        let intent = db.insert_trunk_merge_intent(input_for(&task_id)).unwrap().unwrap();
+        db.retire_trunk_merge_intent(&intent.id, "cancelled").unwrap();
+
+        assert!(db.record_trunk_merge_intent_resubmit(&intent.id).unwrap().is_none());
     }
 
     #[test]
