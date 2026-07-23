@@ -24,6 +24,7 @@ use crate::config;
 use crate::lock::RepoLock;
 use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::paths;
+use crate::reuse_guard;
 use crate::setup::{self, SetupReport, StepStatus, run_setup_engine};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 
@@ -1430,10 +1431,41 @@ fn run_workspace(
             }
 
             // Decide which workspace to use: prefer clean, fall back to the
-            // first repairable conflicted workspace, otherwise auto-create a
-            // fresh one. No pool state (dirty, husk, occupied) is ever a hard
-            // stop — cube always provisions new capacity for a reachable repo.
-            let chosen_id = clean_candidate.or_else(|| conflicted_candidate.as_ref().map(|(id, _)| id.clone()));
+            // first repairable conflicted workspace, then to a quarantined one
+            // that can be verifiably reclaimed, otherwise auto-create a fresh
+            // one. No pool state (dirty, husk, occupied) is ever a hard stop —
+            // cube always provisions new capacity for a reachable repo.
+            let mut chosen_id = clean_candidate.or_else(|| conflicted_candidate.as_ref().map(|(id, _)| id.clone()));
+
+            // Growing the pool is the last resort, not the first: a quarantined
+            // workspace nobody is working in is perfectly good capacity, and
+            // minting instead of reclaiming it is how the pool grew to hundreds
+            // of permanently ineligible entries. The reclaim is verified (see
+            // `reclaim_quarantined_workspace`), so one whose `@` still holds an
+            // unpushed working copy stays quarantined and we do mint.
+            if chosen_id.is_none() {
+                match reclaim_quarantined_workspace(
+                    runner,
+                    &store,
+                    database_path,
+                    &repo,
+                    &repo_record.main_branch,
+                    &exclude,
+                ) {
+                    Ok(Some(reclaimed_id)) => {
+                        health_checks.push(json!({
+                            "workspace_id": reclaimed_id,
+                            "health": "quarantine_reclaimed",
+                            "skipped": false,
+                        }));
+                        chosen_id = Some(reclaimed_id);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("cube: quarantine reclaim: scan failed, provisioning instead: {e}");
+                    }
+                }
+            }
 
             let (mut workspace, mut was_auto_created, repair_bookmarks) = if let Some(ws_id) = chosen_id {
                 // Claim the specific workspace we health-checked.
@@ -4591,11 +4623,130 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
     }
 }
 
+/// How many quarantined workspaces one lease call will probe before giving up
+/// and provisioning a fresh one instead.
+///
+/// Each probe costs a `jj git fetch` plus one or two `jj log`s against a
+/// workspace we may not end up using, and the whole scan runs under the
+/// per-repo lock, so it is bounded rather than sweeping the entire quarantine
+/// set. A truncated scan is recorded in `workspace.quarantine_reclaim_scan`
+/// (`scanned` vs `available`), never dropped silently — the next lease that
+/// would otherwise mint picks up where this one stopped.
+const QUARANTINE_RECLAIM_MAX_PROBES: usize = 4;
+
+/// Try to return a quarantined workspace to the pool instead of minting a new
+/// one, and hand back its id if that succeeds.
+///
+/// Quarantine is set by the dirty-reclaim guard when it refuses a destructive
+/// reset. Before this existed, that marker was permanent: no GC pass cleared
+/// it and the only escape was an operator running `cube workspace
+/// force-release`, so every refusal permanently removed a workspace from the
+/// pool. Reclaim is *verified*, never blind — the guard's own probe is re-run
+/// and the quarantine is cleared only when `@` holds nothing that would be
+/// left behind (it is empty, or a remote already has it). A workspace whose
+/// `@` still holds an unpushed working copy stays quarantined, which is the
+/// whole point of the marker.
+///
+/// Never fails a lease: any probe error skips that workspace and the caller
+/// falls through to provisioning.
+fn reclaim_quarantined_workspace(
+    runner: &dyn CommandRunner,
+    store: &Store,
+    database_path: Option<&Path>,
+    repo: &str,
+    main_branch: &str,
+    exclude: &[String],
+) -> Result<Option<String>> {
+    let quarantined = store.list_workspaces_filtered(&WorkspaceListFilter {
+        repo: Some(repo),
+        effective_state: Some(EffectiveState::FreeQuarantined),
+        ..Default::default()
+    })?;
+
+    let available: Vec<&WorkspaceRecord> = quarantined
+        .iter()
+        .filter(|record| !exclude.contains(&record.workspace_id) && workspace_path_exists(record))
+        .collect();
+
+    let mut scanned = 0usize;
+    let mut reclaimed: Option<String> = None;
+    for record in available.iter().take(QUARANTINE_RECLAIM_MAX_PROBES) {
+        scanned += 1;
+        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch) {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!(
+                    "cube: quarantine reclaim: {}: probe failed, leaving quarantined: {error}",
+                    record.workspace_id,
+                );
+                audit!(
+                    database_path,
+                    "workspace.quarantine_reclaim_error",
+                    repo = repo,
+                    workspace_id = record.workspace_id,
+                    error = error.to_string(),
+                );
+                continue;
+            }
+        };
+
+        if !status.is_reusable() {
+            audit!(
+                database_path,
+                "workspace.quarantine_reclaim_refused",
+                repo = repo,
+                workspace_id = record.workspace_id,
+                head_change_id = status.head_change_id(),
+                head_is_empty = status.head_is_empty(),
+                head_parent_bookmarks = status.head_parent_bookmarks(),
+                unpushed_commits = status.unpushed_summary(),
+            );
+            continue;
+        }
+
+        if !store.clear_workspace_quarantine(repo, &record.workspace_id)? {
+            // Claimed or re-marked between the list and here; leave it be.
+            continue;
+        }
+        audit!(
+            database_path,
+            "workspace.quarantine_cleared",
+            repo = repo,
+            workspace_id = record.workspace_id,
+            source = "lease_reclaim",
+            reuse_reason = status.reuse_reason(),
+            head_change_id = status.head_change_id(),
+            head_parent_bookmarks = status.head_parent_bookmarks(),
+        );
+        reclaimed = Some(record.workspace_id.clone());
+        break;
+    }
+
+    audit!(
+        database_path,
+        "workspace.quarantine_reclaim_scan",
+        repo = repo,
+        available = available.len(),
+        scanned = scanned,
+        truncated = available.len() > scanned,
+        reclaimed = reclaimed.as_deref(),
+    );
+
+    Ok(reclaimed)
+}
+
 /// During pool GC, reset any non-leased free workspace that has been
-/// continuously `dirty` or `conflicted` for longer than `max_age_secs`.
-/// Emits a `workspace.unhealthy_gc_reset` audit event for each workspace
-/// that is reclaimed so the discarded work is traceable.
+/// continuously `dirty`, `conflicted` or `quarantined` for longer than
+/// `max_age_secs`. Emits a `workspace.unhealthy_gc_reset` audit event for each
+/// workspace that is reclaimed so the discarded work is traceable.
 /// Returns the number of workspaces successfully recycled.
+///
+/// `quarantined` rows are handled differently from the other two: they are
+/// there because the dirty-reclaim guard refused to reset them, so age alone
+/// is never enough. The guard's probe is re-run first and the reset happens
+/// only if `@` holds nothing that would be left behind. Age still gates the
+/// attempt, giving an operator a window to inspect a fresh quarantine before
+/// cube touches it.
 fn gc_aged_unhealthy_workspaces(
     runner: &dyn CommandRunner,
     store: &Store,
@@ -4620,13 +4771,20 @@ fn gc_aged_unhealthy_workspaces(
         }
         let is_unhealthy = matches!(
             record.health_status,
-            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
         );
         if !is_unhealthy {
             continue;
         }
-        let Some(unhealthy_since) = record.unhealthy_since_epoch_s else {
-            continue;
+        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
+        // A quarantined row written before the timestamp was stamped on that
+        // path has no age to compare; treat it as old rather than stranding it
+        // forever — the probe below is what actually decides whether it is
+        // safe to touch. Dirty/conflicted rows keep the strict behaviour.
+        let unhealthy_since = match (record.unhealthy_since_epoch_s, is_quarantined) {
+            (Some(since), _) => since,
+            (None, true) => 0,
+            (None, false) => continue,
         };
         if unhealthy_since > threshold_epoch_s {
             continue;
@@ -4667,6 +4825,60 @@ fn gc_aged_unhealthy_workspaces(
 
         let prior_health = record.health_status.map(|h| h.as_str()).unwrap_or("unknown");
         let age_secs = now_epoch_s.saturating_sub(unhealthy_since);
+
+        // Quarantine is only ever lifted against evidence: re-run the
+        // dirty-reclaim guard's probe and leave the workspace alone unless it
+        // now reports that nothing on `@` would be left behind.
+        if is_quarantined {
+            match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch) {
+                Ok(status) if status.is_reusable() => {
+                    audit!(
+                        database_path,
+                        "workspace.quarantine_cleared",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        source = "unhealthy_gc",
+                        reuse_reason = status.reuse_reason(),
+                        head_change_id = status.head_change_id(),
+                        head_parent_bookmarks = status.head_parent_bookmarks(),
+                        age_secs = age_secs,
+                    );
+                }
+                Ok(status) => {
+                    eprintln!(
+                        "cube: unhealthy gc: {} still holds unpushed work; leaving quarantined",
+                        record.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.quarantine_reclaim_refused",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        source = "unhealthy_gc",
+                        head_change_id = status.head_change_id(),
+                        head_is_empty = status.head_is_empty(),
+                        head_parent_bookmarks = status.head_parent_bookmarks(),
+                        unpushed_commits = status.unpushed_summary(),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cube: unhealthy gc: {}: quarantine probe failed: {e}",
+                        record.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.quarantine_reclaim_error",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        source = "unhealthy_gc",
+                        error = e.to_string(),
+                    );
+                    continue;
+                }
+            }
+        }
 
         if let Err(e) = reset_workspace(runner, database_path, &record.workspace_path, &main_branch) {
             eprintln!("cube: unhealthy gc: {}: reset failed: {e}", record.workspace_id,);
@@ -4971,15 +5183,17 @@ fn reset_workspace_guarded(
 
     if let Some(prior) = prior_expired {
         let head_status = read_head_status(runner, database_path, workspace_path, main_branch)?;
-        if !head_status.is_clean_on_main {
+        if !head_status.is_reusable() {
             audit!(
                 database_path,
                 "workspace.reset_refused_dirty",
                 workspace_path = workspace_path.display().to_string(),
                 main_branch = main_branch,
-                head_change_id = head_status.head_change_id,
-                head_is_empty = head_status.head_is_empty,
-                head_parent_bookmarks = head_status.head_parent_bookmarks,
+                head_change_id = head_status.head_change_id(),
+                head_is_empty = head_status.head_is_empty(),
+                head_parent_bookmarks = head_status.head_parent_bookmarks(),
+                parent_is_main = head_status.parent_is_main(),
+                unpushed_commits = head_status.unpushed_summary(),
                 prior_lease_id = prior.lease_id,
                 prior_holder = prior.holder.as_deref(),
                 prior_task = prior.task.as_deref(),
@@ -5341,15 +5555,57 @@ fn audit_jj_op(
     );
 }
 
-/// Snapshot the parts of `jj`'s view we need to tell apart "fresh
-/// clean checkout on main" from "the prior worker left work here."
-/// Empty + parent is main → safe to reset. Anything else → guard.
+/// Snapshot of `jj`'s view of a workspace's `@`, plus the guard's verdict on
+/// whether a destructive reset would orphan anything. See [`crate::reuse_guard`]
+/// for the predicate itself and why the original one was wrong.
 #[derive(Debug)]
 struct HeadStatus {
-    head_change_id: String,
-    head_is_empty: bool,
-    head_parent_bookmarks: String,
-    is_clean_on_main: bool,
+    head: reuse_guard::ParsedHead,
+    /// Non-empty commits reachable from `@` that no remote bookmark holds.
+    /// Empty when the fast path made the probe unnecessary.
+    unpushed: Vec<reuse_guard::UnpushedCommit>,
+    verdict: reuse_guard::ReuseVerdict,
+}
+
+impl HeadStatus {
+    fn is_reusable(&self) -> bool {
+        matches!(self.verdict, reuse_guard::ReuseVerdict::Reuse(_))
+    }
+
+    fn head_change_id(&self) -> &str {
+        &self.head.change_id
+    }
+
+    fn head_is_empty(&self) -> bool {
+        self.head.is_empty
+    }
+
+    /// jj's rendered bookmark text (`main*`, `main@git`, …), carried purely so
+    /// the audit trail stays comparable with pre-fix events.
+    fn head_parent_bookmarks(&self) -> &str {
+        &self.head.rendered_parent_bookmarks
+    }
+
+    /// Whether any parent carries the main bookmark, compared by identity.
+    fn parent_is_main(&self) -> bool {
+        self.head.parent_is_main
+    }
+
+    /// The orphanable commits, rendered for the audit trail.
+    fn unpushed_summary(&self) -> String {
+        self.unpushed
+            .iter()
+            .map(|c| format!("{}:{}", c.change_id, c.commit_id))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn reuse_reason(&self) -> Option<&'static str> {
+        match self.verdict {
+            reuse_guard::ReuseVerdict::Reuse(reason) => Some(reason.as_str()),
+            reuse_guard::ReuseVerdict::Refuse => None,
+        }
+    }
 }
 
 fn read_head_status(
@@ -5358,46 +5614,72 @@ fn read_head_status(
     workspace_path: &Path,
     main_branch: &str,
 ) -> Result<HeadStatus> {
-    // Tab-separated so a bookmark name containing arbitrary chars
-    // (jj allows slashes etc.) can't confuse the parser.
-    let template = "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")";
     let output = run_jj(
         runner,
         database_path,
-        &CommandInvocation {
-            cwd: workspace_path.to_path_buf(),
-            program: "jj".to_string(),
-            args: vec![
-                "log".to_string(),
-                "--no-graph".to_string(),
-                "-r".to_string(),
-                "@".to_string(),
-                "-T".to_string(),
-                template.to_string(),
-            ],
-            env: vec![],
-        },
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", reuse_guard::HEAD_STATUS_TEMPLATE],
+        ),
     )?;
-    let trimmed = output.trim();
-    let mut parts = trimmed.split('\t');
-    let head_change_id = parts.next().unwrap_or("").to_string();
-    let head_is_empty = parts.next().unwrap_or("false").eq_ignore_ascii_case("true");
-    let head_parent_bookmarks = parts.next().unwrap_or("").to_string();
-    // Treat "@ is empty and its parent is on `main`" as a clean reset
-    // candidate. The bookmark list is `;`-separated by parent (jj's @
-    // can have multiple parents post-merge), and each entry is a
-    // comma-separated list of bookmarks on that parent.
-    let parent_is_main = head_parent_bookmarks
-        .split(';')
-        .flat_map(|p| p.split(','))
-        .any(|b| b.trim() == main_branch);
-    let is_clean_on_main = head_is_empty && parent_is_main;
+    let head = reuse_guard::parse_head_status(&output, main_branch);
+
+    // Only ask jj the expensive question when the cheap one didn't settle it:
+    // an empty `@` sitting on main is the steady state and needs no probe.
+    let unpushed = if reuse_guard::needs_unpushed_probe(&head) {
+        let revset = reuse_guard::unpushed_work_revset(main_branch);
+        let output = run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                workspace_path,
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-n",
+                    reuse_guard::UNPUSHED_PROBE_LIMIT,
+                    "-r",
+                    &revset,
+                    "-T",
+                    reuse_guard::UNPUSHED_PROBE_TEMPLATE,
+                ],
+            ),
+        )?;
+        reuse_guard::parse_unpushed_commits(&output)
+    } else {
+        Vec::new()
+    };
+
+    let verdict = reuse_guard::decide(&head, &unpushed);
     Ok(HeadStatus {
-        head_change_id,
-        head_is_empty,
-        head_parent_bookmarks,
-        is_clean_on_main,
+        head,
+        unpushed,
+        verdict,
     })
+}
+
+/// Fetch, then run the reuse guard's probe against a workspace nobody holds.
+///
+/// The fetch matters: the probe decides "is this work anywhere else?" against
+/// the remote-tracking bookmarks, so a stale view would call already-pushed
+/// work orphaned and refuse. Used by the quarantine-reclaim paths, which need
+/// the verdict *without* performing the reset that `reset_workspace_guarded`
+/// couples it to.
+fn probe_workspace_reuse(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+) -> Result<HeadStatus> {
+    audit_jj_op(database_path, workspace_path, "git", &["fetch"], None);
+    run_jj_network(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
+    )?;
+    read_head_status(runner, database_path, workspace_path, main_branch)
 }
 
 /// Default per-attempt wall-clock bound for any subprocess cube spawns
@@ -6482,6 +6764,9 @@ mod tests {
     use crate::cli::{Cli, Command};
     use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
     use crate::lock::RepoLock;
+    use crate::metadata::WorkspaceState;
+    use crate::reuse_guard;
+    use crate::store::{Store, WorkspaceListFilter};
 
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY,
@@ -11373,6 +11658,46 @@ mod tests {
         ])
     }
 
+    /// The dirty-reclaim guard's first probe: what `@` is and what bookmarks
+    /// its parents carry. `output` is the tab-separated line
+    /// [`reuse_guard::HEAD_STATUS_TEMPLATE`] produces — build it with
+    /// [`head_status_output`].
+    fn head_status_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
+        ExpectedCommand::ok(
+            workspace_path.to_path_buf(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", reuse_guard::HEAD_STATUS_TEMPLATE],
+            output,
+        )
+    }
+
+    /// Render a head-status line the way `jj log` would.
+    fn head_status_output(change_id: &str, is_empty: bool, rendered: &str, local: &str, remote: &str) -> String {
+        format!("{change_id}\t{is_empty}\t{rendered}\t{local}\t{remote}")
+    }
+
+    /// The guard's second probe: the commits a reset would orphan. Only issued
+    /// when the first probe didn't already settle it (`@` empty on main).
+    /// An empty `output` means nothing would be lost.
+    fn unpushed_probe_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
+        let revset = reuse_guard::unpushed_work_revset("main");
+        ExpectedCommand::ok(
+            workspace_path.to_path_buf(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-n",
+                reuse_guard::UNPUSHED_PROBE_LIMIT,
+                "-r",
+                &revset,
+                "-T",
+                reuse_guard::UNPUSHED_PROBE_TEMPLATE,
+            ],
+            output,
+        )
+    }
+
     /// Returns an expected gc-log command that reports no consumed bookmarks.
     /// Add to any release runner after `jj new main@origin` to satisfy the gc check.
     fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
@@ -14211,13 +14536,15 @@ steps:
         force_lease_expiry(&database_path, &prior_lease_id, 1);
 
         // The second lease's reset path should run `jj status --no-pager`
-        // (health check), then `jj git fetch`, then the head-status probe,
-        // which trips the guard. Stub the probe to return a non-empty `@`
-        // whose parent isn't `main` — exactly the shape a still-active
-        // worker's WIP looks like. Falling back to a freshly auto-created
-        // workspace (`mono-agent-002`) then runs the standard
-        // add/fetch/remote-list/bookmark-set/new/log sequence.
-        let probe_output = "abcd1234\tfalse\tfeature-bookmark";
+        // (health check), then `jj git fetch`, then the head-status probe.
+        // Stub that probe to return a non-empty `@` on an unpushed
+        // feature bookmark — exactly the shape a still-active worker's WIP
+        // looks like — so the guard falls through to the orphan probe, which
+        // reports a real commit that no remote holds. That is the 2-in-400
+        // case the guard exists for, and it must still refuse. Falling back
+        // to a freshly auto-created workspace (`mono-agent-002`) then runs
+        // the standard add/fetch/remote-list/bookmark-set/new/log sequence.
+        let probe_output = head_status_output("abcd1234", false, "feature-bookmark", "feature-bookmark", "");
         let new_path = workspace_root.join("mono-agent-002");
         let staging = workspace_root.join(".incoming-mono-agent-002");
         let second_runner = FakeRunner::new(vec![
@@ -14228,19 +14555,8 @@ steps:
                 "The working copy is clean",
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(
-                workspace_path.clone(),
-                "jj",
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    "@",
-                    "-T",
-                    "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")",
-                ],
-                probe_output,
-            ),
+            head_status_command(&workspace_path, &probe_output),
+            unpushed_probe_command(&workspace_path, "abcd1234\t6e6b90bc\n"),
             ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
@@ -14276,10 +14592,10 @@ steps:
 
         // The crucial regression-pin: `jj new main` was NEVER invoked on
         // the quarantined workspace, so the prior worker's `@` is
-        // untouched. The probe is the only post-fetch jj call that ran
-        // against `mono-agent-001`; every remaining command in the script
-        // targets `mono-agent-002`, and the runner's exhausted assertion
-        // above proves nothing extra was issued.
+        // untouched. The two read-only probes are the only post-fetch jj
+        // calls that ran against `mono-agent-001`; every remaining command
+        // in the script targets `mono-agent-002`, and the runner's exhausted
+        // assertion above proves nothing extra was issued.
         let events = audit_events(&tempdir);
         let refused: Vec<_> = events
             .iter()
@@ -14368,41 +14684,59 @@ steps:
         assert_eq!(quarantined_filter[0].workspace_id, "mono-agent-001");
     }
 
-    /// A quarantined workspace must never be selected by a later lease
-    /// call — the durability half of the 2026-07-16 fix. Without it, the
-    /// bug reproduces exactly as reported: the guard "protects" the
-    /// workspace in one call, and the very next call destroys it anyway.
-    #[test]
-    fn quarantined_workspace_is_never_selected_by_a_later_lease() {
-        let (tempdir, database_path) = with_database_path();
+    /// Seed a repo whose only workspace is quarantined.
+    fn seed_quarantined_workspace(
+        tempdir: &TempDir,
+        database_path: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        seed_mono_repo(&workspace_root, &database_path);
+        seed_mono_repo(&workspace_root, database_path);
 
-        {
-            let mut store = crate::store::Store::open_at(&database_path).unwrap();
-            store
-                .sync_workspaces(
-                    "mono",
-                    &[crate::metadata::WorkspaceCandidate {
-                        workspace_id: "mono-agent-001".to_string(),
-                        workspace_path: workspace_path.clone(),
-                    }],
-                )
-                .unwrap();
-            store
-                .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
-                .unwrap();
-        }
+        let mut store = crate::store::Store::open_at(database_path).unwrap();
+        store
+            .sync_workspaces(
+                "mono",
+                &[crate::metadata::WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: workspace_path.clone(),
+                }],
+            )
+            .unwrap();
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+            .unwrap();
 
-        // A lease call must skip the quarantined workspace entirely and
-        // auto-provision a fresh one — never even probe the quarantined
-        // workspace's `@` (no `jj status` etc. against mono-agent-001).
+        (workspace_root, workspace_path)
+    }
+
+    /// A quarantined workspace that still holds the prior holder's unpushed
+    /// work must never be selected by a later lease — the durability half of
+    /// the 2026-07-16 fix. Without it, the bug reproduces exactly as
+    /// reported: the guard "protects" the workspace in one call, and the very
+    /// next call destroys it anyway. The reclaim path added for the workspace
+    /// leak probes it (read-only) and must come away refusing.
+    #[test]
+    fn quarantined_workspace_with_unpushed_work_is_not_reclaimed_by_a_later_lease() {
+        let (tempdir, database_path) = with_database_path();
+        let (workspace_root, workspace_path) = seed_quarantined_workspace(&tempdir, &database_path);
+
+        // The lease finds no clean candidate, so it probes the quarantined
+        // workspace before growing the pool. The probe reports committed WIP
+        // that no remote holds, so the quarantine stands and a fresh
+        // workspace is provisioned after all. Note the probe is strictly
+        // read-only: no `jj new` is ever issued against mono-agent-001.
         let new_path = workspace_root.join("mono-agent-002");
         let staging = workspace_root.join(".incoming-mono-agent-002");
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            head_status_command(
+                &workspace_path,
+                &head_status_output("abcd1234", true, "boss/exec_local", "boss/exec_local", ""),
+            ),
+            unpushed_probe_command(&workspace_path, "abcd1234\t6e6b90bc\n"),
             ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
@@ -14450,8 +14784,107 @@ steps:
         assert_eq!(
             quarantined_row.health_status,
             Some(crate::metadata::WorkspaceHealth::Quarantined),
-            "quarantine must survive an unrelated lease call untouched"
+            "quarantine must survive a lease call that could not verify it"
         );
+
+        let events = audit_events(&tempdir);
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.quarantine_reclaim_refused")
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["workspace_id"], "mono-agent-001");
+        assert_eq!(refused[0]["unpushed_commits"], "abcd1234:6e6b90bc");
+    }
+
+    /// The other half of the leak fix: a quarantined workspace whose prior
+    /// holder's work has since reached a remote is real, usable capacity.
+    /// Leasing must reclaim it rather than mint yet another workspace —
+    /// before this, `health_status='quarantined'` was a one-way door and
+    /// every refusal permanently shrank the pool.
+    #[test]
+    fn quarantined_workspace_verified_clean_is_reclaimed_instead_of_minting() {
+        let (tempdir, database_path) = with_database_path();
+        let (_workspace_root, workspace_path) = seed_quarantined_workspace(&tempdir, &database_path);
+
+        // Probe: `@` is empty and its parent carries the pushed boss branch
+        // plus its PR bookmark, so the orphan probe comes back empty. The
+        // quarantine is cleared and the *same* workspace is reset and leased
+        // — note the absence of any `jj workspace add` in this script.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            head_status_command(
+                &workspace_path,
+                &head_status_output(
+                    "abcd1234",
+                    true,
+                    "boss/exec_deadbeef,pr/2196",
+                    "boss/exec_deadbeef,pr/2196",
+                    "boss/exec_deadbeef",
+                ),
+            ),
+            unpushed_probe_command(&workspace_path, ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "incoming"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease must succeed by reclaiming the quarantined workspace");
+        runner.assert_exhausted();
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"], "mono-agent-001",
+            "the reclaimed workspace must be reused, not a freshly minted one"
+        );
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1, "no new workspace may be minted");
+        assert_eq!(rows[0].workspace_id, "mono-agent-001");
+        assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Leased);
+        assert_eq!(rows[0].health_status, None, "quarantine must be lifted");
+
+        let events = audit_events(&tempdir);
+        let cleared: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.quarantine_cleared")
+            .collect();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0]["workspace_id"], "mono-agent-001");
+        assert_eq!(cleared[0]["source"], "lease_reclaim");
+        assert_eq!(cleared[0]["reuse_reason"], "nothing_orphaned");
+
+        let scan: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.quarantine_reclaim_scan")
+            .collect();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0]["available"], 1);
+        assert_eq!(scan[0]["scanned"], 1);
+        assert_eq!(scan[0]["truncated"], false);
+        assert_eq!(scan[0]["reclaimed"], "mono-agent-001");
     }
 
     /// `cube workspace force-release` is the salvage path for a
@@ -14537,8 +14970,9 @@ steps:
 
         force_lease_expiry(&database_path, &prior_lease_id, 1);
 
-        // Clean @: empty, parent on main → safe to reset.
-        let probe_output = "abcd1234\ttrue\tmain";
+        // Clean @: empty, parent on main → safe to reset, and cheap enough
+        // that the orphan probe is never issued.
+        let probe_output = head_status_output("abcd1234", true, "main", "main", "main");
         let second_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -14547,19 +14981,7 @@ steps:
                 "The working copy is clean",
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(
-                workspace_path.clone(),
-                "jj",
-                &[
-                    "log",
-                    "--no-graph",
-                    "-r",
-                    "@",
-                    "-T",
-                    "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")",
-                ],
-                probe_output,
-            ),
+            head_status_command(&workspace_path, &probe_output),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -14588,6 +15010,146 @@ steps:
         )
         .expect("second lease must succeed when the workspace is clean on main");
         second_runner.assert_exhausted();
+    }
+
+    /// Run one expire → reclaim → reuse cycle where the head-status probe
+    /// reports `head_status`, and assert the workspace was reused in place:
+    /// no `jj workspace add`, no quarantine, still exactly one workspace.
+    ///
+    /// `orphan_probe` is the stubbed orphan-probe output, or `None` when the
+    /// fast path should make that second probe unnecessary.
+    fn assert_expired_workspace_is_reused(head_status: &str, orphan_probe: Option<&str>) {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let first = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "wip"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        let prior_lease_id = first.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        force_lease_expiry(&database_path, &prior_lease_id, 1);
+
+        let mut script = vec![
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            head_status_command(&workspace_path, head_status),
+        ];
+        if let Some(output) = orphan_probe {
+            script.push(unpushed_probe_command(&workspace_path, output));
+        }
+        script.extend([
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
+        ]);
+
+        let runner = FakeRunner::new(script);
+        let second = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "next"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("second lease must reuse the expired workspace");
+        // Exhaustion is the load-bearing assertion for "did not mint": a
+        // `jj workspace add` would be an unscripted command and fail here.
+        runner.assert_exhausted();
+        assert_eq!(second.payload["workspace"]["workspace_id"], "mono-agent-001");
+
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1, "reuse must not grow the pool");
+        assert_eq!(rows[0].state, WorkspaceState::Leased);
+
+        let events = audit_events(&tempdir);
+        assert!(
+            !events.iter().any(|e| e["event"] == "workspace.reset_refused_dirty"
+                || e["event"] == "workspace.dirty_reclaim_quarantined"),
+            "a reusable workspace must not be refused or quarantined",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "lease.expired_reclaimed" && e["workspace_id"] == "mono-agent-001"),
+            "the expired lease must still have been swept",
+        );
+    }
+
+    /// The workspace leak, reproduced at the predicate level. jj renders a
+    /// local bookmark that has diverged from its remote as `main*`, and the
+    /// guard used to compare that rendered text against `"main"`. It never
+    /// matched, so a workspace sitting cleanly on main was refused,
+    /// quarantined and replaced by a freshly minted one — 50 of flunge's 105
+    /// recorded refusals were exactly this. It must now be reused in place.
+    #[test]
+    fn expired_workspace_on_diverged_main_is_reused_not_quarantined() {
+        assert_expired_workspace_is_reused(&head_status_output("abcd1234", true, "main*", "main", "main"), None);
+    }
+
+    /// Same bug, the `main@git` rendering: the parent carries no local
+    /// bookmark at all, only the colocated-git remote one. 3 recorded
+    /// refusals.
+    #[test]
+    fn expired_workspace_on_remote_qualified_main_is_reused_not_quarantined() {
+        assert_expired_workspace_is_reused(&head_status_output("abcd1234", true, "main@git", "", "main"), None);
+    }
+
+    /// Same bug, the no-bookmark rendering: `@` is empty and `main` has moved
+    /// past this base commit, so the parent carries no bookmark. 20 recorded
+    /// refusals. The orphan probe settles it — the base commit is still an
+    /// ancestor of `main@origin`, so nothing would be lost.
+    #[test]
+    fn expired_workspace_with_no_parent_bookmark_is_reused_not_quarantined() {
+        assert_expired_workspace_is_reused(&head_status_output("abcd1234", true, "", "", ""), Some(""));
+    }
+
+    /// Same bug, the pushed-boss-branch rendering: the prior holder's work is
+    /// already on GitHub, so there is nothing to protect. 55 recorded
+    /// refusals — the single largest bucket.
+    #[test]
+    fn expired_workspace_on_pushed_boss_branch_is_reused_not_quarantined() {
+        assert_expired_workspace_is_reused(
+            &head_status_output(
+                "abcd1234",
+                true,
+                "boss/exec_deadbeef,pr/2196",
+                "boss/exec_deadbeef,pr/2196",
+                "boss/exec_deadbeef",
+            ),
+            Some(""),
+        );
     }
 
     #[test]
@@ -17654,8 +18216,9 @@ steps:
         (store, ws_path)
     }
 
-    fn reset_runner_for(ws_path: &std::path::Path) -> FakeRunner {
-        FakeRunner::new(vec![
+    /// The command sequence `reset_workspace` issues against a workspace.
+    fn reset_commands_for(ws_path: &std::path::Path) -> Vec<ExpectedCommand> {
+        vec![
             ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 ws_path.to_path_buf(),
@@ -17670,7 +18233,11 @@ steps:
                 "",
             ),
             ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
-        ])
+        ]
+    }
+
+    fn reset_runner_for(ws_path: &std::path::Path) -> FakeRunner {
+        FakeRunner::new(reset_commands_for(ws_path))
     }
 
     #[test]
@@ -17730,6 +18297,99 @@ steps:
         let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
         assert_eq!(ws_after.health_status, None);
         assert_eq!(ws_after.unhealthy_since_epoch_s, None);
+    }
+
+    /// Quarantine used to be a one-way door: `gc_aged_unhealthy_workspaces`
+    /// matched only `Dirty`/`Conflicted`, so a quarantined workspace was
+    /// stranded forever and the pool permanently lost a slot. GC now reclaims
+    /// it — but only after re-running the guard's probe and finding that the
+    /// reset would orphan nothing.
+    #[test]
+    fn gc_reclaims_aged_quarantined_workspace_once_nothing_is_orphaned() {
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+            .expect("mark quarantined");
+
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
+        let max_age_secs = 5 * 86_400;
+
+        // Probe first (fetch + head status + orphan check), then the normal
+        // reset sequence.
+        let mut script = vec![
+            ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            head_status_command(&ws_path, &head_status_output("abcd1234", true, "", "", "")),
+            unpushed_probe_command(&ws_path, ""),
+        ];
+        script.extend(reset_commands_for(&ws_path));
+        let runner = FakeRunner::new(script);
+
+        let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs);
+        runner.assert_exhausted();
+        assert_eq!(recycled, 1);
+
+        let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws_after.health_status, None, "quarantine must be lifted");
+        assert_eq!(ws_after.unhealthy_since_epoch_s, None);
+        assert_eq!(ws_after.state, crate::metadata::WorkspaceState::Free);
+
+        let events = audit_events(&tempdir);
+        let cleared: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.quarantine_cleared")
+            .collect();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0]["source"], "unhealthy_gc");
+        assert_eq!(cleared[0]["reuse_reason"], "nothing_orphaned");
+    }
+
+    /// The protection that must survive the reclaim path: an aged quarantine
+    /// whose `@` still holds work no remote has is left exactly as it is. GC
+    /// must never reset it on age alone.
+    #[test]
+    fn gc_leaves_aged_quarantined_workspace_with_unpushed_work_alone() {
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+            .expect("mark quarantined");
+
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 60 * 86_400;
+        let max_age_secs = 5 * 86_400;
+
+        // The probe runs and refuses; no reset commands may follow.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            head_status_command(
+                &ws_path,
+                &head_status_output("abcd1234", false, "wip-bookmark", "wip-bookmark", ""),
+            ),
+            unpushed_probe_command(&ws_path, "abcd1234\t6e6b90bc\n"),
+        ]);
+
+        let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs);
+        runner.assert_exhausted();
+        assert_eq!(recycled, 0, "no matter how old, unpushed work is never discarded");
+
+        let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(
+            ws_after.health_status,
+            Some(crate::metadata::WorkspaceHealth::Quarantined),
+        );
+
+        let events = audit_events(&tempdir);
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.quarantine_reclaim_refused")
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["source"], "unhealthy_gc");
+        assert_eq!(refused[0]["unpushed_commits"], "abcd1234:6e6b90bc");
     }
 
     #[test]

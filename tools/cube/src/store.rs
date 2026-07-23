@@ -545,8 +545,12 @@ impl Store {
                 UPDATE workspaces
                 SET
                     health_status = ?3,
+                    -- `quarantined` is stamped alongside the other unhealthy
+                    -- states so the aged-unhealthy GC can age it out; only
+                    -- `clean` clears the timestamp. `Store::quarantine_workspace`
+                    -- stamps it the same way.
                     unhealthy_since_epoch_s = CASE
-                        WHEN ?3 IN ('dirty', 'conflicted')
+                        WHEN ?3 IN ('dirty', 'conflicted', 'quarantined')
                             THEN COALESCE(unhealthy_since_epoch_s, unixepoch())
                         ELSE NULL
                     END
