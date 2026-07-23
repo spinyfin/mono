@@ -389,6 +389,18 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
                     },
                 );
             }
+            // Operator-gated (global pause). Deliberately records no
+            // `automation_runs` row — a manual run refused by a pause is not a
+            // failure of the automation, and the operator already knows why.
+            crate::automation_scheduler::TriageDispatch::Held { reason } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("could not enqueue triage: {reason}"),
+                    },
+                );
+            }
         }
     }
 }

@@ -258,6 +258,13 @@ private struct AutomationDetailView: View {
         model.automationRunsByID[automation.id] ?? []
     }
 
+    /// Whether `bossctl automation pause` is in effect. The engine reports it
+    /// as an `automation_paused` health issue, re-broadcast on every
+    /// pause/resume, so this tracks the banner without a second RPC.
+    private var isAutomationPaused: Bool {
+        model.engineHealthIssues.contains { $0.kind == "automation_paused" }
+    }
+
     @State private var isEditing = false
     @State private var showDeleteConfirmation = false
 
@@ -322,11 +329,11 @@ private struct AutomationDetailView: View {
                     }
                     if let nextDue = automation.nextDueAt {
                         LabeledContent("Next fire") {
-                            Text(AutomationTime.relative(nextDue, now: Date()))
+                            Text(AutomationTime.nextFire(nextDue, now: Date(), paused: isAutomationPaused))
                                 .help(AutomationTime.absolute(nextDue) ?? nextDue)
                         }
                     } else if automation.enabled {
-                        LabeledContent("Next fire", value: "Pending")
+                        LabeledContent("Next fire", value: isAutomationPaused ? "Paused" : "Pending")
                     }
                     if let lastFired = automation.lastFiredAt {
                         LabeledContent("Last fired") {
@@ -441,6 +448,25 @@ enum AutomationTime {
             if let date = formatter.date(from: trimmed) { return date }
         }
         return nil
+    }
+
+    /// The "Next fire" cell's text for an automation whose `next_due_at` is
+    /// set. `next_due_at` on its own is not a prediction of the next fire:
+    ///
+    /// - **While automation is globally paused** the scheduler evaluates
+    ///   nothing at all, so the parked timestamp says when the occurrence
+    ///   *was* due, not when anything will happen. Rendering it produced
+    ///   "Next fire in 18 minutes" for an automation that would not fire
+    ///   until a human ran `bossctl automation resume`.
+    /// - **A timestamp at or before now** means the occurrence has not been
+    ///   consumed yet — it is being retried after a transient pre-start
+    ///   failure, or the pass has not run since it came due. "2 hours ago"
+    ///   under a "Next fire" label reads as a rendering bug rather than a
+    ///   state; the "Reason" row directly above carries the why.
+    static func nextFire(_ raw: String, now: Date, paused: Bool) -> String {
+        if paused { return "Paused" }
+        guard let date = parse(raw) else { return raw }
+        return date <= now ? "Due now" : relative(raw, now: now)
     }
 
     /// Human-readable relative form ("in 21 minutes", "2 hours ago").

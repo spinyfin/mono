@@ -1234,8 +1234,17 @@ pub async fn serve_with_merge_probe(
     // `dispatch_not_before` / `pre_start_failure_count` machinery retries a
     // transient pre-start failure transparently; the completion handler's
     // outcome detector finalises the run once the worker reaches a decision.
+    //
+    // The global automation pause is checked in two places, and both are
+    // required. The dispatcher's check refuses to start a triage pass; the
+    // scheduler loop's check stops it evaluating occurrences at all. With only
+    // the former, a pause left the loop running the full per-occurrence ladder
+    // and writing an `automation_runs` upsert for every due automation once a
+    // second, for the entire pause, because a held occurrence's `next_due_at`
+    // never advances out of the past.
     let coord_for_automation_triage = server_state.execution_coordinator.clone();
     let coord_for_automation_pause_check = server_state.execution_coordinator.clone();
+    let coord_for_scheduler_pause_check = server_state.execution_coordinator.clone();
     let automation_triage_dispatcher: Arc<dyn crate::automation_scheduler::TriageDispatcher> =
         Arc::new(crate::automation_triage::EngineTriageDispatcher::new(
             server_state.work_db.clone(),
@@ -1246,6 +1255,7 @@ pub async fn serve_with_merge_probe(
         server_state.work_db.clone(),
         automation_triage_dispatcher,
         server_state.automation_scheduler_kick.clone(),
+        Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
     );
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded

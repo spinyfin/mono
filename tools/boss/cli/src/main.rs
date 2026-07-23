@@ -4964,8 +4964,12 @@ fn print_automation_runs_table(runs: &[AutomationRun]) {
     for r in runs {
         let produced = r.produced_task_id.as_deref().unwrap_or("-");
         let detail = r.detail.as_deref().unwrap_or("-");
+        // `repeat_count` collapses consecutive same-outcome rows, and each row
+        // is one distinct cron occurrence — not one attempt at the same
+        // occurrence. Say "occurrences" so the number isn't read as a retry
+        // counter.
         let outcome = if r.repeat_count > 1 {
-            format!("{} (x{})", r.outcome, r.repeat_count)
+            format!("{} ({} occurrences)", r.outcome, r.repeat_count)
         } else {
             r.outcome.clone()
         };

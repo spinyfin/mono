@@ -594,9 +594,15 @@ impl EngineTriageDispatcher {
     /// `boss automation run` verb: resolve repo, create the triage execution,
     /// kick the coordinator.
     pub fn fire(&self, automation: &Automation) -> TriageDispatch {
+        // A pause is `Held`, not `TransientFailure`. The two used to share the
+        // transient spelling — the only vocabulary this seam had — which meant
+        // the scheduler treated a deliberate operator gate exactly like an
+        // unreachable VPN: one `failed_will_retry` row per attempt, retried at
+        // the loop's sleep floor of once per second, and aged out as "stale"
+        // 15 minutes later. See `automation_scheduler::TriageDispatch::Held`.
         if (self.is_paused)() {
-            return TriageDispatch::TransientFailure {
-                detail: "automation is paused (bossctl automation pause); holding new triage \
+            return TriageDispatch::Held {
+                reason: "automation is paused (bossctl automation pause); holding new triage \
                          passes until `bossctl automation resume`"
                     .to_owned(),
             };
