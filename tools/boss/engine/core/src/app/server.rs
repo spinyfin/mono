@@ -26,15 +26,34 @@ pub async fn run(cli: Cli) -> Result<()> {
     run_server(cli, cfg, isolation).await
 }
 
-async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths) -> Result<()> {
-    let socket_path = cli.socket_path.unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
-
+/// Resolve the pid, events-socket, db, and control-token paths this start
+/// will actually use, and run the isolation gate against them.
+///
+/// A pure function of its arguments — no env reads, no I/O — pulled out of
+/// `run_server` so the wiring that connects [`IsolationPaths`] to a real
+/// engine start is directly unit-testable. Before this extraction, deleting
+/// the `ensure_isolated()` call (or the events-socket stamp `run` applies to
+/// `WorkConfig`) still left the whole test suite green: the derivation and
+/// the gate had unit coverage as pure functions, but nothing exercised the
+/// code that actually calls them on a real start — precisely the asymmetry
+/// this module's isolation doc criticises about the old `isolation_guard.rs`.
+///
+/// `pid_env_override` and `token_env_override` are the callers' env-sourced
+/// fallbacks (`$BOSS_PID_PATH`, `crate::engine_control::default_token_path()`)
+/// — passed in rather than read here so this function has no environment
+/// dependency of its own.
+fn resolve_engine_paths(
+    isolation: &IsolationPaths,
+    cfg: &RuntimeConfig,
+    pid_env_override: Option<std::path::PathBuf>,
+    token_env_override: Option<std::path::PathBuf>,
+) -> Result<crate::app::isolation::EnginePaths> {
     // Use the isolation-derived pid path, falling back to env / hard default.
     let pid_file_path = isolation
         .derived
         .pid
         .clone()
-        .or_else(|| std::env::var_os(crate::config::PID_PATH_ENV).map(std::path::PathBuf::from))
+        .or(pid_env_override)
         .unwrap_or_else(|| DEFAULT_PID_PATH.into());
 
     // The events socket was resolved into the config in `run` (isolation-derived
@@ -44,33 +63,44 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
         bail!("HOME must be set to derive the default events socket path");
     };
 
-    // The control token is resolved through the isolation guard too. Before
-    // this it was resolved outside the guard entirely, so a fixture overwrote
-    // production's token file and deleted it again on shutdown.
-    let control_token_path = isolation
-        .derived
-        .control_token
-        .clone()
-        .or_else(crate::engine_control::default_token_path);
+    // Resolved through the isolation guard so a fixture mints its own token
+    // instead of overwriting — and, via `ControlTokenGuard::drop`, deleting —
+    // production's.
+    let control_token_path = isolation.derived.control_token.clone().or(token_env_override);
+
+    let resolved = crate::app::isolation::EnginePaths {
+        db: Some(cfg.work.db_path.clone()),
+        events_socket: Some(events_socket_path),
+        pid: Some(pid_file_path),
+        control_token: control_token_path,
+    };
 
     // Hard gate, before anything is bound, written, or unlinked: a fixture
     // whose resolved paths still land on production refuses to start. The
     // derivation above is what makes the ordinary case work; this is what
     // makes a miss loud instead of a 50-minute production outage.
-    isolation.ensure_isolated(&crate::app::isolation::EnginePaths {
-        db: Some(cfg.work.db_path.clone()),
-        events_socket: Some(events_socket_path.clone()),
-        pid: Some(pid_file_path.clone()),
-        control_token: control_token_path.clone(),
-    })?;
+    isolation.ensure_isolated(&resolved)?;
 
-    // Log the paths the engine is actually about to use, now that every
-    // fallback has been applied. The previous version of this line ran before
-    // resolution and printed the pre-fallback `Option`s, so it contradicted
-    // itself: `events_socket="None" pid_path="None"` under a claim that
-    // production would not be touched — where `None` meant *will use
-    // production*. It also promised a guarantee it did not enforce; the
-    // guarantee now lives in `ensure_isolated` above, which has already run.
+    Ok(resolved)
+}
+
+async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths) -> Result<()> {
+    let socket_path = cli.socket_path.unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
+
+    let pid_env_override = std::env::var_os(crate::config::PID_PATH_ENV).map(std::path::PathBuf::from);
+    let token_env_override = crate::engine_control::default_token_path();
+    let resolved = resolve_engine_paths(&isolation, &cfg, pid_env_override, token_env_override)?;
+    let pid_file_path = resolved.pid.clone().unwrap_or_else(|| DEFAULT_PID_PATH.into());
+    let events_socket_path = resolved
+        .events_socket
+        .clone()
+        .expect("resolve_engine_paths always sets events_socket or returns Err");
+    let control_token_path = resolved.control_token.clone();
+
+    // Log the paths the engine will actually use, after every fallback has
+    // been applied. `ensure_isolated` has already run (inside
+    // `resolve_engine_paths`), so a fixture's paths are known distinct from
+    // production's.
     if isolation.is_test_fixture {
         tracing::info!(
             cwd = %cfg.work.cwd.display(),
@@ -286,15 +316,22 @@ pub async fn serve_with_merge_probe(
     // The socket this call is about to bind is the one every worker's
     // `settings.json` must name. Stamp it onto the config so downstream
     // resolvers read the binding instead of re-deriving it from the
-    // environment. In production `run` already set this and the swap is a
+    // environment. In production `run` already set this and the fill-in is a
     // no-op; it matters for in-process callers that pass an explicit socket
     // path alongside a config built without one.
-    let cfg = if cfg.work.events_socket_path == events_socket_path {
-        cfg
-    } else {
+    //
+    // Fill-in only: never overwrite a path the config already carries with
+    // `None`. `events_socket_path: None` here just means "this particular
+    // `serve` call didn't bind one" (e.g. an in-process test) — it is not
+    // evidence that the config's own path was wrong, and erasing it would
+    // silently hand every downstream resolver (`bound_events_socket_path`)
+    // back to re-reading `$BOSS_EVENTS_SOCKET`.
+    let cfg = if cfg.work.events_socket_path.is_none() && events_socket_path.is_some() {
         let mut work = cfg.work.clone();
         work.events_socket_path = events_socket_path.clone();
         Arc::new(cfg.with_work(work))
+    } else {
+        cfg
     };
 
     let (control_token, _control_token_guard) = match control_token_path {
@@ -1885,5 +1922,100 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                 tracing::error!(?err, "events socket accept failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_engine_paths_tests {
+    use std::path::PathBuf;
+
+    use super::resolve_engine_paths;
+    use crate::app::isolation::{
+        DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH, EnginePaths, IsolationOverrides, IsolationPaths,
+    };
+    use crate::config::{RuntimeConfig, WorkConfig};
+
+    const FIXTURE_SOCKET: &str = "/tmp/boss-test-resolve-abc.sock";
+
+    fn production() -> EnginePaths {
+        EnginePaths::under_state_root(
+            std::path::Path::new("/Users/tester/Library/Application Support/Boss"),
+            std::path::Path::new(DEFAULT_PID_PATH),
+        )
+    }
+
+    fn cfg_with_events_socket(events_socket: PathBuf) -> RuntimeConfig {
+        let work = WorkConfig::builder()
+            .cwd(PathBuf::from("/tmp"))
+            .db_path(PathBuf::from("/tmp/boss-test-resolve-abc.db"))
+            .events_socket_path(events_socket)
+            .build();
+        RuntimeConfig::from_parts(work, None)
+    }
+
+    /// A fixture with no overrides in play resolves the same four paths
+    /// `IsolationPaths::derive_from` derived, and passes the gate.
+    #[test]
+    fn fixture_with_no_overrides_resolves_the_derived_paths() {
+        let isolation = IsolationPaths::derive_from(FIXTURE_SOCKET, &IsolationOverrides::default(), &production());
+        let cfg = cfg_with_events_socket(isolation.derived.events_socket.clone().unwrap());
+
+        let resolved =
+            resolve_engine_paths(&isolation, &cfg, None, None).expect("a fully isolated fixture must resolve");
+
+        assert_eq!(resolved.db, Some(PathBuf::from("/tmp/boss-test-resolve-abc.db")));
+        assert_eq!(resolved.events_socket, isolation.derived.events_socket);
+        assert_eq!(resolved.pid, isolation.derived.pid);
+        assert_eq!(resolved.control_token, isolation.derived.control_token);
+    }
+
+    /// If the config's events socket resolves onto production — e.g. the
+    /// stamp `run` applies to `WorkConfig` was skipped or bypassed — the
+    /// wiring this function performs (not just the pure `derive_from`/
+    /// `ensure_isolated` functions in isolation.rs) must refuse the start.
+    /// This pins the call site the PR's own module doc criticised the old
+    /// `isolation_guard.rs` for never exercising.
+    #[test]
+    fn config_resolving_onto_production_is_refused_by_the_real_wiring() {
+        let prod = production();
+        let isolation = IsolationPaths::derive_from(FIXTURE_SOCKET, &IsolationOverrides::default(), &prod);
+        let cfg = cfg_with_events_socket(prod.events_socket.clone().unwrap());
+
+        let err = resolve_engine_paths(&isolation, &cfg, None, None)
+            .expect_err("a config resolving onto production must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("events socket"),
+            "error must name the colliding field; got: {msg}"
+        );
+        assert!(msg.contains("refused to start"), "error must be a refusal; got: {msg}");
+    }
+
+    /// The events socket in the resolved paths comes verbatim from `cfg`,
+    /// never re-derived — pins the "nothing but config load re-reads the env
+    /// var" invariant at this call site.
+    #[test]
+    fn events_socket_comes_from_config_not_the_environment() {
+        let isolation = IsolationPaths::derive_from(FIXTURE_SOCKET, &IsolationOverrides::default(), &production());
+        let bound = PathBuf::from("/tmp/boss-test-resolve-abc.events.sock");
+        let cfg = cfg_with_events_socket(bound.clone());
+
+        let resolved = resolve_engine_paths(&isolation, &cfg, None, None).unwrap();
+        assert_eq!(resolved.events_socket, Some(bound));
+    }
+
+    /// A production start (default socket) with no events socket bound onto
+    /// the config is an error, not a silent fall back to re-deriving one.
+    #[test]
+    fn missing_events_socket_in_config_is_an_error() {
+        let isolation = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+        let work = WorkConfig::builder()
+            .cwd(PathBuf::from("/tmp"))
+            .db_path(PathBuf::from("/tmp/state.db"))
+            .build();
+        let cfg = RuntimeConfig::from_parts(work, None);
+
+        let err = resolve_engine_paths(&isolation, &cfg, None, None).expect_err("no bound events socket must error");
+        assert!(format!("{err}").contains("HOME must be set"));
     }
 }

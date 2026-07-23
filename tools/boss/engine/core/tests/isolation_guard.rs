@@ -3,7 +3,8 @@
 //! Issue from 2026-05-24: a Swift XCTest spawned an additional Rust engine
 //! binary alongside the live production engine. Because only `--socket-path`
 //! was overridden, the test engine silently bound to the *production*
-//! `events.sock`, DB, and pid file — causing corrupted state on T651.
+//! `events.sock`, DB, and pid file — corrupting the live engine's state
+//! (see #756).
 //!
 //! The fix: when `--socket-path` is non-default, `IsolationPaths::derive`
 //! derives isolated paths for the DB, events socket, pid file, and
@@ -385,7 +386,11 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
 async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let socket_path = temp.path().join("boss-test-token-iso.sock");
-    let expected_token_path = temp.path().join("boss-test-token-iso.token");
+    // `.control-token`, not `.token`: every derived field is now named after
+    // the production file it stands in for (`engine-control.token`), so the
+    // fixture's token sits alongside `.db` / `.events.sock` / `.pid` under one
+    // naming rule. See `app::isolation::IsolationPaths::derive_from`.
+    let expected_token_path = temp.path().join("boss-test-token-iso.control-token");
 
     let cli = Cli {
         socket_path: Some(socket_path.to_string_lossy().into_owned()),

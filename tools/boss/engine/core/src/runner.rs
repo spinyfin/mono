@@ -145,12 +145,24 @@ pub trait ExecutionRunner: Send + Sync {
 ///
 /// The fallback covers the one shape where nothing was bound —
 /// `serve(..., events_socket_path: None, ...)`, used by in-process tests that
-/// never spawn a real worker.
+/// never spawn a real worker. It re-reads the environment when it fires,
+/// which is exactly the read the rest of this module exists to avoid, so it
+/// logs a warning: a live caller hitting this path is a regression in the
+/// "nothing but config load re-reads `$BOSS_EVENTS_SOCKET`" invariant, and
+/// should be visible in the log rather than only in a worker's `settings.json`.
 pub fn bound_events_socket_path(cfg: &RuntimeConfig) -> PathBuf {
-    cfg.work
-        .events_socket_path
-        .clone()
-        .unwrap_or_else(engine_events_socket_path)
+    match cfg.work.events_socket_path.clone() {
+        Some(path) => path,
+        None => {
+            tracing::warn!(
+                "bound_events_socket_path: no events socket bound on the config; \
+                 falling back to re-reading $BOSS_EVENTS_SOCKET / the production default. \
+                 Every real engine start should bind one via `serve`; seeing this outside \
+                 an in-process test that never spawns a worker is a regression.",
+            );
+            engine_events_socket_path()
+        }
+    }
 }
 
 /// Resolve the events socket from the environment: `BOSS_EVENTS_SOCKET` if
@@ -6492,8 +6504,15 @@ mod pane_spawn_tests {
     /// re-resolved the socket from the environment, so even a fixture that had
     /// correctly isolated its own socket would have baked the production path
     /// into every worker's `settings.json` — sending their hooks to the live
-    /// engine. The bazel test env pins `BOSS_EVENTS_SOCKET` to a value
-    /// distinct from the config's, so a regression here fails loudly.
+    /// engine. The bazel test env pins `HOME=/tmp` (see `engine_lib_test` in
+    /// `BUILD.bazel`) and does not set `BOSS_EVENTS_SOCKET` at all, so
+    /// `engine_events_socket_path()` falls back to
+    /// `/tmp/Library/Application Support/Boss/events.sock` — a path that
+    /// cannot collide with the test's `TempDir`-rooted config path. That is
+    /// what makes `assert_ne!` below meaningful: a regression that re-resolved
+    /// the socket from the environment would still fail loudly, just because
+    /// the two paths live in unrelated directories rather than because the
+    /// env var was deliberately mismatched.
     #[tokio::test]
     async fn spawn_env_uses_the_bound_socket_from_config_not_the_environment() {
         let workspace = TempDir::new().unwrap();

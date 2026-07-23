@@ -45,6 +45,16 @@ pub const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 /// The pid file a production engine writes.
 pub const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
 
+/// Bare filename of [`DEFAULT_PID_PATH`], for the value-shape check in
+/// [`IsolationPaths::derive_from`].
+const DEFAULT_PID_FILENAME: &str = "boss-engine.pid";
+
+/// Directory production's state-root files (db, events socket, control
+/// token) live under, relative to `$HOME` — shared by [`is_production_shaped`]
+/// so it can recognize production's shape without depending on *this*
+/// process's `$HOME`.
+const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
+
 /// The four pieces of engine-owned state a test fixture could collide with.
 ///
 /// One shape serves three roles: where production keeps each file
@@ -68,6 +78,19 @@ impl EnginePaths {
     /// Production's locations, resolved from the current process environment
     /// (really just `$HOME`, plus the hard-coded `/tmp` pid default). These
     /// are what the engine resolves with **no** overrides in play.
+    ///
+    /// **This models production's *default* location, not its actual one.**
+    /// If the live production engine itself runs with `BOSS_EVENTS_SOCKET`
+    /// (or `BOSS_DB_PATH`/`BOSS_ENGINE_CONTROL_TOKEN_PATH`) pointed somewhere
+    /// non-default — a documented, supported way to relocate engine state —
+    /// this struct still reports the default path, not the one the live
+    /// engine actually bound. A fixture that inherits that same relocated
+    /// override is invisible to both [`IsolationPaths::derive_from`]'s
+    /// equality rule and [`IsolationPaths::ensure_isolated`]'s gate: both
+    /// compare against this (wrong) model and report no collision. This is a
+    /// known limitation of the guard, not something either layer can close —
+    /// closing it would require the fixture to ask the *actual* running
+    /// engine where its state lives, which the guard has no channel for.
     pub fn production() -> Self {
         Self {
             db: boss_log_files::default_state_db_path(),
@@ -198,23 +221,51 @@ impl IsolationPaths {
         // it. Applied identically to all four fields: the 2026-07-23 incident
         // hit the events socket only because that worker happened to set
         // `BOSS_DB_PATH` itself; the stand-down logic was the same for each.
-        let derive_field = |override_value: &Option<PathBuf>, production: &Option<PathBuf>, suffix: &str| {
-            let stands_down = match override_value {
-                None => false,
-                Some(value) => !same_path(value, production.as_deref()),
+        //
+        // Two independent tests decide "is this really production", because
+        // either alone has a blind spot:
+        //   - `same_path` against `production` (this process's own $HOME):
+        //     catches the common case, but `production`'s field is `None`
+        //     when `HOME` is unset, and `same_path(_, None)` is unconditionally
+        //     false — so with no `HOME` this test alone would treat every
+        //     inherited production path as a deliberate override.
+        //   - `is_production_shaped`: a *structural* check (right filename,
+        //     parent ends `Library/Application Support/Boss`) that doesn't
+        //     depend on this process's own `$HOME` at all. It catches an
+        //     override inherited from a production engine running under a
+        //     *different* `$HOME` than this process (a wrapper, a launchd
+        //     job, a `rust_test` with `HOME` pinned to `/tmp`) — a case the
+        //     `same_path` test alone stands down on, because it compares
+        //     against this process's own (different) production model.
+        let derive_field =
+            |override_value: &Option<PathBuf>, production: &Option<PathBuf>, filename: &str, suffix: &str| {
+                let stands_down = match override_value {
+                    None => false,
+                    Some(value) => !same_path(value, production.as_deref()) && !is_production_shaped(value, filename),
+                };
+                (!stands_down).then(|| dir.join(format!("{stem}.{suffix}")))
             };
-            (!stands_down).then(|| dir.join(format!("{stem}.{suffix}")))
-        };
 
         Self {
             is_test_fixture: true,
             derived: EnginePaths {
-                db: derive_field(&overrides.db_path, &production.db, "db"),
-                events_socket: derive_field(&overrides.events_socket, &production.events_socket, "events.sock"),
-                pid: derive_field(&overrides.pid_path, &production.pid, "pid"),
+                db: derive_field(
+                    &overrides.db_path,
+                    &production.db,
+                    boss_log_files::STATE_DB_FILENAME,
+                    "db",
+                ),
+                events_socket: derive_field(
+                    &overrides.events_socket,
+                    &production.events_socket,
+                    boss_log_files::EVENTS_SOCKET_FILENAME,
+                    "events.sock",
+                ),
+                pid: derive_field(&overrides.pid_path, &production.pid, DEFAULT_PID_FILENAME, "pid"),
                 control_token: derive_field(
                     &overrides.control_token_path,
                     &production.control_token,
+                    boss_log_files::CONTROL_TOKEN_FILENAME,
                     "control-token",
                 ),
             },
@@ -272,6 +323,27 @@ impl IsolationPaths {
             return Ok(());
         }
 
+        // A gate that cannot compute what it is guarding must not report
+        // success. `same_path(_, None)` is unconditionally false, so if any
+        // of production's fields are unresolved (only possible with `HOME`
+        // unset — the pid field always has a value), the collision check
+        // below would silently find zero collisions for that field no matter
+        // what `resolved` actually names. Refuse to start instead.
+        let unknown_production: Vec<&str> = self
+            .production
+            .fields()
+            .into_iter()
+            .filter(|(_, _, path)| path.is_none())
+            .map(|(what, _, _)| what)
+            .collect();
+        if !unknown_production.is_empty() {
+            bail!(
+                "test-fixture engine refused to start: could not resolve production's {} (is $HOME set?), \
+                 so the isolation gate cannot verify this fixture does not collide with it. Set HOME and retry.",
+                unknown_production.join(", ")
+            );
+        }
+
         let collisions: Vec<String> = resolved
             .fields()
             .into_iter()
@@ -320,6 +392,24 @@ fn is_test_fixture_socket(socket_path: &str) -> bool {
 fn same_path(a: &Path, b: Option<&Path>) -> bool {
     let Some(b) = b else { return false };
     resolve_for_compare(a) == resolve_for_compare(b)
+}
+
+/// Does `path` have production's *shape* for `filename` — i.e. is it named
+/// exactly `filename` and does its parent end with production's state-root
+/// suffix (`Library/Application Support/Boss`)?
+///
+/// This is deliberately independent of *whose* `$HOME` produced `path`: it
+/// exists to catch an override inherited from a production engine running
+/// under a different `$HOME` than this process (or with `HOME` unset here
+/// entirely), which [`same_path`] cannot — `same_path` only knows *this*
+/// process's own production model. See [`EnginePaths::production`]'s doc for
+/// what this still cannot catch (production relocated by env var to a path
+/// that doesn't have this shape at all).
+fn is_production_shaped(path: &Path, filename: &str) -> bool {
+    if path.file_name().and_then(|n| n.to_str()) != Some(filename) {
+        return false;
+    }
+    path.parent().is_some_and(|parent| parent.ends_with(STATE_ROOT_SUFFIX))
 }
 
 fn resolve_for_compare(path: &Path) -> PathBuf {
@@ -501,6 +591,59 @@ mod tests {
             paths.derived.events_socket.as_deref(),
             Some(Path::new("/tmp/boss-test-abc123.events.sock"))
         );
+    }
+
+    /// An override that has production's *shape* (right filename, parent
+    /// ends `Library/Application Support/Boss`) must be treated as inherited
+    /// environment even when it names a *different* `$HOME` than this
+    /// process's own production model — e.g. a fixture launched under a
+    /// production engine running with `HOME=/Users/other`, or a bazel test
+    /// that pins `HOME=/tmp` while inheriting `BOSS_EVENTS_SOCKET` from a
+    /// real `/Users/tester/...` production engine.
+    #[test]
+    fn production_shaped_override_is_not_treated_as_an_override_even_under_a_different_home() {
+        let differently_homed_production =
+            PathBuf::from("/Users/someone-else/Library/Application Support/Boss/events.sock");
+        let paths = derive(IsolationOverrides {
+            events_socket: Some(differently_homed_production),
+            ..IsolationOverrides::default()
+        });
+        assert_eq!(
+            paths.derived.events_socket.as_deref(),
+            Some(Path::new("/tmp/boss-test-abc123.events.sock")),
+            "an override with production's shape is inherited env, not intent, regardless of whose $HOME it names"
+        );
+    }
+
+    /// The same shape check must stand in when this process cannot resolve
+    /// its own production model at all (`HOME` unset): `same_path` alone is
+    /// unconditionally false against `None`, so without the shape check every
+    /// inherited production override would be (wrongly) treated as intent.
+    #[test]
+    fn production_shaped_override_is_not_treated_as_an_override_when_home_is_unset() {
+        let paths = IsolationPaths::derive_from(
+            FIXTURE_SOCKET,
+            &IsolationOverrides {
+                db_path: Some(PathBuf::from(
+                    "/Users/someone/Library/Application Support/Boss/state.db",
+                )),
+                ..IsolationOverrides::default()
+            },
+            &EnginePaths::default(), // models HOME unset: every field None
+        );
+        assert_eq!(paths.derived.db.as_deref(), Some(Path::new("/tmp/boss-test-abc123.db")),);
+    }
+
+    /// The gate must fail closed, not open, when it cannot resolve
+    /// production's own paths — it cannot prove there is no collision.
+    #[test]
+    fn gate_refuses_to_start_when_production_cannot_be_resolved() {
+        let paths =
+            IsolationPaths::derive_from(FIXTURE_SOCKET, &IsolationOverrides::default(), &EnginePaths::default());
+        let err = paths
+            .ensure_isolated(&all_derived())
+            .expect_err("must refuse when production's own state can't be resolved");
+        assert!(format!("{err}").contains("could not resolve production's"));
     }
 
     // -- the refusal gate -------------------------------------------------

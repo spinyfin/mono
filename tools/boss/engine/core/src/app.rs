@@ -68,10 +68,7 @@ mod github_auth;
 pub(crate) mod handler_helpers;
 mod hosts;
 /// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
-/// directly. The previous incarnation of this guard was private, and the
-/// integration test named for it only ever exercised `serve()`'s arguments —
-/// the derivation itself shipped with zero coverage, which is how the
-/// stand-on-any-override bug survived.
+/// directly.
 pub mod isolation;
 mod live_status;
 mod metrics;

@@ -79,8 +79,9 @@ pub enum SocketError {
 ///
 /// Steps:
 ///   1. Ensure the parent directory exists.
-///   2. Unconditionally try to unlink the path. A previous engine
-///      that crashed without cleanup leaves a stale socket file
+///   2. Probe the path: if a live process is listening there, refuse —
+///      see [`path_has_a_live_listener`]. Otherwise unlink it. A previous
+///      engine that crashed without cleanup leaves a stale socket file
 ///      behind; if a fresh `bind()` ran without unlinking, on macOS
 ///      it would either return `EADDRINUSE` (if the kernel still
 ///      considers the inode bound) or — and this is the failure mode
@@ -99,6 +100,13 @@ pub enum SocketError {
 pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    if path_has_a_live_listener(path) {
+        return Err(io::Error::other(format!(
+            "refusing to unlink {}: a live process is already listening on it \
+             (every resolution layer above this one either missed a collision or was bypassed)",
+            path.display()
+        )));
     }
     match std::fs::remove_file(path) {
         Ok(()) => {
@@ -119,6 +127,30 @@ pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
     perms.set_mode(0o600);
     std::fs::set_permissions(path, perms)?;
     Ok(listener)
+}
+
+/// Is a live process currently listening at `path`?
+///
+/// This is the last-line defence beneath the isolation guard's path
+/// resolution (see `crate::app::isolation`): whatever route led here — a
+/// correctly-derived fixture path, a resolution hole in the guard, or a bug
+/// that bypasses it entirely — a socket file with nothing behind it is safe
+/// to unlink and rebind, and one with a live process behind it never is. That
+/// distinction is directly and cheaply testable without trusting anything
+/// about how `path` was resolved.
+///
+/// Connecting and getting `Ok` proves a process called `listen()` on this
+/// path and is still there to accept. `ECONNREFUSED` (socket file present,
+/// nothing listening — a crashed engine's leftover) and `ENOENT` (nothing
+/// there at all) both mean stale; any other error is treated as "can't tell,
+/// assume stale" so a transient permission hiccup doesn't newly block
+/// startup — the existing `remove_file` error handling right after this call
+/// still surfaces a real problem.
+fn path_has_a_live_listener(path: &Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_stream) => true,
+        Err(_) => false,
+    }
 }
 
 /// Look up the peer pid of a connected stream socket via
@@ -333,6 +365,38 @@ mod tests {
             connected.is_ok(),
             "connect() after rebind must succeed, got {:?}",
             connected.err()
+        );
+    }
+
+    /// The counterpart to `rebind_after_stale_file_listens`: a socket file
+    /// with a LIVE process behind it must be refused, not stolen. This is
+    /// the finding this probe closes — `bind_events_socket` previously
+    /// unlinked unconditionally on the assumption every file it found was
+    /// stale, which is exactly what let a fixture rebind a live production
+    /// socket when the layers above this one missed the collision.
+    #[tokio::test]
+    async fn refuses_to_steal_a_live_listener() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+
+        // Round 1: a real listener stays alive on `path` for the whole test.
+        let _live_listener = bind_events_socket(&path).unwrap();
+
+        // Round 2: a second bind attempt at the same path must be refused,
+        // and the first listener must still be reachable afterward.
+        let err = bind_events_socket(&path).expect_err("must not steal a live listener's socket");
+        assert!(
+            format!("{err}").contains("live process"),
+            "error should name the reason; got: {err}"
+        );
+
+        let path_for_thread = path.clone();
+        let connected = std::thread::spawn(move || StdUnixStream::connect(&path_for_thread))
+            .join()
+            .unwrap();
+        assert!(
+            connected.is_ok(),
+            "the original live listener must still be reachable after the refused steal attempt"
         );
     }
 
