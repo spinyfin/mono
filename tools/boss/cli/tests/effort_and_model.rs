@@ -29,18 +29,14 @@ async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
+        CreateProductInput::builder()
+            .name("Boss")
             // Test product has a repo so creation-time repo
             // resolution (design §Q4) doesn't refuse in --no-input;
             // this test is about effort / model fields, not repo
             // inference.
-            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
     )
     .await?;
 
@@ -80,18 +76,14 @@ async fn chore_create_rejects_invalid_effort_level() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
+        CreateProductInput::builder()
+            .name("Boss")
             // Test product has a repo so creation-time repo
             // resolution (design §Q4) doesn't refuse in --no-input;
             // this test is about effort / model fields, not repo
             // inference.
-            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
     )
     .await?;
 
@@ -124,18 +116,14 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
+        CreateProductInput::builder()
+            .name("Boss")
             // Test product has a repo so creation-time repo
             // resolution (design §Q4) doesn't refuse in --no-input;
             // this test is about effort / model fields, not repo
             // inference.
-            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
     )
     .await?;
 
@@ -181,18 +169,14 @@ async fn product_set_default_model_lifecycle_round_trips() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
+        CreateProductInput::builder()
+            .name("Boss")
             // Test product has a repo so creation-time repo
             // resolution (design §Q4) doesn't refuse in --no-input;
             // this test is about effort / model fields, not repo
             // inference.
-            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
     )
     .await?;
 
@@ -229,18 +213,14 @@ async fn model_override_passes_through_unrecognised_slug() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
+        CreateProductInput::builder()
+            .name("Boss")
             // Test product has a repo so creation-time repo
             // resolution (design §Q4) doesn't refuse in --no-input;
             // this test is about effort / model fields, not repo
             // inference.
-            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
     )
     .await?;
 

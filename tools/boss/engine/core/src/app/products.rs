@@ -134,6 +134,40 @@ pub(super) async fn handle_set_product_default_driver(ctx: Dispatch, req: Fronte
     }
 }
 
+pub(super) async fn handle_set_product_merge_mechanism(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetProductMergeMechanism { product_id, mechanism } = req else {
+        unreachable!()
+    };
+    {
+        match work_db.set_product_merge_mechanism(&product_id, mechanism.as_deref()) {
+            Ok(product) => {
+                let item = WorkItem::Product(product);
+                let pid = item.product_id().to_string();
+                let revision = publish_work_invalidation(
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    vec![work_product_topic(&pid)],
+                    "product_merge_mechanism_set",
+                    Some(pid),
+                    vec![work_item_id(&item)],
+                )
+                .await;
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+            }
+            Err(err) => send_work_error(&sink, &request_id, &err),
+        }
+    }
+}
+
 pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

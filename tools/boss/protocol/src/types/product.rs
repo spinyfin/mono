@@ -24,6 +24,10 @@ pub struct CreateProductInput {
     /// default `boss/`. Stored canonicalised with a trailing `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_branch_prefix: Option<String>,
+
+    /// See [`Product::merge_mechanism`]. `None` → `direct`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_mechanism: Option<String>,
 }
 
 /// One recorded enforcement action taken by the editorial-rules hook
@@ -177,6 +181,18 @@ pub struct Product {
     /// `bduff/`). Stored canonicalised with a guaranteed trailing `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_branch_prefix: Option<String>,
+
+    /// Per-product merge mechanism: how an approved merge is executed.
+    /// `None` (stored `NULL`) means `"direct"` — the default `gh pr merge
+    /// --auto --squash`, which also transparently covers GitHub-native
+    /// merge queues. `"trunk_queue"` submits the PR to Trunk's merge
+    /// queue instead. Stored verbatim as the raw setting string; the
+    /// engine parses it into `MergeMechanism` (see
+    /// `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+    /// §"Per-product merge mechanism"). There is no per-task override —
+    /// this is a property of how the repo integrates with its trunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_mechanism: Option<String>,
 }
 
 /// Input for `SetProductEditorialRules`: replace or clear a product's

@@ -27,18 +27,7 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let product = create_product_with(
-        &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
+    let product = create_product_with(&mut client, CreateProductInput::builder().name("Boss").build()).await?;
     let project = create_project_with(
         &mut client,
         CreateProjectInput {
@@ -72,14 +61,10 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
 
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
     )
     .await?;
     let project = create_project_with(
@@ -130,30 +115,8 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let primary = create_product_with(
-        &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
-    let other = create_product_with(
-        &mut client,
-        CreateProductInput {
-            name: "Mono".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
+    let primary = create_product_with(&mut client, CreateProductInput::builder().name("Boss").build()).await?;
+    let other = create_product_with(&mut client, CreateProductInput::builder().name("Mono").build()).await?;
     let project = create_project_with(
         &mut client,
         CreateProjectInput {

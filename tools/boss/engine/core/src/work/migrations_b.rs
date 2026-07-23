@@ -992,6 +992,21 @@ pub(crate) fn migrate_external_tracker_columns(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+/// Add `products.merge_mechanism` — the per-product setting selecting how
+/// an approved merge is executed: `NULL`/`'direct'` (today's `gh pr merge
+/// --auto --squash`, which also transparently covers GitHub-native merge
+/// queues) or `'trunk_queue'` (submit to Trunk's merge queue via its REST
+/// API). See `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+/// §"Per-product merge mechanism". Additive and idempotent; the merge-verb
+/// routing that branches on this value has not landed yet, so nothing in
+/// the merge path reads this column.
+pub(crate) fn migrate_products_merge_mechanism(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "merge_mechanism")? {
+        conn.execute("ALTER TABLE products ADD COLUMN merge_mechanism TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Create the `metrics_counter` / `metrics_gauge` tables for the
 /// engine counter-metrics framework (phase 1). Idempotent — the
 /// framework upserts on every flush, so re-running the migration is

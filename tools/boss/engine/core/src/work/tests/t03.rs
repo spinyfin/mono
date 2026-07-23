@@ -1615,16 +1615,14 @@ fn redispatch_preserves_investigation_execution_kind() {
     let path = temp_db_path("investigation-redispatch-kind");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            // No code repo on the product; the investigation carries its
-            // own docs-repo resolution, mirroring the reported scenario.
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: Some("git@github.com:spinyfin/docs.git".to_owned()),
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                // No code repo on the product; the investigation carries its
+                // own docs-repo resolution, mirroring the reported scenario.
+                .docs_repo("git@github.com:spinyfin/docs.git")
+                .build(),
+        )
         .unwrap();
     let investigation = db
         .create_investigation(

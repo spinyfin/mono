@@ -23,14 +23,10 @@ async fn set_then_show_then_unset_editorial_rules() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "EditorialProduct".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:example/repo.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("EditorialProduct")
+            .repo_remote_url("git@github.com:example/repo.git")
+            .build(),
     )
     .await?;
 
@@ -95,14 +91,7 @@ async fn editorial_test_produces_correct_decision() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "TestDecisionProduct".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder().name("TestDecisionProduct").build(),
     )
     .await?;
 
@@ -159,14 +148,7 @@ async fn editorial_show_returns_empty_initially() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product_with(
         &mut client,
-        CreateProductInput {
-            name: "ShowTestProduct".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder().name("ShowTestProduct").build(),
     )
     .await?;
 

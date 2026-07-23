@@ -62,6 +62,29 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Set (or clear) a product's `merge_mechanism`. `mechanism = None` or
+    /// `Some("")` clears the column (resolves to
+    /// [`crate::merge_mechanism::MergeMechanism::Direct`]). Any other value
+    /// is validated via [`crate::merge_mechanism::MergeMechanism::parse`]
+    /// before the write — this is the CLI-reachable write path, so an
+    /// invalid value must fail loudly here rather than persisting and only
+    /// surfacing later at every parse call site.
+    pub fn set_product_merge_mechanism(&self, product_id: &str, mechanism: Option<&str>) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let stored = mechanism.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        crate::merge_mechanism::MergeMechanism::parse(stored.as_deref())?;
+        let now = now_string();
+        tx.execute(
+            "UPDATE products SET merge_mechanism = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, stored, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Bind (or unbind) a product's external tracker columns.
     ///
     /// When `unset = true`: clears both `external_tracker_kind` and

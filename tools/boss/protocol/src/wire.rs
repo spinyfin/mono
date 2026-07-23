@@ -1658,6 +1658,19 @@ pub enum FrontendRequest {
         input: SetProductExternalTrackerInput,
     },
 
+    /// Set (or clear) a product's `merge_mechanism` (per the Trunk
+    /// merge-queue integration design's "Per-product merge mechanism"
+    /// setting). `mechanism` is the raw setting string (`"direct"` /
+    /// `"trunk_queue"`); `None` clears the column, which resolves to
+    /// `direct`. The engine validates the value against
+    /// `MergeMechanism::parse` and rejects unknown values. Returns the
+    /// updated product wrapped in `WorkItemUpdated`.
+    SetProductMergeMechanism {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mechanism: Option<String>,
+    },
+
     /// Set (or clear) a project's design-doc pointer. Persists the
     /// three `projects.design_doc_*` columns per
     /// [`SetProjectDesignDocInput`]'s semantics and replies with the

@@ -2512,6 +2512,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SetProductDefaultDriver { .. } => {
                 products::handle_set_product_default_driver(ctx, r).await
             }
+            r @ FrontendRequest::SetProductMergeMechanism { .. } => {
+                products::handle_set_product_merge_mechanism(ctx, r).await
+            }
             r @ FrontendRequest::SetProductEditorialRules { .. } => {
                 products::handle_set_product_editorial_rules(ctx, r).await
             }

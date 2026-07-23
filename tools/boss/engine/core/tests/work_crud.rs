@@ -27,14 +27,11 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: Some("multi-agent coding manager".to_owned()),
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .description("multi-agent coding manager")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
     )
     .await?;
     assert_eq!(product.name, "Boss");
@@ -166,14 +163,10 @@ async fn chore_description_with_control_chars_round_trips_as_valid_json() -> Res
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "ControlChars".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:control-chars.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("ControlChars")
+            .repo_remote_url("git@example.com:control-chars.git")
+            .build(),
     )
     .await?;
 
@@ -219,14 +212,10 @@ async fn delete_then_restore_round_trip_through_engine() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Recoverable".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:recoverable.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Recoverable")
+            .repo_remote_url("git@example.com:recoverable.git")
+            .build(),
     )
     .await?;
 
@@ -278,14 +267,10 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Priorities".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:priorities.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Priorities")
+            .repo_remote_url("git@example.com:priorities.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -362,15 +347,10 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Work".to_owned(),
-            description: None,
+        CreateProductInput::builder()
+            .name("Work")
             // Product has no default repo — every chore here picks one.
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+            .build(),
     )
     .await?;
 
@@ -456,14 +436,7 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
     let mut writer_client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(
         &mut writer_client,
-        CreateProductInput {
-            name: "Multiplex".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder().name("Multiplex").build(),
     )
     .await?;
 
@@ -517,14 +490,10 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
     let mut writer_client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(
         &mut writer_client,
-        CreateProductInput {
-            name: "Live".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:live.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Live")
+            .repo_remote_url("git@example.com:live.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -604,14 +573,10 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
     let mut writer_client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(
         &mut writer_client,
-        CreateProductInput {
-            name: "Sequenced".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:sequenced.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Sequenced")
+            .repo_remote_url("git@example.com:sequenced.git")
+            .build(),
     )
     .await?;
 
@@ -665,14 +630,10 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Bindable".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:bindable.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Bindable")
+            .repo_remote_url("git@example.com:bindable.git")
+            .build(),
     )
     .await?;
     let chore = create_chore(
@@ -973,14 +934,10 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
     )
     .await?;
     let a = create_chore(
@@ -1092,14 +1049,10 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "DepTest".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:deptest.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("DepTest")
+            .repo_remote_url("git@example.com:deptest.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -1292,14 +1245,10 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -1439,14 +1388,10 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
     // ----- in-repo (same-product) case --------------------------------------
     let mono = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Mono".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Mono")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -1585,18 +1530,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
     // A product without a `repo_remote_url` and a project whose pointer
     // sets only the path can't be resolved — surface as `Broken` per
     // design Q5.
-    let no_repo = create_product(
-        &mut client,
-        CreateProductInput {
-            name: "NoRepo".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
+    let no_repo = create_product(&mut client, CreateProductInput::builder().name("NoRepo").build()).await?;
     let orphan = create_project(
         &mut client,
         CreateProjectInput {
@@ -1671,14 +1605,10 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -1739,14 +1669,10 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -1830,18 +1756,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let product = create_product(
-        &mut client,
-        CreateProductInput {
-            name: "Greenfield".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
+    let product = create_product(&mut client, CreateProductInput::builder().name("Greenfield").build()).await?;
     let project = create_project(
         &mut client,
         CreateProjectInput {
@@ -1905,18 +1820,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let product = create_product(
-        &mut client,
-        CreateProductInput {
-            name: "Greenfield".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
+    let product = create_product(&mut client, CreateProductInput::builder().name("Greenfield").build()).await?;
     let project = create_project(
         &mut client,
         CreateProjectInput {
@@ -1972,18 +1876,7 @@ async fn product_dispatch_preamble_round_trip() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let product = create_product(
-        &mut client,
-        CreateProductInput {
-            name: "preamble-test".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
-    )
-    .await?;
+    let product = create_product(&mut client, CreateProductInput::builder().name("preamble-test").build()).await?;
     assert!(
         product.dispatch_preamble.is_none(),
         "new product has no dispatch_preamble"
@@ -2067,14 +1960,10 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "dup-test".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/dup-test.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("dup-test")
+            .repo_remote_url("git@github.com:foo/dup-test.git")
+            .build(),
     )
     .await?;
 
@@ -2152,14 +2041,10 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "task-dup-test".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/task-dup-test.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("task-dup-test")
+            .repo_remote_url("git@github.com:foo/task-dup-test.git")
+            .build(),
     )
     .await?;
     let project = create_project(
@@ -2207,14 +2092,10 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
     // Cross-product: same name in a different product is allowed.
     let other_product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "other-product".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("other-product")
+            .repo_remote_url("git@github.com:foo/other.git")
+            .build(),
     )
     .await?;
     let other_project = create_project(
@@ -2252,14 +2133,10 @@ async fn link_external_ref_stores_binding_and_is_findable() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Sync".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Sync")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
     let chore = create_chore(
@@ -2319,14 +2196,10 @@ async fn unlink_external_ref_clears_binding() -> Result<()> {
 
     let product = create_product(
         &mut client,
-        CreateProductInput {
-            name: "Unsync".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        },
+        CreateProductInput::builder()
+            .name("Unsync")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
     )
     .await?;
     let chore = create_chore(
@@ -2416,6 +2289,105 @@ async fn unlink_external_ref_unknown_id_returns_error() -> Result<()> {
     {
         FrontendEvent::WorkError { .. } => {}
         other => return Err(unexpected_event("expected WorkError for missing id", other)),
+    }
+
+    Ok(())
+}
+
+/// A non-NULL `merge_mechanism` set at product-create time survives the
+/// `create_product` -> `query_product` round trip on both `get`
+/// (`ListProducts`) and the freshly-created row returned by `CreateProduct`
+/// itself — guards the `?10` INSERT binding, the added SELECT column, and
+/// `row.get::<_, Option<String>>(17)` in `map_product` against a wrong
+/// column index or a mis-ordered SELECT list.
+#[tokio::test]
+async fn product_merge_mechanism_round_trips_through_create_and_list() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let with_mechanism = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Flunge")
+            .repo_remote_url("git@example.com:flunge.git")
+            .merge_mechanism("trunk_queue")
+            .build(),
+    )
+    .await?;
+    assert_eq!(with_mechanism.merge_mechanism.as_deref(), Some("trunk_queue"));
+
+    let without_mechanism = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Boss Core")
+            .repo_remote_url("git@example.com:boss-core.git")
+            .build(),
+    )
+    .await?;
+    assert_eq!(without_mechanism.merge_mechanism, None);
+
+    let products = list_products(&mut client).await?;
+    let listed_with = products
+        .iter()
+        .find(|p| p.id == with_mechanism.id)
+        .ok_or_else(|| anyhow!("created product with merge_mechanism missing from list_products"))?;
+    assert_eq!(listed_with.merge_mechanism.as_deref(), Some("trunk_queue"));
+
+    let listed_without = products
+        .iter()
+        .find(|p| p.id == without_mechanism.id)
+        .ok_or_else(|| anyhow!("created product without merge_mechanism missing from list_products"))?;
+    assert_eq!(listed_without.merge_mechanism, None);
+
+    Ok(())
+}
+
+/// `SetProductMergeMechanism` writes and clears the column, and rejects an
+/// unknown value rather than persisting it.
+#[tokio::test]
+async fn set_product_merge_mechanism_writes_clears_and_rejects_unknown() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput::builder().name("Mechanism Target").build(),
+    )
+    .await?;
+
+    let updated = match client
+        .send_request(&FrontendRequest::SetProductMergeMechanism {
+            product_id: product.id.clone(),
+            mechanism: Some("trunk_queue".to_owned()),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item)?,
+        other => return Err(unexpected_event("set-merge-mechanism", other)),
+    };
+    assert_eq!(updated.merge_mechanism.as_deref(), Some("trunk_queue"));
+
+    let cleared = match client
+        .send_request(&FrontendRequest::SetProductMergeMechanism {
+            product_id: product.id.clone(),
+            mechanism: None,
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item)?,
+        other => return Err(unexpected_event("set-merge-mechanism", other)),
+    };
+    assert_eq!(cleared.merge_mechanism, None);
+
+    match client
+        .send_request(&FrontendRequest::SetProductMergeMechanism {
+            product_id: product.id.clone(),
+            mechanism: Some("bogus".to_owned()),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { .. } => {}
+        other => return Err(unexpected_event("expected WorkError for unknown mechanism", other)),
     }
 
     Ok(())

@@ -287,6 +287,14 @@ enum ProductCommand {
     /// (`claude`). Mutually exclusive with `--unset`.
     #[command(name = "set-default-driver")]
     SetDefaultDriver(ProductSetDefaultDriverArgs),
+    /// Set (or clear) the product's merge mechanism — how an approved
+    /// merge on this product's PRs is executed. `direct` is today's
+    /// behavior (`gh pr merge --auto --squash`); `trunk_queue` submits to
+    /// Trunk's merge queue instead. See the Trunk merge-queue integration
+    /// design's "Per-product merge mechanism" setting. Mutually exclusive
+    /// with `--unset`.
+    #[command(name = "set-merge-mechanism")]
+    SetMergeMechanism(ProductSetMergeMechanismArgs),
     /// Heuristic feedback-loop audit (design §Q4 follow-up, PR
     /// #370). Aggregates recorded effort-escalation events against
     /// the §Q4 marker corpus and prints a per-marker
@@ -1540,6 +1548,24 @@ struct ProductSetDefaultDriverArgs {
     /// Clear the product's `default_driver` so the dispatcher falls
     /// through to the engine default (`claude`).
     /// Mutually exclusive with `--driver`.
+    #[arg(long)]
+    unset: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProductSetMergeMechanismArgs {
+    selector: String,
+
+    /// Merge mechanism to store on the product: `direct` (today's `gh pr
+    /// merge --auto --squash`, also covers GitHub-native merge queues) or
+    /// `trunk_queue` (submit to Trunk's merge queue). Rejected loudly if
+    /// it isn't one of those two values. Mutually exclusive with
+    /// `--unset`; one of the two is required.
+    #[arg(long, value_name = "MECHANISM", conflicts_with = "unset")]
+    mechanism: Option<String>,
+
+    /// Clear the product's `merge_mechanism` column, which resolves to
+    /// `direct`. Mutually exclusive with `--mechanism`.
     #[arg(long)]
     unset: bool,
 }
@@ -3167,14 +3193,14 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
 
             let product = create_product(
                 &mut client,
-                CreateProductInput {
-                    name,
-                    description,
-                    repo_remote_url,
-                    design_repo,
-                    docs_repo,
-                    worker_branch_prefix: args.worker_branch_prefix,
-                },
+                CreateProductInput::builder()
+                    .name(name)
+                    .maybe_description(description)
+                    .maybe_repo_remote_url(repo_remote_url)
+                    .maybe_design_repo(design_repo)
+                    .maybe_docs_repo(docs_repo)
+                    .maybe_worker_branch_prefix(args.worker_branch_prefix)
+                    .build(),
             )
             .await?;
 
@@ -3270,6 +3296,19 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
             let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
             let driver = if args.unset { None } else { args.driver };
             let updated = set_product_default_driver(&mut client, &product.id, driver).await?;
+            print_entity(ctx, &serde_json::json!({ "product": updated }), || {
+                print_product_details("Updated product", &updated);
+            })
+        }
+        ProductCommand::SetMergeMechanism(args) => {
+            if !args.unset && args.mechanism.is_none() {
+                return Err(CliError::usage(
+                    "provide either --mechanism <direct|trunk_queue> or --unset",
+                ));
+            }
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let mechanism = if args.unset { None } else { args.mechanism };
+            let updated = set_product_merge_mechanism(&mut client, &product.id, mechanism).await?;
             print_entity(ctx, &serde_json::json!({ "product": updated }), || {
                 print_product_details("Updated product", &updated);
             })
@@ -6663,6 +6702,22 @@ async fn set_product_default_driver(
             driver,
         },
         "set-default-driver",
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item),
+    )
+}
+
+async fn set_product_merge_mechanism(
+    client: &mut BossClient,
+    product_id: &str,
+    mechanism: Option<String>,
+) -> Result<Product, CliError> {
+    rpc_call!(
+        try client,
+        FrontendRequest::SetProductMergeMechanism {
+            product_id: product_id.to_owned(),
+            mechanism,
+        },
+        "set-merge-mechanism",
         FrontendEvent::WorkItemUpdated { item } => expect_product(item),
     )
 }

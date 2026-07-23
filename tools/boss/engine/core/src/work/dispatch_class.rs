@@ -124,14 +124,12 @@ mod tests {
 
     /// Create a product with the given repo default. Returns the product id.
     fn product_with_repo(db: &WorkDb, repo: Option<&str>) -> String {
-        db.create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: repo.map(str::to_owned),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
+        db.create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .maybe_repo_remote_url(repo.map(str::to_owned))
+                .build(),
+        )
         .unwrap()
         .id
     }

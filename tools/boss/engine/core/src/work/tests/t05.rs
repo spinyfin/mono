@@ -470,14 +470,13 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
     let (_dir, path) = disk_db_path("resolve-design-repo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .design_repo("git@github.com:linkedin-sandbox/bduff.git")
+                .build(),
+        )
         .unwrap();
     // Project creation seeds a `kind = 'design'` task.
     let project = db
@@ -576,14 +575,13 @@ fn resolve_repo_task_override_wins_over_design_repo() {
     let (_dir, path) = disk_db_path("resolve-design-override-wins");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .design_repo("git@github.com:linkedin-sandbox/bduff.git")
+                .build(),
+        )
         .unwrap();
     let project = db
         .create_project(CreateProjectInput {
@@ -630,14 +628,13 @@ fn product_design_repo_set_and_clear() {
     let (_dir, path) = disk_db_path("design-repo-set-clear");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .design_repo("git@github.com:linkedin-sandbox/bduff.git")
+                .build(),
+        )
         .unwrap();
     assert_eq!(
         product.design_repo.as_deref(),
@@ -676,14 +673,13 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
     let (_dir, path) = disk_db_path("resolve-docs-repo");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .docs_repo("git@github.com:linkedin-sandbox/bduff.git")
+                .build(),
+        )
         .unwrap();
 
     // Create a chore, then flip its kind to `investigation` directly
@@ -730,14 +726,13 @@ fn product_docs_repo_set_and_clear() {
     let (_dir, path) = disk_db_path("docs-repo-set-clear");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .docs_repo("git@github.com:linkedin-sandbox/bduff.git")
+                .build(),
+        )
         .unwrap();
     assert_eq!(
         product.docs_repo.as_deref(),

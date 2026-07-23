@@ -63,14 +63,10 @@ struct SeededExecution {
 async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
     let product = match client
         .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
         })
         .await?
     {
@@ -781,14 +777,10 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
 
     let product = match client
         .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
         })
         .await?
     {
@@ -887,14 +879,10 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
 
     let product = match client
         .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
         })
         .await?
     {
@@ -974,14 +962,10 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
 
     let product = match client
         .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
         })
         .await?
     {
@@ -1211,14 +1195,10 @@ async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> R
 async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protocol::Task> {
     let product = match client
         .send_request(&FrontendRequest::CreateProduct {
-            input: CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            },
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
         })
         .await?
     {
@@ -1297,14 +1277,12 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     // for the seed because there's no public protocol-level
     // `insert_conflict_resolution`; that's an engine-internal flow.
     let work_db = WorkDb::open(engine.db_path.clone())?;
-    let product = work_db.create_product(CreateProductInput {
-        name: "P".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
             .product_id(product.id.clone())
@@ -1405,14 +1383,12 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
     let engine = spawn_engine().await?;
 
     let work_db = WorkDb::open(engine.db_path.clone())?;
-    let product = work_db.create_product(CreateProductInput {
-        name: "P".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
             .product_id(product.id.clone())
@@ -1553,14 +1529,12 @@ async fn mark_ci_remediation_succeeded_via_rebase_pre_probe_guards() -> Result<(
     let engine = spawn_engine().await?;
 
     let work_db = WorkDb::open(engine.db_path.clone())?;
-    let product = work_db.create_product(CreateProductInput {
-        name: "P".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
             .product_id(product.id.clone())
@@ -1717,14 +1691,12 @@ async fn seed_and_claim_via_rebase(
     .await?;
 
     let work_db = WorkDb::open(engine.db_path.clone())?;
-    let product = work_db.create_product(CreateProductInput {
-        name: "P".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
             .product_id(product.id.clone())
@@ -1875,14 +1847,12 @@ async fn mark_ci_remediation_succeeded_via_rebase_rejects_merge_queue_rebounce()
     .await?;
 
     let work_db = WorkDb::open(engine.db_path.clone())?;
-    let product = work_db.create_product(CreateProductInput {
-        name: "P".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
             .product_id(product.id.clone())
@@ -2189,14 +2159,12 @@ async fn seed_two_conflict_resolutions(
     boss_protocol::ConflictResolution,
 )> {
     let work_db = WorkDb::open(engine.db_path.clone())?;
-    let product = work_db.create_product(CreateProductInput {
-        name: "P".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
     let chore = work_db.create_chore(
         CreateChoreInput::builder()
             .product_id(product.id.clone())
