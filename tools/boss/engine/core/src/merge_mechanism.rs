@@ -1,8 +1,10 @@
 //! Per-product merge mechanism: how an approved merge is executed.
 //!
 //! Parses the raw `products.merge_mechanism` setting (`NULL` / `"direct"` /
-//! `"trunk_queue"`) into an engine-side enum. The merge-verb routing that
-//! branches on this enum has not landed yet; see
+//! `"trunk_queue"`) into an engine-side enum.
+//! `app::review::handle_merge_when_ready` branches on this enum: `Direct`
+//! runs `gh pr merge --auto --squash`; `TrunkQueue` submits the PR to
+//! Trunk's merge queue. See
 //! `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
 //! §"Per-product merge mechanism".
 

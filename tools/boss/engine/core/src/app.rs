@@ -887,11 +887,17 @@ impl ServerState {
         let trunk_token_store_for_state: Arc<dyn trunk_auth::TrunkTokenSource> =
             trunk_token_store_override.unwrap_or_else(|| Arc::new(boss_trunk_auth::TrunkTokenStore::new()));
 
-        // Trunk queue REST client. Production shares the same keychain-backed
-        // token store as `trunk_token_store` above (it implements
-        // `boss_trunk_client::TrunkTokenProvider` directly); tests point
-        // `trunk_client_override` at a `wiremock::MockServer` via
-        // `CallConfig::with_base_url`.
+        // Trunk queue REST client. Builds its own `TrunkTokenStore` — it reads
+        // the same env override / keychain entry as `trunk_token_store`
+        // above, but the two traits (`TrunkTokenSource` for set/status,
+        // `TrunkTokenProvider` for API calls) are distinct, so the instance
+        // above can't be passed here directly; both stores are stateless
+        // (every read goes straight to the env var / keychain), so a second
+        // instance behaves identically to sharing one. Note that
+        // `trunk_token_store_override` alone therefore does not affect this
+        // client — a test needs `trunk_client_override` to control the token
+        // the client actually sends. Tests point `trunk_client_override` at a
+        // `wiremock::MockServer` via `CallConfig::with_base_url`.
         let trunk_client_for_state: boss_trunk_client::TrunkClient = trunk_client_override.unwrap_or_else(|| {
             boss_trunk_client::TrunkClient::new(
                 Arc::new(boss_trunk_auth::TrunkTokenStore::new()),

@@ -3556,6 +3556,32 @@ pub(crate) async fn update_pr_poll_state(
             (raw_merge_queue_state, raw_merge_queue_detail)
         };
 
+    // A `trunk_queue`-mechanism task never actually sits in GitHub's native
+    // merge queue or arms GitHub auto-merge, so this probe's
+    // `in_merge_queue`/`auto_merge_enabled` reads are always false for it —
+    // yet `handle_trunk_queue_merge` optimistically writes
+    // `merge_queue_state = "queued"` right after a successful Trunk submit
+    // so the card shows in the Merging lane. Without this gate, the very
+    // next sweep would wipe that write back to NULL, bouncing the card out
+    // of Merging within one poll interval. `preserve_merge_queue_state`
+    // leaves the stored merge-queue columns exactly as `handle_trunk_queue_merge`
+    // (or the Trunk queue poller, once it lands) left them.
+    let preserve_merge_queue_state = match work_db.get_product(&candidate.product_id) {
+        Ok(Some(product)) => matches!(
+            crate::merge_mechanism::MergeMechanism::parse(product.merge_mechanism.as_deref()),
+            Ok(crate::merge_mechanism::MergeMechanism::TrunkQueue { .. })
+        ),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                product_id = %candidate.product_id,
+                ?err,
+                "merge poller: failed to load product to check merge mechanism; treating as direct",
+            );
+            false
+        }
+    };
+
     let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
         PrPollStateInput {
@@ -3565,6 +3591,7 @@ pub(crate) async fn update_pr_poll_state(
             review_required_detail: review_detail.as_deref(),
             merge_queue_state,
             merge_queue_detail: merge_queue_detail.as_deref(),
+            preserve_merge_queue_state,
         },
     ) {
         Ok(outcome) => outcome,
@@ -3626,9 +3653,15 @@ pub(crate) async fn update_pr_poll_state(
     // state change while still queued — can shift where every OTHER queued
     // member of this product belongs, so re-derive the whole set whenever
     // this row's queue membership moved on either side of the update.
+    // Never for a `preserve_merge_queue_state` task: its own row's
+    // merge-queue columns were untouched by this write (whatever
+    // `merge_queue_state`/`outcome.prior_merge_queue_state` read here reflect
+    // the untouched GitHub probe, not the trunk-owned stored value), and a
+    // whole-product renumbering pass is a GitHub-native-queue concept that
+    // does not apply to a `trunk_queue` product's rows.
     let now_queued = merge_queue_state == Some("queued");
     let was_queued = outcome.prior_merge_queue_state.as_deref() == Some("queued");
-    if outcome.changed && (now_queued || was_queued) {
+    if !preserve_merge_queue_state && outcome.changed && (now_queued || was_queued) {
         renumber_merge_queue(work_db, publisher, &candidate.product_id).await;
     }
 
@@ -10377,6 +10410,65 @@ mod tests {
             ci_required_state.as_deref(),
             Some("fail"),
             "ci_required_state must still be stamped normally"
+        );
+    }
+
+    /// Regression: a `trunk_queue`-mechanism task's `merge_queue_state`
+    /// column is owned by `app::review::handle_trunk_queue_merge`'s
+    /// optimistic write after a successful Trunk submit, not by this
+    /// GitHub-facing poller. GitHub always reports
+    /// `in_merge_queue=false`/`auto_merge_enabled=false` for such a task
+    /// (it never actually enters GitHub's native queue), so without the
+    /// `preserve_merge_queue_state` gate every sweep would immediately wipe
+    /// the optimistic `"queued"` write back to `None` — bouncing the card
+    /// out of the Merging lane within one poll interval.
+    #[tokio::test]
+    async fn update_pr_poll_state_preserves_trunk_owned_merge_queue_state() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "TrunkPreserve", Some("git@github.com:foo/bar.git"));
+        db.set_product_merge_mechanism(&product.id, Some("trunk_queue"))
+            .unwrap();
+        let t = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/1");
+
+        let detail = serde_json::json!({"source": "trunk", "state": "pending"}).to_string();
+        db.set_task_merge_queue_state(&t, Some("queued"), Some(&detail))
+            .unwrap();
+
+        // A GitHub probe for a trunk_queue task's PR always reads
+        // "not in GitHub's native queue, auto-merge not armed" — this is
+        // the shape a real sweep would observe.
+        let probe = probe_with_queue_fields(false, None, None, None, false, None);
+        let candidate = PendingMergeCheck {
+            work_item_id: t.clone(),
+            product_id: product.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
+        };
+        let publisher = RecordingPublisher::default();
+        update_pr_poll_state(&db, &publisher, &candidate, &probe).await;
+
+        let (state, stored_detail) = merge_queue_columns(&db, &t);
+        assert_eq!(
+            state.as_deref(),
+            Some("queued"),
+            "a trunk_queue task's optimistic merge_queue_state must survive a GitHub-facing poll sweep"
+        );
+        assert_eq!(
+            stored_detail["source"],
+            serde_json::json!("trunk"),
+            "the trunk-owned detail blob must not be overwritten by the GitHub probe's (empty) detail"
+        );
+
+        // No whole-queue renumbering pass for a trunk_queue product either
+        // — that's a GitHub-native-queue concept and does not apply here.
+        let renumbered = publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(_, _, reason)| reason == "merge_queue_renumbered");
+        assert!(
+            !renumbered,
+            "a trunk_queue product's rows must never go through GitHub-native queue renumbering"
         );
     }
 

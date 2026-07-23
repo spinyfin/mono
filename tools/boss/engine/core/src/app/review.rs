@@ -202,19 +202,67 @@ async fn handle_trunk_queue_merge(
         Ok(Some(intent)) => intent,
         Ok(None) => {
             // Duplicate click: an intent is already active for this work
-            // item. No-op — re-report success without re-submitting to
+            // item. Only a genuine no-op when that intent is still for the
+            // *current* PR — re-report success without re-submitting to
             // Trunk (design: "a second merge click on an already-active
-            // intent is a no-op that re-reports current queue state").
-            server_state.pr_reconciler_kick.notify_one();
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::MergeWhenReadyAccepted {
-                    work_item_id,
-                    pr_url,
-                    action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
-                },
-            );
+            // intent is a no-op that re-reports current queue state"). If
+            // the active intent is for a different PR (closed/reopened,
+            // replaced), reporting success here would tell the user the
+            // current PR was enqueued when nothing was submitted for it.
+            let active = match work_db.get_active_trunk_merge_intent(&work_item_id) {
+                Ok(active) => active,
+                Err(err) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!("merge_when_ready: failed to load active trunk merge intent: {err}"),
+                        },
+                    );
+                    return;
+                }
+            };
+            match active {
+                Some(active) if active.pr_url == pr_url => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::MergeWhenReadyAccepted {
+                            work_item_id,
+                            pr_url,
+                            action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
+                        },
+                    );
+                }
+                Some(active) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "merge_when_ready: a trunk merge intent is already active for {} (this work item's current PR is {pr_url}); resolve the stale intent before retrying",
+                                active.pr_url
+                            ),
+                        },
+                    );
+                }
+                None => {
+                    // The insert reported a duplicate but no active row is
+                    // visible now (raced with the poller retiring it, or
+                    // `INSERT OR IGNORE` swallowed a genuine constraint
+                    // violation unrelated to the dedup index) — do not claim
+                    // success for a submission that never happened.
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: "merge_when_ready: trunk merge intent insert was ignored but no active intent \
+                                      was found; retry the merge"
+                                .to_owned(),
+                        },
+                    );
+                }
+            }
             return;
         }
         Err(err) => {
@@ -230,7 +278,6 @@ async fn handle_trunk_queue_merge(
     };
 
     let trunk_client = server_state.trunk_client.clone();
-    let kick = server_state.pr_reconciler_kick.clone();
     tokio::spawn(async move {
         let request = boss_trunk_client::SubmitPullRequestRequest::builder()
             .repo(boss_trunk_client::TrunkRepoRef::new(
@@ -244,7 +291,15 @@ async fn handle_trunk_queue_merge(
         match trunk_client.submit_pull_request(&request).await {
             Ok(()) => {
                 // Optimistically move the card into the Merging UI ahead of
-                // the queue poller's first sweep.
+                // the queue poller's first sweep. Deliberately does NOT kick
+                // `pr_reconciler_kick`: that wakes the GitHub merge poller,
+                // which for a trunk_queue product always observes
+                // in_merge_queue=false / auto_merge_enabled=false and would
+                // immediately clobber this write back to NULL — see
+                // `merge_poller::update_pr_poll_state`'s
+                // `preserve_merge_queue_state` gate, which is what actually
+                // protects this write once the poller does run on its own
+                // schedule.
                 let detail = serde_json::json!({"source": "trunk", "state": "pending"}).to_string();
                 if let Err(err) = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail)) {
                     tracing::error!(
@@ -253,7 +308,6 @@ async fn handle_trunk_queue_merge(
                         "merge_when_ready: trunk submit succeeded but optimistic merge_queue_state write failed",
                     );
                 }
-                kick.notify_one();
                 send_response(
                     &sink,
                     &request_id,
@@ -800,9 +854,14 @@ mod trunk_queue_tests {
         let envelope = sink.next().await.expect("a response should be enqueued");
         match envelope.payload {
             FrontendEvent::WorkError { message } => {
+                // Tightened from a bare `.contains("trunk")` (which the
+                // wrapper string `"trunk queue submission failed for ..."`
+                // would satisfy for ANY `TrunkError` variant, not just an
+                // auth failure) to pin the actual 401 -> TrunkError::Auth
+                // mapping via its `Display` text.
                 assert!(
-                    message.contains("trunk"),
-                    "expected a trunk-specific error, got: {message}"
+                    message.contains("trunk authentication failed"),
+                    "expected the 401 to map to TrunkError::Auth, got: {message}"
                 );
             }
             other => panic!("expected WorkError, got {other:?}"),
@@ -822,5 +881,320 @@ mod trunk_queue_tests {
             panic!("expected a chore");
         };
         assert_eq!(task.merge_queue_state, None);
+    }
+
+    /// A `TrunkTokenProvider` that always reports "no token configured" —
+    /// exercises the missing-token path (distinct from a rejected-token
+    /// 401 response from the server) through the same loud-no-fallback
+    /// contract as [`trunk_queue_merge_auth_failure_is_loud_with_no_fallback`].
+    #[derive(Clone)]
+    struct NoTokenProvider;
+
+    impl boss_trunk_client::TrunkTokenProvider for NoTokenProvider {
+        fn token(&self) -> Result<boss_trunk_client::SecretString, boss_trunk_client::TrunkError> {
+            Err(boss_trunk_client::TrunkError::Auth("no token configured".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn trunk_queue_merge_missing_token_is_loud_with_no_fallback() {
+        let server = MockServer::start().await;
+        // The client must fail before ever issuing the HTTP call.
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let trunk_client = TrunkClient::new(
+            Arc::new(NoTokenProvider),
+            CallConfig::new(Duration::from_secs(5)).with_base_url(server.uri()),
+        );
+        let (state, _temp) = test_server_state(trunk_client);
+        let (_product_id, work_item_id) = seed_trunk_queue_chore(
+            &state.work_db,
+            "trunk-chore-no-token",
+            "https://github.com/brianduff/flunge/pull/981",
+        );
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: work_item_id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("trunk authentication failed"),
+                    "expected a missing-token auth error, got: {message}"
+                );
+            }
+            other => panic!("expected WorkError, got {other:?}"),
+        }
+
+        assert!(
+            state
+                .work_db
+                .get_active_trunk_merge_intent(&work_item_id)
+                .unwrap()
+                .is_none()
+        );
+        server.verify().await;
+    }
+
+    /// A product with `merge_mechanism` `NULL` still routes through the
+    /// `gh pr merge` (Direct) path: no trunk merge intent is created and
+    /// the Trunk server is never contacted, even though the new
+    /// product/mechanism preflight runs ahead of the Direct branch.
+    #[tokio::test]
+    async fn merge_mechanism_null_still_routes_direct() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "direct-null-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "direct-null-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/990".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        assert!(
+            state
+                .work_db
+                .get_active_trunk_merge_intent(&chore.id)
+                .unwrap()
+                .is_none(),
+            "a NULL-mechanism product must never create a trunk merge intent"
+        );
+        server.verify().await;
+    }
+
+    /// A product with `merge_mechanism` explicitly `"direct"` also routes
+    /// through the Direct path — mirrors the NULL case above, pinning that
+    /// the explicit value behaves identically.
+    #[tokio::test]
+    async fn merge_mechanism_explicit_direct_still_routes_direct() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "direct-explicit-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        state
+            .work_db
+            .set_product_merge_mechanism(&product.id, Some("direct"))
+            .unwrap();
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "direct-explicit-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/991".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        assert!(
+            state
+                .work_db
+                .get_active_trunk_merge_intent(&chore.id)
+                .unwrap()
+                .is_none(),
+            "an explicit direct-mechanism product must never create a trunk merge intent"
+        );
+        server.verify().await;
+    }
+
+    /// An unknown `product_id` on the task fails the new product preflight
+    /// loudly rather than silently falling through to either merge path.
+    #[tokio::test]
+    async fn unknown_product_is_a_loud_work_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        // Create a product, bind a chore to it, then delete the product row
+        // out from under the chore — `create_chore` validates the product
+        // exists at insert time, so this is the simplest way to leave a
+        // chore pointing at a `product_id` `get_product` no longer resolves.
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "vanishing-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "orphaned-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/992".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        {
+            let conn = state.work_db.connect().unwrap();
+            // The chore still references this product, so the delete must
+            // run with the FK check off — deliberately reproducing an
+            // orphaned `product_id` rather than a state schema constraints
+            // would allow.
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute("DELETE FROM products WHERE id = ?1", [&product.id])
+                .unwrap();
+        }
+
+        let sink = make_session_sink();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("unknown product"),
+                    "expected an unknown-product error, got: {message}"
+                );
+            }
+            other => panic!("expected WorkError, got {other:?}"),
+        }
+        server.verify().await;
+    }
+
+    /// A corrupt `merge_mechanism` value (anything other than `NULL`,
+    /// `"direct"`, `"trunk_queue"`) fails loudly rather than silently
+    /// defaulting to either merge path.
+    #[tokio::test]
+    async fn corrupt_merge_mechanism_is_a_loud_work_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _temp) = test_server_state(trunk_client_for(server.uri()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "corrupt-mechanism-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        // `set_product_merge_mechanism` validates before writing, so a
+        // corrupt value can only arise as data corruption — write it
+        // directly, bypassing that validation, to simulate that.
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE products SET merge_mechanism = 'bogus' WHERE id = ?1",
+                [&product.id],
+            )
+            .unwrap();
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "corrupt-mechanism-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/993".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+
+        let sink = make_session_sink();
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::WorkError { message } => {
+                assert!(
+                    message.contains("bogus"),
+                    "expected the unknown-mechanism error to name the offending value, got: {message}"
+                );
+            }
+            other => panic!("expected WorkError, got {other:?}"),
+        }
+        assert!(
+            state
+                .work_db
+                .get_active_trunk_merge_intent(&chore.id)
+                .unwrap()
+                .is_none(),
+            "a corrupt mechanism must never create a trunk merge intent"
+        );
+        server.verify().await;
     }
 }

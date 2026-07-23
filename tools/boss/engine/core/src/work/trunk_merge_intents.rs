@@ -2,9 +2,10 @@
 //! product's PR was submitted to Trunk's merge queue via the merge button.
 //!
 //! One active row per work item is the poller's tracking anchor and the
-//! memory that the operator approved this merge (it authorizes the
-//! auto-resubmit-after-eviction flow — see the design's "Entry state
-//! machine"). The partial unique index on `(work_item_id) WHERE status =
+//! standing record that this merge was approved by a human click — that
+//! record is what authorizes automatic resubmission after an eviction is
+//! fixed, so a fix does not require a fresh click (see the design's "Entry
+//! state machine"). The partial unique index on `(work_item_id) WHERE status =
 //! 'active'` is the dedup gate: [`WorkDb::insert_trunk_merge_intent`] uses
 //! `INSERT OR IGNORE`, so a second merge click while an intent is already
 //! active returns `Ok(None)` rather than a second row — mirroring the
@@ -135,27 +136,6 @@ impl WorkDb {
     pub fn delete_trunk_merge_intent(&self, id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute("DELETE FROM trunk_merge_intents WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    /// Optimistically write the Merging-UI columns for `work_item_id`
-    /// immediately after a successful Trunk `submitPullRequest`, so the
-    /// card moves into the Merging lane without waiting for the queue
-    /// poller's first sweep. Unlike [`Self::update_task_pr_poll_state`],
-    /// this touches only `merge_queue_state`/`merge_queue_detail` — it does
-    /// not require a fresh CI/review probe.
-    pub fn set_task_merge_queue_state(
-        &self,
-        work_item_id: &str,
-        merge_queue_state: Option<&str>,
-        merge_queue_detail: Option<&str>,
-    ) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE tasks SET merge_queue_state = ?2, merge_queue_detail = ?3 \
-             WHERE id = ?1 AND deleted_at IS NULL",
-            params![work_item_id, merge_queue_state, merge_queue_detail],
-        )?;
         Ok(())
     }
 }
