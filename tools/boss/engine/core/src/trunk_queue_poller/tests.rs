@@ -36,7 +36,7 @@ impl StubError {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
 struct StubTrunkApi {
     /// Replies for successive `getQueue` calls. The last entry is sticky,
     /// so a test that only cares about one shape can enqueue it once and
@@ -49,6 +49,11 @@ struct StubTrunkApi {
     list_pull_requests_replies: Mutex<VecDeque<Result<ListPullRequestsResponse, StubError>>>,
     queue_calls: Mutex<Vec<(String, String)>>,
     entry_calls: Mutex<Vec<u64>>,
+    /// `(since, cursor)` for every `listPullRequests` call, in order —
+    /// lets a test assert directly on whether the reconciliation
+    /// backstop advanced its cursor past a failed window, and whether it
+    /// followed `next_cursor` into a second page.
+    list_pull_requests_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
 
 impl StubTrunkApi {
@@ -73,6 +78,10 @@ impl StubTrunkApi {
 
     fn entry_call_count(&self) -> usize {
         self.entry_calls.lock().unwrap().len()
+    }
+
+    fn list_pull_requests_calls(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.list_pull_requests_calls.lock().unwrap().clone()
     }
 }
 
@@ -107,8 +116,12 @@ impl TrunkQueueApi for StubTrunkApi {
 
     async fn list_pull_requests(
         &self,
-        _request: &ListPullRequestsRequest,
+        request: &ListPullRequestsRequest,
     ) -> Result<ListPullRequestsResponse, TrunkError> {
+        self.list_pull_requests_calls
+            .lock()
+            .unwrap()
+            .push((request.since.clone(), request.cursor.clone()));
         let mut replies = self.list_pull_requests_replies.lock().unwrap();
         let reply = if replies.len() > 1 {
             replies.pop_front()
@@ -1035,5 +1048,87 @@ async fn the_reconciliation_backstop_does_not_fire_before_its_own_cadence() {
     assert_eq!(
         second.intents_retired, 0,
         "a stale listPullRequests reply must not fire early"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_reconciliation_call_does_not_advance_the_since_cursor() {
+    let (_tmp, db) = crate::test_support::open_db();
+    seed_intent(&db, "reconcile-failure", 978);
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    // First reconciliation attempt fails outright; the second (a full
+    // RECONCILE_INTERVAL later) would succeed and resolve the entry, but
+    // this test only cares about what `since` the second call sent.
+    api.set_list_pull_requests(vec![
+        Err(StubError::Unavailable),
+        Ok(ListPullRequestsResponse {
+            pull_requests: vec![entry_of(978, TrunkPrState::Cancelled)],
+            next_cursor: None,
+        }),
+    ]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    probe.run_pass(&ctx, t0).await;
+    let first = probe.run_pass(&ctx, t0 + Duration::from_secs(10 * 60 + 1)).await;
+    assert_eq!(first.probe_failures, 1, "the failed listPullRequests call was counted");
+
+    // Due again a further RECONCILE_INTERVAL later.
+    probe.run_pass(&ctx, t0 + Duration::from_secs(2 * (10 * 60 + 1))).await;
+
+    let calls = api.list_pull_requests_calls();
+    assert_eq!(calls.len(), 2, "one call per due reconciliation");
+    assert_eq!(
+        calls[1].0, None,
+        "the cursor must not advance past the window the failed call never actually examined"
+    );
+}
+
+#[tokio::test]
+async fn the_reconciliation_backstop_follows_next_cursor_into_a_second_page() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "paginated", 978);
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    api.set_entry(978, Err(StubError::NotFound));
+    // The tracked member's terminal transition only appears on the
+    // second page; a backstop that ignores `next_cursor` never sees it.
+    api.set_list_pull_requests(vec![
+        Ok(ListPullRequestsResponse {
+            pull_requests: vec![entry_of(1, TrunkPrState::Merged)],
+            next_cursor: Some("page-2".to_owned()),
+        }),
+        Ok(ListPullRequestsResponse {
+            pull_requests: vec![entry_of(978, TrunkPrState::Cancelled)],
+            next_cursor: None,
+        }),
+    ]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    probe.run_pass(&ctx, t0).await;
+    let outcome = probe.run_pass(&ctx, t0 + Duration::from_secs(10 * 60 + 1)).await;
+
+    assert_eq!(outcome.intents_retired, 1, "the second page's transition was observed");
+    assert!(db.get_active_trunk_merge_intent(&task_id).unwrap().is_none());
+
+    let calls = api.list_pull_requests_calls();
+    assert_eq!(calls.len(), 2, "the backstop followed next_cursor onto a second page");
+    assert_eq!(calls[0].1, None, "the first page is requested with no cursor");
+    assert_eq!(
+        calls[1].1,
+        Some("page-2".to_owned()),
+        "the second page is requested with the prior response's next_cursor"
     );
 }

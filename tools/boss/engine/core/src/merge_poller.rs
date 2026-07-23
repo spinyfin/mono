@@ -3778,74 +3778,40 @@ fn merge_queue_sort_key(detail: &StoredMergeQueueDetail, task_id: &str) -> (u8, 
 /// rule callers need: a failed member's number never races between
 /// "kept" and "excluded" mid-transition.
 pub(crate) async fn renumber_merge_queue(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, product_id: &str) {
-    let members = match work_db.list_queued_merge_queue_members(product_id) {
-        Ok(members) => members,
-        Err(err) => {
-            tracing::warn!(
-                product_id,
-                ?err,
-                "merge poller: failed to list queued merge-queue members for renumbering",
-            );
-            return;
-        }
+    let ctx = crate::merge_queue_renumber::RenumberContext {
+        work_db,
+        publisher,
+        product_id,
+        log_context: "merge poller",
+        event: "merge_queue_renumbered",
     };
-    if members.is_empty() {
-        return;
-    }
-
-    let mut parsed: Vec<(String, StoredMergeQueueDetail)> = members
-        .into_iter()
-        .map(|m| {
-            (
-                m.task_id,
-                parse_stored_merge_queue_detail(m.merge_queue_detail.as_deref()),
-            )
-        })
-        .collect();
-    parsed.sort_by_key(|(task_id, detail)| merge_queue_sort_key(detail, task_id));
-
-    for (rank, (task_id, detail)) in parsed.iter().enumerate() {
-        let position = (rank + 1) as i64;
+    crate::merge_queue_renumber::renumber_section_order(
+        &ctx,
+        |member| {
+            Some((
+                member.task_id,
+                parse_stored_merge_queue_detail(member.merge_queue_detail.as_deref()),
+            ))
+        },
+        merge_queue_sort_key,
         // Diff on the parsed position, not the raw JSON string: a member
         // already at its canonical rank must be skipped even though the
         // rewritten blob's key order/section_order differs byte-for-byte
         // from whatever an earlier write (or a legacy/pre-migration row)
         // left behind — this is the "only touch what changed" guarantee,
         // not merely a micro-optimisation.
-        if detail.position == Some(position) {
-            continue;
-        }
-        let Ok(json) = serde_json::to_string(&serde_json::json!({
-            "position": position,
-            "state": detail.state,
-            "enqueued_at": detail.enqueued_at,
-            "section_order": position,
-        })) else {
-            continue;
-        };
-        match work_db.update_task_merge_queue_detail(task_id, &json) {
-            Ok(true) => {
-                publisher
-                    .publish_work_item_changed(product_id, task_id, "merge_queue_renumbered")
-                    .await;
-                tracing::debug!(
-                    work_item_id = %task_id,
-                    product_id,
-                    position,
-                    "merge poller: renumbered merge-queue position",
-                );
-            }
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(
-                    work_item_id = %task_id,
-                    product_id,
-                    ?err,
-                    "merge poller: failed to persist renumbered merge-queue position",
-                );
-            }
-        }
-    }
+        |detail, position| detail.position == Some(position),
+        |detail, position| {
+            serde_json::to_string(&serde_json::json!({
+                "position": position,
+                "state": detail.state,
+                "enqueued_at": detail.enqueued_at,
+                "section_order": position,
+            }))
+            .ok()
+        },
+    )
+    .await;
 }
 
 async fn mark_merged(
