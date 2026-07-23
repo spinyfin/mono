@@ -25,7 +25,8 @@
 use super::*;
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
 use boss_protocol::{
-    ProposalDecider, ProposalFieldError, ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal,
+    Attention, AttentionGroup, ProposalDecider, ProposalFieldError, ProposalKind, ProposalState,
+    ProposalSubmissionError, WorkerProposal,
 };
 
 // ---- input types ----
@@ -56,6 +57,17 @@ pub struct SubmitWorkerProposalOutcome {
     /// returned it untouched instead of inserting. A success either way —
     /// replay safety is the point of the idempotency key.
     pub already_submitted: bool,
+    /// The member + group [`proposal_apply::stage_followup_task_in_transaction`]
+    /// staged, when `kind == FollowupTask` and this was a fresh (not
+    /// replayed) submission. `None` for every other kind, and for a replay
+    /// (nothing was staged this call — the group already reflects the prior
+    /// submission). The caller (`app::proposals::handle_submit_proposal`)
+    /// publishes `FrontendEvent::AttentionCreated` from this so the followup
+    /// card is live in the Notifications window from the moment of
+    /// submission, mirroring every other attention-creating path
+    /// (`app/attentions.rs`, `completion.rs`, `populator.rs`) — see the
+    /// design's "no gated kind is invisible while pending".
+    pub staged_followup: Option<(Attention, AttentionGroup)>,
 }
 
 // ---- mapper ----
@@ -145,7 +157,17 @@ impl WorkDb {
         // `WorkDb::connect`'s docs) is dropped before the post-commit
         // best-effort audit-line append below, which goes through `self`
         // and would otherwise deadlock trying to re-lock it.
-        let (id, now, state, applied_ref, decided_by, decision_reason, decided_at, post_commit_audit_line) = {
+        let (
+            id,
+            now,
+            state,
+            applied_ref,
+            decided_by,
+            decision_reason,
+            decided_at,
+            post_commit_audit_line,
+            staged_followup,
+        ) = {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -167,6 +189,7 @@ impl WorkDb {
                 return Ok(Ok(SubmitWorkerProposalOutcome {
                     proposal: existing,
                     already_submitted: true,
+                    staged_followup: None,
                 }));
             }
 
@@ -185,10 +208,19 @@ impl WorkDb {
             // runs unconditionally alongside (not through) the
             // AutoApply/Gated dispatch below. The proposal row itself stays
             // `proposed` either way — nothing is "applied" until a human
-            // acts on the group.
-            if input.kind == ProposalKind::FollowupTask {
-                proposal_apply::stage_followup_task_in_transaction(&tx, input.work_item_id, &id, input.payload_json)?;
-            }
+            // acts on the group. The staged (member, group) is threaded back
+            // out to the caller so it can publish `AttentionCreated` once the
+            // transaction commits (see `SubmitWorkerProposalOutcome::staged_followup`).
+            let staged_followup = if input.kind == ProposalKind::FollowupTask {
+                Some(proposal_apply::stage_followup_task_in_transaction(
+                    &tx,
+                    input.work_item_id,
+                    &id,
+                    input.payload_json,
+                )?)
+            } else {
+                None
+            };
 
             // Apply-before-insert: for an AutoApply kind, the produced row
             // and the `worker_proposals` row it is `applied_ref`-linked from
@@ -256,6 +288,7 @@ impl WorkDb {
                 decision_reason,
                 decided_at,
                 post_commit_audit_line,
+                staged_followup,
             )
         };
 
@@ -286,6 +319,7 @@ impl WorkDb {
                 .maybe_decided_at(decided_at)
                 .build(),
             already_submitted: false,
+            staged_followup,
         }))
     }
 
@@ -449,6 +483,52 @@ fn count_proposals_in_tx(conn: &Connection, execution_id: &str, kind: ProposalKi
         total: total.max(0) as usize,
         for_kind: for_kind.max(0) as usize,
     })
+}
+
+/// Stamp a human decision on the `worker_proposals` row a `followup_task`
+/// group member was staged from (`Attention::source_proposal_id`), inside
+/// `tx`. Called from [`crate::work::attentions::action_attention_group`]'s
+/// followup-group path when a human accepts (creates a task from) or
+/// skips/dismisses a member — the counterpart to
+/// [`crate::work::proposal_apply::apply_automation_outcome`]'s
+/// `Applied`/`Rejected` stamping, except decided by a human
+/// ([`boss_protocol::ProposalDecider::Human`]) rather than policy. Without
+/// this, a `followup_task` proposal stays `state = 'proposed'` forever even
+/// after the human has created or rejected the task it staged — see the
+/// design's per-proposal disposition vocabulary.
+///
+/// A member with no `source_proposal_id` (created by any path other than
+/// `boss propose followup-task` — a detector, a manifest, the plain
+/// `CreateAttention` RPC) is a no-op: there is no proposal row to update.
+pub(crate) fn mark_followup_proposal_decided_in_tx(
+    conn: &Connection,
+    source_proposal_id: Option<&str>,
+    applied_ref: Option<&str>,
+    decision_reason: &str,
+) -> Result<()> {
+    let Some(proposal_id) = source_proposal_id else {
+        return Ok(());
+    };
+    let now = now_string();
+    let state = if applied_ref.is_some() {
+        ProposalState::Applied
+    } else {
+        ProposalState::Rejected
+    };
+    conn.execute(
+        "UPDATE worker_proposals
+         SET state = ?2, decided_by = ?3, decision_reason = ?4, applied_ref = ?5, decided_at = ?6
+         WHERE id = ?1",
+        params![
+            proposal_id,
+            state.as_str(),
+            boss_protocol::ProposalDecider::Human.as_str(),
+            decision_reason,
+            applied_ref,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 // ---- tests ----

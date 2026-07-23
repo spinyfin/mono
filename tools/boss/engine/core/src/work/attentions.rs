@@ -17,6 +17,7 @@
 //! `generation` and starts a fresh group — this is what keeps "one group ⇒
 //! one revision" true across iteration.
 
+use super::proposals::mark_followup_proposal_decided_in_tx;
 use super::*;
 use std::collections::HashSet;
 
@@ -897,21 +898,72 @@ fn action_question_group(
     Ok(("design_task".to_owned(), reference, vec![task.id]))
 }
 
+/// Describe what a [`FollowupMemberOverride`] changed relative to a
+/// member's stored `proposed_*` values, for `decision_reason`. `None` when
+/// the override is empty (every field `None`) — the caller substitutes its
+/// own "accepted as proposed" text in that case.
+fn describe_followup_override(
+    member: &Attention,
+    effective_name: &str,
+    override_: &FollowupMemberOverride,
+) -> Option<String> {
+    let mut changes = Vec::new();
+    if let Some(name) = override_.name.as_deref().filter(|s| !s.is_empty())
+        && name != member.proposed_name.as_deref().unwrap_or_default()
+    {
+        changes.push(format!("name -> {effective_name:?}"));
+    }
+    if override_.description.is_some() && override_.description.as_deref() != member.proposed_description.as_deref() {
+        changes.push("description edited".to_owned());
+    }
+    if let Some(effort) = override_.effort.as_deref()
+        && Some(effort) != member.proposed_effort.as_deref()
+    {
+        changes.push(format!("effort -> {effort}"));
+    }
+    if let Some(work_kind) = override_.work_kind.as_deref()
+        && Some(work_kind) != member.proposed_work_kind.as_deref()
+    {
+        changes.push(format!("work_kind -> {work_kind}"));
+    }
+    if let Some(product_id) = override_.product_id.as_deref() {
+        changes.push(format!("re-parented to product {product_id}"));
+    }
+    if let Some(project_id) = override_.project_id.as_deref() {
+        changes.push(format!("re-parented to project {project_id}"));
+    }
+    if changes.is_empty() {
+        None
+    } else {
+        Some(format!("human edited before creation: {}", changes.join(", ")))
+    }
+}
+
 /// Produce the downstream artifact for a **followup** group: one task/chore
 /// per accepted (answered) member, created in the originating task's
-/// product/project. Skipped/dismissed members contribute nothing. Returns
-/// `(produced_artifact_kind, produced_artifact_ref_json, produced_ids)`.
+/// product/project unless `overrides` re-parents it elsewhere. Skipped/
+/// dismissed members contribute nothing to the artifact, but every member
+/// with a `source_proposal_id` (staged via `boss propose followup-task`)
+/// gets its `worker_proposals` row stamped with the human's decision —
+/// `applied` (with the created task's id) for an accepted member, `rejected`
+/// for a skipped/dismissed one — so the proposal never sits `proposed`
+/// forever after a human has already decided it (design's per-proposal
+/// disposition vocabulary: `filed-as-proposed` / `filed-with-modifications`
+/// / rejected). Returns `(produced_artifact_kind, produced_artifact_ref_json,
+/// produced_ids)`.
 ///
-/// `proposed_work_kind` is honoured as `chore` vs (project-)`task`; a
-/// `project` hint is materialised as a task in the originating project (v1
-/// produces tasks/chores, per the Attn-3 scope). When the originating work
-/// item has no project (it is itself a chore), the followup is created as a
+/// `proposed_work_kind` (or `overrides`' `work_kind`) is honoured as `chore`
+/// vs (project-)`task`; a `project` hint is materialised as a task in the
+/// effective project (v1 produces tasks/chores, per the Attn-3 scope). When
+/// the effective work item has no project, the followup is created as a
 /// product-level chore.
 fn action_followup_group(
     conn: &Connection,
     group: &AttentionGroup,
     members: &[Attention],
+    overrides: &std::collections::HashMap<String, FollowupMemberOverride>,
 ) -> Result<(String, String, Vec<String>)> {
+    let empty_override = FollowupMemberOverride::default();
     let accepted: Vec<&Attention> = members.iter().filter(|m| m.answer_state == "answered").collect();
     if accepted.is_empty() {
         bail!(
@@ -921,7 +973,8 @@ fn action_followup_group(
         );
     }
 
-    // New work items inherit the originating task's product + project.
+    // New work items inherit the originating task's product + project,
+    // unless a per-member override re-parents them elsewhere.
     let origin_id = group
         .association_task_id
         .as_deref()
@@ -930,31 +983,62 @@ fn action_followup_group(
         .with_context(|| format!("followup group {} has no originating task", group.id))?;
     let origin = query_task(conn, origin_id)?
         .with_context(|| format!("followup group {} references a missing task {origin_id}", group.id))?;
-    let product_id = origin.product_id.clone();
-    let project_id = origin.project_id.clone();
 
     let mut created_ids = Vec::with_capacity(accepted.len());
     let mut created_refs = Vec::with_capacity(accepted.len());
     for m in accepted {
-        let name = m
-            .proposed_name
+        let override_ = overrides.get(&m.id).unwrap_or(&empty_override);
+
+        let name = override_
+            .name
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .with_context(|| format!("accepted followup {} has no proposed_name", m.id))?;
-        let effort = parse_effort(m.proposed_effort.as_deref());
+            .or_else(|| m.proposed_name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .with_context(|| format!("accepted followup {} has no proposed_name and no override name", m.id))?
+            .to_owned();
+        let description = override_.description.clone().or_else(|| m.proposed_description.clone());
+        let effort = parse_effort(override_.effort.as_deref().or(m.proposed_effort.as_deref()));
+        let work_kind = override_.work_kind.as_deref().or(m.proposed_work_kind.as_deref());
+
+        // Re-parenting: an explicit override product wins outright; an
+        // explicit override project must belong to the effective product.
+        // Without an override, both default to the originating task's own.
+        let product_id = override_
+            .product_id
+            .clone()
+            .unwrap_or_else(|| origin.product_id.clone());
+        let project_id = match override_.project_id.clone() {
+            Some(project_id) => {
+                let project = query_project(conn, &project_id)?
+                    .with_context(|| format!("re-parent target project {project_id} does not exist"))?;
+                if project.product_id != product_id {
+                    bail!(
+                        "re-parent target project {project_id} belongs to product {}, not {product_id}",
+                        project.product_id
+                    );
+                }
+                Some(project_id)
+            }
+            // Re-parenting to a different product with no explicit project
+            // files a product-level chore there, mirroring the no-override
+            // "task has no project" case below.
+            None if override_.product_id.is_some() => None,
+            None => origin.project_id.clone(),
+        };
+
         // A `chore` hint, or the absence of a project to file into, lands a
         // product-level chore; everything else becomes a project task. The
         // duplicate guard is bypassed: actioning is an explicit human gesture.
-        let as_chore = m.proposed_work_kind.as_deref() == Some("chore") || project_id.is_none();
+        let as_chore = work_kind == Some("chore") || project_id.is_none();
 
         let created = if as_chore {
             insert_chore_in_tx(
                 conn,
                 CreateChoreInput::builder()
                     .product_id(product_id.clone())
-                    .name(name)
-                    .maybe_description(m.proposed_description.clone())
+                    .name(name.as_str())
+                    .maybe_description(description)
                     .maybe_effort_level(effort)
                     .created_via(CREATED_VIA_ATTENTION)
                     .force_duplicate(true)
@@ -969,8 +1053,8 @@ fn action_followup_group(
                 CreateTaskInput::builder()
                     .product_id(product_id.clone())
                     .project_id(project_id)
-                    .name(name)
-                    .maybe_description(m.proposed_description.clone())
+                    .name(name.as_str())
+                    .maybe_description(description)
                     .maybe_effort_level(effort)
                     .created_via(CREATED_VIA_ATTENTION)
                     .force_duplicate(true)
@@ -982,7 +1066,37 @@ fn action_followup_group(
             "short_id": created.short_id,
             "kind": created.kind,
         }));
+
+        let decision_reason =
+            describe_followup_override(m, &name, override_).unwrap_or_else(|| "accepted as proposed".to_owned());
+        mark_followup_proposal_decided_in_tx(
+            conn,
+            m.source_proposal_id.as_deref(),
+            Some(created.id.as_str()),
+            &decision_reason,
+        )?;
         created_ids.push(created.id);
+    }
+
+    // Skipped/dismissed members produced nothing, but a proposal-staged one
+    // must still be told the human decided against it — otherwise it stays
+    // `proposed` forever even though the group it staged into is now
+    // terminal.
+    for m in members.iter().filter(|m| m.answer_state != "answered") {
+        mark_followup_proposal_decided_in_tx(
+            conn,
+            m.source_proposal_id.as_deref(),
+            None,
+            &format!(
+                "human {} this followup when actioning group {}",
+                if m.answer_state == "skipped" {
+                    "skipped"
+                } else {
+                    "dismissed"
+                },
+                group.id
+            ),
+        )?;
     }
 
     let reference = serde_json::json!({ "tasks": created_refs }).to_string();
@@ -1011,6 +1125,7 @@ impl WorkDb {
         &self,
         id: &str,
         skip_unanswered: bool,
+        member_overrides: &std::collections::HashMap<String, FollowupMemberOverride>,
         pr_checker: &dyn PrStateChecker,
     ) -> Result<ActionedAttentionGroup> {
         let mut conn = self.connect()?;
@@ -1072,7 +1187,7 @@ impl WorkDb {
 
         let (produced_kind, produced_ref, produced_work_item_ids) = match group.kind.as_str() {
             "question" => action_question_group(&tx, &group, &members, pr_checker)?,
-            "followup" => action_followup_group(&tx, &group, &members)?,
+            "followup" => action_followup_group(&tx, &group, &members, member_overrides)?,
             other => bail!("cannot action attention group {} of kind {other:?}", group.id),
         };
 

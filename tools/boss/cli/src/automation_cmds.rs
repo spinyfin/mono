@@ -857,12 +857,14 @@ pub(crate) async fn action_attention_group_rpc(
     client: &mut BossClient,
     id: &str,
     skip_unanswered: bool,
+    member_overrides: HashMap<String, FollowupMemberOverride>,
 ) -> Result<AttentionGroup, CliError> {
     rpc_call!(
         client,
         FrontendRequest::ActionAttentionGroup {
             id: id.to_owned(),
             skip_unanswered,
+            member_overrides,
         },
         "attention action",
         FrontendEvent::AttentionGroupActioned { group, .. } => group,
@@ -1127,7 +1129,13 @@ pub(crate) async fn run_attention_command(command: AttentionCommand, ctx: &RunCo
                     return Ok(());
                 }
             }
-            let actioned = action_attention_group_rpc(&mut client, &group.id, args.skip_unanswered).await?;
+            let member_overrides: HashMap<String, FollowupMemberOverride> = match args.overrides {
+                Some(raw) => serde_json::from_str(&raw)
+                    .map_err(|err| CliError::usage(format!("--overrides is not valid JSON: {err}")))?,
+                None => HashMap::new(),
+            };
+            let actioned =
+                action_attention_group_rpc(&mut client, &group.id, args.skip_unanswered, member_overrides).await?;
             let produced_kind = actioned.produced_artifact_kind.clone();
             let produced_ref = actioned.produced_artifact_ref.clone();
             print_entity(

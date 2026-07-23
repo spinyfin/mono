@@ -161,6 +161,37 @@ pub struct AttentionGroup {
     pub source_task_id: Option<String>,
 }
 
+/// Per-member edit the human applies at the batch-accept gesture, before
+/// task creation — the "filed-with-modifications" half of the
+/// per-proposal disposition vocabulary (design §"Data model", P383 table:
+/// "the accept gesture must let the human edit name/scope/effort and
+/// re-parent an out-of-scope proposal before creation, recording what
+/// changed in `decision_reason`"). Every field is optional: `None` keeps
+/// the member's stored `proposed_*` value, or (for `product_id`/
+/// `project_id`) the originating task's own product/project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct FollowupMemberOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Effort hint (`"trivial"` … `"max"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// `"task"` | `"chore"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_kind: Option<String>,
+    /// Re-parent to a different product than the originating task's own —
+    /// "re-parent an out-of-scope proposal" per the design. Requires
+    /// `project_id` to also be set when the target product needs the
+    /// followup filed as a project task rather than a product-level chore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
 /// One row of the `attention_merges` provenance ledger. Records every fold
 /// event: which candidate was reconciled into which canonical (or suppressed
 /// as a work-item dup / sensibility), the model that decided, the rationale,

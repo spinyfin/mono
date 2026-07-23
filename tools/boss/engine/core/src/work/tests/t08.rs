@@ -367,7 +367,9 @@ fn action_question_with_open_pr_creates_revision() {
         .unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
 
     assert_eq!(actioned.group.state, "actioned");
     assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("revision"));
@@ -414,7 +416,9 @@ fn action_question_with_merged_doc_creates_design_task() {
     // The live PR probe reports Merged, so the revision gate refuses and the
     // action falls back to a fresh design task.
     let checker = FakePrStateChecker::always(PrOpenState::Merged);
-    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
 
     assert_eq!(actioned.group.state, "actioned");
     assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("design_task"));
@@ -441,7 +445,9 @@ fn action_question_without_source_task_creates_design_task() {
     let g = db.answer_attention(&a.id, Some("no".to_owned()), false, false).unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
     assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("design_task"));
     let design = read_task(&db, &actioned.produced_work_item_ids[0]);
     assert_eq!(design.kind, TaskKind::Design);
@@ -457,7 +463,9 @@ fn action_followup_group_creates_tasks() {
     let g = db.answer_attention(&a2.id, None, true, false).unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
 
     assert_eq!(actioned.group.state, "actioned");
     assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("tasks"));
@@ -473,6 +481,139 @@ fn action_followup_group_creates_tasks() {
     assert_eq!(task.created_via, "attention");
 }
 
+/// The batch-accept gesture must let the human edit name/effort before task
+/// creation, record what changed on the staged proposal's `decision_reason`,
+/// and stamp that proposal `applied` with `applied_ref` set to the created
+/// task — the "filed-with-modifications" disposition. Before this, the
+/// group member's `source_proposal_id` proposal stayed `proposed` forever.
+#[test]
+fn action_followup_group_with_override_edits_name_and_effort_and_writes_back_the_proposal() {
+    let (db, _product, project_id, task_id) = fixture();
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let submitted = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &task_id,
+            kind: boss_protocol::ProposalKind::FollowupTask,
+            payload_json: r#"{"proposed_name":"extract helper","proposed_description":"d","rationale":"r"}"#,
+            idempotency_key: "k-override",
+        })
+        .unwrap()
+        .unwrap();
+    let member = submitted.staged_followup.as_ref().unwrap().0.clone();
+    let g = db.answer_attention(&member.id, None, false, false).unwrap();
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        member.id.clone(),
+        FollowupMemberOverride {
+            name: Some("Better name".to_owned()),
+            effort: Some("large".to_owned()),
+            ..Default::default()
+        },
+    );
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&g.id, false, &overrides, &checker).unwrap();
+    let task = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(task.name, "Better name");
+    assert_eq!(task.effort_level, Some(EffortLevel::Large));
+    assert_eq!(task.project_id.as_deref(), Some(project_id.as_str()));
+
+    let proposals = db.list_worker_proposals_for_work_item(&task_id, None, None).unwrap();
+    let updated = proposals
+        .into_iter()
+        .find(|p| p.id == submitted.proposal.id)
+        .expect("the staged proposal must still exist");
+    assert_eq!(updated.state, boss_protocol::ProposalState::Applied);
+    assert_eq!(updated.decided_by, Some(boss_protocol::ProposalDecider::Human));
+    assert_eq!(
+        updated.applied_ref.as_deref(),
+        Some(actioned.produced_work_item_ids[0].as_str())
+    );
+    let reason = updated.decision_reason.expect("decision_reason must explain the edit");
+    assert!(reason.contains("name ->"), "unexpected decision_reason: {reason}");
+    assert!(
+        reason.contains("effort -> large"),
+        "unexpected decision_reason: {reason}"
+    );
+}
+
+/// Re-parenting: an override naming a different product (with no explicit
+/// project) files the followup as a product-level chore under that product
+/// instead of the originating task's own product/project.
+#[test]
+fn action_followup_group_override_reparents_to_a_different_product() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let other_product = create_test_product_named(&db, "Other Product");
+    let (a, _g) = db.create_attention(followup(&task_id, "belongs elsewhere")).unwrap();
+    let g = db.answer_attention(&a.id, None, false, false).unwrap();
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        a.id.clone(),
+        FollowupMemberOverride {
+            product_id: Some(other_product.id.clone()),
+            ..Default::default()
+        },
+    );
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&g.id, false, &overrides, &checker).unwrap();
+    let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(chore.product_id, other_product.id);
+    assert!(
+        chore.project_id.is_none(),
+        "re-parented with no project is a product-level chore"
+    );
+}
+
+/// A followup group member the human skips (never accepted) must still get
+/// its staged proposal stamped `rejected` on action, not left `proposed`
+/// forever.
+#[test]
+fn action_followup_group_writes_back_rejected_for_a_skipped_member() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let execution = create_ready_chore_execution(&db, task_id.clone());
+    let submitted = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &task_id,
+            kind: boss_protocol::ProposalKind::FollowupTask,
+            payload_json: r#"{"proposed_name":"noise","proposed_description":"d","rationale":"r"}"#,
+            idempotency_key: "k-skip",
+        })
+        .unwrap()
+        .unwrap();
+    let (a2, _) = db.create_attention(followup(&task_id, "keep this one")).unwrap();
+    let skipped_member = submitted.staged_followup.as_ref().unwrap().0.clone();
+
+    db.answer_attention(&a2.id, None, false, false).unwrap();
+    let g = db.answer_attention(&skipped_member.id, None, true, false).unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
+
+    let proposals = db.list_worker_proposals_for_work_item(&task_id, None, None).unwrap();
+    let updated = proposals
+        .into_iter()
+        .find(|p| p.id == submitted.proposal.id)
+        .expect("the staged proposal must still exist");
+    assert_eq!(updated.state, boss_protocol::ProposalState::Rejected);
+    assert_eq!(updated.decided_by, Some(boss_protocol::ProposalDecider::Human));
+    assert_eq!(updated.applied_ref, None);
+    assert!(
+        updated
+            .decision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("skipped"),
+        "unexpected decision_reason: {:?}",
+        updated.decision_reason
+    );
+}
+
 #[test]
 fn action_followup_honours_chore_work_kind() {
     let (db, _product, _project, task_id) = fixture();
@@ -482,7 +623,9 @@ fn action_followup_honours_chore_work_kind() {
     let g = db.answer_attention(&a.id, None, false, false).unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
     let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
     assert_eq!(chore.kind, TaskKind::Chore);
     assert!(chore.project_id.is_none(), "chores are product-level");
@@ -498,7 +641,9 @@ fn action_requires_every_member_terminal() {
         .unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let err = db.action_attention_group(&g.id, false, &checker).unwrap_err();
+    let err = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap_err();
     assert!(err.to_string().contains("unanswered"), "unexpected error: {err}");
     // The group is untouched — still actionable later.
     let reloaded = db.get_attention_group(&g.id).unwrap();
@@ -519,7 +664,9 @@ fn action_with_skip_unanswered_clears_open_members_then_actions() {
         .unwrap();
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let actioned = db.action_attention_group(&a2.group_id, true, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&a2.group_id, true, &Default::default(), &checker)
+        .unwrap();
     assert_eq!(actioned.group.state, "actioned");
     assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("revision"));
 
@@ -536,7 +683,9 @@ fn action_all_skipped_question_group_auto_dismisses() {
     let (a, _g) = db.create_attention(question(&project_id, "docs/x.md", "Q")).unwrap();
     let g = db.answer_attention(&a.id, None, true, false).unwrap();
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let result = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let result = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
     assert_eq!(result.group.state, "dismissed");
     assert!(result.group.dismissed_at.is_some());
     assert!(result.produced_work_item_ids.is_empty());
@@ -552,7 +701,9 @@ fn action_all_skipped_via_skip_unanswered_question_group_auto_dismisses() {
     // Skip a1 explicitly; a2 is still open — skip_unanswered covers it.
     let g = db.answer_attention(&a1.id, None, true, false).unwrap();
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let result = db.action_attention_group(&g.id, true, &checker).unwrap();
+    let result = db
+        .action_attention_group(&g.id, true, &Default::default(), &checker)
+        .unwrap();
     assert_eq!(result.group.state, "dismissed");
     assert!(result.produced_work_item_ids.is_empty());
 }
@@ -563,7 +714,9 @@ fn action_rejects_terminal_group() {
     let (_a, g) = db.create_attention(question(&project_id, "docs/x.md", "Q")).unwrap();
     db.dismiss_attention(&g.id, None).unwrap();
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let err = db.action_attention_group(&g.id, true, &checker).unwrap_err();
+    let err = db
+        .action_attention_group(&g.id, true, &Default::default(), &checker)
+        .unwrap_err();
     assert!(err.to_string().contains("dismissed"), "unexpected error: {err}");
 }
 
@@ -573,8 +726,11 @@ fn actioned_group_cannot_be_actioned_again() {
     let (a, _g) = db.create_attention(question(&project_id, "docs/x.md", "Q")).unwrap();
     let g = db.answer_attention(&a.id, Some("x".to_owned()), false, false).unwrap();
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    db.action_attention_group(&g.id, false, &checker).unwrap();
-    let err = db.action_attention_group(&g.id, false, &checker).unwrap_err();
+    db.action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap();
+    let err = db
+        .action_attention_group(&g.id, false, &Default::default(), &checker)
+        .unwrap_err();
     assert!(err.to_string().contains("already actioned"), "unexpected error: {err}");
 }
 
@@ -595,7 +751,9 @@ fn accepting_one_followup_leaves_siblings_open_and_group_clears_only_on_last() {
 
     // Action is refused while the sibling is still open.
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let err = db.action_attention_group(&group.id, false, &checker).unwrap_err();
+    let err = db
+        .action_attention_group(&group.id, false, &Default::default(), &checker)
+        .unwrap_err();
     assert!(err.to_string().contains("unanswered"), "unexpected: {err}");
 
     // Accept the second member — all members are now terminal.
@@ -603,7 +761,9 @@ fn accepting_one_followup_leaves_siblings_open_and_group_clears_only_on_last() {
     assert_eq!(group.state, "partially_answered");
 
     // Only now can the group be closed; both accepted followups produce tasks.
-    let actioned = db.action_attention_group(&group.id, false, &checker).unwrap();
+    let actioned = db
+        .action_attention_group(&group.id, false, &Default::default(), &checker)
+        .unwrap();
     assert_eq!(actioned.group.state, "actioned");
     assert_eq!(
         actioned.produced_work_item_ids.len(),

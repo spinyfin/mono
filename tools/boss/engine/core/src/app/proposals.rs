@@ -231,6 +231,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         Ok(Ok(SubmitWorkerProposalOutcome {
             proposal,
             already_submitted,
+            staged_followup,
         })) => {
             tracing::info!(
                 proposal_id = %proposal.id,
@@ -240,6 +241,23 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 already_submitted,
                 "worker proposal submitted",
             );
+            // A freshly staged `followup_task` member is not yet visible
+            // anywhere else — publish the same `AttentionCreated` event every
+            // other attention-creating path publishes
+            // (`app/attentions.rs:381`, `completion.rs`, `populator.rs`), so
+            // the Notifications window renders the card live instead of
+            // waiting for an unrelated refresh. Design: "no gated kind is
+            // invisible while pending".
+            if let Some((attention, group)) = staged_followup {
+                let product_id = group.product_id.clone();
+                server_state
+                    .publisher
+                    .publish_frontend_event_on_product(
+                        &product_id,
+                        FrontendEvent::AttentionCreated { attention, group },
+                    )
+                    .await;
+            }
             // Mirror completion.rs's legacy marker-detector paths
             // (`file_worker_signal_attention` / `record_deferred_scope_item`):
             // both publish `AttentionItemCreated` on the work item's product

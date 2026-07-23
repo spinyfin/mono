@@ -420,7 +420,7 @@ pub(super) async fn handle_answer_attention(ctx: Dispatch, req: FrontendRequest)
             // so the group closes without a separate human gesture.
             if group.kind == "followup" && members.iter().all(|m| m.answer_state != "open") {
                 if members.iter().any(|m| m.answer_state == "answered") {
-                    match work_db.action_attention_group(&group.id, false, &GhPrStateChecker) {
+                    match work_db.action_attention_group(&group.id, false, &Default::default(), &GhPrStateChecker) {
                         Ok(ActionedAttentionGroup {
                             group: actioned_group,
                             produced_work_item_ids,
@@ -574,10 +574,15 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ActionAttentionGroup { id, skip_unanswered } = req else {
+    let FrontendRequest::ActionAttentionGroup {
+        id,
+        skip_unanswered,
+        member_overrides,
+    } = req
+    else {
         unreachable!()
     };
-    match work_db.action_attention_group(&id, skip_unanswered, &GhPrStateChecker) {
+    match work_db.action_attention_group(&id, skip_unanswered, &member_overrides, &GhPrStateChecker) {
         Ok(ActionedAttentionGroup {
             group,
             produced_work_item_ids,

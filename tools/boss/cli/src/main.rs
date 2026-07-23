@@ -1,3 +1,4 @@
+pub(crate) use std::collections::HashMap;
 pub(crate) use std::io::{self, IsTerminal, Read, Write};
 pub(crate) use std::path::PathBuf;
 pub(crate) use std::process::{Command, ExitCode};
@@ -12,12 +13,13 @@ pub(crate) use boss_protocol::{
     ConflictResolution, CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules,
-    EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FrontendEvent, FrontendRequest,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun,
-    PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, UnpopulatePreservedTask, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent,
+    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
+    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
+    WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch,
 };
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};

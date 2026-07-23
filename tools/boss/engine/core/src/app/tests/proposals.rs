@@ -327,6 +327,61 @@ async fn submission_of_a_gated_kind_stays_proposed() {
     assert_eq!(proposal.decided_at, None);
 }
 
+/// A fresh (not replayed) `followup_task` submission stages a member into
+/// the originating task's `followup` attention group at submission time,
+/// regardless of the kind's `Gated` apply policy — so the card must be live
+/// in the Notifications window from that moment, not only after some
+/// unrelated refresh. Assert the same `AttentionCreated` event every other
+/// attention-creating path publishes (`app/attentions.rs`) goes out on the
+/// work item's product topic.
+#[tokio::test]
+async fn a_fresh_followup_task_submission_publishes_attention_created() {
+    let fx = WorkerFixture::new();
+    let product_id = fx
+        .server_state
+        .work_db
+        .get_work_item(&fx.work_item_id)
+        .unwrap()
+        .product_id()
+        .to_owned();
+
+    let push_session = "push-listener";
+    let push_sink = make_session_sink();
+    fx.server_state
+        .topic_broker
+        .register_session(push_session, push_sink.clone())
+        .await;
+    fx.server_state
+        .topic_broker
+        .subscribe(push_session, &[boss_protocol::work_product_topic(&product_id)])
+        .await;
+
+    let (proposal, already) = submitted(
+        submit(
+            &fx,
+            ProposalKind::FollowupTask,
+            json!({"proposed_name": "N", "proposed_description": "D", "rationale": "R"}),
+        )
+        .await,
+    );
+    assert!(!already);
+    assert_eq!(proposal.state, ProposalState::Proposed);
+
+    push_sink.close();
+    let pushed = push_sink
+        .next()
+        .await
+        .expect("an AttentionCreated push must have been queued for the subscribed session")
+        .payload;
+    match pushed {
+        FrontendEvent::AttentionCreated { attention, group } => {
+            assert_eq!(attention.source_proposal_id.as_deref(), Some(proposal.id.as_str()));
+            assert_eq!(group.product_id, product_id);
+        }
+        other => panic!("expected AttentionCreated, got {other:?}"),
+    }
+}
+
 /// The stored payload is the validation layer's canonical form, not the raw
 /// bytes the caller sent — so the apply pipeline can deserialise it directly.
 #[tokio::test]
