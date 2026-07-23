@@ -69,6 +69,7 @@ pub mod materializer;
 pub mod merge_mechanism;
 pub mod merge_parent_deletion;
 pub mod merge_poller;
+pub mod merge_queue_renumber;
 pub mod merge_when_ready;
 // The metrics framework lives in its own crate; alias it under the
 // module path the engine has always used it by. `metrics_init` holds
