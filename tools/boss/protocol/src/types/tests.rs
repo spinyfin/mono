@@ -517,6 +517,64 @@ fn task_roundtrips_with_effort_and_model_set() {
     assert_eq!(task.model_override, task2.model_override);
 }
 
+// ── StatusActor round-trip / classification tests ────────────────────────
+
+#[test]
+fn status_actor_parses_all_four_values() {
+    use std::str::FromStr;
+    assert_eq!(StatusActor::from_str("human").unwrap(), StatusActor::Human);
+    assert_eq!(StatusActor::from_str("boss").unwrap(), StatusActor::Boss);
+    assert_eq!(StatusActor::from_str("engine").unwrap(), StatusActor::Engine);
+    assert_eq!(StatusActor::from_str("boothby").unwrap(), StatusActor::Boothby);
+}
+
+#[test]
+fn status_actor_rejects_unknown_values_with_documented_message() {
+    use std::str::FromStr;
+    let err = StatusActor::from_str("gremlin").unwrap_err();
+    assert!(err.contains("gremlin"), "error should echo the offending value: {err}");
+    // The message documents the full closed set of accepted actors.
+    for expected in ["human", "boss", "engine", "boothby"] {
+        assert!(err.contains(expected), "error should list `{expected}`: {err}");
+    }
+}
+
+#[test]
+fn status_actor_display_as_str_round_trip_for_all_variants() {
+    use std::str::FromStr;
+    // parse-then-render == original string, guarding the string<->enum
+    // mapping in both directions for every variant.
+    for actor in StatusActor::ALL {
+        let s = actor.as_str();
+        assert_eq!(actor.to_string(), s, "Display must match as_str for {actor:?}");
+        assert_eq!(
+            StatusActor::from_str(s).unwrap(),
+            *actor,
+            "render-then-parse must round-trip for {actor:?}"
+        );
+    }
+}
+
+#[test]
+fn status_actor_is_engine_cascade_true_only_for_engine() {
+    // Encodes the dep-unblock ownership rule: only engine-owned cascades
+    // may be reversed by the engine's sweeps; Human/Boss/Boothby writes
+    // are deliberate per-row decisions and must be left alone.
+    assert!(StatusActor::Engine.is_engine_cascade());
+    assert!(!StatusActor::Human.is_engine_cascade());
+    assert!(!StatusActor::Boss.is_engine_cascade());
+    assert!(!StatusActor::Boothby.is_engine_cascade());
+}
+
+// ── short_id_label tests ─────────────────────────────────────────────────
+
+#[test]
+fn short_id_label_formats_some_and_passes_through_none() {
+    assert_eq!(short_id_label(Some(2344)), Some("T2344".to_owned()));
+    assert_eq!(short_id_label(Some(1)), Some("T1".to_owned()));
+    assert_eq!(short_id_label(None), None);
+}
+
 fn sample_product_json(extra: Value) -> Value {
     let mut base = json!({
         "id": "prod_1",
