@@ -2983,8 +2983,9 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                      Instead, discover the failing build directly on Buildkite (org-wide, since more \
                      than one pipeline may build the episode branch): \
                      `bk api \"/builds?branch=trunk-merge/pr-{pr_num}/<episode-uuid>\"` if the episode \
-                     uuid is known, otherwise `bk api \"/builds?state=failed&per_page=100\"` filtered \
-                     client-side to a branch starting with `trunk-merge/pr-{pr_num}/` \
+                     uuid is known, otherwise `bk api \"/builds?state[]=failed&state[]=failing&per_page=100\"` \
+                     (paginate with `&page=N` if needed) filtered client-side to a branch starting with \
+                     `trunk-merge/pr-{pr_num}/` \
                      (do NOT match `trunk-temp/*` — that is a different, non-gating branch)._\n",
                     pr_num = attempt.pr_number,
                 ));
@@ -3162,8 +3163,9 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 "The failing job ran on Trunk's **ephemeral construction branch** \
                  `trunk-merge/pr-{pr_num}/<uuid>`, NOT the PR head. \
                  Use the pre-filled commands in \"Ready-to-run Buildkite log commands\" above \
-                 if shown; otherwise discover the build via `bk api \"/builds?state=failed&per_page=100\"` \
-                 filtered to a branch starting with `trunk-merge/pr-{pr_num}/`, then \
+                 if shown; otherwise discover the build via \
+                 `bk api \"/builds?state[]=failed&state[]=failing&per_page=100\"` (paginate with `&page=N` \
+                 if needed) filtered to a branch starting with `trunk-merge/pr-{pr_num}/`, then \
                  `bk job log --pipeline <slug> --build-number <N> <job-uuid>`.\n\n",
                 pr_num = attempt.pr_number,
             ));

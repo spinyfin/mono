@@ -1436,6 +1436,9 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
     work_db
         .mark_ci_remediation_failed(&failed.id, "unfixable")?
         .expect("flip to failed");
+    // (e) Trunk queue eviction, still pending → rejected outright, exactly
+    // like the merge-queue rebounce case in (b).
+    let trunk_eviction = seed("sha-e", "trunk_queue_eviction", None)?;
 
     drop(work_db);
 
@@ -1507,6 +1510,28 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
             assert!(message.contains("cir_does_not_exist"), "got: {message}");
         }
         other => return Err(anyhow!("expected WorkError for unknown id, got: {other:?}")),
+    }
+
+    // The guard changed from an equality check on `"merge_queue_rebounce"`
+    // to `is_queue_side_failure_kind`, so pin the Trunk-eviction sibling (e)
+    // separately: a future narrowing of that predicate must not silently
+    // reopen the bypass for this kind.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationNoop {
+            attempt_id: trunk_eviction.id.clone(),
+            observed_sha: None,
+            reason: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationNoopRejected { attempt_id, status, .. } => {
+            assert_eq!(attempt_id, trunk_eviction.id);
+            assert!(
+                status.contains("synthetic/ephemeral commit"),
+                "trunk eviction rejection should explain why: {status}"
+            );
+        }
+        other => return Err(anyhow!("expected NoopRejected for trunk eviction, got: {other:?}")),
     }
 
     Ok(())
@@ -1905,6 +1930,91 @@ async fn mark_ci_remediation_succeeded_via_rebase_rejects_merge_queue_rebounce()
     assert_eq!(
         row.status, "pending",
         "rebounce claim must not be honored even though the fake probe reports green"
+    );
+
+    Ok(())
+}
+
+/// Sibling of [`mark_ci_remediation_succeeded_via_rebase_rejects_merge_queue_rebounce`]
+/// for the other `is_queue_side_failure_kind` member: a Trunk queue eviction's
+/// PR head-branch CI is also green by construction (Trunk only builds a
+/// construction branch for a PR GitHub already reports mergeable), so the
+/// same guard must reject a rebase claim before the live probe ever runs.
+/// The guard condition changed from an equality check on
+/// `"merge_queue_rebounce"` to `is_queue_side_failure_kind`; this pins the
+/// Trunk-eviction case separately so a future narrowing of that predicate
+/// cannot silently reopen the bypass for it.
+#[tokio::test]
+async fn mark_ci_remediation_succeeded_via_rebase_rejects_trunk_queue_eviction() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        merge_probe: Some(Arc::new(FakeCiProbe {
+            ci: OpenPrCiStatus::Clean,
+            head_sha: "sha-green-but-trunk-eviction".to_owned(),
+        })),
+        ..Default::default()
+    })
+    .await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("P")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .build(),
+    )?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
+    let pr = "https://github.com/foo/bar/pull/101";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    let attempt = work_db
+        .insert_ci_remediation(boss_engine::work::CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr.to_owned(),
+            pr_number: 101,
+            head_branch: "feature".to_owned(),
+            head_sha_at_trigger: "trunk:entry_101@2026-07-22T00:00:00.000Z".to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "trunk_queue_eviction".to_owned(),
+            before_commit_sha: None,
+        })?
+        .expect("insert should succeed on a fresh row");
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+            attempt_id: attempt.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationSucceededViaRebaseRejected { status, live_sha, .. } => {
+            assert!(status.contains("synthetic/ephemeral commit"), "got: {status}");
+            assert!(
+                live_sha.is_none(),
+                "trunk eviction guard rejects before the live probe ever runs"
+            );
+        }
+        other => return Err(anyhow!("expected trunk eviction rejection, got: {other:?}")),
+    }
+    let row = work_db.get_ci_remediation(&attempt.id)?.expect("row still exists");
+    assert_eq!(
+        row.status, "pending",
+        "trunk eviction claim must not be honored even though the fake probe reports green"
     );
 
     Ok(())

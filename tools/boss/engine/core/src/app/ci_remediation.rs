@@ -246,9 +246,10 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
         //    eviction) is NOT validated by the PR's head-branch CI (which is
         //    always green in both cases — the failure was on a synthetic/
         //    ephemeral commit, not the PR head; see runner.rs's revision
-        //    fragment). Honoring a rebase claim off a green head-branch probe
-        //    would be exactly the bypass the operator forbade — the same
-        //    guard `mark_ci_remediation_noop` enforces. Reject; keep the row
+        //    fragment). Honouring a rebase claim off a green head-branch
+        //    probe would be a bypass: it would mark the attempt resolved on
+        //    evidence that cannot speak to the failure — the same guard
+        //    `mark_ci_remediation_noop` enforces. Reject; keep the row
         //    actionable.
         if crate::ci_watch::is_queue_side_failure_kind(attempt.failure_kind.as_deref()) {
             tracing::warn!(
@@ -488,9 +489,10 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
         // 3. A queue-side failure (merge-queue rebounce or a Trunk queue
         //    eviction) is NOT validated by the PR's head-branch CI (which is
         //    always green in both cases — the failure was on a synthetic/
-        //    ephemeral commit). Honoring a noop off a green head-branch probe
-        //    would be exactly the bypass the operator forbade. Reject; keep
-        //    the row actionable.
+        //    ephemeral commit). Honouring a noop off a green head-branch
+        //    probe would be a bypass: it would mark the attempt resolved on
+        //    evidence that cannot speak to the failure. Reject; keep the row
+        //    actionable.
         if crate::ci_watch::is_queue_side_failure_kind(attempt.failure_kind.as_deref()) {
             tracing::warn!(
                 attempt_id = %attempt.id,

@@ -1843,7 +1843,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     );
 }
 
-// ----- Trunk merge-queue eviction detection (design task 6) -----
+// ----- Trunk merge-queue eviction detection -----
 
 /// A PR evicted from the Trunk merge queue (combined CI failed on its
 /// ephemeral `trunk-merge/*` construction branch) must flip its owning

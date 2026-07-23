@@ -586,7 +586,7 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
 /// An evicted entry that carries `stateChangedAt` must be handed to
 /// `ci_watch::on_trunk_queue_eviction_detected`, which flips the owning
 /// chore to `blocked: ci_failure` and records a `trunk_queue_eviction`
-/// `ci_remediations` row (design task 6). The Buildkite evidence fetch
+/// `ci_remediations` row. The Buildkite evidence fetch
 /// itself is best-effort and untestable here (no `bk` binary in this test
 /// environment — mirrors the existing `fetch_and_store_log_excerpt`
 /// precedent), so this only exercises the wiring, not the log excerpt.

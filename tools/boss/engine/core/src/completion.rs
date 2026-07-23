@@ -5583,6 +5583,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
         // --- CI signal check ---
         if let Some(ref attempt) = ci_attempt
             && ci_attempt_signal_cleared(&attempt.failed_checks, &open_status.ci)
+            && !crate::ci_watch::is_queue_side_failure_kind(attempt.failure_kind.as_deref())
         {
             tracing::info!(
                 execution_id,
@@ -13230,6 +13231,16 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         head: &str,
         failed_checks: &str,
     ) -> (TempDir, Arc<WorkDb>, String, String, String, String, String) {
+        ci_revision_fixture_with_kind(workspace_path, parent_pr_url, head, failed_checks, "pr_branch_ci")
+    }
+
+    fn ci_revision_fixture_with_kind(
+        workspace_path: &Path,
+        parent_pr_url: &str,
+        head: &str,
+        failed_checks: &str,
+        failure_kind: &str,
+    ) -> (TempDir, Arc<WorkDb>, String, String, String, String, String) {
         use crate::work::{FakePrStateChecker, PrOpenState};
         use boss_protocol::CreateRevisionInput;
 
@@ -13258,7 +13269,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 attempt_kind: "fix".into(),
                 consumes_budget: 1,
                 failed_checks: failed_checks.into(),
-                failure_kind: "pr_branch_ci".into(),
+                failure_kind: failure_kind.into(),
                 before_commit_sha: None,
             })
             .unwrap()
@@ -13419,6 +13430,66 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }),
             "CiRemediationSucceeded must be published; typed events: {typed:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn ci_revision_trunk_queue_eviction_stays_active_despite_clean_head_ci() {
+        // A trunk_queue_eviction attempt's failure is a queue-side signal —
+        // the head branch's own CI is Clean by construction (the eviction
+        // never ran the PR's own CI at all). A Stop with a Clean head probe
+        // must NOT auto-retire the attempt or clear the blocking chore
+        // status: that would be exactly the bypass the queue-side-failure
+        // guards elsewhere in this flow reject, done automatically by the
+        // engine instead of by the worker.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_dir, db, _product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
+            ci_revision_fixture_with_kind(workspace.path(), parent_pr_url, head, "[]", "trunk_queue_eviction");
+
+        let detector = StubPrDetector::ok(None);
+
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        struct CleanProbe;
+        #[async_trait]
+        impl MergeProbe for CleanProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                let mut p = ci_probe(crate::merge_poller::OpenPrCiStatus::Clean);
+                p.url = url.to_owned();
+                Ok(p)
+            }
+        }
+
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(CleanProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            !matches!(outcome, StopOutcome::SignalAlreadyCleared { .. }),
+            "a queue-side trunk_queue_eviction attempt must never be auto-retired by a clean head CI probe; got {outcome:?}",
+        );
+
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_ne!(
+            attempt.status, "succeeded",
+            "trunk_queue_eviction attempt must remain active despite Clean head CI",
+        );
+
+        let parent = match db.get_work_item(&parent_chore_id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_ne!(
+            parent.status,
+            TaskStatus::InReview,
+            "the block must not be silently cleared with no fix pushed",
+        );
+        let _ = probes;
     }
 
     #[tokio::test]

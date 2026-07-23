@@ -31,7 +31,7 @@
 //! merged PR and runs the whole `mark_merged()` cascade (design §"The
 //! merge verb"). And it does **not** remediate an eviction — observing
 //! `failed`/`pending_failure` records the state and leaves the intent
-//! `active` for the `ci_watch` eviction path (design task 6) to pick up.
+//! `active` for the `ci_watch` eviction path to pick up.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -1106,13 +1106,26 @@ async fn apply_resolved_state(
     entry: &TrunkPullRequest,
     outcome: &mut TrunkSweepOutcome,
 ) {
-    // Captured before `record_observed_state` below so the eviction path
-    // fires at most once per episode even in the rare case where Trunk's
-    // live queue snapshot keeps reporting an already-resolved terminal
-    // entry inline (see the `already_resolved_terminal` doc comment) —
-    // `insert_ci_remediation`'s idempotent key makes a repeat call safe,
-    // but this avoids the wasted Buildkite lookup + DB round trip.
-    let already_terminal = already_resolved_terminal(member);
+    // Per-episode dedup, computed before `record_observed_state` below:
+    // Trunk's live queue snapshot can keep reporting an already-resolved
+    // terminal entry inline on every sweep (see the `already_resolved_terminal`
+    // doc comment used elsewhere for the missing-entry case). Gating on the
+    // *episode's own discriminator* — not merely "was the last observed
+    // state terminal" — means a genuinely new episode (a fresh eviction
+    // carrying a new `stateChangedAt` on the same, or a different, entry
+    // id) still gets through even though the intent's last recorded state
+    // was already terminal from a prior episode; only a true repeat of the
+    // same episode is skipped. Falls back to `"unknown"` when Trunk omits
+    // `stateChangedAt` (see `handle_trunk_queue_eviction`), which still
+    // gives at-least-once-per-entry-id dedup.
+    let episode_discriminator = crate::ci_watch::trunk_eviction_discriminator(
+        &entry.id,
+        entry.state_changed_at.as_deref().unwrap_or("unknown"),
+    );
+    let already_handled_this_episode = ctx
+        .work_db
+        .ci_remediation_exists_for_head_sha_at_trigger(&member.intent.work_item_id, &episode_discriminator)
+        .unwrap_or(false);
     let state = &entry.state;
     let state_str = String::from(state.clone());
     record_observed_state(ctx, member, &state_str);
@@ -1135,7 +1148,7 @@ async fn apply_resolved_state(
                 state = %state_str,
                 "trunk queue poller: entry left the queue on a test failure; intent kept active for remediation",
             );
-            if !already_terminal {
+            if !already_handled_this_episode {
                 handle_trunk_queue_eviction(ctx, member, entry, outcome).await;
             }
         }
@@ -1169,13 +1182,25 @@ async fn handle_trunk_queue_eviction(
     entry: &TrunkPullRequest,
     outcome: &mut TrunkSweepOutcome,
 ) {
-    let Some(state_changed_at) = entry.state_changed_at.as_deref() else {
-        tracing::warn!(
-            work_item_id = %member.intent.work_item_id,
-            pr_url = %member.intent.pr_url,
-            "trunk queue poller: eviction observed with no stateChangedAt; cannot key the remediation — skipping",
-        );
-        return;
+    // Trunk should always send `stateChangedAt` on a terminal entry, but if
+    // it ever omits it we must not silently drop the episode forever: a
+    // `None` here still needs a discriminator, so fall back to a fixed
+    // `"unknown"` marker. `on_trunk_queue_eviction_detected`'s idempotent
+    // insert then dedups on `(work_item_id, "trunk:<id>@unknown")`, which
+    // degrades to at-most-once-per-entry-id rather than per-episode — worse
+    // than the normal key, but still visible to a human via the blocked
+    // chore and remediation row instead of vanishing into a debug log.
+    let state_changed_at = match entry.state_changed_at.as_deref() {
+        Some(value) => value,
+        None => {
+            tracing::warn!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                "trunk queue poller: eviction observed with no stateChangedAt; \
+                 falling back to a one-shot per-entry-id key instead of dropping the episode",
+            );
+            "unknown"
+        }
     };
 
     let failures =

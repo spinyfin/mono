@@ -372,13 +372,22 @@ pub struct TrunkEvictionBuild {
     pub failed_job_ids: Vec<String>,
 }
 
-/// Discover the newest failed Buildkite build whose branch is the gating
-/// `trunk-merge/pr-<pr_number>/*` construction branch for a Trunk
+/// Pages of the org-wide failed-build search [`find_trunk_merge_eviction_build`]
+/// is willing to walk before giving up. Bounded rather than exhaustive: this
+/// is a best-effort evidence lookup, not the source of truth for whether an
+/// eviction happened (the `ci_remediations` row and blocked chore are the
+/// source of truth either way), so a couple of pages balances catching a
+/// build pushed past the first page against not hammering the API on a
+/// lookup that is already degrading gracefully to an empty result.
+const MAX_EVICTION_BUILD_SEARCH_PAGES: u32 = 3;
+
+/// Discover the newest failed/failing Buildkite build whose branch is the
+/// gating `trunk-merge/pr-<pr_number>/*` construction branch for a Trunk
 /// merge-queue eviction.
 ///
-/// Queries org-wide via `bk api "/builds?state=failed&per_page=100"` (the
-/// already-authenticated CLI passthrough — one call covers every pipeline
-/// that might build the episode branch, e.g. both `flunge-ci` and
+/// Queries org-wide via `bk api "/builds?state[]=failed&state[]=failing&…"`
+/// (the already-authenticated CLI passthrough — one call covers every
+/// pipeline that might build the episode branch, e.g. both `flunge-ci` and
 /// `flunge-release-frontend`) and filters client-side on the branch prefix:
 /// Trunk's per-episode UUID cannot be obtained from the Trunk API, so an
 /// exact-branch lookup isn't possible (see the investigation doc's
@@ -388,15 +397,42 @@ pub struct TrunkEvictionBuild {
 /// investigation: build #2282 on `trunk-temp/pr-978/…` failed while
 /// `trunk-merge/pr-978/…` passed and the PR merged normally).
 ///
+/// Two robustness gaps a single unpaginated `state=failed` page has: a busy
+/// org can push the episode build past the first 100 results, and Buildkite
+/// reports a build with one failed job but others still running as
+/// `failing`, not `failed`, so a fast eviction signal can arrive before the
+/// build reaches the terminal `failed` state. This walks up to
+/// [`MAX_EVICTION_BUILD_SEARCH_PAGES`] pages and matches on both states to
+/// close both gaps; it still degrades to `Ok(None)` (logged at `info` so the
+/// miss is visible) rather than erroring when nothing is found.
+///
 /// Best-effort by design: an `Err` here (spawn failure, unparseable
 /// response) should be treated by callers the same as `Ok(None)` — fall
 /// back to generic worker instructions rather than fail remediation.
 pub async fn find_trunk_merge_eviction_build(binary: &str, pr_number: u64) -> Result<Option<TrunkEvictionBuild>> {
     let branch_prefix = format!("trunk-merge/pr-{pr_number}/");
-    let output = run_capture(binary, &["api", "/builds?state=failed&per_page=100"]).await?;
-    let builds: serde_json::Value =
-        serde_json::from_str(&output).context("parsing `bk api /builds?state=failed` response as JSON")?;
-    Ok(parse_trunk_eviction_build(&builds, &branch_prefix))
+    for page in 1..=MAX_EVICTION_BUILD_SEARCH_PAGES {
+        let path = format!("/builds?state[]=failed&state[]=failing&per_page=100&page={page}");
+        let output = run_capture(binary, &["api", &path]).await?;
+        let builds: serde_json::Value =
+            serde_json::from_str(&output).context("parsing `bk api /builds?state[]=failed` response as JSON")?;
+        if let Some(found) = parse_trunk_eviction_build(&builds, &branch_prefix) {
+            return Ok(Some(found));
+        }
+        // A page shorter than the requested size is the last page —
+        // no point issuing another request past it.
+        let page_len = builds.as_array().map_or(0, Vec::len);
+        if page_len < 100 {
+            break;
+        }
+    }
+    tracing::info!(
+        pr_number,
+        branch_prefix = %branch_prefix,
+        pages_searched = MAX_EVICTION_BUILD_SEARCH_PAGES,
+        "boss_ci_log_reader: no failed/failing trunk-merge build found for eviction across the pages searched",
+    );
+    Ok(None)
 }
 
 /// Pure parser for [`find_trunk_merge_eviction_build`]: picks the first
@@ -677,7 +713,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("bk");
         let script = r#"#!/bin/sh
-if [ "$1" = "api" ] && [ "$2" = "/builds?state=failed&per_page=100" ]; then
+if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=1" ]; then
     cat <<'JSON'
 [{"branch":"trunk-merge/pr-1007/d772adf2","pipeline":{"slug":"flunge-ci"},"number":2364,"web_url":"https://buildkite.com/flunge/flunge-ci/builds/2364","jobs":[{"id":"job-uuid-1","state":"failed"}]}]
 JSON
@@ -702,6 +738,92 @@ exit 2
         assert_eq!(found.pipeline_slug, "flunge-ci");
         assert_eq!(found.build_number, "2364");
         assert_eq!(found.failed_job_ids, vec!["job-uuid-1".to_owned()]);
+    }
+
+    /// A full first page (100 results) with no branch-prefix match must
+    /// fall through to page 2 rather than giving up — the pagination gap
+    /// this closes: a busy org can push the episode build past the first
+    /// 100 org-wide failed/failing builds.
+    #[tokio::test]
+    async fn find_trunk_merge_eviction_build_falls_through_to_page_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("bk");
+        let page_one_path = dir.path().join("page1.json");
+        // Page 1: exactly 100 non-matching builds (a full page, so the
+        // lookup must not stop here). Page 2: the actual match.
+        let page_one: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "branch": "unrelated/branch",
+                    "pipeline": {"slug": "x"},
+                    "number": i,
+                    "web_url": "u",
+                    "jobs": [],
+                })
+            })
+            .collect();
+        std::fs::write(&page_one_path, serde_json::to_string(&page_one).unwrap()).unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=1" ]; then
+    cat "{page_one}"
+    exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=2" ]; then
+    cat <<'JSON'
+[{{"branch":"trunk-merge/pr-1007/d772adf2","pipeline":{{"slug":"flunge-ci"}},"number":2364,"web_url":"https://buildkite.com/flunge/flunge-ci/builds/2364","jobs":[{{"id":"job-uuid-1","state":"failed"}}]}}]
+JSON
+    exit 0
+fi
+echo "unhandled args: $@" 1>&2
+exit 2
+"#,
+            page_one = page_one_path.display(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
+            .await
+            .unwrap()
+            .expect("eviction build found on page 2");
+        assert_eq!(found.build_number, "2364");
+    }
+
+    /// No match on any searched page degrades to `Ok(None)` rather than an
+    /// error — the caller falls back to generic worker instructions.
+    #[tokio::test]
+    async fn find_trunk_merge_eviction_build_returns_none_when_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("bk");
+        let script = r#"#!/bin/sh
+if [ "$1" = "api" ]; then
+    echo "[]"
+    exit 0
+fi
+echo "unhandled args: $@" 1>&2
+exit 2
+"#;
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
+            .await
+            .unwrap();
+        assert!(found.is_none());
     }
 
     // ---------- tail_lines --------------------------------------------------

@@ -859,6 +859,60 @@ pub async fn on_merge_queue_rebounce_detected(
     labels: &[String],
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    on_queue_side_failure_detected(
+        work_db,
+        publisher,
+        candidate,
+        head_ref_name,
+        QueueSideFailureEpisode {
+            discriminator: before_commit_sha,
+            before_commit_sha: Some(before_commit_sha),
+            failure_kind: "merge_queue_rebounce",
+            labels,
+        },
+        failures,
+    )
+    .await
+}
+
+/// The per-caller facts [`on_queue_side_failure_detected`] needs — bundled
+/// (rather than four more positional args) to keep the shared helper under
+/// the repo's `too_many_arguments` lint threshold.
+struct QueueSideFailureEpisode<'a> {
+    /// The dedup key stored as `ci_remediations.head_sha_at_trigger`.
+    discriminator: &'a str,
+    /// The `ci_remediations.before_commit_sha` provenance column — `Some`
+    /// for a merge-queue rebounce (the synthetic merge SHA), `None` for a
+    /// Trunk eviction (no equivalent commit is persisted).
+    before_commit_sha: Option<&'a str>,
+    failure_kind: &'a str,
+    /// PR labels, for the auto-pr-maintenance-disabled gate. Trunk evictions
+    /// have none available at the call site, so callers pass `&[]`.
+    labels: &'a [String],
+}
+
+/// Shared implementation behind [`on_merge_queue_rebounce_detected`] and
+/// [`on_trunk_queue_eviction_detected`]: both react to a failure whose
+/// evidence lives on a synthetic/ephemeral commit distinct from the PR's own
+/// head (see [`is_queue_side_failure_kind`]), so they share every step from
+/// the in-flight-attempt guards through budget accounting to the revision
+/// spawn. Only the dedup `discriminator`, the `failure_kind` literal, the
+/// `before_commit_sha` provenance column, and the `labels` gate (Trunk
+/// evictions have none) differ between callers — see [`QueueSideFailureEpisode`].
+async fn on_queue_side_failure_detected(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    head_ref_name: Option<&str>,
+    episode: QueueSideFailureEpisode<'_>,
+    failures: &[RequiredCheckFailure],
+) -> bool {
+    let QueueSideFailureEpisode {
+        discriminator,
+        before_commit_sha,
+        failure_kind,
+        labels,
+    } = episode;
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;
     }
@@ -867,7 +921,8 @@ pub async fn on_merge_queue_rebounce_detected(
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                "ci_watch: rebase attempt active; deferring merge_queue_rebounce flip",
+                failure_kind,
+                "ci_watch: rebase attempt active; deferring queue-side-failure flip",
             );
             return false;
         }
@@ -887,7 +942,8 @@ pub async fn on_merge_queue_rebounce_detected(
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                "ci_watch: conflict resolution attempt active; deferring merge_queue_rebounce flip",
+                failure_kind,
+                "ci_watch: conflict resolution attempt active; deferring queue-side-failure flip",
             );
             return false;
         }
@@ -904,14 +960,15 @@ pub async fn on_merge_queue_rebounce_detected(
     }
 
     // Suppression check: if the human manually moved the chore out of
-    // `blocked: ci_failure` for this synthetic merge SHA, honour it.
-    match work_db.is_ci_failure_suppressed(&candidate.work_item_id, before_commit_sha) {
+    // `blocked: ci_failure` for this episode's discriminator, honour it.
+    match work_db.is_ci_failure_suppressed(&candidate.work_item_id, discriminator) {
         Ok(true) => {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                before_commit_sha,
-                "ci_watch: ci_failure suppression active for before_commit_sha; skipping rebounce",
+                discriminator,
+                failure_kind,
+                "ci_watch: ci_failure suppression active for this discriminator; skipping",
             );
             return false;
         }
@@ -950,8 +1007,8 @@ pub async fn on_merge_queue_rebounce_detected(
                         },
                     )
                     .await;
-                // No per-check names available in the rebounce path (the
-                // failing SHA is the synthetic merge commit, not the PR
+                // No per-check names available for a queue-side failure (the
+                // failing SHA is a synthetic/ephemeral commit, not the PR
                 // head); pass an empty slice so the body omits the list.
                 emit_exhausted_attention(work_db, publisher, candidate, used, budget, &[]).await;
                 tracing::info!(
@@ -959,7 +1016,8 @@ pub async fn on_merge_queue_rebounce_detected(
                     pr_url = %candidate.pr_url,
                     used,
                     budget,
-                    "ci_watch: rebounce budget exhausted; parent flipped to blocked: ci_failure_exhausted",
+                    failure_kind,
+                    "ci_watch: queue-side-failure budget exhausted; parent flipped to blocked: ci_failure_exhausted",
                 );
                 return true;
             }
@@ -967,7 +1025,8 @@ pub async fn on_merge_queue_rebounce_detected(
                 tracing::debug!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
-                    "ci_watch: rebounce ci_failure_exhausted WHERE guard missed",
+                    failure_kind,
+                    "ci_watch: queue-side-failure ci_failure_exhausted WHERE guard missed",
                 );
                 return false;
             }
@@ -976,57 +1035,60 @@ pub async fn on_merge_queue_rebounce_detected(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
                     ?err,
-                    "ci_watch: failed to flip row to blocked: ci_failure_exhausted (rebounce)",
+                    failure_kind,
+                    "ci_watch: failed to flip row to blocked: ci_failure_exhausted (queue-side failure)",
                 );
                 return false;
             }
         }
     }
 
-    // Merge-queue rebounces are always `fix` — the semantic merge
-    // conflict requires a worker to rebase and potentially resolve
-    // incompatible changes. `retrigger` would not help.
+    // Queue-side failures are always `fix` — the semantic conflict requires
+    // a worker to rebase and potentially resolve incompatible changes;
+    // `retrigger` would not help.
     let pr_number = parse_pr_number(&candidate.pr_url).unwrap_or(0);
 
-    // The `before_commit_sha` serves as `head_sha_at_trigger` so the
-    // unique key `(work_item_id, head_sha_at_trigger, attempt_kind)`
-    // naturally deduplicates on the synthetic merge SHA: two polls
-    // that see the same bounce event hit the same key and the second
-    // `INSERT OR IGNORE` is a no-op.
+    // `discriminator` serves as `head_sha_at_trigger` so the unique key
+    // `(work_item_id, head_sha_at_trigger, attempt_kind)` naturally
+    // deduplicates on this episode: two polls that see the same event hit
+    // the same key and the second `INSERT OR IGNORE` is a no-op.
     let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
         product_id: candidate.product_id.clone(),
         work_item_id: candidate.work_item_id.clone(),
         pr_url: candidate.pr_url.clone(),
         pr_number,
         head_branch: head_ref_name.unwrap_or_default().to_owned(),
-        head_sha_at_trigger: before_commit_sha.to_owned(),
+        head_sha_at_trigger: discriminator.to_owned(),
         attempt_kind: "fix".to_owned(),
         consumes_budget: 1,
         failed_checks: encode_failed_checks(failures),
-        failure_kind: "merge_queue_rebounce".to_owned(),
-        before_commit_sha: Some(before_commit_sha.to_owned()),
+        failure_kind: failure_kind.to_owned(),
+        before_commit_sha: before_commit_sha.map(str::to_owned),
     });
     let attempt = match insert_result {
         Ok(Some(row)) => row,
         Ok(None) => {
-            // Per-(work_item_id, before_commit_sha) idempotency — THE flap root
-            // cause. `INSERT OR IGNORE` found an existing row for the triplet
-            // (work_item_id, head_sha_at_trigger=before_commit_sha,
-            // attempt_kind='fix'): we have already bounced this exact failing
-            // merge SHA on an earlier sweep. The merge-queue dequeue event stays
-            // in the PR timeline forever, so without this guard we re-flipped the
-            // parent to `blocked: ci_failure` on every poll — and any opposing
-            // head-branch reconciler that briefly returned it to `in_review`
-            // produced the ~once-a-minute oscillation. Bounce a given failing
-            // commit AT MOST ONCE; do not re-bounce until the head SHA advances
-            // (a new fix commit -> a new synthetic merge SHA -> a new triplet).
+            // Per-(work_item_id, discriminator) idempotency — THE flap root
+            // cause for the rebounce case, and the same shape for a Trunk
+            // eviction episode. `INSERT OR IGNORE` found an existing row for
+            // the triplet (work_item_id, head_sha_at_trigger=discriminator,
+            // attempt_kind='fix'): we have already bounced this exact
+            // episode on an earlier sweep. The underlying dequeue/eviction
+            // event stays in the PR timeline forever, so without this guard
+            // we would re-flip the parent to `blocked: ci_failure` on every
+            // poll — and any opposing head-branch reconciler that briefly
+            // returned it to `in_review` would produce a flap. Bounce a
+            // given episode AT MOST ONCE; do not re-bounce until the
+            // discriminator advances (a new fix commit -> a new synthetic
+            // merge SHA, or a new Trunk `stateChangedAt` -> a new triplet).
             // The first bounce's block is sticky on its own WHERE guard.
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                before_commit_sha,
-                "ci_watch: rebounce already recorded for this before_commit_sha; \
-                 idempotent no-op (not re-bouncing on an unchanged failing merge SHA)",
+                discriminator,
+                failure_kind,
+                "ci_watch: queue-side failure already recorded for this discriminator; \
+                 idempotent no-op (not re-bouncing on an unchanged episode)",
             );
             return false;
         }
@@ -1035,7 +1097,8 @@ pub async fn on_merge_queue_rebounce_detected(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 ?err,
-                "ci_watch: failed to insert ci_remediations row (rebounce); deferring",
+                failure_kind,
+                "ci_watch: failed to insert ci_remediations row (queue-side failure); deferring",
             );
             return false;
         }
@@ -1049,7 +1112,8 @@ pub async fn on_merge_queue_rebounce_detected(
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
-                "ci_watch: rebounce WHERE guard missed; row already blocked or manually moved",
+                failure_kind,
+                "ci_watch: queue-side failure WHERE guard missed; row already blocked or manually moved",
             );
             false
         }
@@ -1058,22 +1122,24 @@ pub async fn on_merge_queue_rebounce_detected(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 ?err,
-                "ci_watch: failed to flip row to blocked: ci_failure (rebounce)",
+                failure_kind,
+                "ci_watch: failed to flip row to blocked: ci_failure (queue-side failure)",
             );
             return false;
         }
     };
 
-    // Phase 5 cutover (mirrors Phase 4 for on_ci_failure_detected): rebounce `fix`
-    // attempts now deliver via an engine-triggered revision instead of a bespoke
-    // `ci_remediation` execution. We only reach here on a freshly-inserted attempt
-    // (a repeat probe for the same before_commit_sha returned early above on the
-    // `Ok(None)` insert), so this spawns exactly once per failing merge SHA. The
-    // spawn is intentionally decoupled from `task_transitioned`: a back-to-back
-    // second dequeue inserts a fresh attempt while the parent is already blocked
-    // by the first, and that attempt must still get its own revision rather than
-    // strand. The PR is known-open (it was in the merge queue), so a static
-    // checker is correct here and avoids a redundant `gh pr view` round-trip.
+    // Phase 5 cutover (mirrors Phase 4 for on_ci_failure_detected): queue-side
+    // `fix` attempts now deliver via an engine-triggered revision instead of a
+    // bespoke `ci_remediation` execution. We only reach here on a
+    // freshly-inserted attempt (a repeat probe for the same discriminator
+    // returned early above on the `Ok(None)` insert), so this spawns exactly
+    // once per episode. The spawn is intentionally decoupled from
+    // `task_transitioned`: a back-to-back second event inserts a fresh
+    // attempt while the parent is already blocked by the first, and that
+    // attempt must still get its own revision rather than strand. The PR is
+    // known-open (it was in a merge queue), so a static checker is correct
+    // here and avoids a redundant `gh pr view` round-trip.
     //
     // T2381/PR#1861 fix: unlike `on_ci_failure_detected`, this path used to leave
     // the upfront `blocked: ci_failure` flip in place even after a fix revision
@@ -1113,7 +1179,8 @@ pub async fn on_merge_queue_rebounce_detected(
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
                 ?err,
-                "ci_watch: failed to increment ci_attempts_used (rebounce)",
+                failure_kind,
+                "ci_watch: failed to increment ci_attempts_used (queue-side failure)",
             );
         }
         let change_reason = if task_unblocked_for_revision {
@@ -1139,11 +1206,12 @@ pub async fn on_merge_queue_rebounce_detected(
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
-            before_commit_sha,
-            head_sha_at_trigger = before_commit_sha,
+            discriminator,
+            head_sha_at_trigger = discriminator,
+            failure_kind,
             task_transitioned,
             task_unblocked_for_revision,
-            "ci_watch: merge-queue rebounce detected; parent flipped to blocked: ci_failure",
+            "ci_watch: queue-side failure detected; parent flipped to blocked: ci_failure",
         );
         true
     } else {
@@ -1161,6 +1229,16 @@ pub async fn on_merge_queue_rebounce_detected(
 /// `None` (pre-`failure_kind` rows) and `'pr_branch_ci'` are ordinary.
 pub(crate) fn is_queue_side_failure_kind(kind: Option<&str>) -> bool {
     matches!(kind, Some("merge_queue_rebounce") | Some("trunk_queue_eviction"))
+}
+
+/// The composite per-episode discriminator a Trunk eviction is keyed on —
+/// see [`on_trunk_queue_eviction_detected`]'s doc comment. `trunk:` prefixed
+/// so it can never collide with a real git SHA (which `pr_branch_ci`/rebounce
+/// rows key on). Shared with `trunk_queue_poller::apply_resolved_state`,
+/// which uses it to decide per-episode (not blanket-terminal) whether an
+/// inline-terminal queue entry has already been handled.
+pub(crate) fn trunk_eviction_discriminator(trunk_entry_id: &str, trunk_state_changed_at: &str) -> String {
+    format!("trunk:{trunk_entry_id}@{trunk_state_changed_at}")
 }
 
 /// Entry point for Trunk merge-queue eviction detection.
@@ -1202,265 +1280,21 @@ pub async fn on_trunk_queue_eviction_detected(
     trunk_state_changed_at: &str,
     failures: &[RequiredCheckFailure],
 ) -> bool {
-    if auto_pr_maintenance_disabled(work_db, candidate, &[]) {
-        return false;
-    }
-    match work_db.has_active_rebase_attempt_for_pr(&candidate.pr_url) {
-        Ok(true) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: rebase attempt active; deferring trunk_queue_eviction flip",
-            );
-            return false;
-        }
-        Ok(false) => {}
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to check rebase attempt; deferring",
-            );
-            return false;
-        }
-    }
-    match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-        Ok(Some(_)) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: conflict resolution attempt active; deferring trunk_queue_eviction flip",
-            );
-            return false;
-        }
-        Ok(None) => {}
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to check active conflict_resolutions; deferring",
-            );
-            return false;
-        }
-    }
-
-    // The composite discriminator this attempt is keyed on — see the doc
-    // comment above. `trunk:` prefixed so it can never collide with a real
-    // git SHA (which `pr_branch_ci`/rebounce rows key on).
-    let discriminator = format!("trunk:{trunk_entry_id}@{trunk_state_changed_at}");
-
-    // Suppression check: if the human manually moved the chore out of
-    // `blocked: ci_failure` for this eviction episode, honour it.
-    match work_db.is_ci_failure_suppressed(&candidate.work_item_id, &discriminator) {
-        Ok(true) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                discriminator = %discriminator,
-                "ci_watch: ci_failure suppression active for this trunk eviction episode; skipping",
-            );
-            return false;
-        }
-        Ok(false) => {}
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to read suppression table; continuing",
-            );
-        }
-    }
-
-    let used = work_db.get_ci_attempts_used(&candidate.work_item_id).unwrap_or(0);
-    let budget = work_db.effective_ci_budget(&candidate.work_item_id).unwrap_or(3);
-    if used >= budget {
-        match work_db.mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url) {
-            Ok(Some(_)) => {
-                publisher
-                    .publish_work_item_changed(
-                        &candidate.product_id,
-                        &candidate.work_item_id,
-                        "blocked_ci_failure_exhausted",
-                    )
-                    .await;
-                publisher
-                    .publish_frontend_event_on_product(
-                        &candidate.product_id,
-                        FrontendEvent::CiRemediationExhausted {
-                            product_id: candidate.product_id.clone(),
-                            work_item_id: candidate.work_item_id.clone(),
-                            pr_url: candidate.pr_url.clone(),
-                            attempts_used: used,
-                            budget,
-                        },
-                    )
-                    .await;
-                // No per-check names available from a Trunk eviction (the
-                // failing SHA is Trunk's ephemeral construction commit, not
-                // the PR head); pass an empty slice so the body omits the list.
-                emit_exhausted_attention(work_db, publisher, candidate, used, budget, &[]).await;
-                tracing::info!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    used,
-                    budget,
-                    "ci_watch: trunk queue eviction budget exhausted; parent flipped to blocked: ci_failure_exhausted",
-                );
-                return true;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    "ci_watch: trunk eviction ci_failure_exhausted WHERE guard missed",
-                );
-                return false;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    ?err,
-                    "ci_watch: failed to flip row to blocked: ci_failure_exhausted (trunk eviction)",
-                );
-                return false;
-            }
-        }
-    }
-
-    // Trunk evictions are always `fix` — the semantic conflict requires a
-    // worker to rebase and potentially resolve incompatible changes;
-    // `retrigger` would not help (mirrors merge-queue rebounce).
-    let pr_number = parse_pr_number(&candidate.pr_url).unwrap_or(0);
-
-    let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
-        product_id: candidate.product_id.clone(),
-        work_item_id: candidate.work_item_id.clone(),
-        pr_url: candidate.pr_url.clone(),
-        pr_number,
-        head_branch: head_branch.unwrap_or_default().to_owned(),
-        head_sha_at_trigger: discriminator.clone(),
-        attempt_kind: "fix".to_owned(),
-        consumes_budget: 1,
-        failed_checks: encode_failed_checks(failures),
-        failure_kind: "trunk_queue_eviction".to_owned(),
-        before_commit_sha: None,
-    });
-    let attempt = match insert_result {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            // Per-(work_item_id, discriminator) idempotency: we have already
-            // remediated this exact eviction episode on an earlier sweep.
-            // Do not re-bounce until a fresh episode (a new trunk_entry_id
-            // or a new stateChangedAt) produces a new triplet.
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                discriminator = %discriminator,
-                "ci_watch: trunk eviction already recorded for this episode; idempotent no-op",
-            );
-            return false;
-        }
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to insert ci_remediations row (trunk eviction); deferring",
-            );
-            return false;
-        }
-    };
-
-    let task_result =
-        work_db.mark_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url, Some(&attempt.id));
-    let task_transitioned = match task_result {
-        Ok(Some(_)) => true,
-        Ok(None) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: trunk eviction WHERE guard missed; row already blocked or manually moved",
-            );
-            false
-        }
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to flip row to blocked: ci_failure (trunk eviction)",
-            );
-            return false;
-        }
-    };
-
-    // The PR is known-open (Trunk only builds a construction branch for a
-    // PR GitHub already reports mergeable), so a static checker is correct
-    // here and avoids a redundant `gh pr view` round-trip — mirrors the
-    // rebounce spawn below.
-    let mut task_unblocked_for_revision = false;
-    if attempt.status == "pending"
-        && attempt.revision_task_id.is_none()
-        && maybe_spawn_ci_revision(
-            work_db,
-            publisher,
-            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
-            candidate,
-            failures,
-            &attempt,
-        )
-        .await
-    {
-        task_unblocked_for_revision =
-            blocking_signal::unblock_for_revision(work_db, SignalKind::CiFailure, candidate, &attempt.id);
-    }
-
-    let task_changed = task_transitioned || task_unblocked_for_revision;
-    if task_changed {
-        if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                ?err,
-                "ci_watch: failed to increment ci_attempts_used (trunk eviction)",
-            );
-        }
-        let change_reason = if task_unblocked_for_revision {
-            "ci_revision_in_flight"
-        } else {
-            "blocked_ci_failure"
-        };
-        publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, change_reason)
-            .await;
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                FrontendEvent::CiRemediationStarted {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: attempt.id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                    attempt_kind: attempt.attempt_kind.clone(),
-                },
-            )
-            .await;
-        tracing::info!(
-            work_item_id = %candidate.work_item_id,
-            pr_url = %candidate.pr_url,
-            trunk_entry_id,
-            trunk_state_changed_at,
-            task_transitioned,
-            task_unblocked_for_revision,
-            "ci_watch: trunk queue eviction detected; parent flipped to blocked: ci_failure",
-        );
-        true
-    } else {
-        false
-    }
+    let discriminator = trunk_eviction_discriminator(trunk_entry_id, trunk_state_changed_at);
+    on_queue_side_failure_detected(
+        work_db,
+        publisher,
+        candidate,
+        head_branch,
+        QueueSideFailureEpisode {
+            discriminator: &discriminator,
+            before_commit_sha: None,
+            failure_kind: "trunk_queue_eviction",
+            labels: &[],
+        },
+        failures,
+    )
+    .await
 }
 
 /// Convert a discovered Trunk-eviction Buildkite build into the
@@ -1471,7 +1305,7 @@ pub async fn on_trunk_queue_eviction_detected(
 /// the existing `BuildkiteLogReader` / `render_bk_log_commands` machinery
 /// (which parses pipeline + build number out of that URL) works unmodified
 /// on a Trunk-eviction attempt exactly as it does on a normal per-PR one.
-pub fn trunk_eviction_failures_from_build(
+pub(crate) fn trunk_eviction_failures_from_build(
     build: &crate::ci_log_reader::TrunkEvictionBuild,
 ) -> Vec<RequiredCheckFailure> {
     build
