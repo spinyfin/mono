@@ -252,6 +252,7 @@ dependencies = [
  "comfy-table",
  "git-utils",
  "reqwest",
+ "rpassword",
  "serde",
  "serde_json",
  "tempfile",
@@ -369,6 +370,7 @@ dependencies = [
  "boss-ssh-transport",
  "boss-transcript-markdown",
  "boss-transcript-tail",
+ "boss-trunk-auth",
  "chrono",
  "clap",
  "fastrand 2.4.1",
@@ -532,14 +534,10 @@ dependencies = [
  "bon",
  "boss-engine-utils",
  "boss-github",
+ "boss-keychain",
  "boss-protocol",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "keyring",
  "reqwest",
  "rustls",
- "security-framework 3.7.0",
- "security-framework-sys",
  "serde",
  "serde_json",
  "tempfile",
@@ -556,6 +554,19 @@ dependencies = [
  "fastrand 2.4.1",
  "reqwest",
  "rustls",
+]
+
+[[package]]
+name = "boss-keychain"
+version = "0.1.0"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "keyring",
+ "security-framework 3.7.0",
+ "security-framework-sys",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -631,6 +642,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "boss-trunk-auth"
+version = "0.1.0"
+dependencies = [
+ "boss-keychain",
+ "boss-trunk-client",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

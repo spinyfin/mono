@@ -20,6 +20,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/utils",
         "//tools/boss/github",
+        "//tools/boss/keychain",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -42,6 +43,7 @@ rust_test(
     deps = [
         "//tools/boss/engine/utils",
         "//tools/boss/github",
+        "//tools/boss/keychain",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

@@ -1,0 +1,10 @@
+[package]
+name = "boss-trunk-auth"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+boss-keychain = { path = "../keychain" }
+boss-trunk-client = { path = "../trunk_client" }
+thiserror = { workspace = true }

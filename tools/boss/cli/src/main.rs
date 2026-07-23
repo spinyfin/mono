@@ -1053,6 +1053,26 @@ enum EngineCommand {
         #[command(subcommand)]
         command: EngineAttemptsCommand,
     },
+    /// Manage the Trunk org API token used by the merge-queue integration
+    /// (flunge's Trunk-backed merges). See the Trunk merge-queue
+    /// integration design's "Auth" section.
+    Trunk {
+        #[command(subcommand)]
+        command: EngineTrunkCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineTrunkCommand {
+    /// Store the Trunk org API token. Reads the token from stdin when
+    /// piped (`echo "$TOKEN" | boss engine trunk set-token`), otherwise
+    /// prompts interactively without echoing input. Never accepts the
+    /// token as a command-line argument — it would leak into shell
+    /// history and `ps`.
+    SetToken,
+    /// Report whether a Trunk API token is configured (env override or
+    /// keychain) and run a live queue smoke check when one is.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -5729,6 +5749,90 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
         EngineCommand::Conflicts { command } => run_engine_conflicts_command(command, ctx).await,
         EngineCommand::Ci { command } => run_engine_ci_command(command, ctx).await,
         EngineCommand::Attempts { command } => run_engine_attempts_command(command, ctx).await,
+        EngineCommand::Trunk { command } => run_engine_trunk_command(command, ctx).await,
+    }
+}
+
+async fn run_engine_trunk_command(command: EngineTrunkCommand, ctx: &RunContext) -> Result<(), CliError> {
+    match command {
+        EngineTrunkCommand::SetToken => run_engine_trunk_set_token(ctx).await,
+        EngineTrunkCommand::Status => run_engine_trunk_status(ctx).await,
+    }
+}
+
+/// Reads the Trunk API token from stdin (piped input) or an interactive,
+/// non-echoing prompt. Never from argv — see `EngineTrunkCommand::SetToken`.
+fn read_trunk_token_from_stdin_or_prompt() -> Result<String, CliError> {
+    if io::stdin().is_terminal() {
+        rpassword::prompt_password("Trunk API token: ").map_err(CliError::internal)
+    } else {
+        let mut input = String::new();
+        io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|err| CliError::usage(format!("failed to read Trunk API token from stdin: {err}")))?;
+        Ok(input.trim().to_owned())
+    }
+    .and_then(|token| {
+        if token.is_empty() {
+            Err(CliError::usage("no Trunk API token provided"))
+        } else {
+            Ok(token)
+        }
+    })
+}
+
+async fn run_engine_trunk_set_token(ctx: &RunContext) -> Result<(), CliError> {
+    let token = read_trunk_token_from_stdin_or_prompt()?;
+    let mut client = connect_for_work(ctx).await?;
+    let response = client
+        .send_request(&FrontendRequest::TrunkSetToken { token })
+        .await
+        .map_err(CliError::internal)?;
+    print_trunk_status_response(ctx, response)
+}
+
+async fn run_engine_trunk_status(ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    let response = client
+        .send_request(&FrontendRequest::TrunkStatus)
+        .await
+        .map_err(CliError::internal)?;
+    print_trunk_status_response(ctx, response)
+}
+
+fn print_trunk_status_response(ctx: &RunContext, response: FrontendEvent) -> Result<(), CliError> {
+    match response {
+        FrontendEvent::TrunkStatus {
+            configured,
+            source,
+            queue_check,
+            note,
+        } => {
+            let json = serde_json::json!({
+                "configured": configured,
+                "source": source,
+                "queue_check": queue_check,
+                "note": note,
+            });
+            print_entity(ctx, &json, || {
+                if configured {
+                    let source = source.as_deref().unwrap_or("unknown");
+                    println!("Trunk API token configured ({source}).");
+                } else {
+                    println!("No Trunk API token configured.");
+                }
+                if let Some(check) = &queue_check {
+                    println!("Queue smoke check: {}", if check.ok { "ok" } else { "failed" });
+                    println!("  {}", check.detail);
+                }
+                if let Some(note) = &note {
+                    println!("{note}");
+                }
+            })
+        }
+        other => Err(CliError::internal(anyhow::anyhow!(
+            "unexpected response to Trunk request: {other:?}"
+        ))),
     }
 }
 

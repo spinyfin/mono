@@ -1310,6 +1310,16 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "git_hub_auth_state",
         },
+        TagCase {
+            label: "TrunkStatus",
+            event: FrontendEvent::TrunkStatus {
+                configured: true,
+                source: Some("keychain".into()),
+                queue_check: None,
+                note: None,
+            },
+            expected_tag: "trunk_status",
+        },
         // --- Comments ---
         TagCase {
             label: "CommentResult",
@@ -1637,6 +1647,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ShutdownAccepted
         | FrontendEvent::ShutdownRejected { .. }
         | FrontendEvent::GitHubAuthState { .. }
+        | FrontendEvent::TrunkStatus { .. }
         | FrontendEvent::CommentResult { .. }
         | FrontendEvent::CommentsList { .. }
         | FrontendEvent::CommentsBannerState { .. }

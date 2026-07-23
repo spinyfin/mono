@@ -77,6 +77,7 @@ mod sessions;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
+mod trunk_auth;
 mod work_items;
 mod worker_events;
 
@@ -717,6 +718,11 @@ struct ServerState {
     /// [`FrontendEvent::GitHubAuthState`] on [`TOPIC_GITHUB_AUTH`] plus runs
     /// the org/SSO probe. See the OAuth device-flow design (§3, §4, §7).
     github_auth: Arc<GitHubAuthController>,
+    /// Stores/reads the Trunk org API token (env override or OS keychain).
+    /// Backs the `TrunkSetToken`/`TrunkStatus` RPC handlers
+    /// (`boss engine trunk set-token` / `boss engine trunk status`). See
+    /// the Trunk merge-queue integration design's "Auth" section.
+    trunk_token_store: Arc<dyn trunk_auth::TrunkTokenSource>,
     /// Resolves credentials for external-tracker sync. Uses
     /// `KeychainOAuthResolver` in production so a stored OAuth token
     /// takes precedence over ambient `gh` auth.
@@ -885,17 +891,21 @@ pub enum SendToAppError {
 }
 
 impl ServerState {
-    /// Construct `ServerState` with an optional `MergeProbe` override.
-    /// Production (via [`server::serve`]) passes `None` and gets the real
-    /// `CommandMergeProbe` (shell out to `gh`); tests that need to exercise
-    /// the CI-remediation validation gates (green / pending / red) without
-    /// a live `gh` call inject a fake here — see `MergeProbe`'s doc comment
-    /// ("test doubles can stub it directly").
+    /// Construct `ServerState` with optional `MergeProbe` and Trunk
+    /// token-store overrides. Production (via [`server::serve`]) passes
+    /// `None` for both and gets the real `CommandMergeProbe` (shell out to
+    /// `gh`) and `boss_trunk_auth::TrunkTokenStore` (OS keychain); tests
+    /// that need to exercise the CI-remediation validation gates (green /
+    /// pending / red) or the `TrunkSetToken`/`TrunkStatus` handlers without
+    /// a live `gh` call or the real OS keychain inject a fake for either —
+    /// see `MergeProbe`'s doc comment ("test doubles can stub it directly")
+    /// and `trunk_auth::TrunkTokenSource`.
     fn new_arc_with_app_pid_and_merge_probe(
         cfg: Arc<RuntimeConfig>,
         app_pid: Option<libc::pid_t>,
         control_token: Option<Arc<String>>,
         merge_probe_override: Option<Arc<dyn MergeProbe>>,
+        trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
@@ -1093,6 +1103,16 @@ impl ServerState {
         );
         let github_auth_for_state = Arc::new(github_auth_controller);
 
+        // Trunk org API token store (env override or OS keychain). Backs
+        // `boss engine trunk set-token` / `trunk status`. Production (via
+        // `server::serve`) passes `None` and gets the real
+        // `boss_trunk_auth::TrunkTokenStore`; tests that need to exercise
+        // the handlers without touching the real OS keychain inject a fake
+        // via `trunk_token_store_override` — see
+        // `trunk_auth::TrunkTokenSource`'s doc comment.
+        let trunk_token_store_for_state: Arc<dyn trunk_auth::TrunkTokenSource> =
+            trunk_token_store_override.unwrap_or_else(|| Arc::new(boss_trunk_auth::TrunkTokenStore::new()));
+
         let tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver> =
             Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
                 crate::external_tracker::github_oauth::KeychainTokenStore::new(),
@@ -1254,6 +1274,7 @@ impl ServerState {
                 .automation_scheduler_kick(automation_scheduler_kick_for_state)
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
+                .trunk_token_store(trunk_token_store_for_state)
                 .tracker_credential_resolver(tracker_credential_resolver)
                 .maybe_control_token(control_token_for_state)
                 .shutdown_trigger(shutdown_trigger_for_state)
@@ -2535,6 +2556,8 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::TailRunTranscript { .. } => executions::handle_tail_run_transcript(ctx, r).await,
             r @ FrontendRequest::TriggerPrReview { .. } => review::handle_trigger_pr_review(ctx, r).await,
+            r @ FrontendRequest::TrunkSetToken { .. } => trunk_auth::handle_trunk_set_token(ctx, r).await,
+            r @ FrontendRequest::TrunkStatus => trunk_auth::handle_trunk_status(ctx, r).await,
             r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
                 external_tracker::handle_unlink_work_item_external_ref(ctx, r).await
             }

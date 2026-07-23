@@ -1015,6 +1015,22 @@ pub enum FrontendEvent {
         state: GitHubAuthStateDto,
     },
 
+    /// Reply to [`FrontendRequest::TrunkSetToken`] / [`FrontendRequest::TrunkStatus`].
+    /// `source` is `"env"` / `"keychain"` when `configured` is `true`, `None`
+    /// otherwise. `queue_check` is the live `getQueue` smoke-check outcome —
+    /// `None` when no token is configured, or when there is no
+    /// `trunk_queue`-mechanism product yet to probe against (`note` explains
+    /// which).
+    TrunkStatus {
+        configured: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_check: Option<TrunkQueueCheckDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+
     // --- Comments in the markdown viewer (Phase 2) replies. ---
     /// Reply to `comments_create` / `comments_dismiss` /
     /// `comments_set_status` / `comments_update_anchor` / `comments_post_answer`.

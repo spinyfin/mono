@@ -278,6 +278,7 @@ pub async fn serve_with_merge_probe(
         app_pid,
         control_token.clone(),
         merge_probe_override,
+        None,
     )?;
 
     // Always attempt to unlink any existing file at the path before
