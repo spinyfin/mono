@@ -32,6 +32,7 @@ mod execution;
 mod planner_run;
 mod product;
 mod project;
+mod proposal;
 mod task;
 mod work_item;
 
@@ -48,5 +49,6 @@ pub use execution::*;
 pub use planner_run::*;
 pub use product::*;
 pub use project::*;
+pub use proposal::*;
 pub use task::*;
 pub use work_item::*;

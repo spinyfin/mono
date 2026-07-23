@@ -2086,3 +2086,49 @@ pub(crate) fn migrate_task_targets_table(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Create the `worker_proposals` table: the durable ingress ledger behind
+/// the mediated worker→engine proposal API. Every `boss propose <kind>`
+/// submission becomes one row here, keyed `(execution_id, idempotency_key)`
+/// so a retried or resumed submission is safe to replay instead of erroring
+/// or duplicating.
+///
+/// `work_item_id` is denormalised at insert time (derived from the
+/// execution) rather than requiring a join through `work_executions` on
+/// every read, so `ListProposals` can cheaply scope to "every proposal for
+/// this work item, across executions" — the read a resumed/successor run
+/// needs to see prior dispositions (design §"Data model": dispositions must
+/// be visible across executions, not just in-run).
+///
+/// Purely additive (`CREATE TABLE IF NOT EXISTS`) and independent of every
+/// other table except `execution_id`'s hard reference into
+/// `work_executions`, which cascades on delete like every sibling table
+/// that references that table (`work_runs`, `work_attention_items`) so
+/// execution-retention pruning can delete a pruned execution's proposal
+/// rows along with it. This migration ships schema only — no engine
+/// behavior change; nothing reads or writes this table yet.
+///
+/// Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md` §"Data model".
+pub(crate) fn migrate_worker_proposals_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS worker_proposals (
+             id              TEXT PRIMARY KEY,
+             execution_id    TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+             work_item_id    TEXT,
+             kind            TEXT NOT NULL,
+             payload_json    TEXT NOT NULL,
+             idempotency_key TEXT NOT NULL,
+             state           TEXT NOT NULL DEFAULT 'proposed',
+             decided_by      TEXT,
+             decision_reason TEXT,
+             applied_ref     TEXT,
+             created_at      TEXT NOT NULL,
+             decided_at      TEXT,
+             UNIQUE (execution_id, idempotency_key)
+         );
+
+         CREATE INDEX IF NOT EXISTS worker_proposals_work_item_idx
+             ON worker_proposals(work_item_id, created_at);",
+    )?;
+    Ok(())
+}

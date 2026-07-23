@@ -598,6 +598,12 @@ impl WorkDb {
         // Per-product merge mechanism (`direct` | `trunk_queue`), schema/contract
         // only — see trunk-merge-queue-integration-queue-backed-merges-merging-ui.md.
         migrate_products_merge_mechanism(conn)?;
+        // `worker_proposals`: the durable ingress ledger behind the mediated
+        // worker→engine proposal mechanism. Schema-only — no engine
+        // behavior change until the follow-on submission/apply-pipeline
+        // tasks land.
+        // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
+        migrate_worker_proposals_table(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -724,6 +730,18 @@ mod tests {
         assert!(
             local_host_exists,
             "expected ensure_local_host to have seeded the local host row"
+        );
+
+        let worker_proposals_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'worker_proposals')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            worker_proposals_exists,
+            "expected worker_proposals table from migrate_worker_proposals_table"
         );
     }
 

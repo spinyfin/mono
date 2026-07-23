@@ -34,10 +34,11 @@
 //! which is simpler to reason about than an explicit "superseded by a
 //! later success" join and produces the same practical outcome.
 //!
-//! `work_runs.execution_id` and `work_attention_items.execution_id` are
-//! both `ON DELETE CASCADE`, so a pruned execution's runs and any
-//! (typically already-resolved) attention items pointing at it go with
-//! it. `automation_runs.triage_execution_id` has no FK — that row's
+//! `work_runs.execution_id`, `work_attention_items.execution_id`, and
+//! `worker_proposals.execution_id` are all `ON DELETE CASCADE`, so a pruned
+//! execution's runs, any (typically already-resolved) attention items, and
+//! any worker proposals pointing at it go with it.
+//! `automation_runs.triage_execution_id` has no FK — that row's
 //! `outcome`/`detail` are denormalized at write time, so a pruned triage
 //! execution just leaves that column dangling; the automation's run
 //! history stays intact and readable.
@@ -212,6 +213,49 @@ mod tests {
 
         let remaining = db.list_executions(Some(&work_item_id)).unwrap();
         assert_eq!(remaining.len(), 1, "only the newest kept-floor row remains");
+    }
+
+    #[test]
+    fn prunes_executions_with_worker_proposal_rows_via_cascade() {
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+
+        let execution_id = insert_execution(&db, &work_item_id, "abandoned", now - 20 * DAY);
+
+        // A worker_proposals row referencing a prunable execution must not
+        // block the bulk `DELETE FROM work_executions` with a FOREIGN KEY
+        // constraint violation — the FK is ON DELETE CASCADE, so the
+        // proposal row is expected to go with its execution.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO worker_proposals
+                 (id, execution_id, work_item_id, kind, payload_json, idempotency_key, created_at)
+             VALUES ('prop_1', ?1, ?2, 'pr_created', '{}', 'idem_1', ?3)",
+            rusqlite::params![execution_id, work_item_id, now.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let policy = ExecutionRetentionPolicy {
+            max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+            keep_per_work_item: 0,
+        };
+        let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
+        assert_eq!(
+            outcome.deleted, 1,
+            "the sole old execution is pruned despite the referencing proposal row"
+        );
+
+        let conn = db.connect().unwrap();
+        let remaining_proposals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM worker_proposals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining_proposals, 0,
+            "the cascade removes the proposal row along with its execution"
+        );
     }
 
     #[test]

@@ -1490,6 +1490,246 @@ fn work_execution_epoch_accessors_parse_stored_strings() {
     assert_eq!(exec.created_epoch(), Some(1747000000));
 }
 
+// ── WorkerProposal / ProposalKind / ProposalState round-trip tests ──────
+
+#[test]
+fn proposal_kind_display_and_parse_are_inverses() {
+    for kind in ProposalKind::ALL {
+        let s = kind.to_string();
+        let back: ProposalKind = s
+            .parse()
+            .unwrap_or_else(|e| panic!("ProposalKind::from_str({s:?}) failed: {e}"));
+        assert_eq!(*kind, back, "round-trip failed for {kind:?}");
+    }
+}
+
+#[test]
+fn proposal_kind_serde_uses_wire_strings() {
+    assert_eq!(
+        serde_json::to_string(&ProposalKind::EffortEscalation).unwrap(),
+        r#""effort_escalation""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ProposalKind::FollowupTask).unwrap(),
+        r#""followup_task""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ProposalKind::AutomationOutcome).unwrap(),
+        r#""automation_outcome""#
+    );
+    let pr_created: ProposalKind = serde_json::from_str(r#""pr_created""#).unwrap();
+    assert_eq!(pr_created, ProposalKind::PrCreated);
+}
+
+#[test]
+fn proposal_state_display_and_parse_are_inverses() {
+    for state in ProposalState::ALL {
+        let s = state.to_string();
+        let back: ProposalState = s
+            .parse()
+            .unwrap_or_else(|e| panic!("ProposalState::from_str({s:?}) failed: {e}"));
+        assert_eq!(*state, back, "round-trip failed for {state:?}");
+    }
+}
+
+#[test]
+fn proposal_state_defaults_to_proposed() {
+    assert_eq!(ProposalState::default(), ProposalState::Proposed);
+}
+
+#[test]
+fn proposal_kind_from_str_rejects_unknown_values() {
+    assert!("nope".parse::<ProposalKind>().is_err());
+}
+
+#[test]
+fn proposal_state_from_str_rejects_unknown_values() {
+    assert!("nope".parse::<ProposalState>().is_err());
+}
+
+#[test]
+fn proposal_decider_display_and_parse_are_inverses() {
+    for decider in ProposalDecider::ALL {
+        let s = decider.to_string();
+        let back: ProposalDecider = s
+            .parse()
+            .unwrap_or_else(|e| panic!("ProposalDecider::from_str({s:?}) failed: {e}"));
+        assert_eq!(*decider, back, "round-trip failed for {decider:?}");
+    }
+}
+
+#[test]
+fn proposal_decider_from_str_rejects_unknown_values() {
+    assert!("nope".parse::<ProposalDecider>().is_err());
+}
+
+fn sample_worker_proposal() -> WorkerProposal {
+    WorkerProposal::builder()
+        .id("prp_1")
+        .execution_id("exec_1")
+        .created_at("1747000000")
+        .idempotency_key("exec_1:blocked:abc123")
+        .kind(ProposalKind::Blocked)
+        .payload_json(r#"{"reason":"bazel build wedged"}"#)
+        .build()
+}
+
+#[test]
+fn worker_proposal_defaults_state_to_proposed_and_omits_optional_fields() {
+    let proposal = sample_worker_proposal();
+    assert_eq!(proposal.state, ProposalState::Proposed);
+    let encoded = serde_json::to_value(&proposal).unwrap();
+    let obj = encoded.as_object().unwrap();
+    for absent in [
+        "applied_ref",
+        "decided_at",
+        "decided_by",
+        "decision_reason",
+        "work_item_id",
+    ] {
+        assert!(!obj.contains_key(absent), "expected {absent} omitted on encode");
+    }
+    assert_eq!(obj["state"], "proposed");
+}
+
+#[test]
+fn worker_proposal_roundtrips_with_every_field_set() {
+    let proposal = WorkerProposal::builder()
+        .id("prp_2")
+        .execution_id("exec_2")
+        .created_at("1747000000")
+        .idempotency_key("exec_2:pr_created:def456")
+        .kind(ProposalKind::PrCreated)
+        .payload_json(r#"{"pr_url":"https://github.com/foo/bar/pull/1"}"#)
+        .state(ProposalState::Applied)
+        .applied_ref("task_9")
+        .decided_at("1747000100")
+        .decided_by(ProposalDecider::Policy)
+        .decision_reason("verified PR URL and branch match")
+        .work_item_id("task_9")
+        .build();
+    let encoded = serde_json::to_value(&proposal).unwrap();
+    let back: WorkerProposal = serde_json::from_value(encoded).unwrap();
+    assert_eq!(proposal, back);
+}
+
+#[test]
+fn automation_outcome_payload_tags_on_outcome() {
+    let produced = AutomationOutcomeProposalPayload::ProducedTask {
+        task_id: "task_1".into(),
+    };
+    let raw = serde_json::to_value(&produced).unwrap();
+    assert_eq!(raw, json!({"outcome": "produced_task", "task_id": "task_1"}));
+    let back: AutomationOutcomeProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(produced, back);
+
+    let skip = AutomationOutcomeProposalPayload::Skip {
+        reason: "repo is clean".into(),
+    };
+    let raw = serde_json::to_value(&skip).unwrap();
+    assert_eq!(raw, json!({"outcome": "skip", "reason": "repo is clean"}));
+    let back: AutomationOutcomeProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(skip, back);
+}
+
+#[test]
+fn followup_task_payload_roundtrips_with_and_without_optional_fields() {
+    let full = FollowupTaskProposalPayload {
+        proposed_description: "Add retry/backoff".into(),
+        proposed_name: "Add retry to X client".into(),
+        rationale: "Observed transient 5xx flakes".into(),
+        proposed_effort: Some(EffortLevel::Small),
+        proposed_work_kind: Some("chore".into()),
+    };
+    let raw = serde_json::to_value(&full).unwrap();
+    let back: FollowupTaskProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(full, back);
+
+    let minimal = FollowupTaskProposalPayload {
+        proposed_description: "Add retry/backoff".into(),
+        proposed_name: "Add retry to X client".into(),
+        rationale: "Observed transient 5xx flakes".into(),
+        proposed_effort: None,
+        proposed_work_kind: None,
+    };
+    let raw = serde_json::to_value(&minimal).unwrap();
+    let obj = raw.as_object().unwrap();
+    assert!(!obj.contains_key("proposed_effort"));
+    assert!(!obj.contains_key("proposed_work_kind"));
+    let back: FollowupTaskProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(minimal, back);
+}
+
+#[test]
+fn pr_created_payload_roundtrips() {
+    let payload = PrCreatedProposalPayload {
+        pr_url: "https://github.com/foo/bar/pull/1".into(),
+        branch: Some("boss/exec_1".into()),
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    let back: PrCreatedProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn attention_payload_roundtrips_and_omits_kind_when_none() {
+    let full = AttentionProposalPayload {
+        body_markdown: "please check this".into(),
+        title: "Needs a decision".into(),
+        attention_kind: Some("question".into()),
+    };
+    let raw = serde_json::to_value(&full).unwrap();
+    let back: AttentionProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(full, back);
+
+    let minimal = AttentionProposalPayload {
+        body_markdown: "please check this".into(),
+        title: "Needs a decision".into(),
+        attention_kind: None,
+    };
+    let raw = serde_json::to_value(&minimal).unwrap();
+    let obj = raw.as_object().unwrap();
+    assert!(
+        !obj.contains_key("attention_kind"),
+        "attention_kind should be omitted when None"
+    );
+    let back: AttentionProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(minimal, back);
+}
+
+#[test]
+fn effort_escalation_payload_roundtrips_and_encodes_effort_level_wire_string() {
+    let payload = EffortEscalationProposalPayload {
+        reason: "bazel build wedged".into(),
+        requested_level: EffortLevel::Large,
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    assert_eq!(raw["requested_level"], "large");
+    let back: EffortEscalationProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn blocked_payload_roundtrips() {
+    let payload = BlockedProposalPayload {
+        reason: "waiting on operator approval to force-push".into(),
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    let back: BlockedProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn deferred_scope_payload_roundtrips() {
+    let payload = DeferredScopeProposalPayload {
+        summary: "wiring for the third data source".into(),
+        reason: "needs a new ingestion pipeline; out of scope for this task".into(),
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    let back: DeferredScopeProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
 #[test]
 fn work_execution_epoch_accessors_none_when_unset_or_unparseable() {
     let mut exec = sample_work_execution();
