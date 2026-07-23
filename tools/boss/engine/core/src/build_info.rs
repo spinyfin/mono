@@ -4,19 +4,30 @@
 //! problem ("you merged the fix but rebuilt this morning's engine?")
 //! is immediately visible without guessing.
 //!
-//! Only BOSS_VERSION (the numeric, tag-derived base version, e.g.
-//! "1.0.4") is stamped at Bazel build time, via workspace-status.sh +
-//! the build_info_rs genrule, threaded through compile_data + $(execpath)
-//! in rustc_env. Cargo builds fall back to "unknown" via build.rs.
+//! BOSS_VERSION (the numeric, tag-derived base version, e.g. "1.0.4") is
+//! stamped at Bazel build time via workspace-status.sh + the
+//! build_info_rs genrule, threaded through compile_data + $(execpath) in
+//! rustc_env, and included directly into engine_lib's own compilation
+//! (`build_info_stamp` below). Cargo builds fall back to "unknown" via
+//! build.rs.
 //!
-//! BOSS_GIT_SHA and BOSS_BUILD_TIME are NOT stamped — they are always
-//! "unknown". Stamping a per-commit SHA / per-build wall-clock time into
-//! this file (which compiles into engine_lib) forced a full recompile of
-//! the engine on every CI build; see installer/pkg.bzl's build_info_rs.
-//! The runtime signals below are what actually identify the binary:
+//! [`git_sha`], [`git_dirty`], and [`build_time`] are backed by the
+//! separate `boss_build_provenance` crate instead — a real commit sha
+//! stamped directly into `build_info_stamp` (via the same `include!`
+//! mechanism BOSS_VERSION uses) would change on every commit and force a
+//! full recompile of engine_lib on every CI build (see installer/pkg.bzl's
+//! `build_info_rs` doc comment for the history). `boss_build_provenance`
+//! is its own tiny, dedicated crate for exactly this reason: engine_lib
+//! depends on its compiled interface, not its generated source, so a
+//! changed commit sha invalidates only that crate's own (near-instant)
+//! compile, not engine_lib's.
 //!
-//! 1. The engine binary's filesystem mtime, evaluated at startup
-//!    (what [`build_time`] now reports, since the const is "unknown").
+//! Two more runtime signals round out "am I running the binary I think I
+//! am":
+//!
+//! 1. The engine binary's filesystem mtime, evaluated at startup — the
+//!    fallback [`build_time`] reports when the stamped provenance value
+//!    is unavailable (a Cargo build).
 //! 2. **Binary content fingerprint** — short SHA-256 of the engine
 //!    binary's bytes, computed once at first call to
 //!    [`binary_fingerprint`]. Survives a Bazel cache hit that doesn't
@@ -48,21 +59,29 @@ pub fn version_string(binary_name: &str) -> String {
     format!("{binary_name} {}", build_info_stamp::BOSS_VERSION)
 }
 
-/// Short git SHA the engine binary was built from. No longer stamped
-/// (it busted the build cache on every commit), so this always returns
-/// `"unknown"`. Retained for the diagnostic display fields that report
-/// it; use [`binary_fingerprint`] for an actual build discriminator.
+/// Full git commit sha the engine binary was built from — long enough to
+/// feed directly to `git merge-base --is-ancestor <sha> main`. `"unknown"`
+/// on a Cargo (non-Bazel) build. Stamped via the `boss_build_provenance`
+/// crate; see this module's doc comment for why that lives in its own
+/// crate instead of `build_info_stamp` below.
 pub fn git_sha() -> &'static str {
-    build_info_stamp::BOSS_GIT_SHA
+    boss_build_provenance::git_sha()
 }
 
-/// Best-effort build timestamp string. Uses the stamped BOSS_BUILD_TIME
-/// constant when available; falls back to the binary mtime sampled at
+/// `true` if the engine binary was built from a working tree with
+/// uncommitted changes (or, in a jj workspace, unresolved conflicts on
+/// the built commit). Always `false` on a Cargo (non-Bazel) build.
+pub fn git_dirty() -> bool {
+    boss_build_provenance::git_dirty()
+}
+
+/// Best-effort build timestamp string. Uses the stamped provenance
+/// value when available; falls back to the binary mtime sampled at
 /// first call.
 pub fn build_time() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| {
-        let stamped = build_info_stamp::BOSS_BUILD_TIME;
+        let stamped = boss_build_provenance::build_time();
         if !stamped.is_empty() && stamped != "unknown" {
             return stamped.to_owned();
         }
@@ -217,6 +236,16 @@ mod tests {
     fn git_sha_returns_non_empty_string() {
         let s = git_sha();
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn git_dirty_does_not_panic() {
+        // Best-effort provenance value; just confirm the call is wired
+        // through to `boss_build_provenance` without panicking. The
+        // actual value depends on the build (Bazel-stamped vs the Cargo
+        // `false` default) so there's nothing more specific to assert
+        // here in-tree.
+        let _ = git_dirty();
     }
 
     #[test]

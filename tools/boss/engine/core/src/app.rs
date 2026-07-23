@@ -741,6 +741,7 @@ impl ServerState {
         crate::build_info::init();
         tracing::info!(
             engine_build_sha = crate::build_info::git_sha(),
+            engine_build_dirty = crate::build_info::git_dirty(),
             engine_build_time = crate::build_info::build_time(),
             engine_binary_fingerprint = crate::build_info::binary_fingerprint(),
             "live_status: engine starting (build identity)",

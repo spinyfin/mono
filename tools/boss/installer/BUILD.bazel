@@ -1,5 +1,5 @@
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
-load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs")
+load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs", "build_provenance_rs")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -55,6 +55,16 @@ build_info_rs(
     name = "build_info_rs",
     out = "build_info_generated.rs",
     visibility = ["//tools/boss:__subpackages__"],
+)
+
+# Stamped Rust constants file consumed ONLY by the `boss-build-provenance`
+# crate (never engine_lib directly) — see that crate's BUILD.bazel and
+# pkg.bzl's `build_provenance_rs` doc comment for why a value that changes
+# on every commit/build lives here instead of in `build_info_rs` above.
+build_provenance_rs(
+    name = "build_provenance_rs",
+    out = "build_provenance_generated.rs",
+    visibility = ["//tools/boss/build-provenance:__pkg__"],
 )
 
 # Human-facing release driver (design doc Q4 Phase 3).

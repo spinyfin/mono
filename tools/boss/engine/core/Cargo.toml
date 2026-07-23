@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 boss-build-info = { path = "../../build-info" }
+boss-build-provenance = { path = "../../build-provenance" }
 boss-ci-log-reader = { path = "../ci-log-reader" }
 boss-claude-client = { path = "../../claude_client" }
 boss-github = { path = "../../github" }

@@ -1,0 +1,36 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "build-provenance",
+    srcs = glob(
+        ["src/**/*.rs"],
+        # Cargo-only fallback: build.rs points BOSS_BUILD_PROVENANCE_RS at
+        # this file so `include!(env!(...))` compiles without Bazel. The
+        # Bazel build instead stamps it via compile_data + rustc_env below.
+        exclude = ["src/provenance_default.rs"],
+    ),
+    compile_data = [
+        # Stamped provenance constants (GIT_SHA, GIT_DIRTY, BUILD_TIME).
+        # Referenced via include!(env!("BOSS_BUILD_PROVENANCE_RS")) in lib.rs.
+        "//tools/boss/installer:build_provenance_rs",
+    ],
+    crate_name = "boss_build_provenance",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_env = {
+        # Absolute path to the generated provenance-constants file.
+        "BOSS_BUILD_PROVENANCE_RS": "$(execpath //tools/boss/installer:build_provenance_rs)",
+    },
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+    ],
+)
+
+rust_test(
+    name = "build-provenance_test",
+    size = "small",
+    crate = ":build-provenance",
+    edition = "2024",
+)

@@ -4,6 +4,7 @@ members = [
   "lib/rust/git_utils",
   "tools/boss/bossctl",
   "tools/boss/build-info",
+  "tools/boss/build-provenance",
   "tools/boss/claude_client",
   "tools/boss/cli",
   "tools/boss/client",
