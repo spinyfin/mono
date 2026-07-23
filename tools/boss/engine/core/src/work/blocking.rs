@@ -935,6 +935,28 @@ impl WorkDb {
         Ok(Some(inserted))
     }
 
+    /// Whether a `ci_remediations` row already exists for this
+    /// `(work_item_id, head_sha_at_trigger)` pair, terminal or not. The
+    /// per-episode dedup check a queue-side failure detector (merge-queue
+    /// rebounce, Trunk eviction) uses to decide whether a discovery round
+    /// trip (e.g. a Buildkite log lookup) is worth making before falling
+    /// through to [`Self::insert_ci_remediation`]'s own `INSERT OR IGNORE`
+    /// guard — cheaper than that insert attempt when the caller wants to
+    /// skip the surrounding work entirely for an already-handled episode.
+    pub fn ci_remediation_exists_for_head_sha_at_trigger(
+        &self,
+        work_item_id: &str,
+        head_sha_at_trigger: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ci_remediations WHERE work_item_id = ?1 AND head_sha_at_trigger = ?2)",
+            params![work_item_id, head_sha_at_trigger],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     /// Read a `ci_remediations` row by id, terminal or not. Returns
     /// `Ok(None)` for an unknown id. Used by the worker-marker
     /// handlers in `app.rs` to echo the post-update row back to the
