@@ -3053,10 +3053,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              >   build ran on Trunk's ephemeral `trunk-merge/pr-<N>/<uuid>` construction branch,\n\
              >   listed under \"Failing required checks\" below with its build URL and job id.\n\
              > - Root cause: something landed on the target branch between this PR's CI run and its\n\
-             >   queue turn that is semantically incompatible. After fixing and pushing, the PR must be\n\
-             >   **resubmitted to the Trunk queue** — auto-resubmit is not implemented yet, so ask a\n\
-             >   human to re-run the merge (or comment `/trunk merge`). Do NOT run `gh pr merge` —\n\
-             >   that bypasses the queue.\n\n",
+             >   queue turn that is semantically incompatible. After fixing and pushing, just push and\n\
+             >   stop — Boss auto-resubmits the PR to the Trunk queue on the next poller pass once this\n\
+             >   revision reaches `done`. Do NOT ask a human to re-run the merge, do NOT comment\n\
+             >   `/trunk merge` yourself, and do NOT run `gh pr merge` — that bypasses the queue and\n\
+             >   races the automatic resubmit.\n\n",
         );
     } else {
         out.push_str(&format!(
@@ -3220,9 +3221,10 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
                  - **If post-rebase CI is green**, do NOT call `mark-succeeded-via-rebase` — Trunk \
                  eviction attempts are not validatable via head-branch CI (the engine's guard rejects \
-                 that verb unconditionally for this attempt class). Push the fix, then ask a human to \
-                 get the PR resubmitted to the Trunk queue (auto-resubmit is not implemented yet) and \
-                 stop; the poller retires the attempt when the queue outcome is observed.\n\
+                 that verb unconditionally for this attempt class). Push the fix and stop — do NOT ask \
+                 a human and do NOT run `gh pr merge`; Boss auto-resubmits the PR to the Trunk queue on \
+                 the next poller pass once this revision reaches `done`, and the poller retires the \
+                 attempt when the queue outcome is observed.\n\
                  - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
                  continue to Step 2.\n\n",
             );
@@ -3344,11 +3346,12 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
             );
         } else if is_trunk_eviction {
             out.push_str(
-                "**Step 3 (after CI is green) — Get the PR resubmitted to the Trunk queue.**\n\n\
-                 The Trunk queue does **not** auto-retry after an eviction, and auto-resubmit is not \
-                 implemented yet. After your push produces green CI, ask a human to resubmit — either \
-                 by re-clicking Boss's merge button or commenting `/trunk merge` on the PR. Do NOT run \
-                 `gh pr merge` yourself; that bypasses the queue.\n\n",
+                "**Step 3 — nothing further to do here.**\n\n\
+                 The Trunk queue does **not** auto-retry after an eviction, but Boss's own poller does: \
+                 once this revision reaches `done`, it auto-resubmits the PR to the Trunk queue on its \
+                 next pass. Push your fix and stop — do NOT ask a human to resubmit, do NOT comment \
+                 `/trunk merge` yourself, and do NOT run `gh pr merge`; either would race the automatic \
+                 resubmit.\n\n",
             );
         }
     }

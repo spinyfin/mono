@@ -340,7 +340,7 @@ async fn handle_trunk_queue_merge(
                 // The app is push-only, so the optimistic write needs its
                 // own `work_item_changed` publish to reach the Merging UI —
                 // nothing else emits one for this write.
-                let detail = serde_json::json!({"source": "trunk", "state": "pending"}).to_string();
+                let detail = crate::trunk_merge::optimistic_pending_detail_json();
                 if let Err(err) = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail)) {
                     tracing::error!(
                         %work_item_id,

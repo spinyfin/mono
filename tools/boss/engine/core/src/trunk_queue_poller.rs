@@ -29,9 +29,20 @@
 //! It does **not** decide that a PR merged: Trunk's `merged` state only
 //! retires the intent, because the GitHub-side probe already detects the
 //! merged PR and runs the whole `mark_merged()` cascade (design §"The
-//! merge verb"). And it does **not** remediate an eviction — observing
-//! `failed`/`pending_failure` records the state and leaves the intent
-//! `active` for the `ci_watch` eviction path to pick up.
+//! merge verb"). And it does **not** remediate an eviction or a mid-queue
+//! conflict — observing `failed`/`pending_failure` records the state and
+//! leaves the intent `active` for the `ci_watch` eviction path to pick up;
+//! observing (via `conflict_watch`) that the entry was superseded by a
+//! conflict leaves the fix to the conflict resolver too. What it *does* own
+//! on the write side is narrowly scoped to those two owners handing back
+//! control: once `ci_watch::on_ci_resolved` or `conflict_watch::on_resolved`
+//! marks an intent [`crate::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT`]
+//! (the fix landed), this module calls `submitPullRequest` again; once
+//! `conflict_watch::on_conflict_detected` marks one
+//! [`crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`] (a live entry
+//! just went conflicting), this module calls `cancelPullRequest` — design
+//! §"Eviction: a first-class failure signal" / §"Coordination with
+//! conflict_watch / ci_watch".
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -39,13 +50,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 use boss_trunk_client::{
-    GetQueueRequest, ListPullRequestsRequest, ListPullRequestsResponse, TrunkError, TrunkPrLookup, TrunkPrRef,
-    TrunkPrState, TrunkPullRequest, TrunkQueue, TrunkQueueState, TrunkRepoRef,
+    GetQueueRequest, ListPullRequestsRequest, ListPullRequestsResponse, SubmitPullRequestRequest, TrunkError,
+    TrunkPrLookup, TrunkPrRef, TrunkPrState, TrunkPullRequest, TrunkQueue, TrunkQueueState, TrunkRepoRef,
 };
 
 use crate::coordinator::ExecutionPublisher;
 use crate::metrics::Registry;
-use crate::trunk_merge::trunk_repo_ref;
+use crate::trunk_merge::{TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT, trunk_repo_ref};
 use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
 
 // ── Metrics ───────────────────────────────────────────────────────────────
@@ -85,6 +96,16 @@ crate::register_counter!(
     "trunk_queue_poller.evictions_detected",
     "Trunk queue evictions that flipped the parent to blocked: ci_failure via ci_watch::on_trunk_queue_eviction_detected."
 );
+crate::register_counter!(
+    RESUBMITS,
+    "trunk_queue_poller.resubmits",
+    "submitPullRequest calls issued to auto-resubmit an eviction/conflict-superseded intent whose fix landed."
+);
+crate::register_counter!(
+    QUEUE_CANCELLATIONS,
+    "trunk_queue_poller.queue_cancellations",
+    "cancelPullRequest calls issued to pull an intent out of the queue for a mid-queue conflict."
+);
 
 /// Register every counter this module declares. Called from
 /// [`crate::metrics_init::init_all`] at engine startup.
@@ -96,6 +117,8 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&INTENTS_RETIRED);
     registry.register_counter(&ATTENTIONS_FILED);
     registry.register_counter(&EVICTIONS_DETECTED);
+    registry.register_counter(&RESUBMITS);
+    registry.register_counter(&QUEUE_CANCELLATIONS);
 }
 
 /// Fold one pass's [`TrunkSweepOutcome`] into the registry.
@@ -107,6 +130,8 @@ pub fn record_pass_metrics(metrics: &Registry, outcome: &TrunkSweepOutcome) {
     INTENTS_RETIRED.inc_by(metrics, outcome.intents_retired as u64);
     ATTENTIONS_FILED.inc_by(metrics, outcome.attentions_filed as u64);
     EVICTIONS_DETECTED.inc_by(metrics, outcome.evictions_detected as u64);
+    RESUBMITS.inc_by(metrics, outcome.resubmits as u64);
+    QUEUE_CANCELLATIONS.inc_by(metrics, outcome.queue_cancellations as u64);
 }
 
 // ── Tunables ──────────────────────────────────────────────────────────────
@@ -170,12 +195,18 @@ pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_
 
 // ── Transport seam ────────────────────────────────────────────────────────
 
-/// The two Trunk read verbs this poller issues, behind a trait so tests
-/// can drive the whole state machine without a mock HTTP server.
+/// The Trunk verbs this poller issues, behind a trait so tests can drive
+/// the whole state machine without a mock HTTP server.
 ///
 /// Deliberately narrower than [`boss_trunk_client::TrunkClient`]: the
-/// poller never writes to the queue (no submit/cancel/restart), and
-/// spelling that out in the type keeps it that way.
+/// poller issues only the entry-level writes the auto-resubmit /
+/// conflict-during-queue coordination needs (`submitPullRequest`,
+/// `cancelPullRequest`) — never queue-lifecycle administration (creating,
+/// deleting, or pausing a queue, concurrency-mode changes,
+/// `setImpactedTargets`). `restartTestsOnPullRequest` is also an
+/// entry-level verb per the design's non-goals section, and is the
+/// flake-retrigger action the brief calls for on a still-live entry, but it
+/// is not wired up in this trait yet.
 #[async_trait]
 pub trait TrunkQueueApi: Send + Sync {
     async fn get_queue(&self, request: &GetQueueRequest) -> Result<TrunkQueue, TrunkError>;
@@ -184,6 +215,8 @@ pub trait TrunkQueueApi: Send + Sync {
         &self,
         request: &ListPullRequestsRequest,
     ) -> Result<ListPullRequestsResponse, TrunkError>;
+    async fn submit_pull_request(&self, request: &SubmitPullRequestRequest) -> Result<(), TrunkError>;
+    async fn cancel_pull_request(&self, request: &TrunkPrLookup) -> Result<(), TrunkError>;
 }
 
 #[async_trait]
@@ -201,6 +234,14 @@ impl TrunkQueueApi for boss_trunk_client::TrunkClient {
         request: &ListPullRequestsRequest,
     ) -> Result<ListPullRequestsResponse, TrunkError> {
         boss_trunk_client::TrunkClient::list_pull_requests(self, request).await
+    }
+
+    async fn submit_pull_request(&self, request: &SubmitPullRequestRequest) -> Result<(), TrunkError> {
+        boss_trunk_client::TrunkClient::submit_pull_request(self, request).await
+    }
+
+    async fn cancel_pull_request(&self, request: &TrunkPrLookup) -> Result<(), TrunkError> {
+        boss_trunk_client::TrunkClient::cancel_pull_request(self, request).await
     }
 }
 
@@ -256,6 +297,21 @@ fn already_resolved_terminal(member: &ActiveTrunkMergeIntent) -> bool {
         .is_some_and(|state| is_terminal_trunk_state(&TrunkPrState::from(state.to_owned())))
 }
 
+/// Whether `ci_watch::on_ci_resolved` or `conflict_watch::on_resolved` has
+/// flipped this intent's sentinel to [`TRUNK_INTENT_AWAITING_RESUBMIT`] —
+/// the fix landed and it's clear to call `submitPullRequest` again.
+fn is_awaiting_resubmit(member: &ActiveTrunkMergeIntent) -> bool {
+    member.intent.last_trunk_state.as_deref() == Some(TRUNK_INTENT_AWAITING_RESUBMIT)
+}
+
+/// Whether `conflict_watch::on_conflict_detected` has flipped this intent's
+/// sentinel to [`TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`] — a conflict was
+/// detected while it was still live in the queue and it needs to be pulled
+/// out via `cancelPullRequest`.
+fn is_superseded_by_conflict(member: &ActiveTrunkMergeIntent) -> bool {
+    member.intent.last_trunk_state.as_deref() == Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+}
+
 /// Task statuses past which a merge intent is moot — the card has left the
 /// review lifecycle entirely, so there is nothing left to render or
 /// resubmit. Their intents are retired instead of polled forever (a PR
@@ -302,6 +358,12 @@ pub struct TrunkSweepOutcome {
     /// Trunk queue evictions handed to `ci_watch::on_trunk_queue_eviction_detected`
     /// that flipped the parent to `blocked: ci_failure` this pass.
     pub evictions_detected: usize,
+    /// `submitPullRequest` calls issued this pass to auto-resubmit an
+    /// intent whose eviction/conflict fix landed.
+    pub resubmits: usize,
+    /// `cancelPullRequest` calls issued this pass for an intent superseded
+    /// by a mid-queue conflict.
+    pub queue_cancellations: usize,
 }
 
 impl TrunkSweepOutcome {
@@ -312,6 +374,8 @@ impl TrunkSweepOutcome {
             || self.probe_failures > 0
             || self.attentions_filed > 0
             || self.evictions_detected > 0
+            || self.resubmits > 0
+            || self.queue_cancellations > 0
     }
 }
 
@@ -521,6 +585,19 @@ impl TrunkQueueProbe {
 
         let mut tier = TrunkPollTier::Pending;
         for member in members {
+            // Checked before the queue-membership lookup below: a conflict
+            // detected mid-queue sets this sentinel while the entry is
+            // still LIVE in `enqueuedPullRequests`, so if this check ran
+            // after the lookup the live-entry arm would win every time,
+            // overwrite the sentinel with Trunk's observed state via
+            // `record_observed_state`, and `cancelPullRequest` would never
+            // fire. Cancelling first and `continue`-ing also skips writing
+            // a live-entry snapshot for a slot the conflict resolver now
+            // owns.
+            if is_superseded_by_conflict(member) {
+                cancel_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
+                continue;
+            }
             let observed = match by_pr_number.get(&(member.intent.pr_number as u64)) {
                 Some((position, entry)) if !is_terminal_trunk_state(&entry.state) => {
                     write_live_entry(ctx, member, entry, *position, &queue.state, outcome).await;
@@ -534,6 +611,15 @@ impl TrunkQueueProbe {
                 Some((_, entry)) => {
                     apply_resolved_state(ctx, member, entry, outcome).await;
                     Some(entry.state.clone())
+                }
+                // The eviction/conflict fix landed — `ci_watch::on_ci_resolved`
+                // or `conflict_watch::on_resolved` flipped the sentinel once
+                // the revision reached `done`. Resubmit; a success clears the
+                // sentinel so the arm above picks the entry back up on the
+                // next `getQueue` response.
+                None if is_awaiting_resubmit(member) => {
+                    resubmit_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
+                    None
                 }
                 // Already resolved on an earlier pass and deliberately
                 // left `active` (an eviction awaiting remediation). Its
@@ -1095,6 +1181,133 @@ async fn resolve_missing_entry(
                 "trunk queue poller: getSubmittedPullRequest failed; retrying next cycle",
             );
             None
+        }
+    }
+}
+
+/// Auto-resubmit an intent whose eviction/conflict fix has landed
+/// ([`is_awaiting_resubmit`]). On success, bumps `submit_count`, clears the
+/// sentinel (so the live-tracking arm in [`TrunkQueueProbe::probe_queue`]
+/// picks the entry back up once the next `getQueue` reports it), and
+/// optimistically moves the card back into the Merging lane ahead of that
+/// probe, via the same [`crate::trunk_merge::optimistic_pending_detail_json`]
+/// shape `app::review::handle_merge_when_ready`'s initial-submit optimistic
+/// write uses. On failure, the sentinel is left in place so the next
+/// due cycle retries; Trunk's documented lack of rate limits is what makes
+/// that an acceptable retry cadence rather than a backoff ladder of its own.
+async fn resubmit_intent(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    repo: &TrunkRepoRef,
+    target_branch: &str,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    let request = SubmitPullRequestRequest::builder()
+        .repo(repo.clone())
+        .pr(TrunkPrRef::new(member.intent.pr_number as u64))
+        .target_branch(target_branch)
+        .build();
+    match ctx.api.submit_pull_request(&request).await {
+        Ok(()) => {
+            outcome.resubmits += 1;
+            if let Err(err) = ctx.work_db.record_trunk_merge_intent_resubmit(&member.intent.id) {
+                tracing::warn!(
+                    intent_id = %member.intent.id,
+                    work_item_id = %member.intent.work_item_id,
+                    ?err,
+                    "trunk queue poller: resubmit succeeded but failed to record submit_count",
+                );
+            }
+            let detail = crate::trunk_merge::optimistic_pending_detail_json();
+            match ctx.work_db.set_task_merge_queue_state(
+                &member.intent.work_item_id,
+                Some(MERGE_QUEUE_STATE_QUEUED),
+                Some(&detail),
+            ) {
+                Ok(true) => {
+                    outcome.state_writes += 1;
+                    ctx.publisher
+                        .publish_work_item_changed(
+                            &member.product_id,
+                            &member.intent.work_item_id,
+                            "trunk_merge_resubmitted",
+                        )
+                        .await;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %member.intent.work_item_id,
+                        ?err,
+                        "trunk queue poller: resubmit succeeded but optimistic merge_queue_state write failed",
+                    );
+                }
+            }
+            tracing::info!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                "trunk queue poller: auto-resubmitted an evicted/conflict-superseded intent",
+            );
+        }
+        Err(err) => {
+            outcome.probe_failures += 1;
+            tracing::warn!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                error = %err,
+                "trunk queue poller: submitPullRequest (auto-resubmit) failed; retrying next cycle",
+            );
+        }
+    }
+}
+
+/// Pull an intent superseded by a mid-queue conflict
+/// ([`is_superseded_by_conflict`]) out of the queue. Leaves the sentinel in
+/// place either way — `conflict_watch::on_resolved` is what advances it to
+/// [`TRUNK_INTENT_AWAITING_RESUBMIT`] once the conflict-fix revision lands,
+/// so this call is safe to repeat every due cycle until then (Trunk
+/// documents no rate limits — see the design's API-surface section).
+async fn cancel_intent(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    repo: &TrunkRepoRef,
+    target_branch: &str,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    let lookup = TrunkPrLookup::new(
+        repo.clone(),
+        TrunkPrRef::new(member.intent.pr_number as u64),
+        target_branch.to_owned(),
+    );
+    match ctx.api.cancel_pull_request(&lookup).await {
+        Ok(()) => {
+            outcome.queue_cancellations += 1;
+            tracing::info!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                "trunk queue poller: cancelled a queue entry superseded by a mid-queue conflict",
+            );
+        }
+        Err(TrunkError::NotFound(_)) => {
+            // Already left the queue (Trunk failed it independently, or a
+            // human already cancelled it) — nothing left to cancel. Not
+            // an error: `conflict_watch`'s own resolution path is what
+            // clears the sentinel once the fix lands, regardless of
+            // whether this call ever finds a live entry to pull.
+            tracing::debug!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                "trunk queue poller: cancelPullRequest found no live entry; already left the queue",
+            );
+        }
+        Err(err) => {
+            outcome.probe_failures += 1;
+            tracing::warn!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                error = %err,
+                "trunk queue poller: cancelPullRequest (conflict supersede) failed; retrying next cycle",
+            );
         }
     }
 }

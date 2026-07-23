@@ -12,3 +12,4 @@ mod resolution;
 mod retire;
 mod revision;
 mod supersession;
+mod trunk_coordination;

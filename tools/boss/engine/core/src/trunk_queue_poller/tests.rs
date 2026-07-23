@@ -54,6 +54,18 @@ struct StubTrunkApi {
     /// backstop advanced its cursor past a failed window, and whether it
     /// followed `next_cursor` into a second page.
     list_pull_requests_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// Replies for successive `submitPullRequest` calls, sticky-last like
+    /// `queue_replies`. `Ok(())` by default (no reply queued).
+    submit_replies: Mutex<VecDeque<Result<(), StubError>>>,
+    /// `(owner/name, pr_number, target_branch)` for every `submitPullRequest`
+    /// call, in order.
+    submit_calls: Mutex<Vec<(String, u64, String)>>,
+    /// Replies for successive `cancelPullRequest` calls, sticky-last like
+    /// `queue_replies`. `Ok(())` by default.
+    cancel_replies: Mutex<VecDeque<Result<(), StubError>>>,
+    /// `(owner/name, pr_number, target_branch)` for every `cancelPullRequest`
+    /// call, in order.
+    cancel_calls: Mutex<Vec<(String, u64, String)>>,
 }
 
 impl StubTrunkApi {
@@ -82,6 +94,22 @@ impl StubTrunkApi {
 
     fn list_pull_requests_calls(&self) -> Vec<(Option<String>, Option<String>)> {
         self.list_pull_requests_calls.lock().unwrap().clone()
+    }
+
+    fn set_submit_replies(&self, replies: Vec<Result<(), StubError>>) {
+        *self.submit_replies.lock().unwrap() = replies.into();
+    }
+
+    fn submit_call_count(&self) -> usize {
+        self.submit_calls.lock().unwrap().len()
+    }
+
+    fn set_cancel_replies(&self, replies: Vec<Result<(), StubError>>) {
+        *self.cancel_replies.lock().unwrap() = replies.into();
+    }
+
+    fn cancel_call_count(&self) -> usize {
+        self.cancel_calls.lock().unwrap().len()
     }
 }
 
@@ -135,6 +163,44 @@ impl TrunkQueueApi for StubTrunkApi {
                 pull_requests: Vec::new(),
                 next_cursor: None,
             }),
+        }
+    }
+
+    async fn submit_pull_request(&self, request: &SubmitPullRequestRequest) -> Result<(), TrunkError> {
+        self.submit_calls.lock().unwrap().push((
+            format!("{}/{}", request.repo.owner, request.repo.name),
+            request.pr.number,
+            request.target_branch.clone(),
+        ));
+        let mut replies = self.submit_replies.lock().unwrap();
+        let reply = if replies.len() > 1 {
+            replies.pop_front()
+        } else {
+            replies.front().cloned()
+        };
+        match reply {
+            Some(Ok(())) => Ok(()),
+            Some(Err(err)) => Err(err.into_trunk()),
+            None => Ok(()),
+        }
+    }
+
+    async fn cancel_pull_request(&self, request: &TrunkPrLookup) -> Result<(), TrunkError> {
+        self.cancel_calls.lock().unwrap().push((
+            format!("{}/{}", request.repo.owner, request.repo.name),
+            request.pr.number,
+            request.target_branch.clone(),
+        ));
+        let mut replies = self.cancel_replies.lock().unwrap();
+        let reply = if replies.len() > 1 {
+            replies.pop_front()
+        } else {
+            replies.front().cloned()
+        };
+        match reply {
+            Some(Ok(())) => Ok(()),
+            Some(Err(err)) => Err(err.into_trunk()),
+            None => Ok(()),
         }
     }
 }
@@ -698,6 +764,195 @@ async fn a_resubmitted_entry_returns_to_the_merging_lane() {
         "seeing the entry back in the queue clears the terminal state",
     );
     assert_eq!(stored_detail(&db, &task_id)["position"], 1);
+}
+
+// ── Auto-resubmit / conflict-during-queue coordination ─────────────────────
+
+#[tokio::test]
+async fn an_intent_awaiting_resubmit_is_resubmitted_and_returns_to_the_merging_lane() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "awaiting-resubmit", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    // Mirrors what `ci_watch::on_ci_resolved` / `conflict_watch::on_resolved`
+    // do once the fix lands — no need to drive the whole ci_watch/
+    // conflict_watch pipeline to exercise the poller's own reaction.
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.resubmits, 1);
+    assert_eq!(api.submit_call_count(), 1);
+    let calls = api.submit_calls.lock().unwrap().clone();
+    assert_eq!(calls[0], (REPO.to_owned(), 978, "main".to_owned()));
+
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("still active");
+    assert_eq!(intent.submit_count, 2, "resubmit bumps submit_count");
+    assert!(
+        intent.last_trunk_state.is_none(),
+        "the sentinel clears so live tracking resumes on the next getQueue",
+    );
+    let (state, _) = stored_queue_state(&db, &task_id);
+    assert_eq!(
+        state.as_deref(),
+        Some("queued"),
+        "the card moves back into the Merging lane optimistically",
+    );
+}
+
+#[tokio::test]
+async fn a_failed_resubmit_leaves_the_sentinel_for_the_next_cycle() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "resubmit-fails", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    api.set_submit_replies(vec![Err(StubError::Unavailable)]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.resubmits, 0);
+    assert_eq!(outcome.probe_failures, 1);
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("still active");
+    assert_eq!(intent.submit_count, 1, "a failed resubmit must not bump submit_count");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(crate::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT),
+        "the sentinel stays put so the next due cycle retries",
+    );
+}
+
+/// Covers the case the feature actually exists for: the conflict was
+/// detected while the entry was STILL LIVE in Trunk's `getQueue` snapshot,
+/// so `by_pr_number` carries a non-terminal entry for it on this pass. The
+/// superseded check must win over the live-entry match arm, or
+/// `record_observed_state` clobbers the sentinel before `cancelPullRequest`
+/// is ever issued.
+#[tokio::test]
+async fn a_live_intent_superseded_by_conflict_is_cancelled_before_its_sentinel_can_be_clobbered() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "superseded-live", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(
+        TrunkQueueState::Running,
+        vec![entry_of(978, TrunkPrState::Pending)],
+    ))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.queue_cancellations, 1);
+    assert_eq!(api.cancel_call_count(), 1);
+    let calls = api.cancel_calls.lock().unwrap().clone();
+    assert_eq!(calls[0], (REPO.to_owned(), 978, "main".to_owned()));
+
+    // The sentinel must survive: a live-entry write here would mean
+    // `cancelPullRequest` is unreachable in production.
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("still active");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+    );
+    assert!(db.active_ci_remediation_for_work_item(&task_id).unwrap().is_none());
+}
+
+/// The entry-absent case: the conflict resolver already pulled it, or Trunk
+/// failed it independently, before this pass ran.
+#[tokio::test]
+async fn an_intent_superseded_by_conflict_is_cancelled_and_the_sentinel_persists() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "superseded", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.queue_cancellations, 1);
+    assert_eq!(api.cancel_call_count(), 1);
+    let calls = api.cancel_calls.lock().unwrap().clone();
+    assert_eq!(calls[0], (REPO.to_owned(), 978, "main".to_owned()));
+
+    // No eviction remediation, and the conflict resolver still owns the
+    // slot: the sentinel is untouched, and no `ci_remediations` row exists.
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("still active");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+    );
+    assert!(db.active_ci_remediation_for_work_item(&task_id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_cancel_that_finds_no_live_entry_is_not_a_probe_failure() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "cancel-not-found", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    api.set_cancel_replies(vec![Err(StubError::NotFound)]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.queue_cancellations, 0);
+    assert_eq!(outcome.probe_failures, 0, "a NotFound cancel reply is not a failure");
 }
 
 #[tokio::test]
