@@ -88,8 +88,9 @@ impl std::str::FromStr for ProposalKind {
 /// - `applied`: the apply pipeline (auto-apply or the human batch-accept
 ///   gesture, per kind) produced an effect; `WorkerProposal::applied_ref`
 ///   points at the row it produced.
-/// - `rejected`: a policy/human judgment declined the proposal (e.g. dedup
-///   verdict "already exists as T123"); `decision_reason` carries why.
+/// - `rejected`: a policy/human judgment declined the proposal (e.g. a
+///   dedup verdict that an equivalent task already exists); `decision_reason`
+///   carries why.
 /// - `superseded`: a newer proposal in the same idempotency scope replaced
 ///   this one before it was decided (e.g. triage revises its outcome).
 /// - `expired`: still undecided when the originating execution reached a
@@ -151,12 +152,59 @@ impl std::str::FromStr for ProposalState {
     }
 }
 
+/// Closed vocabulary for `worker_proposals.decided_by`: who/what decided a
+/// proposal's disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalDecider {
+    /// An auto-apply policy applier acted without human/coordinator input.
+    Policy,
+    Coordinator,
+    Human,
+}
+
+impl ProposalDecider {
+    pub const ALL: &'static [ProposalDecider] = &[
+        ProposalDecider::Policy,
+        ProposalDecider::Coordinator,
+        ProposalDecider::Human,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalDecider::Policy => "policy",
+            ProposalDecider::Coordinator => "coordinator",
+            ProposalDecider::Human => "human",
+        }
+    }
+}
+
+impl std::fmt::Display for ProposalDecider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProposalDecider {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "policy" => Ok(ProposalDecider::Policy),
+            "coordinator" => Ok(ProposalDecider::Coordinator),
+            "human" => Ok(ProposalDecider::Human),
+            other => Err(format!(
+                "unknown proposal decider `{other}`; expected one of: policy, coordinator, human"
+            )),
+        }
+    }
+}
+
 /// One row in the `worker_proposals` ingress ledger — the durable record of
 /// a `boss propose <kind>` submission. `payload_json` is the JSON encoding
 /// of the kind-matched payload struct below (e.g. `kind = FollowupTask` ⇒
 /// `payload_json` deserializes as [`FollowupTaskProposalPayload`]); this
 /// type does not enforce that correspondence itself; the submission RPC
-/// (task 2) validates it at write time.
+/// validates that correspondence at write time.
 ///
 /// `(execution_id, idempotency_key)` is UNIQUE at the schema level, so a
 /// retried or resumed `boss propose` call is safe to replay.
@@ -185,15 +233,14 @@ pub struct WorkerProposal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_at: Option<String>,
 
-    /// Who/what decided this proposal's disposition: `policy` (an
-    /// auto-apply appliers), `coordinator`, or `human`. `None` while still
+    /// Who/what decided this proposal's disposition. `None` while still
     /// `proposed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decided_by: Option<String>,
+    pub decided_by: Option<ProposalDecider>,
 
     /// Human-readable reason for a `rejected` (or otherwise notable)
-    /// disposition, e.g. `"duplicate of T123"`. `None` for proposals with
-    /// no decision yet, and for most `applied` rows.
+    /// disposition, e.g. `"duplicate of an existing task"`. `None` for
+    /// proposals with no decision yet, and for most `applied` rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<String>,
 

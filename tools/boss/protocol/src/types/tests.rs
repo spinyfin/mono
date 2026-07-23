@@ -1537,6 +1537,32 @@ fn proposal_state_defaults_to_proposed() {
     assert_eq!(ProposalState::default(), ProposalState::Proposed);
 }
 
+#[test]
+fn proposal_kind_from_str_rejects_unknown_values() {
+    assert!("nope".parse::<ProposalKind>().is_err());
+}
+
+#[test]
+fn proposal_state_from_str_rejects_unknown_values() {
+    assert!("nope".parse::<ProposalState>().is_err());
+}
+
+#[test]
+fn proposal_decider_display_and_parse_are_inverses() {
+    for decider in ProposalDecider::ALL {
+        let s = decider.to_string();
+        let back: ProposalDecider = s
+            .parse()
+            .unwrap_or_else(|e| panic!("ProposalDecider::from_str({s:?}) failed: {e}"));
+        assert_eq!(*decider, back, "round-trip failed for {decider:?}");
+    }
+}
+
+#[test]
+fn proposal_decider_from_str_rejects_unknown_values() {
+    assert!("nope".parse::<ProposalDecider>().is_err());
+}
+
 fn sample_worker_proposal() -> WorkerProposal {
     WorkerProposal::builder()
         .id("prp_1")
@@ -1578,7 +1604,7 @@ fn worker_proposal_roundtrips_with_every_field_set() {
         .state(ProposalState::Applied)
         .applied_ref("task_9")
         .decided_at("1747000100")
-        .decided_by("policy")
+        .decided_by(ProposalDecider::Policy)
         .decision_reason("verified PR URL and branch match")
         .work_item_id("task_9")
         .build();
@@ -1642,6 +1668,65 @@ fn pr_created_payload_roundtrips() {
     };
     let raw = serde_json::to_value(&payload).unwrap();
     let back: PrCreatedProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn attention_payload_roundtrips_and_omits_kind_when_none() {
+    let full = AttentionProposalPayload {
+        body_markdown: "please check this".into(),
+        title: "Needs a decision".into(),
+        attention_kind: Some("question".into()),
+    };
+    let raw = serde_json::to_value(&full).unwrap();
+    let back: AttentionProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(full, back);
+
+    let minimal = AttentionProposalPayload {
+        body_markdown: "please check this".into(),
+        title: "Needs a decision".into(),
+        attention_kind: None,
+    };
+    let raw = serde_json::to_value(&minimal).unwrap();
+    let obj = raw.as_object().unwrap();
+    assert!(
+        !obj.contains_key("attention_kind"),
+        "attention_kind should be omitted when None"
+    );
+    let back: AttentionProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(minimal, back);
+}
+
+#[test]
+fn effort_escalation_payload_roundtrips_and_encodes_effort_level_wire_string() {
+    let payload = EffortEscalationProposalPayload {
+        reason: "bazel build wedged".into(),
+        requested_level: EffortLevel::Large,
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    assert_eq!(raw["requested_level"], "large");
+    let back: EffortEscalationProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn blocked_payload_roundtrips() {
+    let payload = BlockedProposalPayload {
+        reason: "waiting on operator approval to force-push".into(),
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    let back: BlockedProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn deferred_scope_payload_roundtrips() {
+    let payload = DeferredScopeProposalPayload {
+        summary: "wiring for the third data source".into(),
+        reason: "needs a new ingestion pipeline; out of scope for this task".into(),
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    let back: DeferredScopeProposalPayload = serde_json::from_value(raw).unwrap();
     assert_eq!(payload, back);
 }
 

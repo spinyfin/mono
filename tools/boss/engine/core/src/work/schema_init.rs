@@ -598,10 +598,10 @@ impl WorkDb {
         // Per-product merge mechanism (`direct` | `trunk_queue`), schema/contract
         // only — see trunk-merge-queue-integration-queue-backed-merges-merging-ui.md.
         migrate_products_merge_mechanism(conn)?;
-        // Worker proposal API (task 1): `worker_proposals`, the durable
-        // ingress ledger behind the mediated worker→engine proposal
-        // mechanism. Schema-only — no engine behavior change until the
-        // follow-on submission/apply-pipeline tasks land.
+        // `worker_proposals`: the durable ingress ledger behind the mediated
+        // worker→engine proposal mechanism. Schema-only — no engine
+        // behavior change until the follow-on submission/apply-pipeline
+        // tasks land.
         // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
         migrate_worker_proposals_table(conn)?;
         conn.execute(
