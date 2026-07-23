@@ -23,8 +23,8 @@
 //! enabled. The crate split buys logical separation and a much smaller,
 //! near-instant *compile* of the changed value, but not cache isolation
 //! for `engine_lib` itself — that would require reading these values
-//! from a runtime resource instead of a compiled-in Rust constant, which
-//! is a larger change tracked separately.
+//! from a runtime resource instead of a compiled-in Rust constant —
+//! not done here.
 //!
 //! Exposed as plain functions (not `pub const`s) as a style preference
 //! matching the rest of this crate's API — it does not change the cache
