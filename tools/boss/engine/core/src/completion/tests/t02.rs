@@ -1781,7 +1781,7 @@ async fn deferred_scope_proposals_first_flag_skips_legacy_marker_when_a_proposal
 #[tokio::test]
 async fn deferred_scope_proposals_first_flag_falls_back_to_the_legacy_marker_and_counts_the_hit() {
     let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
     // No proposal was ever submitted for this execution — only the
     // legacy marker.
     write_assistant_transcript(
