@@ -21,7 +21,7 @@ use super::*;
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
     AutomationTrigger, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState,
-    ProposalFieldError, TaskKind, TaskStatus,
+    ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -1168,6 +1168,17 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "proposals_list",
         },
+        TagCase {
+            label: "WorkerTierDenied",
+            event: FrontendEvent::WorkerTierDenied {
+                denial: WorkerTierDenial::redirect(
+                    "CreateTask",
+                    WorkerTierDenialReason::MutatingTaxonomy,
+                    "boss propose followup-task",
+                ),
+            },
+            expected_tag: "worker_tier_denied",
+        },
         // --- Feature flags & settings ---
         TagCase {
             label: "FeatureFlagsList",
@@ -1661,6 +1672,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProposalSubmitted { .. }
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }
+        | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }
         | FrontendEvent::FeatureFlagSet { .. }

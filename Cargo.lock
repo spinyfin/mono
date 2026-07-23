@@ -360,6 +360,7 @@ dependencies = [
  "boss-engine-proposal-validation",
  "boss-engine-transient-error",
  "boss-engine-utils",
+ "boss-engine-worker-policy",
  "boss-feature-flags",
  "boss-github",
  "boss-github-tracker",
@@ -499,6 +500,14 @@ name = "boss-engine-utils"
 version = "0.1.0"
 dependencies = [
  "chrono",
+]
+
+[[package]]
+name = "boss-engine-worker-policy"
+version = "0.1.0"
+dependencies = [
+ "boss-protocol",
+ "serde_json",
 ]
 
 [[package]]

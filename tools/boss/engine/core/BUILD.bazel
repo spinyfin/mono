@@ -60,6 +60,7 @@ rust_library(
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
+        "//tools/boss/engine/worker-policy",
         "//tools/boss/github",
         "//tools/boss/github_tracker",
         "//tools/boss/log-files",

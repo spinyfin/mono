@@ -38,6 +38,7 @@ boss-ssh-transport = { path = "../ssh-transport" }
 boss-engine-day-rotated-log = { path = "../day-rotated-log" }
 boss-engine-transient-error = { path = "../transient-error" }
 boss-engine-utils = { path = "../utils" }
+boss-engine-worker-policy = { path = "../worker-policy" }
 boss-transcript-tail = { path = "../transcript-tail" }
 clap = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }

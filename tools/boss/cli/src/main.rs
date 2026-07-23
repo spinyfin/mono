@@ -67,6 +67,12 @@ macro_rules! rpc_call {
             FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                 Err(CliError::application(message))
             }
+            // Worker-tier refusal. Handled in the shared macro rather than
+            // per verb because any verb can draw one: the engine's gate runs
+            // before dispatch and applies to the whole surface. The denial's
+            // own message already names the refused verb and the `boss
+            // propose …` to use instead, so it renders as-is.
+            FrontendEvent::WorkerTierDenied { denial } => Err(CliError::application(denial.message)),
             other => Err(unexpected_event($label, &other)),
         }
     };
@@ -8811,6 +8817,16 @@ fn expect_leaf_work_item(item: WorkItem) -> Result<(Task, &'static str), CliErro
 }
 
 fn unexpected_event(context: &str, event: &FrontendEvent) -> CliError {
+    // A worker-tier refusal can arrive in reply to *any* verb — the engine's
+    // gate runs ahead of dispatch across the whole surface — so it reaches
+    // the hand-rolled `match` sites that don't go through `rpc_call!` as
+    // well. Rendering it here rather than adding an arm to each of those
+    // means one place knows how, and none of them can forget: a denial is an
+    // application error with an actionable message, not an engine bug worth
+    // dumping raw JSON for.
+    if let FrontendEvent::WorkerTierDenied { denial } = event {
+        return CliError::application(denial.message.clone());
+    }
     CliError::internal(anyhow::anyhow!(
         "unexpected engine event for {context}: {}",
         serde_json::to_string(event).unwrap_or_else(|_| "<unserializable>".to_owned())
