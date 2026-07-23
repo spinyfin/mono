@@ -23,5 +23,29 @@
     <string>15.0</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <!-- net.daringfireball.markdown is already a system-declared UTI on
+         macOS 15+ (imported by Notes/Xcode, tags .md/.markdown, conforms
+         to public.plain-text) — no UTImportedTypeDeclarations needed
+         here, just reference it. Boss only renders markdown (Textual)
+         and never writes back to the file, so CFBundleTypeRole is
+         Viewer. LSHandlerRank is Alternate: Boss should be selectable
+         from Finder's "Open With" and settable as the user's default,
+         but must not auto-claim default status away from the user's
+         existing markdown app on install. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Markdown Document</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>net.daringfireball.markdown</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

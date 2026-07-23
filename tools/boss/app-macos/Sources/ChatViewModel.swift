@@ -1802,6 +1802,31 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// Open a local `.md`/`.markdown` file in the in-app design renderer,
+    /// reusing [[designRendererOpener]] — the same window and rendering
+    /// path as [[openProjectDesignDoc]] and File ▸ Open (⌘O). This is the
+    /// shared entry point for every "open a markdown file" surface: the
+    /// File ▸ Open panel, `open -a Boss foo.md` from the shell, and
+    /// Finder's "Open With ▸ Boss" (both routed through the app's
+    /// `application(_:open:)` delegate callback, which calls this after
+    /// [[designRendererOpener]] is wired). Falls back to `urlOpener` (the
+    /// OS-registered handler) when the renderer window isn't wired yet —
+    /// tests and headless contexts.
+    func openLocalMarkdownFile(url: URL) {
+        let content = DesignRendererContent(
+            title: url.deletingPathExtension().lastPathComponent,
+            filePath: url.path,
+            webURL: "",
+            repoLabel: "",
+            projectID: ""
+        )
+        if let opener = designRendererOpener {
+            opener(content)
+        } else {
+            urlOpener(url)
+        }
+    }
+
     /// Fetch raw markdown from `rawURL` and open it in the
     /// [[markdownViewerOpener]] window. Falls back to `urlOpener(webURL)`
     /// if the fetch fails or [[markdownViewerOpener]] is not wired.
