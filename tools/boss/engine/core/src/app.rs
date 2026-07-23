@@ -53,6 +53,7 @@ mod broadcasts;
 mod ci_remediation;
 mod comments;
 mod conflict_resolution;
+mod context;
 mod dependencies;
 mod effort;
 mod engine_meta;
@@ -1787,6 +1788,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
+            r @ FrontendRequest::GetWorkerContext { .. } => context::handle_get_worker_context(ctx, r).await,
             r @ FrontendRequest::GetWorkItem { .. } => work_items::handle_get_work_item(ctx, r).await,
             r @ FrontendRequest::GetWorkItemByShortId { .. } => {
                 work_items::handle_get_work_item_by_short_id(ctx, r).await

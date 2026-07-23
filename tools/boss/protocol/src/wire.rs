@@ -17,7 +17,7 @@ use crate::types::{
     ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem,
     WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch, WorkRun, WorkerProposal, WorkerTierDenial,
+    WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -743,6 +743,26 @@ pub enum FrontendRequest {
     /// when the work item has no executions yet.
     GetTaskRuntime {
         work_item_id: String,
+    },
+
+    /// Worker → engine, read-only: the sanitized one-call context bundle —
+    /// own task + project + product, sibling tasks in the project (each
+    /// with dependency edges), edges touching the caller's own task, open
+    /// attention groups on its work item, and its work item's proposals
+    /// across executions with dispositions.
+    ///
+    /// No work-item argument, deliberately — exactly like
+    /// [`Self::ListProposals`], scope is derived from the socket peer's
+    /// attributed execution, never from a caller-supplied id. `run_id` is
+    /// the caller's own `BOSS_RUN_ID`, a cross-check rather than a
+    /// credential.
+    ///
+    /// Replies with [`FrontendEvent::WorkerContextResult`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails — reused
+    /// from the proposal API, which faces the identical attribution
+    /// failure modes (see `engine/core/src/app/context.rs`).
+    GetWorkerContext {
+        run_id: String,
     },
 
     GetWorkItem {

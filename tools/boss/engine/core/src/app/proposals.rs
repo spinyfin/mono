@@ -47,9 +47,13 @@ use crate::work::{SubmitWorkerProposalInput, SubmitWorkerProposalOutcome};
 
 /// The execution a proposal call was attributed to, plus the work item it
 /// is thereby scoped to.
-struct AttributedCaller {
-    execution_id: String,
-    work_item_id: String,
+///
+/// `pub(super)`: [`attribute_caller`] is reused by `app::context` for
+/// `GetWorkerContext`, which is attributed identically and refuses the same
+/// way (see that module's doc comment).
+pub(super) struct AttributedCaller {
+    pub(super) execution_id: String,
+    pub(super) work_item_id: String,
 }
 
 /// Resolve the calling connection to a specific execution.
@@ -60,7 +64,7 @@ struct AttributedCaller {
 /// failed, because the remediations differ: a remote worker cannot fix
 /// anything, a mismatched env var can be corrected, and a pruned execution
 /// means the run is over.
-fn attribute_caller(
+pub(super) fn attribute_caller(
     server_state: &ServerState,
     work_db: &WorkDb,
     peer_pid: Option<libc::pid_t>,
@@ -131,7 +135,9 @@ fn attribute_caller(
     }
 }
 
-fn send_rejection(sink: &SessionSink, request_id: &str, error: ProposalSubmissionError) {
+/// `pub(super)`: reused by `app::context` to render an attribution failure
+/// the same way `SubmitProposal`/`ListProposals` do.
+pub(super) fn send_rejection(sink: &SessionSink, request_id: &str, error: ProposalSubmissionError) {
     send_response(sink, request_id, FrontendEvent::ProposalRejected { error });
 }
 

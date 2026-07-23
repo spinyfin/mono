@@ -141,6 +141,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetWorkItem { .. }
         | FrontendRequest::GetWorkItemByShortId { .. }
         | FrontendRequest::GetWorkTree { .. }
+        | FrontendRequest::GetWorkerContext { .. }
         | FrontendRequest::ListChores { .. }
         | FrontendRequest::ListProducts
         | FrontendRequest::ListProjects { .. }

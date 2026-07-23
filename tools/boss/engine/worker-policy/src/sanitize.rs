@@ -214,6 +214,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::ProposalsList { .. }
+        | FrontendEvent::WorkerContextResult { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }
         | FrontendEvent::FeatureFlagSet { .. }

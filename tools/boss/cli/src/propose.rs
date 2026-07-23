@@ -575,7 +575,9 @@ async fn run_propose_list(
     }
 }
 
-fn print_proposals_table(proposals: &[WorkerProposal]) {
+/// `pub(crate)`: reused by `context::run_context_command` to render the
+/// proposals section of `boss context`'s human output.
+pub(crate) fn print_proposals_table(proposals: &[WorkerProposal]) {
     let mut table = new_dynamic_table(["ID", "KIND", "STATE", "DECIDED BY", "REASON", "CREATED"]);
     for proposal in proposals {
         table.add_row([
@@ -624,7 +626,12 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
 /// complaint gets its own line (pointing at the flag that fills it, when
 /// known) before the summary message becomes the exit error. `kind` is
 /// `None` for `--list` rejections, which never carry field errors.
-fn render_proposal_rejection(kind: Option<ProposalKind>, error: ProposalSubmissionError) -> CliError {
+///
+/// `pub(crate)`: `boss context` reuses `ProposalRejected` for its own
+/// attribution failures (see `engine/core/src/app/context.rs`'s doc
+/// comment), so `context::run_context_command` renders them the same way
+/// with `kind = None`.
+pub(crate) fn render_proposal_rejection(kind: Option<ProposalKind>, error: ProposalSubmissionError) -> CliError {
     for field_error in &error.field_errors {
         match kind.and_then(|kind| flag_hint_for_field(kind, &field_error.field)) {
             Some(flag) => eprintln!("  {flag} ({}): {}", field_error.field, field_error.message),

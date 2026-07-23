@@ -11,8 +11,9 @@
 
 use super::*;
 use boss_protocol::{
-    BranchNaming, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest, ProposalKind, WorkExecution,
-    WorkItemPatch, WorkRun, WorkerTierDenialReason,
+    BranchNaming, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest, Product, ProposalKind, Task,
+    TaskKind, TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun, WorkerContextBundle,
+    WorkerTierDenialReason,
 };
 use policy::variant_name;
 use serde_json::json;
@@ -167,6 +168,13 @@ fn proposal_verbs_are_allowed() {
         run_id: "exec_1".into(),
         kind: None,
         state: None,
+    });
+}
+
+#[test]
+fn get_worker_context_is_allowed() {
+    assert_allowed(FrontendRequest::GetWorkerContext {
+        run_id: "exec_1".into(),
     });
 }
 
@@ -424,6 +432,51 @@ fn execution_rows_carry_no_runtime_half_fields() {
     ] {
         assert_nothing_leaked(&sanitize_event_for_worker(event));
     }
+}
+
+fn worker_context_bundle() -> WorkerContextBundle {
+    WorkerContextBundle {
+        task: Task::builder()
+            .id("task_1")
+            .product_id("prod_1")
+            .created_at("1700000000")
+            .description("Do a thing")
+            .kind(TaskKind::Task)
+            .name("A task")
+            .status(TaskStatus::Todo)
+            .updated_at("1700000000")
+            .build(),
+        project: None,
+        product: Product::builder()
+            .id("prod_1")
+            .created_at("1700000000")
+            .description("A product")
+            .name("Widgets")
+            .slug("widgets")
+            .status("active")
+            .updated_at("1700000000")
+            .build(),
+        sibling_tasks: vec![],
+        own_dependencies: WorkItemDependencyDetail {
+            work_item_id: "task_1".into(),
+            dependents: vec![],
+            prerequisites: vec![],
+        },
+        attention_groups: vec![],
+        proposals: vec![],
+    }
+}
+
+/// `boss context`'s bundle carries no `WorkExecution`/`WorkRun` rows, so it
+/// has nothing to strip — but it still has to be a deliberate, named
+/// pass-through in `sanitize_event_for_worker`'s exhaustive match (a
+/// compile error otherwise), and this pins that it stays leak-free even so.
+#[test]
+fn worker_context_result_carries_no_runtime_half_fields() {
+    let event = FrontendEvent::WorkerContextResult {
+        bundle: Box::new(worker_context_bundle()),
+    };
+    assert_nothing_leaked(&sanitize_event_for_worker(event));
 }
 
 #[test]
