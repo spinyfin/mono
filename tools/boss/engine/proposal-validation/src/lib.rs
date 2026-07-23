@@ -101,6 +101,20 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             let title = reader.required_text("title", MAX_SHORT_FIELD_CHARS);
             let body_markdown = reader.required_text("body_markdown", MAX_LONG_FIELD_CHARS);
             let attention_kind = reader.optional_text("attention_kind", MAX_SHORT_FIELD_CHARS);
+            if let Some(kind) = attention_kind.as_deref()
+                && RESERVED_ATTENTION_KINDS.contains(&kind)
+            {
+                reader.error(
+                    "attention_kind",
+                    format!(
+                        "`{kind}` is reserved for the engine's own proposal kinds ({}); a plain \
+                         `attention` proposal may not claim it, since `work_attention_items.kind` \
+                         drives engine behaviour (auto-nudge pausing, deferred-scope task \
+                         conversion) keyed on these exact values",
+                        RESERVED_ATTENTION_KINDS.join(", ")
+                    ),
+                );
+            }
             reader.finish()?;
             to_json(&AttentionProposalPayload {
                 body_markdown: body_markdown.unwrap_or_default(),
@@ -127,6 +141,13 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
         ProposalKind::DeferredScope => {
             let reason = reader.required_text("reason", MAX_SHORT_FIELD_CHARS);
             let summary = reader.required_text("summary", MAX_SHORT_FIELD_CHARS);
+            for (field, value) in [("summary", &summary), ("reason", &reason)] {
+                if let Some(text) = value
+                    && let Some(problem) = quoted_marker_field_problem(text)
+                {
+                    reader.error(field, problem);
+                }
+            }
             reader.finish()?;
             to_json(&DeferredScopeProposalPayload {
                 reason: reason.unwrap_or_default(),
@@ -278,6 +299,46 @@ const PROPOSED_WORK_KINDS: &[&str] = &["task", "chore", "project"];
 /// Accepted values for `automation_outcome.outcome` — the serde tag of
 /// [`AutomationOutcomeProposalPayload`].
 const AUTOMATION_OUTCOMES: &[&str] = &["produced_task", "skip"];
+
+/// `work_attention_items.kind` values the engine itself relies on for
+/// behaviour — `unresolved_worker_signal_reason` pauses the auto-nudge loop
+/// for an unresolved `worker_escalation`/`worker_blocked` row, and
+/// `deferred_scope` rows are the only ones
+/// `WorkDb::create_task_from_deferred_scope_attention` accepts. A plain
+/// `attention` proposal must not be able to reach those paths just by
+/// setting `attention_kind` to one of these strings — the dedicated
+/// `effort_escalation`/`blocked`/`deferred_scope` proposal kinds are the only
+/// sanctioned way in. Kept as literal strings (mirroring
+/// `AUTOMATION_OUTCOMES`/`PROPOSED_WORK_KINDS` above) rather than importing
+/// the engine crate's constants, since this crate is a standalone,
+/// engine-independent payload validator; keep this list in sync with
+/// `crate::worker_escalation::{WORKER_ESCALATION_ATTENTION_KIND,
+/// WORKER_BLOCKED_ATTENTION_KIND}` and
+/// `crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND` in
+/// `boss-engine-core`.
+const RESERVED_ATTENTION_KINDS: &[&str] = &["worker_escalation", "worker_blocked", "deferred_scope"];
+
+/// `deferred_scope`'s `summary`/`reason` are embedded verbatim inside a
+/// double-quoted `[deferred-scope] summary="…" reason="…"` marker line
+/// (`crate::deferred_scope` in `boss-engine-core`) that downstream consumers
+/// parse by scanning for a quoted `key="value"` pair on a single line. An
+/// embedded `"` would prematurely close the quoted value (corrupting the
+/// parse of both this field and whatever follows it on the line) and an
+/// embedded newline would split the marker across lines entirely, so both
+/// are rejected here rather than silently producing an unparseable marker.
+fn quoted_marker_field_problem(text: &str) -> Option<String> {
+    if text.contains('"') {
+        return Some(
+            "must not contain a double-quote character — this field is embedded in a \
+             double-quoted `key=\"value\"` marker line"
+                .to_owned(),
+        );
+    }
+    if text.contains('\n') || text.contains('\r') {
+        return Some("must not contain a newline — this field is embedded in a single-line marker".to_owned());
+    }
+    None
+}
 
 fn json_type_name(value: &Value) -> &'static str {
     match value {

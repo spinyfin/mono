@@ -423,7 +423,7 @@ mod tests {
         }
     }
 
-    /// `follow_task` is Gated (the human batch-accept gesture decides it,
+    /// `followup_task` is Gated (the human batch-accept gesture decides it,
     /// per design) — a fresh submission must land untouched in `proposed`
     /// with no disposition stamped.
     #[test]
@@ -620,6 +620,49 @@ mod tests {
         assert!(
             description.contains(r#"reason="needs a new ingestion pipeline""#),
             "{description}"
+        );
+    }
+
+    /// The attention item the applier writes must carry the real,
+    /// verbatim `[deferred-scope] summary="…" reason="…"` marker line — not
+    /// just prose mentioning the summary/reason — because
+    /// `create_task_from_deferred_scope_attention` (the "Create task" UI
+    /// gesture) re-parses `body_markdown` for exactly that marker. Before
+    /// this fix the applier wrote prose only, so this conversion fell back
+    /// to "(summary not parseable — see marker below)" for every
+    /// proposal-filed deferred_scope item.
+    #[test]
+    fn deferred_scope_applied_attention_is_convertible_to_a_task_with_the_real_summary_and_reason() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::DeferredScope,
+            r#"{"summary":"third data source wiring","reason":"needs a new ingestion pipeline"}"#,
+            "key-1",
+        )
+        .unwrap();
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+
+        let (_attention, task) = db.create_task_from_deferred_scope_attention(&applied_ref).unwrap();
+
+        assert!(
+            task.description.contains("third data source wiring"),
+            "{}",
+            task.description
+        );
+        assert!(
+            task.description.contains("needs a new ingestion pipeline"),
+            "{}",
+            task.description
+        );
+        assert!(
+            !task.description.contains("not parseable"),
+            "summary/reason must parse from the applier's marker line: {}",
+            task.description
         );
     }
 

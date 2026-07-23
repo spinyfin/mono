@@ -234,6 +234,50 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
                 already_submitted,
                 "worker proposal submitted",
             );
+            // Mirror completion.rs's legacy marker-detector paths
+            // (`file_worker_signal_attention` / `record_deferred_scope_item`):
+            // both publish `AttentionItemCreated` on the work item's product
+            // right after writing the row, which is what the macOS app's
+            // deferred-scope badge and Notifications window key their
+            // live-update off of. A fresh (not replayed) auto-applied
+            // `attention`/`effort_escalation`/`blocked`/`deferred_scope`
+            // proposal produces the exact same row through a different
+            // write path, so it must publish the exact same event.
+            if !already_submitted
+                && proposal.state == boss_protocol::ProposalState::Applied
+                && let Some(applied_ref) = proposal.applied_ref.as_deref()
+                && applied_ref.starts_with("attn_")
+            {
+                match work_db.get_attention_item(applied_ref) {
+                    Ok(item) => match work_db.get_work_item(&caller.work_item_id) {
+                        Ok(work_item) => {
+                            server_state
+                                .publisher
+                                .publish_frontend_event_on_product(
+                                    work_item.product_id(),
+                                    FrontendEvent::AttentionItemCreated { item },
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                work_item_id = %caller.work_item_id,
+                                ?err,
+                                "submit_proposal: applied attention item created, but failed to read \
+                                 its work item to publish AttentionItemCreated (non-fatal)",
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            applied_ref,
+                            ?err,
+                            "submit_proposal: failed to read the just-applied attention item to publish \
+                             AttentionItemCreated (non-fatal)",
+                        );
+                    }
+                }
+            }
             send_response(
                 &sink,
                 &request_id,

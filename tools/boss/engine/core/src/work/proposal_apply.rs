@@ -74,6 +74,7 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
 }
 
 /// What a successful [`apply_in_transaction`] call produced.
+#[derive(Debug)]
 pub struct ApplyOutcome {
     /// Id of the row the apply produced — stamped onto the proposal's
     /// `applied_ref` column in the same transaction.
@@ -101,7 +102,9 @@ pub fn apply_in_transaction(
         ProposalKind::Blocked => apply_blocked(tx, execution_id, payload_json),
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json),
         ProposalKind::FollowupTask | ProposalKind::AutomationOutcome | ProposalKind::PrCreated => {
-            unreachable!("apply_in_transaction is only called for AutoApply kinds; {kind} is Gated")
+            anyhow::bail!(
+                "no applier for `{kind}`; apply_policy marks it AutoApply but proposal_apply has no arm for it"
+            )
         }
     }
 }
@@ -194,24 +197,40 @@ fn apply_blocked(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -
 /// `deferred_scope` proposals auto-apply the same two effects
 /// [`crate::completion::WorkerCompletionHandler::record_deferred_scope_item`]
 /// writes for the legacy `[deferred-scope]` marker: a `deferred_scope`-kind
-/// attention item (in-transaction, atomic with the proposal row) plus a
-/// durable `[deferred-scope] epoch …: summary="…" reason="…"` audit line
-/// appended to the work item's description (best-effort, after commit —
-/// see the module doc).
+/// attention item (in-transaction, atomic with the proposal row) carrying
+/// the verbatim `[deferred-scope] summary="…" reason="…"` marker line —
+/// exactly what [`crate::deferred_scope::detect_deferred_scope_items`]
+/// scans `body_markdown` for — plus a durable
+/// `[deferred-scope] epoch …: summary="…" reason="…"` audit line appended to
+/// the work item's description (best-effort, after commit — see the module
+/// doc). Embedding the real marker line (rather than free prose) is what
+/// lets [`crate::work::workitems::WorkDb::create_task_from_deferred_scope_attention`]
+/// recover the real summary/reason, keeps the macOS
+/// `DeferredScopeAttentionPresentation.parseMarker` badge readable, and
+/// restores the legacy detectors' content-keyed dedup
+/// (`body_markdown.contains(&marker_line)`) across the marker/proposal
+/// transition period.
+///
+/// `payload.summary`/`payload.reason` cannot contain `"` or a newline —
+/// `boss_engine_proposal_validation::validate_payload` rejects those for
+/// `deferred_scope` precisely because they would corrupt this quoted,
+/// single-line marker — so building the marker line here by direct
+/// interpolation is safe.
 fn apply_deferred_scope(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -> Result<ApplyOutcome> {
     let payload: DeferredScopeProposalPayload =
         serde_json::from_str(payload_json).context("deferred_scope proposal payload_json did not deserialize")?;
+    let marker_line = format!(
+        "{DEFERRED_SCOPE_MARKER} summary=\"{}\" reason=\"{}\"",
+        payload.summary, payload.reason,
+    );
     let body = format!(
         "Worker deferred part of this task's scope.\n\n\
          - execution: `{execution_id}`\n\n\
-         Summary of what was deferred:\n\n{summary}\n\n\
-         Reason:\n\n{reason}\n\n\
+         Marker (verbatim):\n\n```\n{marker_line}\n```\n\n\
          This is NOT yet tracked work — the worker has no ability to file a task itself. Decide \
          whether to create a followup task for the deferred item, or consciously accept the \
          deferral (e.g. it is genuinely out of scope for this task). Either way, resolving this \
          item records that a human made that call, rather than the remainder silently vanishing.",
-        summary = payload.summary,
-        reason = payload.reason,
     );
     let mut outcome = create_attention_item_row(
         tx,
@@ -221,11 +240,12 @@ fn apply_deferred_scope(tx: &Transaction<'_>, execution_id: &str, payload_json: 
         body,
     )?;
 
+    let item = crate::deferred_scope::DeferredScopeItem {
+        marker_line,
+        parse_warning: None,
+    };
     let epoch = boss_engine_utils::epoch_time::now_epoch_secs();
-    outcome.post_commit_audit_line = Some(format!(
-        "\n{DEFERRED_SCOPE_MARKER} epoch {epoch}: summary=\"{}\" reason=\"{}\"",
-        payload.summary, payload.reason,
-    ));
+    outcome.post_commit_audit_line = Some(crate::deferred_scope::render_audit_line(epoch, &item));
     Ok(outcome)
 }
 
@@ -244,6 +264,24 @@ mod tests {
         assert_eq!(
             apply_policy(ProposalKind::DeferredScope),
             ProposalApplyPolicy::AutoApply
+        );
+    }
+
+    /// If a `Gated` kind is ever flipped to `AutoApply` in [`apply_policy`]
+    /// before its arm is added to [`apply_in_transaction`]'s match, the
+    /// submission must fail with a typed error the caller sees — not panic
+    /// and take the socket connection down with it.
+    #[test]
+    fn flipping_a_gated_kind_to_autoapply_without_an_applier_errors_instead_of_panicking() {
+        let (_dir, db) = crate::test_support::open_db();
+        let mut conn = db.connect().unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let err = apply_in_transaction(&tx, "exec_missing", "{}", ProposalKind::FollowupTask)
+            .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
+        assert!(
+            err.to_string().contains("followup_task"),
+            "error should name the unhandled kind: {err}"
         );
     }
 
