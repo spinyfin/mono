@@ -31,6 +31,7 @@ members = [
   "tools/boss/engine/metrics-registry",
   "tools/boss/engine/planner-validation",
   "tools/boss/engine/pr-review",
+  "tools/boss/engine/proposal-validation",
   "tools/boss/log-files",
   "tools/boss/protocol",
   "tools/boss/engine/ssh-transport",

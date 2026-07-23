@@ -1,0 +1,12 @@
+[package]
+name = "boss-engine-proposal-validation"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-github = { path = "../../github" }
+boss-protocol = { path = "../../protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

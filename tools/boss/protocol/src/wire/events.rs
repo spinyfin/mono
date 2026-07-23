@@ -796,6 +796,40 @@ pub enum FrontendEvent {
         run_id: String,
         released: usize,
     },
+    /// Success reply to [`FrontendRequest::SubmitProposal`]: the row is
+    /// durable. `proposal` is the persisted `worker_proposals` row —
+    /// engine-assigned `id` (`prp_…`), the canonicalised `payload_json`, and
+    /// the `idempotency_key` that was used (the derived one when the caller
+    /// omitted it, so a subsequent call can pass it back explicitly).
+    ///
+    /// `already_submitted` distinguishes "this call created the row" from
+    /// "an identical submission already existed and this call was a no-op".
+    /// It is a *successful* outcome either way — replay safety is the point —
+    /// so a caller that treats it as an error is misreading the contract; the
+    /// only sane use is to soften the message it prints.
+    ///
+    /// Every row lands in `state: proposed` today: the apply pipeline is a
+    /// later task, so nothing observes these rows yet.
+    ProposalSubmitted {
+        proposal: WorkerProposal,
+        already_submitted: bool,
+    },
+    /// Failure reply to [`FrontendRequest::SubmitProposal`] or
+    /// [`FrontendRequest::ListProposals`]. Sent instead of the generic
+    /// [`FrontendEvent::WorkError`] so the caller can branch on
+    /// `error.code` and, for a validation failure, point at the offending
+    /// fields by name rather than re-printing prose.
+    ProposalRejected {
+        error: ProposalSubmissionError,
+    },
+    /// Response to [`FrontendRequest::ListProposals`]: every proposal filed
+    /// against `work_item_id` across all its executions, newest first, with
+    /// dispositions attached. `work_item_id` echoes the scope the engine
+    /// derived from the caller's attributed execution.
+    ProposalsList {
+        work_item_id: String,
+        proposals: Vec<WorkerProposal>,
+    },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)

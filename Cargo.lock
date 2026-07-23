@@ -357,6 +357,7 @@ dependencies = [
  "boss-engine-gh-invocation",
  "boss-engine-live-status-redact",
  "boss-engine-planner-validation",
+ "boss-engine-proposal-validation",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-feature-flags",
@@ -472,6 +473,17 @@ name = "boss-engine-planner-validation"
 version = "0.1.0"
 dependencies = [
  "boss-protocol",
+]
+
+[[package]]
+name = "boss-engine-proposal-validation"
+version = "0.1.0"
+dependencies = [
+ "boss-github",
+ "boss-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

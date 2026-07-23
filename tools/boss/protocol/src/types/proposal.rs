@@ -335,3 +335,166 @@ pub struct PrCreatedProposalPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Submission errors and rate caps (the `SubmitProposal` / `ListProposals` RPCs)
+// ---------------------------------------------------------------------------
+
+/// Why a `SubmitProposal` / `ListProposals` call was refused.
+///
+/// The whole point of the proposal API is that a bad submission produces an
+/// *immediate, typed* failure the worker can act on mid-run, rather than a
+/// silent parse failure discovered at Stop (design §"Failure semantics":
+/// "Malformed submission → immediate typed error, worker fixes in-run. This
+/// is the primary win over parse-at-a-distance"). So the code is a closed
+/// vocabulary keyed on what the caller must *do differently*, not a single
+/// bucket with prose inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalErrorCode {
+    /// The payload did not satisfy its kind's schema. Remediation: read
+    /// [`ProposalSubmissionError::field_errors`], fix those fields, retry.
+    ValidationFailed,
+    /// A per-execution rate cap is exhausted
+    /// ([`PROPOSAL_CAP_TOTAL_PER_EXECUTION`] /
+    /// [`PROPOSAL_CAP_PER_KIND_PER_EXECUTION`]). Remediation: none in-run —
+    /// this is runaway-loop protection, and the caps are generous enough
+    /// that hitting one means something is looping.
+    RateLimited,
+    /// The connection has no local socket peer pid, so the engine cannot
+    /// derive who is proposing. v1 scopes the proposal API to local workers
+    /// (design §"Non-goals": remote SSH workers have no peer pid and are
+    /// rejected until per-run token auth exists). Remediation: none — use
+    /// the `[blocked]` bootstrap marker.
+    NoLocalPeer,
+    /// A local peer pid was present but its process ancestry contains no
+    /// registered worker run, so the call cannot be attributed to an
+    /// execution. Fails closed rather than trusting the caller-supplied run
+    /// id — attribution is verified identity, never a worker-supplied flag.
+    AttributionUnresolved,
+    /// The caller-supplied `BOSS_RUN_ID` disagrees with the run the socket
+    /// peer resolves to. `BOSS_RUN_ID` is a cross-check, not a credential
+    /// (design §"Transport and authn"); a mismatch means a misconfigured
+    /// env or a command copy-pasted across worker panes.
+    AttributionMismatch,
+    /// Attribution succeeded but the execution row it names is gone (or its
+    /// work item is unreadable) — a stale registry entry for a pruned
+    /// execution.
+    UnknownExecution,
+    /// The engine failed to persist or read the proposal. Distinguished
+    /// from every code above so a worker does not "fix" a payload that was
+    /// never the problem.
+    Internal,
+}
+
+impl ProposalErrorCode {
+    pub const ALL: &'static [ProposalErrorCode] = &[
+        ProposalErrorCode::ValidationFailed,
+        ProposalErrorCode::RateLimited,
+        ProposalErrorCode::NoLocalPeer,
+        ProposalErrorCode::AttributionUnresolved,
+        ProposalErrorCode::AttributionMismatch,
+        ProposalErrorCode::UnknownExecution,
+        ProposalErrorCode::Internal,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalErrorCode::ValidationFailed => "validation_failed",
+            ProposalErrorCode::RateLimited => "rate_limited",
+            ProposalErrorCode::NoLocalPeer => "no_local_peer",
+            ProposalErrorCode::AttributionUnresolved => "attribution_unresolved",
+            ProposalErrorCode::AttributionMismatch => "attribution_mismatch",
+            ProposalErrorCode::UnknownExecution => "unknown_execution",
+            ProposalErrorCode::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for ProposalErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One field-scoped validation complaint. `field` is the payload key as the
+/// worker wrote it (`"reason"`, `"outcome"`, `"pr_url"`), so a CLI can point
+/// at the offending flag by name instead of echoing a whole-payload error.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposalFieldError {
+    pub field: String,
+    pub message: String,
+}
+
+impl ProposalFieldError {
+    pub fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A refused submission or listing, as returned by the `SubmitProposal` /
+/// `ListProposals` RPCs.
+///
+/// `message` is always populated and human-readable on its own;
+/// `field_errors` is non-empty only for [`ProposalErrorCode::ValidationFailed`]
+/// and carries the per-field detail that makes fix-and-retry mechanical.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposalSubmissionError {
+    pub code: ProposalErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<ProposalFieldError>,
+}
+
+impl ProposalSubmissionError {
+    /// A non-validation refusal: a code plus a human-readable explanation,
+    /// with no per-field detail.
+    pub fn new(code: ProposalErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            field_errors: Vec::new(),
+        }
+    }
+
+    /// A [`ProposalErrorCode::ValidationFailed`] refusal carrying one
+    /// complaint per offending field. The summary `message` names the count
+    /// so a caller that only logs the message still says something useful.
+    pub fn validation(field_errors: Vec<ProposalFieldError>) -> Self {
+        let message = match field_errors.len() {
+            1 => format!(
+                "proposal payload is invalid: {} — {}",
+                field_errors[0].field, field_errors[0].message
+            ),
+            n => format!("proposal payload is invalid: {n} field errors"),
+        };
+        Self {
+            code: ProposalErrorCode::ValidationFailed,
+            message,
+            field_errors,
+        }
+    }
+}
+
+impl std::fmt::Display for ProposalSubmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ProposalSubmissionError {}
+
+/// Maximum proposals one execution may submit across all kinds.
+///
+/// Deliberately generous: per design §"Transport and authn", "the goal is
+/// runaway-loop protection and attribution, not scarcity". A run that files
+/// 32 proposals is looping, not working.
+pub const PROPOSAL_CAP_TOTAL_PER_EXECUTION: usize = 32;
+
+/// Maximum proposals of any single kind one execution may submit. Bounds a
+/// loop that is stuck re-proposing one thing without consuming the whole
+/// total budget, which would mask the pattern.
+pub const PROPOSAL_CAP_PER_KIND_PER_EXECUTION: usize = 8;
