@@ -259,6 +259,11 @@ struct WorkBoardSection: Identifiable {
     /// icon) reads this to look up the resolved
     /// `ProjectDesignDocState` for the section's header row.
     var projectID: String? = nil
+    /// "Trunk queue paused/draining" banner shown in the section header
+    /// (`ChatViewModel.mergingSection`'s `MergeQueueDetail.queueStateBanner`
+    /// rollup). `nil` for every section except "Merging" while a tracked
+    /// Trunk queue is non-`RUNNING`.
+    var queueBannerText: String? = nil
 }
 
 /// Swift mirror of `boss_protocol::short_name_for(url)` from the

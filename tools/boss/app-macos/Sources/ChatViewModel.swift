@@ -445,6 +445,16 @@ final class ChatViewModel: ObservableObject {
     /// Guards against a duplicate tap while the engine is running the merge.
     var mergingWhenReadyIDs: Set<String> = []
 
+    /// Inline confirmation banner shown next to a card whose
+    /// `merge_when_ready_accepted` reply just arrived (e.g. "Submitted to
+    /// Trunk merge queue"), keyed by the wire `action` value in
+    /// `ChatViewModel+EventHandling`. Single-slot and auto-dismissed —
+    /// mirrors `dragRefusalNotice`.
+    struct MergeFeedbackNotice: Equatable {
+        let taskID: String
+        let message: String
+    }
+
     /// Ask the engine to merge (or queue for merging) the PR for the given
     /// Review-column task. Guards against a duplicate tap while the RPC is
     /// in flight. The engine runs `gh pr merge --auto --squash` and kicks
@@ -2058,6 +2068,11 @@ final class ChatViewModel: ObservableObject {
     /// unsatisfied gating prereqs (design item 11). Single-slot — the
     /// previous notice is replaced when a new refusal fires.
     @Published var dragRefusalNotice: DragRefusalNotice?
+
+    /// Inline confirmation banner shown on a Review-lane card after its
+    /// `merge_when_ready_accepted` reply arrives (`MergeFeedbackNotice`).
+    /// Set and auto-dismissed from `ChatViewModel+EventHandling`.
+    @Published var mergeFeedbackNotice: MergeFeedbackNotice?
 
     // MARK: - Optimistic kanban moves
 

@@ -188,9 +188,11 @@ enum EngineEvent {
     case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String)
     /// Response to `merge_when_ready` — the engine has successfully
     /// initiated the merge process for the PR. `action` is one of:
-    /// `"enqueued"` (merge queue), `"auto_merge_enabled"` (will merge
-    /// when checks pass), `"merged"` (directly merged). The PR-reconciler
-    /// is kicked on the engine side so the kanban state refreshes promptly.
+    /// `"enqueued"` (GitHub-native merge queue), `"auto_merge_enabled"`
+    /// (will merge when checks pass), `"merged"` (directly merged), or
+    /// `"trunk_enqueued"` (submitted to a `trunk_queue`-mechanism
+    /// product's Trunk merge queue). The PR-reconciler is kicked on the
+    /// engine side so the kanban state refreshes promptly.
     case mergeWhenReadyAccepted(workItemID: String, prURL: String, action: String)
     /// GitHub OAuth auth-state push (OAuth device-flow design §4).
     /// Delivered both as the immediate reply to a `git_hub_auth_*`

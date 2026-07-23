@@ -16,19 +16,27 @@ extension ChatViewModel {
     /// stable order.
     static func mergingSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
-        let keyed = items.map { task in
-            (task: task, order: MergeQueueDetail.parse(task.mergeQueueDetail)?.sectionOrder ?? .max)
+        let details = items.map { MergeQueueDetail.parse($0.mergeQueueDetail) }
+        let keyed = zip(items, details).map { task, detail in
+            (task: task, order: detail?.sectionOrder ?? .max)
         }
         let sorted = keyed.sorted { lhs, rhs in
             if lhs.order != rhs.order { return lhs.order < rhs.order }
             return lhs.task.id < rhs.task.id
         }.map(\.task)
+        // Queue administration lives in the Trunk web app, not Boss — this
+        // just surfaces that a tracked queue is stalled so the operator
+        // isn't left wondering why the lane stopped moving. First match
+        // wins: multiple distinct paused queues in one Merging section is
+        // rare enough not to warrant enumerating them all here.
+        let queueBanner = details.compactMap { $0?.queueStateBanner }.first
         return WorkBoardSection(
             id: "done-merging",
             title: "Merging",
             items: sorted,
             isCollapsible: true,
-            defaultExpanded: true
+            defaultExpanded: true,
+            queueBannerText: queueBanner
         )
     }
 
