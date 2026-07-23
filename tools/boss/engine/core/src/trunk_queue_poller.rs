@@ -46,7 +46,7 @@ use boss_trunk_client::{
 use crate::coordinator::ExecutionPublisher;
 use crate::metrics::Registry;
 use crate::trunk_merge::trunk_repo_ref;
-use crate::work::{ActiveTrunkMergeIntent, WorkDb};
+use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
 
 // ── Metrics ───────────────────────────────────────────────────────────────
 
@@ -80,6 +80,11 @@ crate::register_counter!(
     "trunk_queue_poller.attentions_filed",
     "Attention items filed for a paused/draining queue, an unreachable/rejecting API, or a cancelled entry."
 );
+crate::register_counter!(
+    EVICTIONS_DETECTED,
+    "trunk_queue_poller.evictions_detected",
+    "Trunk queue evictions that flipped the parent to blocked: ci_failure via ci_watch::on_trunk_queue_eviction_detected."
+);
 
 /// Register every counter this module declares. Called from
 /// [`crate::metrics_init::init_all`] at engine startup.
@@ -90,6 +95,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&STATE_WRITES);
     registry.register_counter(&INTENTS_RETIRED);
     registry.register_counter(&ATTENTIONS_FILED);
+    registry.register_counter(&EVICTIONS_DETECTED);
 }
 
 /// Fold one pass's [`TrunkSweepOutcome`] into the registry.
@@ -100,6 +106,7 @@ pub fn record_pass_metrics(metrics: &Registry, outcome: &TrunkSweepOutcome) {
     STATE_WRITES.inc_by(metrics, outcome.state_writes as u64);
     INTENTS_RETIRED.inc_by(metrics, outcome.intents_retired as u64);
     ATTENTIONS_FILED.inc_by(metrics, outcome.attentions_filed as u64);
+    EVICTIONS_DETECTED.inc_by(metrics, outcome.evictions_detected as u64);
 }
 
 // ── Tunables ──────────────────────────────────────────────────────────────
@@ -292,12 +299,19 @@ pub struct TrunkSweepOutcome {
     pub probe_failures: usize,
     /// Attention items filed this pass.
     pub attentions_filed: usize,
+    /// Trunk queue evictions handed to `ci_watch::on_trunk_queue_eviction_detected`
+    /// that flipped the parent to `blocked: ci_failure` this pass.
+    pub evictions_detected: usize,
 }
 
 impl TrunkSweepOutcome {
     /// Whether this pass did anything worth an info-level log line.
     pub fn is_noteworthy(&self) -> bool {
-        self.state_writes > 0 || self.intents_retired > 0 || self.probe_failures > 0 || self.attentions_filed > 0
+        self.state_writes > 0
+            || self.intents_retired > 0
+            || self.probe_failures > 0
+            || self.attentions_filed > 0
+            || self.evictions_detected > 0
     }
 }
 
@@ -518,7 +532,7 @@ impl TrunkQueueProbe {
                 // window where a failed/cancelled entry keeps rendering as
                 // a healthy queue member.
                 Some((_, entry)) => {
-                    apply_resolved_state(ctx, member, &entry.state, outcome).await;
+                    apply_resolved_state(ctx, member, entry, outcome).await;
                     Some(entry.state.clone())
                 }
                 // Already resolved on an earlier pass and deliberately
@@ -1054,8 +1068,9 @@ async fn resolve_missing_entry(
     );
     match ctx.api.get_submitted_pull_request(&lookup).await {
         Ok(pr) => {
-            apply_resolved_state(ctx, member, &pr.state, outcome).await;
-            Some(pr.state)
+            let state = pr.state.clone();
+            apply_resolved_state(ctx, member, &pr, outcome).await;
+            Some(state)
         }
         Err(TrunkError::NotFound(detail)) => {
             // Trunk has no record of this PR on this branch. Not a
@@ -1088,9 +1103,17 @@ async fn resolve_missing_entry(
 async fn apply_resolved_state(
     ctx: &TrunkSweepContext<'_>,
     member: &ActiveTrunkMergeIntent,
-    state: &TrunkPrState,
+    entry: &TrunkPullRequest,
     outcome: &mut TrunkSweepOutcome,
 ) {
+    // Captured before `record_observed_state` below so the eviction path
+    // fires at most once per episode even in the rare case where Trunk's
+    // live queue snapshot keeps reporting an already-resolved terminal
+    // entry inline (see the `already_resolved_terminal` doc comment) —
+    // `insert_ci_remediation`'s idempotent key makes a repeat call safe,
+    // but this avoids the wasted Buildkite lookup + DB round trip.
+    let already_terminal = already_resolved_terminal(member);
+    let state = &entry.state;
     let state_str = String::from(state.clone());
     record_observed_state(ctx, member, &state_str);
     match state {
@@ -1103,9 +1126,8 @@ async fn apply_resolved_state(
         // cancelled the entry. Cancellation is a decision, not a failure:
         // no revision is spawned, the card just returns to Review.
         TrunkPrState::Cancelled => retire_intent(ctx, member, "cancelled", true, outcome).await,
-        // Eviction. Recorded and left `active` on purpose — the
-        // `ci_watch` eviction path (design task 6) owns the remediation,
-        // and the intent is what authorizes the resubmit after it.
+        // Eviction. Recorded and left `active` on purpose — the intent is
+        // what authorizes the resubmit after remediation lands.
         TrunkPrState::Failed | TrunkPrState::PendingFailure => {
             tracing::info!(
                 work_item_id = %member.intent.work_item_id,
@@ -1113,11 +1135,97 @@ async fn apply_resolved_state(
                 state = %state_str,
                 "trunk queue poller: entry left the queue on a test failure; intent kept active for remediation",
             );
+            if !already_terminal {
+                handle_trunk_queue_eviction(ctx, member, entry, outcome).await;
+            }
         }
         // A live state observed while the entry was missing from the queue
         // snapshot (a race between the two calls). Nothing to resolve —
         // the next cycle's `getQueue` reports it with a position again.
         _ => {}
+    }
+}
+
+/// The `bk` binary invoked to discover Buildkite evidence for a Trunk
+/// eviction. Not threaded through [`TrunkSweepContext`] (which would force
+/// updating every existing test construction site) — mirrors
+/// `ci_watch::fetch_and_store_log_excerpt`'s existing precedent of
+/// hardcoding `"bk"` in production and accepting that the shell-out itself
+/// goes untested (there is no `bk` binary in CI); the pure JSON parser and
+/// an end-to-end fake-binary test cover the discovery logic in
+/// `boss_ci_log_reader`.
+const BK_BINARY: &str = "bk";
+
+/// Fetch Buildkite evidence for a Trunk queue eviction and hand it to
+/// [`crate::ci_watch::on_trunk_queue_eviction_detected`]. Best-effort: a
+/// failed/empty Buildkite lookup still calls through with an empty
+/// `failures` slice (mirrors `check_merge_queue_rebounce`'s handling of an
+/// empty `fetch_failing_checks_for_commit` result) rather than skipping
+/// remediation outright — the worker can always fall back to discovering
+/// the build manually.
+async fn handle_trunk_queue_eviction(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    entry: &TrunkPullRequest,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    let Some(state_changed_at) = entry.state_changed_at.as_deref() else {
+        tracing::warn!(
+            work_item_id = %member.intent.work_item_id,
+            pr_url = %member.intent.pr_url,
+            "trunk queue poller: eviction observed with no stateChangedAt; cannot key the remediation — skipping",
+        );
+        return;
+    };
+
+    let failures =
+        match crate::ci_log_reader::find_trunk_merge_eviction_build(BK_BINARY, member.intent.pr_number as u64).await {
+            Ok(Some(build)) => {
+                tracing::info!(
+                    work_item_id = %member.intent.work_item_id,
+                    pipeline = %build.pipeline_slug,
+                    build_number = %build.build_number,
+                    failed_jobs = build.failed_job_ids.len(),
+                    "trunk queue poller: discovered Buildkite evidence for eviction",
+                );
+                crate::ci_watch::trunk_eviction_failures_from_build(&build)
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    work_item_id = %member.intent.work_item_id,
+                    pr_number = member.intent.pr_number,
+                    "trunk queue poller: no failed trunk-merge build found for eviction",
+                );
+                Vec::new()
+            }
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %member.intent.work_item_id,
+                    pr_number = member.intent.pr_number,
+                    ?err,
+                    "trunk queue poller: failed to discover Buildkite evidence for eviction",
+                );
+                Vec::new()
+            }
+        };
+
+    let candidate = PendingMergeCheck {
+        work_item_id: member.intent.work_item_id.clone(),
+        product_id: member.product_id.clone(),
+        pr_url: member.intent.pr_url.clone(),
+    };
+    if crate::ci_watch::on_trunk_queue_eviction_detected(
+        ctx.work_db,
+        ctx.publisher,
+        &candidate,
+        None, // head branch not tracked on the intent; mirrors the GH rebounce production callsite
+        &entry.id,
+        state_changed_at,
+        &failures,
+    )
+    .await
+    {
+        outcome.evictions_detected += 1;
     }
 }
 

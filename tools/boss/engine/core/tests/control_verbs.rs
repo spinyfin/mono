@@ -1472,7 +1472,7 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
         FrontendEvent::CiRemediationNoopRejected { attempt_id, status, .. } => {
             assert_eq!(attempt_id, rebounce.id);
             assert!(
-                status.contains("merge_queue_rebounce"),
+                status.contains("synthetic/ephemeral commit"),
                 "rebounce rejection should explain why: {status}"
             );
         }
@@ -1893,7 +1893,7 @@ async fn mark_ci_remediation_succeeded_via_rebase_rejects_merge_queue_rebounce()
         .await?;
     match response {
         FrontendEvent::CiRemediationSucceededViaRebaseRejected { status, live_sha, .. } => {
-            assert!(status.contains("merge_queue_rebounce"), "got: {status}");
+            assert!(status.contains("synthetic/ephemeral commit"), "got: {status}");
             assert!(
                 live_sha.is_none(),
                 "rebounce guard rejects before the live probe ever runs"

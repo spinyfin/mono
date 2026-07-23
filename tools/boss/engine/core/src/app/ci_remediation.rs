@@ -242,18 +242,20 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
             return;
         }
 
-        // 3. A merge-queue rebounce failure is NOT validated by the PR's
-        //    head-branch CI (which is always green for a rebounce — the
-        //    failure was on the synthetic merge commit, not the PR head;
-        //    see runner.rs's rebounce directive). Honoring a rebase claim
-        //    off a green head-branch probe would be exactly the bypass
-        //    the operator forbade — the same guard `mark_ci_remediation_noop`
-        //    enforces. Reject; keep the row actionable.
-        if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce") {
+        // 3. A queue-side failure (merge-queue rebounce or a Trunk queue
+        //    eviction) is NOT validated by the PR's head-branch CI (which is
+        //    always green in both cases — the failure was on a synthetic/
+        //    ephemeral commit, not the PR head; see runner.rs's revision
+        //    fragment). Honoring a rebase claim off a green head-branch probe
+        //    would be exactly the bypass the operator forbade — the same
+        //    guard `mark_ci_remediation_noop` enforces. Reject; keep the row
+        //    actionable.
+        if crate::ci_watch::is_queue_side_failure_kind(attempt.failure_kind.as_deref()) {
             tracing::warn!(
                 attempt_id = %attempt.id,
                 work_item_id = %attempt.work_item_id,
-                "mark_ci_remediation_succeeded_via_rebase: rejected — rebounce attempt not validatable via head-branch CI",
+                failure_kind = ?attempt.failure_kind,
+                "mark_ci_remediation_succeeded_via_rebase: rejected — queue-side-failure attempt not validatable via head-branch CI",
             );
             send_response(
                 &sink,
@@ -262,12 +264,11 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                     attempt_id: attempt.id.clone(),
                     work_item_id: attempt.work_item_id.clone(),
                     pr_url: attempt.pr_url.clone(),
-                    status: "merge_queue_rebounce attempts cannot be validated via head-branch CI: the failure is \
-                             on the synthetic merge commit, not the PR head, so head-branch CI going green \
-                             proves nothing about the rebounce. If post-rebase CI is green, do not retry this \
-                             verb — re-enqueue the PR directly (`gh pr merge --auto --squash`) and stop; the \
-                             merge-poller retires the attempt when the queue outcome is observed. If CI is \
-                             still red, fix the semantic conflict and push."
+                    status: "This attempt's failure lives on a synthetic/ephemeral commit, not the PR head, so \
+                             head-branch CI going green proves nothing about it. If post-rebase CI is green, do \
+                             not retry this verb — push the fix and get the PR resubmitted to its queue (Trunk \
+                             or GitHub's merge queue as applicable) and stop; the poller retires the attempt when \
+                             the queue outcome is observed. If CI is still red, fix the semantic conflict and push."
                         .to_owned(),
                     live_sha: None,
                 },
@@ -484,16 +485,18 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
             return;
         }
 
-        // 3. A merge-queue rebounce failure is NOT validated by the PR's
-        //    head-branch CI (which is always green for a rebounce — the
-        //    failure was on the synthetic merge commit). Honoring a noop
-        //    off a green head-branch probe would be exactly the bypass
-        //    the operator forbade. Reject; keep the row actionable.
-        if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce") {
+        // 3. A queue-side failure (merge-queue rebounce or a Trunk queue
+        //    eviction) is NOT validated by the PR's head-branch CI (which is
+        //    always green in both cases — the failure was on a synthetic/
+        //    ephemeral commit). Honoring a noop off a green head-branch probe
+        //    would be exactly the bypass the operator forbade. Reject; keep
+        //    the row actionable.
+        if crate::ci_watch::is_queue_side_failure_kind(attempt.failure_kind.as_deref()) {
             tracing::warn!(
                 attempt_id = %attempt.id,
                 work_item_id = %attempt.work_item_id,
-                "mark_ci_remediation_noop: rejected — rebounce attempt not validatable via head-branch CI",
+                failure_kind = ?attempt.failure_kind,
+                "mark_ci_remediation_noop: rejected — queue-side-failure attempt not validatable via head-branch CI",
             );
             send_response(
                 &sink,
@@ -502,9 +505,9 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                     attempt_id: attempt.id.clone(),
                     work_item_id: attempt.work_item_id.clone(),
                     pr_url: attempt.pr_url.clone(),
-                    status: "merge_queue_rebounce attempts cannot be validated via head-branch CI: the failure is \
-                             on the synthetic merge commit, not the PR head. Fix the rebounce and re-enqueue, or use \
-                             `boss engine ci mark-failed`."
+                    status: "This attempt's failure lives on a synthetic/ephemeral commit, not the PR head, so \
+                             head-branch CI cannot validate it. Fix the failure and get the PR resubmitted to its \
+                             queue, or use `boss engine ci mark-failed`."
                         .to_owned(),
                     live_sha: None,
                     observed_sha,

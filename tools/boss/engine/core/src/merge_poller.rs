@@ -1819,8 +1819,22 @@ fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 /// state. Do NOT re-add a "wait for all checks terminal" gate here — that was
 /// the regression (T1150 commit 1). Phantom prevention belongs in withdraw,
 /// not in detection delay.
+///
+/// Excludes Trunk's own bookkeeping check (`"Trunk Merge Queue (<branch>)"`,
+/// posted by the `trunk-io` app on the PR head) from the required-failure
+/// set unconditionally. Trunk flips that check to failure the moment a
+/// queue episode is evicted — a check name that can only exist on a repo
+/// with Trunk installed, whose failure is already the authoritative
+/// `ci_watch::on_trunk_queue_eviction_detected` path's own signal (driven
+/// by `TrunkQueueProbe`, not this rollup). Without this exclusion the same
+/// eviction would ALSO read as a failing required check here, on the PR's
+/// own head, and spawn a duplicate/misleading `pr_branch_ci` remediation
+/// from a check that isn't a real CI run (see the buildkite-log-access
+/// investigation's coordination note).
 fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> OpenPrCiStatus {
     use std::collections::BTreeMap;
+
+    const TRUNK_QUEUE_CHECK_NAME_PREFIX: &str = "Trunk Merge Queue";
 
     // Group by name, keeping the most-recently-seen leaf per name.
     // The rollup is ordered oldest-to-newest for same-name re-runs.
@@ -1838,7 +1852,7 @@ fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> Op
             .or_else(|| leaf.get("context").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_owned();
-        if name.is_empty() {
+        if name.is_empty() || name.starts_with(TRUNK_QUEUE_CHECK_NAME_PREFIX) {
             continue;
         }
         by_name.insert(name, leaf);
@@ -9804,6 +9818,60 @@ mod tests {
             }),
         ];
         assert_eq!(super::classify_ci(&optional_fail, None), OpenPrCiStatus::Clean,);
+    }
+
+    /// A Trunk merge-queue eviction flips Trunk's own bookkeeping check
+    /// (`"Trunk Merge Queue (main)"`, posted by the `trunk-io` app) to
+    /// failure on the PR head. That check must never be treated as an
+    /// ordinary required-check failure — the Trunk-eviction path
+    /// (`ci_watch::on_trunk_queue_eviction_detected`, driven by
+    /// `TrunkQueueProbe`) is the authoritative handler for that signal, and
+    /// double-firing here would spawn a duplicate, misleading
+    /// `pr_branch_ci` remediation from a check that isn't a real CI run.
+    #[test]
+    fn classify_ci_excludes_trunk_merge_queue_check() {
+        // The Trunk check is the ONLY failing check → the PR must read
+        // Clean, not Failing, so `on_ci_failure_detected` never fires.
+        let only_trunk_check_failing = [serde_json::json!({
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "isRequired": true,
+        })];
+        assert_eq!(
+            super::classify_ci(&only_trunk_check_failing, None),
+            OpenPrCiStatus::Clean
+        );
+
+        // A real required-check failure alongside the Trunk check still
+        // surfaces Failing — but the failure list must not include the
+        // Trunk check itself.
+        let mixed = [
+            serde_json::json!({
+                "name": "Trunk Merge Queue (main)",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "isRequired": true,
+            }),
+            serde_json::json!({
+                "name": "ci/test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "isRequired": true,
+            }),
+        ];
+        assert_eq!(
+            super::classify_ci(&mixed, None),
+            OpenPrCiStatus::Failing {
+                failures: vec![RequiredCheckFailure {
+                    name: "ci/test".into(),
+                    conclusion: "FAILURE".into(),
+                    target_url: "".into(),
+                    provider: CiProvider::Other,
+                    provider_job_id: None,
+                }],
+            },
+        );
     }
 
     /// Build a minimal `RequiredCheckFailure` for the pure-helper tests

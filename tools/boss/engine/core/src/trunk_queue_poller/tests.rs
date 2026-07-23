@@ -149,6 +149,20 @@ fn entry_of(pr_number: u64, state: TrunkPrState) -> TrunkPullRequest {
         .build()
 }
 
+/// Like [`entry_of`], but with `state_changed_at` set — the field
+/// `handle_trunk_queue_eviction` needs to key the `ci_watch` remediation
+/// (see [`an_evicted_entry_with_state_changed_at_triggers_ci_watch`]).
+/// Kept separate from `entry_of` rather than adding an optional parameter
+/// there, since most existing fixtures don't care about this field.
+fn entry_of_with_state_changed_at(pr_number: u64, state: TrunkPrState, state_changed_at: &str) -> TrunkPullRequest {
+    TrunkPullRequest::builder()
+        .id(format!("entry_{pr_number}"))
+        .state(state)
+        .pr_number(pr_number)
+        .state_changed_at(state_changed_at)
+        .build()
+}
+
 fn queue_of(state: TrunkQueueState, entries: Vec<TrunkPullRequest>) -> TrunkQueue {
     TrunkQueue::builder()
         .state(state)
@@ -567,6 +581,80 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
     probe.run_pass(&ctx, t0 + Duration::from_secs(93)).await;
     assert_eq!(api.entry_call_count(), 1);
     assert!(api.queue_call_count() >= 4);
+}
+
+/// An evicted entry that carries `stateChangedAt` must be handed to
+/// `ci_watch::on_trunk_queue_eviction_detected`, which flips the owning
+/// chore to `blocked: ci_failure` and records a `trunk_queue_eviction`
+/// `ci_remediations` row (design task 6). The Buildkite evidence fetch
+/// itself is best-effort and untestable here (no `bk` binary in this test
+/// environment — mirrors the existing `fetch_and_store_log_excerpt`
+/// precedent), so this only exercises the wiring, not the log excerpt.
+#[tokio::test]
+async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-ci-watch", 1007);
+    let api = StubTrunkApi::with_queue(vec![
+        Ok(queue_of(
+            TrunkQueueState::Running,
+            vec![entry_of(1007, TrunkPrState::Testing)],
+        )),
+        Ok(queue_of(TrunkQueueState::Running, Vec::new())),
+    ]);
+    api.set_entry(
+        1007,
+        Ok(entry_of_with_state_changed_at(
+            1007,
+            TrunkPrState::Failed,
+            "2026-07-23T01:32:50.000Z",
+        )),
+    );
+    let publisher = RecordingPublisher::default();
+    let mut probe = TrunkQueueProbe::new();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    probe.run_pass(&ctx, t0).await;
+    let outcome = probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await;
+
+    assert_eq!(outcome.evictions_detected, 1);
+
+    let task = match db.get_work_item(&task_id).unwrap() {
+        crate::work::WorkItem::Chore(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert_eq!(
+        task.status,
+        crate::work::TaskStatus::InReview,
+        "revision spawn unblocks the parent"
+    );
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&task_id)
+        .unwrap()
+        .expect("active ci_remediations row");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("trunk_queue_eviction"));
+    assert_eq!(attempt.head_sha_at_trigger, "trunk:entry_1007@2026-07-23T01:32:50.000Z");
+
+    // A repeat sweep for the same (already-resolved) episode must not
+    // fire a second time.
+    probe.run_pass(&ctx, t0 + Duration::from_secs(62)).await;
+    let conn = db.connect().unwrap();
+    let attempt_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ci_remediations WHERE work_item_id = ?1",
+            rusqlite::params![&task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        attempt_count, 1,
+        "an already-resolved eviction must not re-trigger ci_watch"
+    );
 }
 
 #[tokio::test]

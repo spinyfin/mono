@@ -155,6 +155,7 @@ mod tests {
             "trunk_queue_poller.state_writes",
             "trunk_queue_poller.intents_retired",
             "trunk_queue_poller.attentions_filed",
+            "trunk_queue_poller.evictions_detected",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -163,10 +164,10 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            55,
+            56,
             "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
              18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring + 1 dispatch_metrics + \
-             6 trunk_queue_poller counters"
+             7 trunk_queue_poller counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
