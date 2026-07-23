@@ -1,7 +1,6 @@
 //! Live-descendant-process probe for a worker's Stop boundary.
 //!
-//! Background: incident surfaced live 2026-07-17 (worker Riker, chore
-//! T2843, `exec_18c31347a0305440_374`). A worker's Claude session had
+//! Background: observed live 2026-07-17 — a worker's Claude session had
 //! spawned one or more BACKGROUND SUBAGENTS via the harness Agent tool
 //! (`subagent_type: "fork"` and friends) — separate `claude` processes
 //! that re-invoke the worker with a task-notification once they finish.
@@ -13,7 +12,7 @@
 //! nudged into unproductive replies and eventually parked/abandoned.
 //!
 //! Same misclassification family as the build-wait false positives
-//! ([`crate::build_wait`], T2608/T2612) — a worker that ended its turn
+//! ([`crate::build_wait`]) — a worker that ended its turn
 //! for a legitimate reason looks identical, over hooks alone, to one that
 //! is truly stuck — but a distinct case: there the worker's own
 //! foreground process is busy (mid-tool-call); here the worker's turn has

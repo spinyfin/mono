@@ -127,9 +127,8 @@ impl WorkerCompletionHandler {
                 }
             }
         }
-        // Background-children suppression (2026-07-17 incident, worker
-        // Riker / T2843, `exec_18c31347a0305440_374`): the worker's own
-        // turn genuinely ended (Stop fired, hooks go quiet), but its
+        // Background-children suppression (observed live 2026-07-17): the
+        // worker's own turn genuinely ended (Stop fired, hooks go quiet), but its
         // process tree still has live descendant processes — a
         // backgrounded subagent spawned via the harness Agent tool that
         // has not yet reported back with a task-notification. That is

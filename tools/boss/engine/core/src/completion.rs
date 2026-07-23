@@ -1048,7 +1048,7 @@ pub struct WorkerCompletionHandler {
     /// Reports whether an execution's worker process tree still has live
     /// descendant processes at Stop boundary — e.g. a backgrounded
     /// subagent spawned via the harness Agent tool that has not yet
-    /// reported back (2026-07-17 incident, worker Riker / T2843). See
+    /// reported back (observed live 2026-07-17). See
     /// [`crate::background_children`] for the process-tree scan this
     /// wraps in production. Defaults to
     /// [`crate::background_children::NoopBackgroundActivityProbe`]; `app.rs`
@@ -1498,9 +1498,8 @@ pub enum StopOutcome {
     BuildWaitPending { waited_secs: i64 },
     /// The worker's Stop-boundary process tree still has live descendant
     /// processes — e.g. a backgrounded subagent spawned via the harness
-    /// Agent tool that has not yet reported back (2026-07-17 incident,
-    /// worker Riker / T2843, `exec_18c31347a0305440_374`). Same
-    /// suppression shape as [`Self::BuildWaitPending`] (checked before
+    /// Agent tool that has not yet reported back (observed live
+    /// 2026-07-17). Same suppression shape as [`Self::BuildWaitPending`] (checked before
     /// [`crate::nudge_breaker`] is even consulted, so this Stop does not
     /// burn any of its cap) but a distinct signal: process-tree-based
     /// rather than text-narration-based. `descendant_count` is how many
@@ -1839,3 +1838,4 @@ fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
 }
 
 #[cfg(test)]
+mod tests;
