@@ -930,26 +930,39 @@ impl WorkDb {
         })
     }
 
-    /// Optimistically write the Merging-UI columns for `work_item_id`
-    /// immediately after a successful Trunk `submitPullRequest`, so the
-    /// card moves into the Merging lane without waiting for the queue
-    /// poller's first sweep. Unlike [`Self::update_task_pr_poll_state`],
-    /// this touches only `merge_queue_state`/`merge_queue_detail` — it does
-    /// not require a fresh CI/review probe. Does not stamp `updated_at`,
-    /// consistent with `update_task_pr_poll_state` also leaving it alone.
+    /// Write the Merging-UI columns for `work_item_id` directly — the
+    /// Trunk-owned counterpart to [`Self::update_task_pr_poll_state`],
+    /// whose `preserve_merge_queue_state` gate deliberately keeps the
+    /// GitHub probe off these two columns for a `trunk_queue` product.
+    ///
+    /// Two callers: `app::review::handle_trunk_queue_merge`'s optimistic
+    /// write right after a successful `submitPullRequest`, and the Trunk
+    /// queue poller on every observation (including the `NULL, NULL`
+    /// Review snap-back when an entry leaves the queue).
+    ///
+    /// Returns whether the stored pair actually moved. The poller re-derives
+    /// identical JSON on most sweeps, and the macOS app is push-only — so
+    /// without this the poller would either publish a `work_item_changed`
+    /// per PR per 15 s regardless of news, or have to re-read the row
+    /// itself to tell. Does not stamp `updated_at`, consistent with
+    /// `update_task_pr_poll_state` also leaving it alone.
     pub fn set_task_merge_queue_state(
         &self,
         work_item_id: &str,
         merge_queue_state: Option<&str>,
         merge_queue_detail: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.connect()?;
-        conn.execute(
+        // `IS NOT` (not `<>`) so a NULL on either side compares as a value:
+        // `NULL <> 'queued'` is NULL, i.e. not true, which would silently
+        // swallow the very first write and the snap-back back to NULL.
+        let changed = conn.execute(
             "UPDATE tasks SET merge_queue_state = ?2, merge_queue_detail = ?3 \
-             WHERE id = ?1 AND deleted_at IS NULL",
+             WHERE id = ?1 AND deleted_at IS NULL \
+               AND (merge_queue_state IS NOT ?2 OR merge_queue_detail IS NOT ?3)",
             params![work_item_id, merge_queue_state, merge_queue_detail],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 }
 

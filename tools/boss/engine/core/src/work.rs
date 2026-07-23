@@ -487,4 +487,4 @@ pub use pr_state::classify_pr_merge_state;
 pub use proposals::SubmitWorkerProposalInput;
 pub use proposals::SubmitWorkerProposalOutcome;
 pub use revision_helpers::normalize_priority;
-pub use trunk_merge_intents::{TrunkMergeIntent, TrunkMergeIntentInsertInput};
+pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};

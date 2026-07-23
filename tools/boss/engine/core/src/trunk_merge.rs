@@ -9,6 +9,11 @@
 
 use anyhow::{Result, anyhow};
 
+/// The `host` every `TrunkRepoRef` Boss builds carries. Boss only ever
+/// tracks GitHub-hosted PRs (`parse_trunk_pr_coordinates` rejects anything
+/// else outright), so this is a constant rather than a product setting.
+pub const TRUNK_REPO_HOST: &str = "github.com";
+
 /// Repo/PR coordinates Trunk's queue API addresses, parsed from a task's
 /// canonical GitHub PR URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,9 +37,42 @@ pub fn parse_trunk_pr_coordinates(pr_url: &str) -> Result<TrunkPrCoordinates> {
     })
 }
 
+/// Build the `{host, owner, name}` repo reference Trunk's API expects from
+/// a `trunk_merge_intents.repo` value (`"<owner>/<name>"`).
+///
+/// Returns `None` for anything that isn't exactly one `owner/name` pair.
+/// The queue poller treats that as "this intent's coordinates are
+/// unusable" and parks the queue rather than issuing a request Trunk would
+/// reject anyway — the column is written by
+/// `app::review::handle_trunk_queue_merge` from already-parsed
+/// [`TrunkPrCoordinates`], so a malformed value means data corruption, not
+/// a user typo.
+pub fn trunk_repo_ref(repo: &str) -> Option<boss_trunk_client::TrunkRepoRef> {
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(boss_trunk_client::TrunkRepoRef::new(TRUNK_REPO_HOST, owner, name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_a_repo_ref_from_an_owner_name_slug() {
+        let repo_ref = trunk_repo_ref("brianduff/flunge").unwrap();
+        assert_eq!(repo_ref.host, TRUNK_REPO_HOST);
+        assert_eq!(repo_ref.owner, "brianduff");
+        assert_eq!(repo_ref.name, "flunge");
+    }
+
+    #[test]
+    fn rejects_repo_slugs_that_are_not_exactly_owner_slash_name() {
+        for bad in ["flunge", "", "/flunge", "brianduff/", "a/b/c"] {
+            assert!(trunk_repo_ref(bad).is_none(), "expected {bad:?} to be rejected");
+        }
+    }
 
     #[test]
     fn parses_a_canonical_pr_url() {
