@@ -626,7 +626,7 @@ impl TrunkQueueProbe {
                             .iter()
                             .find(|member| member.intent.pr_number as u64 == pr.pr_number)
                         {
-                            apply_resolved_state(ctx, member, &pr.state, outcome).await;
+                            apply_resolved_state(ctx, member, pr, outcome).await;
                         }
                     }
                     match response.next_cursor {
