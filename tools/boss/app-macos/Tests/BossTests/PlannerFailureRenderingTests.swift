@@ -50,6 +50,14 @@ final class PlannerFailureRenderingTests: XCTestCase {
         XCTAssertNil(run.plannerFailureHeadline)
     }
 
+    func testHeadlineIsNilWhenResultSummaryLacksThePlannerPrefix() {
+        // A malformed/unparseable result_summary (no "planner <tag>: " prefix
+        // at all) must fall back to nil, not the generic sentence — that
+        // fallback is reserved for a well-formed but unrecognized tag.
+        let run = makeRun(outcome: "planner_failed", resultSummary: "something went wrong")
+        XCTAssertNil(run.plannerFailureHeadline)
+    }
+
     func testUnescapedForDisplayCollapsesNestedQuoteEscaping() {
         // Mirrors the reported bug: a serde error message embedding the
         // `Debug` form of a `Vec<String>`, itself carrying `Debug`-escaped
@@ -68,6 +76,21 @@ final class PlannerFailureRenderingTests: XCTestCase {
     func testUnescapedForDisplayIsIdempotentOnPlainText() {
         let plain = "anthropic returned 429: rate limited"
         XCTAssertEqual(plain.unescapedForDisplay, plain)
+    }
+
+    func testDisclosureNeededForManyShortLinesUnderCharacterThreshold() {
+        // Eight 20-character lines is only 167 characters (well under the
+        // 200-char threshold) but exceeds the 4-line collapsed cap, so the
+        // "Show more" affordance must still appear — this is exactly the
+        // "truncated with no way to expand" case the disclosure exists to
+        // prevent.
+        let manyShortLines = Array(repeating: "01234567890123456789", count: 8).joined(separator: "\n")
+        XCTAssertLessThanOrEqual(manyShortLines.count, PlannerResultSummaryLayout.disclosureCharacterThreshold)
+        XCTAssertTrue(PlannerResultSummaryLayout.needsDisclosure(for: manyShortLines))
+    }
+
+    func testDisclosureNotNeededForShortSingleLineText() {
+        XCTAssertFalse(PlannerResultSummaryLayout.needsDisclosure(for: "created 5 tasks, 3 edges"))
     }
 
     // MARK: - Helpers

@@ -3247,7 +3247,7 @@ private struct PlannerRunRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     if let summary = run.resultSummary, !summary.isEmpty {
-                        Text(summary)
+                        Text(summary.unescapedForDisplay)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
@@ -3349,17 +3349,19 @@ private struct PlannerRunRow: View {
 /// "Show more" disclosure so a long payload can't blow out the surrounding
 /// layout, and offers a copy button for the verbatim text a developer would
 /// need to debug something like a schema mismatch.
-struct PlannerResultSummaryView: View {
+private struct PlannerResultSummaryView: View {
     let headline: String?
     let raw: String
     @State private var isExpanded = false
 
-    /// Below this, the text always fits comfortably within the collapsed
-    /// line cap, so the "Show more" toggle would just be dead chrome.
-    private static let disclosureThreshold = 200
+    /// `true` only for a `planner_failed` run's diagnostic — the only case
+    /// with a non-nil `headline` (see `PlannerRun.plannerFailureHeadline`).
+    /// Successful-run summaries (e.g. "created 5 tasks, 3 edges") render as
+    /// plain prose with no monospace/copy chrome, matching their pre-PR look.
+    private var isFailure: Bool { headline != nil }
 
     private var displayText: String { raw.unescapedForDisplay }
-    private var needsDisclosure: Bool { displayText.count > Self.disclosureThreshold }
+    private var needsDisclosure: Bool { PlannerResultSummaryLayout.needsDisclosure(for: displayText) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3372,18 +3374,20 @@ struct PlannerResultSummaryView: View {
             if isExpanded {
                 ScrollView {
                     Text(displayText)
-                        .font(.caption.monospaced())
+                        .font(isFailure ? .caption.monospaced() : .caption)
                         .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(maxHeight: 220)
             } else {
                 Text(displayText)
-                    .font(.caption.monospaced())
+                    .font(isFailure ? .caption.monospaced() : .caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(4)
+                    .lineLimit(PlannerResultSummaryLayout.collapsedLineLimit)
                     .truncationMode(.tail)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack(spacing: 10) {
@@ -3394,19 +3398,48 @@ struct PlannerResultSummaryView: View {
                     .buttonStyle(.link)
                     .font(.caption2)
                 }
-                Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(raw, forType: .string)
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
+                if isFailure {
+                    Button {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString(raw, forType: .string)
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                    .help("Copy the raw, unmodified text to the clipboard")
                 }
-                .buttonStyle(.borderless)
-                .font(.caption2)
-                .help("Copy the raw error to the clipboard")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Pure, testable layout rules backing [[PlannerResultSummaryView]]'s "Show
+/// more" disclosure — kept as a free-standing internal type (rather than
+/// nested in the file-private view) so `PlannerFailureRenderingTests` can
+/// exercise the predicate via `@testable import` without needing the view
+/// itself to be visible outside this file.
+enum PlannerResultSummaryLayout {
+    /// Below this, and within `collapsedLineLimit` lines, the text always
+    /// fits comfortably in the collapsed state, so "Show more" would be dead
+    /// chrome.
+    static let disclosureCharacterThreshold = 200
+    /// Line cap applied to the collapsed `Text` — shared with
+    /// `needsDisclosure` so the two can't drift apart.
+    static let collapsedLineLimit = 4
+
+    /// `true` when `text` would be truncated by either dimension of the
+    /// collapsed rendering: too many characters, or (independently) more
+    /// newline-separated lines than the collapsed line cap allows. A short
+    /// multi-line payload (e.g. eight 20-character lines) is well under the
+    /// character threshold but still gets clipped by `lineLimit`, so both
+    /// checks are required.
+    static func needsDisclosure(for text: String) -> Bool {
+        if text.count > disclosureCharacterThreshold { return true }
+        let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        return lineCount > collapsedLineLimit
     }
 }
 

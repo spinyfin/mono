@@ -93,11 +93,14 @@ extension PlannerRun {
     /// prefix (`populator.rs`: `result_summary(format!("planner {}: {detail}",
     /// failure.tag()))`, tags from `PlannerOutcome::tag()` in `planner.rs`).
     /// `nil` for any other outcome, or when `result_summary` doesn't have
-    /// the expected shape — callers fall back to the raw text alone rather
-    /// than showing a blank or misleading headline.
+    /// the expected `"planner <tag>: <detail>"` shape at all (no recognized
+    /// prefix) — callers fall back to the raw text alone rather than showing
+    /// a blank or misleading headline. An unrecognized but well-formed tag
+    /// still yields a generic fallback sentence rather than `nil`.
     var plannerFailureHeadline: String? {
         guard outcome == "planner_failed", let resultSummary else { return nil }
-        switch plannerFailureTag(from: resultSummary) {
+        guard let tag = plannerFailureTag(from: resultSummary) else { return nil }
+        switch tag {
         case "invalid_output":
             return "The planner returned output that did not match the expected schema."
         case "no_api_key":
