@@ -64,15 +64,17 @@ pub(crate) struct ProposeArgs {
 /// One proposal submission per variant, matching `ProposalKind` exactly.
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ProposeCommand {
-    /// Escalate this run's effort level. Auto-applies to a worker-signal
-    /// attention and pauses the auto-nudge loop until acknowledged.
+    /// Escalate this run's effort level. Recorded as `proposed`; once the
+    /// apply pipeline lands this files a worker-signal attention and
+    /// pauses the auto-nudge loop until acknowledged.
     ///
     /// Example: `boss propose effort-escalation --level large --reason
     /// "multi-subsystem race; brief didn't mention the engine/app boundary"`
     EffortEscalation(EffortEscalationArgs),
     /// Declare that you cannot proceed without a human/coordinator
-    /// decision. Auto-applies to a worker-signal attention and pauses the
-    /// auto-nudge loop.
+    /// decision. Recorded as `proposed`; once the apply pipeline lands
+    /// this files a worker-signal attention and pauses the auto-nudge
+    /// loop.
     ///
     /// Example: `boss propose blocked --reason "bazel E0583 survives
     /// clean --expunge; need direction"`
@@ -89,21 +91,22 @@ pub(crate) enum ProposeCommand {
     /// --rationale "observed transient 5xx during this task"`
     FollowupTask(FollowupTaskArgs),
     /// Record scope you consciously decided not to deliver from this run's
-    /// brief. Auto-applies to a durable audit line on the work item plus
-    /// an attention.
+    /// task. Recorded as `proposed`; once the apply pipeline lands this
+    /// writes a durable audit line on the work item plus an attention.
     ///
     /// Example: `boss propose deferred-scope --summary "wiring for the
     /// third data source" --reason "needs a new ingestion pipeline"`
     DeferredScope(DeferredScopeArgs),
     /// File an ad-hoc attention (question or info notice) for the human.
-    /// Auto-applies to the same attention rows the engine's own detectors
-    /// write.
+    /// Recorded as `proposed`; once the apply pipeline lands this writes
+    /// to the same attention rows the engine's own detectors write.
     ///
     /// Example: `boss propose attention --title "Ambiguous requirement"
     /// --body-file b.md`
     Attention(AttentionProposalArgs),
     /// Declare this automation triage pass's outcome: either the task id
-    /// you created, or that there was nothing to do. Auto-applies with a
+    /// you created, or that there was nothing to do. Recorded as
+    /// `proposed`; once the apply pipeline lands this applies with a
     /// provenance check (a `--produced-task` id must actually exist and
     /// carry this run's `source_automation_id`).
     ///
@@ -112,9 +115,10 @@ pub(crate) enum ProposeCommand {
     /// "repo is clean"`
     AutomationOutcome(AutomationOutcomeArgs),
     /// Declare that you opened a PR — the worker's terminal action after
-    /// `cube pr create`. Auto-applies with verification (URL shape,
-    /// product-repo slug, branch match against your execution) and binds
-    /// the PR to the work item.
+    /// `cube pr create`. Recorded as `proposed`; once the apply pipeline
+    /// lands this applies with verification (URL shape, product-repo
+    /// slug, branch match against your execution) and binds the PR to
+    /// the work item.
     ///
     /// Example: `boss propose pr-created --url
     /// https://github.com/o/r/pull/123`
@@ -135,9 +139,10 @@ struct IdempotencyArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EffortEscalationArgs {
-    /// Requested effort level. `max` is the human-only escape hatch — use
-    /// it when you need Claude's maximum reasoning depth regardless of
-    /// what the original brief's scope markers suggest.
+    /// Requested effort level. `max` is normally reserved for a human
+    /// decision — propose it only when the work genuinely needs Claude's
+    /// maximum reasoning depth, regardless of how the task was originally
+    /// sized.
     #[arg(long, value_enum)]
     level: EffortLevelArg,
 
@@ -370,9 +375,12 @@ pub(crate) async fn run_propose_command(args: ProposeArgs, ctx: &RunContext) -> 
 /// and silently misattribute, where the env var is fixed by the session
 /// the engine itself spawned.
 fn require_run_id() -> Result<String, CliError> {
-    std::env::var("BOSS_RUN_ID").map_err(|_| {
-        CliError::usage("BOSS_RUN_ID is not set — `boss propose` only works inside a Boss worker session.")
-    })
+    std::env::var("BOSS_RUN_ID")
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::usage("BOSS_RUN_ID is not set — `boss propose` only works inside a Boss worker session.")
+        })
 }
 
 /// Resolve a `--field` / `--field-file` pair. clap's `conflicts_with`
@@ -388,37 +396,52 @@ fn resolve_text_or_file(flag: &str, text: Option<String>, file: Option<PathBuf>)
     }
 }
 
-async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
-    let run_id = require_run_id()?;
+/// Build the `(kind, payload, idempotency_key)` triple for a submission,
+/// with no side effects besides `--*-file` reads. Payloads are built from
+/// the typed `boss_protocol` structs (not hand-assembled `json!` literals)
+/// so a field rename in the protocol crate is a compile error here instead
+/// of a runtime "unknown field" rejection from the engine's validator.
+fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Value, Option<String>), CliError> {
+    use boss_protocol::{
+        AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
+        DeferredScopeProposalPayload, EffortEscalationProposalPayload, EffortLevel, FollowupTaskProposalPayload,
+        PrCreatedProposalPayload,
+    };
 
-    let (kind, payload, idempotency_key) = match command {
+    Ok(match command {
         ProposeCommand::EffortEscalation(args) => (
             ProposalKind::EffortEscalation,
-            serde_json::json!({
-                "requested_level": boss_protocol::EffortLevel::from(args.level).as_str(),
-                "reason": args.reason,
-            }),
+            serde_json::to_value(EffortEscalationProposalPayload {
+                reason: args.reason,
+                requested_level: EffortLevel::from(args.level),
+            })
+            .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
         ProposeCommand::Blocked(args) => (
             ProposalKind::Blocked,
-            serde_json::json!({ "reason": args.reason }),
+            serde_json::to_value(BlockedProposalPayload { reason: args.reason }).map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
         ProposeCommand::DeferredScope(args) => (
             ProposalKind::DeferredScope,
-            serde_json::json!({ "summary": args.summary, "reason": args.reason }),
+            serde_json::to_value(DeferredScopeProposalPayload {
+                reason: args.reason,
+                summary: args.summary,
+            })
+            .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
         ProposeCommand::Attention(args) => {
             let body_markdown = resolve_text_or_file("body", args.body, args.body_file)?;
             (
                 ProposalKind::Attention,
-                serde_json::json!({
-                    "title": args.title,
-                    "body_markdown": body_markdown,
-                    "attention_kind": args.attention_kind,
-                }),
+                serde_json::to_value(AttentionProposalPayload {
+                    title: args.title,
+                    body_markdown,
+                    attention_kind: args.attention_kind,
+                })
+                .map_err(CliError::internal)?,
                 args.common.idempotency_key,
             )
         }
@@ -426,20 +449,21 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
             let proposed_description = resolve_text_or_file("description", args.description, args.description_file)?;
             (
                 ProposalKind::FollowupTask,
-                serde_json::json!({
-                    "proposed_name": args.name,
-                    "proposed_description": proposed_description,
-                    "rationale": args.rationale,
-                    "proposed_effort": args.effort.map(|e| boss_protocol::EffortLevel::from(e).as_str()),
-                    "proposed_work_kind": args.work_kind.map(ProposedWorkKindArg::as_str),
-                }),
+                serde_json::to_value(FollowupTaskProposalPayload {
+                    proposed_name: args.name,
+                    proposed_description,
+                    rationale: args.rationale,
+                    proposed_effort: args.effort.map(EffortLevel::from),
+                    proposed_work_kind: args.work_kind.map(|k| k.as_str().to_owned()),
+                })
+                .map_err(CliError::internal)?,
                 args.common.idempotency_key,
             )
         }
         ProposeCommand::AutomationOutcome(args) => {
             let payload = match (args.produced_task, args.skip, args.reason) {
-                (Some(task_id), false, None) => serde_json::json!({ "outcome": "produced_task", "task_id": task_id }),
-                (None, true, Some(reason)) => serde_json::json!({ "outcome": "skip", "reason": reason }),
+                (Some(task_id), false, None) => AutomationOutcomeProposalPayload::ProducedTask { task_id },
+                (None, true, Some(reason)) => AutomationOutcomeProposalPayload::Skip { reason },
                 (None, true, None) => return Err(CliError::usage("--skip requires --reason")),
                 (None, false, _) => {
                     return Err(CliError::usage(
@@ -449,14 +473,27 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
                 (Some(_), true, _) => return Err(CliError::usage("--produced-task and --skip are mutually exclusive")),
                 (Some(_), false, Some(_)) => return Err(CliError::usage("--reason is only used with --skip")),
             };
-            (ProposalKind::AutomationOutcome, payload, args.common.idempotency_key)
+            (
+                ProposalKind::AutomationOutcome,
+                serde_json::to_value(payload).map_err(CliError::internal)?,
+                args.common.idempotency_key,
+            )
         }
         ProposeCommand::PrCreated(args) => (
             ProposalKind::PrCreated,
-            serde_json::json!({ "pr_url": args.url, "branch": args.branch }),
+            serde_json::to_value(PrCreatedProposalPayload {
+                pr_url: args.url,
+                branch: args.branch,
+            })
+            .map_err(CliError::internal)?,
             args.common.idempotency_key,
         ),
-    };
+    })
+}
+
+async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result<(), CliError> {
+    let run_id = require_run_id()?;
+    let (kind, payload, idempotency_key) = payload_for(command)?;
 
     let mut client = connect_for_work(ctx).await?;
     let response = client
@@ -467,7 +504,9 @@ async fn run_propose_submit(ctx: &RunContext, command: ProposeCommand) -> Result
             idempotency_key,
         })
         .await
-        .map_err(CliError::internal)?;
+        .map_err(|err| {
+            CliError::engine_unavailable(format!("boss propose lost the engine connection mid-request: {err}"))
+        })?;
 
     match response {
         FrontendEvent::ProposalSubmitted {
@@ -507,7 +546,9 @@ async fn run_propose_list(
     let response = client
         .send_request(&FrontendRequest::ListProposals { run_id, kind, state })
         .await
-        .map_err(CliError::internal)?;
+        .map_err(|err| {
+            CliError::engine_unavailable(format!("boss propose lost the engine connection mid-request: {err}"))
+        })?;
 
     match response {
         FrontendEvent::ProposalsList {
@@ -789,5 +830,140 @@ mod tests {
             Some("--level")
         );
         assert_eq!(flag_hint_for_field(ProposalKind::PrCreated, "unknown_field"), None);
+    }
+
+    fn command_for(args: &[&str]) -> ProposeCommand {
+        parse_propose(args).command.expect("expected a subcommand")
+    }
+
+    #[test]
+    fn payload_for_effort_escalation_pins_wire_shape() {
+        let (kind, payload, _) = payload_for(command_for(&[
+            "effort-escalation",
+            "--level",
+            "large",
+            "--reason",
+            "multi-subsystem race",
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::EffortEscalation);
+        assert_eq!(
+            payload,
+            serde_json::json!({ "requested_level": "large", "reason": "multi-subsystem race" })
+        );
+    }
+
+    #[test]
+    fn payload_for_blocked_pins_wire_shape() {
+        let (kind, payload, _) = payload_for(command_for(&["blocked", "--reason", "need direction"])).unwrap();
+        assert_eq!(kind, ProposalKind::Blocked);
+        assert_eq!(payload, serde_json::json!({ "reason": "need direction" }));
+    }
+
+    #[test]
+    fn payload_for_deferred_scope_pins_wire_shape() {
+        let (kind, payload, _) = payload_for(command_for(&[
+            "deferred-scope",
+            "--summary",
+            "wiring for the third data source",
+            "--reason",
+            "needs a new ingestion pipeline",
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::DeferredScope);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "summary": "wiring for the third data source",
+                "reason": "needs a new ingestion pipeline",
+            })
+        );
+    }
+
+    #[test]
+    fn payload_for_attention_pins_wire_shape() {
+        let (kind, payload, _) = payload_for(command_for(&["attention", "--title", "t", "--body", "b"])).unwrap();
+        assert_eq!(kind, ProposalKind::Attention);
+        assert_eq!(payload, serde_json::json!({ "title": "t", "body_markdown": "b" }));
+    }
+
+    #[test]
+    fn payload_for_followup_task_pins_wire_shape() {
+        let (kind, payload, _) = payload_for(command_for(&[
+            "followup-task",
+            "--name",
+            "n",
+            "--description",
+            "d",
+            "--effort",
+            "small",
+            "--work-kind",
+            "chore",
+            "--rationale",
+            "r",
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::FollowupTask);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "proposed_name": "n",
+                "proposed_description": "d",
+                "rationale": "r",
+                "proposed_effort": "small",
+                "proposed_work_kind": "chore",
+            })
+        );
+    }
+
+    #[test]
+    fn payload_for_automation_outcome_produced_task_pins_wire_shape() {
+        let (kind, payload, _) =
+            payload_for(command_for(&["automation-outcome", "--produced-task", "task_abc"])).unwrap();
+        assert_eq!(kind, ProposalKind::AutomationOutcome);
+        assert_eq!(
+            payload,
+            serde_json::json!({ "outcome": "produced_task", "task_id": "task_abc" })
+        );
+    }
+
+    #[test]
+    fn payload_for_automation_outcome_skip_pins_wire_shape() {
+        let (kind, payload, _) = payload_for(command_for(&[
+            "automation-outcome",
+            "--skip",
+            "--reason",
+            "repo is clean",
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::AutomationOutcome);
+        assert_eq!(
+            payload,
+            serde_json::json!({ "outcome": "skip", "reason": "repo is clean" })
+        );
+    }
+
+    #[test]
+    fn payload_for_pr_created_pins_wire_shape() {
+        let (kind, payload, _) =
+            payload_for(command_for(&["pr-created", "--url", "https://github.com/o/r/pull/123"])).unwrap();
+        assert_eq!(kind, ProposalKind::PrCreated);
+        assert_eq!(
+            payload,
+            serde_json::json!({ "pr_url": "https://github.com/o/r/pull/123" })
+        );
+    }
+
+    #[test]
+    fn require_run_id_rejects_empty_value() {
+        // SAFETY: single-threaded test setting/removing an env var scoped to this test.
+        unsafe {
+            std::env::set_var("BOSS_RUN_ID", "");
+        }
+        let result = require_run_id();
+        unsafe {
+            std::env::remove_var("BOSS_RUN_ID");
+        }
+        assert!(matches!(result, Err(CliError::Usage(_))));
     }
 }
