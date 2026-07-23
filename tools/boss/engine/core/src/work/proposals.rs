@@ -329,6 +329,30 @@ impl WorkDb {
         let conn = self.connect()?;
         count_proposals_in_tx(&conn, execution_id, kind)
     }
+
+    /// Every proposal of `kind` filed against `execution_id` specifically
+    /// (not the whole work item — see [`Self::list_worker_proposals_for_work_item`]
+    /// for that), newest first.
+    ///
+    /// Used by [`crate::completion::WorkerCompletionHandler::execution_has_worker_signal_proposal`]
+    /// to compare a legacy marker's content against what was actually
+    /// proposed, rather than skipping on kind alone.
+    pub fn list_worker_proposals_for_execution(
+        &self,
+        execution_id: &str,
+        kind: ProposalKind,
+    ) -> Result<Vec<WorkerProposal>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "{SELECT_WORKER_PROPOSAL}
+             WHERE execution_id = ?1
+               AND kind = ?2
+             ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![execution_id, kind.as_str()], map_worker_proposal)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
 }
 
 /// Count this execution's committed proposals, total and for one kind.

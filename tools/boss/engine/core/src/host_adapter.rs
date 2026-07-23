@@ -446,7 +446,11 @@ impl SshHostAdapter {
         match self.transport.run_shell(probe.as_str()).await {
             Ok(out) if out.success() => {
                 let mut prompt_text = prompt_text;
-                prompt_text.push_str(&bazel_prepush_gate_text());
+                // `false`: the remote path doesn't yet read
+                // `worker_signal_proposals_seam` (see the comment on the
+                // `compose_worker_spawn` call above) — legacy marker text
+                // matches the flag's registry default.
+                prompt_text.push_str(&bazel_prepush_gate_text(false));
                 prompt_text
             }
             Ok(_) => prompt_text,
@@ -677,13 +681,18 @@ impl HostAdapter for SshHostAdapter {
             work_item,
             workspace_path,
             cube_change_id,
-            // Editorial controls default OFF on the remote path: SshHostAdapter
-            // does not hold a FeatureFlagsStore (its `cfg` is "not yet read";
-            // see struct docs). The editorial kill switch defaults off, and the
-            // feature only ever gated the local PaneSpawnRunner path, so passing
-            // `false` preserves the original behavior. Wire feature flags into
-            // the remote path alongside the cross-host config work (PR3/PR4).
-            (false, self.cfg.work.max_review_embed_diff_lines),
+            // Editorial controls and the worker-proposal-seam prompt gate both
+            // default OFF on the remote path: SshHostAdapter does not hold a
+            // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
+            // docs). Both flags default off in the registry, and neither
+            // feature yet gates anything on the remote path itself, so
+            // passing `false` for each preserves the original (pre-flag)
+            // behavior — the remote worker gets the legacy `[blocked]` /
+            // `[effort-escalation]` marker text, matching what the engine's
+            // read path does when the seam flag is off. Wire feature flags
+            // into the remote path alongside the cross-host config work
+            // (PR3/PR4).
+            (false, self.cfg.work.max_review_embed_diff_lines, false),
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by

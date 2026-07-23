@@ -232,6 +232,22 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "worker_proposals",
+        description: "Master kill switch for the mediated worker-proposal API (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md). Every per-seam \
+             migration flag (e.g. `worker_signal_proposals_seam`) is read as `worker_proposals && \
+             <seam flag>` by both halves of its gate — the engine's proposals-first read path and \
+             the worker-facing prompt text that teaches the `boss propose` verbs — so this one \
+             switch takes every seam back to its pre-migration marker-only behavior at once, \
+             independent of each seam's individual rollout state. DEFAULT OFF: flip on only once \
+             `SubmitProposal`/`ListProposals` themselves (task 2/3 of the design) are validated in \
+             staging. Kill switch: set false to disable every proposal-backed seam immediately, \
+             regardless of their individual flags.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_signal_proposals_seam",
         description: "Read worker_proposals rows before falling back to the legacy [effort-escalation]/ \
              [blocked] marker parsers in detect_and_file_worker_signals (design: \

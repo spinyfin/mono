@@ -4882,19 +4882,19 @@ status is otherwise left unchanged for re-dispatch or manual review."
     /// marker was found — the documented marker is the contract; the
     /// heuristic is a best-effort net under it.
     ///
-    /// When `worker_signal_proposals_seam` is on (implementation task 8 of
-    /// `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`), each
-    /// detected signal is read proposals-first: if `execution` already
-    /// carries a `worker_proposals` row of the matching kind,
+    /// When `worker_signal_proposals_seam` is on, each detected signal is
+    /// read proposals-first: if `execution` already carries a
+    /// `worker_proposals` row of the matching kind *and matching `reason=`*
+    /// (see [`Self::execution_has_worker_signal_proposal`]),
     /// `WorkDb::submit_worker_proposal`'s apply pipeline
-    /// ([`crate::work::proposal_apply`]) already filed that kind's attention
-    /// item synchronously at submission time, so the legacy marker is
-    /// skipped rather than re-filed. Only when no such proposal exists does
-    /// the legacy parser run — exactly as before the flag existed — and
-    /// every time it does, the seam's `worker_proposals.fallback_hit.*`
-    /// counter increments and a WARN logs, which is this seam's exit
-    /// criterion for eventually deleting the parser. With the flag off, this
-    /// method is unchanged from before task 8.
+    /// ([`crate::work::proposal_apply`]) already filed that signal's
+    /// attention item synchronously at submission time, so the legacy
+    /// marker is skipped rather than re-filed. Only when no matching
+    /// proposal exists does the legacy parser run, and every time it does,
+    /// the seam's `worker_proposals.fallback_hit.*` counter increments and a
+    /// WARN logs — this is the seam's exit criterion for eventually
+    /// deleting the parser. With the flag off, the marker parsers run
+    /// unconditionally and nothing is counted or skipped.
     async fn detect_and_file_worker_signals(&self, execution: &crate::work::WorkExecution) {
         let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
             return;
@@ -4906,9 +4906,16 @@ status is otherwise left unchanged for re-dispatch or manual review."
         {
             signals.push(signal);
         }
-        let proposals_first = self.feature_flags.is_enabled("worker_signal_proposals_seam");
+        // `worker_proposals` is the master kill switch for every proposal-backed
+        // seam (design §"Gating": "worker_proposals master flag + per-seam
+        // flags"); `worker_signal_proposals_seam` is this seam's own flag. Both
+        // must be on for the proposals-first read to engage, so flipping the
+        // master flag off disables every seam at once regardless of each
+        // seam's individual rollout state.
+        let proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("worker_signal_proposals_seam");
         for signal in &signals {
-            if proposals_first && self.execution_has_worker_signal_proposal(execution, signal.kind) {
+            if proposals_first && self.execution_has_worker_signal_proposal(execution, signal) {
                 // Already filed via the proposal apply pipeline — the legacy
                 // marker documents the same event, not a new one.
                 continue;
@@ -4920,10 +4927,23 @@ status is otherwise left unchanged for re-dispatch or manual review."
         }
     }
 
-    /// Whether `execution` already carries a `worker_proposals` row of the
-    /// [`ProposalKind`] matching `kind` — the proposals-first check
-    /// [`Self::detect_and_file_worker_signals`] uses to skip that kind's
-    /// legacy marker parser once the worker has used `boss propose` instead.
+    /// Whether `execution` already carries a `worker_proposals` row of
+    /// `signal.kind` whose `reason` matches `signal`'s own `reason=` field —
+    /// the proposals-first check [`Self::detect_and_file_worker_signals`]
+    /// uses to skip *that specific signal's* legacy marker once the worker
+    /// has used `boss propose` instead.
+    ///
+    /// This is content-aware, not just kind-scoped: the Stop-boundary
+    /// transcript is cumulative, so an execution that proposed `blocked`
+    /// early and then, after `boss propose` became unreachable, fell back to
+    /// the `[blocked]` bootstrap marker with a *different* `reason=` must
+    /// still have that second, distinct signal filed — kind-scoped skipping
+    /// would silently discard it, defeating the bootstrap fallback the
+    /// worker directive exists to provide. When neither the marker nor a
+    /// candidate proposal carries a comparable reason (a malformed marker,
+    /// or — defensively — a payload some future kind omits `reason` from),
+    /// this falls back to the old kind-only comparison rather than treating
+    /// every unreasoned marker as automatically distinct.
     ///
     /// A storage error fails open (`false`, so the legacy parser still
     /// runs) rather than silently dropping a real signal — the same
@@ -4932,17 +4952,27 @@ status is otherwise left unchanged for re-dispatch or manual review."
     fn execution_has_worker_signal_proposal(
         &self,
         execution: &crate::work::WorkExecution,
-        kind: WorkerSignalKind,
+        signal: &WorkerSignal,
     ) -> bool {
-        let proposal_kind = match kind {
+        let proposal_kind = match signal.kind {
             WorkerSignalKind::EffortEscalation => ProposalKind::EffortEscalation,
             WorkerSignalKind::Blocked => ProposalKind::Blocked,
         };
+        let marker_reason = worker_escalation::extract_quoted(&signal.marker_line, "reason");
         match self
             .work_db
-            .count_worker_proposals_for_execution(&execution.id, proposal_kind)
+            .list_worker_proposals_for_execution(&execution.id, proposal_kind)
         {
-            Ok(counts) => counts.for_kind > 0,
+            Ok(proposals) => proposals.iter().any(|proposal| {
+                let proposal_reason = serde_json::from_str::<serde_json::Value>(&proposal.payload_json)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned));
+                match (marker_reason, proposal_reason.as_deref()) {
+                    (Some(m), Some(p)) => m == p,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                }
+            }),
             Err(err) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -10756,6 +10786,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             flags_dir.path().join("feature-flags.toml"),
         ));
         flags.load().unwrap();
+        flags.set("worker_proposals", true).unwrap();
         flags.set("worker_signal_proposals_seam", true).unwrap();
         let metrics = Arc::new(Registry::new());
         register_metrics(&metrics);
@@ -10806,6 +10837,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             flags_dir.path().join("feature-flags.toml"),
         ));
         flags.load().unwrap();
+        flags.set("worker_proposals", true).unwrap();
         flags.set("worker_signal_proposals_seam", true).unwrap();
         let metrics = Arc::new(Registry::new());
         register_metrics(&metrics);
@@ -10903,6 +10935,83 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             metrics.counter_value("worker_proposals.fallback_hit.effort_escalation"),
             Some(0),
             "fallback counting only happens when the seam flag is on",
+        );
+    }
+
+    #[tokio::test]
+    async fn proposals_first_flag_still_files_a_later_marker_with_a_distinct_reason() {
+        // Regression test: an execution that proposed `blocked` early (reason
+        // A) and later — after `boss propose` presumably stopped working —
+        // fell back to the `[blocked]` bootstrap marker with a *different*
+        // reason (B) must have that second, distinct signal filed. A
+        // kind-scoped (content-blind) skip would silently drop it, since the
+        // Stop-boundary transcript is cumulative and a `blocked` proposal
+        // already exists for this execution.
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &chore_id,
+            kind: ProposalKind::Blocked,
+            payload_json: r#"{"reason":"reason A"}"#,
+            idempotency_key: "key-1",
+        })
+        .unwrap()
+        .unwrap();
+        write_assistant_transcript(&db, workspace.path(), &execution_id, "[blocked] reason=\"reason B\"\n");
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("worker_proposals", true).unwrap();
+        flags.set("worker_signal_proposals_seam", true).unwrap();
+        let metrics = Arc::new(Registry::new());
+        register_metrics(&metrics);
+
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let blocked_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+            .collect();
+        // Two items: one filed synchronously by the reason-A proposal's apply
+        // pipeline (at submission time, above), one filed by the legacy
+        // parser for the reason-B marker the content-aware check correctly
+        // did NOT treat as covered by the reason-A proposal.
+        assert_eq!(
+            blocked_items.len(),
+            2,
+            "reason B is a distinct signal from reason A's proposal and must be filed \
+             independently, not silently discarded because a same-kind proposal already exists; \
+             got {items:?}",
+        );
+        assert!(
+            blocked_items.iter().any(|i| i.body_markdown.contains("reason A")),
+            "the reason-A proposal's own synchronous apply must still have filed its item; \
+             got {items:?}",
+        );
+        assert!(
+            blocked_items.iter().any(|i| i.body_markdown.contains("reason B")),
+            "the reason-B marker must be filed by the legacy parser, not silently discarded; \
+             got {items:?}",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.blocked"),
+            Some(1),
+            "the legacy path fired for the unmatched marker, so the fallback-hit counter must \
+             increment",
         );
     }
 
