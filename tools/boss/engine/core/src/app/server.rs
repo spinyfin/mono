@@ -25,8 +25,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             db_path = %cfg.work.db_path.display(),
             events_socket = ?isolation.events_socket,
             pid_path = ?isolation.pid_path,
+            token_path = ?isolation.token_path,
             "test-fixture mode: isolated paths derived from non-default socket; \
-             production state (events.sock, state.db, pid file) will not be touched"
+             production state (events.sock, state.db, pid file, control token) will not be touched"
         );
     } else {
         tracing::info!(
@@ -54,7 +55,12 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
         .map(Ok)
         .unwrap_or_else(default_events_socket_path)?;
 
-    let control_token_path = crate::engine_control::default_token_path();
+    // Use the isolation-derived token path, falling back to env / home
+    // default. Without this, a test-fixture engine would resolve the
+    // production control-token path unconditionally — see
+    // `crate::engine_control` for the write/delete-time hardening
+    // layered on top as defense in depth.
+    let control_token_path = isolation.token_path.or_else(crate::engine_control::default_token_path);
 
     // Orphan watcher: when the engine is a test fixture (non-default socket),
     // watch the parent process pid.  If the parent exits (e.g. a `bazel test`
@@ -209,9 +215,13 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
 /// tests that don't exercise the events channel.
 ///
 /// When `control_token_path` is `Some`, the engine mints a random
-/// secret on startup, writes it to that path (mode 0600), and accepts
-/// matching `Shutdown { token }` RPCs on the frontend socket. The
-/// file is removed on graceful exit via [`crate::engine_control::ControlTokenGuard`].
+/// secret on startup and writes it to that path (mode 0600) via
+/// [`crate::engine_control::write_token_file`], which refuses to
+/// overwrite a token still owned by a live engine — so `serve` returns
+/// `Err` rather than starting if `control_token_path` already resolves
+/// to a live engine's token. The engine accepts matching
+/// `Shutdown { token }` RPCs on the frontend socket, and the file is
+/// removed on graceful exit via [`crate::engine_control::ControlTokenGuard`].
 /// Tests pass `None` to skip the file entirely; in-process callers
 /// own the runtime handle and don't need an authenticated wire path.
 ///
@@ -268,7 +278,7 @@ pub async fn serve_with_merge_probe(
                 token_path = %path.display(),
                 "engine-control token: ready",
             );
-            let guard = crate::engine_control::ControlTokenGuard::new(path.clone(), std::process::id());
+            let guard = crate::engine_control::ControlTokenGuard::new(path.clone(), std::process::id(), token.clone());
             (Some(Arc::new(token)), Some(guard))
         }
         None => (None, None),

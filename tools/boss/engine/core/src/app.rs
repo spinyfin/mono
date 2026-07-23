@@ -1472,6 +1472,14 @@ struct IsolationPaths {
     events_socket: Option<std::path::PathBuf>,
     /// Isolated pid file derived from the socket stem.
     pid_path: Option<std::path::PathBuf>,
+    /// Isolated engine-control token path derived from the socket stem.
+    ///
+    /// Without this, `default_token_path()` resolved the production
+    /// token path unconditionally, entirely outside this struct — a
+    /// test-fixture engine would write, and on shutdown delete, the
+    /// production control token. See `crate::engine_control` for the
+    /// write/delete-time hardening layered on top of this derivation.
+    token_path: Option<std::path::PathBuf>,
 }
 
 impl IsolationPaths {
@@ -1491,6 +1499,7 @@ impl IsolationPaths {
                 db_path: None,
                 events_socket: None,
                 pid_path: None,
+                token_path: None,
             };
         }
 
@@ -1512,12 +1521,16 @@ impl IsolationPaths {
         let pid_path = std::env::var_os("BOSS_ENGINE_PID_PATH")
             .is_none()
             .then(|| dir.join(format!("{stem}.pid")));
+        let token_path = std::env::var_os(crate::engine_control::TOKEN_PATH_ENV)
+            .is_none()
+            .then(|| dir.join(format!("{stem}.token")));
 
         Self {
             is_test_fixture: true,
             db_path,
             events_socket,
             pid_path,
+            token_path,
         }
     }
 }
