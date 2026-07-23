@@ -1122,10 +1122,13 @@ pub enum FrontendEvent {
     /// successfully initiated the merge process for the PR. `action`
     /// identifies what happened: `"enqueued"` (PR added to the repo's
     /// merge queue), `"auto_merge_enabled"` (auto-merge enabled; PR
-    /// will merge once required checks pass), or `"merged"` (PR was
-    /// merged directly because all checks were already passing). The
-    /// PR-reconciler is kicked on the engine side so the kanban state
-    /// refreshes promptly without waiting for the next periodic sweep.
+    /// will merge once required checks pass), `"merged"` (PR was
+    /// merged directly because all checks were already passing), or
+    /// `"trunk_enqueued"` (PR submitted to a `trunk_queue`-mechanism
+    /// product's Trunk merge queue; also the reply for a duplicate click
+    /// while an intent is already active). The PR-reconciler is kicked on
+    /// the engine side so the kanban state refreshes promptly without
+    /// waiting for the next periodic sweep.
     MergeWhenReadyAccepted {
         work_item_id: String,
         pr_url: String,

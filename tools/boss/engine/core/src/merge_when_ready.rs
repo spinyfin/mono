@@ -11,21 +11,30 @@
 //! status label (`enqueued` / `merged` / `auto_merge_enabled`).
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 
 use boss_github::gh_runner::pr_in_merge_queue;
 
 use boss_engine_gh_invocation::gh_output;
 
-/// Outcome of a successful [`gh_merge_when_ready`] call.
+/// Outcome of a successful merge-when-ready call, whichever mechanism
+/// produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeAction {
-    /// The PR was enqueued in the repository's merge queue.
+    /// The PR was enqueued in the repository's (GitHub-native) merge queue.
     Enqueued,
     /// Auto-merge was enabled; the PR will merge once required checks pass.
     AutoMergeEnabled,
     /// The PR was merged directly (all checks were already passing and no
     /// merge queue was configured for this PR).
     Merged,
+    /// The PR was submitted to a `trunk_queue`-mechanism product's Trunk
+    /// merge queue (`POST submitPullRequest`). Produced by
+    /// `app::review::handle_merge_when_ready`'s `MergeMechanism::TrunkQueue`
+    /// branch, not by [`gh_merge_when_ready`] — see
+    /// `trunk-merge-queue-integration-queue-backed-merges-merging-ui.md`
+    /// §"The merge verb: submit + standing merge intent".
+    TrunkEnqueued,
 }
 
 impl MergeAction {
@@ -36,6 +45,7 @@ impl MergeAction {
             Self::Enqueued => "enqueued",
             Self::AutoMergeEnabled => "auto_merge_enabled",
             Self::Merged => "merged",
+            Self::TrunkEnqueued => "trunk_enqueued",
         }
     }
 }
@@ -79,6 +89,32 @@ pub(crate) fn derive_action(is_in_queue: bool, is_merged: bool) -> MergeAction {
     }
 }
 
+/// Executes the Direct merge-mechanism side effect (`gh pr merge --auto
+/// --squash`, via [`gh_merge_when_ready`]) for a PR. `app::review`'s
+/// `handle_merge_when_ready` calls this instead of the free function
+/// directly so test doubles can stub the live `gh` call — see
+/// `CommandDirectMergeExecutor` for the production impl and
+/// `app::review`'s `trunk_queue_tests` for a fake used by the Direct-branch
+/// routing tests.
+#[async_trait]
+pub trait DirectMergeExecutor: Send + Sync {
+    async fn execute(&self, pr_url: &str) -> Result<MergeAction>;
+}
+
+/// `DirectMergeExecutor` that shells out to `gh pr merge --auto --squash`
+/// via [`gh_merge_when_ready`]. The production default everywhere except
+/// tests that inject a fake through `ServerState`'s
+/// `direct_merge_executor_override`.
+#[derive(Debug, Default)]
+pub struct CommandDirectMergeExecutor;
+
+#[async_trait]
+impl DirectMergeExecutor for CommandDirectMergeExecutor {
+    async fn execute(&self, pr_url: &str) -> Result<MergeAction> {
+        gh_merge_when_ready(pr_url).await
+    }
+}
+
 /// Returns `true` when the PR's GitHub state is `MERGED`.
 /// Returns `false` on any error (graceful degradation).
 async fn probe_is_merged(pr_url: &str) -> bool {
@@ -109,6 +145,11 @@ mod tests {
     #[test]
     fn merge_action_merged_as_str() {
         assert_eq!(MergeAction::Merged.as_str(), "merged");
+    }
+
+    #[test]
+    fn merge_action_trunk_enqueued_as_str() {
+        assert_eq!(MergeAction::TrunkEnqueued.as_str(), "trunk_enqueued");
     }
 
     // --- derive_action (mirrors the if/else in gh_merge_when_ready) ---

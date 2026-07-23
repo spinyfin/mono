@@ -372,6 +372,7 @@ dependencies = [
  "boss-transcript-markdown",
  "boss-transcript-tail",
  "boss-trunk-auth",
+ "boss-trunk-client",
  "chrono",
  "clap",
  "fastrand 2.4.1",

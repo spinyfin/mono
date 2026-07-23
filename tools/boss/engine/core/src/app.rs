@@ -388,6 +388,13 @@ struct ServerState {
     /// without shelling out to `gh`. Defaults to `CommandMergeProbe::new()`
     /// in production (see [`Self::new_arc_with_app_pid_and_merge_probe`]).
     merge_probe: Arc<dyn MergeProbe>,
+    /// Executes the Direct merge-mechanism side effect (`gh pr merge --auto
+    /// --squash`) for `handle_merge_when_ready`'s `MergeMechanism::Direct`
+    /// branch. Defaults to `CommandDirectMergeExecutor` in production (see
+    /// [`Self::new_arc_with_app_pid_and_merge_probe`]); tests inject a fake
+    /// so exercising the Direct routing decision never shells out to a real
+    /// `gh` process.
+    direct_merge_executor: Arc<dyn merge_when_ready::DirectMergeExecutor>,
     /// Shared dispatch-event sink. The execution coordinator emits
     /// the per-stage events into this sink during dispatch; the
     /// `UpdateWorkItem` handler emits a `StatusTransition` event
@@ -611,6 +618,13 @@ struct ServerState {
     /// (`boss engine trunk set-token` / `boss engine trunk status`). See
     /// the Trunk merge-queue integration design's "Auth" section.
     trunk_token_store: Arc<dyn trunk_auth::TrunkTokenSource>,
+    /// Typed client for Trunk's merge-queue REST API, built from the same
+    /// org API token as `trunk_token_store` (env override or OS keychain).
+    /// `handle_merge_when_ready` uses it to `submitPullRequest` for a
+    /// `trunk_queue`-mechanism product. Cheap to clone — see
+    /// `boss_trunk_client::TrunkClient`'s doc comment. See the Trunk
+    /// merge-queue integration design's "The merge verb" section.
+    trunk_client: boss_trunk_client::TrunkClient,
     /// Resolves credentials for external-tracker sync. Uses
     /// `KeychainOAuthResolver` in production so a stored OAuth token
     /// takes precedence over ambient `gh` auth.
@@ -653,21 +667,27 @@ struct ServerState {
 }
 
 impl ServerState {
-    /// Construct `ServerState` with optional `MergeProbe` and Trunk
-    /// token-store overrides. Production (via [`server::serve`]) passes
-    /// `None` for both and gets the real `CommandMergeProbe` (shell out to
-    /// `gh`) and `boss_trunk_auth::TrunkTokenStore` (OS keychain); tests
+    /// Construct `ServerState` with optional `MergeProbe`, Trunk
+    /// token-store, and Trunk client overrides. Production (via
+    /// [`server::serve`]) passes `None` for all three and gets the real
+    /// `CommandMergeProbe` (shell out to `gh`), `boss_trunk_auth::TrunkTokenStore`
+    /// (OS keychain), and a `TrunkClient` built from that same store; tests
     /// that need to exercise the CI-remediation validation gates (green /
-    /// pending / red) or the `TrunkSetToken`/`TrunkStatus` handlers without
-    /// a live `gh` call or the real OS keychain inject a fake for either —
-    /// see `MergeProbe`'s doc comment ("test doubles can stub it directly")
-    /// and `trunk_auth::TrunkTokenSource`.
+    /// pending / red), the `TrunkSetToken`/`TrunkStatus` handlers, or the
+    /// `trunk_queue` merge-when-ready path without a live `gh` call, the
+    /// real OS keychain, or a live Trunk API call inject a fake/mock for
+    /// any of the three — see `MergeProbe`'s doc comment ("test doubles can
+    /// stub it directly"), `trunk_auth::TrunkTokenSource`, and
+    /// `boss_trunk_client::TrunkClient::new` (point `CallConfig::base_url`
+    /// at a `wiremock::MockServer`).
     fn new_arc_with_app_pid_and_merge_probe(
         cfg: Arc<RuntimeConfig>,
         app_pid: Option<libc::pid_t>,
         control_token: Option<Arc<String>>,
         merge_probe_override: Option<Arc<dyn MergeProbe>>,
         trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
+        trunk_client_override: Option<boss_trunk_client::TrunkClient>,
+        direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
@@ -875,12 +895,32 @@ impl ServerState {
         let trunk_token_store_for_state: Arc<dyn trunk_auth::TrunkTokenSource> =
             trunk_token_store_override.unwrap_or_else(|| Arc::new(boss_trunk_auth::TrunkTokenStore::new()));
 
+        // Trunk queue REST client. Builds its own `TrunkTokenStore` — it reads
+        // the same env override / keychain entry as `trunk_token_store`
+        // above, but the two traits (`TrunkTokenSource` for set/status,
+        // `TrunkTokenProvider` for API calls) are distinct, so the instance
+        // above can't be passed here directly; both stores are stateless
+        // (every read goes straight to the env var / keychain), so a second
+        // instance behaves identically to sharing one. Note that
+        // `trunk_token_store_override` alone therefore does not affect this
+        // client — a test needs `trunk_client_override` to control the token
+        // the client actually sends. Tests point `trunk_client_override` at a
+        // `wiremock::MockServer` via `CallConfig::with_base_url`.
+        let trunk_client_for_state: boss_trunk_client::TrunkClient = trunk_client_override.unwrap_or_else(|| {
+            boss_trunk_client::TrunkClient::new(
+                Arc::new(boss_trunk_auth::TrunkTokenStore::new()),
+                boss_trunk_client::CallConfig::default(),
+            )
+        });
+
         let tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver> =
             Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
                 crate::external_tracker::github_oauth::KeychainTokenStore::new(),
             ));
         let ci_probe: Arc<dyn MergeProbe> = merge_probe_override.unwrap_or_else(|| Arc::new(CommandMergeProbe::new()));
         let merge_probe_for_state = ci_probe.clone();
+        let direct_merge_executor_for_state: Arc<dyn merge_when_ready::DirectMergeExecutor> =
+            direct_merge_executor_override.unwrap_or_else(|| Arc::new(merge_when_ready::CommandDirectMergeExecutor));
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -994,6 +1034,7 @@ impl ServerState {
                 .cube_client(cube_client_for_state)
                 .publisher(publisher_for_state)
                 .merge_probe(merge_probe_for_state)
+                .direct_merge_executor(direct_merge_executor_for_state)
                 .dispatch_events(dispatch_events_for_state)
                 .dispatch_event_root(dispatch_event_root_for_state)
                 .topic_broker(topic_broker)
@@ -1037,6 +1078,7 @@ impl ServerState {
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)
+                .trunk_client(trunk_client_for_state)
                 .tracker_credential_resolver(tracker_credential_resolver)
                 .maybe_control_token(control_token_for_state)
                 .shutdown_trigger(shutdown_trigger_for_state)

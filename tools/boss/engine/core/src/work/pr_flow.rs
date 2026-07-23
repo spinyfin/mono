@@ -845,6 +845,16 @@ impl WorkDb {
     /// a stale "ci failing" badge away during the poll we already do. Per-task
     /// poll writes are serialised by the sweep loop, so the read-then-write is
     /// race-free in practice.
+    ///
+    /// `input.preserve_merge_queue_state` leaves `merge_queue_state` /
+    /// `merge_queue_detail` untouched regardless of `input.merge_queue_state`
+    /// / `input.merge_queue_detail` — the merge poller sets this for a
+    /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by
+    /// the Trunk submission flow (`ServerState`'s `handle_trunk_queue_merge`),
+    /// not by this GitHub probe: GitHub always reports
+    /// `in_merge_queue=false`/`auto_merge_enabled=false` for such a task, so
+    /// without this gate every sweep would immediately wipe the optimistic
+    /// `"queued"` state the trunk submission just wrote.
     pub fn update_task_pr_poll_state(&self, work_item_id: &str, input: PrPollStateInput) -> Result<PrPollStateOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -881,20 +891,26 @@ impl WorkDb {
         // which ticks every sweep while queued) differs from what's already
         // stored. COALESCE treats NULL as distinct from any non-empty string,
         // so the first probe after migration always fires the event.
+        //
+        // `preserve` (`?8`) short-circuits both the merge-queue SET clauses
+        // (via CASE, so the stored value passes through unchanged) and the
+        // merge-queue arms of the changed-check, so a preserved row's
+        // `changed` outcome reflects only CI/review movement.
+        let preserve = input.preserve_merge_queue_state;
         let changed = tx.execute(
             "UPDATE tasks
              SET ci_required_state      = ?2,
                  review_required_state  = ?3,
                  ci_required_detail     = ?4,
                  review_required_detail = ?5,
-                 merge_queue_state      = ?6,
-                 merge_queue_detail     = ?7
+                 merge_queue_state      = CASE WHEN ?8 THEN merge_queue_state ELSE ?6 END,
+                 merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
                     OR COALESCE(review_required_state, '') != ?3
-                    OR COALESCE(merge_queue_state, '') != COALESCE(?6, '')
-                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, ''))",
+                    OR (NOT ?8 AND (COALESCE(merge_queue_state, '') != COALESCE(?6, '')
+                                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, ''))))",
             params![
                 work_item_id,
                 input.ci_required_state,
@@ -903,6 +919,7 @@ impl WorkDb {
                 input.review_required_detail,
                 input.merge_queue_state,
                 input.merge_queue_detail,
+                preserve,
             ],
         )?;
         tx.commit()?;
@@ -911,6 +928,28 @@ impl WorkDb {
             prior_ci_state,
             prior_merge_queue_state,
         })
+    }
+
+    /// Optimistically write the Merging-UI columns for `work_item_id`
+    /// immediately after a successful Trunk `submitPullRequest`, so the
+    /// card moves into the Merging lane without waiting for the queue
+    /// poller's first sweep. Unlike [`Self::update_task_pr_poll_state`],
+    /// this touches only `merge_queue_state`/`merge_queue_detail` — it does
+    /// not require a fresh CI/review probe. Does not stamp `updated_at`,
+    /// consistent with `update_task_pr_poll_state` also leaving it alone.
+    pub fn set_task_merge_queue_state(
+        &self,
+        work_item_id: &str,
+        merge_queue_state: Option<&str>,
+        merge_queue_detail: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks SET merge_queue_state = ?2, merge_queue_detail = ?3 \
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, merge_queue_state, merge_queue_detail],
+        )?;
+        Ok(())
     }
 }
 
@@ -926,6 +965,12 @@ pub struct PrPollStateInput<'a> {
     pub review_required_detail: Option<&'a str>,
     pub merge_queue_state: Option<&'a str>,
     pub merge_queue_detail: Option<&'a str>,
+    /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
+    /// untouched regardless of the values above — set by the caller for a
+    /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by
+    /// the Trunk submission flow rather than this GitHub probe. Defaults to
+    /// `false` (the pre-existing behaviour) via `#[derive(Default)]`.
+    pub preserve_merge_queue_state: bool,
 }
 
 /// Outcome of [`WorkDb::update_task_pr_poll_state`].

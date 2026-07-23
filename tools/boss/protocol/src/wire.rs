@@ -1203,11 +1203,19 @@ pub enum FrontendRequest {
     },
 
     /// User-initiated "Merge When Ready" for a Review-lane task's PR.
-    /// The engine resolves the task's PR, determines the repo's merge
-    /// mechanism, and fires the appropriate GitHub operation:
-    /// - repo has a merge queue → enqueue the PR
-    /// - no merge queue, checks passing → merge directly
-    /// - no merge queue, checks pending → enable auto-merge
+    /// The engine resolves the task's PR and its product's merge
+    /// mechanism, then fires the appropriate operation:
+    /// - `direct` (default; also covers a GitHub-native merge queue):
+    ///   - repo has a merge queue → enqueue the PR
+    ///   - no merge queue, checks passing → merge directly
+    ///   - no merge queue, checks pending → enable auto-merge
+    /// - `trunk_queue`: submit the PR to the product's Trunk merge queue
+    ///   (`POST submitPullRequest`) and record a standing merge intent the
+    ///   queue poller tracks to a terminal state. A missing/rejected Trunk
+    ///   API token surfaces as a loud [`FrontendEvent::WorkError`] — never
+    ///   a silent fallback to the `direct` verb. A second click while an
+    ///   intent is already active is a no-op that re-reports success
+    ///   without re-submitting.
     ///
     /// Pre-flight guards: the task must be a task/chore (not a project),
     /// have `status == "in_review"`, and carry a non-empty `pr_url`.

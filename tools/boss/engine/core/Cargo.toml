@@ -11,6 +11,7 @@ boss-claude-client = { path = "../../claude_client" }
 boss-github = { path = "../../github" }
 boss-github-tracker = { path = "../../github_tracker" }
 boss-trunk-auth = { path = "../../trunk_auth" }
+boss-trunk-client = { path = "../../trunk_client" }
 boss-transcript-markdown = { path = "../transcript-markdown" }
 boss-engine-automation-dedup = { path = "../automation-dedup" }
 boss-engine-automation-schedule = { path = "../automation-schedule" }

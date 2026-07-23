@@ -604,6 +604,10 @@ impl WorkDb {
         // tasks land.
         // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
         migrate_worker_proposals_table(conn)?;
+        // `trunk_merge_intents`: the standing record of a merge-button click
+        // submitted to Trunk's queue for a `trunk_queue` product. Additive,
+        // independent of every other table.
+        migrate_trunk_merge_intents_table(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

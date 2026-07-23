@@ -407,6 +407,7 @@ mod schema_init;
 mod task_targets;
 #[cfg(test)]
 mod tests;
+mod trunk_merge_intents;
 mod updates;
 mod workitems;
 
@@ -486,3 +487,4 @@ pub use pr_state::classify_pr_merge_state;
 pub use proposals::SubmitWorkerProposalInput;
 pub use proposals::SubmitWorkerProposalOutcome;
 pub use revision_helpers::normalize_priority;
+pub use trunk_merge_intents::{TrunkMergeIntent, TrunkMergeIntentInsertInput};
