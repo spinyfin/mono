@@ -6,6 +6,7 @@ pub mod config;
 pub mod lock;
 pub mod metadata;
 pub mod paths;
+pub(crate) mod reuse_guard;
 pub mod setup;
 pub mod store;
 

@@ -60,11 +60,24 @@ pub enum WorkspaceHealth {
     /// committed-but-unpushed work off the repo's main branch (the
     /// dirty-reclaim guard in `reset_workspace_guarded` tripped). Unlike
     /// `Dirty`/`Conflicted`, this state is durable: it is never selected by
-    /// the lease health-check candidate discovery, never auto-recovered by
-    /// health reconciliation, and never recycled by the aged-unhealthy pool
-    /// GC. Only an explicit `cube workspace force-release` clears it, so a
-    /// human confirms the prior holder's work is genuinely abandoned (or
-    /// has been salvaged) before the workspace re-enters the pool.
+    /// the lease health-check candidate discovery and never auto-recovered by
+    /// health reconciliation.
+    ///
+    /// It is not, however, permanent. A quarantine that were never lifted
+    /// would remove the workspace from the pool forever, which is how cube
+    /// accumulated a large majority of permanently ineligible workspaces. It
+    /// is cleared by any of:
+    ///
+    /// - an explicit `cube workspace force-release`, the operator escape
+    ///   hatch, which clears it without inspecting the working copy;
+    /// - the aged-unhealthy pool GC, once older than the configured
+    ///   `unhealthy_gc` age;
+    /// - a lease call that would otherwise mint a new workspace.
+    ///
+    /// The last two are *verified*: they re-run the guard's own probe and
+    /// clear the marker only when `@` holds nothing that resetting would leave
+    /// behind — it is empty, or a remote already has it. A workspace whose `@`
+    /// still holds an unpushed working copy stays quarantined.
     Quarantined,
 }
 
