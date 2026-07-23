@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/day-rotated-log:__pkg__",
+        "//tools/boss/engine/design-docs:__pkg__",
         "//tools/boss/engine/metrics:__pkg__",
         "//tools/boss/engine/metrics-registry:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",

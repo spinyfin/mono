@@ -896,6 +896,36 @@ extension EngineClient {
         ])
     }
 
+    /// Ask the engine for the markdown files at HEAD of `productID`'s
+    /// configured repo. Engine replies with `product_design_docs_list`
+    /// carrying a `DesignDocTreeState`. Read-only; nothing on this
+    /// machine's filesystem is consulted.
+    ///
+    /// The engine validates its listing cache against the repo's live
+    /// HEAD on every call, so the default (`refresh: false`) is already
+    /// never stale. Pass `refresh: true` only for the explicit reload
+    /// affordance — it additionally re-reads the repo's default branch.
+    func sendListProductDesignDocs(productID: String, refresh: Bool = false) {
+        sendLine([
+            "type": "list_product_design_docs",
+            "product_id": productID,
+            "refresh": refresh,
+        ])
+    }
+
+    /// Fetch one document's body from GitHub. `gitRef` is the commit sha
+    /// the listing was read at, so the body returned is the one the
+    /// operator saw listed even if the branch has since moved. Engine
+    /// replies with `product_design_doc_content`.
+    func sendGetProductDesignDoc(ref: DesignDocRef) {
+        sendLine([
+            "type": "get_product_design_doc",
+            "repo_remote_url": ref.repoRemoteURL,
+            "path": ref.path,
+            "git_ref": ref.gitRef,
+        ])
+    }
+
     /// Engine-tab listing fetch (Phase 5 #14). `productID = nil`
     /// returns every product's attempts; `statuses` is AND-ed on the
     /// server, `limit` caps the response.

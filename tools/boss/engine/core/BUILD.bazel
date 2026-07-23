@@ -43,6 +43,7 @@ rust_library(
         "//tools/boss/engine/ci-log-reader",
         "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/day-rotated-log",
+        "//tools/boss/engine/design-docs",
         "//tools/boss/engine/deterministic-resolvers",
         "//tools/boss/engine/driver",
         "//tools/boss/engine/editorial",

@@ -179,6 +179,12 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::LiveStatusDisabledSlotsList { .. }
         | FrontendEvent::LiveStatusDebugReportEvent { .. }
         | FrontendEvent::ProjectDesignDocResolved { .. }
+        // Markdown read out of a product's own GitHub repo. Carries no
+        // run/execution rows, so nothing straddles the boundary — the
+        // paths and bodies in here are public-to-the-worker repo content
+        // it could read with `gh` directly.
+        | FrontendEvent::ProductDesignDocsList { .. }
+        | FrontendEvent::ProductDesignDocContent { .. }
         | FrontendEvent::ConflictResolutionMarkedFailed { .. }
         | FrontendEvent::CiRemediationClassified { .. }
         | FrontendEvent::CiRemediationMarkedFailed { .. }

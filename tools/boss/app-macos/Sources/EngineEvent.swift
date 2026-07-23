@@ -47,6 +47,15 @@ enum EngineEvent {
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
+    /// Engine reply to `ListProductDesignDocs` — the markdown listing
+    /// at HEAD of the product's repo, or the classified reason there
+    /// isn't one. Consumed by the Designs tab.
+    case productDesignDocsList(productID: String, state: DesignDocTreeState)
+    /// Engine reply to `GetProductDesignDoc` — one document's body, or
+    /// the reason it could not be read. The `(repo, path, ref)` triple
+    /// is echoed so the reader pane can drop a late reply that arrived
+    /// after the operator moved to a different document.
+    case productDesignDocContent(ref: DesignDocRef, content: DesignDocContent)
     /// Response to `list_conflict_resolutions` — the filtered set of
     /// rows for the Engine tab. Phase 5 #13/#14 of the merge-conflict
     /// design.

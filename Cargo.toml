@@ -18,6 +18,7 @@ members = [
   "tools/boss/engine/deterministic-resolvers",
   "tools/boss/engine/core",
   "tools/boss/engine/day-rotated-log",
+  "tools/boss/engine/design-docs",
   "tools/boss/engine/driver",
   "tools/boss/engine/effort",
   "tools/boss/engine/editorial",

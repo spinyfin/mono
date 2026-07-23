@@ -263,6 +263,21 @@ final class ChatViewModel: ObservableObject {
     /// A missing entry means "we haven't asked yet" — the affordance
     /// stays hidden until the engine replies.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
+    /// Designs-tab markdown listings, keyed by product id. A missing
+    /// entry means "not asked yet"; the value is the engine's classified
+    /// outcome (loaded / no repo / unreachable / rate-limited / empty).
+    /// Read and written by [[ChatViewModel+DesignDocs.swift]].
+    @Published var designDocTreeByProductID: [String: DesignDocTreeState] = [:]
+    /// Products with an outstanding listing request, so the tab can show
+    /// a spinner without losing the previously-loaded listing underneath.
+    @Published var designDocsLoadingProductIDs: Set<String> = []
+    /// Fetched document bodies keyed by their full `(repo, path, ref)`
+    /// triple. Keyed by the triple rather than held in a single
+    /// "current document" slot so a slow fetch landing after the
+    /// operator clicked elsewhere cannot overwrite the visible document.
+    @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
+    /// The document the Designs tab reader pane is showing, if any.
+    @Published var selectedDesignDocRef: DesignDocRef?
     /// In-flight resolve-RPC batch. The engine resolves design-doc
     /// pointers in lock-step (responses arrive back-to-back regardless of
     /// per-project work), so stamping each project with its own

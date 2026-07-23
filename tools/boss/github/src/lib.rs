@@ -15,6 +15,7 @@ pub mod contents;
 pub mod gh_runner;
 pub mod pr_files;
 pub mod pr_url;
+pub mod trees;
 
 pub use check_runs::{
     CiProvider, RequiredCheckFailure, fetch_failing_checks_for_commit, parse_check_runs_for_failures,

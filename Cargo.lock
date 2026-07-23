@@ -354,6 +354,7 @@ dependencies = [
  "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
  "boss-engine-day-rotated-log",
+ "boss-engine-design-docs",
  "boss-engine-driver",
  "boss-engine-effort",
  "boss-engine-gh-invocation",
@@ -421,6 +422,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-design-docs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boss-engine-utils",
+ "boss-github",
+ "boss-protocol",
+ "git-utils",
+ "tokio",
 ]
 
 [[package]]

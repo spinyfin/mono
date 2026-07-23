@@ -466,6 +466,26 @@ pub enum FrontendEvent {
     ProjectDesignDocResolved {
         output: ResolveProjectDesignDocOutput,
     },
+    /// Response to [`FrontendRequest::ListProductDesignDocs`]: the
+    /// markdown listing at HEAD of the product's repo, or the
+    /// classified reason there isn't one. `product_id` is echoed so a
+    /// client that switched products mid-flight can discard a reply
+    /// for the product it is no longer showing.
+    ProductDesignDocsList {
+        product_id: String,
+        state: DesignDocTreeState,
+    },
+    /// Response to [`FrontendRequest::GetProductDesignDoc`]: one
+    /// document's body, or the reason it could not be read. The
+    /// `(repo, path, ref)` triple is echoed so the reader pane can
+    /// confirm the reply matches the document it is currently showing
+    /// and drop a late reply for a previous selection.
+    ProductDesignDocContent {
+        repo_remote_url: String,
+        path: String,
+        git_ref: String,
+        content: DesignDocContent,
+    },
     /// Response to
     /// [`FrontendRequest::MarkConflictResolutionFailed`]: the
     /// post-update `conflict_resolutions` row. Carries the full row

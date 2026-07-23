@@ -5,150 +5,30 @@ import Textual
 
 private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "DesignDocTiming")
 
-// MARK: - Repo path resolution
-
-enum DesignRepoPath {
-    /// Derive the repo basename from a git remote URL. Handles:
-    ///   git@github.com:spinyfin/mono.git
-    ///   https://github.com/spinyfin/mono.git
-    ///   https://github.com/spinyfin/mono
-    static func basename(from remoteURL: String) -> String? {
-        var trimmed = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if trimmed.hasSuffix(".git") {
-            trimmed = String(trimmed.dropLast(4))
-        }
-        let parts = trimmed.split(whereSeparator: { $0 == "/" || $0 == ":" })
-        guard let last = parts.last else { return nil }
-        let name = String(last)
-        return name.isEmpty ? nil : name
-    }
-
-    /// Canonical local clone path for the given remote URL, rooted at
-    /// `~/Documents/dev/<basename>`. Returns nil if the URL is empty or
-    /// can't be parsed into a basename.
-    static func localCloneURL(for remoteURL: String) -> URL? {
-        guard let name = basename(from: remoteURL) else { return nil }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent("Documents/dev/\(name)", isDirectory: true)
-    }
-}
-
-// MARK: - File enumeration
-
-struct DesignFileNode: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let url: URL
-    let isDirectory: Bool
-    var children: [DesignFileNode]?
-
-    var hasChildren: Bool {
-        (children?.isEmpty == false)
-    }
-}
-
-enum DesignFileLoader {
-    /// Directory names skipped when walking a repo. These are
-    /// build/dependency outputs; recursing into them is just noise and
-    /// can be very slow (node_modules, target).
-    static let skippedDirectoryNames: Set<String> = [
-        "node_modules",
-        "target",
-        ".git",
-        "build",
-        "dist",
-        ".next",
-    ]
-
-    /// Directory name prefixes skipped when walking a repo. Bazel emits
-    /// `bazel-bin`, `bazel-out`, `bazel-testlogs`, `bazel-<workspace>`
-    /// symlinks at the repo root — match by prefix so we don't have to
-    /// hardcode the workspace name.
-    static let skippedDirectoryPrefixes: [String] = ["bazel-"]
-
-    static func shouldSkip(directoryName name: String) -> Bool {
-        if skippedDirectoryNames.contains(name) {
-            return true
-        }
-        for prefix in skippedDirectoryPrefixes {
-            if name.hasPrefix(prefix) {
-                return true
-            }
-        }
-        return false
-    }
-
-    /// Recursively enumerate `.md` files under `root`, returning a tree
-    /// of directories and files. Empty directories (no markdown
-    /// descendants) are pruned so the sidebar doesn't fill with noise.
-    static func loadTree(at root: URL) -> [DesignFileNode] {
-        guard let nodes = enumerate(directory: root) else { return [] }
-        return nodes
-    }
-
-    private static func enumerate(directory: URL) -> [DesignFileNode]? {
-        let fm = FileManager.default
-        let contents: [URL]
-        do {
-            contents = try fm.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )
-        } catch {
-            return nil
-        }
-
-        var directoryNodes: [DesignFileNode] = []
-        var fileNodes: [DesignFileNode] = []
-
-        for url in contents {
-            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            let name = url.lastPathComponent
-            if isDir {
-                if shouldSkip(directoryName: name) { continue }
-                if let children = enumerate(directory: url), !children.isEmpty {
-                    directoryNodes.append(
-                        DesignFileNode(
-                            id: url.path,
-                            name: name,
-                            url: url,
-                            isDirectory: true,
-                            children: children
-                        )
-                    )
-                }
-            } else {
-                guard url.pathExtension.lowercased() == "md" else { continue }
-                fileNodes.append(
-                    DesignFileNode(
-                        id: url.path,
-                        name: name,
-                        url: url,
-                        isDirectory: false,
-                        children: nil
-                    )
-                )
-            }
-        }
-
-        directoryNodes.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        fileNodes.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        let combined = directoryNodes + fileNodes
-        return combined.isEmpty ? nil : combined
-    }
-}
-
 // MARK: - View model
 
+/// Selection state for the Designs tab.
+///
+/// Deliberately thin: the document listing, the fetched bodies, and the
+/// in-flight bookkeeping all live on [[ChatViewModel]] (see
+/// `ChatViewModel+DesignDocs.swift`), because they come from the engine
+/// and survive tab switches. This model holds only what is local to the
+/// browsing session — which product is selected, and which directories
+/// are disclosed.
 @MainActor
 final class DesignsViewModel: ObservableObject {
     @Published var selectedProductID: String?
-    @Published var fileTree: [DesignFileNode] = []
-    @Published var selectedFile: DesignFileNode?
-    @Published var resolvedRoot: URL?
-    @Published var rootExists: Bool = false
+    /// Ids of disclosed directory nodes. Seeded from the listing on
+    /// first load so docs nested two or three levels deep — which is
+    /// where design docs actually live (`docs/design-docs/…`) — are
+    /// visible without the operator drilling in by hand.
+    @Published var expandedDirectoryIDs: Set<String> = []
+    /// Tree the expansion set was seeded from, so re-seeding happens
+    /// once per (product, commit) rather than on every re-render — and
+    /// so a reload that brings genuinely new directories re-seeds while
+    /// one that changes nothing leaves the operator's manual
+    /// collapse/expand choices intact.
+    private var seededTreeKey: String?
 
     private let defaults = UserDefaults.standard
     private let selectedProductDefaultsKey = "boss.designs.selectedProductID"
@@ -157,55 +37,58 @@ final class DesignsViewModel: ObservableObject {
         selectedProductID = defaults.string(forKey: selectedProductDefaultsKey)
     }
 
-    func selectProduct(_ productID: String?, products: [WorkProduct]) {
+    func selectProduct(_ productID: String?) {
+        guard selectedProductID != productID else { return }
         selectedProductID = productID
+        seededTreeKey = nil
+        expandedDirectoryIDs = []
         if let productID {
             defaults.set(productID, forKey: selectedProductDefaultsKey)
         }
-        selectedFile = nil
-        refresh(products: products)
     }
 
-    /// Resolve the local clone path for the currently selected product
-    /// and reload the file tree. If the local clone is missing,
-    /// `rootExists` flips to false and the detail pane shows an empty
-    /// state with the resolved path — we don't try to clone anything.
-    func refresh(products: [WorkProduct]) {
-        guard let product = products.first(where: { $0.id == selectedProductID })
-            ?? products.first
-        else {
-            resolvedRoot = nil
-            rootExists = false
-            fileTree = []
+    /// Fall back to the first available product when nothing is selected
+    /// yet, or when the persisted selection names a product that no
+    /// longer exists.
+    func adoptDefaultProduct(from products: [WorkProduct]) {
+        guard !products.isEmpty else { return }
+        if let current = selectedProductID, products.contains(where: { $0.id == current }) {
             return
         }
-        if selectedProductID == nil {
-            selectedProductID = product.id
-        }
+        selectProduct(products.first?.id)
+    }
 
-        guard let remote = product.repoRemoteURL,
-              let root = DesignRepoPath.localCloneURL(for: remote) else {
-            resolvedRoot = nil
-            rootExists = false
-            fileTree = []
-            return
-        }
+    /// Expand every directory the first time a given (product, commit)
+    /// listing is shown.
+    func seedExpansion(productID: String, tree: DesignDocTree, nodes: [DesignDocNode]) {
+        let key = "\(productID)@\(tree.gitRef)"
+        guard seededTreeKey != key else { return }
+        seededTreeKey = key
+        expandedDirectoryIDs = Set(DesignDocTreeBuilder.directoryIDs(in: nodes))
+    }
 
-        resolvedRoot = root
+    func isExpanded(_ id: String) -> Bool {
+        expandedDirectoryIDs.contains(id)
+    }
 
-        var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir) && isDir.boolValue
-        rootExists = exists
-        if exists {
-            fileTree = DesignFileLoader.loadTree(at: root)
+    func setExpanded(_ id: String, _ expanded: Bool) {
+        if expanded {
+            expandedDirectoryIDs.insert(id)
         } else {
-            fileTree = []
+            expandedDirectoryIDs.remove(id)
         }
     }
 }
 
 // MARK: - Top-level view
 
+/// Browses the markdown documents at HEAD of the selected product's
+/// configured GitHub repo.
+///
+/// No local checkout is involved at any point. The view sends a product
+/// id to the engine and renders whichever [[DesignDocTreeState]] comes
+/// back; GitHub queries, credentials, markdown filtering, and error
+/// classification all live behind the RPC.
 struct DesignsView: View {
     @ObservedObject var chat: ChatViewModel
     @StateObject private var model = DesignsViewModel()
@@ -218,119 +101,191 @@ struct DesignsView: View {
             detail
                 .background(Color(nsColor: .windowBackgroundColor))
         }
-        // Re-resolve the design tree whenever the active product set
-        // changes. A `.task(id:)` runs the refresh after the render
-        // commits — keying it on `activeProducts` replaces the old
-        // `.task` + `.onChange` pair, whose `.onChange` mutated the
-        // view model's @Published state synchronously during the update
-        // ChatViewModel triggered ("Publishing changes from within view
-        // updates").
+        // Both loads run from `.task(id:)` rather than `.onChange` so
+        // they fire after the render commits. Mutating ChatViewModel's
+        // @Published state synchronously during an update it triggered
+        // is what produced "Publishing changes from within view updates"
+        // in the previous implementation.
         .task(id: chat.activeProducts) {
-            model.refresh(products: chat.activeProducts)
+            model.adoptDefaultProduct(from: chat.activeProducts)
+        }
+        .task(id: model.selectedProductID) {
+            guard let productID = model.selectedProductID else { return }
+            chat.loadDesignDocs(productID: productID)
         }
     }
+
+    /// The engine's classified outcome for the selected product, or
+    /// `nil` when we haven't asked yet.
+    private var treeState: DesignDocTreeState? {
+        model.selectedProductID.flatMap { chat.designDocTreeByProductID[$0] }
+    }
+
+    private var isLoading: Bool {
+        model.selectedProductID.map { chat.isLoadingDesignDocs(productID: $0) } ?? false
+    }
+
+    // MARK: Sidebar
 
     @ViewBuilder
     private var sidebar: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                if chat.activeProducts.isEmpty {
-                    Text("No products")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    SidebarProductPicker(
-                        selection: Binding(
-                            get: { model.selectedProductID ?? chat.activeProducts.first?.id },
-                            set: { newValue in
-                                model.selectProduct(newValue, products: chat.activeProducts)
-                            }
-                        ),
-                        products: chat.activeProducts
-                    )
-                    .frame(maxWidth: .infinity)
-                }
+            sidebarHeader
+            Divider()
+            sidebarBody
+        }
+    }
 
-                Button {
-                    model.refresh(products: chat.activeProducts)
-                } label: {
+    @ViewBuilder
+    private var sidebarHeader: some View {
+        HStack(spacing: 8) {
+            if chat.activeProducts.isEmpty {
+                Text("No products")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                SidebarProductPicker(
+                    selection: Binding(
+                        get: { model.selectedProductID ?? chat.activeProducts.first?.id },
+                        set: { model.selectProduct($0) }
+                    ),
+                    products: chat.activeProducts
+                )
+                .frame(maxWidth: .infinity)
+            }
+
+            Button {
+                guard let productID = model.selectedProductID else { return }
+                chat.loadDesignDocs(productID: productID, refresh: true)
+            } label: {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
                     Image(systemName: "arrow.clockwise")
                 }
-                .buttonStyle(.borderless)
-                .help("Reload markdown files")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .buttonStyle(.borderless)
+            .disabled(model.selectedProductID == nil || isLoading)
+            .help("Re-read the document list from GitHub")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
 
-            Divider()
-
-            if chat.activeProducts.isEmpty {
-                Spacer()
-                Text("Create a product to browse its design docs.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(20)
-                Spacer()
-            } else if !model.rootExists {
-                emptyState
-            } else if model.fileTree.isEmpty {
-                Spacer()
-                Text("No markdown files found.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            } else {
-                List(selection: Binding(
-                    get: { model.selectedFile?.id },
-                    set: { newID in
-                        if let newID, let node = findNode(id: newID, in: model.fileTree),
-                           !node.isDirectory {
-                            model.selectedFile = node
-                        }
-                    }
-                )) {
-                    OutlineGroup(model.fileTree, children: \.children) { node in
-                        DesignFileRow(node: node)
-                            .tag(node.id)
-                    }
-                }
-                .listStyle(.sidebar)
+    @ViewBuilder
+    private var sidebarBody: some View {
+        if chat.activeProducts.isEmpty {
+            DesignsStatusView(
+                icon: "shippingbox",
+                title: "No products",
+                message: "Create a product to browse its documents."
+            )
+        } else {
+            switch treeState {
+            case .none:
+                DesignsStatusView(
+                    icon: "arrow.clockwise",
+                    title: "Loading…",
+                    message: "Reading the document list from GitHub."
+                )
+            case .noRepoConfigured:
+                DesignsStatusView(
+                    icon: "link.badge.plus",
+                    title: "No repo configured",
+                    message: "This product has no repo URL, so there is nothing to read documents from. "
+                        + "Set one on the product to browse its markdown."
+                )
+            case .unreachable(let repo, let reason):
+                DesignsStatusView(
+                    icon: "exclamationmark.triangle",
+                    title: "Can't read \(repo)",
+                    message: reason
+                )
+            case .rateLimited(let repo, let reason):
+                DesignsStatusView(
+                    icon: "clock.badge.exclamationmark",
+                    title: "GitHub rate limit reached",
+                    message: reason,
+                    detail: repo
+                )
+            case .empty(_, let ownerRepo, _):
+                DesignsStatusView(
+                    icon: "doc.text.magnifyingglass",
+                    title: "No markdown files",
+                    message: "\(ownerRepo) was read successfully but contains no `.md` or `.markdown` files at HEAD."
+                )
+            case .loaded(let tree):
+                loadedSidebar(tree: tree)
             }
         }
     }
 
     @ViewBuilder
-    private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Local clone not found")
-                .font(.callout.weight(.semibold))
-            if let root = model.resolvedRoot {
-                Text("Expected at:")
+    private func loadedSidebar(tree: DesignDocTree) -> some View {
+        let nodes = DesignDocTreeBuilder.build(from: tree)
+        VStack(spacing: 0) {
+            if tree.truncated {
+                // GitHub caps a single recursive tree response; say so
+                // rather than presenting a subset as the whole repo.
+                Text("This repo is too large for one listing — some files are missing.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(root.path)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text("This product has no `repo_remote_url` configured.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                Divider()
             }
-            Spacer()
+            List {
+                DesignDocOutline(
+                    nodes: nodes,
+                    model: model,
+                    selectedRef: chat.selectedDesignDocRef,
+                    onSelect: { chat.openDesignDoc($0) }
+                )
+            }
+            .listStyle(.sidebar)
+            Divider()
+            listingFooter(tree: tree, count: tree.entries.count)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(20)
+        .task(id: "\(model.selectedProductID ?? "")@\(tree.gitRef)") {
+            guard let productID = model.selectedProductID else { return }
+            model.seedExpansion(productID: productID, tree: tree, nodes: nodes)
+        }
     }
+
+    @ViewBuilder
+    private func listingFooter(tree: DesignDocTree, count: Int) -> some View {
+        // The commit the listing was read at, shown so it is obvious the
+        // tab is reading a pinned GitHub revision rather than whatever
+        // happens to be on disk somewhere.
+        HStack(spacing: 6) {
+            Text("\(count) file\(count == 1 ? "" : "s")")
+            Text("·")
+            Text("\(tree.branch) @ \(shortSHA(tree.gitRef))")
+                .monospaced()
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .help("\(tree.ownerRepo) at \(tree.gitRef), read \(tree.fetchedAt)")
+    }
+
+    // MARK: Detail
 
     @ViewBuilder
     private var detail: some View {
-        if let file = model.selectedFile {
-            MarkdownDocumentView(fileURL: file.url)
-                .id(file.id)
+        if let ref = chat.selectedDesignDocRef {
+            DesignDocReaderView(
+                ref: ref,
+                ownerRepo: loadedTree?.ownerRepo,
+                content: chat.designDocContent(for: ref)
+            )
+            .id(ref)
         } else {
             VStack(alignment: .center, spacing: 8) {
                 Image(systemName: "doc.text")
@@ -344,71 +299,146 @@ struct DesignsView: View {
         }
     }
 
-    private func findNode(id: String, in nodes: [DesignFileNode]) -> DesignFileNode? {
-        for node in nodes {
-            if node.id == id { return node }
-            if let children = node.children, let hit = findNode(id: id, in: children) {
-                return hit
-            }
-        }
+    private var loadedTree: DesignDocTree? {
+        if case .loaded(let tree) = treeState { return tree }
         return nil
     }
 }
 
-private struct DesignFileRow: View {
-    let node: DesignFileNode
+/// First 7 characters of a commit sha — the length git itself abbreviates
+/// to. Returns the input unchanged when it is already shorter.
+func shortSHA(_ sha: String) -> String {
+    sha.count <= 7 ? sha : String(sha.prefix(7))
+}
+
+// MARK: - Sidebar rows
+
+/// Recursive outline of the document tree.
+///
+/// Written as nested `DisclosureGroup`s rather than an `OutlineGroup` so
+/// expansion is bindable: the tab expands everything on first load,
+/// which matters because the documents worth reading are usually two or
+/// three directories deep.
+private struct DesignDocOutline: View {
+    let nodes: [DesignDocNode]
+    @ObservedObject var model: DesignsViewModel
+    let selectedRef: DesignDocRef?
+    let onSelect: (DesignDocRef) -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: node.isDirectory ? "folder" : "doc.text")
-                .foregroundStyle(node.isDirectory ? .secondary : .primary)
-                .font(.system(size: 12))
-                .frame(width: 14)
-            Text(node.name)
-                .font(.body)
-                .lineLimit(1)
-                .truncationMode(.middle)
+        ForEach(nodes) { node in
+            if node.isDirectory {
+                DisclosureGroup(
+                    isExpanded: Binding(
+                        get: { model.isExpanded(node.id) },
+                        set: { model.setExpanded(node.id, $0) }
+                    )
+                ) {
+                    DesignDocOutline(
+                        nodes: node.children ?? [],
+                        model: model,
+                        selectedRef: selectedRef,
+                        onSelect: onSelect
+                    )
+                } label: {
+                    Label(node.name, systemImage: "folder")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } else if let ref = node.docRef {
+                DesignDocFileRow(
+                    name: node.name,
+                    isSelected: selectedRef == ref,
+                    action: { onSelect(ref) }
+                )
+            }
         }
     }
 }
 
-// MARK: - Markdown rendering
+private struct DesignDocFileRow: View {
+    let name: String
+    let isSelected: Bool
+    let action: () -> Void
 
-private struct MarkdownDocumentView: View {
-    let fileURL: URL
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "doc.text")
+                    .font(.system(size: 12))
+                    .frame(width: 14)
+                Text(name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 2)
+            .padding(.horizontal, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isSelected ? Color.accentColor.opacity(0.25) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
 
-    @State private var loadError: String?
-    @State private var source: String = ""
+// MARK: - Status / empty states
+
+/// One of the tab's non-document states.
+///
+/// Each caller supplies its own title and remedy sentence: the four
+/// failure modes (no repo, unreachable, rate-limited, no markdown) have
+/// four different fixes, and collapsing them into a shared "not found"
+/// is what made the tab useless before.
+private struct DesignsStatusView: View {
+    let icon: String
+    let title: String
+    let message: String
+    var detail: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: icon)
+                .font(.callout.weight(.semibold))
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if let detail {
+                Text(detail)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(20)
+    }
+}
+
+// MARK: - Reader pane
+
+/// Renders one document fetched from GitHub.
+///
+/// `content` is `nil` while the engine's fetch is in flight; the pane
+/// shows a spinner rather than a blank page so a slow read is legible
+/// as "loading" and not as "empty document".
+private struct DesignDocReaderView: View {
+    let ref: DesignDocRef
+    let ownerRepo: String?
+    let content: DesignDocContent?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(fileURL.lastPathComponent)
-                        .font(.title3.weight(.semibold))
-                    Spacer()
-                    Text(fileURL.path)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(fileURL.path)
-                }
+                header
                 Divider()
-
-                if let loadError {
-                    Text(loadError)
-                        .foregroundStyle(.red)
-                        .font(.callout)
-                } else {
-                    StructuredText(
-                        markdown: source,
-                        baseURL: fileURL.deletingLastPathComponent()
-                    )
-                    .bossMarkdown()
-                    .textual.textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                body(for: content)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
@@ -416,32 +446,69 @@ private struct MarkdownDocumentView: View {
             .frame(maxWidth: .infinity)
         }
         .textSelection(.enabled)
-        .task(id: fileURL) {
-            await load()
+    }
+
+    @ViewBuilder
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(ref.fileName)
+                .font(.title3.weight(.semibold))
+            Spacer()
+            if let githubURL {
+                Link(destination: githubURL) {
+                    Label("GitHub", systemImage: "arrow.up.forward.square")
+                        .font(.caption)
+                }
+                .help(githubURL.absoluteString)
+            }
+        }
+        Text("\(ref.path) @ \(shortSHA(ref.gitRef))")
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(ref.path)
+    }
+
+    @ViewBuilder
+    private func body(for content: DesignDocContent?) -> some View {
+        switch content {
+        case .none:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading from GitHub…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .failed(let reason):
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Couldn't read this document", systemImage: "exclamationmark.triangle")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text(reason)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .loaded(let markdown):
+            StructuredText(markdown: markdown)
+                .bossMarkdown()
+                .textual.textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
-    private func load() async {
-        let url = fileURL
-        let result: Result<String, Error> = await Task.detached {
-            do {
-                let raw = try String(contentsOf: url, encoding: .utf8)
-                return .success(raw)
-            } catch {
-                return .failure(error)
-            }
-        }.value
-
-        switch result {
-        case .success(let text):
-            self.loadError = nil
-            self.source = text
-        case .failure(let error):
-            self.loadError = "Failed to read file: \(error.localizedDescription)"
-            self.source = ""
-        }
+    /// Permalink at the exact commit the listing was read at, so the link
+    /// and the rendered text can never disagree.
+    private var githubURL: URL? {
+        guard let ownerRepo, !ownerRepo.isEmpty else { return nil }
+        return URL(string: "https://github.com/\(ownerRepo)/blob/\(ref.gitRef)/\(ref.path)")
     }
 }
+
 
 /// Payload passed to the `"markdown-viewer"` WindowGroup scene via
 /// `openWindow(id:value:)`. Codable for state restoration; Hashable so
@@ -468,7 +535,7 @@ struct MarkdownViewerContent: Codable, Hashable {
 
 /// Stand-alone scrolling viewer for long task / chore descriptions.
 /// Rendered inside the `"markdown-viewer"` WindowGroup scene. The
-/// chrome matches `MarkdownDocumentView` so the "Read full description"
+/// chrome matches [[DesignDocReaderView]] so the "Read full description"
 /// affordance lands in a layout that visually mirrors the Designs file
 /// viewer.
 ///
