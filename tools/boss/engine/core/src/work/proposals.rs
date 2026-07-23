@@ -19,7 +19,7 @@
 
 use super::*;
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
-use boss_protocol::{ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal};
+use boss_protocol::{ProposalFieldError, ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal};
 
 // ---- input types ----
 
@@ -137,6 +137,20 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         if let Some(existing) = find_by_idempotency_key(&tx, input.execution_id, input.idempotency_key)? {
+            // The key matched, but the row it found is a different `kind` —
+            // an explicit key reused across kinds, not a genuine replay. A
+            // caller that submitted `pr_created` must not silently get back
+            // an unrelated `blocked` row with `already_submitted: true`.
+            if existing.kind != input.kind {
+                return Ok(Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                    "idempotency_key",
+                    format!(
+                        "idempotency_key `{}` was already used for a `{}` proposal (id {}); reuse it \
+                         only for a genuine retry of the same submission, or choose a different key",
+                        input.idempotency_key, existing.kind, existing.id
+                    ),
+                )])));
+            }
             return Ok(Ok(SubmitWorkerProposalOutcome {
                 proposal: existing,
                 already_submitted: true,
@@ -188,10 +202,12 @@ impl WorkDb {
     ///
     /// Work-item scope (not execution scope) is the whole point: a resumed
     /// or successor run must see that a prior execution's followup proposal
-    /// came back `rejected: duplicate of T123`, so it adjusts instead of
-    /// re-proposing (design §"Disposition of P383", P383's Q4). `state` is
-    /// unfiltered by default for the same reason — the `rejected` and
-    /// `expired` history *is* the useful part.
+    /// came back `rejected: duplicate of an existing task`, so it adjusts
+    /// instead of re-proposing (dispositions must be visible across
+    /// executions, not just in-run — see
+    /// `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`).
+    /// `state` is unfiltered by default for the same reason — the
+    /// `rejected` and `expired` history *is* the useful part.
     pub fn list_worker_proposals_for_work_item(
         &self,
         work_item_id: &str,
@@ -602,7 +618,7 @@ mod tests {
             .execute(
                 "UPDATE worker_proposals
                  SET state = 'rejected', decided_by = 'human',
-                     decision_reason = 'duplicate of T123', decided_at = '1747000000'
+                     decision_reason = 'duplicate of an existing task', decided_at = '1747000000'
                  WHERE id = ?1",
                 params![old.proposal.id],
             )
@@ -613,7 +629,10 @@ mod tests {
 
         let rejected = all.iter().find(|p| p.id == old.proposal.id).unwrap();
         assert_eq!(rejected.state, ProposalState::Rejected);
-        assert_eq!(rejected.decision_reason.as_deref(), Some("duplicate of T123"));
+        assert_eq!(
+            rejected.decision_reason.as_deref(),
+            Some("duplicate of an existing task")
+        );
         assert_eq!(rejected.decided_by, Some(boss_protocol::ProposalDecider::Human));
     }
 

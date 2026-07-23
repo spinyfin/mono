@@ -76,8 +76,8 @@ fn every_kind_validates_its_minimal_payload() {
 }
 
 /// The canonical form must round-trip back through the kind's payload struct.
-/// This is what lets the apply pipeline (task 5/6) deserialise a stored row
-/// without re-validating it.
+/// This is what lets the apply pipeline deserialise a stored row without
+/// re-validating it.
 #[test]
 fn canonical_payloads_deserialize_as_their_payload_struct() {
     let canonical = ok(
@@ -419,10 +419,30 @@ fn different_content_kind_or_execution_derives_a_different_key() {
 }
 
 /// Derived keys live in their own namespace, so a worker-chosen
-/// `--idempotency-key` can never collide with one the engine derived.
+/// `--idempotency-key` can never collide with one the engine derived —
+/// [`validate_caller_idempotency_key`] is what rejects a caller key that
+/// tries to land in it.
 #[test]
 fn derived_keys_are_namespaced_by_prefix_and_kind() {
     let canonical = ok(ProposalKind::Blocked, json!({"reason": "stuck"}));
     let key = derive_idempotency_key("exec_1", ProposalKind::Blocked, &canonical);
     assert!(key.starts_with("auto:blocked:"), "{key}");
+}
+
+#[test]
+fn caller_idempotency_key_rejects_the_derived_prefix() {
+    let err = validate_caller_idempotency_key("auto:blocked:deadbeef").unwrap_err();
+    assert_eq!(err.field, "idempotency_key");
+}
+
+#[test]
+fn caller_idempotency_key_rejects_over_length() {
+    let key = "a".repeat(MAX_SHORT_FIELD_CHARS + 1);
+    let err = validate_caller_idempotency_key(&key).unwrap_err();
+    assert_eq!(err.field, "idempotency_key");
+}
+
+#[test]
+fn caller_idempotency_key_accepts_a_normal_key() {
+    validate_caller_idempotency_key("my-custom-key").unwrap();
 }

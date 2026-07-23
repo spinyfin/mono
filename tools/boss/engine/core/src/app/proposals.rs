@@ -39,7 +39,7 @@
 
 use super::*;
 
-use boss_engine_proposal_validation::{derive_idempotency_key, validate_payload};
+use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
 use boss_protocol::{ProposalErrorCode, ProposalSubmissionError};
 
 use crate::work::{SubmitWorkerProposalInput, SubmitWorkerProposalOutcome};
@@ -192,8 +192,23 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
     // storing that would make every keyless submission from the run collide.
     let idempotency_key = idempotency_key
         .map(|key| key.trim().to_owned())
-        .filter(|key| !key.is_empty())
-        .unwrap_or_else(|| derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json));
+        .filter(|key| !key.is_empty());
+
+    let idempotency_key = match idempotency_key {
+        Some(key) => match validate_caller_idempotency_key(&key) {
+            Ok(()) => key,
+            Err(field_error) => {
+                let error = ProposalSubmissionError::validation(vec![field_error]);
+                tracing::debug!(
+                    execution_id = %caller.execution_id,
+                    kind = %kind,
+                    "submit_proposal rejected: idempotency_key invalid",
+                );
+                return send_rejection(&sink, &request_id, error);
+            }
+        },
+        None => derive_idempotency_key(&caller.execution_id, kind, &validated.canonical_json),
+    };
 
     let outcome = work_db.submit_worker_proposal(SubmitWorkerProposalInput {
         execution_id: &caller.execution_id,

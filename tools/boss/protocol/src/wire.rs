@@ -1046,11 +1046,14 @@ pub enum FrontendRequest {
     /// current disposition (`state`, `decision_reason`, `applied_ref`).
     ///
     /// Scope is the work item, not the execution, deliberately: a resumed or
-    /// successor run must be able to see "rejected: duplicate of T123" from
-    /// a prior execution and adjust, rather than re-proposing into the same
-    /// wall (design §"Disposition of P383", P383's Q4). The caller cannot
-    /// widen the scope — the work item is derived from the socket peer's
-    /// attributed execution, never from a field on this request.
+    /// successor run must be able to see "rejected: duplicate of an existing
+    /// task" from a prior execution and adjust, rather than re-proposing
+    /// into the same wall (dispositions must be visible across executions,
+    /// not just in-run — see
+    /// `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`).
+    /// The caller cannot widen the scope — the work item is derived from
+    /// the socket peer's attributed execution, never from a field on this
+    /// request.
     ///
     /// `run_id` is the caller's own `BOSS_RUN_ID` (i.e. `work_executions.id`)
     /// and is a **cross-check, not a credential** — see [`Self::SubmitProposal`].

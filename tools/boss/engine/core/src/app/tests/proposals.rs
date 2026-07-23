@@ -356,6 +356,45 @@ async fn an_explicit_key_overrides_content_addressing() {
     assert_eq!(first.idempotency_key, "my-key");
 }
 
+/// Reusing an explicit key across a *different* `kind` is not a replay — the
+/// caller submitted an unrelated proposal under the same key by mistake, so
+/// it must be refused rather than silently handed back the other kind's row
+/// with `already_submitted: true`.
+#[tokio::test]
+async fn an_explicit_key_reused_with_a_different_kind_is_refused() {
+    let fx = WorkerFixture::new();
+    submitted(
+        call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::Blocked,
+                json!({"reason": "stuck"}),
+                "my-key",
+            ),
+        )
+        .await,
+    );
+
+    let error = rejected(
+        call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::DeferredScope,
+                json!({"summary": "S", "reason": "R"}),
+                "my-key",
+            ),
+        )
+        .await,
+    );
+
+    assert_eq!(error.code, ProposalErrorCode::ValidationFailed);
+    assert_eq!(error.field_errors[0].field, "idempotency_key");
+}
+
 /// An unset shell variable expands to an empty string. Treating that as a
 /// real key would make every keyless submission from a run collide on `""`
 /// and silently return the first one forever.
@@ -382,6 +421,53 @@ async fn a_blank_explicit_key_falls_back_to_the_derived_one() {
     assert!(!already, "distinct content must not collide on a blank key");
     assert_ne!(first.id, second.id);
     assert!(first.idempotency_key.starts_with("auto:"), "{}", first.idempotency_key);
+}
+
+/// The column has no other bound, unlike every payload field, so an
+/// over-length explicit key must be refused rather than stored.
+#[tokio::test]
+async fn an_overlong_explicit_key_is_refused() {
+    let fx = WorkerFixture::new();
+    let key = "k".repeat(boss_engine_proposal_validation::MAX_SHORT_FIELD_CHARS + 1);
+    let error = rejected(
+        call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::Blocked,
+                json!({"reason": "stuck"}),
+                &key,
+            ),
+        )
+        .await,
+    );
+
+    assert_eq!(error.code, ProposalErrorCode::ValidationFailed);
+    assert_eq!(error.field_errors[0].field, "idempotency_key");
+}
+
+/// The `auto:` prefix is reserved for keys the engine derives itself — a
+/// caller cannot pre-claim one.
+#[tokio::test]
+async fn an_explicit_key_with_the_derived_prefix_is_refused() {
+    let fx = WorkerFixture::new();
+    let error = rejected(
+        call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::Blocked,
+                json!({"reason": "stuck"}),
+                "auto:blocked:deadbeef",
+            ),
+        )
+        .await,
+    );
+
+    assert_eq!(error.code, ProposalErrorCode::ValidationFailed);
+    assert_eq!(error.field_errors[0].field, "idempotency_key");
 }
 
 // ── Attribution ──────────────────────────────────────────────────────────────
@@ -534,7 +620,7 @@ async fn a_replay_at_the_cap_still_succeeds() {
 
 /// The read a successor run depends on: proposals from *every* execution of
 /// the work item, with prior dispositions attached, so a resumed run sees
-/// "rejected: duplicate of T123" and adjusts instead of re-proposing.
+/// sees the predecessor's rejection reason and adjusts instead of re-proposing.
 #[tokio::test]
 async fn listing_spans_prior_executions_and_carries_dispositions() {
     let (server_state, _dir) = test_server_state();
@@ -563,7 +649,7 @@ async fn listing_spans_prior_executions_and_carries_dispositions() {
         .unwrap()
         .execute(
             "UPDATE worker_proposals SET state = 'rejected', decided_by = 'human',
-             decision_reason = 'duplicate of T123', decided_at = '1747000000' WHERE id = ?1",
+             decision_reason = 'duplicate of an existing task', decided_at = '1747000000' WHERE id = ?1",
             rusqlite::params![old.id],
         )
         .unwrap();
@@ -587,7 +673,10 @@ async fn listing_spans_prior_executions_and_carries_dispositions() {
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].execution_id, first.id, "the predecessor's row is visible");
     assert_eq!(proposals[0].state, ProposalState::Rejected);
-    assert_eq!(proposals[0].decision_reason.as_deref(), Some("duplicate of T123"));
+    assert_eq!(
+        proposals[0].decision_reason.as_deref(),
+        Some("duplicate of an existing task")
+    );
 }
 
 /// Another work item's proposals must never appear: the scope is derived

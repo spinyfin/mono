@@ -218,8 +218,9 @@ pub fn check_rate_caps(kind: ProposalKind, counts: ProposalCounts) -> Result<(),
 /// function here — rather than in either caller — is what guarantees the two
 /// sides agree.
 ///
-/// The `auto:` prefix keeps derived keys in a namespace of their own, so a
-/// worker-chosen `--idempotency-key` can never collide with a derived one.
+/// The `auto:` prefix keeps derived keys in a namespace of their own, and
+/// [`validate_caller_idempotency_key`] is what actually enforces that a
+/// caller-supplied key cannot land in it.
 pub fn derive_idempotency_key(execution_id: &str, kind: ProposalKind, canonical_json: &str) -> String {
     let mut hasher = Sha256::new();
     // Length-prefix each component so distinct field splits cannot produce
@@ -231,6 +232,39 @@ pub fn derive_idempotency_key(execution_id: &str, kind: ProposalKind, canonical_
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
     format!("auto:{kind}:{hex}")
+}
+
+/// The prefix [`derive_idempotency_key`] reserves for keys it derives itself.
+pub const DERIVED_IDEMPOTENCY_KEY_PREFIX: &str = "auto:";
+
+/// Validate a caller-supplied (non-empty, already-trimmed) idempotency key.
+///
+/// The column has no other bound, unlike every payload field
+/// ([`MAX_SHORT_FIELD_CHARS`]), so a runaway worker could otherwise write
+/// arbitrarily large keys into it. It is also the only thing standing between
+/// a caller-chosen key and the `auto:` namespace [`derive_idempotency_key`]
+/// reserves for itself: without this check a worker could pre-claim a key
+/// the engine would later derive for a different submission.
+pub fn validate_caller_idempotency_key(key: &str) -> Result<(), ProposalFieldError> {
+    if key.len() > MAX_SHORT_FIELD_CHARS {
+        return Err(ProposalFieldError::new(
+            "idempotency_key",
+            format!(
+                "idempotency_key is {} characters, over the {MAX_SHORT_FIELD_CHARS}-character limit",
+                key.len()
+            ),
+        ));
+    }
+    if key.starts_with(DERIVED_IDEMPOTENCY_KEY_PREFIX) {
+        return Err(ProposalFieldError::new(
+            "idempotency_key",
+            format!(
+                "idempotency_key may not start with `{DERIVED_IDEMPOTENCY_KEY_PREFIX}` — that \
+                 prefix is reserved for keys the engine derives itself"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -423,10 +457,10 @@ impl<'a> PayloadReader<'a> {
     /// Read `field` as a canonical GitHub PR URL.
     ///
     /// Shape validation only — the product-repo-slug and branch-match checks
-    /// the design pairs with it belong to the `pr_created` applier (task 6),
-    /// which has the execution row in hand. Here it catches the shapes a
-    /// worker can get wrong while typing the command: a `/files` suffix, an
-    /// `issues/` path, an enterprise host.
+    /// the design pairs with it belong to the `pr_created` applier, which
+    /// has the execution row in hand and lands with the apply pipeline.
+    /// Here it catches the shapes a worker can get wrong while typing the
+    /// command: a `/files` suffix, an `issues/` path, an enterprise host.
     fn required_pr_url(&mut self, field: &'static str) -> Option<String> {
         let text = self.required_text(field, MAX_SHORT_FIELD_CHARS)?;
         if boss_github::pr_url::parse_pr_url_parts(&text).is_none() {
