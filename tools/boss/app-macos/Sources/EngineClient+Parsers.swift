@@ -221,6 +221,7 @@ extension EngineClient {
             createdVia: (payload["created_via"] as? String) ?? "unknown",
             repoRemoteURL: payload["repo_remote_url"] as? String,
             blockedReason: payload["blocked_reason"] as? String,
+            blockedDetail: payload["blocked_detail"] as? String,
             blockedAttemptID: payload["blocked_attempt_id"] as? String,
             shortID: (payload["short_id"] as? NSNumber)?.intValue,
             autostart: (payload["autostart"] as? Bool) ?? false,

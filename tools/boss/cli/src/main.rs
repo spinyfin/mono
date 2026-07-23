@@ -2601,6 +2601,16 @@ struct TaskUpdateArgs {
     /// clearing happens when the engine transitions a row away from `blocked`.
     #[arg(long = "blocked-reason", value_name = "REASON", allow_hyphen_values = true)]
     blocked_reason: Option<String>,
+
+    /// Set or clear the long-form, verbatim explanation of the blocked
+    /// reason. Rendered as a tooltip on the pill instead of the short
+    /// label: no title-casing, no truncation, no length limit — put the
+    /// full prose (identifiers, punctuation, sentences) here instead of
+    /// cramming it into --blocked-reason. Pass `--blocked-detail ""` to
+    /// clear. Requires an accompanying (or already-set) --blocked-reason;
+    /// the engine rejects a detail with no reason to attach it to.
+    #[arg(long = "blocked-detail", value_name = "DETAIL", allow_hyphen_values = true)]
+    blocked_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -4307,11 +4317,13 @@ async fn run_update_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskUp
         // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
         // maps to NULL in the engine (clears the field).
         blocked_reason: args.blocked_reason,
+        // Same "empty string clears" convention as blocked_reason.
+        blocked_detail: args.blocked_detail,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, or --blocked-reason",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, --blocked-reason, or --blocked-detail",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {
@@ -8799,7 +8811,8 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.dispatch_preamble.is_some()
         || patch.worker_branch_prefix.is_some()
         || patch.autostart.is_some()
-        || patch.blocked_reason.is_some();
+        || patch.blocked_reason.is_some()
+        || patch.blocked_detail.is_some();
 
     if has_fields {
         Ok(())

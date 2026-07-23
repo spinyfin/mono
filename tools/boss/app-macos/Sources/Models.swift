@@ -50,6 +50,13 @@ struct WorkTask: Identifiable, Hashable {
     /// kanban renders it as no-op decoration until a later phase wires
     /// the badge labels through.
     var blockedReason: String? = nil
+    /// Long-form, verbatim sibling of `blockedReason`: the explanation the
+    /// short pill label has no room for. Rendered as a tooltip on the pill
+    /// exactly as written — no title-casing, no truncation. `nil` when
+    /// there's nothing beyond the label; the pill then falls back to
+    /// showing the untruncated `blockedReason` in its tooltip instead.
+    /// Mirrors `Task.blocked_detail` on the wire.
+    var blockedDetail: String? = nil
     /// Soft FK to the engine attempt currently trying to clear the
     /// block (a `conflict_resolutions.id` for `merge_conflict`).
     /// Discriminated by `blockedReason`; `nil` for blocks without an
@@ -238,6 +245,22 @@ enum WorkBlockedBadge {
         return label(forReason: reason)
     }
 
+    /// Tooltip content for the blocked pill: the verbatim, untransformed
+    /// `blockedDetail` when set, otherwise the raw (untruncated)
+    /// `blockedReason` as a fallback so rows with prose already sitting in
+    /// the label field — written before `blockedDetail` existed, or by a
+    /// caller that still crams explanation into the label — stay readable
+    /// via hover instead of silently truncating with no way to recover the
+    /// rest. `nil` when the badge itself wouldn't render (mirrors
+    /// `badgeText`'s status gate).
+    static func badgeTooltip(for task: WorkTask) -> String? {
+        guard task.status == "blocked" else { return nil }
+        if let detail = task.blockedDetail, !detail.isEmpty {
+            return detail
+        }
+        return task.blockedReason
+    }
+
     /// Human-readable label for a raw `blocked_reason` string. Used by
     /// [[badgeText(for:)]] and by any future surface (e.g. detail
     /// metadata row) that needs the same vocabulary. Falls back to a
@@ -253,6 +276,34 @@ enum WorkBlockedBadge {
         case "review_feedback": return "Review"
         default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
         }
+    }
+
+    /// Known short `blocked_reason` discriminators — the cases
+    /// [[label(forReason:)]] maps to a fixed label rather than
+    /// title-casing verbatim. Shared with [[hasMoreInfo(for:)]] so the
+    /// "more info" affordance only lights up for reasons that actually
+    /// hit the title-casing fallback (i.e. custom/freeform text, which is
+    /// exactly the case that can be truncated prose).
+    private static let knownReasons: Set<String> = [
+        "dependency", "merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback",
+    ]
+
+    /// Whether the blocked pill has meaningfully more to say than its
+    /// visible label, i.e. whether to show the "hover for more" dot.
+    /// True whenever `blockedDetail` is set (the explicit long-form
+    /// field), or when `blockedReason` isn't one of the known short
+    /// discriminators above (the title-cased fallback branch) — that's
+    /// exactly the "prose crammed into the label" case the tooltip
+    /// fallback in [[badgeTooltip(for:)]] exists to recover. Known
+    /// discriminators never light the dot: their tooltip is the same
+    /// information, just differently cased, not additional information.
+    static func hasMoreInfo(for task: WorkTask) -> Bool {
+        guard task.status == "blocked" else { return false }
+        if let detail = task.blockedDetail, !detail.isEmpty {
+            return true
+        }
+        guard let reason = task.blockedReason else { return false }
+        return !knownReasons.contains(reason)
     }
 
     /// True when the "conflict cleared" badge may show: `cleared` is set

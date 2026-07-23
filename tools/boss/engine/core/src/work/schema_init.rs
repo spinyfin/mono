@@ -608,6 +608,12 @@ impl WorkDb {
         // submitted to Trunk's queue for a `trunk_queue` product. Additive,
         // independent of every other table.
         migrate_trunk_merge_intents_table(conn)?;
+        // `tasks.blocked_detail`: verbatim long-form explanation of
+        // `blocked_reason`, rendered as a tooltip on the kanban card's
+        // blocked pill. `blocked_reason` itself stays a short, title-cased
+        // label — this sibling column is where prose goes instead of
+        // being crammed (and truncated) into the label.
+        migrate_tasks_blocked_detail_column(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

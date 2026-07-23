@@ -2511,7 +2511,11 @@ struct WorkBoardCardView: View {
                         ResolvingCIFailureBadge()
                     } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
                         let isDependencyBadge = blockedText == WorkBlockedBadge.label(forReason: "dependency")
-                        WorkStatusBadge(text: blockedText)
+                        WorkStatusBadge(
+                            text: blockedText,
+                            tooltip: WorkBlockedBadge.badgeTooltip(for: task),
+                            hasMoreInfo: WorkBlockedBadge.hasMoreInfo(for: task)
+                        )
                             .onHover { hovering in
                                 if isDependencyBadge {
                                     onDepBadgeHover?(hovering)
@@ -3649,6 +3653,14 @@ struct WorkCardPopoverView: View {
                         "Blocked reason",
                         value: reason.replacingOccurrences(of: "_", with: " ").capitalized
                     )
+                    // Verbatim — no title-casing, no truncation — unlike the
+                    // pill's `.help()` tooltip, this row is plain readable
+                    // text: it's reachable by keyboard focus and read by
+                    // VoiceOver without depending on a hover gesture, which
+                    // `.help()` alone does not guarantee (see PR discussion).
+                    if let detail = task.blockedDetail, !detail.isEmpty {
+                        metadataRow("Blocked detail", value: detail)
+                    }
                 }
                 priorityRow
                 repoRow
@@ -5799,18 +5811,37 @@ private struct ReviewingAIBadge: View {
 private struct WorkStatusBadge: View {
     let text: String
     var emphasized: Bool = false
+    /// Overrides the `.help()` hover tooltip. `nil` (the default) falls
+    /// back to `text` itself, matching every pre-existing call site
+    /// unchanged. Pass this when the visible label is a short/transformed
+    /// stand-in for something longer — e.g. the blocked pill's verbatim
+    /// detail.
+    var tooltip: String? = nil
+    /// Shows a small dot so a hovering user can tell there's more before
+    /// the system tooltip delay fires, rather than discovering it by
+    /// accident. Only meaningful when `tooltip` differs from `text`.
+    var hasMoreInfo: Bool = false
 
     var body: some View {
-        Text(text)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(foregroundColor)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(backgroundColor)
-            .clipShape(Capsule())
-            .help(text)
+        HStack(spacing: 3) {
+            Text(text)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if hasMoreInfo {
+                Circle()
+                    .fill(foregroundColor.opacity(0.55))
+                    .frame(width: 4, height: 4)
+                    .accessibilityHidden(true)
+            }
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(foregroundColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(backgroundColor)
+        .clipShape(Capsule())
+        .help(tooltip ?? text)
+        .accessibilityHint(hasMoreInfo ? (tooltip ?? "") : "")
     }
 
     private var foregroundColor: Color {
