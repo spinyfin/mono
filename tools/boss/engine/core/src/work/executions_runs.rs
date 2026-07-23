@@ -726,21 +726,32 @@ impl WorkDb {
         // kanban. Don't downgrade items already in `done` or
         // `archived` — manual transitions win.
         //
-        // `in_review` is also protected: a row in Review owns an open
-        // PR, and the only legitimate follow-up work on that PR is a
-        // `kind=revision` task (a separate row that rides the base's
-        // PR). A worker-start that lands on the base while it is
-        // `in_review` — e.g. a stray re-dispatch / late execution
-        // racing a revision's push — must NOT yank the base back out of
-        // Review into Doing. Only an explicit human or merge action
-        // advances a row out of Review. This guards the base row
-        // (chore AND project_task — same machinery, same rule) for the
-        // whole revision lifecycle. `reconcile_revision_execution` has
-        // its own settle path that also abandons such stray executions
-        // for engine-spawned *revision* rows; this guard is the
-        // single, kind-agnostic backstop that closes the hole at the
-        // source so the base never strands in Doing (revision-tasks
-        // stranding regression).
+        // `in_review` needs a narrower guard than a blanket exclusion
+        // (T3042). A row in Review owns an open PR. For a non-revision
+        // base (chore/project_task/task) the only legitimate
+        // continuation of that PR is a `kind=revision` task riding the
+        // base's branch — the base itself must never re-appear in
+        // Doing, whether the fresh execution landed on it by a stray
+        // race (the pre-existing base-protection tests) or via a
+        // deliberate direct re-dispatch (e.g. the P992 automated
+        // reviewer-pass mechanism dispatches follow-up
+        // `chore_implementation` / `pr_review` executions straight
+        // against the base while `record_worker_pr_completion`'s
+        // `PendingReview` target holds its status exactly where it
+        // was — that whole mechanism depends on the base never
+        // visibly flipping to Doing mid-review).
+        //
+        // A revision task is different: its own re-dispatch IS the
+        // sanctioned continuation, and revision rows themselves rest
+        // in `in_review` between attempts (e.g. `reconcile_revision`
+        // settling a row once its spawning CI/conflict attempt
+        // retires, or a worker that exited without pushing) —
+        // blocking those from ever reaching `active` again strands a
+        // live worker with no Doing card anywhere on the board. So the
+        // guard is lifted only for `kind = 'revision'`, and only when
+        // the revision has no non-terminal revision child of its own
+        // (a revision-of-a-revision defers to that child exactly like
+        // a base defers to it, per the same reasoning).
         //
         // `autostart` is cleared here (single-shot semantics): once a
         // row has ever transitioned to Doing, the flag is consumed so
@@ -753,7 +764,20 @@ impl WorkDb {
                  updated_at = ?2
              WHERE id = ?1
                AND deleted_at IS NULL
-               AND status NOT IN ('done', 'archived', 'blocked', 'in_review')",
+               AND status NOT IN ('done', 'archived', 'blocked')
+               AND (
+                 status != 'in_review'
+                 OR (
+                     kind = 'revision'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks child
+                         WHERE child.parent_task_id = ?1
+                           AND child.kind = 'revision'
+                           AND child.deleted_at IS NULL
+                           AND child.status NOT IN ('done', 'archived', 'cancelled')
+                     )
+                 )
+               )",
             params![execution.work_item_id, now],
         )?;
 

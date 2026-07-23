@@ -1053,6 +1053,110 @@ fn revision_completion_keeps_base_project_task_in_review() {
     assert_started_execution_keeps_base_in_review(&db, &base_id);
 }
 
+// ── T3042: re-dispatching an in_review revision must reach `active` ────────
+
+/// A `kind=revision` task that has settled to `in_review` (e.g. via
+/// `reconcile_revision`'s "spawning attempt retired" path, or a worker that
+/// exited without ever pushing) has no further revision child of its own —
+/// unlike the base-protection tests above, there is nothing else carrying
+/// the work forward. Re-dispatching it (`bossctl work start` on the
+/// revision itself, or any engine-initiated re-dispatch) must advance it to
+/// `active` so the kanban shows a live Doing card instead of a static
+/// Review chip with an invisible worker underneath.
+#[test]
+fn redispatching_in_review_revision_advances_to_active() {
+    let db = WorkDb::open(temp_db_path("rev-self-in-review-active")).unwrap();
+    let product_id = make_revision_product(&db, "self-in-review");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3042";
+    let base_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&base_id), &checker).unwrap();
+    assert_eq!(revision.status, TaskStatus::Todo, "precondition");
+
+    // Simulate the revision settling to `in_review` (e.g. its spawning
+    // CI/conflict attempt retired without the revision ever pushing).
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    }
+    assert_eq!(task_status(&db, &revision.id), "in_review", "precondition");
+
+    // Re-dispatch the revision itself, exactly as `bossctl work start`
+    // (or an engine-initiated re-dispatch) would.
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    db.start_execution_run(
+        &exec.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_status(&db, &revision.id),
+        "active",
+        "re-dispatching an in_review revision with no outstanding child must advance it \
+         to active so the kanban Doing column reflects the live worker",
+    );
+}
+
+/// Unlike a revision task, a non-revision base (chore/project_task/task)
+/// must stay parked in Review even when re-dispatched directly and with no
+/// revision ever filed against it — the P992 automated reviewer-pass
+/// mechanism relies on exactly this: it re-dispatches a fresh
+/// `chore_implementation` (and later `pr_review`) execution straight
+/// against the base while it is `in_review`, and `record_worker_pr_completion`'s
+/// `PendingReview` target only "holds" the row's current status correctly
+/// because that status never visibly flipped to `active` mid-flight. Kind
+/// is therefore the deciding factor here, not whether a revision child
+/// exists.
+#[test]
+fn redispatching_in_review_base_with_no_revision_stays_in_review() {
+    let db = WorkDb::open(temp_db_path("base-no-rev-in-review-active")).unwrap();
+    let product_id = make_revision_product(&db, "base-no-rev");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3043";
+    let base_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(base_id.clone()).build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    db.start_execution_run(
+        &exec.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_status(&db, &base_id),
+        "in_review",
+        "re-dispatching an in_review non-revision base must NOT advance it to active — \
+         only a kind=revision task's own re-dispatch is the sanctioned continuation",
+    );
+}
+
 // ── Transcript-path recording for conflict-resolution revision executions ──
 
 /// Regression guard for the T1291 incident: a conflict-resolution revision
