@@ -203,8 +203,7 @@ mod tests {
 
     #[test]
     fn summary_and_reason_extracts_both_fields() {
-        let (summary, reason) =
-            summary_and_reason(
+        let (summary, reason) = summary_and_reason(
             "[deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new pipeline\"",
         );
         assert_eq!(summary.as_deref(), Some("wiring for the third data source"));
