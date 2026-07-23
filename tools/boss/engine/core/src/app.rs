@@ -31,10 +31,10 @@ use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, HostedPaneEntry,
-    InterruptWorkerPaneInput, ListHostedPanesInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
-    RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic,
-    work_product_topic,
+    InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState, ReleaseWorkerPaneInput,
+    RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH,
+    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
+    execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -101,7 +101,7 @@ use server::{
 // `ServerState` methods and matches on the returned error with `{err}`/`{err:?}`,
 // never the concrete type — so this import is dead outside `#[cfg(test)]`.
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, RetirePaneError, SendInputError};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SendInputError};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{
@@ -1865,6 +1865,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::MetricsListLive => metrics::handle_metrics_list_live(ctx, r).await,
             r @ FrontendRequest::MetricsReset { .. } => metrics::handle_metrics_reset(ctx, r).await,
             r @ FrontendRequest::MetricsShowLive { .. } => metrics::handle_metrics_show_live(ctx, r).await,
+            r @ FrontendRequest::OpenDocument { .. } => panes::handle_open_document(ctx, r).await,
             r @ FrontendRequest::OpenLiveWorkspaceTerminal { .. } => {
                 review::handle_open_live_workspace_terminal(ctx, r).await
             }

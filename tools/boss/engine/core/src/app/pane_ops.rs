@@ -1,6 +1,6 @@
 //! `ServerState` methods for the small, uniformly-shaped engine→app
 //! pane RPCs: focus / send-input / interrupt / reveal-work-item /
-//! retire-pane / list-husk-panes. Split out of `app.rs` for file-size
+//! retire-pane / list-husk-panes / open-document. Split out of `app.rs` for file-size
 //! hygiene; behavior is unchanged from when these lived inline. See
 //! [`super::panes`] for the `FrontendRequest` handlers that call into
 //! most of these (`reveal_work_item` is called from `app/work_items.rs`
@@ -64,6 +64,34 @@ pub enum RevealItemError {
     NotFound(String),
     #[error("work item {0} is deleted")]
     Deleted(String),
+    #[error("app reported error: {0:?}")]
+    App(EngineToAppError),
+    #[error(transparent)]
+    Send(#[from] SendToAppError),
+    #[error("app returned unexpected response: {0}")]
+    ResponseKindMismatch(String),
+}
+
+/// Surfaced by [`ServerState::open_document`]. Separates path-validation
+/// failures (checked engine-side so the app stays a thin reader) from
+/// app-side / transport failures, mirroring [`RevealItemError`].
+#[derive(Debug, thiserror::Error)]
+pub enum OpenDocumentError {
+    #[error("no such file: {0}")]
+    NotFound(String),
+    #[error("not a regular file: {0}")]
+    NotAFile(String),
+    #[error("file is not readable: {0}")]
+    NotReadable(String),
+    #[error("not a markdown file (expected .md or .markdown): {0}")]
+    NotMarkdown(String),
+    /// Distinguished from the generic [`SendToAppError::NotRegistered`] /
+    /// [`SendToAppError::AppDisconnected`] / [`SendToAppError::SessionWedged`]
+    /// Display text so `bossctl open` fails with an actionable remedy;
+    /// the bare "no app session is registered" text doesn't say what to
+    /// do about it.
+    #[error("no Boss app session is registered — launch (or relaunch) the Boss app and try again")]
+    NoAppSession,
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -219,6 +247,43 @@ impl ServerState {
             Ok(EngineToAppResponse::RevealWorkItem { result: Err(err) }) => Err(RevealItemError::App(err)),
             Ok(other) => Err(RevealItemError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(RevealItemError::Send(err)),
+        }
+    }
+
+    /// Validate `path` (must exist, be a regular readable file, and
+    /// have a `.md`/`.markdown` extension) and ask the app to open it
+    /// in the design-renderer window — the same in-app markdown
+    /// surface File ▸ Open uses. Validation lives here, not in the
+    /// app, so the SwiftUI layer stays a thin reader per the design
+    /// note in [`crate::protocol::FrontendRequest::OpenDocument`].
+    /// Powers `bossctl open`.
+    pub async fn open_document(&self, path: &str) -> Result<(), OpenDocumentError> {
+        let metadata = std::fs::metadata(path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => OpenDocumentError::NotFound(path.to_owned()),
+            _ => OpenDocumentError::NotReadable(path.to_owned()),
+        })?;
+        if !metadata.is_file() {
+            return Err(OpenDocumentError::NotAFile(path.to_owned()));
+        }
+        if std::fs::File::open(path).is_err() {
+            return Err(OpenDocumentError::NotReadable(path.to_owned()));
+        }
+        let is_markdown = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
+        if !is_markdown {
+            return Err(OpenDocumentError::NotMarkdown(path.to_owned()));
+        }
+        let request = EngineToAppRequest::OpenDocument(OpenDocumentInput { path: path.to_owned() });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::OpenDocument { result: Ok(_) }) => Ok(()),
+            Ok(EngineToAppResponse::OpenDocument { result: Err(err) }) => Err(OpenDocumentError::App(err)),
+            Ok(other) => Err(OpenDocumentError::ResponseKindMismatch(format!("{other:?}"))),
+            Err(SendToAppError::NotRegistered | SendToAppError::AppDisconnected | SendToAppError::SessionWedged) => {
+                Err(OpenDocumentError::NoAppSession)
+            }
+            Err(err) => Err(OpenDocumentError::Send(err)),
         }
     }
 

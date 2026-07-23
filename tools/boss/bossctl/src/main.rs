@@ -12,7 +12,7 @@
 //! print a structured "not_implemented" response so the Boss session
 //! can call them and see which ones are pending.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -178,6 +178,21 @@ enum Command {
     Reveal {
         /// Work item to reveal: short id (`T607`) or canonical id.
         id: String,
+    },
+    /// Open a markdown file in the Boss UI, the same as using the app's
+    /// File ▸ Open. Relative paths are resolved against this process's
+    /// current directory before being sent to the engine — the engine
+    /// and the app run with different working directories, so a bare
+    /// relative path would be ambiguous by the time it reached either
+    /// of them. Re-opening a path that already has a window open
+    /// focuses that window instead of opening a duplicate. Returns a
+    /// non-zero exit with an actionable message when the Boss app is
+    /// not running (no app session registered) — this verb never
+    /// silently no-ops.
+    Open {
+        /// Path to the markdown file to open. May be relative to the
+        /// current directory or absolute.
+        path: String,
     },
     /// Read engine diagnostic logs. Works file-scan-only — no running engine
     /// required. Resolves log paths automatically from the Boss state root.
@@ -960,6 +975,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: comments::CommentsAction::Runs { comment_id, state_root },
         } => comments::comments_runs(cli.json, state_root, &comment_id),
         Command::Reveal { id } => agents::reveal_work_item(&cli.socket_path, cli.json, id).await,
+        Command::Open { path } => agents::open_document(&cli.socket_path, cli.json, path).await,
         Command::Logs {
             source,
             tail,

@@ -1047,6 +1047,13 @@ pub enum FrontendEvent {
     WorkItemRevealed {
         id: String,
     },
+    /// Engine acknowledges an open-document request — the macOS app
+    /// has opened (or focused an already-open window for) the
+    /// document renderer for `path`. Response to
+    /// [`FrontendRequest::OpenDocument`].
+    DocumentOpened {
+        path: String,
+    },
     /// Response to [`FrontendRequest::Shutdown`] when the supplied
     /// token matched the engine's. The engine sends this immediately
     /// before starting graceful shutdown so the caller has a

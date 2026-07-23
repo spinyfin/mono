@@ -2,7 +2,7 @@
 //! focus, send, interrupt, stop, reap, retire-pane, transcript,
 //! launch, list, pools), the reference-resolution helpers shared with
 //! `bossctl probe`, and the small neighboring `work start` / `work
-//! cancel` / `reveal` verbs that were interleaved with them in
+//! cancel` / `reveal` / `open` verbs that were interleaved with them in
 //! `main.rs`.
 //!
 //! Split out of `main.rs` for file-size hygiene; behavior is
@@ -598,6 +598,58 @@ pub(crate) async fn reveal_work_item(socket_path: &Option<String>, json: bool, i
     }
 }
 
+/// Open a markdown file in the Boss UI (the coordinator-invocable
+/// equivalent of File ▸ Open). `path` is resolved against this
+/// process's current directory before it goes on the wire — the
+/// engine and the app each have their own working directory, so a
+/// relative path is only unambiguous here, at the caller. Path
+/// existence/readability/markdown-ness is validated engine-side (see
+/// [`FrontendRequest::OpenDocument`]); this function's own error
+/// handling only covers `std::env::current_dir` failing and the
+/// engine's rejection responses (not found, not markdown, no app
+/// session registered — the last one arrives with an actionable
+/// "launch/relaunch Boss" message baked in by the engine).
+/// Resolve `path` against `cwd` if it isn't already absolute. Split out
+/// of [`open_document`] so the relative-path case can be tested
+/// headlessly, without a socket connection.
+pub(crate) fn resolve_document_path(cwd: &Path, path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path).to_string_lossy().into_owned()
+    }
+}
+
+pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path: String) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving current directory for a relative path")?;
+    let resolved = resolve_document_path(&cwd, &path);
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::OpenDocument { path: resolved.clone() })
+        .await
+        .context("sending OpenDocument")?;
+    match response {
+        FrontendEvent::DocumentOpened { path } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "opened",
+                        "path": path,
+                    })
+                );
+            } else {
+                println!("opened {path}");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected open: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
 /// Inject `text` into the worker pane referenced by `agent`, as if
 /// the user had typed it and pressed Return. The submit step is the
 /// app-side writer's responsibility: after pasting the body via
@@ -1090,6 +1142,23 @@ mod tests {
             .created_at("")
             .updated_at("")
             .build()
+    }
+
+    // ---- resolve_document_path ---------------------------------------------
+
+    #[test]
+    fn resolve_document_path_leaves_absolute_path_untouched() {
+        let cwd = Path::new("/some/other/dir");
+        assert_eq!(resolve_document_path(cwd, "/abs/path/notes.md"), "/abs/path/notes.md");
+    }
+
+    #[test]
+    fn resolve_document_path_joins_relative_path_against_cwd() {
+        let cwd = Path::new("/home/user/project");
+        assert_eq!(
+            resolve_document_path(cwd, "docs/notes.md"),
+            "/home/user/project/docs/notes.md"
+        );
     }
 
     // ---- resolve_agent_ref -------------------------------------------------

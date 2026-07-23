@@ -120,6 +120,24 @@ extension EngineClient {
         ])
     }
 
+    func sendOpenDocumentResponse(requestId: String, result: EngineOpenDocumentResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success:
+            resultPayload = ["Ok": [String: Any]()]
+        case .failure(let error):
+            resultPayload = ["Err": openDocumentEngineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "open_document",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
     /// Reply to `EngineRequestKind.listHostedPanes`. Always `Ok` — this
     /// is a read-only enumeration of whatever the app currently has;
     /// there is no app-side failure mode analogous to `.unknownSlot` /
@@ -200,6 +218,13 @@ extension EngineClient {
     }
 
     private func revealEngineToAppErrorPayload(_ error: EngineRevealError) -> [String: Any] {
+        switch error {
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
+    private func openDocumentEngineToAppErrorPayload(_ error: EngineOpenDocumentError) -> [String: Any] {
         switch error {
         case .internalFailure(let message):
             return ["kind": "internal", "message": message]

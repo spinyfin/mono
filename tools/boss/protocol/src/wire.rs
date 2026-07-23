@@ -1276,6 +1276,22 @@ pub enum FrontendRequest {
         name: String,
     },
 
+    /// Boss-tier RPC: ask the macOS app to open `path` (an absolute or
+    /// caller-cwd-relative markdown file, resolved to absolute by the
+    /// `bossctl open` caller before it reaches the wire) in the same
+    /// in-app renderer window File ▸ Open uses. The engine — not the
+    /// app — validates that the path exists, is readable, and has a
+    /// markdown extension, so the SwiftUI layer stays a thin reader.
+    /// Opening the same path twice focuses the existing renderer
+    /// window rather than opening a duplicate (the window is keyed by
+    /// its content, which is identical for a repeat open). Replies
+    /// with [`FrontendEvent::DocumentOpened`] on success or
+    /// [`FrontendEvent::WorkError`] on failure (path not found, not
+    /// readable, not markdown, or no app session registered).
+    OpenDocument {
+        path: String,
+    },
+
     /// App asks the engine for a terminal into the workspace of a work
     /// item's already-live execution (Doing-column debugging affordance).
     /// Unlike [`Self::OpenReviewTerminal`], this does NOT lease a new

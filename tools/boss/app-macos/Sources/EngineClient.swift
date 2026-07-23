@@ -414,6 +414,9 @@ final class EngineClient: @unchecked Sendable {
                         requestId: requestId,
                         request: .revealWorkItem(workItemId: workItemId, productId: productId)
                     ))
+                case "open_document":
+                    let path = request["path"] as? String ?? ""
+                    emit(.engineRequest(requestId: requestId, request: .openDocument(path: path)))
                 case "list_hosted_panes":
                     emit(.engineRequest(requestId: requestId, request: .listHostedPanes))
                 default:

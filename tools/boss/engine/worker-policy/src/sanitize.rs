@@ -241,6 +241,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::CiBudgetUpdated { .. }
         | FrontendEvent::EngineAttemptsList { .. }
         | FrontendEvent::WorkItemRevealed { .. }
+        | FrontendEvent::DocumentOpened { .. }
         | FrontendEvent::ShutdownAccepted
         | FrontendEvent::ShutdownRejected { .. }
         | FrontendEvent::GitHubAuthState { .. }

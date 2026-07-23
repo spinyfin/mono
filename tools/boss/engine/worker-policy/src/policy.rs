@@ -321,6 +321,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::MetricsListLive
         | FrontendRequest::MetricsReset { .. }
         | FrontendRequest::MetricsShowLive { .. }
+        | FrontendRequest::OpenDocument { .. }
         | FrontendRequest::OpenLiveWorkspaceTerminal { .. }
         | FrontendRequest::OpenReviewTerminal { .. }
         | FrontendRequest::ProbeRun { .. }

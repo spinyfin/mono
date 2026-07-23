@@ -90,6 +90,15 @@ enum EngineRevealResult: Sendable {
     case failure(EngineRevealError)
 }
 
+enum EngineOpenDocumentError: Sendable {
+    case internalFailure(String)
+}
+
+enum EngineOpenDocumentResult: Sendable {
+    case success
+    case failure(EngineOpenDocumentError)
+}
+
 /// One slot the app reports as currently hosting a session, in reply
 /// to `EngineRequestKind.listHostedPanes`. Mirrors the wire
 /// `HostedPaneEntry` shape.
@@ -107,6 +116,12 @@ enum EngineRequestKind: Sendable {
     case focusWorkerPane(slotId: Int)
     case interruptWorkerPane(slotId: Int)
     case revealWorkItem(workItemId: String, productId: String)
+    /// Engine asks the app to open a markdown document — the
+    /// `bossctl open` path. `path` is an absolute, engine-validated
+    /// path; the handler renders it through the same design-renderer
+    /// window File ▸ Open uses (see
+    /// [[DesignRendererContent.forLocalFile(path:)]]).
+    case openDocument(path: String)
     /// Read-only: engine asks which slots the app currently hosts a
     /// session in, regardless of whether the engine has a live-tracked
     /// run for them. Backs `bossctl agents list --all` — the engine

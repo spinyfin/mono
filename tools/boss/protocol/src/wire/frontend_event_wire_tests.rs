@@ -1365,6 +1365,13 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "work_item_revealed",
         },
         TagCase {
+            label: "DocumentOpened",
+            event: FrontendEvent::DocumentOpened {
+                path: "/tmp/design.md".into(),
+            },
+            expected_tag: "document_opened",
+        },
+        TagCase {
             label: "ShutdownAccepted",
             event: FrontendEvent::ShutdownAccepted,
             expected_tag: "shutdown_accepted",
@@ -1722,6 +1729,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::CiBudgetUpdated { .. }
         | FrontendEvent::EngineAttemptsList { .. }
         | FrontendEvent::WorkItemRevealed { .. }
+        | FrontendEvent::DocumentOpened { .. }
         | FrontendEvent::ShutdownAccepted
         | FrontendEvent::ShutdownRejected { .. }
         | FrontendEvent::GitHubAuthState { .. }
