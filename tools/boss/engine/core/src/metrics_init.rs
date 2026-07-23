@@ -42,6 +42,9 @@ pub fn init_all(registry: &Registry) {
     // Queue-level dispatch telemetry: per-pool depth/oldest-wait gauges,
     // dispatch-completed counter, drain-pass-duration gauge.
     crate::dispatch_metrics::register_metrics(registry);
+    // Trunk merge-queue poller: probe/lookup volume, state writes, intent
+    // retirements, and attention items.
+    crate::trunk_queue_poller::init(registry);
 }
 
 #[cfg(test)]
@@ -144,11 +147,26 @@ mod tests {
             names.contains(&"dispatch.completed".to_owned()),
             "init_all must register dispatch.completed"
         );
+        // Trunk merge-queue poller counters.
+        for expected in [
+            "trunk_queue_poller.queue_probes",
+            "trunk_queue_poller.queue_probe_failures",
+            "trunk_queue_poller.entry_lookups",
+            "trunk_queue_poller.state_writes",
+            "trunk_queue_poller.intents_retired",
+            "trunk_queue_poller.attentions_filed",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         assert_eq!(
             names.len(),
-            49,
+            55,
             "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
-             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring + 1 dispatch_metrics counters"
+             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring + 1 dispatch_metrics + \
+             6 trunk_queue_poller counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

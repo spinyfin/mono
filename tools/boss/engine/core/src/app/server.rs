@@ -779,7 +779,13 @@ pub async fn serve_with_merge_probe(
     // promoting the merged ones to `done`. Polling cadence is
     // deliberately conservative — chores rarely sit in review for
     // long, and we don't want to spam `gh` from the engine process.
+    // The same loop also drives the Trunk merge-queue observer, on its own
+    // cadence tiers — see `merge_poller::spawn_loop`. It stays idle (one
+    // local-DB read, zero Trunk requests) until a `trunk_queue` product's
+    // merge button records an active merge intent.
     let merge_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
+    let trunk_queue_api: Arc<dyn crate::trunk_queue_poller::TrunkQueueApi> =
+        Arc::new(server_state.trunk_client.clone());
     let _merge_handle = spawn_merge_poller(
         server_state.work_db.clone(),
         merge_probe,
@@ -787,6 +793,7 @@ pub async fn serve_with_merge_probe(
         (
             server_state.cube_client.clone(),
             server_state.completion_handler.clone(),
+            trunk_queue_api,
         ),
         Duration::from_secs(60),
         server_state.metrics.clone(),

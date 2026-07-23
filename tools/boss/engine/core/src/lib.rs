@@ -130,6 +130,7 @@ pub mod trace_rotation;
 pub use boss_engine_transient_error as transient_error;
 pub mod transient_recovery;
 pub mod trunk_merge;
+pub mod trunk_queue_poller;
 pub mod work;
 pub mod work_dependencies;
 pub mod worker_escalation;

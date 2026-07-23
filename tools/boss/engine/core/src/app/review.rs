@@ -319,7 +319,7 @@ async fn handle_trunk_queue_merge(
     tokio::spawn(async move {
         let request = boss_trunk_client::SubmitPullRequestRequest::builder()
             .repo(boss_trunk_client::TrunkRepoRef::new(
-                "github.com",
+                crate::trunk_merge::TRUNK_REPO_HOST,
                 coords.owner,
                 coords.repo,
             ))

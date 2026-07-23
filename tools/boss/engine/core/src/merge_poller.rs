@@ -4285,24 +4285,36 @@ fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
 /// `targeted_kick` is the [`PrReconcilerTargetedKick`] companion — same
 /// quiesce window, but it reconciles just the named PR(s) via
 /// [`reconcile_one`] rather than triggering a full sweep.
+///
+/// The Trunk merge-queue observer
+/// ([`crate::trunk_queue_poller::TrunkQueueProbe`]) rides this same loop
+/// rather than running free: it gets its own arm in the wait `select!`,
+/// driven by its own cadence tiers, so it inherits this task's lifetime
+/// and publisher plumbing while keeping its 15 s/30 s cadence independent
+/// of the 60 s full-sweep tick.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
     publisher: Arc<dyn ExecutionPublisher>,
-    // (cube_client, completion_handler) — bundled to keep the parameter
-    // count under clippy::too_many_arguments.
-    handlers: (Arc<dyn CubeClient>, Arc<WorkerCompletionHandler>),
+    // (cube_client, completion_handler, trunk_queue_api) — bundled to keep
+    // the parameter count under clippy::too_many_arguments.
+    handlers: (
+        Arc<dyn CubeClient>,
+        Arc<WorkerCompletionHandler>,
+        Arc<dyn crate::trunk_queue_poller::TrunkQueueApi>,
+    ),
     interval: Duration,
     metrics: Arc<Registry>,
     // (broad kick, targeted kick) — bundled to keep the parameter count
     // under clippy::too_many_arguments.
     kicks: (Arc<Notify>, PrReconcilerTargetedKick),
 ) -> tokio::task::JoinHandle<()> {
-    let (cube_client, completion_handler) = handlers;
+    let (cube_client, completion_handler, trunk_queue_api) = handlers;
     let (kick, targeted_kick) = kicks;
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
+        let mut trunk_probe = crate::trunk_queue_poller::TrunkQueueProbe::new();
         let mut spec_schedule = crate::speculative_conflict::SpeculativeCheckSchedule::default();
         let mut stacking_schedule = crate::stacked_pr_structuring::StackingSchedule::default();
         let stacking_fetcher = crate::stacked_pr_structuring::GhPrChangedFiles;
@@ -4421,9 +4433,39 @@ pub fn spawn_loop(
                     .next_due()
                     .map(|at| at.saturating_duration_since(now))
                     .unwrap_or(NO_PR_DUE_WAIT);
+                // The Trunk observer's own cadence: 15s while an entry is
+                // testing, 30s while entries only wait, and a bare
+                // local-DB rescan when nothing is enqueued. Deliberately
+                // NOT folded into `remaining_interval`: it must be able to
+                // tick faster than the 60s full sweep without dragging the
+                // GitHub probe (and its API quota) along with it.
+                let trunk_wait = trunk_probe.next_wake_at(now).saturating_duration_since(now);
                 tokio::select! {
                     _ = tokio::time::sleep(remaining_interval) => {
                         break 'wait;
+                    }
+                    _ = tokio::time::sleep(trunk_wait) => {
+                        let outcome = trunk_probe.run_pass(
+                            &crate::trunk_queue_poller::TrunkSweepContext {
+                                work_db: work_db.as_ref(),
+                                publisher: publisher.as_ref(),
+                                api: trunk_queue_api.as_ref(),
+                            },
+                            Instant::now(),
+                        ).await;
+                        crate::trunk_queue_poller::record_pass_metrics(&metrics, &outcome);
+                        if outcome.is_noteworthy() {
+                            tracing::info!(
+                                queues_probed = outcome.queues_probed,
+                                entry_lookups = outcome.entry_lookups,
+                                state_writes = outcome.state_writes,
+                                intents_retired = outcome.intents_retired,
+                                probe_failures = outcome.probe_failures,
+                                attentions_filed = outcome.attentions_filed,
+                                "merge poller: trunk queue pass",
+                            );
+                        }
+                        // continue listening; a Trunk pass is not a full sweep
                     }
                     _ = tokio::time::sleep(pr_wait) => {
                         for pr_url in schedule.drain_due(Instant::now()) {
