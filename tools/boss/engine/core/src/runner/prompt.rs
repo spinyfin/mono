@@ -43,6 +43,18 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// never be taught a verb the engine won't yet read proposals-first for.
     #[builder(default)]
     worker_signal_proposals_seam_enabled: bool,
+    /// Whether `deferred_scope_proposals_seam` is on — gates the worker-facing
+    /// prompt half of the deferred-scope seam migration (design
+    /// implementation task 9): [`deferred_scope_directive`]. `false` (the
+    /// flag's registry default) reproduces the exact marker-only text;
+    /// `true` teaches `boss propose deferred-scope` instead. This is the
+    /// OTHER half of the flag: the engine's read path
+    /// (`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`)
+    /// is gated by the same flag name read directly from
+    /// `FeatureFlagsStore`; gating the prompt too is what makes "flag off"
+    /// restore today's behavior exactly, prompt included.
+    #[builder(default)]
+    deferred_scope_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -230,6 +242,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         pr_template_set,
         editorial_enabled,
         worker_signal_proposals_seam_enabled,
+        deferred_scope_proposals_seam_enabled,
         merge_order_preservation,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
@@ -389,7 +402,10 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                 conflict_attempt,
                 ci_attempt,
                 merge_order_preservation,
-                worker_signal_proposals_seam_enabled,
+                (
+                    worker_signal_proposals_seam_enabled,
+                    deferred_scope_proposals_seam_enabled,
+                ),
             ));
         }
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation => {
@@ -502,7 +518,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             execution.kind,
             ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
         ) {
-            prompt.push_str(&deferred_scope_directive());
+            prompt.push_str(&deferred_scope_directive(deferred_scope_proposals_seam_enabled));
         }
         // Give a fresh-PR chore/task implementation worker a SANCTIONED
         // way to terminate as "the work was already done". Without it, a worker
@@ -911,8 +927,27 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
 /// [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
 /// for what the engine does with it: appends a durable audit line to the
 /// work item's description and files a coordinator-visible attention item.
-pub(crate) fn deferred_scope_directive() -> String {
-    "\n## If you deliver less than the brief asks: declare the gap\n\n\
+///
+/// `seam_enabled` mirrors the `deferred_scope_proposals_seam` feature flag —
+/// the same flag
+/// [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
+/// reads for the engine's read path, threaded here so the two halves of the
+/// migration move together (design implementation task 9, following the
+/// recipe [`worker_escalation_protocol_directive`] established): a worker
+/// must never be taught the `boss propose deferred-scope` verb when the
+/// engine won't yet read proposals-first for it, and flipping the flag off
+/// must restore today's marker-only directive exactly.
+///
+/// `seam_enabled = false` reproduces the pre-migration directive verbatim.
+/// `seam_enabled = true` instructs `boss propose deferred-scope` instead —
+/// unlike `[blocked]`, the `[deferred-scope]` marker has no bootstrap-
+/// fallback carve-out (design §"Failure semantics": only `[blocked]` is
+/// retained indefinitely), so the seam-enabled directive teaches the verb
+/// only; the engine still accepts a stray legacy marker as a counted
+/// fallback (see [`crate::deferred_scope`]).
+pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
+    if !seam_enabled {
+        return "\n## If you deliver less than the brief asks: declare the gap\n\n\
      If you consciously decide to narrow scope — implement part of what was asked and \
      deliberately leave a piece undone (it needs plumbing/data/access this run doesn't have, \
      it's a genuinely separate concern, etc.) rather than doing it — emit one line per deferred \
@@ -941,6 +976,38 @@ pub(crate) fn deferred_scope_directive() -> String {
      to flag it, and it will be flagged. A \"## Deferred\" section in the PR body is fine as \
      human-readable prose, but only in addition to the markers, never instead of them — the \
      marker costs one line and is parsed even if malformed, so there is no excuse to skip it.\n"
+            .to_string();
+    }
+    "\n## If you deliver less than the brief asks: declare the gap\n\n\
+     If you consciously decide to narrow scope — implement part of what was asked and \
+     deliberately leave a piece undone (it needs plumbing/data/access this run doesn't have, \
+     it's a genuinely separate concern, etc.) rather than doing it — call `boss propose \
+     deferred-scope` once per deferred item, during the run:\n\n\
+     ```\n\
+     boss propose deferred-scope --summary \"<what you did not deliver>\" --reason \"<why you deferred it>\"\n\
+     ```\n\n\
+     Both flags are required. Example:\n\n\
+     ```\n\
+     boss propose deferred-scope --summary \"wiring for the third data source\" --reason \"needs a new ingestion pipeline; out of scope for this wiring-only chore\"\n\
+     ```\n\n\
+     Submission is synchronous and validated immediately — a malformed call fails right away with \
+     a typed error you can fix and retry, unlike a marker line the engine only reads long after \
+     you've moved on. Do NOT write \"filed as a followup\", \"tracked separately\", or similar in \
+     your PR body or summary as a substitute for calling this — you have no other way to file or \
+     track anything, that sentence would simply be false. `boss propose deferred-scope` is the \
+     channel that actually creates a durable record: it is recorded against this task and \
+     surfaced to a human, who decides whether to spin up a followup or accept the gap. This is \
+     distinct from the followups mechanism above, which proposes brand-new out-of-scope work you \
+     noticed — use `boss propose deferred-scope` specifically for work the brief asked for that \
+     you did not deliver.\n\n\
+     **The verb is the only sanctioned channel for declaring deferred scope — prose is not \
+     enough.** If your PR body, a summary section, or your final response says anything that \
+     states or implies narrowed scope — \"deferred\", \"not included in this PR\", \"left for a \
+     future task\", \"out of scope for now\", a \"## Deferred\" heading, or similar — every item \
+     it names MUST also have a matching `boss propose deferred-scope` call. A prose deferral \
+     section with no matching proposal is a protocol violation: reviewers are instructed to flag \
+     it, and it will be flagged. A \"## Deferred\" section in the PR body is fine as human-\
+     readable prose, but only in addition to the proposal calls, never instead of them.\n"
         .to_string()
 }
 
@@ -1420,8 +1487,11 @@ fn compose_revision_directive(
     conflict_attempt: Option<&ConflictResolution>,
     ci_attempt: Option<&CiRemediation>,
     merge_order_preservation: &[String],
-    worker_signal_proposals_seam_enabled: bool,
+    // (worker_signal_proposals_seam_enabled, deferred_scope_proposals_seam_enabled)
+    // — bundled to keep the parameter count under clippy::too_many_arguments.
+    proposals_seam_flags: (bool, bool),
 ) -> String {
+    let (worker_signal_proposals_seam_enabled, deferred_scope_proposals_seam_enabled) = proposals_seam_flags;
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
         _ => String::new(),
@@ -1546,7 +1616,7 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
-    out.push_str(&deferred_scope_directive());
+    out.push_str(&deferred_scope_directive(deferred_scope_proposals_seam_enabled));
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\

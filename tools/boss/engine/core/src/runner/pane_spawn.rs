@@ -282,6 +282,11 @@ impl ExecutionRunner for PaneSpawnRunner {
         // so the two halves of the migration move together.
         let worker_signal_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("worker_signal_proposals_seam");
+        // Mirrors `worker_signal_proposals_seam_enabled` above — see
+        // `deferred_scope_directive`'s doc for why both halves of the
+        // deferred-scope seam migration must move together.
+        let deferred_scope_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("deferred_scope_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -296,6 +301,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 editorial_enabled,
                 self.cfg.work.max_review_embed_diff_lines,
                 worker_signal_proposals_seam_enabled,
+                deferred_scope_proposals_seam_enabled,
             ),
         )
         .await?;
