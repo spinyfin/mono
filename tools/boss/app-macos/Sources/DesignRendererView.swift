@@ -61,6 +61,25 @@ struct DesignRendererContent: Codable, Hashable {
         return .prDoc(repoRemoteURL: repoRemoteURL, branch: branch, path: path)
     }
 
+    /// Payload for opening a plain local markdown file directly (not a
+    /// project's pointed-at design doc) — shared by File ▸ Open
+    /// (`OpenMarkdownFileCommand`) and the engine-pushed `open_document`
+    /// RPC that backs `bossctl open`
+    /// (`ChatViewModel.handleEngineRequest`), so both routes render
+    /// through the exact same window and view rather than growing a
+    /// second markdown-rendering surface. No repo/comment metadata —
+    /// `commentArtifact` is nil for both callers.
+    static func forLocalFile(path: String) -> DesignRendererContent {
+        let url = URL(fileURLWithPath: path)
+        return DesignRendererContent(
+            title: url.deletingPathExtension().lastPathComponent,
+            filePath: path,
+            webURL: "",
+            repoLabel: "",
+            projectID: ""
+        )
+    }
+
     /// Convenience for tests and the wiring layer in
     /// [[ChatViewModel.openProjectDesignDoc(_:)]] — builds the payload
     /// from a [[ResolvedDesignDoc]] + workspace path. Returns nil when

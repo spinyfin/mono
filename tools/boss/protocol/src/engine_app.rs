@@ -180,6 +180,21 @@ pub struct RevealWorkItemInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RevealWorkItemResult {}
 
+/// Engine asks the app to open a markdown document in the same
+/// in-app renderer File ▸ Open uses. `path` is an absolute,
+/// already-validated (exists, readable, markdown extension) path —
+/// the engine owns that validation so the app stays a thin reader.
+/// Powers `bossctl open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenDocumentInput {
+    pub path: String,
+}
+
+/// App's reply when the document renderer window has been opened
+/// (or focused, if a window for the same content was already open).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenDocumentResult {}
+
 /// What the engine is asking the app to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -190,6 +205,7 @@ pub enum EngineToAppRequest {
     FocusWorkerPane(FocusWorkerPaneInput),
     InterruptWorkerPane(InterruptWorkerPaneInput),
     RevealWorkItem(RevealWorkItemInput),
+    OpenDocument(OpenDocumentInput),
     ListHostedPanes(ListHostedPanesInput),
 }
 
@@ -220,6 +236,9 @@ pub enum EngineToAppResponse {
     },
     RevealWorkItem {
         result: Result<RevealWorkItemResult, EngineToAppError>,
+    },
+    OpenDocument {
+        result: Result<OpenDocumentResult, EngineToAppError>,
     },
     ListHostedPanes {
         result: Result<ListHostedPanesResult, EngineToAppError>,
@@ -480,6 +499,39 @@ mod tests {
     fn interrupt_response_err_round_trips() {
         let original = EngineToAppResponse::InterruptWorkerPane {
             result: Err(EngineToAppError::UnknownSlot),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn open_document_request_round_trips() {
+        let original = EngineToAppRequest::OpenDocument(OpenDocumentInput {
+            path: "/Users/dev/design.md".into(),
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("open_document"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn open_document_response_ok_round_trips() {
+        let original = EngineToAppResponse::OpenDocument {
+            result: Ok(OpenDocumentResult {}),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn open_document_response_err_round_trips() {
+        let original = EngineToAppResponse::OpenDocument {
+            result: Err(EngineToAppError::Internal {
+                message: "renderer window failed to open".into(),
+            }),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();

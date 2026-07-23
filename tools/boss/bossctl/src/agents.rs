@@ -598,6 +598,51 @@ pub(crate) async fn reveal_work_item(socket_path: &Option<String>, json: bool, i
     }
 }
 
+/// Open a markdown file in the Boss UI (the coordinator-invocable
+/// equivalent of File ▸ Open). `path` is resolved against this
+/// process's current directory before it goes on the wire — the
+/// engine and the app each have their own working directory, so a
+/// relative path is only unambiguous here, at the caller. Path
+/// existence/readability/markdown-ness is validated engine-side (see
+/// [`FrontendRequest::OpenDocument`]); this function's own error
+/// handling only covers `std::env::current_dir` failing and the
+/// engine's rejection responses (not found, not markdown, no app
+/// session registered — the last one arrives with an actionable
+/// "launch/relaunch Boss" message baked in by the engine).
+pub(crate) async fn open_document(socket_path: &Option<String>, json: bool, path: String) -> Result<()> {
+    let resolved = if Path::new(&path).is_absolute() {
+        path
+    } else {
+        let cwd = std::env::current_dir().context("resolving current directory for a relative path")?;
+        cwd.join(&path).to_string_lossy().into_owned()
+    };
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::OpenDocument { path: resolved.clone() })
+        .await
+        .context("sending OpenDocument")?;
+    match response {
+        FrontendEvent::DocumentOpened { path } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "opened",
+                        "path": path,
+                    })
+                );
+            } else {
+                println!("opened {path}");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected open: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
 /// Inject `text` into the worker pane referenced by `agent`, as if
 /// the user had typed it and pressed Return. The submit step is the
 /// app-side writer's responsibility: after pasting the body via

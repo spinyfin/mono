@@ -367,6 +367,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             | EngineToAppResponse::FocusWorkerPane { .. }
             | EngineToAppResponse::InterruptWorkerPane { .. }
             | EngineToAppResponse::RevealWorkItem { .. }
+            | EngineToAppResponse::OpenDocument { .. }
             | EngineToAppResponse::ListHostedPanes { .. },
         ) => {
             return Err(StartWorkerError::ResponseKindMismatch);

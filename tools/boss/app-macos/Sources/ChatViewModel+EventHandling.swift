@@ -525,6 +525,24 @@ extension ChatViewModel {
                     result: .failure(.internalFailure(reason))
                 )
             }
+        case .openDocument(let path):
+            // Reuses the exact File ▸ Open code path
+            // (`OpenMarkdownFileCommand` in `BossMacApp.swift`) via the
+            // same `designRendererOpener` closure and the same
+            // `DesignRendererContent.forLocalFile` payload builder —
+            // there is no second markdown-rendering surface. `path` is
+            // already validated (exists, readable, markdown) by the
+            // engine, so there is no app-side failure mode here beyond
+            // the opener not being wired yet (window not ready).
+            if let opener = designRendererOpener {
+                opener(.forLocalFile(path: path))
+                engine.sendOpenDocumentResponse(requestId: requestId, result: .success)
+            } else {
+                engine.sendOpenDocumentResponse(
+                    requestId: requestId,
+                    result: .failure(.internalFailure("document renderer window is not ready yet"))
+                )
+            }
         case .listHostedPanes:
             let panes = paneListHostedHandler?() ?? []
             engine.sendListHostedPanesResponse(requestId: requestId, panes: panes)

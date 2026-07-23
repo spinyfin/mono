@@ -96,6 +96,7 @@ fn request_kind(req: &EngineToAppRequest) -> &'static str {
         EngineToAppRequest::FocusWorkerPane(_) => "focus_worker_pane",
         EngineToAppRequest::InterruptWorkerPane(_) => "interrupt_worker_pane",
         EngineToAppRequest::RevealWorkItem(_) => "reveal_work_item",
+        EngineToAppRequest::OpenDocument(_) => "open_document",
         EngineToAppRequest::ListHostedPanes(_) => "list_hosted_panes",
     }
 }
@@ -108,6 +109,7 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
         EngineToAppResponse::FocusWorkerPane { .. } => "focus_worker_pane",
         EngineToAppResponse::InterruptWorkerPane { .. } => "interrupt_worker_pane",
         EngineToAppResponse::RevealWorkItem { .. } => "reveal_work_item",
+        EngineToAppResponse::OpenDocument { .. } => "open_document",
         EngineToAppResponse::ListHostedPanes { .. } => "list_hosted_panes",
     }
 }
@@ -117,9 +119,9 @@ mod tests {
     use super::*;
     use crate::protocol::{
         EngineToAppResponse, FocusWorkerPaneInput, FocusWorkerPaneResult, InterruptWorkerPaneInput,
-        InterruptWorkerPaneResult, ListHostedPanesInput, ListHostedPanesResult, ReleaseWorkerPaneInput,
-        ReleaseWorkerPaneResult, RevealWorkItemInput, RevealWorkItemResult, SendToPaneInput, SendToPaneResult,
-        SpawnWorkerPaneInput, SpawnWorkerPaneResult,
+        InterruptWorkerPaneResult, ListHostedPanesInput, ListHostedPanesResult, OpenDocumentInput, OpenDocumentResult,
+        ReleaseWorkerPaneInput, ReleaseWorkerPaneResult, RevealWorkItemInput, RevealWorkItemResult, SendToPaneInput,
+        SendToPaneResult, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
     };
 
     /// Every `EngineToAppRequest` variant must emit its documented
@@ -169,6 +171,12 @@ mod tests {
                     product_id: "prod_1".into(),
                 }),
                 "reveal_work_item",
+            ),
+            (
+                EngineToAppRequest::OpenDocument(OpenDocumentInput {
+                    path: "/tmp/design.md".into(),
+                }),
+                "open_document",
             ),
             (
                 EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {}),
@@ -224,6 +232,12 @@ mod tests {
                     result: Ok(RevealWorkItemResult {}),
                 },
                 "reveal_work_item",
+            ),
+            (
+                EngineToAppResponse::OpenDocument {
+                    result: Ok(OpenDocumentResult {}),
+                },
+                "open_document",
             ),
             (
                 EngineToAppResponse::ListHostedPanes {
