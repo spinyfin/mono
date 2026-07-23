@@ -1702,6 +1702,196 @@ async fn repeated_stops_do_not_duplicate_the_deferred_scope_record() {
     }
 }
 
+// -----------------------------------------------------------
+// Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
+// implementation task 9): `deferred_scope_proposals_seam` makes
+// `detect_and_record_deferred_scope` read proposals-first, demoting the
+// `[deferred-scope]` marker parser to a counted fallback. Mirrors the
+// `worker_signal_proposals_seam` tests above.
+// -----------------------------------------------------------
+
+#[tokio::test]
+async fn deferred_scope_proposals_first_flag_skips_legacy_marker_when_a_proposal_already_exists() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    // The worker already called `boss propose deferred-scope` — this
+    // auto-applies synchronously, appending the audit line and filing
+    // the attention item.
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::DeferredScope,
+        payload_json: r#"{"summary":"notifications wiring","reason":"needs new data plumbing, not just wiring"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    // The final message also carries the legacy marker with matching
+    // fields — proposals-first must not re-record it a second time.
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "[deferred-scope] summary=\"notifications wiring\" reason=\"needs new data plumbing, not just wiring\"\n",
+    );
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("deferred_scope_proposals_seam", true).unwrap();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    handler.on_stop(&execution_id).await;
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .count(),
+        1,
+        "the proposal's synchronous apply already filed the attention item; the legacy \
+         marker parser must not re-record it; got {items:?}",
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(
+            t.description.matches("[deferred-scope]").count(),
+            1,
+            "the proposal apply pipeline already appended the audit line; the legacy parser \
+             must not append a second one; got: {}",
+            t.description,
+        ),
+        other => panic!("expected chore, got {other:?}"),
+    }
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.deferred_scope"),
+        Some(0),
+        "no fallback hit expected — an existing proposal covered this marker",
+    );
+}
+
+#[tokio::test]
+async fn deferred_scope_proposals_first_flag_falls_back_to_the_legacy_marker_and_counts_the_hit() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    // No proposal was ever submitted for this execution — only the
+    // legacy marker.
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "[deferred-scope] summary=\"notifications wiring\" reason=\"needs new data plumbing\"\n",
+    );
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("deferred_scope_proposals_seam", true).unwrap();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    handler.on_stop(&execution_id).await;
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .count(),
+        1,
+        "no proposal existed, so the legacy parser must still record the marker; got {items:?}",
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.deferred_scope"),
+        Some(1),
+        "the legacy path fired, so the seam's fallback-hit counter must increment",
+    );
+
+    // The marker line never disappears from the transcript once emitted,
+    // so a second terminal Stop against the same cumulative transcript
+    // must not re-increment the exit-criterion counter.
+    handler.on_stop(&execution_id).await;
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .count(),
+        1,
+        "the marker is already recorded; a repeat Stop must not record it again; got {items:?}",
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.deferred_scope"),
+        Some(1),
+        "a repeat Stop against the same already-recorded marker must not re-increment the \
+         fallback-hit counter",
+    );
+}
+
+#[tokio::test]
+async fn deferred_scope_proposals_first_flag_off_matches_pre_migration_behavior_exactly() {
+    // Even with an existing proposal AND the legacy marker both present,
+    // the flag defaulting off must reproduce the exact pre-seam
+    // behavior: the legacy parser always runs, no proposals-first
+    // check, no fallback counting.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::DeferredScope,
+        payload_json: r#"{"summary":"notifications wiring","reason":"needs new data plumbing"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "[deferred-scope] summary=\"notifications wiring\" reason=\"needs new data plumbing\"\n",
+    );
+
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_metrics(metrics.clone());
+
+    handler.on_stop(&execution_id).await;
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .count(),
+        1,
+        "with the flag off the legacy parser must still record the marker unconditionally; \
+         got {items:?}",
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.deferred_scope"),
+        Some(0),
+        "with the flag off nothing is counted",
+    );
+}
+
 #[tokio::test]
 async fn blocked_worker_is_never_reaped_across_repeated_stops() {
     // The other half of the auto-remediation contract: a worker with a

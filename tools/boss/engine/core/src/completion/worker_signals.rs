@@ -96,6 +96,11 @@ impl WorkerCompletionHandler {
     /// runs) rather than silently dropping a real signal — the same
     /// "surface it, never swallow it" discipline
     /// [`worker_escalation`]'s module doc describes for malformed markers.
+    ///
+    /// Field comparisons are trimmed on both sides so a marker whose fields
+    /// differ from the proposal only in incidental leading/trailing
+    /// whitespace still counts as covered, rather than double-recording (see
+    /// [`Self::execution_has_matching_proposal`]).
     pub(super) fn execution_has_worker_signal_proposal(
         &self,
         execution: &crate::work::WorkExecution,
@@ -105,33 +110,55 @@ impl WorkerCompletionHandler {
             WorkerSignalKind::EffortEscalation => ProposalKind::EffortEscalation,
             WorkerSignalKind::Blocked => ProposalKind::Blocked,
         };
-        let marker_reason = worker_escalation::extract_quoted(&signal.marker_line, "reason");
-        match self
-            .work_db
-            .list_worker_proposals_for_execution(&execution.id, proposal_kind)
-        {
+        let marker_reason = worker_escalation::extract_quoted(&signal.marker_line, "reason").map(str::trim);
+        self.execution_has_matching_proposal(execution, proposal_kind, "worker_signal_proposals_seam", |payload| {
+            let proposal_reason = payload.get("reason").and_then(|r| r.as_str()).map(str::trim);
+            match (marker_reason, proposal_reason) {
+                (Some(m), Some(p)) => m == p,
+                // A reason-less marker (malformed, or a payload some
+                // future kind omits `reason` from) is never treated as
+                // covered by an existing proposal — it falls through to
+                // `file_worker_signal_attention`, whose own marker-line
+                // content dedup still prevents a truly redundant bare
+                // marker from double-filing.
+                _ => false,
+            }
+        })
+    }
+
+    /// Shared proposals-first check every proposal-backed seam
+    /// (`worker_signal_proposals_seam`, `deferred_scope_proposals_seam`, and
+    /// any seam migrated after them per the design's migration map) uses to
+    /// decide whether `execution` already carries a `worker_proposals` row
+    /// of `kind` that covers a just-detected legacy marker. Holds the db
+    /// lookup, the JSON parse, the `.any()` scan, and the fail-open WARN —
+    /// each seam supplies only `matches`, its own payload-field predicate
+    /// (see [`Self::execution_has_worker_signal_proposal`] and
+    /// [`Self::execution_has_deferred_scope_proposal`] for the two current
+    /// callers).
+    ///
+    /// A storage error fails open (`false`, so the legacy parser still
+    /// runs) rather than silently dropping a real signal.
+    pub(super) fn execution_has_matching_proposal(
+        &self,
+        execution: &crate::work::WorkExecution,
+        kind: ProposalKind,
+        seam: &str,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> bool {
+        match self.work_db.list_worker_proposals_for_execution(&execution.id, kind) {
             Ok(proposals) => proposals.iter().any(|proposal| {
-                let proposal_reason = serde_json::from_str::<serde_json::Value>(&proposal.payload_json)
+                serde_json::from_str::<serde_json::Value>(&proposal.payload_json)
                     .ok()
-                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned));
-                match (marker_reason, proposal_reason.as_deref()) {
-                    (Some(m), Some(p)) => m == p,
-                    // A reason-less marker (malformed, or a payload some
-                    // future kind omits `reason` from) is never treated as
-                    // covered by an existing proposal — it falls through to
-                    // `file_worker_signal_attention`, whose own marker-line
-                    // content dedup still prevents a truly redundant bare
-                    // marker from double-filing.
-                    (None, _) => false,
-                    (Some(_), None) => false,
-                }
+                    .is_some_and(|payload| matches(&payload))
             }),
             Err(err) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     ?err,
-                    "worker_signal_proposals_seam: failed to check for an existing proposal; \
-                     falling back to the legacy marker parser for this signal",
+                    seam,
+                    "failed to check for an existing proposal; falling back to the legacy marker \
+                     parser for this signal",
                 );
                 false
             }
@@ -152,17 +179,42 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         signal: &WorkerSignal,
     ) {
-        match signal.kind {
-            WorkerSignalKind::EffortEscalation => WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION.inc(&self.metrics),
-            WorkerSignalKind::Blocked => WORKER_SIGNAL_FALLBACK_HIT_BLOCKED.inc(&self.metrics),
-        }
+        let (counter, kind) = match signal.kind {
+            WorkerSignalKind::EffortEscalation => (&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION, "effort_escalation"),
+            WorkerSignalKind::Blocked => (&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED, "blocked"),
+        };
+        self.record_proposal_fallback_hit(
+            execution,
+            counter,
+            "worker_signal_proposals_seam",
+            kind,
+            &signal.marker_line,
+        );
+    }
+
+    /// Shared fallback-hit recorder every proposal-backed seam uses: bumps
+    /// `counter` and logs a WARN carrying the seam name, the signal/marker
+    /// kind, and the marker line that triggered the legacy path. Each seam's
+    /// `record_*_fallback_hit` supplies only its own counter handle and kind
+    /// label (see [`Self::record_worker_signal_fallback_hit`] and
+    /// [`Self::record_deferred_scope_fallback_hit`]).
+    pub(super) fn record_proposal_fallback_hit(
+        &self,
+        execution: &crate::work::WorkExecution,
+        counter: &'static crate::metrics::CounterHandle,
+        seam: &str,
+        kind: &str,
+        marker_line: &str,
+    ) {
+        counter.inc(&self.metrics);
         tracing::warn!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,
-            kind = ?signal.kind,
-            marker_line = %signal.marker_line,
-            "worker_signal_proposals_seam: no worker_proposals row found for this execution/kind; \
-             legacy marker parser fired instead of the proposal path",
+            seam,
+            kind,
+            marker_line,
+            "no worker_proposals row found for this execution/kind; legacy marker parser fired \
+             instead of the proposal path",
         );
     }
 
@@ -275,13 +327,105 @@ impl WorkerCompletionHandler {
     /// [`crate::deferred_scope`] for the marker contract and the incident
     /// this exists to fix. Best-effort: recording failures are logged and
     /// swallowed, never block completion.
+    ///
+    /// When `deferred_scope_proposals_seam` is on (design implementation
+    /// task 9, following the recipe `worker_signal_proposals_seam`
+    /// established for effort-escalation/blocked), each detected marker is
+    /// read proposals-first: if `execution` already carries a
+    /// `worker_proposals` row of kind `deferred_scope` matching this
+    /// marker's `summary=`/`reason=` (see
+    /// [`Self::execution_has_deferred_scope_proposal`]),
+    /// `WorkDb::submit_worker_proposal`'s apply pipeline
+    /// ([`crate::work::proposal_apply`]) already wrote the audit line and
+    /// attention item synchronously at submission time, so the legacy
+    /// marker is skipped rather than re-recorded. Only when no matching
+    /// proposal exists does the legacy parser run, and every time it does,
+    /// `worker_proposals.fallback_hit.deferred_scope` increments and a WARN
+    /// logs — this seam's exit criterion for eventually deleting the
+    /// parser. With the flag off, the marker parser runs unconditionally
+    /// and nothing is counted or skipped.
     pub(super) async fn detect_and_record_deferred_scope(&self, execution: &crate::work::WorkExecution) {
         let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
             return;
         };
+        let proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("deferred_scope_proposals_seam");
         for item in crate::deferred_scope::detect_deferred_scope_items(&text) {
-            self.record_deferred_scope_item(execution, &item).await;
+            if proposals_first && self.execution_has_deferred_scope_proposal(execution, &item) {
+                // Already recorded via the proposal apply pipeline — the
+                // legacy marker documents the same event, not a new one.
+                continue;
+            }
+            let recorded = self.record_deferred_scope_item(execution, &item).await;
+            if proposals_first && recorded {
+                self.record_deferred_scope_fallback_hit(execution, &item);
+            }
         }
+    }
+
+    /// Whether `execution` already carries a `worker_proposals` row of kind
+    /// `deferred_scope` whose `summary`/`reason` both match `item`'s own
+    /// `summary=`/`reason=` fields — the proposals-first check
+    /// [`Self::detect_and_record_deferred_scope`] uses to skip *that
+    /// specific marker's* legacy handling once the worker has used
+    /// `boss propose` instead. Content-aware, not just kind-scoped, mirroring
+    /// [`Self::execution_has_worker_signal_proposal`]'s discipline: a
+    /// malformed marker missing either field is never treated as covered
+    /// (falls through to [`Self::record_deferred_scope_item`], whose own
+    /// marker-line content dedup still prevents a truly redundant marker
+    /// from double-recording).
+    ///
+    /// A storage error fails open (`false`, so the legacy parser still
+    /// runs) rather than silently dropping a real signal.
+    ///
+    /// Field comparisons are trimmed on both sides so a marker whose fields
+    /// differ from the proposal only in incidental leading/trailing
+    /// whitespace still counts as covered, rather than double-recording (see
+    /// [`Self::execution_has_matching_proposal`]).
+    pub(super) fn execution_has_deferred_scope_proposal(
+        &self,
+        execution: &crate::work::WorkExecution,
+        item: &crate::deferred_scope::DeferredScopeItem,
+    ) -> bool {
+        let (marker_summary, marker_reason) = crate::deferred_scope::summary_and_reason(&item.marker_line);
+        let marker_summary = marker_summary.as_deref().map(str::trim);
+        let marker_reason = marker_reason.as_deref().map(str::trim);
+        self.execution_has_matching_proposal(
+            execution,
+            ProposalKind::DeferredScope,
+            "deferred_scope_proposals_seam",
+            |payload| {
+                let proposal_summary = payload.get("summary").and_then(|v| v.as_str()).map(str::trim);
+                let proposal_reason = payload.get("reason").and_then(|v| v.as_str()).map(str::trim);
+                match (marker_summary, marker_reason) {
+                    (Some(s), Some(r)) => proposal_summary == Some(s) && proposal_reason == Some(r),
+                    // A marker missing either field is never treated as
+                    // covered by an existing proposal.
+                    _ => false,
+                }
+            },
+        )
+    }
+
+    /// Count one legacy-parser hit for the deferred-scope seam and log a
+    /// WARN. Called only when `deferred_scope_proposals_seam` is on, no
+    /// proposal covered the marker, and [`Self::record_deferred_scope_item`]
+    /// actually recorded a new item for it — mirrors
+    /// [`Self::record_worker_signal_fallback_hit`]'s discipline of not
+    /// re-incrementing on every subsequent terminal Stop of the same
+    /// cumulative transcript.
+    pub(super) fn record_deferred_scope_fallback_hit(
+        &self,
+        execution: &crate::work::WorkExecution,
+        item: &crate::deferred_scope::DeferredScopeItem,
+    ) {
+        self.record_proposal_fallback_hit(
+            execution,
+            &DEFERRED_SCOPE_FALLBACK_HIT,
+            "deferred_scope_proposals_seam",
+            "deferred_scope",
+            &item.marker_line,
+        );
     }
 
     /// Durably record one [`crate::deferred_scope::DeferredScopeItem`],
@@ -297,11 +441,17 @@ impl WorkerCompletionHandler {
     /// signals do. The attention item's body explicitly frames the decision
     /// left for a human: create a followup task for the deferred item, or
     /// consciously accept the deferral.
+    ///
+    /// Returns whether a new attention item was actually filed (`false` on
+    /// the already-seen early return) so callers — specifically
+    /// [`Self::detect_and_record_deferred_scope`]'s fallback-hit counting —
+    /// can tell a genuinely new marker from a stale one resurfacing on a
+    /// later Stop of the same cumulative transcript.
     pub(super) async fn record_deferred_scope_item(
         &self,
         execution: &crate::work::WorkExecution,
         item: &crate::deferred_scope::DeferredScopeItem,
-    ) {
+    ) -> bool {
         let kind = crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND;
         let already_seen = self
             .work_db
@@ -313,7 +463,7 @@ impl WorkerCompletionHandler {
             })
             .unwrap_or(false);
         if already_seen {
-            return;
+            return false;
         }
 
         let epoch = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -377,6 +527,7 @@ impl WorkerCompletionHandler {
                 );
             }
         }
+        true
     }
 
     /// `Some(reason)` when `execution` has at least one *unresolved*

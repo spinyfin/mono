@@ -132,13 +132,13 @@ mod tests {
     #[test]
     fn detects_well_formed_deferred_scope() {
         let text = "Some prose.\n\n\
-                    [deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new ingestion pipeline\"\n";
+                    [deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline\"\n";
         let items = detect_deferred_scope_items(text);
         assert_eq!(items.len(), 1);
         assert!(items[0].is_well_formed(), "warning: {:?}", items[0].parse_warning);
         assert_eq!(
             items[0].marker_line,
-            "[deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new ingestion pipeline\""
+            "[deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline\""
         );
     }
 
@@ -204,8 +204,10 @@ mod tests {
     #[test]
     fn summary_and_reason_extracts_both_fields() {
         let (summary, reason) =
-            summary_and_reason("[deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new pipeline\"");
-        assert_eq!(summary.as_deref(), Some("T11 data plumbing"));
+            summary_and_reason(
+            "[deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new pipeline\"",
+        );
+        assert_eq!(summary.as_deref(), Some("wiring for the third data source"));
         assert_eq!(reason.as_deref(), Some("needs a new pipeline"));
     }
 

@@ -692,8 +692,10 @@ impl HostAdapter for SshHostAdapter {
             // hit in `worker_proposals.fallback_hit.*` — see the caveat on
             // those counters' declaration in `completion.rs` before using them
             // as an exit criterion. Wire feature flags into the remote path
-            // alongside the cross-host config work (PR3/PR4).
-            (false, self.cfg.work.max_review_embed_diff_lines, false),
+            // alongside the cross-host config work (PR3/PR4). The fourth
+            // `false` mirrors the same hardcoding for
+            // `deferred_scope_proposals_seam` (design implementation task 9).
+            (false, self.cfg.work.max_review_embed_diff_lines, false, false),
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by

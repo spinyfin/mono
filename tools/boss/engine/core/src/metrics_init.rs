@@ -176,8 +176,8 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            60,
-            "expected 4 pr_url_capture + 2 worker_proposals fallback_hit + 3 cube_workspace_lease + \
+            61,
+            "expected 4 pr_url_capture + 3 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 10 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller counters"
         );
