@@ -2275,18 +2275,7 @@ pub async fn run_one_pass(
     // here would either find nothing or, worse, race the Trunk-owned
     // coordination state with a GitHub-side signal that was never armed
     // for this product.
-    let mut rebounce_seen = std::collections::HashSet::new();
-    let rebounce_candidates: Vec<&PendingMergeCheck> = in_review
-        .iter()
-        .chain(blocked_ci.iter())
-        .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
-        .filter(|candidate| !is_trunk_queue_product(work_db, &candidate.product_id))
-        .collect();
-    let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
-    let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
-    for candidate in &rebounce_candidates {
-        check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, &mut outcome).await;
-    }
+    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
 
     // P992 reviewer-fallback sweep: tasks held in `active` (PendingReview)
     // while waiting for an AI reviewer pass that has since finished or timed
@@ -2391,18 +2380,7 @@ pub async fn reconcile_one(
     // See the matching gate in `run_one_pass`: a `trunk_queue` product's
     // dequeue/eviction signal is owned by the Trunk queue poller, not
     // GitHub's merge-queue timeline.
-    let mut rebounce_seen = std::collections::HashSet::new();
-    let rebounce_candidates: Vec<&PendingMergeCheck> = in_review
-        .iter()
-        .chain(blocked_ci.iter())
-        .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
-        .filter(|candidate| !is_trunk_queue_product(work_db, &candidate.product_id))
-        .collect();
-    let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
-    let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
-    for candidate in &rebounce_candidates {
-        check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, &mut outcome).await;
-    }
+    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
 
     let reviewer_stale_secs: u64 = 10 * 60;
     match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
@@ -2739,6 +2717,31 @@ async fn sweep_late_pr(handler: &WorkerCompletionHandler, candidate: &LatePrCand
         // on-Stop path, never from a late-PR recheck.
         | StopOutcome::BuildWaitPending { .. }
         | StopOutcome::DbError => {}
+    }
+}
+
+/// Shared by [`run_one_pass`] and [`reconcile_one`]: dedup `in_review` and
+/// `blocked_ci` by `work_item_id`, drop `trunk_queue` products (see
+/// [`is_trunk_queue_product`]), batch-fetch merge-queue dequeue events for
+/// the remaining candidates, and run [`check_merge_queue_rebounce`] on each.
+async fn run_merge_queue_rebounce_pass(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    in_review: &[PendingMergeCheck],
+    blocked_ci: &[PendingMergeCheck],
+    outcome: &mut SweepOutcome,
+) {
+    let mut rebounce_seen = std::collections::HashSet::new();
+    let rebounce_candidates: Vec<&PendingMergeCheck> = in_review
+        .iter()
+        .chain(blocked_ci.iter())
+        .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
+        .filter(|candidate| !is_trunk_queue_product(work_db, &candidate.product_id))
+        .collect();
+    let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
+    let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
+    for candidate in &rebounce_candidates {
+        check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, outcome).await;
     }
 }
 
@@ -3526,8 +3529,8 @@ fn merge_queue_detail_json(probe: &PrLifecycleProbe) -> Option<String> {
 /// `preserve_merge_queue_state` in [`update_pr_poll_state`] and the
 /// `check_merge_queue_rebounce` gate in [`run_one_pass`]/[`reconcile_one`]).
 /// Defaults to `false` (treat as `direct`) on a missing product or a DB
-/// error, logging the latter — the same fail-open behavior
-/// `update_pr_poll_state` already used before this was extracted.
+/// error, logging the latter — a transient DB failure must not silently
+/// disable GitHub-side merge handling for a `direct` product.
 fn is_trunk_queue_product(work_db: &WorkDb, product_id: &str) -> bool {
     match work_db.get_product(product_id) {
         Ok(Some(product)) => matches!(
@@ -10537,6 +10540,31 @@ mod tests {
             !renumbered,
             "a trunk_queue product's rows must never go through GitHub-native queue renumbering"
         );
+    }
+
+    #[test]
+    fn is_trunk_queue_product_true_for_trunk_queue_mechanism() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "TrunkMechanism", Some("git@github.com:foo/bar.git"));
+        db.set_product_merge_mechanism(&product.id, Some("trunk_queue"))
+            .unwrap();
+
+        assert!(is_trunk_queue_product(&db, &product.id));
+    }
+
+    #[test]
+    fn is_trunk_queue_product_false_for_direct_mechanism() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_with_repo(&db, "DirectMechanism", Some("git@github.com:foo/bar.git"));
+
+        assert!(!is_trunk_queue_product(&db, &product.id));
+    }
+
+    #[test]
+    fn is_trunk_queue_product_false_for_unknown_product() {
+        let (_dir, db) = open_db();
+
+        assert!(!is_trunk_queue_product(&db, "does-not-exist"));
     }
 
     #[test]
