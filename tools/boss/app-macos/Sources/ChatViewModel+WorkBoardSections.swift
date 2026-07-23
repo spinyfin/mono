@@ -16,20 +16,26 @@ extension ChatViewModel {
     /// stable order.
     static func mergingSection(items: [WorkTask]) -> WorkBoardSection? {
         guard !items.isEmpty else { return nil }
-        let details = items.map { MergeQueueDetail.parse($0.mergeQueueDetail) }
-        let keyed = zip(items, details).map { task, detail in
-            (task: task, order: detail?.sectionOrder ?? .max)
+        let keyed = items.map { task in
+            (task: task, detail: MergeQueueDetail.parse(task.mergeQueueDetail))
         }
-        let sorted = keyed.sorted { lhs, rhs in
-            if lhs.order != rhs.order { return lhs.order < rhs.order }
+        let sortedKeyed = keyed.sorted { lhs, rhs in
+            let lhsOrder = lhs.detail?.sectionOrder ?? .max
+            let rhsOrder = rhs.detail?.sectionOrder ?? .max
+            if lhsOrder != rhsOrder { return lhsOrder < rhsOrder }
             return lhs.task.id < rhs.task.id
-        }.map(\.task)
+        }
+        let sorted = sortedKeyed.map(\.task)
         // Queue administration lives in the Trunk web app, not Boss — this
-        // just surfaces that a tracked queue is stalled so the operator
-        // isn't left wondering why the lane stopped moving. First match
-        // wins: multiple distinct paused queues in one Merging section is
-        // rare enough not to warrant enumerating them all here.
-        let queueBanner = details.compactMap { $0?.queueStateBanner }.first
+        // just surfaces that a tracked queue is stalled, so it's clear why
+        // the lane stopped moving. First match wins, read in the same
+        // top-to-bottom lane order the user sees (`sortedKeyed`, not the
+        // caller's `items` order): multiple distinct paused queues in one
+        // Merging section is rare enough not to warrant enumerating them
+        // all here. The banner text carries no product/repo name (single-
+        // product v1); revisit if a second Trunk-queue product makes
+        // "Trunk queue paused" alone ambiguous.
+        let queueBanner = sortedKeyed.compactMap { $0.detail?.queueStateBanner }.first
         return WorkBoardSection(
             id: "done-merging",
             title: "Merging",

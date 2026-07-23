@@ -91,8 +91,8 @@ final class MergeQueueDetailTests: XCTestCase {
         XCTAssertEqual(MergeQueueDetail(position: 3, state: "pending", source: "trunk").trunkBadgeText, "#3")
     }
 
-    func testTrunkBadgeTextPendingWithNoPositionIsNil() {
-        XCTAssertNil(MergeQueueDetail(state: "pending", source: "trunk").trunkBadgeText)
+    func testTrunkBadgeTextPendingWithNoPositionFallsBackToQueued() {
+        XCTAssertEqual(MergeQueueDetail(state: "pending", source: "trunk").trunkBadgeText, "Queued")
     }
 
     func testTrunkBadgeTextTesting() {
@@ -112,6 +112,11 @@ final class MergeQueueDetailTests: XCTestCase {
         XCTAssertNil(MergeQueueDetail(state: "pending_failure", source: "trunk").trunkBadgeText)
     }
 
+    func testTrunkBadgeTextNilForCancelledAndMerged() {
+        XCTAssertNil(MergeQueueDetail(state: "cancelled", source: "trunk").trunkBadgeText)
+        XCTAssertNil(MergeQueueDetail(state: "merged", source: "trunk").trunkBadgeText)
+    }
+
     func testTrunkBadgeTextRendersRawStringForUnknownState() {
         XCTAssertEqual(MergeQueueDetail(state: "some_future_state", source: "trunk").trunkBadgeText, "some_future_state")
     }
@@ -127,6 +132,12 @@ final class MergeQueueDetailTests: XCTestCase {
         XCTAssertTrue(MergeQueueDetail(state: "pending_failure", source: "trunk").isTrunkTerminal)
         XCTAssertFalse(MergeQueueDetail(state: "testing", source: "trunk").isTrunkTerminal)
         XCTAssertFalse(MergeQueueDetail(state: "failed").isTrunkTerminal)
+    }
+
+    func testIsTrunkTerminalForCancelledAndMerged() {
+        XCTAssertTrue(MergeQueueDetail(state: "cancelled", source: "trunk").isTrunkTerminal)
+        XCTAssertTrue(MergeQueueDetail(state: "merged", source: "trunk").isTrunkTerminal)
+        XCTAssertFalse(MergeQueueDetail(state: "cancelled").isTrunkTerminal)
     }
 
     // MARK: - queueStateBanner

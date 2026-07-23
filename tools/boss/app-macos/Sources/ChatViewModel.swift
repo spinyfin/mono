@@ -2069,9 +2069,16 @@ final class ChatViewModel: ObservableObject {
     /// previous notice is replaced when a new refusal fires.
     @Published var dragRefusalNotice: DragRefusalNotice?
 
-    /// Inline confirmation banner shown on a Review-lane card after its
-    /// `merge_when_ready_accepted` reply arrives (`MergeFeedbackNotice`).
-    /// Set and auto-dismissed from `ChatViewModel+EventHandling`.
+    /// Inline confirmation banner shown on the card whose
+    /// `merge_when_ready_accepted` reply just arrived (`MergeFeedbackNotice`)
+    /// — for `trunk_enqueued`/`enqueued` the engine's optimistic
+    /// `merge_queue_state` write routes the card into the Merging section in
+    /// the same handler that emits the reply, so the banner typically shows
+    /// on a Merging-section card, not a Review-lane one. If the Merging
+    /// section is collapsed, the banner is not visible for those actions and
+    /// the 5s auto-dismiss expires unseen — acceptable for now since the
+    /// section defaults to expanded. Set and auto-dismissed from
+    /// `ChatViewModel+EventHandling`.
     @Published var mergeFeedbackNotice: MergeFeedbackNotice?
 
     // MARK: - Optimistic kanban moves

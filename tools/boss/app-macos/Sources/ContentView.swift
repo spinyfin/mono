@@ -2054,11 +2054,14 @@ private struct WorkDragRefusalBanner: View {
     }
 }
 
-/// Inline confirmation banner shown on a Review-lane card right after its
-/// `merge_when_ready_accepted` reply arrives (`ChatViewModel.mergeFeedbackNotice`),
-/// e.g. "Submitted to Trunk merge queue". Auto-dismissed after 5s; the close
-/// button lets the user clear it early. Mirrors `WorkDragRefusalBanner`'s
-/// shape with a positive (green, checkmark) treatment instead of a warning.
+/// Inline confirmation banner shown on the card whose
+/// `merge_when_ready_accepted` reply just arrived (`ChatViewModel.mergeFeedbackNotice`),
+/// e.g. "Submitted to Trunk merge queue" — typically already routed into the
+/// Merging section by the engine's optimistic queue-state write rather than
+/// still sitting in Review (see `mergeFeedbackNotice`'s doc comment). Auto-
+/// dismissed after 5s; the close button lets the user clear it early. Mirrors
+/// `WorkDragRefusalBanner`'s shape with a positive (green, checkmark)
+/// treatment instead of a warning.
 private struct WorkMergeFeedbackBanner: View {
     let message: String
     let onDismiss: () -> Void
@@ -5400,32 +5403,44 @@ struct MergeQueueDetail: Equatable {
 
     /// Badge text for a Trunk-sourced entry, mapping `TrunkPrState` to the
     /// short label `MergeQueueBadge` renders: `pending` shows the queue
-    /// position (`"#3"`, same convention as the GitHub path), `testing`/
-    /// `tests_passed` show a short verb phrase, `not_ready` explains the
-    /// stall (readiness, not a queue-mechanics problem — design doc
-    /// §"not_ready is not a failure"). Any other/future state renders
-    /// Trunk's raw string rather than hiding the card. `nil` for
-    /// `failed`/`pending_failure` (see `isTrunkTerminal`) or a non-Trunk
-    /// entry.
+    /// position (`"#3"`, same convention as the GitHub path) or, during the
+    /// optimistic-submit window before the poller has attached a position
+    /// (engine writes `{"source":"trunk","state":"pending"}` with no
+    /// `position` the instant the merge click lands), falls back to
+    /// `"Queued"` so the card never reads as if it were still on the
+    /// GitHub/Merge-When-Ready path. `testing`/`tests_passed` show a short
+    /// verb phrase, `not_ready` explains the stall (readiness, not a
+    /// queue-mechanics problem — design doc §"not_ready is not a failure").
+    /// Any other/future state renders Trunk's raw string rather than hiding
+    /// the card — but only for states not otherwise known: `cancelled`/
+    /// `merged` are handled by `isTrunkTerminal` instead, same as
+    /// `failed`/`pending_failure`, since all four are retired states rather
+    /// than in-flight ones. `nil` for `failed`/`pending_failure`/
+    /// `cancelled`/`merged` (see `isTrunkTerminal`) or a non-Trunk entry.
     var trunkBadgeText: String? {
         guard isTrunk, let state else { return nil }
         switch state {
-        case "pending": return position.map { "#\($0)" }
+        case "pending": return position.map { "#\($0)" } ?? "Queued"
         case "testing": return "Testing"
         case "tests_passed": return "Merging…"
         case "not_ready": return "Waiting on readiness"
-        case "failed", "pending_failure": return nil
+        case "failed", "pending_failure", "cancelled", "merged": return nil
         default: return state
         }
     }
 
-    /// Whether a Trunk-sourced entry has left the queue on a test failure.
-    /// These states retire the merge intent and snap the card back to
-    /// Review before the badge would ever redraw with them, but the badge
-    /// checks this defensively so a stale render never shows a failure as
-    /// if it were still progressing.
+    /// Whether a Trunk-sourced entry has left the queue on a test failure,
+    /// or otherwise retired without merging (`cancelled`) or completed
+    /// (`merged`). All four states retire the merge intent — `failed`/
+    /// `pending_failure` snap the card back to Review, `cancelled` does the
+    /// same (design doc §"Trunk queue poller" task 5, §"Failure surfacing"),
+    /// and `merged` means the card is about to leave the board entirely —
+    /// before the badge would ever redraw with them, but the badge checks
+    /// this defensively so a stale render never shows a retired entry as if
+    /// it were still progressing.
     var isTrunkTerminal: Bool {
-        isTrunk && (state == "failed" || state == "pending_failure")
+        guard isTrunk, let state else { return false }
+        return ["failed", "pending_failure", "cancelled", "merged"].contains(state)
     }
 
     /// "Trunk queue paused/draining" banner text for the Merging section
@@ -5448,7 +5463,7 @@ struct MergeQueueDetail: Equatable {
 /// for mergeable / unmergeable / checks-running — replacing the old verbose
 /// "merging — #1, awaiting checks" text chip. A Merge-When-Ready card that
 /// hasn't reached the queue yet has no position to show, so it renders the
-/// readiness icon alone (T2531/mono#1939: the old chip's unbounded text
+/// readiness icon alone (mono#1939: the old chip's unbounded text
 /// truncated the PR number off review cards; this one keeps the same
 /// `.layoutPriority(-1)` / single-line shape so the PR link — laid out at
 /// `.layoutPriority(1)` — always wins the available width first).
@@ -5529,7 +5544,12 @@ private struct MergeQueueBadge: View {
         var parts: [String]
         if isTrunk {
             parts = ["PR is in the Trunk merge queue."]
-            if let badgeText {
+            if parsed?.state == "pending" {
+                // `trunkBadgeText` shows a queue position for this state,
+                // not a state name — phrase the tooltip to match instead
+                // of "State: #3.".
+                parts.append(parsed?.position.map { "Queue position \($0)." } ?? "Queued.")
+            } else if let badgeText {
                 parts.append("State: \(badgeText).")
             }
         } else if mergeQueueState == "queued" {
