@@ -24,6 +24,7 @@ use comfy_table::{Cell, ContentArrangement, Table};
 use serde::Serialize;
 
 mod buildkite_release;
+mod propose;
 mod repo_resolution;
 use boss_github as github_app;
 use git_utils::repo_slug::short_name_for;
@@ -193,6 +194,18 @@ enum Commands {
         #[command(subcommand)]
         command: AttentionCommand,
     },
+    /// Submit a mediated worker→engine proposal, or list your own work
+    /// item's proposals across all its executions.
+    ///
+    /// The typed, validated replacement for the `[effort-escalation]` /
+    /// `[blocked]` / `[deferred-scope]` / `FOLLOWUPS:` markers: a
+    /// submission is synchronously validated and persisted before this
+    /// command exits, so a malformed payload comes back as a field-level
+    /// error you can fix and retry in the same run, instead of a silent
+    /// parse failure discovered after you're gone.
+    ///
+    /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
+    Propose(propose::ProposeArgs),
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
@@ -3043,6 +3056,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Attention { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_attention_command(command, &ctx).await
+        }
+        Commands::Propose(args) => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            propose::run_propose_command(args, &ctx).await
         }
         Commands::Engine { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
