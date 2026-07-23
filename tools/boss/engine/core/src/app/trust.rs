@@ -55,11 +55,75 @@ impl Drop for PidFileGuard {
 ///   they kept locking the coordinator out of legitimate calls. Keep
 ///   the tier so any future verb can opt into it explicitly rather
 ///   than accidentally inheriting it.
+/// - `Worker`: the odd one out — a *classification* rather than a
+///   privilege level. `authorize_rpc(Worker, peer)` asks "is this
+///   peer a live worker session?", i.e. does its process ancestry
+///   contain a registered worker pane shell. It is the inverse of the
+///   worker-exclusion clause the two tiers above use as a fallback.
+///   Unlike the other tiers it is deliberately *not* permissive in
+///   test mode: "no trust roots configured" must not mean "everything
+///   is a worker", or an engine started without the macOS app would
+///   confine the coordinator to worker tier.
+///
+///   The live connection-level gate that actually admits a connection
+///   to the worker verb policy ([`boss_engine_worker_policy`]) does
+///   not go through `authorize_rpc(Worker, ..)` — it calls
+///   [`ServerState::classify_peer`] once per connection and checks
+///   [`PeerClass::is_worker`] directly (`handle_frontend_connection`,
+///   `worker_tier_denial`). `authorize_rpc(Worker, ..)` delegates to
+///   the same `classify_peer` call and exists for handlers or tests
+///   that want to ask the classification question through the generic
+///   `authorize_rpc` entry point rather than reaching for
+///   `classify_peer` directly; it is not itself on the production
+///   dispatch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcTier {
     User,
     AppOrBoss,
     BossOnly,
+    Worker,
+}
+
+/// How a frontend connection's socket peer was classified.
+///
+/// Resolved once per connection rather than per request: the `boss` CLI
+/// opens a fresh connection per invocation and the macOS app holds one for
+/// its lifetime, so a per-request ancestry walk would buy nothing and cost a
+/// `proc_pidinfo` chain on every app request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerClass {
+    /// The peer descends from a registered worker pane shell. `run_id` is
+    /// the execution that shell is running — the same id the worker knows as
+    /// `BOSS_RUN_ID`. Carried here (rather than just a `bool`) because the
+    /// verb gate logs it, and because the read verbs coming in later tasks
+    /// scope on it.
+    Worker { run_id: String },
+    /// Everything else: the macOS app, the Boss pane, a plain terminal, a
+    /// connection with no local peer pid at all.
+    ///
+    /// Note the asymmetry this implies, which the design accepts: a worker
+    /// whose lineage to its pane shell has been broken (double-fork,
+    /// reparenting) classifies here and keeps the old unconstrained `User`
+    /// tier, because nothing distinguishes it from the coordinator's own
+    /// shell. Closing *that* would require rejecting the coordinator too.
+    /// What the design's "strictly closed" lean governs is the case where a
+    /// peer *is* classified as a worker but resolution then fails — that
+    /// path refuses rather than falling back (see `app::proposals`).
+    Other,
+}
+
+impl PeerClass {
+    /// The execution this connection belongs to, if it is a worker.
+    pub fn worker_run_id(&self) -> Option<&str> {
+        match self {
+            PeerClass::Worker { run_id } => Some(run_id),
+            PeerClass::Other => None,
+        }
+    }
+
+    pub fn is_worker(&self) -> bool {
+        matches!(self, PeerClass::Worker { .. })
+    }
 }
 
 impl ServerState {
@@ -125,6 +189,15 @@ impl ServerState {
         if matches!(tier, RpcTier::User) {
             return true;
         }
+        // Evaluated before the trust-root shortcut below, deliberately.
+        // `Worker` asks a question about the *worker registry*, not about
+        // the app/Boss trust roots, so the "no trust roots => permissive"
+        // escape hatch does not apply: answering `true` there would classify
+        // the coordinator's own shell as a worker on any engine started
+        // without the macOS app.
+        if matches!(tier, RpcTier::Worker) {
+            return self.classify_peer(peer_pid).is_worker();
+        }
         let app_pid = self.current_app_pid();
         let boss_pid = self.current_boss_pid();
         if app_pid.is_none() && boss_pid.is_none() {
@@ -136,7 +209,9 @@ impl ServerState {
             return false;
         };
         match tier {
-            RpcTier::User => true,
+            // Both handled above; repeated here only to keep the match
+            // exhaustive without a wildcard arm.
+            RpcTier::User | RpcTier::Worker => true,
             RpcTier::AppOrBoss => {
                 // Fast path: peer descends from a known trust root. Common
                 // case is the human running bossctl from the Boss pane
@@ -183,5 +258,101 @@ impl ServerState {
                 !is_descendant_of_any(peer_pid, &worker_pids)
             }
         }
+    }
+
+    /// Classify a frontend connection's socket peer.
+    ///
+    /// This is *verified* identity: the run id comes from walking the peer's
+    /// process ancestry to a pid the engine itself registered at pane spawn
+    /// ([`crate::worker_registry::WorkerRegistry::register`]), never from
+    /// anything the caller supplied. A worker therefore cannot present as a
+    /// different run, and cannot present as the coordinator.
+    ///
+    /// A peer with no pid — a socket whose `SO_PEERCRED`/`LOCAL_PEERPID`
+    /// lookup failed, which in practice means a non-local connection — is
+    /// [`PeerClass::Other`]. That is the v1 remote-worker position from the
+    /// design's non-goals: remote SSH workers cannot present a local peer pid,
+    /// so they get no worker tier (and, at the proposal verbs, an explicit
+    /// `no_local_peer` refusal rather than silent admission).
+    pub fn classify_peer(&self, peer_pid: Option<libc::pid_t>) -> PeerClass {
+        let Some(peer_pid) = peer_pid else {
+            return PeerClass::Other;
+        };
+        match self.worker_registry.lookup_with_ancestor_walk(peer_pid) {
+            Some(run_id) => PeerClass::Worker { run_id },
+            None => PeerClass::Other,
+        }
+    }
+
+    /// Decide whether `request` may run on a connection classified as
+    /// `peer_class`, returning the typed refusal when it may not.
+    ///
+    /// Two gates, in order:
+    ///
+    /// 1. **The flag.** While `worker_rpc_tier` is off, every connection
+    ///    keeps the historical unconditional `RpcTier::User` behaviour, so a
+    ///    rollback is a flag flip rather than a redeploy.
+    /// 2. **The classification.** Only worker-classified peers are subject to
+    ///    the verb policy; the app, the Boss pane, and plain terminals are
+    ///    untouched, which is the "a human/coordinator shell not descended
+    ///    from a worker pid is unaffected" property.
+    pub(super) fn worker_tier_denial(
+        &self,
+        peer_class: &PeerClass,
+        request: &FrontendRequest,
+    ) -> Option<WorkerTierDenial> {
+        if !peer_class.is_worker() {
+            return None;
+        }
+        if !self.feature_flags.is_enabled("worker_rpc_tier") {
+            return None;
+        }
+        worker_verb_decision(request).denial().cloned()
+    }
+
+    /// Per-row scoping for the two verbs [`worker_verb_decision`] allows but
+    /// cannot itself scope, because it is pure over the verb and has no
+    /// caller identity or database access: `GetRun` and `ListRuns`. Both are
+    /// on the worker allowlist because a worker must be able to read its
+    /// *own* run rows, but the design names "work runs of other executions"
+    /// explicitly off-limits (design §"Read-only model access and the
+    /// exposure boundary") — `GetExecution`/`ListExecutions` stay unscoped by
+    /// contrast, because sibling *executions* are part of the model half a
+    /// worker is meant to see.
+    ///
+    /// `ListRuns { execution_id }` compares directly against the caller's own
+    /// execution id. `GetRun { id }` may name either a `run_*` id or (per
+    /// `handle_get_run`'s own fallback) an `exec_*` id, so this resolves it
+    /// the same way the handler does before comparing the *owning* execution
+    /// id — an unresolvable id is left to the handler's own "unknown run"
+    /// response rather than denied here, since no row could be leaked by a
+    /// lookup that failed anyway.
+    pub(super) fn worker_row_scope_denial(
+        &self,
+        peer_class: &PeerClass,
+        request: &FrontendRequest,
+    ) -> Option<WorkerTierDenial> {
+        let caller_execution_id = peer_class.worker_run_id()?;
+        if !self.feature_flags.is_enabled("worker_rpc_tier") {
+            return None;
+        }
+        let owning_execution_id = match request {
+            FrontendRequest::ListRuns { execution_id } => execution_id.clone(),
+            FrontendRequest::GetRun { id } => {
+                self.work_db
+                    .get_run(id)
+                    .ok()
+                    .or_else(|| self.work_db.list_runs(id).ok().and_then(|mut runs| runs.pop()))?
+                    .execution_id
+            }
+            _ => return None,
+        };
+        if owning_execution_id == caller_execution_id {
+            return None;
+        }
+        Some(WorkerTierDenial::closed(
+            variant_name(request),
+            WorkerTierDenialReason::RuntimeIsolation,
+        ))
     }
 }

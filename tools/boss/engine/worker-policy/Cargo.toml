@@ -1,0 +1,9 @@
+[package]
+name = "boss-engine-worker-policy"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-protocol = { path = "../../protocol" }
+serde_json = { workspace = true }

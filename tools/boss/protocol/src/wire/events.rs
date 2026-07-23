@@ -822,6 +822,19 @@ pub enum FrontendEvent {
     ProposalRejected {
         error: ProposalSubmissionError,
     },
+    /// Refusal reply to *any* [`FrontendRequest`] that a worker-tier
+    /// connection is not permitted to call. Sent instead of executing the
+    /// verb, from a gate that runs before dispatch — so no handler ever sees
+    /// the request.
+    ///
+    /// Distinct from the generic [`FrontendEvent::WorkError`] because the
+    /// remediation is structured: [`WorkerTierDenial::use_instead`] names the
+    /// verb to call instead (usually a `boss propose …`), which is the whole
+    /// point of converting the mediation policy from prompt-enforced to
+    /// engine-enforced.
+    WorkerTierDenied {
+        denial: WorkerTierDenial,
+    },
     /// Response to [`FrontendRequest::ListProposals`]: every proposal filed
     /// against `work_item_id` across all its executions, newest first, with
     /// dispositions attached. `work_item_id` echoes the scope the engine

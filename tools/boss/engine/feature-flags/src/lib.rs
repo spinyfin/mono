@@ -231,6 +231,24 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: false,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: "worker_rpc_tier",
+        description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
+             socket peer descends from a registered worker pane shell is classified `RpcTier::Worker` and \
+             confined to the worker verb policy: taxonomy reads, `SubmitProposal`/`ListProposals`, and the \
+             sanctioned telemetry verbs are allowed; mutating taxonomy verbs and everything \
+             coordinator-shaped are refused with a typed `WorkerTierDenied` naming the `boss propose` verb \
+             to use instead. Execution and run rows returned to workers are field-sanitized. Until this \
+             flag is on, the mediation policy is enforced only by prompt text — `boss task update` from a \
+             worker shell executes at `RpcTier::User`, unconditionally allowed. DEFAULT OFF: enabling it \
+             newly denies any script or human debugging session that runs a mutating verb from inside a \
+             worker pane. Kill switch: set false to return every connection to `RpcTier::User` without a \
+             rebuild.",
+        category: "worker-isolation",
+        default_enabled: false,
+        capability_id: None,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.

@@ -35,6 +35,7 @@ mod project;
 mod proposal;
 mod task;
 mod work_item;
+mod worker_tier;
 
 #[cfg(test)]
 mod tests;
@@ -52,3 +53,4 @@ pub use project::*;
 pub use proposal::*;
 pub use task::*;
 pub use work_item::*;
+pub use worker_tier::*;

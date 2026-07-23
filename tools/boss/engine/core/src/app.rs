@@ -118,7 +118,14 @@ pub use app_session::SendToAppError;
 use app_session::{APP_CHANNEL_UNHEALTHY_STREAK, AppChannelHealth, AppSessionHandle};
 use probes::{InFlightProbe, PendingProbe, ProbeLifecycleState, ServerStateProbeQueuer};
 use trust::PidFileGuard;
-pub use trust::RpcTier;
+pub use trust::{PeerClass, RpcTier};
+
+// The worker exposure boundary: the verb policy `trust::worker_tier_denial`
+// consults, and the row sanitizer the writer task applies. Both are pure
+// functions over the wire types — see the crate docs for why they live
+// outside `boss-engine`.
+use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name, worker_verb_decision};
+use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
@@ -1513,6 +1520,28 @@ async fn handle_frontend_connection(
     let work_db = server_state.work_db.clone();
     let session_id = server_state.allocate_session_id();
 
+    // Classify the peer once, here, rather than per request. The `boss` CLI
+    // opens a connection per invocation so this is still per-command for
+    // workers, while the macOS app — which holds one connection for its
+    // lifetime and sends thousands of requests over it — pays a single
+    // ancestry walk instead of one per frame. Registration normally happens
+    // at spawn, before the pane's first `boss` call; on the ack-timeout path
+    // (`spawn_flow.rs`, shell_pid 0) it is deferred until the app sends
+    // `UpdateWorkerShellPid` once the libghostty surface attaches, so a call
+    // in that interval classifies as `Other` and keeps `User` tier — the
+    // same fail-open direction `PeerClass::Other` documents for broken
+    // lineage.
+    let peer_class = server_state.classify_peer(peer_pid);
+    if let Some(run_id) = peer_class.worker_run_id() {
+        tracing::debug!(
+            session_id = %session_id,
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "frontend connection classified as worker tier",
+        );
+    }
+    let peer_is_worker = peer_class.is_worker();
+
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
 
@@ -1527,8 +1556,25 @@ async fn handle_frontend_connection(
     }));
 
     let writer_sink = sink.clone();
+    // Read per event rather than snapshotted at connect, so flipping
+    // `worker_rpc_tier` takes effect on connections that are already open —
+    // the same evaluation point the verb gate uses. Without this, killing the
+    // flag would leave every live worker session still sanitized until it
+    // reconnected, which is not what a kill switch means.
+    let writer_flags = server_state.feature_flags.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(event) = writer_sink.next().await {
+        while let Some(mut event) = writer_sink.next().await {
+            // The exposure boundary's single write choke point. Every frame
+            // leaving a worker-classified connection passes through here —
+            // request responses and topic pushes alike — so no handler has
+            // to remember to sanitize, and a verb added later cannot leak a
+            // `transcript_path` by forgetting to. Non-worker connections
+            // short-circuit on `peer_is_worker`, so the app pays nothing but
+            // a bool test per frame.
+            if peer_is_worker && writer_flags.is_enabled("worker_rpc_tier") {
+                event.payload = sanitize_event_for_worker(event.payload);
+            }
+
             // If this response has a stashed population-timing trace, complete
             // it here: the serialize and socket-write costs live on this task,
             // not the handler's. `None` for every non-population event.
@@ -1621,6 +1667,30 @@ async fn handle_frontend_connection(
         let decode_ms = crate::population_timing::elapsed_ms(decode_start);
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
+
+        // The worker verb gate, ahead of dispatch: a refused verb never
+        // reaches its handler, so there is no path by which a partially
+        // applied mutation escapes. One gate rather than 171 per-handler
+        // checks — the policy itself is an exhaustive match, so a verb added
+        // later cannot slip through unclassified.
+        let row_scope_denial = server_state.worker_row_scope_denial(&peer_class, &request);
+        if let Some(denial) = server_state
+            .worker_tier_denial(&peer_class, &request)
+            .or(row_scope_denial)
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                run_id = peer_class.worker_run_id().unwrap_or("<unresolved>"),
+                verb = %denial.verb,
+                reason = %denial.reason,
+                "worker-tier RPC denied",
+            );
+            let _ = sink.enqueue(FrontendEventEnvelope::response(
+                request_id.clone(),
+                FrontendEvent::WorkerTierDenied { denial },
+            ));
+            continue;
+        }
 
         let ctx = Dispatch::builder()
             .server_state(server_state.clone())
