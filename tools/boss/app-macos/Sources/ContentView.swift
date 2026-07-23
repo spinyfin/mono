@@ -3063,9 +3063,7 @@ private struct PlannerRunPopoverView: View {
             Text(run.outcomeLabel)
                 .font(.subheadline.weight(.medium))
             if let summary = run.resultSummary, !summary.isEmpty {
-                Text(summary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                PlannerResultSummaryView(headline: run.plannerFailureHeadline, raw: summary)
             }
             Divider()
             HStack(spacing: 8) {
@@ -3095,7 +3093,7 @@ private struct PlannerRunPopoverView: View {
             .font(.caption)
         }
         .padding(14)
-        .frame(minWidth: 300)
+        .frame(minWidth: 300, maxWidth: 460, alignment: .leading)
     }
 }
 
@@ -3226,6 +3224,11 @@ private struct PlannerRunRow: View {
                         PlannerRunRationaleText(text: notes)
                     }
                 }
+                if let summary = run.resultSummary, !summary.isEmpty {
+                    section(title: "Result") {
+                        PlannerResultSummaryView(headline: run.plannerFailureHeadline, raw: summary)
+                    }
+                }
                 if hasDebugInfo {
                     debugInfoDisclosure
                 }
@@ -3247,6 +3250,8 @@ private struct PlannerRunRow: View {
                         Text(summary)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.tail)
                     }
                 }
                 Spacer(minLength: 0)
@@ -3332,6 +3337,76 @@ private struct PlannerRunRow: View {
                 ProgressView().controlSize(.small)
             }
         }
+    }
+}
+
+/// Wrapped, capped rendering of a Planner run's `result_summary` — populated
+/// verbatim by the engine, so a `planner_failed` run can carry an arbitrarily
+/// long, multiply-escaped serde diagnostic (see `populator.rs`). Leads with a
+/// short human-readable `headline` when one is available (see
+/// `PlannerRun.plannerFailureHeadline`), always wraps rather than laying the
+/// text out on one unbounded line, caps the raw text to a few lines behind a
+/// "Show more" disclosure so a long payload can't blow out the surrounding
+/// layout, and offers a copy button for the verbatim text a developer would
+/// need to debug something like a schema mismatch.
+struct PlannerResultSummaryView: View {
+    let headline: String?
+    let raw: String
+    @State private var isExpanded = false
+
+    /// Below this, the text always fits comfortably within the collapsed
+    /// line cap, so the "Show more" toggle would just be dead chrome.
+    private static let disclosureThreshold = 200
+
+    private var displayText: String { raw.unescapedForDisplay }
+    private var needsDisclosure: Bool { displayText.count > Self.disclosureThreshold }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let headline {
+                Text(headline)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if isExpanded {
+                ScrollView {
+                    Text(displayText)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
+            } else {
+                Text(displayText)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 10) {
+                if needsDisclosure {
+                    Button(isExpanded ? "Show less" : "Show more") {
+                        withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+                }
+                Button {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(raw, forType: .string)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .font(.caption2)
+                .help("Copy the raw error to the clipboard")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
