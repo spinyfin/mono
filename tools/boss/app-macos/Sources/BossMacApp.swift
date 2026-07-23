@@ -5,6 +5,7 @@ import UpdateCore
 import os.log
 
 private let appUpdateLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
+private let appOpenLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "open-document")
 
 @main
 struct BossMacApp: App {
@@ -206,6 +207,7 @@ private struct OpenMarkdownFileCommand: View {
         panel.allowedContentTypes = [
             UTType(filenameExtension: "md") ?? .plainText,
             UTType(filenameExtension: "markdown") ?? .plainText,
+            UTType(filenameExtension: "mdown") ?? .plainText,
         ]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         chatModel.openLocalMarkdownFile(url: url)
@@ -313,16 +315,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp()
 
-    /// Set by `BossMacApp.task` once `ContentView` has appeared and wired
-    /// [[ChatViewModel.designRendererOpener]]. Used by
-    /// `application(_:open:)` below to route an OS-delivered markdown
-    /// file through the same in-app renderer as File ▸ Open. Any open
-    /// request that arrives before this is set (the app was launched
-    /// directly via `open -a Boss foo.md` / Finder "Open With", so the
-    /// Apple Event can land before the main window finishes appearing)
-    /// is buffered in `pendingMarkdownOpenURLs` and flushed here.
+    /// Set by `BossMacApp.task` once `ContentView` has appeared. The
+    /// flush that matters is gated on
+    /// [[ChatViewModel.onDesignRendererWired]], not on this assignment —
+    /// this setter and the `.task` that wires
+    /// `chatModel.designRendererOpener` (in `ContentView`) are two
+    /// independent SwiftUI tasks with no ordering guarantee, so gating
+    /// the flush here could fire before the renderer is wired and fall
+    /// through to the `NSWorkspace.shared.open` fallback — which, since
+    /// Boss can now be the OS-registered `.md` handler, would bounce the
+    /// file straight back to Boss's own `application(_:open:)`.
     var chatModel: ChatViewModel? {
-        didSet { flushPendingMarkdownOpens() }
+        didSet {
+            chatModel?.onDesignRendererWired = { [weak self] in
+                self?.flushPendingMarkdownOpens()
+            }
+            // The renderer may already have been wired by the time
+            // `chatModel` lands here (the inner `.task` won the race) —
+            // in that case `onDesignRendererWired` already fired once
+            // and won't fire again, so flush directly too.
+            if chatModel?.designRendererOpener != nil {
+                flushPendingMarkdownOpens()
+            }
+        }
     }
     private var pendingMarkdownOpenURLs: [URL] = []
 
@@ -332,29 +347,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Routes every markdown URL through
     /// [[ChatViewModel.openLocalMarkdownFile(url:)]], the same entry point
     /// File ▸ Open (⌘O) uses, so both surfaces render in the same
-    /// design-renderer window.
+    /// design-renderer window. Passes `allowOSFallback: false` — an
+    /// event that arrived from LaunchServices must never be handed back
+    /// to `NSWorkspace.shared.open`.
     func application(_ application: NSApplication, open urls: [URL]) {
         let markdownURLs = urls.filter(Self.isMarkdownFile)
+        let rejectedURLs = urls.filter { !Self.isMarkdownFile($0) }
+        for url in rejectedURLs {
+            appOpenLog.notice("Ignoring non-markdown open-document URL: \(url.path, privacy: .public)")
+        }
         guard !markdownURLs.isEmpty else { return }
-        guard let chatModel else {
+        guard let chatModel, chatModel.designRendererOpener != nil else {
             pendingMarkdownOpenURLs.append(contentsOf: markdownURLs)
             return
         }
         for url in markdownURLs {
-            chatModel.openLocalMarkdownFile(url: url)
+            chatModel.openLocalMarkdownFile(url: url, allowOSFallback: false)
         }
     }
 
     private func flushPendingMarkdownOpens() {
-        guard let chatModel, !pendingMarkdownOpenURLs.isEmpty else { return }
+        guard let chatModel, chatModel.designRendererOpener != nil, !pendingMarkdownOpenURLs.isEmpty else { return }
         let urls = pendingMarkdownOpenURLs
         pendingMarkdownOpenURLs.removeAll()
         for url in urls {
-            chatModel.openLocalMarkdownFile(url: url)
+            chatModel.openLocalMarkdownFile(url: url, allowOSFallback: false)
         }
     }
 
     private static func isMarkdownFile(_ url: URL) -> Bool {
+        let markdownExtensions: Set<String> = ["md", "markdown", "mdown"]
+        if markdownExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
         guard let markdownType = UTType("net.daringfireball.markdown"),
               let type = UTType(filenameExtension: url.pathExtension)
         else { return false }
