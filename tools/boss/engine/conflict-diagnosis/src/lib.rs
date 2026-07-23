@@ -135,22 +135,49 @@ async fn run_git(args: &[&str], workspace_path: &Path, git_dir: &Path) -> std::i
         .await
 }
 
+/// Resolve the jj repo directory (the dir that directly contains
+/// `store/`, `op_store/`, etc.) for `workspace_path`.
+///
+/// In a **primary** jj workspace (or a colocated jj+git dev/test
+/// fixture), `<workspace_path>/.jj/repo` is itself that directory.
+///
+/// In a cube **secondary** workspace, `<workspace_path>/.jj/repo` is
+/// instead a *file* containing the absolute path to the primary
+/// workspace's `.jj/repo` directory — secondary workspaces share one
+/// object store with their siblings rather than owning their own.
+/// This function follows that indirection so callers always end up
+/// with the directory that actually contains `store/git_target`.
+fn resolve_jj_repo_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
+    let repo_path = workspace_path.join(".jj").join("repo");
+
+    if repo_path.is_file() {
+        let raw = std::fs::read_to_string(&repo_path)?;
+        Ok(PathBuf::from(raw.trim()))
+    } else {
+        Ok(repo_path)
+    }
+}
+
 /// Resolve the git directory for `workspace_path`.
 ///
 /// For jj-only cube workspaces (no top-level `.git`), the real git
-/// store is recorded in `.jj/repo/store/git_target` as a relative path
-/// from `.jj/repo/store/`. This function reads that file and returns the
-/// canonicalised absolute path so callers can pass it as `GIT_DIR`.
+/// store is recorded in `<jj-repo-dir>/store/git_target` as a relative
+/// path from `<jj-repo-dir>/store/`, where `<jj-repo-dir>` is resolved
+/// via [`resolve_jj_repo_dir`] to account for secondary workspaces
+/// whose `.jj/repo` is a file pointing at the shared primary store.
+/// This function reads that file and returns the canonicalised
+/// absolute path so callers can pass it as `GIT_DIR`.
 ///
 /// Falls back to `<workspace_path>/.git` when `git_target` is absent,
 /// which covers colocated jj+git workspaces (test fixtures, dev-mode).
 fn resolve_git_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
-    let git_target_file = workspace_path.join(".jj").join("repo").join("store").join("git_target");
+    let jj_repo_dir = resolve_jj_repo_dir(workspace_path)?;
+    let git_target_file = jj_repo_dir.join("store").join("git_target");
 
     if git_target_file.exists() {
         let raw = std::fs::read_to_string(&git_target_file)?;
         let relative = raw.trim();
-        let base = workspace_path.join(".jj").join("repo").join("store");
+        let base = jj_repo_dir.join("store");
         let resolved = base.join(relative).canonicalize()?;
         Ok(resolved)
     } else {
@@ -668,6 +695,77 @@ changed in both\n\
             diag.files.len(),
             1,
             "jj-only workspace: expected one conflicted file, got: {:?}",
+            diag.files
+        );
+        assert_eq!(diag.files[0].path, "a.txt");
+    }
+
+    /// Regression test: `collect` must succeed against a cube
+    /// **secondary** workspace, where `.jj/repo` is a FILE containing
+    /// the path to a separate primary workspace's `.jj/repo` directory
+    /// (the shared-store layout), rather than being that directory
+    /// itself. This is the shape `resolve_git_dir` originally missed —
+    /// it only handled `.jj/repo` as a directory or `.git` at the
+    /// workspace root, so `git_target_file.exists()` was always false
+    /// here and every mono conflict diagnosis silently came back empty.
+    #[tokio::test]
+    async fn collect_against_secondary_cube_workspace_resolves_git_dir() {
+        if which_git().is_none() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        // --- Build a normal git repo with a conflict between main/feature --
+        let git_dir = tempfile::tempdir().unwrap();
+        let git_repo = git_dir.path();
+        run_git(git_repo, &["init", "-q", "--initial-branch=main"]).await;
+        run_git(git_repo, &["config", "user.email", "test@example.invalid"]).await;
+        run_git(git_repo, &["config", "user.name", "Test"]).await;
+
+        std::fs::write(git_repo.join("a.txt"), "alpha\n").unwrap();
+        run_git(git_repo, &["add", "a.txt"]).await;
+        run_git(git_repo, &["commit", "-q", "-m", "init"]).await;
+
+        run_git(git_repo, &["checkout", "-q", "-b", "feature"]).await;
+        std::fs::write(git_repo.join("a.txt"), "feature side\n").unwrap();
+        run_git(git_repo, &["commit", "-q", "-am", "feature"]).await;
+
+        run_git(git_repo, &["checkout", "-q", "main"]).await;
+        std::fs::write(git_repo.join("a.txt"), "main side\n").unwrap();
+        run_git(git_repo, &["commit", "-q", "-am", "main"]).await;
+
+        // --- Build a "primary workspace" jj repo dir, separate from the
+        // secondary workspace we'll actually probe -------------------------
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_repo_dir = primary_dir.path().join(".jj").join("repo");
+        let primary_store = primary_repo_dir.join("store");
+        std::fs::create_dir_all(&primary_store).unwrap();
+        std::fs::write(
+            primary_store.join("git_target"),
+            git_repo.join(".git").to_str().unwrap(),
+        )
+        .unwrap();
+
+        // --- Build the secondary workspace: `.jj/repo` is a FILE pointing
+        // at the primary's `.jj/repo` directory, not a directory itself --
+        let secondary_dir = tempfile::tempdir().unwrap();
+        let ws = secondary_dir.path();
+        std::fs::create_dir_all(ws.join(".jj")).unwrap();
+        std::fs::write(ws.join(".jj").join("repo"), primary_repo_dir.to_str().unwrap()).unwrap();
+        // Intentionally no .git and no .jj/repo/store at the secondary
+        // workspace root — this is the shared-store shape that was
+        // producing "not a git repository" for every mono conflict probe.
+
+        let diag = collect(ws, "main", "feature").await.unwrap();
+        assert!(
+            diag.error.is_none(),
+            "secondary cube workspace: diagnosis errored: {:?}",
+            diag.error
+        );
+        assert_eq!(
+            diag.files.len(),
+            1,
+            "secondary cube workspace: expected one conflicted file, got: {:?}",
             diag.files
         );
         assert_eq!(diag.files[0].path, "a.txt");
