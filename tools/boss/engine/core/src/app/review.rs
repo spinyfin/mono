@@ -116,6 +116,9 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let pr_url2 = pr_url.clone();
                 let kick = server_state.pr_reconciler_kick.clone();
                 let direct_merge_executor = server_state.direct_merge_executor.clone();
+                let work_db2 = work_db.clone();
+                let product_name = product.name.clone();
+                let product_slug = product.slug.clone();
                 tokio::spawn(async move {
                     match direct_merge_executor.execute(&pr_url2).await {
                         Ok(action) => {
@@ -135,11 +138,27 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                             );
                         }
                         Err(err) => {
+                            let message = format!("{err:#}");
+                            if crate::merge_mechanism::is_push_restriction_error(&message) {
+                                let _ = work_db2.create_attention_item(crate::work::CreateAttentionItemInput {
+                                    work_item_id: Some(work_item_id2.clone()),
+                                    kind: crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND.to_owned(),
+                                    title: crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_TITLE.to_owned(),
+                                    body_markdown: crate::merge_mechanism::render_push_restriction_attention_body(
+                                        &product_name,
+                                        &product_slug,
+                                        &message,
+                                    ),
+                                    execution_id: None,
+                                    status: None,
+                                    resolved_at: None,
+                                });
+                            }
                             send_response(
                                 &sink2,
                                 &request_id2,
                                 FrontendEvent::WorkError {
-                                    message: format!("merge_when_ready failed: {err:#}"),
+                                    message: format!("merge_when_ready failed: {message}"),
                                 },
                             );
                         }
