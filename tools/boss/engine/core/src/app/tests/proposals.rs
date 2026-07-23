@@ -186,10 +186,145 @@ async fn submission_persists_a_proposed_row_attributed_to_the_caller() {
     assert!(proposal.id.starts_with("prp_"), "{}", proposal.id);
     assert_eq!(proposal.execution_id, fx.execution_id);
     assert_eq!(proposal.work_item_id.as_deref(), Some(fx.work_item_id.as_str()));
-    // No apply pipeline in this PR: everything stays `proposed`.
+    // `blocked` auto-applies (crate::work::proposal_apply::apply_policy) —
+    // the apply pipeline runs inside the same submission transaction.
+    assert_eq!(proposal.state, ProposalState::Applied);
+    assert!(proposal.applied_ref.as_deref().is_some_and(|r| r.starts_with("attn_")));
+    assert_eq!(proposal.decided_by, Some(boss_protocol::ProposalDecider::Policy));
+    assert!(proposal.decided_at.is_some());
+}
+
+/// The macOS app's deferred-scope badge and Notifications window only
+/// re-fetch on `AttentionItemCreated` (`ChatViewModel+DeferredScope.swift`) —
+/// same as the legacy marker-detector paths in `completion.rs`. A proposal
+/// that auto-applies to a fresh (not replayed) attention item must publish
+/// that event on the work item's product topic, exactly like the legacy
+/// paths do, or the UI never live-updates.
+#[tokio::test]
+async fn a_fresh_auto_applied_proposal_publishes_attention_item_created() {
+    let fx = WorkerFixture::new();
+    let product_id = fx
+        .server_state
+        .work_db
+        .get_work_item(&fx.work_item_id)
+        .unwrap()
+        .product_id()
+        .to_owned();
+
+    // Register and subscribe a session on the product topic so the topic
+    // broker actually has somewhere to deliver the push — the same
+    // subscribe-then-observe flow a real macOS session goes through via
+    // `handle_subscribe`.
+    let push_session = "push-listener";
+    let push_sink = make_session_sink();
+    fx.server_state
+        .topic_broker
+        .register_session(push_session, push_sink.clone())
+        .await;
+    fx.server_state
+        .topic_broker
+        .subscribe(push_session, &[boss_protocol::work_product_topic(&product_id)])
+        .await;
+
+    let (proposal, already) = submitted(submit(&fx, ProposalKind::Blocked, json!({"reason": "stuck"})).await);
+    assert!(!already);
+    assert_eq!(proposal.state, ProposalState::Applied);
+    let applied_ref = proposal.applied_ref.clone().unwrap();
+
+    push_sink.close();
+    let pushed = push_sink
+        .next()
+        .await
+        .expect("an AttentionItemCreated push must have been queued for the subscribed session")
+        .payload;
+    match pushed {
+        FrontendEvent::AttentionItemCreated { item } => assert_eq!(item.id, applied_ref),
+        other => panic!("expected AttentionItemCreated, got {other:?}"),
+    }
+}
+
+/// A replayed (`already_submitted`) proposal did not create a new row this
+/// call, so it must not publish a second `AttentionItemCreated` for the same
+/// item — that would look like a brand-new attention item to the UI.
+#[tokio::test]
+async fn a_replayed_proposal_does_not_republish_attention_item_created() {
+    let fx = WorkerFixture::new();
+    let product_id = fx
+        .server_state
+        .work_db
+        .get_work_item(&fx.work_item_id)
+        .unwrap()
+        .product_id()
+        .to_owned();
+
+    let (first, _) = submitted(
+        call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::Blocked,
+                json!({"reason": "stuck"}),
+                "key-1",
+            ),
+        )
+        .await,
+    );
+    assert_eq!(first.state, ProposalState::Applied);
+
+    let push_session = "push-listener";
+    let push_sink = make_session_sink();
+    fx.server_state
+        .topic_broker
+        .register_session(push_session, push_sink.clone())
+        .await;
+    fx.server_state
+        .topic_broker
+        .subscribe(push_session, &[boss_protocol::work_product_topic(&product_id)])
+        .await;
+
+    let (replay, already) = submitted(
+        call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::Blocked,
+                json!({"reason": "stuck"}),
+                "key-1",
+            ),
+        )
+        .await,
+    );
+    assert!(already);
+    assert_eq!(replay.id, first.id);
+
+    push_sink.close();
+    assert!(
+        push_sink.next().await.is_none(),
+        "a replayed submission must not publish another AttentionItemCreated",
+    );
+}
+
+/// `followup_task` is Gated — it awaits the human batch-accept gesture, so a
+/// fresh submission must land untouched in `proposed`.
+#[tokio::test]
+async fn submission_of_a_gated_kind_stays_proposed() {
+    let fx = WorkerFixture::new();
+
+    let (proposal, _) = submitted(
+        submit(
+            &fx,
+            ProposalKind::FollowupTask,
+            json!({"proposed_name": "N", "proposed_description": "D", "rationale": "R"}),
+        )
+        .await,
+    );
+
     assert_eq!(proposal.state, ProposalState::Proposed);
     assert_eq!(proposal.applied_ref, None);
     assert_eq!(proposal.decided_by, None);
+    assert_eq!(proposal.decided_at, None);
 }
 
 /// The stored payload is the validation layer's canonical form, not the raw
@@ -719,8 +854,18 @@ async fn listing_never_leaks_another_work_items_proposals() {
 #[tokio::test]
 async fn listing_honours_the_kind_and_state_filters() {
     let fx = WorkerFixture::new();
+    // AutoApply — lands `applied`.
     submitted(submit(&fx, ProposalKind::Blocked, json!({"reason": "stuck"})).await);
     submitted(submit(&fx, ProposalKind::DeferredScope, json!({"summary": "S", "reason": "R"})).await);
+    // Gated — stays `proposed`.
+    submitted(
+        submit(
+            &fx,
+            ProposalKind::FollowupTask,
+            json!({"proposed_name": "N", "proposed_description": "D", "rationale": "R"}),
+        )
+        .await,
+    );
 
     let list = |kind, state| {
         call_with_peer(
@@ -738,11 +883,11 @@ async fn listing_honours_the_kind_and_state_filters() {
     assert_eq!(blocked.len(), 1);
     assert_eq!(blocked[0].kind, ProposalKind::Blocked);
 
-    let (_, proposed) = listed(list(None, Some(ProposalState::Proposed)).await);
-    assert_eq!(proposed.len(), 2);
-
     let (_, applied) = listed(list(None, Some(ProposalState::Applied)).await);
-    assert!(applied.is_empty(), "nothing is applied in this PR");
+    assert_eq!(applied.len(), 2, "blocked + deferred_scope auto-applied");
+
+    let (_, proposed) = listed(list(None, Some(ProposalState::Proposed)).await);
+    assert_eq!(proposed.len(), 1, "followup_task is gated");
 }
 
 #[tokio::test]

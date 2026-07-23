@@ -326,6 +326,58 @@ fn pr_created_accepts_a_canonical_url_with_a_branch() {
     assert_eq!(parsed.branch.as_deref(), Some("boss/exec_abc"));
 }
 
+// ── attention_kind must not claim an engine-reserved kind ───────────────────
+
+#[test]
+fn attention_rejects_engine_reserved_attention_kinds() {
+    for reserved in ["worker_escalation", "worker_blocked", "deferred_scope"] {
+        let errors = errs(
+            ProposalKind::Attention,
+            json!({"title": "T", "body_markdown": "B", "attention_kind": reserved}),
+        );
+        assert!(
+            message_for(&errors, "attention_kind").contains(reserved),
+            "expected `{reserved}` to be rejected as reserved, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn attention_accepts_a_non_reserved_attention_kind() {
+    let canonical = ok(
+        ProposalKind::Attention,
+        json!({"title": "T", "body_markdown": "B", "attention_kind": "question"}),
+    );
+    let parsed: AttentionProposalPayload = serde_json::from_str(&canonical).unwrap();
+    assert_eq!(parsed.attention_kind.as_deref(), Some("question"));
+}
+
+// ── deferred_scope's summary/reason feed a quoted marker line ───────────────
+
+#[test]
+fn deferred_scope_rejects_a_double_quote_in_summary_or_reason() {
+    let errors = errs(
+        ProposalKind::DeferredScope,
+        json!({"summary": "has \"quotes\" in it", "reason": "r"}),
+    );
+    assert!(message_for(&errors, "summary").contains("double-quote"), "{errors:?}");
+
+    let errors = errs(
+        ProposalKind::DeferredScope,
+        json!({"summary": "s", "reason": "has \"quotes\" in it"}),
+    );
+    assert!(message_for(&errors, "reason").contains("double-quote"), "{errors:?}");
+}
+
+#[test]
+fn deferred_scope_rejects_an_embedded_newline_in_summary_or_reason() {
+    let errors = errs(
+        ProposalKind::DeferredScope,
+        json!({"summary": "line one\nline two", "reason": "r"}),
+    );
+    assert!(message_for(&errors, "summary").contains("newline"), "{errors:?}");
+}
+
 // ── Rate caps ───────────────────────────────────────────────────────────────
 
 #[test]

@@ -69,36 +69,49 @@ fn list_tasks_kind_filter_sql() -> String {
     .join(", ")
 }
 
+/// The write half of [`WorkDb::create_attention_item`], factored out to a
+/// bare `conn: &Connection` so it can be driven either by that method's own
+/// short-lived transaction, or by another caller that already holds an open
+/// transaction of its own — e.g. [`crate::work::proposal_apply`], which
+/// stamps a `worker_proposals` row and its produced attention item
+/// atomically in one transaction (`Transaction` derefs to `Connection`, so
+/// passing `&tx` here just works).
+pub(crate) fn insert_attention_item_row(
+    conn: &Connection,
+    input: &CreateAttentionItemInput,
+) -> Result<WorkAttentionItem> {
+    let (execution_id, work_item_id) = attention_target_from_input(conn, input)?;
+
+    let id = next_id("attn");
+    let now = now_string();
+    let status = input.status.clone().unwrap_or_else(|| "open".to_owned());
+    let resolved_at = normalize_optional_text(input.resolved_at.clone());
+
+    conn.execute(
+        "INSERT INTO work_attention_items (
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            execution_id,
+            work_item_id,
+            input.kind,
+            status,
+            input.title,
+            input.body_markdown,
+            now,
+            resolved_at,
+        ],
+    )?;
+
+    query_attention_item(conn, &id)?.with_context(|| format!("missing attention item after insert: {id}"))
+}
+
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let (execution_id, work_item_id) = attention_target_from_input(&tx, &input)?;
-
-        let id = next_id("attn");
-        let now = now_string();
-        let status = input.status.unwrap_or_else(|| "open".to_owned());
-        let resolved_at = normalize_optional_text(input.resolved_at);
-
-        tx.execute(
-            "INSERT INTO work_attention_items (
-                id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                execution_id,
-                work_item_id,
-                input.kind,
-                status,
-                input.title,
-                input.body_markdown,
-                now,
-                resolved_at,
-            ],
-        )?;
-
-        let item =
-            query_attention_item(&tx, &id)?.with_context(|| format!("missing attention item after insert: {id}"))?;
+        let item = insert_attention_item_row(&tx, &input)?;
         tx.commit()?;
         Ok(item)
     }

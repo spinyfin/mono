@@ -11,15 +11,22 @@
 //!   `ListProposals`, scoped to a **work item** rather than an execution so a
 //!   resumed or successor run sees prior executions' dispositions.
 //!
-//! Nothing here applies a proposal: every row this module writes lands in
-//! `state = 'proposed'`, and the apply pipeline is a later task.
+//! [`WorkDb::submit_worker_proposal`] also runs the apply pipeline
+//! ([`crate::work::proposal_apply`]) for auto-apply kinds, inside the same
+//! transaction as the insert: `state`/`applied_ref`/`decided_by`/
+//! `decided_at` are stamped on the row from the moment it is written, not
+//! patched in afterward. Gated kinds (no applier yet, or gated by design —
+//! see [`crate::work::proposal_apply::apply_policy`]) land in `state =
+//! 'proposed'` exactly as before.
 //!
 //! Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
 //! §"Data model".
 
 use super::*;
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
-use boss_protocol::{ProposalFieldError, ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal};
+use boss_protocol::{
+    ProposalDecider, ProposalFieldError, ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal,
+};
 
 // ---- input types ----
 
@@ -133,54 +140,110 @@ impl WorkDb {
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The transaction-holding half. Scoped to a block so the `conn`
+        // guard (a lock over `WorkDb`'s single shared connection — see
+        // `WorkDb::connect`'s docs) is dropped before the post-commit
+        // best-effort audit-line append below, which goes through `self`
+        // and would otherwise deadlock trying to re-lock it.
+        let (id, now, state, applied_ref, decided_by, decided_at, post_commit_audit_line) = {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(existing) = find_by_idempotency_key(&tx, input.execution_id, input.idempotency_key)? {
-            // The key matched, but the row it found is a different `kind` —
-            // an explicit key reused across kinds, not a genuine replay. A
-            // caller that submitted `pr_created` must not silently get back
-            // an unrelated `blocked` row with `already_submitted: true`.
-            if existing.kind != input.kind {
-                return Ok(Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
-                    "idempotency_key",
-                    format!(
-                        "idempotency_key `{}` was already used for a `{}` proposal (id {}); reuse it \
-                         only for a genuine retry of the same submission, or choose a different key",
-                        input.idempotency_key, existing.kind, existing.id
-                    ),
-                )])));
+            if let Some(existing) = find_by_idempotency_key(&tx, input.execution_id, input.idempotency_key)? {
+                // The key matched, but the row it found is a different `kind` —
+                // an explicit key reused across kinds, not a genuine replay. A
+                // caller that submitted `pr_created` must not silently get back
+                // an unrelated `blocked` row with `already_submitted: true`.
+                if existing.kind != input.kind {
+                    return Ok(Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                        "idempotency_key",
+                        format!(
+                            "idempotency_key `{}` was already used for a `{}` proposal (id {}); reuse it \
+                             only for a genuine retry of the same submission, or choose a different key",
+                            input.idempotency_key, existing.kind, existing.id
+                        ),
+                    )])));
+                }
+                return Ok(Ok(SubmitWorkerProposalOutcome {
+                    proposal: existing,
+                    already_submitted: true,
+                }));
             }
-            return Ok(Ok(SubmitWorkerProposalOutcome {
-                proposal: existing,
-                already_submitted: true,
-            }));
-        }
 
-        let counts = count_proposals_in_tx(&tx, input.execution_id, input.kind)?;
-        if let Err(refusal) = check_rate_caps(input.kind, counts) {
-            return Ok(Err(refusal));
-        }
+            let counts = count_proposals_in_tx(&tx, input.execution_id, input.kind)?;
+            if let Err(refusal) = check_rate_caps(input.kind, counts) {
+                return Ok(Err(refusal));
+            }
 
-        let id = next_id("prp");
-        let now = now_string();
-        tx.execute(
-            "INSERT INTO worker_proposals
-                 (id, execution_id, work_item_id, kind, payload_json,
-                  idempotency_key, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
+            let id = next_id("prp");
+            let now = now_string();
+
+            // Apply-before-insert: for an AutoApply kind, the produced
+            // `work_attention_items` row and the `worker_proposals` row it
+            // is `applied_ref`-linked from land in the same `INSERT`, so a
+            // reader can never observe one without the other.
+            let apply_outcome = match apply_policy(input.kind) {
+                ProposalApplyPolicy::AutoApply => Some(apply_in_transaction(
+                    &tx,
+                    input.execution_id,
+                    input.payload_json,
+                    input.kind,
+                )?),
+                ProposalApplyPolicy::Gated => None,
+            };
+            let (state, applied_ref, decided_by, decided_at, post_commit_audit_line) = match apply_outcome {
+                Some(outcome) => (
+                    ProposalState::Applied,
+                    Some(outcome.applied_ref),
+                    Some(ProposalDecider::Policy),
+                    Some(now.clone()),
+                    outcome.post_commit_audit_line,
+                ),
+                None => (ProposalState::Proposed, None, None, None, None),
+            };
+
+            tx.execute(
+                "INSERT INTO worker_proposals
+                     (id, execution_id, work_item_id, kind, payload_json,
+                      idempotency_key, state, applied_ref, decided_by, decided_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id,
+                    input.execution_id,
+                    input.work_item_id,
+                    input.kind.as_str(),
+                    input.payload_json,
+                    input.idempotency_key,
+                    state.as_str(),
+                    applied_ref,
+                    decided_by.map(ProposalDecider::as_str),
+                    decided_at,
+                    now,
+                ],
+            )?;
+            tx.commit()?;
+
+            (
                 id,
-                input.execution_id,
-                input.work_item_id,
-                input.kind.as_str(),
-                input.payload_json,
-                input.idempotency_key,
-                ProposalState::Proposed.as_str(),
                 now,
-            ],
-        )?;
-        tx.commit()?;
+                state,
+                applied_ref,
+                decided_by,
+                decided_at,
+                post_commit_audit_line,
+            )
+        };
+
+        if let Some(audit_line) = post_commit_audit_line
+            && let Err(err) = crate::reconcile_audit::append_description_line(self, input.work_item_id, &audit_line)
+        {
+            tracing::warn!(
+                execution_id = %input.execution_id,
+                work_item_id = %input.work_item_id,
+                ?err,
+                "deferred_scope proposal: failed to append audit line to description (non-fatal)",
+            );
+        }
 
         Ok(Ok(SubmitWorkerProposalOutcome {
             proposal: WorkerProposal::builder()
@@ -190,8 +253,11 @@ impl WorkDb {
                 .idempotency_key(input.idempotency_key)
                 .kind(input.kind)
                 .payload_json(input.payload_json)
-                .state(ProposalState::Proposed)
+                .state(state)
                 .work_item_id(input.work_item_id)
+                .maybe_applied_ref(applied_ref)
+                .maybe_decided_by(decided_by)
+                .maybe_decided_at(decided_at)
                 .build(),
             already_submitted: false,
         }))
@@ -319,6 +385,28 @@ mod tests {
         .unwrap()
     }
 
+    /// A `kind`-appropriate valid `payload_json`, varied by `i` so repeated
+    /// calls produce distinct content. This module calls
+    /// `WorkDb::submit_worker_proposal` directly, bypassing the
+    /// `SubmitProposal` RPC handler's `validate_payload` step — so unlike
+    /// the RPC-level tests (`app::tests::proposals`), a wrong-shaped payload
+    /// here isn't caught by validation. It IS caught by the apply
+    /// pipeline's `serde_json` deserialization for auto-apply kinds
+    /// (`crate::work::proposal_apply`), so every kind needs its real shape.
+    fn payload_json_for(kind: ProposalKind, i: usize) -> String {
+        match kind {
+            ProposalKind::Attention => format!(r#"{{"title":"T{i}","body_markdown":"B{i}"}}"#),
+            ProposalKind::EffortEscalation => format!(r#"{{"requested_level":"large","reason":"n{i}"}}"#),
+            ProposalKind::Blocked => format!(r#"{{"reason":"n{i}"}}"#),
+            ProposalKind::DeferredScope => format!(r#"{{"summary":"S{i}","reason":"n{i}"}}"#),
+            ProposalKind::FollowupTask => {
+                format!(r#"{{"proposed_name":"N{i}","proposed_description":"D{i}","rationale":"R{i}"}}"#)
+            }
+            ProposalKind::AutomationOutcome => r#"{"outcome":"skip","reason":"clean"}"#.to_owned(),
+            ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/o/r/pull/{}"}}"#, i + 1),
+        }
+    }
+
     /// Submit `n` distinct proposals of `kind`, asserting each is accepted.
     /// Distinct keys, so none of them collapses onto a replay.
     fn fill(db: &WorkDb, execution_id: &str, work_item_id: &str, kind: ProposalKind, n: usize) {
@@ -328,15 +416,18 @@ mod tests {
                 execution_id,
                 work_item_id,
                 kind,
-                &format!(r#"{{"reason":"n{i}"}}"#),
+                &payload_json_for(kind, i),
                 &format!("key-{kind}-{i}"),
             )
             .unwrap_or_else(|err| panic!("submission {i} of {n} should be under the cap, got {err}"));
         }
     }
 
+    /// `followup_task` is Gated (the human batch-accept gesture decides it,
+    /// per design) — a fresh submission must land untouched in `proposed`
+    /// with no disposition stamped.
     #[test]
-    fn fresh_submission_lands_in_proposed_with_a_prp_id() {
+    fn fresh_submission_of_a_gated_kind_lands_in_proposed_with_a_prp_id() {
         let (_dir, db) = open_db();
         let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
 
@@ -344,8 +435,8 @@ mod tests {
             &db,
             &execution_id,
             &chore_id,
-            ProposalKind::Blocked,
-            r#"{"reason":"stuck"}"#,
+            ProposalKind::FollowupTask,
+            r#"{"proposed_name":"n","proposed_description":"d","rationale":"r"}"#,
             "key-1",
         )
         .unwrap();
@@ -355,11 +446,224 @@ mod tests {
         assert_eq!(outcome.proposal.state, ProposalState::Proposed);
         assert_eq!(outcome.proposal.execution_id, execution_id);
         assert_eq!(outcome.proposal.work_item_id.as_deref(), Some(chore_id.as_str()));
-        assert_eq!(outcome.proposal.kind, ProposalKind::Blocked);
-        // No apply pipeline in this PR — nothing decides a row on submission.
+        assert_eq!(outcome.proposal.kind, ProposalKind::FollowupTask);
         assert_eq!(outcome.proposal.decided_by, None);
         assert_eq!(outcome.proposal.decided_at, None);
         assert_eq!(outcome.proposal.applied_ref, None);
+    }
+
+    // ---- apply pipeline: one test per auto-apply kind ----
+
+    /// `attention` auto-applies straight to a `work_attention_items` row,
+    /// carrying the worker-supplied `attention_kind` through verbatim.
+    #[test]
+    fn auto_apply_attention_creates_an_attention_item_with_the_supplied_kind() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::Attention,
+            r#"{"title":"Heads up","body_markdown":"details","attention_kind":"question"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(
+            outcome.proposal.decided_by,
+            Some(boss_protocol::ProposalDecider::Policy)
+        );
+        assert!(outcome.proposal.decided_at.is_some());
+        let applied_ref = outcome.proposal.applied_ref.clone().expect("applied_ref must be set");
+        assert!(applied_ref.starts_with("attn_"), "{applied_ref}");
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.id == applied_ref)
+            .expect("attention item must exist");
+        assert_eq!(item.kind, "question");
+        assert_eq!(item.title, "Heads up");
+        assert_eq!(item.body_markdown, "details");
+        assert_eq!(item.status, "open");
+    }
+
+    /// `attention` with no `attention_kind` falls back to the engine
+    /// default rather than an empty/invalid `work_attention_items.kind`.
+    #[test]
+    fn auto_apply_attention_defaults_the_kind_when_unspecified() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::Attention,
+            r#"{"title":"Heads up","body_markdown":"details"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items.iter().find(|i| i.id == applied_ref).unwrap();
+        assert_eq!(item.kind, proposal_apply::ATTENTION_PROPOSAL_DEFAULT_KIND);
+    }
+
+    /// `effort_escalation` auto-applies the same as the legacy
+    /// `[effort-escalation]` marker: a `worker_escalation`-kind attention
+    /// item. That row, while unresolved, is the entire auto-nudge-pause
+    /// mechanism (`unresolved_worker_signal_reason` in `completion.rs`
+    /// re-derives it reactively), so asserting the row exists open with
+    /// the right kind is asserting the pause takes effect.
+    #[test]
+    fn auto_apply_effort_escalation_files_a_worker_escalation_attention() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::EffortEscalation,
+            r#"{"requested_level":"large","reason":"multi-subsystem race"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(
+            outcome.proposal.decided_by,
+            Some(boss_protocol::ProposalDecider::Policy)
+        );
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items.iter().find(|i| i.id == applied_ref).unwrap();
+        assert_eq!(item.kind, crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND);
+        assert_eq!(item.status, "open");
+        assert!(item.body_markdown.contains("multi-subsystem race"));
+        assert!(item.body_markdown.contains("large"));
+    }
+
+    /// `blocked` auto-applies the same as the legacy `[blocked]` marker: a
+    /// `worker_blocked`-kind attention item, pausing the auto-nudge loop the
+    /// same reactive way `effort_escalation` does.
+    #[test]
+    fn auto_apply_blocked_files_a_worker_blocked_attention() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::Blocked,
+            r#"{"reason":"bazel E0583 survives clean --expunge"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items.iter().find(|i| i.id == applied_ref).unwrap();
+        assert_eq!(item.kind, crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND);
+        assert_eq!(item.status, "open");
+        assert!(item.body_markdown.contains("bazel E0583"));
+    }
+
+    /// `deferred_scope` auto-applies both legacy-path effects: an attention
+    /// item (atomic with the proposal row, in the same transaction) plus a
+    /// durable audit line on the work item's description (best-effort,
+    /// appended just after commit — see the module doc on
+    /// `crate::work::proposal_apply` for why that half can't be atomic too).
+    #[test]
+    fn auto_apply_deferred_scope_files_an_attention_and_appends_the_audit_line() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::DeferredScope,
+            r#"{"summary":"third data source wiring","reason":"needs a new ingestion pipeline"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items.iter().find(|i| i.id == applied_ref).unwrap();
+        assert_eq!(item.kind, crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND);
+        assert!(item.body_markdown.contains("third data source wiring"));
+        assert!(item.body_markdown.contains("needs a new ingestion pipeline"));
+
+        let work_item = db.get_work_item(&chore_id).unwrap();
+        let description = match &work_item {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.clone(),
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert!(description.contains("[deferred-scope] epoch"), "{description}");
+        assert!(
+            description.contains(r#"summary="third data source wiring""#),
+            "{description}"
+        );
+        assert!(
+            description.contains(r#"reason="needs a new ingestion pipeline""#),
+            "{description}"
+        );
+    }
+
+    /// The attention item the applier writes must carry the real,
+    /// verbatim `[deferred-scope] summary="…" reason="…"` marker line — not
+    /// just prose mentioning the summary/reason — because
+    /// `create_task_from_deferred_scope_attention` (the "Create task" UI
+    /// gesture) re-parses `body_markdown` for exactly that marker. Before
+    /// this fix the applier wrote prose only, so this conversion fell back
+    /// to "(summary not parseable — see marker below)" for every
+    /// proposal-filed deferred_scope item.
+    #[test]
+    fn deferred_scope_applied_attention_is_convertible_to_a_task_with_the_real_summary_and_reason() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::DeferredScope,
+            r#"{"summary":"third data source wiring","reason":"needs a new ingestion pipeline"}"#,
+            "key-1",
+        )
+        .unwrap();
+        let applied_ref = outcome.proposal.applied_ref.unwrap();
+
+        let (_attention, task) = db.create_task_from_deferred_scope_attention(&applied_ref).unwrap();
+
+        assert!(
+            task.description.contains("third data source wiring"),
+            "{}",
+            task.description
+        );
+        assert!(
+            task.description.contains("needs a new ingestion pipeline"),
+            "{}",
+            task.description
+        );
+        assert!(
+            !task.description.contains("not parseable"),
+            "summary/reason must parse from the applier's marker line: {}",
+            task.description
+        );
     }
 
     /// The returned row must be what a later read sees, not an optimistic
@@ -640,6 +944,7 @@ mod tests {
     fn listing_filters_by_kind_and_state() {
         let (_dir, db) = open_db();
         let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        // AutoApply — lands `applied`.
         submit(
             &db,
             &execution_id,
@@ -658,6 +963,16 @@ mod tests {
             "key-d",
         )
         .unwrap();
+        // Gated — stays `proposed`.
+        submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::FollowupTask,
+            r#"{"proposed_name":"n","proposed_description":"d","rationale":"r"}"#,
+            "key-f",
+        )
+        .unwrap();
 
         let blocked = db
             .list_worker_proposals_for_work_item(&chore_id, Some(ProposalKind::Blocked), None)
@@ -666,15 +981,18 @@ mod tests {
         assert_eq!(blocked[0].kind, ProposalKind::Blocked);
 
         assert_eq!(
+            db.list_worker_proposals_for_work_item(&chore_id, None, Some(ProposalState::Applied))
+                .unwrap()
+                .len(),
+            2,
+            "blocked + deferred_scope auto-applied"
+        );
+        assert_eq!(
             db.list_worker_proposals_for_work_item(&chore_id, None, Some(ProposalState::Proposed))
                 .unwrap()
                 .len(),
-            2
-        );
-        assert!(
-            db.list_worker_proposals_for_work_item(&chore_id, None, Some(ProposalState::Applied))
-                .unwrap()
-                .is_empty()
+            1,
+            "followup_task is gated"
         );
     }
 
