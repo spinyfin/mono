@@ -87,6 +87,61 @@ extension PlannerRun {
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map(String.init)
     }
+
+    /// Short, human-readable explanation of a `planner_failed` run, derived
+    /// from the failure tag the engine writes as the `result_summary`
+    /// prefix (`populator.rs`: `result_summary(format!("planner {}: {detail}",
+    /// failure.tag()))`, tags from `PlannerOutcome::tag()` in `planner.rs`).
+    /// `nil` for any other outcome, or when `result_summary` doesn't have
+    /// the expected `"planner <tag>: <detail>"` shape at all (no recognized
+    /// prefix) — callers fall back to the raw text alone rather than showing
+    /// a blank or misleading headline. An unrecognized but well-formed tag
+    /// still yields a generic fallback sentence rather than `nil`.
+    var plannerFailureHeadline: String? {
+        guard outcome == "planner_failed", let resultSummary else { return nil }
+        guard let tag = plannerFailureTag(from: resultSummary) else { return nil }
+        switch tag {
+        case "invalid_output":
+            return "The planner returned output that did not match the expected schema."
+        case "no_api_key":
+            return "The planner call failed: no model API key is configured on the engine."
+        case "api_error":
+            return "The planner call failed: the model API returned an error."
+        case "transport_error":
+            return "The planner call failed: the request to the model could not complete."
+        default:
+            return "The planner call failed unexpectedly."
+        }
+    }
+
+    private func plannerFailureTag(from resultSummary: String) -> String? {
+        guard resultSummary.hasPrefix("planner ") else { return nil }
+        let rest = resultSummary.dropFirst("planner ".count)
+        guard let colonIndex = rest.firstIndex(of: ":") else { return nil }
+        return String(rest[rest.startIndex..<colonIndex])
+    }
+}
+
+extension String {
+    /// Best-effort readability cleanup for diagnostic strings that carry
+    /// multiple levels of backslash-escaping — e.g. a serde error whose
+    /// message embeds the `Debug` form of a `Vec<String>`, itself embedding
+    /// `Debug`-escaped quotes from the original values. This is display-only:
+    /// it collapses `\"`, `\n`, and `\t` escape sequences repeatedly until
+    /// the string stops changing (capped, so a pathological input can't loop
+    /// forever), it does not attempt to parse or validate JSON.
+    var unescapedForDisplay: String {
+        var current = self
+        for _ in 0..<6 {
+            let next = current
+                .replacingOccurrences(of: "\\\"", with: "\"")
+                .replacingOccurrences(of: "\\n", with: "\n")
+                .replacingOccurrences(of: "\\t", with: "\t")
+            if next == current { break }
+            current = next
+        }
+        return current
+    }
 }
 
 /// Swift mirror of `boss_protocol::UnpopulatePreservedTask` — one task
