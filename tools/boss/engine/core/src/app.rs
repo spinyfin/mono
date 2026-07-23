@@ -953,10 +953,10 @@ impl ServerState {
             direct_merge_executor_override.unwrap_or_else(|| Arc::new(merge_when_ready::CommandDirectMergeExecutor));
 
         // Create the live per-slot worker registry and the operator-hold
-        // registry up front (rather than where they were previously
-        // instantiated, further down) so the completion handler — which
-        // needs both for the background-children probe and the idle-park
-        // hold check — and `ServerState` share the SAME instances.
+        // registry before the completion handler is built, so the
+        // completion handler (background-children probe, idle-park hold
+        // check), the coordinator's occupancy guard, and `ServerState` all
+        // share the SAME instances.
         let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
         let live_worker_states_for_coordinator = live_worker_states.clone();
         let live_worker_states_for_completion = live_worker_states.clone();

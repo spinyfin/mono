@@ -415,6 +415,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GitHubAuthDisconnect
         | FrontendRequest::GitHubAuthStart
         | FrontendRequest::GitHubAuthStatus
+        | FrontendRequest::HoldRun { .. }
         | FrontendRequest::KickPrReconcilers
         | FrontendRequest::ListAttentionMerges { .. }
         | FrontendRequest::ListAutomationDedupSuppressions { .. }
@@ -426,6 +427,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ListPlannerRuns { .. }
         | FrontendRequest::MergeWhenReady { .. }
         | FrontendRequest::PlanProject { .. }
+        | FrontendRequest::ReleaseHoldRun { .. }
         | FrontendRequest::ReleaseProject { .. }
         | FrontendRequest::RetryCiRemediation { .. }
         | FrontendRequest::RetryConflictResolution { .. }

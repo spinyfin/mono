@@ -1955,9 +1955,8 @@ async fn build_wait_horizon_expiry_falls_back_to_normal_nudge() {
 }
 
 // -----------------------------------------------------------
-// Background-children suppression (2026-07-17 incident, worker Riker /
-// T2843, `exec_18c31347a0305440_374`). A worker whose Stop-boundary
-// process tree still has live descendant processes — a backgrounded
+// Background-children suppression (observed live 2026-07-17). A worker
+// whose Stop-boundary process tree still has live descendant processes — a backgrounded
 // subagent spawned via the harness Agent tool that has not yet
 // reported back — must not be nudged: the worker's turn genuinely
 // ended, but it is waiting, not stalled.
