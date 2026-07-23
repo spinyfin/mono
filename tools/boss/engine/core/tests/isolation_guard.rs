@@ -9,15 +9,28 @@
 //! isolated paths for `BOSS_EVENTS_SOCKET`, `BOSS_DB_PATH`, and
 //! `BOSS_ENGINE_PID_PATH` from the socket's directory + stem.  This module
 //! validates that derivation and the resulting isolation at the `serve()` level.
+//!
+//! Issue from 2026-07: the engine-control token was resolved via
+//! `default_token_path()` entirely outside this isolation machinery, so a
+//! worker-launched fixture engine wrote — and then, on its own shutdown,
+//! deleted — the production control token. The token is now derived
+//! alongside pid/db/events-socket (see the `token_*` tests below), and
+//! `write_token_file` independently refuses to clobber a token still owned
+//! by a live engine (see `fixture_cannot_overwrite_live_production_token`)
+//! as defense in depth for the case where derivation is bypassed or
+//! misconfigured.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
-use boss_engine::app::{process_is_alive, serve};
+use boss_engine::app::{process_is_alive, run, serve};
+use boss_engine::cli::Cli;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
+use boss_engine::engine_control::ControlTokenFile;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -224,5 +237,141 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
 
     prod_join.abort();
     test_join.abort();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Engine-control token isolation (2026-07 incident)
+// ---------------------------------------------------------------------------
+
+/// Starting an engine through the real `run()` entry point with a
+/// non-default `--socket-path` derives the control-token path alongside
+/// pid/db/events — it must NOT fall through to `default_token_path()`
+/// (which resolves under `$HOME/Library/Application Support/Boss/`, the
+/// production location). This is the direct regression test for the
+/// incident: a worker-launched fixture engine that only sets
+/// `--socket-path` must resolve its own isolated token, never production's.
+#[tokio::test]
+async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let socket_path = temp.path().join("boss-test-token-iso.sock");
+    let expected_token_path = temp.path().join("boss-test-token-iso.token");
+
+    let cli = Cli {
+        socket_path: Some(socket_path.to_string_lossy().into_owned()),
+    };
+    let join = tokio::spawn(async move { run(cli).await });
+
+    if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        join.abort();
+        return Err(anyhow!("engine never bound socket {}", socket_path.display()));
+    }
+
+    assert!(
+        expected_token_path.exists(),
+        "isolated engine must derive its control-token path alongside its socket, at {}",
+        expected_token_path.display()
+    );
+    let parsed: ControlTokenFile = serde_json::from_str(&std::fs::read_to_string(&expected_token_path)?)?;
+    assert_eq!(parsed.pid, std::process::id());
+
+    // The production-shaped default (env HOME=/tmp for this test binary,
+    // per BUILD.bazel) must differ from the derived path, and — if some
+    // other file happens to already exist there — must not have been
+    // touched by this run.
+    let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+    let prod_token_path = PathBuf::from(home).join("Library/Application Support/Boss/engine-control.token");
+    assert_ne!(
+        expected_token_path, prod_token_path,
+        "derived token path must differ from the production default"
+    );
+    if let Ok(raw) = std::fs::read_to_string(&prod_token_path)
+        && let Ok(prod_parsed) = serde_json::from_str::<ControlTokenFile>(&raw)
+    {
+        assert_ne!(
+            prod_parsed.pid,
+            std::process::id(),
+            "test-fixture engine must NOT have written its pid to the production token path"
+        );
+    }
+
+    join.abort();
+    Ok(())
+}
+
+/// Defense in depth for when isolation is bypassed or misconfigured: even
+/// if a second engine resolves the *same* token path as a live engine (the
+/// exact shape of the 2026-07 incident once isolation is stripped away),
+/// `serve()` must refuse to start rather than overwrite it — and the live
+/// engine's token must be provably untouched (same content, same inode)
+/// afterward. Because the write is refused before any
+/// `ControlTokenGuard` is created, the second engine's (failed) shutdown
+/// also cannot delete the file — covering both the escalation and the
+/// denial-of-service halves of the incident in one test.
+#[tokio::test]
+async fn fixture_cannot_overwrite_or_delete_live_production_token() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let prod_token_path = temp.path().join("prod-engine-control.token");
+
+    // "Production" engine: owns the token path for real, stays running.
+    let prod_socket = temp.path().join("prod.sock");
+    let prod_db = temp.path().join("prod.db");
+    let prod_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(prod_db)
+        .build();
+    let prod_cfg = Arc::new(RuntimeConfig::from_parts(prod_work, None));
+    let prod_sock_c = prod_socket.clone();
+    let prod_token_c = prod_token_path.clone();
+    let prod_join =
+        tokio::spawn(async move { serve(prod_cfg, prod_sock_c, None, None, Some(prod_token_c), None).await });
+    if !wait_for_socket(prod_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        prod_join.abort();
+        return Err(anyhow!("production engine never bound socket"));
+    }
+
+    let before_raw = std::fs::read_to_string(&prod_token_path)?;
+    let before_ino = std::fs::metadata(&prod_token_path)?.ino();
+    let before_parsed: ControlTokenFile = serde_json::from_str(&before_raw)?;
+
+    // "Fixture" engine: distinct socket/db, but (simulating an isolation
+    // bug or future misconfigured caller) the SAME token path.
+    let fixture_socket = temp.path().join("fixture.sock");
+    let fixture_db = temp.path().join("fixture.db");
+    let fixture_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(fixture_db)
+        .build();
+    let fixture_cfg = Arc::new(RuntimeConfig::from_parts(fixture_work, None));
+    let fixture_token_c = prod_token_path.clone();
+    let fixture_result = serve(fixture_cfg, fixture_socket, None, None, Some(fixture_token_c), None).await;
+
+    let err = fixture_result.expect_err("fixture engine must refuse to start when the token path is already live");
+    assert!(
+        format!("{err:#}").contains("still owned by live engine"),
+        "unexpected error: {err:#}"
+    );
+
+    // Production's token file must be byte-for-byte and inode-identical —
+    // neither overwritten (escalation) nor deleted (denial of service).
+    let after_raw = std::fs::read_to_string(&prod_token_path)?;
+    let after_ino = std::fs::metadata(&prod_token_path)?.ino();
+    assert_eq!(after_raw, before_raw, "production token content must be unchanged");
+    assert_eq!(
+        after_ino, before_ino,
+        "production token file must be the same inode, not recreated"
+    );
+    let after_parsed: ControlTokenFile = serde_json::from_str(&after_raw)?;
+    assert_eq!(after_parsed.pid, before_parsed.pid);
+    assert_eq!(after_parsed.token, before_parsed.token);
+
+    // Legitimate coordinator paths still work: the production engine is
+    // still alive and its socket still connectable throughout.
+    assert!(
+        wait_for_socket(prod_socket.to_str().unwrap(), Duration::from_secs(1)).await,
+        "production engine's frontend socket must remain reachable throughout"
+    );
+
+    prod_join.abort();
     Ok(())
 }
