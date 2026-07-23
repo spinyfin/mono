@@ -403,13 +403,18 @@ extension ChatViewModel {
             if reviewTerminalVM.windowIsOpen {
                 reviewTerminalVM.state = .ready(content)
             }
-        case .mergeWhenReadyAccepted(let workItemID, _, _):
+        case .mergeWhenReadyAccepted(let workItemID, _, let action):
             // Engine successfully initiated the merge. Clear the in-flight
             // guard so the button re-enables if the user wants to retry.
             // The PR-reconciler was kicked on the engine side, so a
             // WorkItemUpdated event carrying the new merge-queue / merged
             // state will arrive shortly.
             mergingWhenReadyIDs.remove(workItemID)
+            mergeFeedbackNotice = MergeFeedbackNotice(
+                taskID: workItemID,
+                message: Self.mergeWhenReadyFeedbackText(for: action)
+            )
+            scheduleMergeFeedbackDismiss(for: workItemID)
         case .gitHubAuthState(let state):
             // The engine pushes this on every device-flow transition (and
             // as the reply to a `git_hub_auth_*` request). The settings
@@ -593,6 +598,42 @@ extension ChatViewModel {
             || message.hasPrefix("socket waiting:")
             || message.hasPrefix("socket send failed:")
             || message.hasPrefix("socket receive failed:")
+    }
+
+    // MARK: - Merge When Ready confirmation
+
+    /// Confirmation text for `mergeWhenReadyAccepted`'s `action` wire value
+    /// (`MergeAction::as_str()` on the engine — `merge_when_ready.rs`).
+    /// `"trunk_enqueued"` gets its own copy per the Merging UI design doc;
+    /// the other three mechanisms still get a mechanism-specific message
+    /// rather than one generic string, since they describe meaningfully
+    /// different outcomes (queued vs. armed vs. merged immediately).
+    private static func mergeWhenReadyFeedbackText(for action: String) -> String {
+        switch action {
+        case "trunk_enqueued": return "Submitted to Trunk merge queue"
+        case "enqueued": return "Submitted to merge queue"
+        case "auto_merge_enabled": return "Merge When Ready armed"
+        case "merged": return "Merged"
+        default: return "Merge requested"
+        }
+    }
+
+    /// Manual dismiss for the merge-confirmation banner's close button.
+    func clearMergeFeedback() {
+        mergeFeedbackNotice = nil
+    }
+
+    /// Clear `mergeFeedbackNotice` 5s after it was set, unless a newer
+    /// notice (for the same or a different task) has already replaced it.
+    /// Mirrors `scheduleDragRefusalDismiss`.
+    private func scheduleMergeFeedbackDismiss(for taskID: String) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            await MainActor.run { [weak self] in
+                guard let self, self.mergeFeedbackNotice?.taskID == taskID else { return }
+                self.mergeFeedbackNotice = nil
+            }
+        }
     }
 
     // MARK: - Test entry point

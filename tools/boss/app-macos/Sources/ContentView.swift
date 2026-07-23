@@ -1005,7 +1005,8 @@ struct ContentView: View {
                 title: section.title,
                 count: section.items.count,
                 defaultExpanded: section.defaultExpanded,
-                shortIDLabel: sectionProject?.shortID.map { "P" + String($0) }
+                shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
+                banner: section.queueBannerText
             ) {
                 if let sectionProject {
                     HStack(spacing: 6) {
@@ -1064,6 +1065,10 @@ private struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View
     let count: Int
     let defaultExpanded: Bool
     var shortIDLabel: String? = nil
+    /// "Trunk queue paused/draining" (or similar) banner shown under the
+    /// header, always visible regardless of collapse state so a stalled
+    /// queue is noticeable without expanding the section.
+    var banner: String? = nil
     @ViewBuilder let accessory: () -> Accessory
     @ViewBuilder let content: () -> Content
 
@@ -1075,6 +1080,7 @@ private struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View
         count: Int,
         defaultExpanded: Bool,
         shortIDLabel: String? = nil,
+        banner: String? = nil,
         @ViewBuilder accessory: @escaping () -> Accessory = { EmptyView() },
         @ViewBuilder content: @escaping () -> Content
     ) {
@@ -1083,6 +1089,7 @@ private struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View
         self.count = count
         self.defaultExpanded = defaultExpanded
         self.shortIDLabel = shortIDLabel
+        self.banner = banner
         self.accessory = accessory
         self.content = content
         let stored = UserDefaults.standard.object(
@@ -1125,6 +1132,16 @@ private struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View
                 .buttonStyle(.plain)
 
                 accessory()
+            }
+
+            if let banner {
+                HStack(spacing: 4) {
+                    Image(systemName: "pause.circle.fill")
+                        .font(.caption2)
+                    Text(banner)
+                        .font(.caption2)
+                }
+                .foregroundStyle(.orange)
             }
 
             if isExpanded {
@@ -1729,6 +1746,9 @@ private struct WorkBoardCardItem: View {
         let dragRefusal: String? = (model.dragRefusalNotice?.taskID == task.id)
             ? model.dragRefusalNotice?.message
             : nil
+        let mergeFeedback: String? = (model.mergeFeedbackNotice?.taskID == task.id)
+            ? model.mergeFeedbackNotice?.message
+            : nil
         let repoChip = model.repoChip(for: task)
         let designDocProject: WorkProject? = (task.kind == "design" || task.kind == "design_postmortem")
             ? task.projectID.flatMap { model.project(withID: $0) }
@@ -1877,6 +1897,12 @@ private struct WorkBoardCardItem: View {
                     model.clearDragRefusal()
                 }
             }
+
+            if let mergeFeedback {
+                WorkMergeFeedbackBanner(message: mergeFeedback) {
+                    model.clearMergeFeedback()
+                }
+            }
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
@@ -2022,6 +2048,52 @@ private struct WorkDragRefusalBanner: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .strokeBorder(Color.orange.opacity(0.4), lineWidth: 1)
+                )
+        )
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Inline confirmation banner shown on the card whose
+/// `merge_when_ready_accepted` reply just arrived (`ChatViewModel.mergeFeedbackNotice`),
+/// e.g. "Submitted to Trunk merge queue" — typically already routed into the
+/// Merging section by the engine's optimistic queue-state write rather than
+/// still sitting in Review (see `mergeFeedbackNotice`'s doc comment). Auto-
+/// dismissed after 5s; the close button lets the user clear it early. Mirrors
+/// `WorkDragRefusalBanner`'s shape with a positive (green, checkmark)
+/// treatment instead of a warning.
+private struct WorkMergeFeedbackBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .font(.caption)
+                .padding(.top, 1)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss merge confirmation")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.green.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.green.opacity(0.4), lineWidth: 1)
                 )
         )
         .accessibilityElement(children: .combine)
@@ -5263,20 +5335,34 @@ private struct PrCiIndicator: View {
 /// unit-tested without hosting a view (mirrors `AutomationTime`).
 struct MergeQueueDetail: Equatable {
     /// 1-indexed queue position. `nil` while the PR is only Merge-When-Ready
-    /// armed (not yet queued), or when GitHub didn't report one.
+    /// armed (not yet queued), or when GitHub/Trunk didn't report one.
     var position: Int?
-    /// GitHub's raw `mergeQueueEntry.state` (e.g. `"AWAITING_CHECKS"`,
-    /// `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`, `"UNMERGEABLE"`). `nil` while
-    /// not queued, or when GitHub didn't report one.
+    /// The entry's raw state — GitHub's `mergeQueueEntry.state` (e.g.
+    /// `"AWAITING_CHECKS"`, `"MERGEABLE"`, `"LOCKED"`, `"QUEUED"`,
+    /// `"UNMERGEABLE"`) for a GitHub-native entry, or Trunk's lowercase
+    /// `TrunkPrState` (`"pending"`, `"testing"`, `"tests_passed"`,
+    /// `"not_ready"`, `"failed"`, `"cancelled"`, `"pending_failure"`) when
+    /// `source == "trunk"`. `nil` while not queued, or when neither
+    /// reported one.
     var state: String?
     /// RFC 3339 timestamp of when the PR entered the queue. `nil` when
-    /// GitHub didn't report one.
+    /// GitHub/Trunk didn't report one.
     var enqueuedAt: String?
     /// Engine-computed sort key for the kanban "Merging" section — ascending
     /// order matches the real merge-queue order, with Merge-When-Ready cards
     /// (no queue position) always sorting below every queued card. `nil`
     /// only for a malformed/legacy payload; callers should sort those last.
     var sectionOrder: Int64?
+    /// Which mechanism wrote this entry: `"trunk"` for a Trunk-queue
+    /// product's `TrunkQueueProbe`, `nil` for the GitHub-native path (the
+    /// GitHub probe never writes this key — see `trunk_queue_poller.rs`'s
+    /// `live_entry_detail_json`). Disambiguates `state`'s vocabulary, since
+    /// GitHub and Trunk use different (and overlapping-looking) strings.
+    var source: String?
+    /// Trunk's queue-level state (`"RUNNING"`, `"PAUSED"`, `"DRAINING"`,
+    /// `"SWITCHING_MODES"`), distinct from this entry's own `state`. `nil`
+    /// for a GitHub-native entry, which has no equivalent concept.
+    var queueState: String?
 
     /// Parse the engine's JSON blob. Returns `nil` for `nil`/empty/
     /// unparseable input so the caller can fall back to a sane default
@@ -5288,14 +5374,17 @@ struct MergeQueueDetail: Equatable {
             position: (obj["position"] as? NSNumber)?.intValue,
             state: obj["state"] as? String,
             enqueuedAt: obj["enqueued_at"] as? String,
-            sectionOrder: (obj["section_order"] as? NSNumber)?.int64Value
+            sectionOrder: (obj["section_order"] as? NSNumber)?.int64Value,
+            source: obj["source"] as? String,
+            queueState: obj["queue_state"] as? String
         )
     }
 
     /// Human-readable form of `state` for tooltips (e.g.
     /// `"AWAITING_CHECKS"` → `"awaiting checks"`). Falls back to a
     /// lowercased, underscore-stripped rendering of any unrecognised value
-    /// so a future GitHub enum addition still reads sensibly.
+    /// so a future GitHub enum addition still reads sensibly. GitHub-path
+    /// only — Trunk entries render through `trunkBadgeText` instead.
     var displayState: String? {
         guard let state, !state.isEmpty else { return nil }
         switch state.uppercased() {
@@ -5307,6 +5396,66 @@ struct MergeQueueDetail: Equatable {
         default: return state.lowercased().replacingOccurrences(of: "_", with: " ")
         }
     }
+
+    /// Whether this entry was written by the Trunk queue poller rather
+    /// than the GitHub-native probe.
+    var isTrunk: Bool { source == "trunk" }
+
+    /// Badge text for a Trunk-sourced entry, mapping `TrunkPrState` to the
+    /// short label `MergeQueueBadge` renders: `pending` shows the queue
+    /// position (`"#3"`, same convention as the GitHub path) or, during the
+    /// optimistic-submit window before the poller has attached a position
+    /// (engine writes `{"source":"trunk","state":"pending"}` with no
+    /// `position` the instant the merge click lands), falls back to
+    /// `"Queued"` so the card never reads as if it were still on the
+    /// GitHub/Merge-When-Ready path. `testing`/`tests_passed` show a short
+    /// verb phrase, `not_ready` explains the stall (readiness, not a
+    /// queue-mechanics problem — design doc §"not_ready is not a failure").
+    /// Any other/future state renders Trunk's raw string rather than hiding
+    /// the card — but only for states not otherwise known: `cancelled`/
+    /// `merged` are handled by `isTrunkTerminal` instead, same as
+    /// `failed`/`pending_failure`, since all four are retired states rather
+    /// than in-flight ones. `nil` for `failed`/`pending_failure`/
+    /// `cancelled`/`merged` (see `isTrunkTerminal`) or a non-Trunk entry.
+    var trunkBadgeText: String? {
+        guard isTrunk, let state else { return nil }
+        switch state {
+        case "pending": return position.map { "#\($0)" } ?? "Queued"
+        case "testing": return "Testing"
+        case "tests_passed": return "Merging…"
+        case "not_ready": return "Waiting on readiness"
+        case "failed", "pending_failure", "cancelled", "merged": return nil
+        default: return state
+        }
+    }
+
+    /// Whether a Trunk-sourced entry has left the queue on a test failure,
+    /// or otherwise retired without merging (`cancelled`) or completed
+    /// (`merged`). All four states retire the merge intent — `failed`/
+    /// `pending_failure` snap the card back to Review, `cancelled` does the
+    /// same (design doc §"Trunk queue poller" task 5, §"Failure surfacing"),
+    /// and `merged` means the card is about to leave the board entirely —
+    /// before the badge would ever redraw with them, but the badge checks
+    /// this defensively so a stale render never shows a retired entry as if
+    /// it were still progressing.
+    var isTrunkTerminal: Bool {
+        guard isTrunk, let state else { return false }
+        return ["failed", "pending_failure", "cancelled", "merged"].contains(state)
+    }
+
+    /// "Trunk queue paused/draining" banner text for the Merging section
+    /// header (`ChatViewModel.mergingSection`). `nil` while the queue is
+    /// `RUNNING` (the healthy default), for a non-Trunk entry, or when
+    /// Trunk didn't report a queue state.
+    var queueStateBanner: String? {
+        guard isTrunk, let queueState, queueState != "RUNNING" else { return nil }
+        switch queueState {
+        case "PAUSED": return "Trunk queue paused"
+        case "DRAINING": return "Trunk queue draining"
+        case "SWITCHING_MODES": return "Trunk queue switching modes"
+        default: return "Trunk queue \(queueState.lowercased())"
+        }
+    }
 }
 
 /// Compact queue badge for a card in the kanban's "Merging" section (Done
@@ -5314,7 +5463,7 @@ struct MergeQueueDetail: Equatable {
 /// for mergeable / unmergeable / checks-running — replacing the old verbose
 /// "merging — #1, awaiting checks" text chip. A Merge-When-Ready card that
 /// hasn't reached the queue yet has no position to show, so it renders the
-/// readiness icon alone (T2531/mono#1939: the old chip's unbounded text
+/// readiness icon alone (mono#1939: the old chip's unbounded text
 /// truncated the PR number off review cards; this one keeps the same
 /// `.layoutPriority(-1)` / single-line shape so the PR link — laid out at
 /// `.layoutPriority(1)` — always wins the available width first).
@@ -5352,7 +5501,16 @@ private struct MergeQueueBadge: View {
         }
     }
 
+    private var isTrunk: Bool { parsed?.isTrunk ?? false }
+
     private var readiness: Readiness {
+        if isTrunk {
+            switch parsed?.state {
+            case "tests_passed": return .mergeable
+            case "failed", "pending_failure": return .unmergeable
+            default: return .checksRunning // pending, testing, not_ready, unknown, nil
+            }
+        }
         if mergeQueueState == "queued" {
             switch parsed?.state?.uppercased() {
             case "MERGEABLE": return .mergeable
@@ -5372,9 +5530,29 @@ private struct MergeQueueBadge: View {
         return parsed?.position
     }
 
+    /// Primary badge label: Trunk entries render their mapped state text
+    /// (`trunkBadgeText`, e.g. `"Testing"`/`"Merging…"`); everything else
+    /// keeps the plain `"#n"` queue-position rendering.
+    private var badgeText: String? {
+        if isTrunk {
+            return parsed?.trunkBadgeText
+        }
+        return queuePosition.map { "#\($0)" }
+    }
+
     private var tooltipText: String {
         var parts: [String]
-        if mergeQueueState == "queued" {
+        if isTrunk {
+            parts = ["PR is in the Trunk merge queue."]
+            if parsed?.state == "pending" {
+                // `trunkBadgeText` shows a queue position for this state,
+                // not a state name — phrase the tooltip to match instead
+                // of "State: #3.".
+                parts.append(parsed?.position.map { "Queue position \($0)." } ?? "Queued.")
+            } else if let badgeText {
+                parts.append("State: \(badgeText).")
+            }
+        } else if mergeQueueState == "queued" {
             parts = ["PR is in the merge queue."]
             if let queuePosition {
                 parts.append("Queue position \(queuePosition).")
@@ -5390,29 +5568,40 @@ private struct MergeQueueBadge: View {
     }
 
     private var accessibilityLabel: String {
+        if isTrunk, let badgeText {
+            return "\(badgeText), \(readiness.label)"
+        }
         let subject = queuePosition.map { "Queue position \($0)" } ?? "Merge when ready"
         return "\(subject), \(readiness.label)"
     }
 
     var body: some View {
-        HStack(spacing: 3) {
-            if let queuePosition {
-                Text("#\(queuePosition)")
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+        // A Trunk entry that left the queue on a test failure has already
+        // retired its merge intent and snapped the card back to Review —
+        // rendering nothing here (rather than a stale terminal label) is
+        // the correct behavior if a redraw ever races that transition.
+        if parsed?.isTrunkTerminal == true {
+            EmptyView()
+        } else {
+            HStack(spacing: 3) {
+                if let badgeText {
+                    Text(badgeText)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Image(systemName: readiness.systemImage)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(readiness == .mergeable ? Color.green : Color.white)
             }
-            Image(systemName: readiness.systemImage)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(readiness == .mergeable ? Color.green : Color.white)
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(backgroundColor)
+            .clipShape(Capsule())
+            .help(tooltipText)
+            .accessibilityLabel(accessibilityLabel)
         }
-        .foregroundStyle(Color.white)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(backgroundColor)
-        .clipShape(Capsule())
-        .help(tooltipText)
-        .accessibilityLabel(accessibilityLabel)
     }
 
     private var backgroundColor: Color {

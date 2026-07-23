@@ -71,6 +71,33 @@ final class MergingSectionKanbanTests: XCTestCase {
         XCTAssertEqual(section?.items.map(\.id), ["task_a", "task_b", "task_c"])
     }
 
+    func testMergingSectionSetsQueueBannerTextWhenTrunkQueuePaused() {
+        var task = makeTask(id: "task_trunk", status: "in_review", mergeQueueState: "queued", sectionOrder: 1)
+        task.mergeQueueDetail = #"""
+        {"source":"trunk","state":"testing","position":1,"enqueued_at":null,"queue_state":"PAUSED","section_order":1}
+        """#
+
+        let section = ChatViewModel.mergingSection(items: [task])
+        XCTAssertEqual(section?.queueBannerText, "Trunk queue paused")
+    }
+
+    func testMergingSectionQueueBannerTextNilWhenTrunkQueueRunning() {
+        var task = makeTask(id: "task_trunk", status: "in_review", mergeQueueState: "queued", sectionOrder: 1)
+        task.mergeQueueDetail = #"""
+        {"source":"trunk","state":"testing","position":1,"enqueued_at":null,"queue_state":"RUNNING","section_order":1}
+        """#
+
+        let section = ChatViewModel.mergingSection(items: [task])
+        XCTAssertNil(section?.queueBannerText)
+    }
+
+    func testMergingSectionQueueBannerTextNilForGitHubNativeEntries() {
+        let queued = makeTask(id: "task_queued", status: "in_review", mergeQueueState: "queued", sectionOrder: 1)
+
+        let section = ChatViewModel.mergingSection(items: [queued])
+        XCTAssertNil(section?.queueBannerText)
+    }
+
     func testMergingSectionSortsMissingSectionOrderLast() {
         let queued = makeTask(id: "task_queued", status: "in_review", mergeQueueState: "queued", sectionOrder: 1)
         var malformed = makeTask(id: "task_malformed", status: "in_review", mergeQueueState: "auto_merge_enabled", sectionOrder: 0)
