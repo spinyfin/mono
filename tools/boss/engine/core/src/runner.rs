@@ -5768,6 +5768,34 @@ mod compose_prompt_tests {
     }
 
     #[test]
+    fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revision_implementation() {
+        // Mirrors `deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on`
+        // above, but through `compose_revision_directive`'s call site
+        // (runner.rs's `proposals_seam_flags` tuple) rather than the
+        // chore/task-implementation one — the two flags in that tuple are
+        // same-typed bools a future edit could transpose silently, so both
+        // call sites need their own coverage.
+        let work_item = revision_task_with_created_via(None, "operator");
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .deferred_scope_proposals_seam_enabled(true)
+                .build(),
+        );
+        assert!(
+            prompt.contains("boss propose deferred-scope --summary"),
+            "revision prompt, seam on: must teach the deferred-scope verb with a worked example:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("[deferred-scope] summary="),
+            "revision prompt, seam on: must not also teach the legacy marker grammar:\n{prompt}",
+        );
+    }
+
+    #[test]
     fn deferred_scope_directive_absent_for_answer_agent() {
         // The answer agent is read-only and never delivers scope against a
         // brief — it must not be taught a marker it has no reason to emit.
