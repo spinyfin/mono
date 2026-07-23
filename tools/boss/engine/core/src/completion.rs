@@ -98,11 +98,22 @@ crate::register_counter!(
     "staged URL's PR branch did not match execution's expected branch; URL was dropped.",
 );
 
-// Worker-proposal seam migration (task 8): fallback-hit counters for
+// Worker-proposal seam: fallback-hit counters for
 // `detect_and_file_worker_signals`'s legacy marker parsers, incremented only
 // when `worker_signal_proposals_seam` is on and no `worker_proposals` row
 // covered the signal — the exit criterion for eventually deleting each
 // parser (design §"Failure semantics: degrade loudly").
+//
+// Caveat: remote SSH-host workers always render the legacy marker-only
+// prompt text, because `SshHostAdapter` holds no `FeatureFlagsStore` and so
+// hardcodes the prompt-side seam flag to `false` regardless of the engine's
+// (local) read-path flag state (see `host_adapter.rs`'s `compose_worker_spawn`
+// call). Every remote worker's marker therefore counts here even when the
+// read path is proposals-first, indistinguishable from a local worker simply
+// ignoring the `boss propose` directive. Read this counter against local
+// executions only until the remote path also reads feature flags — a nonzero
+// count that includes remote executions does not mean the fallback is not
+// yet quiet.
 crate::register_counter!(
     WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION,
     "worker_proposals.fallback_hit.effort_escalation",
@@ -4920,10 +4931,16 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 // marker documents the same event, not a new one.
                 continue;
             }
-            if proposals_first {
+            let filed = self.file_worker_signal_attention(execution, signal).await;
+            // Only count a fallback hit when the marker actually filed a new
+            // attention item. `detect_and_file_worker_signals` runs on every
+            // terminal Stop and the marker line never disappears from the
+            // transcript once emitted, so without this an execution that
+            // survives N Stops after one uncovered marker would increment
+            // the exit-criterion counter N times instead of once.
+            if proposals_first && filed {
                 self.record_worker_signal_fallback_hit(execution, signal);
             }
-            self.file_worker_signal_attention(execution, signal).await;
         }
     }
 
@@ -4939,11 +4956,14 @@ status is otherwise left unchanged for re-dispatch or manual review."
     /// the `[blocked]` bootstrap marker with a *different* `reason=` must
     /// still have that second, distinct signal filed — kind-scoped skipping
     /// would silently discard it, defeating the bootstrap fallback the
-    /// worker directive exists to provide. When neither the marker nor a
-    /// candidate proposal carries a comparable reason (a malformed marker,
-    /// or — defensively — a payload some future kind omits `reason` from),
-    /// this falls back to the old kind-only comparison rather than treating
-    /// every unreasoned marker as automatically distinct.
+    /// worker directive exists to provide. When the marker itself carries no
+    /// comparable reason (a malformed bare marker with no `reason=`), it is
+    /// never treated as covered by an existing proposal — `validate_blocked_fields`
+    /// already treats a reason-less `[blocked]` as a real signal the worker
+    /// meant to send, so it must fall through to
+    /// [`Self::file_worker_signal_attention`] rather than being silently
+    /// skipped here; that function's own marker-line content dedup still
+    /// keeps a truly redundant bare marker from double-filing.
     ///
     /// A storage error fails open (`false`, so the legacy parser still
     /// runs) rather than silently dropping a real signal — the same
@@ -4969,7 +4989,13 @@ status is otherwise left unchanged for re-dispatch or manual review."
                     .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned));
                 match (marker_reason, proposal_reason.as_deref()) {
                     (Some(m), Some(p)) => m == p,
-                    (None, _) => true,
+                    // A reason-less marker (malformed, or a payload some
+                    // future kind omits `reason` from) is never treated as
+                    // covered by an existing proposal — it falls through to
+                    // `file_worker_signal_attention`, whose own marker-line
+                    // content dedup still prevents a truly redundant bare
+                    // marker from double-filing.
+                    (None, _) => false,
                     (Some(_), None) => false,
                 }
             }),
@@ -4986,10 +5012,14 @@ status is otherwise left unchanged for re-dispatch or manual review."
     }
 
     /// Count one legacy-parser hit for `signal.kind`'s seam and log a WARN.
-    /// Called only when `worker_signal_proposals_seam` is on and no
-    /// proposal covered the signal — i.e. the legacy path just did the work
-    /// the proposal API was supposed to. See the counter declarations above
-    /// for what "exit criterion" means here.
+    /// Called only when `worker_signal_proposals_seam` is on, no proposal
+    /// covered the signal, and [`Self::file_worker_signal_attention`] actually
+    /// filed a new attention item for it — i.e. the legacy path just did the
+    /// work the proposal API was supposed to, for the first time. Skipping
+    /// this when the marker was already-seen keeps the counter from
+    /// re-incrementing on every subsequent terminal Stop of the same
+    /// cumulative transcript. See the counter declarations above for what
+    /// "exit criterion" means here.
     fn record_worker_signal_fallback_hit(&self, execution: &crate::work::WorkExecution, signal: &WorkerSignal) {
         match signal.kind {
             WorkerSignalKind::EffortEscalation => WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION.inc(&self.metrics),
@@ -5015,7 +5045,17 @@ status is otherwise left unchanged for re-dispatch or manual review."
     /// and letting the coordinator's resolution
     /// ([`WorkDb::resolve_worker_signal_attentions_for_execution`]) actually
     /// stick instead of being immediately re-filed from the same stale line.
-    async fn file_worker_signal_attention(&self, execution: &crate::work::WorkExecution, signal: &WorkerSignal) {
+    ///
+    /// Returns whether a new attention item was actually filed (`false` on
+    /// the already-seen early return) so callers — specifically
+    /// [`Self::detect_and_file_worker_signals`]'s fallback-hit counting — can
+    /// tell a genuinely new signal from a stale marker resurfacing on a
+    /// later Stop of the same cumulative transcript.
+    async fn file_worker_signal_attention(
+        &self,
+        execution: &crate::work::WorkExecution,
+        signal: &WorkerSignal,
+    ) -> bool {
         let kind = signal.kind.attention_kind();
         let already_seen = self
             .work_db
@@ -5027,7 +5067,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
             })
             .unwrap_or(false);
         if already_seen {
-            return;
+            return false;
         }
 
         let (title, label) = match signal.kind {
@@ -5082,6 +5122,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 );
             }
         }
+        true
     }
 
     /// Scan `execution`'s Stop-boundary transcript for `[deferred-scope]`
@@ -10749,8 +10790,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     // -----------------------------------------------------------
-    // Worker-proposal seam migration (task 8 of
-    // worker-proposal-api-replace-fragile-worker-to-engine-seams.md):
+    // Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md):
     // `worker_signal_proposals_seam` makes `detect_and_file_worker_signals`
     // read proposals-first, demoting the marker parsers to a counted
     // fallback.
@@ -10873,12 +10913,37 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             Some(0),
             "only the blocked seam fired in this test",
         );
+
+        // The marker line never disappears from the transcript once emitted,
+        // so a second terminal Stop against the same cumulative transcript
+        // must not re-increment the exit-criterion counter — the attention
+        // item is already filed and the fallback hit already counted.
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .count(),
+            1,
+            "the marker is already filed; a repeat Stop must not file a duplicate; got {items:?}",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.blocked"),
+            Some(1),
+            "a repeat Stop against the same already-filed marker must not re-increment the \
+             fallback-hit counter",
+        );
     }
 
     #[tokio::test]
     async fn proposals_first_flag_off_matches_pre_migration_behavior_exactly() {
         // Even with an existing proposal AND the legacy marker both present,
-        // the flag defaulting off must reproduce the exact pre-task-8
+        // the flag defaulting off must reproduce the exact pre-seam
         // behavior: the legacy parser always runs, no proposals-first
         // check, no fallback counting.
         let workspace = tempdir().unwrap();
@@ -10929,7 +10994,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 .count(),
             2,
             "flag off: the proposal apply and the legacy parser each file independently, exactly \
-             as they did before task 8; got {items:?}",
+             as they did before this seam existed; got {items:?}",
         );
         assert_eq!(
             metrics.counter_value("worker_proposals.fallback_hit.effort_escalation"),
@@ -11011,6 +11076,74 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             metrics.counter_value("worker_proposals.fallback_hit.blocked"),
             Some(1),
             "the legacy path fired for the unmatched marker, so the fallback-hit counter must \
+             increment",
+        );
+    }
+
+    #[tokio::test]
+    async fn proposals_first_flag_still_files_a_reasonless_marker_despite_an_existing_proposal() {
+        // Regression test: a malformed bare `[blocked]` marker (no `reason=`)
+        // must never be treated as covered by an existing same-kind
+        // proposal — that would silently drop it, the exact failure mode the
+        // content-aware rewrite exists to remove, just for unreasoned
+        // markers specifically. It must still be filed (and still counted as
+        // a fallback hit), relying on file_worker_signal_attention's own
+        // marker-line dedup to prevent actual double-filing.
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &chore_id,
+            kind: ProposalKind::Blocked,
+            payload_json: r#"{"reason":"reason A"}"#,
+            idempotency_key: "key-1",
+        })
+        .unwrap()
+        .unwrap();
+        write_assistant_transcript(&db, workspace.path(), &execution_id, "[blocked]\n");
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("worker_proposals", true).unwrap();
+        flags.set("worker_signal_proposals_seam", true).unwrap();
+        let metrics = Arc::new(Registry::new());
+        register_metrics(&metrics);
+
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let blocked_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+            .collect();
+        assert_eq!(
+            blocked_items.len(),
+            2,
+            "the bare reason-less marker must be filed independently of the reason-A proposal, \
+             not silently discarded; got {items:?}",
+        );
+        assert!(
+            blocked_items
+                .iter()
+                .any(|i| i.body_markdown.contains("```\n[blocked]\n```")),
+            "the bare marker must be filed by the legacy parser; got {items:?}",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.blocked"),
+            Some(1),
+            "the legacy path fired for the reason-less marker, so the fallback-hit counter must \
              increment",
         );
     }

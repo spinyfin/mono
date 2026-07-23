@@ -1107,6 +1107,7 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
                         .pr_template_set(&pr_template_set)
                         .editorial_enabled(editorial_enabled)
+                        .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                         .build(),
                 )
             }
@@ -1138,6 +1139,7 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
                     .pr_template_set(&pr_template_set)
                     .editorial_enabled(editorial_enabled)
+                    .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                     .build(),
             )
         } else {
@@ -1344,11 +1346,11 @@ struct ExecutionPromptParams<'a> {
     #[builder(default)]
     editorial_enabled: bool,
     /// Whether `worker_signal_proposals_seam` is on — gates the worker-facing
-    /// prompt half of the escalation/blocker migration (task 8 of
-    /// `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`):
+    /// prompt half of this seam
+    /// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md`):
     /// [`worker_escalation_protocol_directive`], the two Bazel pre-push gate
     /// blurbs, and [`no_op_completion_directive`]'s pointer. `false` (the
-    /// flag's registry default) reproduces the exact pre-task-8 marker-only
+    /// flag's registry default) reproduces the exact marker-only
     /// text; `true` teaches the `boss propose` verbs instead — see those
     /// functions' docs. This is the OTHER half of the flag: the engine's
     /// read path (`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`)
@@ -1652,7 +1654,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
         prompt.push_str(&ci_monitoring_directive(execution));
-        // Incident 2026-07-02 (exec_18b5243e65ff188_2d / T2085): teach the
+        // Incident 2026-07-02 (exec_18b5243e65ff188_2d): teach the
         // full escalation/blocker marker syntax so a well-formed marker is
         // the default, not a lucky accident — see the function doc for why.
         prompt.push_str(&worker_escalation_protocol_directive(
@@ -1986,7 +1988,7 @@ fn pr_terminal_directive() -> String {
 ///
 /// `seam_enabled = false` reproduces the pre-migration directive verbatim:
 /// both `[effort-escalation]` and `[blocked]` as markers, no `boss propose`
-/// mention. Incident 2026-07-02 (`exec_18b5243e65ff188_2d`, T2085) is why
+/// mention. Incident 2026-07-02 (`exec_18b5243e65ff188_2d`) is why
 /// the marker syntax is spelled out explicitly rather than left implicit —
 /// a worker hit a bazel blocker it could not resolve, did the right thing
 /// by stopping instead of pushing broken code, and emitted a bare

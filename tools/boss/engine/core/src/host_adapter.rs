@@ -684,14 +684,15 @@ impl HostAdapter for SshHostAdapter {
             // Editorial controls and the worker-proposal-seam prompt gate both
             // default OFF on the remote path: SshHostAdapter does not hold a
             // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
-            // docs). Both flags default off in the registry, and neither
-            // feature yet gates anything on the remote path itself, so
-            // passing `false` for each preserves the original (pre-flag)
-            // behavior — the remote worker gets the legacy `[blocked]` /
-            // `[effort-escalation]` marker text, matching what the engine's
-            // read path does when the seam flag is off. Wire feature flags
-            // into the remote path alongside the cross-host config work
-            // (PR3/PR4).
+            // docs), so this hardcodes `false` regardless of the engine's own
+            // (local) read of `worker_signal_proposals_seam` — the remote
+            // worker always gets the legacy `[blocked]` / `[effort-escalation]`
+            // marker text, even when the engine's read path is
+            // proposals-first. That marker then always counts as a fallback
+            // hit in `worker_proposals.fallback_hit.*` — see the caveat on
+            // those counters' declaration in `completion.rs` before using them
+            // as an exit criterion. Wire feature flags into the remote path
+            // alongside the cross-host config work (PR3/PR4).
             (false, self.cfg.work.max_review_embed_diff_lines, false),
         )
         .await?;

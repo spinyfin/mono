@@ -240,7 +240,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              the worker-facing prompt text that teaches the `boss propose` verbs — so this one \
              switch takes every seam back to its pre-migration marker-only behavior at once, \
              independent of each seam's individual rollout state. DEFAULT OFF: flip on only once \
-             `SubmitProposal`/`ListProposals` themselves (task 2/3 of the design) are validated in \
+             `SubmitProposal`/`ListProposals` themselves are validated in \
              staging. Kill switch: set false to disable every proposal-backed seam immediately, \
              regardless of their individual flags.",
         category: "completion",
@@ -251,7 +251,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         name: "worker_signal_proposals_seam",
         description: "Read worker_proposals rows before falling back to the legacy [effort-escalation]/ \
              [blocked] marker parsers in detect_and_file_worker_signals (design: \
-             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 8: seam migration for \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md — the seam migration for \
              effort-escalation + blocked signals — the first seam migration, establishing the recipe later \
              seams follow). When on, an execution that already carries a worker_proposals row for a given \
              kind (effort_escalation or blocked) skips that kind's legacy marker parser entirely — \
