@@ -24,6 +24,156 @@ fn disk_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+// ── legacy (pre-migration) schema construction ─────────────────────────
+//
+// The migration tests each stand up a hand-written "legacy" schema on
+// disk and then re-open it through `WorkDb::open` so the migration
+// chain runs against it. Those schemas are all the same shape — a
+// `metadata` table carrying the `schema_version` stamp plus some
+// historical prefix of the `products` / `projects` / `tasks` column
+// sets — so the boilerplate lives here and each test declares only
+// what makes its case interesting: the columns the migration under
+// test is about, any extra tables, and its seed rows.
+
+/// Pass to `LegacySchema::products` / `projects` / `tasks` when the
+/// table should be created with only its baseline columns.
+const NO_EXTRA_COLUMNS: &str = "";
+
+/// `projects.last_status_actor`, added in schema v4.
+const PROJECTS_V4_COLUMNS: &str = "last_status_actor TEXT NOT NULL DEFAULT 'human'";
+
+/// `tasks.last_status_actor` + `tasks.priority`, added in schema v4.
+const TASKS_V4_COLUMNS: &str = "last_status_actor TEXT NOT NULL DEFAULT 'human',
+     priority TEXT NOT NULL DEFAULT 'medium'";
+
+/// A drifted variant some legacy fixtures use: `priority` +
+/// `created_via` but no `last_status_actor`. Kept distinct because
+/// those tests only need a DB old enough to lack the column their
+/// migration adds, and the missing actor column is immaterial there.
+const TASKS_NO_ACTOR_COLUMNS: &str = "priority TEXT NOT NULL DEFAULT 'medium',
+     created_via TEXT NOT NULL DEFAULT 'unknown'";
+
+/// The v4 task columns plus `created_via`, added in schema v5.
+fn tasks_v5_columns() -> String {
+    format!("{TASKS_V4_COLUMNS},\n     created_via TEXT NOT NULL DEFAULT 'unknown'")
+}
+
+/// The baseline (schema v3) column list for each legacy table. Later
+/// versions only ever appended columns, so a call site describes its
+/// schema as "baseline + these extras" and the appended order matches
+/// the historical one — which positional `INSERT INTO t VALUES (...)`
+/// seeds depend on.
+const PRODUCTS_BASE_COLUMNS: &str = "id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+     description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+     status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL";
+
+const PROJECTS_BASE_COLUMNS: &str = "id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+     slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+     goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+     priority TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL";
+
+const TASKS_BASE_COLUMNS: &str = "id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+     kind TEXT NOT NULL, name TEXT NOT NULL,
+     description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+     ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+     autostart INTEGER NOT NULL DEFAULT 1";
+
+/// Builder for a pre-migration schema. Emits `metadata` (stamped with
+/// `version`), then whichever of `products` / `projects` / `tasks` the
+/// caller asked for, then any extra DDL, then any seed rows — in that
+/// order, as a single `execute_batch`.
+struct LegacySchema {
+    version: u32,
+    tables: Vec<String>,
+    seeds: Vec<String>,
+}
+
+impl LegacySchema {
+    /// Start a legacy schema whose `metadata.schema_version` is `version`.
+    fn new(version: u32) -> Self {
+        Self {
+            version,
+            tables: Vec::new(),
+            seeds: Vec::new(),
+        }
+    }
+
+    /// Create `products` with the baseline columns plus `extra`
+    /// (`NO_EXTRA_COLUMNS` for baseline only).
+    fn products(self, extra: &str) -> Self {
+        self.table("products", PRODUCTS_BASE_COLUMNS, extra)
+    }
+
+    /// Create `projects` with the baseline columns plus `extra`.
+    fn projects(self, extra: &str) -> Self {
+        self.table("projects", PROJECTS_BASE_COLUMNS, extra)
+    }
+
+    /// Create `tasks` with the baseline columns plus `extra`.
+    fn tasks(self, extra: &str) -> Self {
+        self.table("tasks", TASKS_BASE_COLUMNS, extra)
+    }
+
+    /// Append verbatim DDL (a table this builder has no baseline for).
+    fn ddl(mut self, sql: &str) -> Self {
+        self.tables.push(sql.trim().to_owned());
+        self
+    }
+
+    /// Append verbatim seed statements, run after all DDL.
+    fn seed(mut self, sql: &str) -> Self {
+        self.seeds.push(sql.trim().to_owned());
+        self
+    }
+
+    fn table(mut self, name: &str, base: &str, extra: &str) -> Self {
+        let columns = if extra.trim().is_empty() {
+            base.to_owned()
+        } else {
+            format!("{base},\n     {}", extra.trim())
+        };
+        self.tables.push(format!("CREATE TABLE {name} (\n     {columns});"));
+        self
+    }
+
+    /// Execute the assembled schema against `conn`.
+    fn create(self, conn: &rusqlite::Connection) {
+        let mut sql = String::from("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n");
+        for table in &self.tables {
+            sql.push_str(table);
+            sql.push('\n');
+        }
+        sql.push_str(&format!(
+            "INSERT INTO metadata(key, value) VALUES ('schema_version', '{}');\n",
+            self.version
+        ));
+        for seed in &self.seeds {
+            sql.push_str(seed);
+            sql.push('\n');
+        }
+        conn.execute_batch(&sql)
+            .unwrap_or_else(|e| panic!("legacy schema v{} failed: {e}\n{sql}", self.version));
+    }
+}
+
+/// The `products` seed row every legacy schema plants so the child
+/// rows have a parent. Timestamps are the suite-wide `1700000000`.
+fn legacy_product_seed(id: &str, name: &str, slug: &str) -> String {
+    format!(
+        "INSERT INTO products(id, name, slug, status, created_at, updated_at)
+         VALUES ('{id}', '{name}', '{slug}', 'active', '1700000000', '1700000000');"
+    )
+}
+
+/// The matching `projects` seed row.
+fn legacy_project_seed(id: &str, product_id: &str, name: &str, slug: &str) -> String {
+    format!(
+        "INSERT INTO projects(id, product_id, name, slug, status, priority, created_at, updated_at)
+         VALUES ('{id}', '{product_id}', '{name}', '{slug}', 'planned', 'medium', '1700000000', '1700000000');"
+    )
+}
+
 /// Project creation auto-spawns a `kind = 'design'` task, which
 /// otherwise sits at the head of the project's task chain and
 /// holds the dispatcher's `ready` slot. Most legacy tests pre-date

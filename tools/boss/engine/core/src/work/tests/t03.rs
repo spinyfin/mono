@@ -1265,27 +1265,11 @@ fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
     // Stand up a minimal v3 schema: just `tasks`, `projects`,
     // `metadata`, no dep table, no last_status_actor.
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1);
-             INSERT INTO metadata(key, value) VALUES ('schema_version','3');",
-    )
-    .unwrap();
+    LegacySchema::new(3)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(NO_EXTRA_COLUMNS)
+        .tasks(NO_EXTRA_COLUMNS)
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -1320,35 +1304,13 @@ fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
 fn migration_adds_project_design_doc_columns() {
     let (_dir, path) = disk_db_path("design-doc-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human');
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium');
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_legacy', 'Legacy', 'legacy', 'active', '1700000000', '1700000000');
-             INSERT INTO projects(id, product_id, name, slug, status, priority, created_at, updated_at)
-             VALUES ('proj_legacy', 'prod_legacy', 'Legacy', 'legacy', 'planned', 'medium', '1700000000', '1700000000');
-             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
-    )
-    .unwrap();
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V4_COLUMNS)
+        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
+        .seed(&legacy_project_seed("proj_legacy", "prod_legacy", "Legacy", "legacy"))
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -1420,39 +1382,20 @@ fn create_via_round_trip_per_source() {
 fn migration_adds_created_via_with_unknown_default() {
     let (_dir, path) = disk_db_path("created-via-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human');
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium');
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000');
-             INSERT INTO tasks(id, product_id, project_id, kind, name, description,
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V4_COLUMNS)
+        .seed(&legacy_product_seed("prod_legacy", "L", "l"))
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, description,
                  status, ordinal, pr_url, deleted_at, created_at, updated_at,
                  autostart, last_status_actor, priority)
              VALUES ('task_legacy', 'prod_legacy', NULL, 'chore', 'old', '',
                  'todo', NULL, NULL, NULL, '1700000000', '1700000000',
-                 1, 'human', 'medium');
-             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
-    )
-    .unwrap();
+                 1, 'human', 'medium');",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -1525,41 +1468,25 @@ fn migration_from_v4_adds_tasks_repo_remote_url() {
     let conn = rusqlite::Connection::open(&path).unwrap();
     // Stand up a minimal v4 schema: just enough to round-trip a
     // single task row that pre-dates the new column.
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE products (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE projects (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
-                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 design_doc_repo_remote_url TEXT,
-                 design_doc_branch TEXT,
-                 design_doc_path TEXT);
-             CREATE TABLE tasks (
-                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-                 kind TEXT NOT NULL, name TEXT NOT NULL,
-                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 autostart INTEGER NOT NULL DEFAULT 1,
-                 last_status_actor TEXT NOT NULL DEFAULT 'human',
-                 priority TEXT NOT NULL DEFAULT 'medium');
-             INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_legacy', 'Legacy', 'legacy', 'active',
-                     '1700000000', '1700000000');
-             INSERT INTO tasks(id, product_id, kind, name, status,
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        // This one already has the design-doc pointer columns — the
+        // migration under test is the later `tasks.repo_remote_url`.
+        .projects(
+            "last_status_actor TEXT NOT NULL DEFAULT 'human',
+     design_doc_repo_remote_url TEXT,
+     design_doc_branch TEXT,
+     design_doc_path TEXT",
+        )
+        .tasks(TASKS_V4_COLUMNS)
+        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
+        .seed(
+            "INSERT INTO tasks(id, product_id, kind, name, status,
                                created_at, updated_at)
              VALUES ('task_legacy', 'prod_legacy', 'chore', 'Legacy',
-                     'todo', '1700000000', '1700000000');
-             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
-    )
-    .unwrap();
+                     'todo', '1700000000', '1700000000');",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();

@@ -219,24 +219,12 @@ fn migration_completed_at_backfills_from_created_at_not_updated_at() {
     let conn = rusqlite::Connection::open(&path).unwrap();
 
     // Build a minimal schema without completed_at (simulates pre-v21 DB).
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE products (
-             id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-             description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-             status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-         CREATE TABLE tasks (
-             id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-             kind TEXT NOT NULL, name TEXT NOT NULL,
-             description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-             ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-             autostart INTEGER NOT NULL DEFAULT 1,
-             priority TEXT NOT NULL DEFAULT 'medium',
-             created_via TEXT NOT NULL DEFAULT 'unknown');
-         INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
-         -- done row: created_at=100, updated_at=999 (the buggy re-stamp).
+    LegacySchema::new(20)
+        .products(NO_EXTRA_COLUMNS)
+        .tasks(TASKS_NO_ACTOR_COLUMNS)
+        .seed(&legacy_product_seed("prod_1", "P", "p"))
+        .seed(
+            "-- done row: created_at=100, updated_at=999 (the buggy re-stamp).
          INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
              VALUES ('t_done', 'prod_1', 'chore', 'done-task', 'done', '100', '999');
          -- archived row
@@ -244,10 +232,9 @@ fn migration_completed_at_backfills_from_created_at_not_updated_at() {
              VALUES ('t_arch', 'prod_1', 'chore', 'arch-task', 'archived', '200', '888');
          -- active (non-terminal) row — must remain NULL
          INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
-             VALUES ('t_active', 'prod_1', 'chore', 'active-task', 'active', '300', '300');
-         INSERT INTO metadata(key, value) VALUES ('schema_version', '20');",
-    )
-    .unwrap();
+             VALUES ('t_active', 'prod_1', 'chore', 'active-task', 'active', '300', '300');",
+        )
+        .create(&conn);
     drop(conn);
 
     // Open via WorkDb — this runs all migrations including migrate_tasks_completed_at.
@@ -532,28 +519,15 @@ fn record_worker_idle_abandonment_is_idempotent() {
 fn migration_completed_at_is_idempotent() {
     let (_dir, path) = disk_db_path("migrate-completed-at-idempotent");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE products (
-             id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-             description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
-             status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-         CREATE TABLE tasks (
-             id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
-             kind TEXT NOT NULL, name TEXT NOT NULL,
-             description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
-             ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
-             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-             autostart INTEGER NOT NULL DEFAULT 1,
-             priority TEXT NOT NULL DEFAULT 'medium',
-             created_via TEXT NOT NULL DEFAULT 'unknown');
-         INSERT INTO products(id, name, slug, status, created_at, updated_at)
-             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
-         INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
-             VALUES ('t_done2', 'prod_1', 'chore', 'done2', 'done', '555', '999');
-         INSERT INTO metadata(key, value) VALUES ('schema_version', '20');",
-    )
-    .unwrap();
+    LegacySchema::new(20)
+        .products(NO_EXTRA_COLUMNS)
+        .tasks(TASKS_NO_ACTOR_COLUMNS)
+        .seed(&legacy_product_seed("prod_1", "P", "p"))
+        .seed(
+            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at)
+             VALUES ('t_done2', 'prod_1', 'chore', 'done2', 'done', '555', '999');",
+        )
+        .create(&conn);
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
