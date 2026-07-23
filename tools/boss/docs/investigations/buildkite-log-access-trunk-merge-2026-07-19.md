@@ -13,7 +13,7 @@ This investigation answers two pre-implementation questions from the design's ri
 
 **Log access: yes, verified end-to-end — but not by the route the design assumed.** `prSha` does _not_ locate the failing build (it is the PR's head commit, not the tested construction commit), and GitHub's check-runs API returns _zero_ results for construction commits on flunge (Buildkite posts one legacy build-level commit status there, with no job-uuid fragment). The reliable, verified path is Buildkite-side and branch-based: episode branch name → org-wide build lookup → failed jobs from the build JSON → `bk job log <job-uuid> -p <pipeline> -b <build>`. One real defect found on the way: `BuildkiteLogReader` invokes the bare `bk job log <uuid>` form, which fails with `failed to resolve a pipeline` unless the process cwd is a repo checkout with a resolvable pipeline — the reader needs the pipeline slug and build number threaded through.
 
-**Dedup key: direct verification is blocked on the Trunk API token (task 3), which does not exist yet on the operator machine or in Boss code.** `getSubmittedPullRequest` cannot be called by anything on this machine today, so a deliberate eviction now could not observe `id`/`stateChangedAt` and was not performed (the queue was actively merging production PRs at probe time). Indirect evidence is strong that a per-episode UUID exists and is distinct from the queue id. Either way, the composite key `(id, stateChangedAt-of-the-failed-transition)` is unique per episode under _both_ candidate semantics of `id`, so task 6 does not need to block on the answer. A 10-minute post-token verification runbook is included below.
+**Dedup key: verified post-token on 2026-07-22 (see addendum below) — `getSubmittedPullRequest.id` is per-PR stable, not per-episode.** This directly contradicts this doc's original indirect-evidence guess (Finding 4, superseded). The composite key `(id, stateChangedAt-of-the-failed-transition)` remains unique per episode and is now load-bearing rather than belt-and-braces, since `id` alone collides across episodes of the same PR. `prSha` was also confirmed to be re-read live, not snapshotted at submission — see the addendum for both results and for why the original deliberate-eviction runbook (§ below) could not produce a real eviction and had to be corrected.
 
 ## Anatomy of a queue episode (observed live)
 
@@ -79,17 +79,67 @@ What was established:
 - **Documentation is silent.** Trunk's endpoint reference documents `getSubmittedPullRequest.id` as a bare `type: string` with no description; `stateChangedAt` and `prSha` are equally undescribed; the webhook docs describe payload fields only loosely and defer schemas to the Svix portal. No documented answer exists for id-per-episode vs id-per-PR.
 - **No historical evidence exists.** Across the queue's entire history to date (800 builds ≈ June 25 → now; trunk builds began 2026-07-20 UTC), all 15 `trunk-merge/*` builds passed — **no eviction has ever occurred** — and no PR appears with two episode UUIDs, so resubmission behavior has never been exercised.
 - **No token, no plumbing.** `BOSS_TRUNK_API_TOKEN` is unset, no keychain item exists under `dev.spinyfin.boss.trunk` (or any trunk-named service), and the repo contains no Trunk token plumbing yet (task 3 is unstarted). Nothing on this machine can call `getSubmittedPullRequest` today. A deliberate eviction _now_ therefore could not observe `id`/`stateChangedAt` at all — and the queue was actively merging production Boss PRs at probe time (5 merges in the hour before this probe), so a blind scratch eviction would have delayed real merges for zero information. The deliberate-eviction experiment must ride token provisioning; runbook below.
-- **Indirect evidence favors per-episode ids.** Trunk mints a fresh UUID per submission episode and stamps it into both construction branch names; that UUID is distinct from the queue id. It would be surprising (though not impossible) for `getSubmittedPullRequest.id` to be neither of these.
+- ~~**Indirect evidence favors per-episode ids.** Trunk mints a fresh UUID per submission episode and stamps it into both construction branch names; that UUID is distinct from the queue id. It would be surprising (though not impossible) for `getSubmittedPullRequest.id` to be neither of these.~~ **Superseded 2026-07-22 by live measurement (see the addendum below): `id` is per-PR stable, not per-episode.** The indirect-evidence guess above was wrong — keep it here struck through as a record of what was believed pre-token, not as guidance. Do not rely on this bullet; rely on the addendum's evidence table instead.
 
 **Recommendation for task 6, valid under either semantics:** key `ci_remediations` idempotency on `(trunk_entry_id, stateChangedAt)` captured at the moment the poller first observes `state == failed`. If `id` is per-episode, the pair is trivially unique per episode. If `id` is per-PR-stable, the pair is still unique per episode because each episode's `failed` transition carries a distinct `stateChangedAt`. Repeat sweeps observing the same stuck `failed` state see the same pair (idempotent), and the design already fires only on `failed` (never on `pending_failure`), so the timestamp is stable for the lifetime of the episode's terminal state. Record `(prNumber, prSha, stateChangedAt)` alongside for provenance; it is the documented fallback key and costs nothing to store. The only loss-mode either key shares is a _missed_ observation (human resubmits before the next sweep) — that is a poller-cadence question, covered by the design's `listPullRequests since=` reconciliation backstop, not a key-shape question.
 
-### Post-token verification runbook (~10 minutes, do first thing after task 3 lands)
+### Post-token verification — completed 2026-07-22
 
-1. Create a scratch branch on `brianduff/flunge` with a change that deterministically fails `flunge-ci` (e.g. break a backend test); open a scratch PR.
-2. `POST /v1/getSubmittedPullRequest` before submission (expect not-found), then submit via `POST /v1/submitPullRequest`; immediately record `{id, stateChangedAt, prSha}` — **check whether `id` equals the `trunk-merge/pr-<N>/<uuid>` branch UUID** that appears in Buildkite within seconds (this also decides whether step 1 of the evidence recipe can use the direct branch-name form).
-3. Poll until `state == failed` (flunge CI ≈ 1 minute); record `{id, stateChangedAt}` at `failed`. Confirm a failed `trunk-merge/pr-<N>/<uuid>` build exists and its failed-job log is fetchable per the recipe above.
-4. Resubmit the same PR; record `{id, stateChangedAt}` for the second episode. `id` changed ⇒ per-episode (primary key confirmed); `id` unchanged ⇒ per-PR (composite key still holds; note it in the task-6 PR).
-5. `POST /v1/cancelPullRequest`, close the scratch PR, delete the branch.
+Run live (operator-authorized) against scratch PR `brianduff/flunge#1063`, 2026-07-22 18:32–18:35 PDT. **Do not re-run this experiment** — results below are final for the questions they answer; the remaining open items (construction-branch UUID comparison, direct branch-name lookup from `id`, failed-job-log fetch) are unresolved for a structural reason (Finding 3 below) and need a corrected recipe, not a repeat of this run.
+
+**Result 1 — `id` is per-PR stable, not per-episode.** Same PR #1063 across a full cancel → resubmit cycle:
+
+| event                     | id                                     | state       | stateChangedAt           |
+| ------------------------- | -------------------------------------- | ----------- | ------------------------ |
+| submit 18:32:50 PDT       | `36883b5b-bbae-4841-b239-a554d73e6f30` | `not_ready` | 2026-07-23T01:32:50.000Z |
+| cancel 18:34:15 PDT       | `36883b5b-bbae-4841-b239-a554d73e6f30` | `cancelled` | 2026-07-23T01:34:15.000Z |
+| resubmit 18:34:15 PDT     | `36883b5b-bbae-4841-b239-a554d73e6f30` | `not_ready` | 2026-07-23T01:34:15.000Z |
+| final cancel 18:35:03 PDT | `36883b5b-bbae-4841-b239-a554d73e6f30` | `cancelled` | 2026-07-23T01:35:03.000Z |
+
+`id` never changed while `stateChangedAt` advanced on every transition — this contradicts Finding 4's original indirect-evidence guess (per-episode). Consequence for task 6: the `(id, stateChangedAt)` composite key is **load-bearing, not belt-and-braces** — `id` alone would collide across episodes of the same PR.
+
+**Caveat — this was cancel → resubmit, not eviction → resubmit.** No real eviction was produced in this run (see Result 3 below), so it remains an open question whether an _eviction_ specifically mints a new `id` the way a manual cancel does not. Treat that as unresolved, not as covered by the table above.
+
+**Result 2 — `prSha` is re-read live, not snapshotted at submission.** A second commit pushed mid-episode moved `prSha` immediately while `id` and `stateChangedAt` held steady:
+
+- before: `prSha = fa0f1b1e29388193dc5c135a1e675bf4eaff8d9f`
+- after pushing `8f5b91d1`: `prSha = 8f5b91d123d37e6cb521683c6339174e6b3cc406`, `stateChangedAt` unchanged at `01:34:15.000Z`
+
+This closes this doc's second Open Question outright. It also means **`prSha` is unsafe as a provenance/dedup field** — it can mutate mid-episode without any corresponding state or timestamp change, so a consumer that reads it more than once during the same episode cannot treat two different values as evidence of two different episodes.
+
+**Result 3 — the original runbook below is flawed; a scratch PR that fails its own CI never reaches the queue.** Submitting a PR whose own `flunge-ci` deterministically fails produced:
+
+```json
+{
+  "state": "not_ready",
+  "readiness": { "gitHubMergeability": "not_mergeable", "doesBaseBranchMatch": true },
+  "isCurrentlySubmittedToQueue": true
+}
+```
+
+It parked at `not_ready` indefinitely and never transitioned to `failed`. No construction branch was ever created (`git/matching-refs/heads/trunk-` returned 0 refs throughout the run). Trunk only builds a construction branch for a PR GitHub already reports as mergeable — a PR that fails its own required check is never admitted, so this recipe cannot produce a real eviction. `forceEnqueued` was deliberately not used to force admission: with `directMergeMode: "off"` and `mergeMethod: "squash"` in the queue config, it could not be ruled out that it would actually merge the scratch throwaway change into `main` — treat `forceEnqueued` as a merge hazard, not a safe bypass, until that is separately verified.
+
+**Left unanswered, all downstream of Result 3** (no construction branch ever existed to test against):
+
+- Whether `id` equals the `trunk-merge/pr-<N>/<uuid>` construction-branch UUID.
+- Whether direct branch-name lookup can be driven from `id`.
+- Whether the failed-job log is fetchable via the Finding 3 recipe (`bk api "/builds?branch=..."` + `bk job log`) — never exercised, since no build existed.
+
+**Incidental finding, worth keeping:** the queue's live config answers the separate open question about queue-entry mechanism: `enqueueingLabel: "trunk-merge-queue-submit"`, `labelCommandsEnabled: true`, `commandsEnabled: true`, `requiredStatuses: ["buildkite/flunge-ci"]`.
+
+**Cleanup verified complete:** PR #1063 `state=CLOSED`, `mergedAt=null` (never merged); branch `scratch/trunk-dedup-verify-t2989` deleted (404 on lookup); submission cancelled, `isCurrentlySubmittedToQueue: false`; queue back to `running` with 0 enqueued; 0 `trunk-` matching refs; neither scratch commit landed on `main`; flunge ruleset `19592276` untouched.
+
+### Corrected recipe for a genuine deliberate eviction (for whoever answers the remaining questions)
+
+The scratch PR must **pass its own CI** (so GitHub reports it mergeable and Trunk admits it to the queue) but **fail only when merged with `main` on the construction branch** — a semantic conflict introduced against a moving `main`, not a broken test in the PR's own branch. That is materially harder to arrange deterministically than the original runbook assumed (it depends on `main`'s current state at merge time), so budget more setup time than the original ~10-minute estimate.
+
+1. Pick or create a semantic conflict against current `main` tip (e.g. two branches independently renaming/removing the same symbol in incompatible ways) so the PR's own CI passes but the Trunk-constructed merge commit fails compilation/tests.
+2. Confirm via `gh pr view --json mergeable,statusCheckRollup` that GitHub reports the scratch PR as mergeable with all its own required checks green, _before_ submitting to the queue — this is the gate Result 3 shows Trunk enforces.
+3. `POST /v1/getSubmittedPullRequest` before submission (expect not-found), then submit via `POST /v1/submitPullRequest`; record `{id, stateChangedAt, prSha}` and confirm a `trunk-merge/pr-<N>/<uuid>` construction branch actually appears in `git/matching-refs/heads/trunk-` within seconds — do not proceed to step 4 until it does.
+4. Compare the observed `id` against the construction-branch UUID directly.
+5. Poll until `state == failed`; record `{id, stateChangedAt}`. Confirm the failed `trunk-merge` build is discoverable via `bk api "/builds?branch=..."` and its failed-job log is fetchable via `bk job log <uuid> -p <pipeline> -b <n>` (Finding 3's recipe).
+6. Do not use `forceEnqueued` to shortcut step 2 unless `directMergeMode`/`mergeMethod` have been separately verified not to auto-merge on force-enqueue.
+7. `POST /v1/cancelPullRequest`, close the scratch PR, delete the branch and any construction refs left behind.
 
 ## Follow-up code changes (for the human to file — none made here)
 
@@ -98,5 +148,8 @@ What was established:
 
 ## Open Questions
 
-- `getSubmittedPullRequest.id` semantics (per-episode vs per-PR) and whether `id` equals the construction-branch UUID — resolvable only via the post-token runbook above; the recommended composite key makes task 6 safe to build before the answer arrives.
-- Whether `prSha` is snapshotted at submission or re-read from the live PR head during an episode — same runbook can answer it (push to the scratch PR mid-episode) if it ever matters; nothing in the current design depends on it.
+- **Resolved 2026-07-22:** `getSubmittedPullRequest.id` is per-PR stable (verified across a cancel → resubmit cycle, see the post-token verification addendum above). This supersedes Finding 4's original per-episode guess. The composite `(id, stateChangedAt)` key remains task 6's recommended dedup key and is now load-bearing rather than belt-and-braces.
+- **Resolved 2026-07-22:** `prSha` is re-read live from the current PR head, not snapshotted at submission — it changed mid-episode on a new push while `id`/`stateChangedAt` held steady. Do not use `prSha` as a dedup or provenance field for a single episode; it can mutate within that episode.
+- **Still open — whether an _eviction_ (not a manual cancel) also mints a new `id`.** The 2026-07-22 run only exercised cancel → resubmit; no real eviction occurred. Needs the corrected recipe above (a PR that passes its own CI but fails on the construction branch) to resolve.
+- **Still open — whether `id` equals the `trunk-merge/pr-<N>/<uuid>` construction-branch UUID, and whether direct branch-name lookup can be driven from `id`.** The 2026-07-22 scratch PR never reached the queue (Finding 3 in the addendum: a PR that fails its own CI is never admitted), so no construction branch existed to compare against. Needs the corrected recipe above.
+- **Still open — whether the failed-job log is fetchable via the Finding 3 recipe** (`bk api "/builds?branch=..."` + `bk job log`) for a real eviction. Never exercised in the 2026-07-22 run because no failed build existed. Needs the corrected recipe above.
