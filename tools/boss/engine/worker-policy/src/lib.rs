@@ -37,5 +37,5 @@ mod sanitize;
 #[cfg(test)]
 mod tests;
 
-pub use policy::{WorkerVerbDecision, worker_verb_decision};
+pub use policy::{WorkerVerbDecision, variant_name, worker_verb_decision};
 pub use sanitize::{SANITIZED_EXECUTION_FIELDS, sanitize_event_for_worker};

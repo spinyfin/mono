@@ -59,13 +59,23 @@ impl Drop for PidFileGuard {
 ///   privilege level. `authorize_rpc(Worker, peer)` asks "is this
 ///   peer a live worker session?", i.e. does its process ancestry
 ///   contain a registered worker pane shell. It is the inverse of the
-///   worker-exclusion clause the two tiers above use as a fallback,
-///   and it is what admits a connection to the worker verb policy
-///   ([`boss_engine_worker_policy`]) instead of the unconditional
-///   `User` tier. Unlike the other tiers it is deliberately *not*
-///   permissive in test mode: "no trust roots configured" must not
-///   mean "everything is a worker", or an engine started without the
-///   macOS app would confine the coordinator to worker tier.
+///   worker-exclusion clause the two tiers above use as a fallback.
+///   Unlike the other tiers it is deliberately *not* permissive in
+///   test mode: "no trust roots configured" must not mean "everything
+///   is a worker", or an engine started without the macOS app would
+///   confine the coordinator to worker tier.
+///
+///   The live connection-level gate that actually admits a connection
+///   to the worker verb policy ([`boss_engine_worker_policy`]) does
+///   not go through `authorize_rpc(Worker, ..)` — it calls
+///   [`ServerState::classify_peer`] once per connection and checks
+///   [`PeerClass::is_worker`] directly (`handle_frontend_connection`,
+///   `worker_tier_denial`). `authorize_rpc(Worker, ..)` delegates to
+///   the same `classify_peer` call and exists for handlers or tests
+///   that want to ask the classification question through the generic
+///   `authorize_rpc` entry point rather than reaching for
+///   `classify_peer` directly; it is not itself on the production
+///   dispatch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcTier {
     User,
@@ -298,5 +308,51 @@ impl ServerState {
             return None;
         }
         worker_verb_decision(request).denial().cloned()
+    }
+
+    /// Per-row scoping for the two verbs [`worker_verb_decision`] allows but
+    /// cannot itself scope, because it is pure over the verb and has no
+    /// caller identity or database access: `GetRun` and `ListRuns`. Both are
+    /// on the worker allowlist because a worker must be able to read its
+    /// *own* run rows, but the design names "work runs of other executions"
+    /// explicitly off-limits (design §"Read-only model access and the
+    /// exposure boundary") — `GetExecution`/`ListExecutions` stay unscoped by
+    /// contrast, because sibling *executions* are part of the model half a
+    /// worker is meant to see.
+    ///
+    /// `ListRuns { execution_id }` compares directly against the caller's own
+    /// execution id. `GetRun { id }` may name either a `run_*` id or (per
+    /// `handle_get_run`'s own fallback) an `exec_*` id, so this resolves it
+    /// the same way the handler does before comparing the *owning* execution
+    /// id — an unresolvable id is left to the handler's own "unknown run"
+    /// response rather than denied here, since no row could be leaked by a
+    /// lookup that failed anyway.
+    pub(super) fn worker_row_scope_denial(
+        &self,
+        peer_class: &PeerClass,
+        request: &FrontendRequest,
+    ) -> Option<WorkerTierDenial> {
+        let caller_execution_id = peer_class.worker_run_id()?;
+        if !self.feature_flags.is_enabled("worker_rpc_tier") {
+            return None;
+        }
+        let owning_execution_id = match request {
+            FrontendRequest::ListRuns { execution_id } => execution_id.clone(),
+            FrontendRequest::GetRun { id } => {
+                self.work_db
+                    .get_run(id)
+                    .ok()
+                    .or_else(|| self.work_db.list_runs(id).ok().and_then(|mut runs| runs.pop()))?
+                    .execution_id
+            }
+            _ => return None,
+        };
+        if owning_execution_id == caller_execution_id {
+            return None;
+        }
+        Some(WorkerTierDenial::closed(
+            variant_name(request),
+            WorkerTierDenialReason::RuntimeIsolation,
+        ))
     }
 }

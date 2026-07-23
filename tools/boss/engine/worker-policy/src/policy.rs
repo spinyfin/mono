@@ -31,7 +31,7 @@
 //! them. The narrow exceptions are enumerated in [`worker_verb_decision`]'s
 //! "sanctioned writes" arm, each with the reason it is sanctioned.
 
-use boss_protocol::{FrontendRequest, WorkerTierDenial, WorkerTierDenialReason};
+use boss_protocol::{FrontendRequest, WorkItemPatch, WorkerTierDenial, WorkerTierDenialReason};
 
 /// Whether a worker-tier connection may execute a given verb.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,26 @@ const PROPOSE_PR_CREATED: &str = "boss propose pr-created";
 const PROPOSE_EFFORT_ESCALATION: &str = "boss propose effort-escalation";
 /// `boss propose deferred-scope` — the route for "I left part of this undone".
 const PROPOSE_DEFERRED_SCOPE: &str = "boss propose deferred-scope";
+/// The general fallback for an `UpdateWorkItem` patch that names neither a PR
+/// binding nor an effort change — the general `boss propose` route, since no
+/// single mechanical redirect fits every other field on the patch.
+const PROPOSE_GENERAL: &str = "boss propose (pr-created, effort-escalation, blocked, ...)";
+
+/// Which `boss propose …` a denied `UpdateWorkItem` should point at, based on
+/// which field of the patch the worker was actually trying to set. Branching
+/// here — rather than always naming `pr-created` — is what keeps the
+/// redirect mechanical instead of guessed: a worker denied an effort change
+/// gets told about `effort-escalation`, not a PR-binding verb that does not
+/// apply to its intent.
+fn update_work_item_redirect(patch: &WorkItemPatch) -> &'static str {
+    if patch.pr_url.is_some() {
+        PROPOSE_PR_CREATED
+    } else if patch.effort_level.is_some() {
+        PROPOSE_EFFORT_ESCALATION
+    } else {
+        PROPOSE_GENERAL
+    }
+}
 
 fn redirect(verb: String, use_instead: &str) -> WorkerVerbDecision {
     WorkerVerbDecision::Deny(Box::new(WorkerTierDenial::redirect(
@@ -101,6 +121,11 @@ fn coordinator(verb: String) -> WorkerVerbDecision {
 /// proposals against *its own* work item, may only answer *its own* comment
 /// thread) is enforced inside the individual handlers from the peer-resolved
 /// execution — this function decides only whether the handler runs at all.
+/// `GetRun` and `ListRuns` are the one exception: their scoping needs a
+/// database lookup this crate deliberately does not have, so it runs at the
+/// connection gate instead (`ServerState::worker_row_scope_denial` in
+/// `boss-engine-core`'s `app/trust.rs`), ahead of the handler, denying a
+/// `GetRun`/`ListRuns` whose target execution is not the caller's own.
 pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
     use WorkerVerbDecision::Allow;
 
@@ -149,6 +174,14 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // reason `sanitize_event_for_worker` exists: the taxonomy-relevant
         // columns (status, PR binding, timestamps) are exposed while
         // `transcript_path` and friends are stripped. See `crate::sanitize`.
+        //
+        // `GetExecution`/`ListExecutions` are unscoped by design — sibling
+        // executions are part of the model half a worker is meant to see,
+        // same as sibling tasks above. `GetRun`/`ListRuns` are scoped to the
+        // caller's own execution, but *not here*: this match is pure and has
+        // no database access, so the scoping runs at the connection gate
+        // (`ServerState::worker_row_scope_denial`) ahead of the handler. See
+        // this function's doc comment.
         FrontendRequest::GetExecution { .. }
         | FrontendRequest::GetRun { .. }
         | FrontendRequest::ListExecutions { .. }
@@ -168,10 +201,10 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         //
         // - `CreateAutomationTask` is triage's `boss task create
         //   --automation`. The design keeps this create direct and mediates
-        //   only the outcome declaration: "This design keeps that create
-        //   direct (it is already provenance-checked and is the one place
-        //   T2944's structural gate will attach)" (§"Risks / open
-        //   questions"). Removing it here would break every triage run.
+        //   only the outcome declaration: the create is already
+        //   provenance-checked, and it is the single point where a future
+        //   structural dedup gate will attach (§"Risks / open questions").
+        //   Removing it here would break every triage run.
         // - `RecordProducerSideConflict` / `MarkConflictResolutionFailed`
         //   are `boss engine conflicts …`, instructed by the conflict
         //   worker prompt (`runner.rs`) and by the worker preamble's
@@ -227,9 +260,12 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         }
 
         // `UpdateWorkItem` is how a work item's status, PR binding, effort,
-        // and description are all edited. A worker that wants its PR bound
-        // declares it; a worker that wants a status change asks for one.
-        FrontendRequest::UpdateWorkItem { .. } => redirect(variant_name(request), PROPOSE_PR_CREATED),
+        // and description are all edited, so the redirect branches on the
+        // patch rather than always naming `pr-created` — a worker denied an
+        // effort change should not be told to declare a PR.
+        FrontendRequest::UpdateWorkItem { patch, .. } => {
+            redirect(variant_name(request), update_work_item_redirect(patch))
+        }
 
         // ── Denied: taxonomy writes with no proposal route ───────────────
         //
@@ -405,7 +441,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
 ///
 /// Only ever called on the denial path, so the round-trip through
 /// `serde_json` costs nothing on allowed traffic.
-pub(crate) fn variant_name(request: &FrontendRequest) -> String {
+pub fn variant_name(request: &FrontendRequest) -> String {
     serde_json::to_value(request)
         .ok()
         .as_ref()

@@ -255,7 +255,7 @@ async fn allowed_verb_from_a_worker_still_executes() {
 
 #[tokio::test]
 async fn run_rows_reaching_a_worker_have_their_transcript_path_stripped() {
-    let (server_state, _dir) = enforcing_state("exec_abc");
+    let (server_state, _dir) = test_server_state();
     let db = &server_state.work_db;
     let product = crate::test_support::create_test_product(db);
     let chore = crate::test_support::create_test_chore(db, product.id, "Cleanup");
@@ -273,6 +273,16 @@ async fn run_rows_reaching_a_worker_have_their_transcript_path_stripped() {
         run.transcript_path.is_some(),
         "fixture must actually store a transcript path, or this test proves nothing",
     );
+
+    // Register the worker as running *this* execution, not an unrelated one
+    // — the point of this test is what a worker sees of its own run, and
+    // `run_scope_denies_a_worker_reading_another_executions_runs` below
+    // covers the cross-execution case.
+    server_state.worker_registry.register(self_pid(), execution.id.clone());
+    server_state
+        .feature_flags
+        .set("worker_rpc_tier", true)
+        .expect("worker_rpc_tier must be a registered flag");
 
     let request = serde_json::json!({
         "request_id": "req-1",
@@ -309,7 +319,7 @@ async fn run_rows_reaching_a_worker_have_their_transcript_path_stripped() {
     // And with the flag off, a worker connection behaves exactly as it did
     // before this change — the flag is a kill switch for the whole tier, not
     // just for the verb gate.
-    server_state.worker_registry.register(self_pid(), "exec_abc".to_owned());
+    server_state.worker_registry.register(self_pid(), execution.id.clone());
     server_state.feature_flags.set("worker_rpc_tier", false).unwrap();
     let parsed = round_trip(server_state, Some(self_pid()), &request).await;
     let runs = parsed["payload"]["runs"].as_array().unwrap();
@@ -318,4 +328,68 @@ async fn run_rows_reaching_a_worker_have_their_transcript_path_stripped() {
         run.transcript_path.as_deref(),
         "with worker_rpc_tier off, sanitization must be off too",
     );
+}
+
+/// A worker classified for one execution must not be able to read another
+/// execution's run rows via `ListRuns` or `GetRun` — the two verbs are
+/// allowed by `worker_verb_decision` (a worker must see its own runs), but
+/// [`ServerState::worker_row_scope_denial`] scopes them to the caller's own
+/// execution at the connection gate, since the pure verb table has no way to
+/// know which execution a `GetRun`/`ListRuns` target belongs to.
+#[tokio::test]
+async fn run_scope_denies_a_worker_reading_another_executions_runs() {
+    let (server_state, _dir) = test_server_state();
+    let db = &server_state.work_db;
+    let product = crate::test_support::create_test_product(db);
+    let mine_chore = crate::test_support::create_test_chore(db, product.id.clone(), "Mine");
+    let mine_execution = crate::test_support::create_ready_chore_execution(db, mine_chore.id);
+    let other_chore = crate::test_support::create_test_chore(db, product.id, "Someone else's");
+    let other_execution = crate::test_support::create_ready_chore_execution(db, other_chore.id);
+    let other_run = db
+        .create_run(
+            boss_protocol::CreateRunInput::builder()
+                .agent_id("agent_1")
+                .execution_id(other_execution.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+    server_state
+        .worker_registry
+        .register(self_pid(), mine_execution.id.clone());
+    server_state
+        .feature_flags
+        .set("worker_rpc_tier", true)
+        .expect("worker_rpc_tier must be a registered flag");
+
+    // ListRuns against another execution: denied.
+    let list_request = serde_json::json!({
+        "request_id": "req-1",
+        "payload": { "type": "list_runs", "execution_id": other_execution.id },
+    })
+    .to_string();
+    let parsed = round_trip(server_state.clone(), Some(self_pid()), &list_request).await;
+    assert_eq!(parsed["payload"]["type"], "worker_tier_denied");
+    assert_eq!(parsed["payload"]["denial"]["verb"], "ListRuns");
+    assert_eq!(parsed["payload"]["denial"]["reason"], "runtime_isolation");
+
+    // GetRun against another execution's run, by run id: denied.
+    let get_request = serde_json::json!({
+        "request_id": "req-2",
+        "payload": { "type": "get_run", "id": other_run.id },
+    })
+    .to_string();
+    let parsed = round_trip(server_state.clone(), Some(self_pid()), &get_request).await;
+    assert_eq!(parsed["payload"]["type"], "worker_tier_denied");
+    assert_eq!(parsed["payload"]["denial"]["verb"], "GetRun");
+    assert_eq!(parsed["payload"]["denial"]["reason"], "runtime_isolation");
+
+    // ListRuns against its own execution still works.
+    let own_request = serde_json::json!({
+        "request_id": "req-3",
+        "payload": { "type": "list_runs", "execution_id": mine_execution.id },
+    })
+    .to_string();
+    let parsed = round_trip(server_state, Some(self_pid()), &own_request).await;
+    assert_eq!(parsed["payload"]["type"], "runs_list");
 }

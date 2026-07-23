@@ -39,6 +39,7 @@ fn run() -> WorkRun {
         .created_at("1700000000")
         .status("active")
         .transcript_path("/Users/someone/Library/Application Support/Boss/transcripts/exec_1.jsonl")
+        .artifacts_path("/Users/someone/Library/Application Support/Boss/artifacts/exec_1")
         .build()
 }
 
@@ -356,17 +357,16 @@ fn assert_nothing_leaked(event: &FrontendEvent) {
 }
 
 #[test]
-fn run_transcript_path_is_stripped() {
+fn run_transcript_and_artifacts_paths_are_stripped() {
     let before = FrontendEvent::RunResult { run: run() };
-    // Guard the guard: the fixture must actually carry a transcript path, or
-    // this test would pass against a sanitizer that does nothing.
-    assert_eq!(
-        forbidden_values(&before)
-            .iter()
-            .map(|(key, _)| key.as_str())
-            .collect::<Vec<_>>(),
-        vec!["transcript_path"],
-    );
+    // Guard the guard: the fixture must actually carry both paths, or this
+    // test would pass against a sanitizer that does nothing.
+    let mut before_keys = forbidden_values(&before)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    before_keys.sort();
+    assert_eq!(before_keys, vec!["artifacts_path", "transcript_path"]);
 
     let after = sanitize_event_for_worker(before);
     assert_nothing_leaked(&after);
@@ -374,6 +374,7 @@ fn run_transcript_path_is_stripped() {
         panic!("sanitizing must not change the variant");
     };
     assert!(run.transcript_path.is_none());
+    assert!(run.artifacts_path.is_none());
     // Everything else survives — a sanitizer that blanked the row would
     // satisfy the forbidden-key assertion while making the read useless.
     assert_eq!(run.id, "run_1");

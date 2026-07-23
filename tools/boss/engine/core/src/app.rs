@@ -124,8 +124,8 @@ pub use trust::{PeerClass, RpcTier};
 // consults, and the row sanitizer the writer task applies. Both are pure
 // functions over the wire types — see the crate docs for why they live
 // outside `boss-engine`.
-use boss_engine_worker_policy::{sanitize_event_for_worker, worker_verb_decision};
-use boss_protocol::WorkerTierDenial;
+use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name, worker_verb_decision};
+use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
@@ -1524,9 +1524,13 @@ async fn handle_frontend_connection(
     // opens a connection per invocation so this is still per-command for
     // workers, while the macOS app — which holds one connection for its
     // lifetime and sends thousands of requests over it — pays a single
-    // ancestry walk instead of one per frame. A worker's pane shell pid is
-    // registered at spawn, long before its first `boss` call, so there is no
-    // window where a live worker classifies as anything else.
+    // ancestry walk instead of one per frame. Registration normally happens
+    // at spawn, before the pane's first `boss` call; on the ack-timeout path
+    // (`spawn_flow.rs`, shell_pid 0) it is deferred until the app sends
+    // `UpdateWorkerShellPid` once the libghostty surface attaches, so a call
+    // in that interval classifies as `Other` and keeps `User` tier — the
+    // same fail-open direction `PeerClass::Other` documents for broken
+    // lineage.
     let peer_class = server_state.classify_peer(peer_pid);
     if let Some(run_id) = peer_class.worker_run_id() {
         tracing::debug!(
@@ -1669,7 +1673,11 @@ async fn handle_frontend_connection(
         // applied mutation escapes. One gate rather than 171 per-handler
         // checks — the policy itself is an exhaustive match, so a verb added
         // later cannot slip through unclassified.
-        if let Some(denial) = server_state.worker_tier_denial(&peer_class, &request) {
+        let row_scope_denial = server_state.worker_row_scope_denial(&peer_class, &request);
+        if let Some(denial) = server_state
+            .worker_tier_denial(&peer_class, &request)
+            .or(row_scope_denial)
+        {
             tracing::warn!(
                 session_id = %session_id,
                 run_id = peer_class.worker_run_id().unwrap_or("<unresolved>"),

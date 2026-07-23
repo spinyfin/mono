@@ -29,10 +29,11 @@
 //! ## What this module does not do
 //!
 //! No apply pipeline: every accepted row lands in `state = proposed` and
-//! nothing consumes it yet. No tier enforcement either — these verbs run at
-//! the existing `RpcTier::User` classification, and their own attribution is
-//! what confines a worker to its own work item until `RpcTier::Worker`
-//! lands.
+//! nothing consumes it yet. Tier enforcement now exists: worker-classified
+//! connections are gated by `worker_verb_decision` before dispatch when
+//! `worker_rpc_tier` is on, and `SubmitProposal`/`ListProposals` are on the
+//! worker allowlist. Their own peer-pid attribution is what additionally
+//! confines a worker to its own work item, independently of the flag.
 //!
 //! Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
 //! §"Transport and authn" / §"CLI surface".
