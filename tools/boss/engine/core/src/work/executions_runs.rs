@@ -726,17 +726,17 @@ impl WorkDb {
         // kanban. Don't downgrade items already in `done` or
         // `archived` — manual transitions win.
         //
-        // `in_review` needs a narrower guard than a blanket exclusion
-        // (T3042). A row in Review owns an open PR. For a non-revision
+        // `in_review` needs a narrower guard than a blanket exclusion.
+        // A row in Review owns an open PR. For a non-revision
         // base (chore/project_task/task) the only legitimate
         // continuation of that PR is a `kind=revision` task riding the
         // base's branch — the base itself must never re-appear in
         // Doing, whether the fresh execution landed on it by a stray
         // race (the pre-existing base-protection tests) or via a
-        // deliberate direct re-dispatch (e.g. the P992 automated
-        // reviewer-pass mechanism dispatches follow-up
-        // `chore_implementation` / `pr_review` executions straight
-        // against the base while `record_worker_pr_completion`'s
+        // deliberate direct re-dispatch (e.g. the automated reviewer
+        // pass dispatches follow-up `chore_implementation` /
+        // `pr_review` executions straight against the base while
+        // `record_worker_pr_completion`'s
         // `PendingReview` target holds its status exactly where it
         // was — that whole mechanism depends on the base never
         // visibly flipping to Doing mid-review).
@@ -752,6 +752,30 @@ impl WorkDb {
         // the revision has no non-terminal revision child of its own
         // (a revision-of-a-revision defers to that child exactly like
         // a base defers to it, per the same reasoning).
+        //
+        // The child check below is deliberately one level deep, not a
+        // full descendant walk: it matches only immediate children via
+        // `child.parent_task_id = ?1`. A revision-of-a-revision-of-a-
+        // revision (three levels) would not defer correctly if the
+        // middle link were terminal while the leaf were still live.
+        // This is accepted rather than fixed here because that shape is
+        // rare in practice and the chain-tail dependency gate already
+        // serializes deeper chains; widen this to the recursive CTE
+        // used in `revision_helpers.rs`/`chain_helpers.rs` if deeper
+        // chains turn out to matter.
+        //
+        // This relaxation also narrows the reverse transition (`active`
+        // back to `in_review`) to two specific paths:
+        // `record_worker_pr_completion` on a PR-completion signal, and
+        // `reconcile_revision_execution`'s settle for conflict/CI-fix
+        // revisions. A human/reviewer-created revision that reaches
+        // `active` via this guard and then has its worker die without a
+        // Stop or a push has no path back to `in_review` — it will sit
+        // in `active` and surface via the orphan-active sweep instead of
+        // as a static Review card. This is an accepted trade-off (the
+        // old blanket guard's incidental loop-halt for that specific
+        // failure mode is given up in exchange for the live worker
+        // actually showing on the kanban), not a defect in this query.
         //
         // `autostart` is cleared here (single-shot semantics): once a
         // row has ever transitioned to Doing, the flag is consumed so

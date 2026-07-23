@@ -1053,7 +1053,7 @@ fn revision_completion_keeps_base_project_task_in_review() {
     assert_started_execution_keeps_base_in_review(&db, &base_id);
 }
 
-// ── T3042: re-dispatching an in_review revision must reach `active` ────────
+// ── Re-dispatching an in_review revision must reach `active` ───────────────
 
 /// A `kind=revision` task that has settled to `in_review` (e.g. via
 /// `reconcile_revision`'s "spawning attempt retired" path, or a worker that
@@ -1115,10 +1115,103 @@ fn redispatching_in_review_revision_advances_to_active() {
     );
 }
 
+/// A `kind=revision` task in `in_review` that itself has a non-terminal
+/// `kind=revision` child must NOT advance to `active` on re-dispatch — the
+/// child is the live continuation of the work, exactly like a non-revision
+/// base defers to its revision child. Without this test, the `NOT EXISTS`
+/// child subquery in `start_execution_run_on_host` could be deleted with no
+/// test failing.
+#[test]
+fn redispatching_in_review_revision_with_live_child_stays_in_review() {
+    let db = WorkDb::open(temp_db_path("rev-with-live-child-in-review")).unwrap();
+    let product_id = make_revision_product(&db, "rev-with-live-child");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3044";
+    let base_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&base_id), &checker).unwrap();
+
+    // Settle the revision to `in_review`, as in the sibling test above.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    }
+    assert_eq!(task_status(&db, &revision.id), "in_review", "precondition");
+
+    // File a revision-of-a-revision against it and leave it non-terminal.
+    let child_revision = db.create_revision(revision_input(&revision.id), &checker).unwrap();
+    assert_eq!(task_status(&db, &child_revision.id), "todo", "precondition");
+
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    db.start_execution_run(
+        &exec.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_status(&db, &revision.id),
+        "in_review",
+        "re-dispatching an in_review revision with a live revision child must NOT advance it \
+         to active — the child is the sanctioned continuation of the work",
+    );
+
+    // Mirror case: once the child reaches a terminal status, the guard releases.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![child_revision.id],
+        )
+        .unwrap();
+    }
+    let exec2 = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec2.status, ExecutionStatus::Ready);
+    db.start_execution_run(
+        &exec2.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_status(&db, &revision.id),
+        "active",
+        "once the revision child reaches a terminal status, re-dispatching the parent \
+         revision must advance it to active",
+    );
+}
+
 /// Unlike a revision task, a non-revision base (chore/project_task/task)
 /// must stay parked in Review even when re-dispatched directly and with no
-/// revision ever filed against it — the P992 automated reviewer-pass
-/// mechanism relies on exactly this: it re-dispatches a fresh
+/// revision ever filed against it — the automated reviewer pass relies on
+/// exactly this: it re-dispatches a fresh
 /// `chore_implementation` (and later `pr_review`) execution straight
 /// against the base while it is `in_review`, and `record_worker_pr_completion`'s
 /// `PendingReview` target only "holds" the row's current status correctly
