@@ -48,7 +48,8 @@ use async_trait::async_trait;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
     AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
-    CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind,
+    CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, ProposalKind,
+    TaskKind,
 };
 
 use crate::attentions_detector;
@@ -97,6 +98,24 @@ crate::register_counter!(
     "staged URL's PR branch did not match execution's expected branch; URL was dropped.",
 );
 
+// Worker-proposal seam migration (task 8): fallback-hit counters for
+// `detect_and_file_worker_signals`'s legacy marker parsers, incremented only
+// when `worker_signal_proposals_seam` is on and no `worker_proposals` row
+// covered the signal — the exit criterion for eventually deleting each
+// parser (design §"Failure semantics: degrade loudly").
+crate::register_counter!(
+    WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION,
+    "worker_proposals.fallback_hit.effort_escalation",
+    "detect_and_file_worker_signals fell back to the legacy [effort-escalation] marker parser \
+     because no worker_proposals row existed for the execution (worker_signal_proposals_seam on).",
+);
+crate::register_counter!(
+    WORKER_SIGNAL_FALLBACK_HIT_BLOCKED,
+    "worker_proposals.fallback_hit.blocked",
+    "detect_and_file_worker_signals fell back to the legacy [blocked] marker parser because no \
+     worker_proposals row existed for the execution (worker_signal_proposals_seam on).",
+);
+
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
 /// surface at boot rather than at the first counter increment.
@@ -105,6 +124,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
     registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);
+    registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION);
+    registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -4860,6 +4881,20 @@ status is otherwise left unchanged for re-dispatch or manual review."
     /// OFF) additionally scans for guidance-ask prose when no explicit
     /// marker was found — the documented marker is the contract; the
     /// heuristic is a best-effort net under it.
+    ///
+    /// When `worker_signal_proposals_seam` is on (implementation task 8 of
+    /// `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`), each
+    /// detected signal is read proposals-first: if `execution` already
+    /// carries a `worker_proposals` row of the matching kind,
+    /// `WorkDb::submit_worker_proposal`'s apply pipeline
+    /// ([`crate::work::proposal_apply`]) already filed that kind's attention
+    /// item synchronously at submission time, so the legacy marker is
+    /// skipped rather than re-filed. Only when no such proposal exists does
+    /// the legacy parser run — exactly as before the flag existed — and
+    /// every time it does, the seam's `worker_proposals.fallback_hit.*`
+    /// counter increments and a WARN logs, which is this seam's exit
+    /// criterion for eventually deleting the parser. With the flag off, this
+    /// method is unchanged from before task 8.
     async fn detect_and_file_worker_signals(&self, execution: &crate::work::WorkExecution) {
         let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
             return;
@@ -4871,9 +4906,73 @@ status is otherwise left unchanged for re-dispatch or manual review."
         {
             signals.push(signal);
         }
+        let proposals_first = self.feature_flags.is_enabled("worker_signal_proposals_seam");
         for signal in &signals {
+            if proposals_first && self.execution_has_worker_signal_proposal(execution, signal.kind) {
+                // Already filed via the proposal apply pipeline — the legacy
+                // marker documents the same event, not a new one.
+                continue;
+            }
+            if proposals_first {
+                self.record_worker_signal_fallback_hit(execution, signal);
+            }
             self.file_worker_signal_attention(execution, signal).await;
         }
+    }
+
+    /// Whether `execution` already carries a `worker_proposals` row of the
+    /// [`ProposalKind`] matching `kind` — the proposals-first check
+    /// [`Self::detect_and_file_worker_signals`] uses to skip that kind's
+    /// legacy marker parser once the worker has used `boss propose` instead.
+    ///
+    /// A storage error fails open (`false`, so the legacy parser still
+    /// runs) rather than silently dropping a real signal — the same
+    /// "surface it, never swallow it" discipline
+    /// [`worker_escalation`]'s module doc describes for malformed markers.
+    fn execution_has_worker_signal_proposal(
+        &self,
+        execution: &crate::work::WorkExecution,
+        kind: WorkerSignalKind,
+    ) -> bool {
+        let proposal_kind = match kind {
+            WorkerSignalKind::EffortEscalation => ProposalKind::EffortEscalation,
+            WorkerSignalKind::Blocked => ProposalKind::Blocked,
+        };
+        match self
+            .work_db
+            .count_worker_proposals_for_execution(&execution.id, proposal_kind)
+        {
+            Ok(counts) => counts.for_kind > 0,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "worker_signal_proposals_seam: failed to check for an existing proposal; \
+                     falling back to the legacy marker parser for this signal",
+                );
+                false
+            }
+        }
+    }
+
+    /// Count one legacy-parser hit for `signal.kind`'s seam and log a WARN.
+    /// Called only when `worker_signal_proposals_seam` is on and no
+    /// proposal covered the signal — i.e. the legacy path just did the work
+    /// the proposal API was supposed to. See the counter declarations above
+    /// for what "exit criterion" means here.
+    fn record_worker_signal_fallback_hit(&self, execution: &crate::work::WorkExecution, signal: &WorkerSignal) {
+        match signal.kind {
+            WorkerSignalKind::EffortEscalation => WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION.inc(&self.metrics),
+            WorkerSignalKind::Blocked => WORKER_SIGNAL_FALLBACK_HIT_BLOCKED.inc(&self.metrics),
+        }
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            kind = ?signal.kind,
+            marker_line = %signal.marker_line,
+            "worker_signal_proposals_seam: no worker_proposals row found for this execution/kind; \
+             legacy marker parser fired instead of the proposal path",
+        );
     }
 
     /// File one [`WorkerSignal`] as a `work_attention_items` row, unless an
@@ -10616,6 +10715,194 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             vec![execution_id.clone()],
             "on_stop must clear any stale queued probe for this run so dispatch_probe_on_stop \
              cannot deliver a nudge minted before the blocker was recognized",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Worker-proposal seam migration (task 8 of
+    // worker-proposal-api-replace-fragile-worker-to-engine-seams.md):
+    // `worker_signal_proposals_seam` makes `detect_and_file_worker_signals`
+    // read proposals-first, demoting the marker parsers to a counted
+    // fallback.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn proposals_first_flag_skips_legacy_marker_when_a_proposal_already_exists() {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // The worker already called `boss propose effort-escalation` — this
+        // auto-applies synchronously and files the attention item.
+        db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &chore_id,
+            kind: ProposalKind::EffortEscalation,
+            payload_json: r#"{"requested_level":"large","reason":"multi-subsystem race"}"#,
+            idempotency_key: "key-1",
+        })
+        .unwrap()
+        .unwrap();
+        // The final message also carries the legacy marker (e.g. an older
+        // habit, or belt-and-suspenders) — proposals-first must not re-file
+        // it as a second attention item.
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[effort-escalation] requested_level=large reason=\"multi-subsystem race\"\n",
+        );
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("worker_signal_proposals_seam", true).unwrap();
+        let metrics = Arc::new(Registry::new());
+        register_metrics(&metrics);
+
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND)
+                .count(),
+            1,
+            "the proposal's synchronous apply already filed the attention item; the legacy \
+             marker parser must not re-file it; got {items:?}",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.effort_escalation"),
+            Some(0),
+            "no fallback hit expected — an existing proposal covered this signal",
+        );
+    }
+
+    #[tokio::test]
+    async fn proposals_first_flag_falls_back_to_the_legacy_marker_and_counts_the_hit() {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        // No proposal was ever submitted for this execution — only the
+        // legacy marker.
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[blocked] reason=\"bazel E0583, survives clean --expunge; need explicit direction\"\n",
+        );
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("worker_signal_proposals_seam", true).unwrap();
+        let metrics = Arc::new(Registry::new());
+        register_metrics(&metrics);
+
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .count(),
+            1,
+            "no proposal existed, so the legacy parser must still file the attention item; \
+             got {items:?}",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.blocked"),
+            Some(1),
+            "the legacy path fired, so the seam's fallback-hit counter must increment",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.effort_escalation"),
+            Some(0),
+            "only the blocked seam fired in this test",
+        );
+    }
+
+    #[tokio::test]
+    async fn proposals_first_flag_off_matches_pre_migration_behavior_exactly() {
+        // Even with an existing proposal AND the legacy marker both present,
+        // the flag defaulting off must reproduce the exact pre-task-8
+        // behavior: the legacy parser always runs, no proposals-first
+        // check, no fallback counting.
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &chore_id,
+            kind: ProposalKind::EffortEscalation,
+            payload_json: r#"{"requested_level":"large","reason":"multi-subsystem race"}"#,
+            idempotency_key: "key-1",
+        })
+        .unwrap()
+        .unwrap();
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[effort-escalation] requested_level=large reason=\"multi-subsystem race\"\n",
+        );
+
+        let metrics = Arc::new(Registry::new());
+        register_metrics(&metrics);
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        // No `with_feature_flags` call — default store, flag at its
+        // registry default (off).
+        let handler = handler.with_metrics(metrics.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+
+        // Pre-migration behavior: the proposal's own apply files one
+        // attention item, and the (un-gated) legacy parser files its own —
+        // `file_worker_signal_attention`'s content dedup only matches
+        // identical marker-line text already present in an item's body, and
+        // the proposal-authored item's body does not contain the literal
+        // marker line, so both land. This is intentionally what "flag off
+        // restores today's behavior exactly" means.
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND)
+                .count(),
+            2,
+            "flag off: the proposal apply and the legacy parser each file independently, exactly \
+             as they did before task 8; got {items:?}",
+        );
+        assert_eq!(
+            metrics.counter_value("worker_proposals.fallback_hit.effort_escalation"),
+            Some(0),
+            "fallback counting only happens when the seam flag is on",
         );
     }
 

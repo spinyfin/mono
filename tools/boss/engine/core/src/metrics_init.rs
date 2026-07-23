@@ -68,6 +68,16 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // Worker-proposal seam: fallback-hit counters.
+        for expected in [
+            "worker_proposals.fallback_hit.effort_escalation",
+            "worker_proposals.fallback_hit.blocked",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         // Phase 3: cube workspace lease counters.
         for expected in [
             "cube_workspace_lease.attempts",
@@ -164,10 +174,10 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            56,
-            "expected 4 pr_url_capture + 3 cube_workspace_lease + 10 dispatcher + 10 merge_poller + \
-             18 external_tracker + 2 speculative_conflict + 1 stacked_pr_structuring + 1 dispatch_metrics + \
-             7 trunk_queue_poller counters"
+            58,
+            "expected 4 pr_url_capture + 2 worker_proposals fallback_hit + 3 cube_workspace_lease + \
+             10 dispatcher + 10 merge_poller + 18 external_tracker + 2 speculative_conflict + \
+             1 stacked_pr_structuring + 1 dispatch_metrics + 7 trunk_queue_poller counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
