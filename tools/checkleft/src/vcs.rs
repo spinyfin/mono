@@ -205,13 +205,17 @@ impl Vcs {
     }
 
     pub fn remote_repo_slug(&self) -> Option<String> {
-        if let Ok(output) = run_command(&self.root, "git", &["remote", "get-url", "origin"])
-            && let Some(slug) = parse_repo_slug_from_remote_url(output.trim())
-        {
-            return Some(slug);
+        match self.kind {
+            VcsKind::Git => {
+                let output = run_command(&self.root, "git", &["remote", "get-url", "origin"]).ok()?;
+                parse_repo_slug_from_remote_url(output.trim())
+            }
+            VcsKind::Jujutsu => {
+                let output = run_command(&self.root, "jj", &["git", "remote", "list"]).ok()?;
+                let url = parse_jj_remote_list_url(&output, "origin")?;
+                parse_repo_slug_from_remote_url(&url)
+            }
         }
-
-        None
     }
 
     /// Return the name of the current branch/bookmark, if determinable.
@@ -607,6 +611,17 @@ fn resolve_git_merge_base(root: &Path, base_ref: &str) -> Result<String> {
     Ok(revision.to_owned())
 }
 
+/// Parse `jj git remote list` output (lines of `<name> <url>`) and return the
+/// URL for the named remote, if present.
+fn parse_jj_remote_list_url(output: &str, remote_name: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut parts = line.splitn(2, ' ');
+        let name = parts.next()?.trim();
+        let url = parts.next()?.trim();
+        (name == remote_name && !url.is_empty()).then(|| url.to_owned())
+    })
+}
+
 fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
     let remote_url = remote_url.trim();
     let repo_path = if let Some(stripped) = remote_url.strip_prefix("git@github.com:") {
@@ -638,7 +653,8 @@ mod tests {
 
     use super::{
         normalize_non_empty, parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary,
-        parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list, try_expand_brace_notation,
+        parse_jj_remote_list_url, parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
+        try_expand_brace_notation,
     };
 
     #[test]
@@ -809,6 +825,135 @@ R docs/old.md => docs/new.md
             parse_repo_slug_from_remote_url("ssh://git@github.com/example/flunge.git"),
             Some("example/flunge".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_jj_remote_list_url_for_named_remote() {
+        assert_eq!(
+            parse_jj_remote_list_url("origin git@github.com:example/flunge.git\n", "origin"),
+            Some("git@github.com:example/flunge.git".to_owned())
+        );
+        assert_eq!(
+            parse_jj_remote_list_url(
+                "origin git@github.com:example/flunge.git\nupstream https://github.com/other/flunge.git\n",
+                "upstream"
+            ),
+            Some("https://github.com/other/flunge.git".to_owned())
+        );
+        assert_eq!(parse_jj_remote_list_url("", "origin"), None);
+        assert_eq!(
+            parse_jj_remote_list_url("origin git@github.com:example/flunge.git\n", "upstream"),
+            None
+        );
+    }
+
+    /// Whether `jj` is on PATH. The jj-specific tests below are skipped (not
+    /// failed) when it isn't, so the suite stays green in sandboxes that don't
+    /// provision the jj binary — same convention as
+    /// `tests/change_detection_e2e.rs`'s `jj_available()`.
+    fn jj_available() -> bool {
+        std::process::Command::new("jj")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_jj(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("jj")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run jj");
+        assert!(
+            output.status.success(),
+            "jj {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Plain git checkout: `remote_repo_slug()` must keep working via `git remote get-url`.
+    #[test]
+    fn remote_repo_slug_plain_git_checkout() {
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init", "-b", "main"]);
+        run_git(
+            temp.path(),
+            &["remote", "add", "origin", "git@github.com:example/flunge.git"],
+        );
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        assert_eq!(vcs.kind(), super::VcsKind::Git);
+        assert_eq!(vcs.remote_repo_slug(), Some("example/flunge".to_owned()));
+    }
+
+    /// A colocated jj repo (has a real `.git` at the root): `remote_repo_slug()`
+    /// must resolve via the jj path, same as a non-colocated workspace.
+    #[test]
+    fn remote_repo_slug_colocated_jj_repo() {
+        use tempfile::tempdir;
+
+        if !jj_available() {
+            eprintln!("skipping remote_repo_slug_colocated_jj_repo: `jj` is not on PATH");
+            return;
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_jj(temp.path(), &["git", "init", "--colocate"]);
+        run_jj(
+            temp.path(),
+            &["git", "remote", "add", "origin", "git@github.com:example/flunge.git"],
+        );
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        assert_eq!(vcs.kind(), super::VcsKind::Jujutsu);
+        assert_eq!(vcs.remote_repo_slug(), Some("example/flunge".to_owned()));
+    }
+
+    /// A non-colocated jj repo (no `.git` at the root — this is the shape of a
+    /// cube secondary workspace): this is the case that was silently broken,
+    /// since `git remote get-url origin` has no `.git` to operate on here.
+    #[test]
+    fn remote_repo_slug_non_colocated_jj_workspace() {
+        use tempfile::tempdir;
+
+        if !jj_available() {
+            eprintln!("skipping remote_repo_slug_non_colocated_jj_workspace: `jj` is not on PATH");
+            return;
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_jj(temp.path(), &["git", "init"]);
+        run_jj(
+            temp.path(),
+            &["git", "remote", "add", "origin", "git@github.com:example/flunge.git"],
+        );
+        assert!(
+            !temp.path().join(".git").exists(),
+            "test setup must produce a non-colocated jj repo (no .git at root)"
+        );
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        assert_eq!(vcs.kind(), super::VcsKind::Jujutsu);
+        assert_eq!(vcs.remote_repo_slug(), Some("example/flunge".to_owned()));
     }
 
     #[test]
