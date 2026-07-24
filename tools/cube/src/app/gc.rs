@@ -1,0 +1,768 @@
+//! Garbage collection: consumed bookmarks, closed-PR bookmarks, aged
+//! unhealthy workspaces, stale logs, and the background pool GC trigger.
+
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use git_utils::pr_bookmark;
+use git_utils::repo_slug::parse_github_remote;
+
+use crate::command_runner::{CommandRunner, RealCommandRunner};
+use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
+use crate::store::{EffectiveState, Store, WorkspaceListFilter};
+use crate::{audit, config, paths};
+
+use crate::app::errors::Result;
+use crate::app::health::probe_workspace_reuse;
+use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
+use crate::app::reconcile::reconcile_free_workspace_health;
+use crate::app::reset::reset_workspace;
+use crate::app::util::current_epoch_s;
+
+/// Pool-wide gc runs at most once per 24 hours (when there is no known
+/// backlog), triggered from `cube workspace lease`.
+pub(super) const AUTO_GC_INTERVAL_SECS: i64 = 24 * 60 * 60;
+/// Stamped on COMPLETION of a pool GC pass; gates the throttle above.
+pub(super) const POOL_GC_LAST_AT_KEY: &str = "last_pool_gc_at";
+/// Stamped before running the GC pass, to prevent two overlapping `cube
+/// workspace lease` invocations from both running a pass at once. The pass
+/// itself now runs synchronously (see `maybe_trigger_pool_gc`), bounded by
+/// POOL_GC_TIME_BUDGET and wrapped in `catch_unwind`, so it always clears/
+/// advances this key before the triggering process exits — a started-but-
+/// never-completed pass should no longer be possible. This timeout is kept
+/// only as a safety net against a process that dies by external means (e.g.
+/// SIGKILL) mid-pass.
+pub(super) const POOL_GC_STARTED_AT_KEY: &str = "last_pool_gc_started_at";
+pub(super) const POOL_GC_IN_PROGRESS_TIMEOUT_SECS: i64 = 5 * 60; // 5 minutes
+
+/// Wall-clock budget for a pool GC pass triggered automatically from `cube
+/// workspace lease`. `lease` is a short-lived CLI process — it used to spawn
+/// GC on a detached `std::thread` and exit immediately after, which killed
+/// the thread mid-pass on essentially every invocation (the pass never got
+/// to stamp completion). Running synchronously fixes that, but a lease call
+/// can't be allowed to block on an unbounded pass, so per-workspace GC work
+/// checks this deadline before starting each new unit of work and stops
+/// early — cleanly, not by being killed — once it's exceeded. The explicit,
+/// operator-invoked `cube workspace gc` verb is unbounded by design (`None`
+/// deadline) since it isn't on the lease hot path.
+const POOL_GC_TIME_BUDGET: Duration = Duration::from_secs(20);
+
+/// How soon a pool GC pass that hit POOL_GC_TIME_BUDGET before clearing all
+/// aged-unhealthy candidates is eligible to run again, instead of waiting the
+/// full AUTO_GC_INTERVAL_SECS. Keeps a backlog draining across many short,
+/// bounded passes rather than stalling for a day once there's more work than
+/// one budget allows.
+pub(super) const POOL_GC_BACKLOG_RETRY_SECS: i64 = 5 * 60;
+
+/// List and optionally forget consumed `boss/exec_*` bookmarks and closed/merged
+/// `pr/<n>` bookmarks in a workspace.
+///
+/// A `boss/exec_*` bookmark is "consumed" when its tip is reachable from `main`
+/// (`bookmarks(glob:"boss/exec_*") & ::main`). A `pr/<n>` bookmark is eligible
+/// for GC when its corresponding GitHub PR is in the MERGED or CLOSED state
+/// (resolved via `gh pr view`; skipped silently when offline).
+///
+/// If `do_fetch` is true, runs `jj git fetch` first so `::main` reflects the
+/// latest merged PRs. If `dry_run` is true, lists what would be forgotten
+/// without acting.
+///
+/// Returns the names of bookmarks forgotten (or that would be forgotten on
+/// dry-run). Failures are propagated to the caller; release-path callers
+/// should treat them as warnings.
+pub(super) fn gc_workspace_bookmarks(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    do_fetch: bool,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    if do_fetch {
+        run_jj_network(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
+        )?;
+    }
+
+    let output = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(glob:\"boss/exec_*\") & ::main",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ],
+        ),
+    )?;
+
+    let mut bookmarks: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        output
+            .split_whitespace()
+            .filter(|s| s.starts_with("boss/exec_") && !s.contains('@'))
+            .filter(|s| seen.insert(s.to_string()))
+            .map(str::to_string)
+            .collect()
+    };
+
+    // Also sweep pr/<n> bookmarks whose GitHub PR is closed or merged.
+    bookmarks.extend(gc_collect_closed_pr_bookmarks(runner, database_path, workspace_path));
+
+    if bookmarks.is_empty() || dry_run {
+        return Ok(bookmarks);
+    }
+
+    let mut args: Vec<&str> = vec!["bookmark", "forget"];
+    let bookmark_refs: Vec<&str> = bookmarks.iter().map(String::as_str).collect();
+    args.extend_from_slice(&bookmark_refs);
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &args),
+    )?;
+
+    Ok(bookmarks)
+}
+
+/// Collect local `pr/<n>` bookmarks in `workspace_path` whose GitHub PR is
+/// MERGED or CLOSED. Returns an empty list when offline, the workspace has no
+/// GitHub remote, or there are no `pr/*` bookmarks. Failures from `jj` or
+/// `gh` are swallowed so this best-effort sweep never blocks the caller.
+pub(super) fn gc_collect_closed_pr_bookmarks(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+) -> Vec<String> {
+    // Resolve the GitHub owner/repo slug from the workspace's jj remotes.
+    let remote_output = match runner.run(&RealCommandRunner::invocation(
+        workspace_path,
+        "jj",
+        &["git", "remote", "list"],
+    )) {
+        Ok(out) => out,
+        Err(_) => return vec![],
+    };
+    let (_remote_name, owner_repo) = match parse_github_remote(&remote_output) {
+        Some(r) => r,
+        None => return vec![],
+    };
+
+    // Find all local pr/* bookmarks in the workspace.
+    let bookmark_output = match run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(glob:\"pr/*\")",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ],
+        ),
+    ) {
+        Ok(out) => out,
+        Err(_) => return vec![],
+    };
+
+    let pr_bookmarks: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        bookmark_output
+            .split_whitespace()
+            .filter(|s| pr_bookmark::is_pr_bookmark(s) && !s.contains('@'))
+            .filter(|s| seen.insert(s.to_string()))
+            .map(str::to_string)
+            .collect()
+    };
+
+    if pr_bookmarks.is_empty() {
+        return vec![];
+    }
+
+    // For each pr/<n> bookmark, query GitHub for the PR state. Skip silently
+    // on network/auth failures so GC degrades gracefully when offline.
+    pr_bookmarks
+        .into_iter()
+        .filter(|bookmark| {
+            let Some(pr_num) = bookmark.strip_prefix("pr/") else {
+                return false;
+            };
+            let state = match runner.run(&RealCommandRunner::invocation(
+                workspace_path,
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    pr_num,
+                    "-R",
+                    &owner_repo,
+                    "--json",
+                    "state",
+                    "--jq",
+                    ".state",
+                ],
+            )) {
+                Ok(out) => out,
+                Err(_) => return false,
+            };
+            matches!(state.trim(), "MERGED" | "CLOSED")
+        })
+        .collect()
+}
+
+/// Cheap, read-only check for whether any aged-unhealthy candidate currently
+/// exists that `gc_aged_unhealthy_workspaces` can actually reset — used to
+/// decide whether a completed-but-partial pass should be retried after
+/// POOL_GC_BACKLOG_RETRY_SECS instead of waiting a full day.
+///
+/// Deliberately excludes `Quarantined` workspaces even though
+/// `gc_aged_unhealthy_workspaces` also considers them: quarantine is only
+/// ever lifted against evidence from a live reuse probe (an unpushed-work
+/// check), and a quarantined workspace whose `@` genuinely still holds
+/// unpushed work stays quarantined forever — its `unhealthy_since` never
+/// advances, so counting it here would pin the retry interval at
+/// POOL_GC_BACKLOG_RETRY_SECS permanently instead of settling back to
+/// AUTO_GC_INTERVAL_SECS once the resettable (Dirty/Conflicted) backlog is
+/// actually drained. Dirty/Conflicted workspaces have no such refusal path —
+/// `gc_aged_unhealthy_workspaces` resets them unconditionally once aged past
+/// the threshold — so they are a reliable "will make progress next pass"
+/// signal. Running the live probe here to distinguish resettable from stuck
+/// quarantined workspaces would defeat the point of this being a cheap,
+/// read-only check (see `gc_aged_unhealthy_workspaces`'s quarantine probe).
+pub(super) fn pool_gc_has_aged_unhealthy_backlog(store: &Store, now_epoch_s: i64) -> Result<bool> {
+    let max_age_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
+    let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
+    let records = store.list_workspaces_filtered(&WorkspaceListFilter::default())?;
+    Ok(records.into_iter().any(|record| {
+        if record.state == WorkspaceState::Leased {
+            return false;
+        }
+        let is_unhealthy = matches!(
+            record.health_status,
+            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+        );
+        if !is_unhealthy {
+            return false;
+        }
+        let Some(unhealthy_since) = record.unhealthy_since_epoch_s else {
+            return false;
+        };
+        unhealthy_since <= threshold_epoch_s
+    }))
+}
+
+/// Trigger a pool GC pass, throttled so it does not run on every lease.
+///
+/// Two metadata keys guard the trigger:
+/// - `last_pool_gc_at` (POOL_GC_LAST_AT_KEY): stamped on completion; gates
+///   the throttle (AUTO_GC_INTERVAL_SECS normally, POOL_GC_BACKLOG_RETRY_SECS
+///   when a backlog of aged-unhealthy workspaces is known to remain).
+/// - `last_pool_gc_started_at` (POOL_GC_STARTED_AT_KEY): stamped here before
+///   the pass runs, to prevent two overlapping `cube workspace lease`
+///   invocations from both running a pass at once.
+///
+/// The pass itself runs synchronously on this call — not on a detached
+/// `std::thread::spawn` — because `cube workspace lease` is a short-lived CLI
+/// process that used to exit (killing the thread) before the pass could ever
+/// finish. It is bounded by POOL_GC_TIME_BUDGET so a large backlog cannot
+/// stall lease dispatch, and wrapped in `catch_unwind` so a panic inside it
+/// cannot leave `last_pool_gc_started_at` permanently ahead of
+/// `last_pool_gc_at`.
+pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
+    // Skip if a pass is already in progress (started within the safety-net timeout).
+    let last_started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)?;
+    if last_started.is_some_and(|t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
+        return Ok(());
+    }
+    // Skip if a pass completed recently — how recently depends on whether
+    // there is known backlog left over from a prior bounded pass.
+    if let Some(last_completed) = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)? {
+        let interval = if pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true) {
+            POOL_GC_BACKLOG_RETRY_SECS
+        } else {
+            AUTO_GC_INTERVAL_SECS
+        };
+        if (now_epoch_s - last_completed) < interval {
+            return Ok(());
+        }
+    }
+
+    store.set_pool_metadata_i(POOL_GC_STARTED_AT_KEY, now_epoch_s)?;
+    let db_path_owned = database_path.map(Path::to_path_buf);
+    let deadline = Instant::now() + POOL_GC_TIME_BUDGET;
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_pool_gc_background(db_path_owned, deadline);
+    })) {
+        eprintln!("cube: auto gc: pass panicked: {panic:?}");
+    }
+    // Always stamp completion here — whether the pass above finished all its
+    // work, stopped early at the deadline, or panicked — so a broken pass can
+    // never leave `last_pool_gc_started_at` stuck ahead of `last_pool_gc_at`.
+    let _ = store
+        .set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now_epoch_s)
+        .map_err(|e| eprintln!("cube: auto gc: failed to stamp completion: {e}"));
+    Ok(())
+}
+
+pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, deadline: Instant) {
+    let store = match database_path.as_deref() {
+        Some(p) => Store::open_at(p),
+        None => Store::open_default(),
+    };
+    let Ok(store) = store else {
+        eprintln!("cube: auto gc: failed to open store");
+        return;
+    };
+    let runner = RealCommandRunner;
+
+    // Run the aged-unhealthy recycler first so it genuinely gets first claim
+    // on the time budget — it is the part that actually reclaims disk space
+    // from stuck-dirty workspaces, and it must not be starved by the
+    // reconcile pass below (which only refreshes cached health labels, a
+    // less time-critical repair). It is bounded by `deadline` itself, so a
+    // large backlog cannot consume more than its share.
+    let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
+    let max_age_secs = gc_config.max_age_secs();
+    if let Ok(now) = current_epoch_s() {
+        gc_aged_unhealthy_workspaces(
+            &runner,
+            &store,
+            database_path.as_deref(),
+            now,
+            max_age_secs,
+            Some(deadline),
+        );
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!(
+            "cube: auto gc: time budget exhausted after aged-unhealthy pass, deferring reconcile/log/bookmark gc"
+        );
+        return;
+    }
+
+    // Reconcile stale health cache: re-check dirty/conflicted workspaces
+    // against their on-disk state and promote any that have recovered to
+    // clean. Runs after the aged-unhealthy pass (which already reset whatever
+    // it could) and is itself bounded by the same deadline so it cannot eat
+    // into the remaining budget meant for the log/bookmark sweep below.
+    let health_report = reconcile_free_workspace_health(
+        &runner,
+        &store,
+        database_path.as_deref(),
+        None,
+        None,
+        false,
+        Some(deadline),
+    );
+    if !health_report.promoted_to_clean.is_empty() {
+        eprintln!(
+            "cube: auto gc: promoted {} workspace(s) from dirty/conflicted to clean",
+            health_report.promoted_to_clean.len(),
+        );
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!("cube: auto gc: time budget exhausted after reconcile pass, deferring log/bookmark gc");
+        return;
+    }
+
+    gc_stale_workspace_logs(&store);
+
+    // Sweep consumed bookmarks from every non-leased workspace. Each workspace
+    // runs jj git fetch; a broken/unreachable remote times out after
+    // network_cmd_timeout() and is skipped so one slow workspace cannot block
+    // the rest of the pass. Bounded by the same deadline as the aged-unhealthy
+    // pass above, checked before starting each workspace.
+    let records = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cube: auto gc: failed to list workspaces: {e}");
+            return;
+        }
+    };
+    let mut budget_exhausted = false;
+    for record in &records {
+        if record.state == WorkspaceState::Leased {
+            continue;
+        }
+        if !workspace_path_exists(record) {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            budget_exhausted = true;
+            break;
+        }
+        if let Err(e) = gc_workspace_bookmarks(&runner, database_path.as_deref(), &record.workspace_path, true, false) {
+            eprintln!("cube: auto gc: {}: {e}", record.workspace_id,);
+        }
+    }
+    if budget_exhausted {
+        eprintln!("cube: auto gc: time budget exhausted, deferred remaining bookmark gc to next pass");
+    }
+}
+
+/// How many quarantined workspaces one lease call will probe before giving up
+/// and provisioning a fresh one instead.
+///
+/// Each probe costs a `jj git fetch` plus one or two `jj log`s against a
+/// workspace we may not end up using, and the whole scan runs under the
+/// per-repo lock, so it is bounded rather than sweeping the entire quarantine
+/// set. A truncated scan is recorded in `workspace.quarantine_reclaim_scan`
+/// (`scanned` vs `available`), never dropped silently — the next lease that
+/// would otherwise mint picks up where this one stopped.
+const QUARANTINE_RECLAIM_MAX_PROBES: usize = 4;
+
+/// Try to return a quarantined workspace to the pool instead of minting a new
+/// one, and hand back its id if that succeeds.
+///
+/// Quarantine is set by the dirty-reclaim guard when it refuses a destructive
+/// reset. Before this existed, that marker was permanent: no GC pass cleared
+/// it and the only escape was an operator running `cube workspace
+/// force-release`, so every refusal permanently removed a workspace from the
+/// pool. Reclaim is *verified*, never blind — the guard's own probe is re-run
+/// and the quarantine is cleared only when `@` holds nothing that would be
+/// left behind (it is empty, or a remote already has it). A workspace whose
+/// `@` still holds an unpushed working copy stays quarantined, which is the
+/// whole point of the marker.
+///
+/// Never fails a lease: any probe error skips that workspace and the caller
+/// falls through to provisioning.
+pub(super) fn reclaim_quarantined_workspace(
+    runner: &dyn CommandRunner,
+    store: &Store,
+    database_path: Option<&Path>,
+    repo: &str,
+    main_branch: &str,
+    exclude: &[String],
+) -> Result<Option<String>> {
+    let quarantined = store.list_workspaces_filtered(&WorkspaceListFilter {
+        repo: Some(repo),
+        effective_state: Some(EffectiveState::FreeQuarantined),
+        ..Default::default()
+    })?;
+
+    let available: Vec<&WorkspaceRecord> = quarantined
+        .iter()
+        .filter(|record| !exclude.contains(&record.workspace_id) && workspace_path_exists(record))
+        .collect();
+
+    let mut scanned = 0usize;
+    let mut reclaimed: Option<String> = None;
+    for record in available.iter().take(QUARANTINE_RECLAIM_MAX_PROBES) {
+        scanned += 1;
+        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch) {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!(
+                    "cube: quarantine reclaim: {}: probe failed, leaving quarantined: {error}",
+                    record.workspace_id,
+                );
+                audit!(
+                    database_path,
+                    "workspace.quarantine_reclaim_error",
+                    repo = repo,
+                    workspace_id = record.workspace_id,
+                    error = error.to_string(),
+                );
+                continue;
+            }
+        };
+
+        if !status.is_reusable() {
+            audit!(
+                database_path,
+                "workspace.quarantine_reclaim_refused",
+                repo = repo,
+                workspace_id = record.workspace_id,
+                head_change_id = status.head_change_id(),
+                head_is_empty = status.head_is_empty(),
+                head_parent_bookmarks = status.head_parent_bookmarks(),
+                unpushed_commits = status.unpushed_summary(),
+            );
+            continue;
+        }
+
+        if !store.clear_workspace_quarantine(repo, &record.workspace_id)? {
+            // Claimed or re-marked between the list and here; leave it be.
+            continue;
+        }
+        audit!(
+            database_path,
+            "workspace.quarantine_cleared",
+            repo = repo,
+            workspace_id = record.workspace_id,
+            source = "lease_reclaim",
+            reuse_reason = status.reuse_reason(),
+            head_change_id = status.head_change_id(),
+            head_parent_bookmarks = status.head_parent_bookmarks(),
+        );
+        reclaimed = Some(record.workspace_id.clone());
+        break;
+    }
+
+    audit!(
+        database_path,
+        "workspace.quarantine_reclaim_scan",
+        repo = repo,
+        available = available.len(),
+        scanned = scanned,
+        truncated = available.len() > scanned,
+        reclaimed = reclaimed.as_deref(),
+    );
+
+    Ok(reclaimed)
+}
+
+/// During pool GC, reset any non-leased free workspace that has been
+/// continuously `dirty`, `conflicted` or `quarantined` for longer than
+/// `max_age_secs`. Emits a `workspace.unhealthy_gc_reset` audit event for each
+/// workspace that is reclaimed so the discarded work is traceable.
+/// Returns the number of workspaces successfully recycled.
+///
+/// `quarantined` rows are handled differently from the other two: they are
+/// there because the dirty-reclaim guard refused to reset them, so age alone
+/// is never enough. The guard's probe is re-run first and the reset happens
+/// only if `@` holds nothing that would be left behind. Age still gates the
+/// attempt, giving an operator a window to inspect a fresh quarantine before
+/// cube touches it.
+///
+/// `deadline`, when set, is checked before starting work on each candidate;
+/// once passed, remaining candidates are left for the next pass rather than
+/// starting new (potentially slow, network-bound) reset work. Pass `None`
+/// for an unbounded run — used by the explicit, operator-invoked `cube
+/// workspace gc` verb, which isn't on the lease dispatch hot path.
+pub(super) fn gc_aged_unhealthy_workspaces(
+    runner: &dyn CommandRunner,
+    store: &Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+    max_age_secs: i64,
+    deadline: Option<Instant>,
+) -> usize {
+    let records = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cube: unhealthy gc: failed to list workspaces: {e}");
+            return 0;
+        }
+    };
+
+    let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
+    let mut recycled: usize = 0;
+
+    for record in records {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            eprintln!("cube: unhealthy gc: time budget exhausted, deferring remaining candidates to next pass");
+            break;
+        }
+        if record.state == WorkspaceState::Leased {
+            continue;
+        }
+        let is_unhealthy = matches!(
+            record.health_status,
+            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
+        );
+        if !is_unhealthy {
+            continue;
+        }
+        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
+        // A quarantined row written before the timestamp was stamped on that
+        // path has no age to compare; treat it as old rather than stranding it
+        // forever — the probe below is what actually decides whether it is
+        // safe to touch. Dirty/conflicted rows keep the strict behaviour.
+        let unhealthy_since = match (record.unhealthy_since_epoch_s, is_quarantined) {
+            (Some(since), _) => since,
+            (None, true) => 0,
+            (None, false) => continue,
+        };
+        if unhealthy_since > threshold_epoch_s {
+            continue;
+        }
+        if !workspace_path_exists(&record) {
+            continue;
+        }
+
+        // Re-check state: skip if the workspace was claimed between the list
+        // and this point.
+        let current_state = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some(&record.repo),
+                workspace_id: Some(&record.workspace_id),
+                ..Default::default()
+            })
+            .ok()
+            .and_then(|mut v| v.pop())
+            .map(|r| r.state);
+        if current_state != Some(WorkspaceState::Free) {
+            eprintln!(
+                "cube: unhealthy gc: {} was claimed mid-pass, skipping",
+                record.workspace_id,
+            );
+            continue;
+        }
+
+        let main_branch = match store.get_repo(&record.repo).ok().flatten() {
+            Some(r) => r.main_branch,
+            None => {
+                eprintln!(
+                    "cube: unhealthy gc: {}: repo {} not found, skipping",
+                    record.workspace_id, record.repo,
+                );
+                continue;
+            }
+        };
+
+        let prior_health = record.health_status.map(|h| h.as_str()).unwrap_or("unknown");
+        let age_secs = now_epoch_s.saturating_sub(unhealthy_since);
+
+        // Quarantine is only ever lifted against evidence: re-run the
+        // dirty-reclaim guard's probe and leave the workspace alone unless it
+        // now reports that nothing on `@` would be left behind.
+        if is_quarantined {
+            match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch) {
+                Ok(status) if status.is_reusable() => {
+                    audit!(
+                        database_path,
+                        "workspace.quarantine_cleared",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        source = "unhealthy_gc",
+                        reuse_reason = status.reuse_reason(),
+                        head_change_id = status.head_change_id(),
+                        head_parent_bookmarks = status.head_parent_bookmarks(),
+                        age_secs = age_secs,
+                    );
+                }
+                Ok(status) => {
+                    eprintln!(
+                        "cube: unhealthy gc: {} still holds unpushed work; leaving quarantined",
+                        record.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.quarantine_reclaim_refused",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        source = "unhealthy_gc",
+                        head_change_id = status.head_change_id(),
+                        head_is_empty = status.head_is_empty(),
+                        head_parent_bookmarks = status.head_parent_bookmarks(),
+                        unpushed_commits = status.unpushed_summary(),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cube: unhealthy gc: {}: quarantine probe failed: {e}",
+                        record.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.quarantine_reclaim_error",
+                        repo = record.repo,
+                        workspace_id = record.workspace_id,
+                        source = "unhealthy_gc",
+                        error = e.to_string(),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if let Err(e) = reset_workspace(runner, database_path, &record.workspace_path, &main_branch) {
+            eprintln!("cube: unhealthy gc: {}: reset failed: {e}", record.workspace_id,);
+            continue;
+        }
+
+        match store.gc_clear_workspace_unhealthy_state(&record.repo, &record.workspace_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "cube: unhealthy gc: {}: claimed between reset and store update",
+                    record.workspace_id,
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "cube: unhealthy gc: {}: failed to clear store state: {e}",
+                    record.workspace_id,
+                );
+                continue;
+            }
+        }
+
+        audit!(
+            database_path,
+            "workspace.unhealthy_gc_reset",
+            workspace_id = record.workspace_id,
+            repo = record.repo,
+            prior_health = prior_health,
+            prior_holder = record.holder.as_deref(),
+            prior_task = record.task.as_deref(),
+            unhealthy_since_epoch_s = unhealthy_since,
+            age_secs = age_secs,
+        );
+
+        eprintln!(
+            "cube: unhealthy gc: reset {} (was {} for {}s)",
+            record.workspace_id, prior_health, age_secs,
+        );
+        recycled += 1;
+    }
+    recycled
+}
+
+fn gc_stale_workspace_logs(store: &Store) {
+    let data_dir = match paths::data_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let logs_dir = paths::workspace_logs_dir_in(&data_dir);
+    if !logs_dir.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(&logs_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("cube: workspace logs gc: failed to read {}: {e}", logs_dir.display());
+            return;
+        }
+    };
+    let active_workspaces = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
+        Ok(w) => w
+            .iter()
+            .map(|r| r.workspace_id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+        Err(e) => {
+            eprintln!("cube: workspace logs gc: failed to list workspaces: {e}");
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let workspace_id = match path.file_name().and_then(|n| n.to_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        if !active_workspaces.contains(&workspace_id)
+            && let Err(e) = fs::remove_dir_all(&path)
+        {
+            eprintln!("cube: workspace logs gc: failed to remove {}: {e}", path.display());
+        }
+    }
+}
