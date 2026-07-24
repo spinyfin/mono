@@ -15,6 +15,7 @@ mod event;
 mod filter;
 mod supervisor;
 
+pub use boss_engine_metrics_registry::Registry;
 pub use bus::{EventBus, Subscription};
 pub use event::{Event, EventKind};
 pub use filter::TopicFilter;

@@ -13,7 +13,9 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/timer-wheel:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/metrics-registry:metrics_registry",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
@@ -21,7 +23,9 @@ rust_test(
     size = "small",
     crate = ":event-bus",
     edition = "2024",
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/engine/metrics-registry:metrics_registry",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

@@ -624,6 +624,7 @@ dependencies = [
 name = "boss-event-bus"
 version = "0.1.0"
 dependencies = [
+ "boss-engine-metrics-registry",
  "tokio",
  "tracing",
 ]
