@@ -195,38 +195,95 @@ final class BossPaneModel: ObservableObject {
         // log/status/diff) are also allowed; explicit Edit/Write/
         // jj-push/git-push are not — the Boss delegates code work
         // to workers per its system prompt.
-        let settings = bossSettingsLocalJson()
+        //
+        // Unlike CLAUDE.md above, this file is merged rather than
+        // clobbered: an operator may have hand-added their own rules,
+        // and a blind overwrite on every start would silently drop them.
         let settingsPath = claudeDir.appendingPathComponent("settings.local.json")
-        try? settings.write(to: settingsPath, atomically: true, encoding: .utf8)
+        writeBossSettingsLocalJson(to: settingsPath)
 
         return bossSession.path
     }
 }
 
-private func bossSettingsLocalJson() -> String {
-    """
-    {
-      "permissions": {
-        "allow": [
-          "Bash(boss *)",
-          "Bash(bossctl *)",
-          "Bash(gh pr view *)",
-          "Bash(gh pr list *)",
-          "Bash(gh pr checks *)",
-          "Bash(gh pr comments *)",
-          "Bash(gh issue view *)",
-          "Bash(gh issue list *)",
-          "Bash(jj log *)",
-          "Bash(jj status)",
-          "Bash(jj diff *)",
-          "Read",
-          "Glob",
-          "Grep",
-          "TodoWrite"
-        ]
-      }
+/// Baseline `permissions.allow` rules the Boss coordinator session needs to run its
+/// own CLIs and inspect state without prompting.
+private let bossBaselinePermissionsAllow: [String] = [
+    "Bash(boss *)",
+    "Bash(bossctl *)",
+    "Bash(gh pr view *)",
+    "Bash(gh pr list *)",
+    "Bash(gh pr checks *)",
+    "Bash(gh pr comments *)",
+    "Bash(gh issue view *)",
+    "Bash(gh issue list *)",
+    "Bash(jj log *)",
+    "Bash(jj status)",
+    "Bash(jj diff *)",
+    "Read",
+    "Glob",
+    "Grep",
+    "TodoWrite",
+]
+
+/// Extra `autoMode.allow` rules, layered on top of `$defaults`. The coordinator
+/// launches with `--permission-mode auto` (see `coordinatorInvocation`), so
+/// `permissions.allow` above only clears the ordinary tool-permission gate — the
+/// harness's separate auto-mode classifier still judges each Bash command on its
+/// own semantics and can block one even though `Bash(boss *)` already allows it,
+/// reacting to surface wording (e.g. "delete") rather than the underlying
+/// operation. These four verbs are reversible taxonomy CRUD the coordinator uses
+/// constantly (`boss task restore` is the inverse of `boss task delete`), so
+/// pre-clearing them with the classifier costs nothing in safety. Deliberately
+/// narrow: no `boss project delete`, and no blanket `boss *` wildcard here — that
+/// would pre-clear the classifier for destructive verbs this list isn't meant to
+/// cover.
+private let bossAutoModeAllow: [String] = [
+    "Bash(boss task delete *)",
+    "Bash(boss task restore *)",
+    "Bash(boss task update *)",
+    "Bash(boss chore update *)",
+]
+
+/// Writes the Boss coordinator session's `.claude/settings.local.json`. Merges the
+/// required allow-rules into whatever is already on disk — preserving any other keys
+/// and any operator-added rules — rather than clobbering the file, unlike `CLAUDE.md`.
+private func writeBossSettingsLocalJson(to path: URL) {
+    var root = existingJsonObject(at: path) ?? [:]
+
+    var permissions = root["permissions"] as? [String: Any] ?? [:]
+    permissions["allow"] = mergedRules(
+        existing: permissions["allow"] as? [String],
+        required: bossBaselinePermissionsAllow
+    )
+    root["permissions"] = permissions
+
+    var autoMode = root["autoMode"] as? [String: Any] ?? [:]
+    autoMode["allow"] = mergedRules(
+        existing: autoMode["allow"] as? [String],
+        required: ["$defaults"] + bossAutoModeAllow
+    )
+    root["autoMode"] = autoMode
+
+    guard JSONSerialization.isValidJSONObject(root),
+          let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+    else { return }
+    try? data.write(to: path, options: .atomic)
+}
+
+private func existingJsonObject(at path: URL) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: path) else { return nil }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+/// Appends any `required` rule missing from `existing`, preserving `existing`'s
+/// order and any operator-added entries; never drops or reorders what's already there.
+private func mergedRules(existing: [String]?, required: [String]) -> [String] {
+    var merged = existing ?? []
+    for rule in required where !merged.contains(rule) {
+        merged.append(rule)
     }
-    """
+    return merged
 }
 
 /// Reads `coordinator.direct_developer_mode` from the engine settings.toml on disk.
