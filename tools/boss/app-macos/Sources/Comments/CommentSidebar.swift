@@ -389,6 +389,38 @@ private struct AnchorStatusBadge: View {
     }
 }
 
+/// The small grey elapsed-time chip in a comment row's footer. Coarse
+/// ("2 minutes ago") rather than SwiftUI's built-in `Text(_:style:.relative)`,
+/// which ticks at ~1s granularity and reads as ongoing activity even for a
+/// long-`resolved` comment.
+///
+/// Static everywhere except `isLiveAnswering`, the one state where elapsed
+/// time is genuinely informative (a live answer agent is working). There it
+/// refreshes on a slow cadence — mirrors `WorkerWaitingIndicator`'s
+/// `TimelineView(.periodic(from:by:))` — rather than SwiftUI's 1s tick.
+private struct CommentAgeChip: View {
+    let comment: Comment
+    let isLiveAnswering: Bool
+
+    var body: some View {
+        if isLiveAnswering {
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                chipText(now: context.date)
+            }
+        } else {
+            chipText(now: Date())
+        }
+    }
+
+    private func chipText(now: Date) -> some View {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return Text(formatter.localizedString(for: comment.createdAt, relativeTo: now))
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+    }
+}
+
 private struct CommentRow: View {
     let comment: Comment
     @ObservedObject var layer: CommentLayer
@@ -450,6 +482,13 @@ private struct CommentRow: View {
         }
     }
 
+    /// Whether this comment has a genuinely live answer agent running — the
+    /// one case where the age chip's elapsed time is still informative.
+    /// Mirrors the `bucketTwoTrack` `.answering` predicate above.
+    private var isLiveAnswering: Bool {
+        comment.status == .answering && !comment.answerAgentFailed && comment.answerAgentRunning
+    }
+
     private var rowContent: some View {
         ZStack(alignment: .topTrailing) {
             VStack(alignment: .leading, spacing: 8) {
@@ -496,9 +535,7 @@ private struct CommentRow: View {
                         RevisionChip(state: chipState)
                     }
                     AnchorStatusBadge(comment: comment)
-                    Text(comment.createdAt, style: .relative)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    CommentAgeChip(comment: comment, isLiveAnswering: isLiveAnswering)
                 }
             }
             .padding(.horizontal, 12)

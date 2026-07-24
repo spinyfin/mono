@@ -539,6 +539,43 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[1].status, .answering)
     }
 
+    /// The engine writes `work_comments.created_at` as epoch seconds
+    /// serialised to a string (e.g. "1753302417"), never ISO-8601 — see
+    /// `now_string()` / `now_epoch_secs()` in `engine/core`. Every fixture
+    /// above this point uses ISO or the literal "t"; none exercises the
+    /// engine's actual shape. `Comment.parseWireTimestamp` must parse it,
+    /// not silently fall back to "now".
+    func testCommentFromParsesEngineEpochTimestamp() {
+        let wc = Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", createdAt: "1753302417").comment
+        let comment = Comment.from(wc, threadEntries: [], answerAgentRunning: false, answerAgentFailed: false)
+        XCTAssertEqual(comment.createdAt, Date(timeIntervalSince1970: 1_753_302_417))
+    }
+
+    /// Regression for the "every comment reads the same age" bug: two
+    /// comments created seconds apart must keep distinct `createdAt` values
+    /// across a second `applyList` (e.g. triggered by an unrelated reload),
+    /// not both re-stamp to the reload instant.
+    func testApplyListPreservesDistinctCreatedAtAcrossReload() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        let rows = [
+            Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", createdAt: "1753302000"),
+            Self.wireComment(id: "cmt_2", exact: "beta", body: "two", createdAt: "1753302417"),
+        ]
+        layer.applyList(rows)
+        let firstPass = Dictionary(uniqueKeysWithValues: layer.comments.map { ($0.id, $0.createdAt) })
+        XCTAssertNotEqual(firstPass["cmt_1"], firstPass["cmt_2"])
+
+        // Re-apply the identical wire rows, simulating a reload unrelated to
+        // these two comments (self-echo, cross-session invalidation, etc.).
+        layer.applyList(rows)
+        let secondPass = Dictionary(uniqueKeysWithValues: layer.comments.map { ($0.id, $0.createdAt) })
+        XCTAssertEqual(firstPass["cmt_1"], secondPass["cmt_1"])
+        XCTAssertEqual(firstPass["cmt_2"], secondPass["cmt_2"])
+        XCTAssertNotEqual(secondPass["cmt_1"], secondPass["cmt_2"])
+    }
+
     func testApplyResolvedStampsFuzzyAndOrphanGlyphs() {
         let layer = CommentLayer()
         let backend = FakeCommentBackend()
@@ -866,7 +903,8 @@ final class CommentLayerTests: XCTestCase {
         status: String = "active",
         intent: String? = nil,
         lastResolvedWith: String? = nil,
-        answerAgentFailed: Bool = false
+        answerAgentFailed: Bool = false,
+        createdAt: String = "2026-07-04T12:00:00Z"
     ) -> CommentWithThread {
         CommentWithThread(
             comment: WorkComment(
@@ -876,7 +914,7 @@ final class CommentLayerTests: XCTestCase {
                 artifactKind: "work_item",
                 author: "user:me",
                 body: body,
-                createdAt: "2026-07-04T12:00:00Z",
+                createdAt: createdAt,
                 status: status,
                 lastResolvedWith: lastResolvedWith,
                 intent: intent
