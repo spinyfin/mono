@@ -135,6 +135,7 @@ crate::stub_cube_client! { ScriptCube {
             lease_id: "lease-1".to_owned(),
             workspace_id: "ws-1".to_owned(),
             workspace_path: self.workspace_path.clone(),
+            dirty_verified: None,
         })
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<()> {
@@ -712,6 +713,7 @@ async fn rung0_all_resolved_pushes_and_retires_at_rung_0() {
         lease_id: "lease-r0".to_owned(),
         workspace_id: "ws-r0".to_owned(),
         workspace_path: ws.path().to_path_buf(),
+        dirty_verified: None,
     };
     let cube = Rung0Cube::new(true);
 
@@ -768,6 +770,7 @@ async fn rung0_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
         lease_id: "lease-r0d".to_owned(),
         workspace_id: "ws-r0d".to_owned(),
         workspace_path: ws.path().to_path_buf(),
+        dirty_verified: None,
     };
     let cube = Rung0Cube::with_tripwire_findings(
         true,
@@ -818,6 +821,7 @@ async fn rung0_declined_file_falls_through_without_pushing() {
         lease_id: "lease-r0b".to_owned(),
         workspace_id: "ws-r0b".to_owned(),
         workspace_path: PathBuf::from("/tmp/rung0-declined"),
+        dirty_verified: None,
     };
     let cube = Rung0Cube::new(true);
 
@@ -866,6 +870,7 @@ async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
         lease_id: "lease-r0d".to_owned(),
         workspace_id: "ws-r0d".to_owned(),
         workspace_path: PathBuf::from("/tmp/rung0-declined-mixed-does-not-exist"),
+        dirty_verified: None,
     };
     let cube = Rung0Cube::new(true);
 
@@ -912,6 +917,7 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
         lease_id: "lease-r0c".to_owned(),
         workspace_id: "ws-r0c".to_owned(),
         workspace_path: ws.path().to_path_buf(),
+        dirty_verified: None,
     };
     let cube = Rung0Cube::new(false);
 

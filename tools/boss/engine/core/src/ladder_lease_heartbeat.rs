@@ -151,6 +151,7 @@ mod tests {
             lease_id: "heartbeat-test-lease-1".to_owned(),
             workspace_id: "ws-heartbeat-test-1".to_owned(),
             workspace_path: std::path::PathBuf::from("/tmp/ws-heartbeat-test-1"),
+            dirty_verified: None,
         };
         crate::ladder_lease_registry::register(&lease);
 
@@ -177,6 +178,7 @@ mod tests {
             lease_id: "heartbeat-test-lease-fail".to_owned(),
             workspace_id: "ws-heartbeat-test-fail".to_owned(),
             workspace_path: std::path::PathBuf::from("/tmp/ws-heartbeat-test-fail"),
+            dirty_verified: None,
         };
         crate::ladder_lease_registry::register(&lease);
 

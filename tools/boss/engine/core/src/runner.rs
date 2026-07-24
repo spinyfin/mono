@@ -1367,6 +1367,172 @@ struct ExecutionPromptParams<'a> {
     merge_order_preservation: &'a [String],
 }
 
+/// Render the `## STARTUP RECOVERY` block for a worker respawned after its
+/// predecessor was interrupted.
+///
+/// ## What was wrong with the old block
+///
+/// It talked about exactly one thing — a branch the prior worker *might have
+/// pushed* — and said nothing about the case that actually loses work: a
+/// dirty working copy that was never committed, let alone pushed. Worse, its
+/// fallback instruction was `jj new main@origin`, which **moves `@` off any
+/// recovered uncommitted state**. A worker handed back a recovered tree,
+/// finding no pushed branch, would follow the prompt and discard the very
+/// work the recovery machinery had just saved.
+///
+/// ## What it says now
+///
+/// When the engine recovered state into this workspace it drops a marker
+/// (`.boss/recovery-report.json`, see [`crate::recovery_apply`]); `report` is
+/// that marker, already filtered to this execution. The block then states, in
+/// order:
+///
+/// 1. whether state was recovered, and how — in place by cube (jj history
+///    intact) or replayed from a patch (uncommitted edits only);
+/// 2. what exactly was restored, in files and line counts, so the worker can
+///    check rather than guess;
+/// 3. to **inspect before building on it** — recovered work is a crashed
+///    worker's mid-thought, not a reviewed baseline;
+/// 4. a fallback that is explicitly conditional on the working copy being
+///    clean, so it can never discard recovered state.
+///
+/// A `patch_error` on the report means recovery FAILED. That case gets its
+/// own paragraph telling the worker not to assume anything was resumed —
+/// silence there would leave it guessing, which is how a "recovered" worker
+/// quietly redoes everything or, worse, half-redoes it.
+fn startup_recovery_block(
+    prior_branch: &str,
+    expected_branch_new: &str,
+    report: Option<&crate::recovery_apply::RecoveryReport>,
+) -> String {
+    use crate::recovery_apply::RecoverySource;
+
+    let mut block = String::from("## STARTUP RECOVERY\n\n");
+    block.push_str(
+        "This execution was respawned after the previous worker session was interrupted \
+         (engine or UI crash). Treat everything below as a recovered mid-thought, not as a \
+         reviewed starting point.\n\n",
+    );
+
+    // 1 + 2: what was recovered, and how.
+    match report {
+        Some(r) if r.patch_error.is_some() => {
+            let err = r.patch_error.as_deref().unwrap_or_default();
+            block.push_str(&format!(
+                "### Recovery FAILED\n\
+                 \n\
+                 The engine had a saved patch of the prior worker's uncommitted work but it \
+                 did NOT apply:\n\
+                 \n\
+                 ```\n{err}\n```\n\
+                 \n\
+                 **Do NOT assume any of the prior work is present.** Your working copy holds \
+                 whatever the workspace already had — most likely nothing. Verify with \
+                 `jj status` and `jj diff --stat` before you plan, and expect to redo the \
+                 prior work from the task description. The patch was deliberately left on \
+                 disk so a human can salvage it; say so in your summary if the redo is \
+                 substantial.\n\n",
+            ));
+        }
+        Some(r) if r.source == RecoverySource::CubeInPlace => {
+            block.push_str(
+                "### State recovered IN PLACE\n\
+                 \n\
+                 You are running in the *same* cube workspace the interrupted worker was \
+                 using, and its uncommitted working copy is intact — including its jj \
+                 operation log. **Do not reset it.** Start by looking at what is already \
+                 there:\n\
+                 \n\
+                 ```\n\
+                 jj status\n\
+                 jj diff --stat\n\
+                 jj log -r '::@' -n 10\n\
+                 ```\n\
+                 \n\
+                 Read the recovered changes before adding to them. They are a crashed \
+                 worker's in-progress edits: they may be half-finished, may not compile, and \
+                 may not match the current task description. Reconcile them against the \
+                 brief first, then continue.\n\n",
+            );
+        }
+        Some(r) => {
+            // RecoverySource::Patch, applied successfully.
+            let summary = r
+                .applied
+                .as_ref()
+                .map(|a| a.summary())
+                .unwrap_or_else(|| "nothing".to_string());
+            let files = r
+                .applied
+                .as_ref()
+                .map(|a| a.paths.iter().map(|p| format!("  - `{p}`\n")).collect::<String>())
+                .unwrap_or_default();
+            block.push_str(&format!(
+                "### State recovered FROM A PATCH\n\
+                 \n\
+                 The interrupted worker's cube workspace could not be reclaimed, so the \
+                 engine replayed its saved patch into THIS workspace. Restored: \
+                 {summary}.\n\
+                 \n\
+                 Files restored:\n{files}\
+                 \n\
+                 These are **uncommitted edits only** — the prior worker's jj history and \
+                 operation log did not come with them, and Boss's own bookkeeping files were \
+                 filtered out. **Do not reset the working copy.** Inspect before building on \
+                 it:\n\
+                 \n\
+                 ```\n\
+                 jj status\n\
+                 jj diff --stat\n\
+                 ```\n\
+                 \n\
+                 A three-way apply can leave edits that do not compile or that reference \
+                 things that have since changed on `main`. Verify the restored state builds \
+                 and matches the task description before adding to it.\n\n",
+            ));
+        }
+        None => {
+            block.push_str(
+                "The engine has no record of recovered uncommitted state for this run. Still \
+                 check `jj status` before you start — if the working copy is NOT clean, it \
+                 holds the prior worker's edits and you must inspect them rather than \
+                 discard them.\n\n",
+            );
+        }
+    }
+
+    // 3: the pushed-branch half, unchanged in intent.
+    block.push_str(&format!(
+        "### Prior pushed branch\n\
+         \n\
+         The prior worker may also have pushed commits to `{prior_branch}` on the remote:\n\
+         \n\
+         ```\n\
+         jj git fetch\n\
+         jj edit {prior_branch}@origin   # resumes prior commits if the branch was pushed\n\
+         ```\n\
+         \n\
+         If you resume that branch, continue from those commits and push using the NEW \
+         expected branch name `{expected_branch_new}` (see the `expected branch name` line \
+         in the execution context below). Do NOT reuse the prior branch name.\n\n",
+    ));
+
+    // 4: a fallback that cannot destroy recovered state.
+    block.push_str(
+        "### If there is no prior branch\n\
+         \n\
+         `jj edit` will fail if the prior worker never pushed. In that case:\n\
+         \n\
+         - If `jj status` shows a **dirty** working copy, that is your recovered work — \
+           keep it and continue from where you are. **Do NOT run `jj new main@origin`**: it \
+           moves `@` off the recovered state and is how this work gets lost a second time.\n\
+         - Only if `jj status` shows the working copy is **clean** is it correct to start \
+           fresh with `jj new main@origin`.\n\n",
+    );
+
+    block
+}
+
 fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     let ExecutionPromptParams {
         execution,
@@ -1444,25 +1610,10 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
             &execution.branch_naming,
             execution.worker_branch_prefix.as_deref(),
         );
-        prompt.push_str(&format!(
-            "## STARTUP RECOVERY\n\
-             \n\
-             This execution was respawned after the previous worker session was interrupted \
-             (engine or UI crash). The prior worker may have pushed commits to \
-             `{prior_branch}` on the remote.\n\
-             \n\
-             After leasing your workspace, attempt to resume the prior branch:\n\
-             ```\n\
-             jj git fetch\n\
-             jj edit {prior_branch}@origin   # resumes prior commits if branch was pushed\n\
-             ```\n\
-             If that command fails (branch not found on remote — prior worker hadn't pushed \
-             yet), fall back to `jj new main@origin` instead.\n\
-             \n\
-             If you successfully resumed the prior branch, continue from those commits and \
-             push using the new expected branch name `{expected_branch_new}` (see the \
-             `expected branch name` line in the execution context below). Do NOT reuse the \
-             prior branch name.\n\n",
+        prompt.push_str(&startup_recovery_block(
+            prior_branch,
+            &expected_branch_new,
+            crate::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id).as_ref(),
         ));
     }
 
@@ -4022,6 +4173,127 @@ mod compose_prompt_tests {
             prompt.contains("jj edit boss/exec_prior123_09@origin"),
             "recovery block should instruct jj edit on the remote branch:\n{prompt}",
         );
+    }
+
+    // ── STARTUP RECOVERY: recovered working state (P3) ────────────────────
+    //
+    // The old block talked only about a *pushed branch* and told the worker
+    // to fall back to `jj new main@origin` — which moves `@` off any
+    // recovered uncommitted state. These tests pin the fix.
+
+    fn apply_report(paths: &[&str], insertions: usize, deletions: usize) -> crate::recovery_apply::ApplyReport {
+        crate::recovery_apply::ApplyReport {
+            paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+            insertions,
+            deletions,
+            filtered_paths: vec![".boss/events-pending.jsonl".to_owned()],
+        }
+    }
+
+    /// With no recovery marker the block must still refuse the unconditional
+    /// `jj new main@origin` that used to discard recovered state.
+    #[test]
+    fn recovery_block_never_tells_the_worker_to_unconditionally_reset() {
+        let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", None);
+        assert!(
+            block.contains("Do NOT run `jj new main@origin`"),
+            "the block must forbid the reset that discards recovered state:\n{block}",
+        );
+        assert!(
+            block.contains("Only if `jj status` shows the working copy is **clean**"),
+            "the reset must be conditional on a clean working copy:\n{block}",
+        );
+    }
+
+    /// Cube recovered the tree in place: say so, say the jj history came with
+    /// it, and tell the worker to look before it leaps.
+    #[test]
+    fn recovery_block_reports_in_place_recovery() {
+        let report = crate::recovery_apply::RecoveryReport {
+            for_execution_id: "exec_new".to_owned(),
+            from_execution_id: "exec_dead".to_owned(),
+            source: crate::recovery_apply::RecoverySource::CubeInPlace,
+            applied: None,
+            patch_error: None,
+        };
+        let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", Some(&report));
+        assert!(block.contains("State recovered IN PLACE"), "{block}");
+        assert!(
+            block.contains("operation log is intact") || block.contains("operation log"),
+            "{block}"
+        );
+        assert!(block.contains("Do not reset it."), "{block}");
+        assert!(
+            block.contains("jj diff --stat"),
+            "the worker must be told how to inspect before building on it:\n{block}",
+        );
+    }
+
+    /// Patch recovery: name the files and the line counts, and be explicit
+    /// that only uncommitted edits came across.
+    #[test]
+    fn recovery_block_reports_patch_recovery_in_human_terms() {
+        let report = crate::recovery_apply::RecoveryReport {
+            for_execution_id: "exec_new".to_owned(),
+            from_execution_id: "exec_dead".to_owned(),
+            source: crate::recovery_apply::RecoverySource::Patch,
+            applied: Some(apply_report(&["tools/cube/src/app.rs", "docs/x.md"], 120, 14)),
+            patch_error: None,
+        };
+        let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", Some(&report));
+        assert!(block.contains("State recovered FROM A PATCH"), "{block}");
+        assert!(block.contains("2 file(s), +120/-14"), "{block}");
+        assert!(block.contains("`tools/cube/src/app.rs`"), "{block}");
+        assert!(block.contains("`docs/x.md`"), "{block}");
+        assert!(
+            block.contains("uncommitted edits only"),
+            "the worker must know the jj history did NOT come with the patch:\n{block}",
+        );
+        assert!(block.contains("Do not reset the working copy."), "{block}");
+    }
+
+    /// A failed apply must be surfaced to the worker, not silently omitted.
+    /// Silence would leave it believing it was resuming.
+    #[test]
+    fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
+        let report = crate::recovery_apply::RecoveryReport {
+            for_execution_id: "exec_new".to_owned(),
+            from_execution_id: "exec_dead".to_owned(),
+            source: crate::recovery_apply::RecoverySource::Patch,
+            applied: None,
+            patch_error: Some("error: patch does not apply".to_owned()),
+        };
+        let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", Some(&report));
+        assert!(block.contains("Recovery FAILED"), "{block}");
+        assert!(block.contains("error: patch does not apply"), "{block}");
+        assert!(
+            block.contains("Do NOT assume any of the prior work is present."),
+            "the worker must not believe it is resuming:\n{block}",
+        );
+        assert!(
+            !block.contains("State recovered"),
+            "a failed recovery must never read as a successful one:\n{block}",
+        );
+    }
+
+    /// The pushed-branch half of the block is preserved in every variant —
+    /// the new working-state reporting is additive, not a replacement.
+    #[test]
+    fn recovery_block_keeps_the_prior_branch_instructions() {
+        for report in [
+            None,
+            Some(crate::recovery_apply::RecoveryReport {
+                for_execution_id: "e".to_owned(),
+                from_execution_id: "d".to_owned(),
+                source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                applied: None,
+                patch_error: None,
+            }),
+        ] {
+            let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", report.as_ref());
+            assert!(block.contains("jj edit boss/exec_prior_09@origin"), "{block}");
+            assert!(block.contains("boss/exec_new_01"), "{block}");
+        }
     }
 
     #[test]

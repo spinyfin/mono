@@ -452,6 +452,21 @@ pub struct CubeWorkspaceLease {
     pub lease_id: String,
     pub workspace_id: String,
     pub workspace_path: PathBuf,
+    /// Cube's positive recovery check, reported only on an `--allow-dirty`
+    /// reclaim:
+    ///
+    /// - `Some(true)`  — the workspace still held work that exists on no
+    ///   remote, i.e. cube recovered the dead worker's tree in place. This is
+    ///   the good path: the work is live, with its jj operation log intact.
+    /// - `Some(false)` — the lease succeeded but there was nothing left to
+    ///   recover (the tree had already been reset). The caller must fall back
+    ///   to the engine's saved recovery patch.
+    /// - `None`        — not a recovery lease; the field does not apply.
+    ///
+    /// The distinction matters because lease success alone never proved
+    /// recovery: a caller that inferred it would start from an empty tree
+    /// while believing it was resuming.
+    pub dirty_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4543,6 +4558,11 @@ impl ExecutionCoordinator {
             }
         };
 
+        // Recovery, cube-first (see `reconcile_workspace_recovery`). Runs
+        // before the run starts so the worker's prompt can read the marker
+        // this drops. A no-op for every non-resume dispatch.
+        self.reconcile_workspace_recovery(execution, worker_id, &lease).await;
+
         // Lease-time occupancy guard (defect 3). Cube should never hand us
         // a workspace that is still the cwd of a live worker — but the
         // duplicate-dispatch incident proved it can when an upstream bug
@@ -5210,6 +5230,241 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Locate the recovery patch belonging to the execution that
+    /// `execution` is resuming, if the engine captured one.
+    ///
+    /// Returns `(dead_execution_id, patch_path)`. The dead execution is found
+    /// the same way [`crate::runner`] finds it for the STARTUP RECOVERY
+    /// prompt block — `get_prior_orphaned_execution` — so both halves of the
+    /// recovery story agree on which run is being resumed.
+    ///
+    /// Every failure mode (no recovery dir, no prior orphan, no patch on
+    /// disk, a DB error) yields `None`: recovery is a precaution layered on
+    /// top of dispatch and must never be able to break it.
+    fn recovery_patch_for_resume(&self, execution: &WorkExecution) -> Option<(String, PathBuf)> {
+        let recovery_dir = crate::recovery_backup::default_recovery_dir()?;
+        let prior = self
+            .work_db
+            .get_prior_orphaned_execution(&execution.work_item_id, &execution.id)
+            .ok()
+            .flatten()?;
+        let patch = crate::recovery_apply::find_patch(&recovery_dir, &prior.id)?;
+        Some((prior.id, patch))
+    }
+
+    /// Resolve, and record, how a resume dispatch got its predecessor's work
+    /// back — cube first, patch only as fallback.
+    ///
+    /// Called once per dispatch immediately after the lease. Does nothing for
+    /// a non-resume execution (`allow_dirty` is the resume flag; the
+    /// reconcilers set it on every respawn that pins a workspace).
+    ///
+    /// The order is the operator's:
+    ///
+    /// 1. **Cube recovered in place.** `lease.dirty_verified == Some(true)`
+    ///    means cube handed back a working copy that still held work existing
+    ///    on no remote. The work is live, in place, with jj history intact.
+    ///    We must NOT apply the patch on top of it — the hunks are already
+    ///    there and a second application either duplicates them or conflicts.
+    /// 2. **Cube could not recover.** The lease failed and we degraded to a
+    ///    free workspace, or it succeeded with `dirty_verified == Some(false)`
+    ///    because the tree had already been reset. Now, and only now, replay
+    ///    the patch.
+    ///
+    /// A failed apply is loud: an `outcome=error` dispatch event, an
+    /// `ERROR`-level log, and a recovery report carrying `patch_error` so the
+    /// worker's prompt tells it recovery FAILED rather than letting it build
+    /// on a tree it believes was restored.
+    async fn reconcile_workspace_recovery(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        lease: &CubeWorkspaceLease,
+    ) {
+        if !execution.allow_dirty {
+            return;
+        }
+        let Some((dead_execution_id, patch_path)) = self.recovery_patch_for_resume(execution) else {
+            // No captured patch. Cube may still have recovered in place — say
+            // so, so the worker knows not to start from `main`.
+            if lease.dirty_verified == Some(true) {
+                self.record_recovery(
+                    execution,
+                    worker_id,
+                    lease,
+                    crate::recovery_apply::RecoveryReport {
+                        for_execution_id: execution.id.clone(),
+                        from_execution_id: String::new(),
+                        source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                        applied: None,
+                        patch_error: None,
+                    },
+                    None,
+                )
+                .await;
+            }
+            return;
+        };
+
+        // ── 1. cube-first ────────────────────────────────────────────────
+        if lease.dirty_verified == Some(true) {
+            self.record_recovery(
+                execution,
+                worker_id,
+                lease,
+                crate::recovery_apply::RecoveryReport {
+                    for_execution_id: execution.id.clone(),
+                    from_execution_id: dead_execution_id,
+                    source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                    applied: None,
+                    patch_error: None,
+                },
+                Some(&patch_path),
+            )
+            .await;
+            return;
+        }
+
+        // ── 2. patch fallback ────────────────────────────────────────────
+        match crate::recovery_apply::apply_recovery_patch(&lease.workspace_path, &patch_path) {
+            Ok(Some(applied)) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    dead_execution_id = %dead_execution_id,
+                    workspace_id = %lease.workspace_id,
+                    restored = %applied.summary(),
+                    "workspace recovery: replayed the dead execution's patch into the resuming workspace",
+                );
+                self.record_recovery(
+                    execution,
+                    worker_id,
+                    lease,
+                    crate::recovery_apply::RecoveryReport {
+                        for_execution_id: execution.id.clone(),
+                        from_execution_id: dead_execution_id,
+                        source: crate::recovery_apply::RecoverySource::Patch,
+                        applied: Some(applied),
+                        patch_error: None,
+                    },
+                    Some(&patch_path),
+                )
+                .await;
+            }
+            Ok(None) => {
+                // The capture held nothing but Boss's own bookkeeping. Not a
+                // failure, but not a recovery either — say nothing to the
+                // worker rather than claim a restoration that did not happen.
+                tracing::info!(
+                    execution_id = %execution.id,
+                    dead_execution_id = %dead_execution_id,
+                    patch = %patch_path.display(),
+                    "workspace recovery: patch held only Boss bookkeeping; nothing restored",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "source": "patch",
+                                "restored": false,
+                                "reason": "bookkeeping_only",
+                                "dead_execution_id": dead_execution_id,
+                            })),
+                    )
+                    .await;
+                crate::recovery_apply::mark_patch_consumed(&patch_path);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                tracing::error!(
+                    execution_id = %execution.id,
+                    dead_execution_id = %dead_execution_id,
+                    workspace_id = %lease.workspace_id,
+                    patch = %patch_path.display(),
+                    error = %message,
+                    "workspace recovery FAILED: the dead execution's patch did not apply; \
+                     the worker will be told NOT to assume its state was recovered",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "source": "patch",
+                                "restored": false,
+                                "reason": "apply_failed",
+                                "dead_execution_id": dead_execution_id,
+                                "recovery_patch": patch_path.display().to_string(),
+                                "error": message,
+                            })),
+                    )
+                    .await;
+                // Deliberately NOT marked consumed: the patch is the only
+                // copy of the work and a human may still salvage it by hand.
+                let report = crate::recovery_apply::RecoveryReport {
+                    for_execution_id: execution.id.clone(),
+                    from_execution_id: dead_execution_id,
+                    source: crate::recovery_apply::RecoverySource::Patch,
+                    applied: None,
+                    patch_error: Some(message),
+                };
+                if let Err(write_err) = report.write(&lease.workspace_path) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{write_err:#}"),
+                        "workspace recovery: could not write the failure marker; \
+                         the worker's prompt will not mention the failed recovery",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Persist a successful recovery: drop the marker the worker's prompt
+    /// reads, emit the dispatch event, and retire the patch so a later
+    /// restart does not replay it over the work it already restored (P4).
+    async fn record_recovery(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        lease: &CubeWorkspaceLease,
+        report: crate::recovery_apply::RecoveryReport,
+        consume_patch: Option<&Path>,
+    ) {
+        let source = match report.source {
+            crate::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
+            crate::recovery_apply::RecoverySource::Patch => "patch",
+        };
+        let restored = report.applied.as_ref().map(|a| a.summary());
+        if let Err(err) = report.write(&lease.workspace_path) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "workspace recovery: could not write the recovery marker; the worker's \
+                 prompt will not know its state was recovered",
+            );
+        }
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_details(serde_json::json!({
+                        "source": source,
+                        "restored": true,
+                        "workspace_id": lease.workspace_id,
+                        "dead_execution_id": report.from_execution_id,
+                        "summary": restored,
+                    })),
+            )
+            .await;
+        if let Some(patch) = consume_patch {
+            crate::recovery_apply::mark_patch_consumed(patch);
+        }
+    }
+
     /// Lease a cube workspace for `execution`, emitting a structured
     /// attempt/failure event for every try and falling back to "any
     /// free workspace" when an unprefixed lease fails.
@@ -5396,9 +5651,49 @@ impl ExecutionCoordinator {
         // lives only in the named workspace, so landing elsewhere is
         // meaningless and must surface an error rather than silently
         // dispatching to a clean workspace.
-        if prefer.is_some() && (!execution.prefer_is_soft || allow_dirty) {
+        // P5 — a resume that loses the workspace race is not automatically
+        // doomed. The hard pin exists because the uncommitted work lived ONLY
+        // in that workspace; once the engine has captured a recovery patch
+        // for the dead execution, that premise is false and the work is
+        // reproducible anywhere. Observed failure mode: a fresh dispatch
+        // grabbed the pinned workspace seven seconds before the resume, the
+        // resume burned its retries against a guaranteed-failing lease, and
+        // the item terminalized to `todo` with `blocked_reason: null` — no
+        // user-visible signal at all.
+        //
+        // So: degrade to `any_free` when (and only when) there is a patch to
+        // replay. Without one, the hard fail is still correct.
+        let recovery_patch = self.recovery_patch_for_resume(execution);
+        let patch_rescues_this_resume = allow_dirty && recovery_patch.is_some();
+        if prefer.is_some() && (!execution.prefer_is_soft || allow_dirty) && !patch_rescues_this_resume {
             CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
             return Err(first_err);
+        }
+        if patch_rescues_this_resume {
+            let (dead_execution_id, patch_path) = recovery_patch.as_ref().expect("checked above");
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id,
+                prefer = ?prefer,
+                dead_execution_id = %dead_execution_id,
+                patch = %patch_path.display(),
+                "resume lost its pinned workspace, but a recovery patch exists; \
+                 degrading to any free workspace and replaying the patch there",
+            );
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::WorkspaceRecovery, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_details(serde_json::json!({
+                            "step": "prefer_degraded_to_any_free",
+                            "prefer_workspace_id": prefer,
+                            "dead_execution_id": dead_execution_id,
+                            "recovery_patch": patch_path.display().to_string(),
+                        })),
+                )
+                .await;
         }
 
         let mut attempt2_args = vec![
@@ -7067,6 +7362,7 @@ mod tests {
                 lease_id: "lease-1".to_owned(),
                 workspace_id: workspace_id.clone(),
                 workspace_path: PathBuf::from(format!("/tmp/{workspace_id}")),
+                dirty_verified: None,
             })
         }
 
@@ -9512,6 +9808,341 @@ mod tests {
             "terminal lease failure must raise exactly one attention item",
         );
         assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
+    }
+
+    // ── reconcile_workspace_recovery: cube first, patch second ────────────
+
+    /// `BOSS_RECOVERY_DIR` is process-global, so the recovery tests
+    /// serialise on this lock rather than racing each other's tempdirs.
+    fn recovery_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Seed a chore with a dead predecessor execution (orphaned, so
+    /// `get_prior_orphaned_execution` finds it) plus a live resume execution
+    /// carrying `allow_dirty`. Returns `(dead_execution_id, resume_execution)`.
+    fn seed_resume_pair(db: &Arc<WorkDb>) -> (String, WorkExecution) {
+        let product = create_test_product(db);
+        let chore = create_test_chore_manual(db, product.id.clone(), "Recover me");
+        db.reconcile_product_executions(&product.id).unwrap();
+        db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+            .unwrap();
+        let dead_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        db.start_execution_run(
+            &dead_id,
+            "agent-dead",
+            "mono",
+            "lease-dead",
+            "mono-agent-003",
+            "/tmp/mono-agent-003",
+        )
+        .unwrap();
+        db.mark_execution_orphaned(&dead_id, "engine crash").unwrap();
+        let resume = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .preferred_workspace_id("mono-agent-003")
+                    .allow_dirty(true)
+                    .build(),
+            )
+            .unwrap();
+        (dead_id, resume)
+    }
+
+    fn recovery_coordinator(db: Arc<WorkDb>) -> Arc<ExecutionCoordinator> {
+        Arc::new(ExecutionCoordinator::new(
+            db,
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        ))
+    }
+
+    /// A git repo with one committed file, so `git apply --3way` has a blob
+    /// to three-way against.
+    fn init_recovery_workspace(path: &std::path::Path) -> bool {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !run(&["init", "--initial-branch=main"]) {
+            return false;
+        }
+        let _ = run(&["config", "user.email", "t@example.com"]);
+        let _ = run(&["config", "user.name", "T"]);
+        std::fs::write(path.join("hello.txt"), "original\n").unwrap();
+        run(&["add", "."]) && run(&["commit", "-m", "seed"])
+    }
+
+    fn lease_for(workspace_path: &std::path::Path, dirty_verified: Option<bool>) -> CubeWorkspaceLease {
+        CubeWorkspaceLease {
+            lease_id: "lease-resume".to_owned(),
+            workspace_id: "mono-agent-003".to_owned(),
+            workspace_path: workspace_path.to_path_buf(),
+            dirty_verified,
+        }
+    }
+
+    const RECOVERY_PATCH: &str = "diff --git a/hello.txt b/hello.txt\n\
+                                  index 0000000..1111111 100644\n\
+                                  --- a/hello.txt\n\
+                                  +++ b/hello.txt\n\
+                                  @@ -1 +1 @@\n\
+                                  -original\n\
+                                  +recovered work\n";
+
+    /// Cube recovered the tree in place. The patch must NOT be applied on top
+    /// — the hunks are already there, and a second application either
+    /// duplicates them or conflicts. The worker is still told it is resuming.
+    // The env guard is a std Mutex held across awaits. clippy flags that
+    // shape because it can block an executor thread, but here it is the
+    // point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
+    // gets its own current-thread runtime, and serialising these tests on
+    // one thread is exactly the intended behaviour.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recovery_prefers_cube_in_place_and_does_not_replay_the_patch() {
+        let _guard = recovery_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // The "recovered in place" content cube handed back.
+        std::fs::write(ws.join("hello.txt"), "recovered work\n").unwrap();
+        let recovery_dir = dir.path().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, resume) = seed_resume_pair(&db);
+        let patch = recovery_dir.join(format!("{dead_id}.patch"));
+        std::fs::write(&patch, RECOVERY_PATCH).unwrap();
+
+        let coordinator = recovery_coordinator(db);
+        coordinator
+            .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(true)))
+            .await;
+
+        let report = crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
+            .expect("an in-place recovery must still be reported to the worker");
+        assert_eq!(report.source, crate::recovery_apply::RecoverySource::CubeInPlace);
+        assert_eq!(report.from_execution_id, dead_id);
+        assert!(report.applied.is_none(), "nothing was replayed");
+        assert!(report.patch_error.is_none());
+        // The file is untouched — the patch would have failed to apply here
+        // anyway (its pre-image is `original`), so a silent apply attempt
+        // would have surfaced as an error report.
+        assert_eq!(
+            std::fs::read_to_string(ws.join("hello.txt")).unwrap(),
+            "recovered work\n"
+        );
+        // P4: consumed, so a later restart does not replay it.
+        assert!(!patch.exists());
+        assert!(recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
+
+        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+    }
+
+    /// Cube could NOT recover (`dirty_verified: false` — the tree had already
+    /// been reset). Now, and only now, the patch is replayed.
+    // The env guard is a std Mutex held across awaits. clippy flags that
+    // shape because it can block an executor thread, but here it is the
+    // point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
+    // gets its own current-thread runtime, and serialising these tests on
+    // one thread is exactly the intended behaviour.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recovery_falls_back_to_the_patch_when_cube_recovered_nothing() {
+        let _guard = recovery_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        if !init_recovery_workspace(&ws) {
+            eprintln!("skipping: git unavailable in sandbox");
+            return;
+        }
+        let recovery_dir = dir.path().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, resume) = seed_resume_pair(&db);
+        let patch = recovery_dir.join(format!("{dead_id}.patch"));
+        std::fs::write(&patch, RECOVERY_PATCH).unwrap();
+
+        let coordinator = recovery_coordinator(db);
+        coordinator
+            .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(ws.join("hello.txt")).unwrap(),
+            "recovered work\n",
+            "the patch must actually restore the work into the workspace",
+        );
+        let report = crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).expect("report");
+        assert_eq!(report.source, crate::recovery_apply::RecoverySource::Patch);
+        let applied = report.applied.expect("a patch recovery must report what it restored");
+        assert_eq!(applied.paths, ["hello.txt"]);
+        assert_eq!((applied.insertions, applied.deletions), (1, 1));
+        assert!(
+            !patch.exists(),
+            "a consumed patch must not be replayed on a later restart"
+        );
+
+        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+    }
+
+    /// A patch that does not apply must be loud: the worker is told recovery
+    /// FAILED, and the patch is deliberately NOT consumed because it is the
+    /// only remaining copy of that work.
+    // The env guard is a std Mutex held across awaits. clippy flags that
+    // shape because it can block an executor thread, but here it is the
+    // point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
+    // gets its own current-thread runtime, and serialising these tests on
+    // one thread is exactly the intended behaviour.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_failed_patch_apply_is_reported_and_the_patch_is_kept() {
+        let _guard = recovery_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        if !init_recovery_workspace(&ws) {
+            eprintln!("skipping: git unavailable in sandbox");
+            return;
+        }
+        let recovery_dir = dir.path().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, resume) = seed_resume_pair(&db);
+        let patch = recovery_dir.join(format!("{dead_id}.patch"));
+        // Pre-image that exists nowhere, and a blob id git cannot resolve, so
+        // neither the direct apply nor the 3-way fallback can succeed.
+        std::fs::write(
+            &patch,
+            "diff --git a/absent.txt b/absent.txt\n\
+             index deadbee..cafebab 100644\n\
+             --- a/absent.txt\n\
+             +++ b/absent.txt\n\
+             @@ -1 +1 @@\n\
+             -never here\n\
+             +replacement\n",
+        )
+        .unwrap();
+
+        let coordinator = recovery_coordinator(db);
+        coordinator
+            .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
+            .await;
+
+        let report = crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
+            .expect("a failed recovery must still be reported — silence would let the worker assume success");
+        assert!(report.applied.is_none());
+        let err = report.patch_error.expect("the failure must be carried to the worker");
+        assert!(err.contains("git apply --3way"), "error should name the command: {err}");
+        assert!(
+            patch.exists(),
+            "the only copy of the work must survive a failed apply for manual salvage",
+        );
+        assert!(!recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
+        let _ = dead_id;
+
+        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+    }
+
+    /// A patch of nothing but Boss's own hook spool restores nothing, and
+    /// must not be reported to the worker as a recovery.
+    // The env guard is a std Mutex held across awaits. clippy flags that
+    // shape because it can block an executor thread, but here it is the
+    // point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
+    // gets its own current-thread runtime, and serialising these tests on
+    // one thread is exactly the intended behaviour.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_bookkeeping_only_patch_is_not_reported_as_a_recovery() {
+        let _guard = recovery_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let recovery_dir = dir.path().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, resume) = seed_resume_pair(&db);
+        let patch = recovery_dir.join(format!("{dead_id}.patch"));
+        std::fs::write(
+            &patch,
+            "diff --git a/.boss/events-pending.jsonl b/.boss/events-pending.jsonl\n\
+             --- a/.boss/events-pending.jsonl\n\
+             +++ b/.boss/events-pending.jsonl\n\
+             @@ -0,0 +1 @@\n\
+             +{\"event\":\"Stop\"}\n",
+        )
+        .unwrap();
+
+        let coordinator = recovery_coordinator(db);
+        coordinator
+            .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
+            .await;
+
+        assert!(
+            crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).is_none(),
+            "a bookkeeping-only patch restores nothing and must not claim a recovery",
+        );
+        assert!(!patch.exists(), "the spent patch is still retired");
+
+        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+    }
+
+    /// A normal (non-resume) dispatch must not touch the recovery machinery
+    /// at all — no marker, no consumed patch.
+    // The env guard is a std Mutex held across awaits. clippy flags that
+    // shape because it can block an executor thread, but here it is the
+    // point: `BOSS_RECOVERY_DIR` is process-global, each `#[tokio::test]`
+    // gets its own current-thread runtime, and serialising these tests on
+    // one thread is exactly the intended behaviour.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recovery_is_a_no_op_for_a_non_resume_dispatch() {
+        let _guard = recovery_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let recovery_dir = dir.path().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (dead_id, _resume) = seed_resume_pair(&db);
+        let patch = recovery_dir.join(format!("{dead_id}.patch"));
+        std::fs::write(&patch, RECOVERY_PATCH).unwrap();
+
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Fresh work");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let fresh = db
+            .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+            .unwrap();
+        assert!(!fresh.allow_dirty, "a fresh dispatch is not a resume");
+
+        let coordinator = recovery_coordinator(db);
+        coordinator
+            .reconcile_workspace_recovery(&fresh, "worker-1", &lease_for(&ws, None))
+            .await;
+
+        assert!(crate::recovery_apply::RecoveryReport::read_for(&ws, &fresh.id).is_none());
+        assert!(patch.exists(), "an unrelated execution's patch must be left alone");
+
+        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
     }
 
     /// Issue #962 -- the UI-crash resume reclaims a stale lease.

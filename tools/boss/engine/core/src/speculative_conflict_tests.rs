@@ -80,6 +80,7 @@ crate::stub_cube_client! { ScriptCube {
             lease_id: format!("lease-{count}"),
             workspace_id: format!("ws-{count}"),
             workspace_path: PathBuf::from("/tmp/speculative-ws"),
+            dirty_verified: None,
         })
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<()> {
