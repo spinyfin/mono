@@ -166,7 +166,7 @@ pub enum Stage {
     /// operators can distinguish "slot claimed but PID dead" from
     /// "slot not claimed at all."
     DeadPidReconcile,
-    /// The periodic pane-death sweep ([`crate::dead_pane_sweep`]) found a
+    /// The periodic pane-death sweep (`boss_engine::dead_pane_sweep`) found a
     /// still-`running`/`waiting_human` local execution whose worker pane is
     /// provably gone — its durable shell pid (persisted from the app's
     /// `UpdateWorkerShellPid`) reports `ESRCH` from `kill(pid, 0)`. Unlike
@@ -266,7 +266,7 @@ pub enum Stage {
     /// logged, not evented, because every live worker is refreshed every
     /// interval and per-success events would bloat the stream. A run of these
     /// for one lease means cube and the engine have desynced for that
-    /// workspace; see `crate::cube_lease_heartbeat`.
+    /// workspace; see `boss_engine::cube_lease_heartbeat`.
     CubeLeaseHeartbeat,
     /// The lost-workspace reconciler finalized a non-terminal execution
     /// (`running` / `waiting_human` / …) whose recorded local cube
@@ -278,10 +278,10 @@ pub enum Stage {
     /// redundant-spawn guard blocks every future spawn for that work item.
     /// The `details` object carries `prior_status`, the missing
     /// `workspace_path`, and the reap `reason` so the strand is diagnosable
-    /// from `bossctl dispatch tail`; see `crate::lost_workspace_sweep`.
+    /// from `bossctl dispatch tail`; see `boss_engine::lost_workspace_sweep`.
     LostWorkspaceReconcile,
     /// The cube-lease heartbeat sweep gave up refreshing a lease after
-    /// [`crate::cube_lease_heartbeat::AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`]
+    /// `boss_engine::cube_lease_heartbeat::AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`
     /// consecutive failures and auto-reaped the execution through the same
     /// terminal path as `bossctl agents reap` (`mark_execution_orphaned`).
     /// Before this existed, a lease cube no longer tracked (workspace
@@ -293,7 +293,7 @@ pub enum Stage {
     /// operator can see how long the lease had been failing before the
     /// auto-reap fired.
     CubeLeaseAutoReap,
-    /// The periodic remote-lease reconciler ([`crate::remote_lease_reconcile`])
+    /// The periodic remote-lease reconciler (`boss_engine::remote_lease_reconcile`)
     /// found a still-`waiting_human`/`running` execution on a remote SSH host
     /// whose worker process was provably gone (a `kill -0` over the host's
     /// `ControlMaster` reported no such process), reaped the execution through
@@ -304,7 +304,7 @@ pub enum Stage {
     /// `details` object carries `prior_status`, the `remote_pid`, and the
     /// reap `reason` so the strand is diagnosable from `bossctl dispatch tail`.
     RemoteLeaseReconcile,
-    /// The host-reconcile sweep ([`crate::host_reconcile`]) terminalized a
+    /// The host-reconcile sweep (`boss_engine::host_reconcile`) terminalized a
     /// non-terminal execution whose latest run was bound to a host that is
     /// now offline — disabled by the operator (`bossctl hosts disable`),
     /// auto-disabled by the dispatch-health circuit breaker, or removed
@@ -320,7 +320,7 @@ pub enum Stage {
     /// (`host_disabled` / `host_removed`) so the re-route is diagnosable
     /// from `bossctl dispatch tail`.
     HostDrainReconcile,
-    /// The periodic spawn-ack sweep ([`crate::spawn_ack_sweep`]) found a
+    /// The periodic spawn-ack sweep (`boss_engine::spawn_ack_sweep`) found a
     /// slot stuck in `Spawning` that never reported a shell pid AND never
     /// received a single hook event, past the grace window — proof no
     /// worker process ever came up at all, not merely one blocked on the
@@ -348,7 +348,7 @@ pub enum Stage {
     /// a pre-spawn failure that exhausted its retries stayed parked until
     /// a human ran `bossctl work start` (2026-07-03 T215 incident — sat
     /// undispatched 45+ minutes with free slots available). See
-    /// `crate::dispatch_failure_recovery_sweep`.
+    /// `boss_engine::dispatch_failure_recovery_sweep`.
     DispatchFailureRecoveryRedispatch,
     /// The app proactively reported — via `ReportWorkerSpawnFailed` — that a
     /// worker pane's shell never came up because the libghostty surface
@@ -373,22 +373,22 @@ pub enum Stage {
     /// `app_spawn_capability_unhealthy` attention item as ONE loud signal,
     /// instead of independently churning each work item into its own churn
     /// guard — but whether it also **pauses dispatch** depends on
-    /// [`crate::config::WorkConfig::enable_spawn_capability_breaker`]
+    /// `boss_engine::config::WorkConfig::enable_spawn_capability_breaker`
     /// (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`, ON by default — see
-    /// [`crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER`] for the
+    /// `boss_engine::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER` for the
     /// 2026-07-15 incident that briefly defaulted it off and why it is safe
     /// to default on again). When enabled, dispatch stays paused
     /// until either the half-open recovery probe or a fresh app session
     /// registering auto-resumes it (see
     /// [`Stage::SpawnCapabilityRecovered`] and
-    /// [`crate::spawn_health::maybe_admit_recovery_probe`]); when disabled,
+    /// `boss_engine::spawn_health::maybe_admit_recovery_probe`); when disabled,
     /// this event fires as observability only. The `details` object carries
     /// `distinct_work_items`, `window_secs`, `breaker_enabled`, and
     /// `dispatch_paused` (mirrors `breaker_enabled`).
     SpawnCapabilityUnhealthy,
     /// Dispatch auto-resumed after Breaker-origin evidence that the app's
     /// spawn path recovered — either the half-open recovery probe's canary
-    /// (see [`crate::spawn_health::maybe_admit_recovery_probe`]) reported a
+    /// (see `boss_engine::spawn_health::maybe_admit_recovery_probe`) reported a
     /// real shell pid, or a fresh app session registered (an app relaunch,
     /// the operator's natural recovery action). Never fired for an
     /// operator-originated pause, which stays manual-resume-only. The
@@ -397,7 +397,7 @@ pub enum Stage {
     /// sentinel `"engine"` for a fresh-session recovery with no specific
     /// execution behind it.
     SpawnCapabilityRecovered,
-    /// The periodic husk-pane sweep ([`crate::husk_pane_sweep`]) found a
+    /// The periodic husk-pane sweep (`boss_engine::husk_pane_sweep`) found a
     /// worker pane the macOS app is STILL hosting for a slot the engine has
     /// no live-tracked run for at all, confirmed across two consecutive
     /// passes, and retired it (the same teardown `bossctl agents
@@ -422,7 +422,7 @@ pub enum Stage {
     /// The execution-liveness reconciler finalized a non-terminal LOCAL
     /// execution whose worker pane never reported a shell pid and has been
     /// running past the pane-attach deadline (a spawn that stalled before
-    /// `pane_spawned`) — see `crate::lost_workspace_sweep`. This is the gap
+    /// `pane_spawned`) — see `boss_engine::lost_workspace_sweep`. This is the gap
     /// `lost_workspace_reconcile` (workspace dir still on disk),
     /// `dead_pane_sweep` (only ever probes a pid that was actually reported),
     /// and `cube_lease_auto_reap` (the engine's own DB-fallback heartbeat kept
@@ -433,7 +433,7 @@ pub enum Stage {
     /// `reason` (`pane_never_attached`), `prior_status`, `age_in_status_secs`,
     /// and the observed `shell_pid` (always absent) so a recurrence is
     /// attributable from `bossctl dispatch tail` in one read; see
-    /// `crate::execution_liveness::classify_pane_liveness`.
+    /// `boss_engine::execution_liveness::classify_pane_liveness`.
     ExecutionLivenessReconcile,
     /// Dispatch (and, when `details.reviews_held` is `true`, `pr_review`)
     /// was paused — either an operator toggled `bossctl dispatch pause` /
@@ -460,7 +460,7 @@ pub enum Stage {
     /// operator toggled dispatch back on, or the spawn-capability breaker's
     /// half-open recovery probe / a fresh app session cleared a
     /// Breaker-origin pause (see
-    /// [`crate::spawn_health::resume_dispatch_after_breaker_recovery`]). The
+    /// `boss_engine::spawn_health::resume_dispatch_after_breaker_recovery`). The
     /// `details` object carries `origin`, `actor` (`"operator"` for a human
     /// toggle, `"automatic"` for breaker auto-recovery), `resumed_at_epoch_s`,
     /// `pause_duration_secs` (how long the episode this closes actually
@@ -468,7 +468,7 @@ pub enum Stage {
     DispatchResumed,
     /// A ready mainline item preempted an in-progress spilled automation
     /// run to obtain an interactive slot (see
-    /// [`crate::dispatch_spillover`]). Fires only when every Bridge Crew
+    /// `boss_engine::dispatch_spillover`). Fires only when every Bridge Crew
     /// and Lower Decks slot is occupied; never for a review or automation
     /// item, and never against a mainline or review victim.
     ///

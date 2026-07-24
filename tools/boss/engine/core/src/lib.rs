@@ -34,7 +34,7 @@ pub mod deferred_scope;
 pub mod dep_unblock_sweep;
 pub mod design_detector;
 pub use boss_deterministic_resolvers as deterministic_resolvers;
-pub mod dispatch_events;
+pub use boss_dispatch_events as dispatch_events;
 pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_metrics;
 pub(crate) mod dispatch_spillover;
