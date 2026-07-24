@@ -894,6 +894,12 @@ pub struct WorkerCompletionHandler {
     /// `on_stop_inner`'s SHA-delta `Contributed` gate to distinguish the
     /// revision's own push from a concurrent parent-worker push.
     staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
+    /// In-memory staging map for failed `boss propose` submissions.
+    /// Populated by the `PostToolUse` hook dispatcher in `app.rs`; consumed
+    /// by [`Self::detect_and_file_proposal_channel_error`] on `on_stop`,
+    /// which files an attention and increments
+    /// `worker_proposals.channel_error`. See [`crate::proposal_channel_error`].
+    staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
     /// Toggleable feature flags (incident 001 AI #5). Consulted by
     /// `on_stop_inner` and `recheck_for_pr` to decide whether the
     /// cold-path PR fallback is permitted to run. Defaults to a

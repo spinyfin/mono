@@ -414,6 +414,43 @@ impl WorkDb {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Coordinator-facing read: every `worker_proposals` row across the
+    /// whole ledger, optionally narrowed by any combination of
+    /// `execution_id` / `work_item_id` / `kind` / `state`. Unlike
+    /// [`Self::list_worker_proposals_for_work_item`] (worker-tier, scoped to
+    /// the caller's own work item) this has no implicit scope — it backs
+    /// `bossctl work proposals list`, which per the design's §"UI
+    /// visibility and provenance" is where the full ledger (including
+    /// `rejected`/`expired` history) is CLI-inspectable.
+    pub fn list_worker_proposals(
+        &self,
+        execution_id: Option<&str>,
+        work_item_id: Option<&str>,
+        kind: Option<ProposalKind>,
+        state: Option<ProposalState>,
+    ) -> Result<Vec<WorkerProposal>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "{SELECT_WORKER_PROPOSAL}
+             WHERE (?1 IS NULL OR execution_id = ?1)
+               AND (?2 IS NULL OR work_item_id = ?2)
+               AND (?3 IS NULL OR kind = ?3)
+               AND (?4 IS NULL OR state = ?4)
+             ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                execution_id,
+                work_item_id,
+                kind.map(|k| k.as_str()),
+                state.map(|s| s.as_str())
+            ],
+            map_worker_proposal,
+        )?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Expire undecided (`state = 'proposed'`) proposals of an in-flight-only
     /// kind whose owning execution has reached a terminal status. Called by
     /// the periodic [`crate::proposal_expiry_sweep`]. Returns the number of
@@ -1211,6 +1248,84 @@ mod tests {
         let listed = db.list_worker_proposals_for_work_item(&my_chore, None, None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].execution_id, mine);
+    }
+
+    /// [`WorkDb::list_worker_proposals`] is the unscoped, coordinator-facing
+    /// read behind `bossctl work proposals list` — unlike
+    /// `list_worker_proposals_for_work_item`, it has no implicit scope and
+    /// every filter (execution/work-item/kind/state) is optional and
+    /// independently applicable.
+    #[test]
+    fn list_worker_proposals_supports_every_filter_combination() {
+        let (_dir, db) = open_db();
+        let (mine, my_chore) = execution_for_new_chore(&db, "Mine");
+        let (theirs, their_chore) = execution_for_new_chore(&db, "Theirs");
+
+        submit(
+            &db,
+            &mine,
+            &my_chore,
+            ProposalKind::Blocked,
+            r#"{"reason":"mine"}"#,
+            "key-1",
+        )
+        .unwrap();
+        submit(
+            &db,
+            &mine,
+            &my_chore,
+            ProposalKind::EffortEscalation,
+            r#"{"reason":"mine-2","requested_level":"large"}"#,
+            "key-2",
+        )
+        .unwrap();
+        submit(
+            &db,
+            &theirs,
+            &their_chore,
+            ProposalKind::Blocked,
+            r#"{"reason":"theirs"}"#,
+            "key-1",
+        )
+        .unwrap();
+
+        // No filters: every proposal in the ledger.
+        assert_eq!(db.list_worker_proposals(None, None, None, None).unwrap().len(), 3);
+
+        // execution_id filter.
+        let by_execution = db.list_worker_proposals(Some(&mine), None, None, None).unwrap();
+        assert_eq!(by_execution.len(), 2);
+        assert!(by_execution.iter().all(|p| p.execution_id == mine));
+
+        // work_item_id filter.
+        let by_work_item = db.list_worker_proposals(None, Some(&their_chore), None, None).unwrap();
+        assert_eq!(by_work_item.len(), 1);
+        assert_eq!(by_work_item[0].execution_id, theirs);
+
+        // kind filter, applied across both work items.
+        let by_kind = db
+            .list_worker_proposals(None, None, Some(ProposalKind::Blocked), None)
+            .unwrap();
+        assert_eq!(by_kind.len(), 2);
+
+        // Combined execution_id + kind filter.
+        let combined = db
+            .list_worker_proposals(Some(&mine), None, Some(ProposalKind::EffortEscalation), None)
+            .unwrap();
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].idempotency_key, "key-2");
+
+        // state filter: every seeded proposal here auto-applies (Blocked /
+        // EffortEscalation are both AutoApply kinds), so filtering to
+        // `Proposed` should find none.
+        let none_proposed = db
+            .list_worker_proposals(None, None, None, Some(ProposalState::Proposed))
+            .unwrap();
+        assert!(none_proposed.is_empty());
+        let all_applied = db
+            .list_worker_proposals(None, None, None, Some(ProposalState::Applied))
+            .unwrap();
+        assert_eq!(all_applied.len(), 3);
     }
 
     #[test]

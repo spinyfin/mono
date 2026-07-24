@@ -28,6 +28,7 @@ impl WorkerCompletionHandler {
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
+            staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
             feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())),
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
@@ -59,6 +60,17 @@ impl WorkerCompletionHandler {
     /// the same cache instance.
     pub fn with_staged_revision_pushes(mut self, cache: Arc<crate::pr_url_capture::StagedRevisionPushCache>) -> Self {
         self.staged_revision_pushes = cache;
+        self
+    }
+
+    /// Wire an externally-owned [`crate::proposal_channel_error::ProposalChannelErrorTracker`]
+    /// into this handler. Called by `app.rs` so the PostToolUse dispatcher
+    /// and `on_stop`'s proposal-channel-error pass share the same instance.
+    pub fn with_staged_proposal_channel_errors(
+        mut self,
+        tracker: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
+    ) -> Self {
+        self.staged_proposal_channel_errors = tracker;
         self
     }
 

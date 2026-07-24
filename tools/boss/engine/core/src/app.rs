@@ -80,7 +80,7 @@ mod planner_ops;
 mod probes;
 mod products;
 mod projects;
-mod proposals;
+pub(crate) mod proposals;
 mod review;
 mod server;
 mod sessions;
@@ -478,6 +478,13 @@ struct ServerState {
     /// completion handler so `on_stop_inner`'s SHA-delta gate can confirm
     /// the revision was the one that moved the PR head.
     staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
+    /// In-memory `execution_id → error` staging map for `boss propose`
+    /// submissions that failed. Populated by the `PostToolUse` hook
+    /// dispatcher; consumed by the completion handler's
+    /// `proposal_channel_error` pass, which files an attention and
+    /// increments `worker_proposals.channel_error`. See
+    /// [`crate::proposal_channel_error`].
+    staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
     /// Per-execution deny counter for the editorial PreToolUse loop guard
     /// (design R3). State is in-memory only; a restart resets it to zero,
     /// which is the safe direction (worst case a worker gets three fresh
@@ -804,6 +811,8 @@ impl ServerState {
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         let staged_revision_pushes = Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
+        let staged_proposal_channel_errors =
+            Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new());
 
         // Resolve the Boss state root early — both the feature-flags
         // store (loaded below, before the completion handler is
@@ -955,6 +964,7 @@ impl ServerState {
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
             .with_staged_revision_pushes(staged_revision_pushes.clone())
+            .with_staged_proposal_channel_errors(staged_proposal_channel_errors.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion)
@@ -1079,6 +1089,7 @@ impl ServerState {
                 .design_docs(Arc::new(boss_engine_design_docs::DesignDocsService::new()))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
+                .staged_proposal_channel_errors(staged_proposal_channel_errors)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
                 .maybe_anthropic_api_key(anthropic_api_key)
                 .worker_pool_size(worker_pool_size)
