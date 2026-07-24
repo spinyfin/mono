@@ -186,19 +186,19 @@ final class BossPaneModel: ObservableObject {
         // the next Boss-session start without manually clearing files.
         try? bossSystemPrompt(directDeveloperMode: readDirectDeveloperMode()).write(to: claudeMd, atomically: true, encoding: .utf8)
 
-        // Auto-mode allowlist for the Boss session. Without these,
-        // Claude Code's auto-mode classifier blocks the Boss from
-        // running its own CLIs (`boss` for work-taxonomy CRUD,
-        // `bossctl` for control verbs) and we lose the Boss's
-        // ability to delegate or queue work. Read-only inspection
-        // tools (Read/Glob/Grep, gh PR/issue read verbs, jj
-        // log/status/diff) are also allowed; explicit Edit/Write/
-        // jj-push/git-push are not — the Boss delegates code work
-        // to workers per its system prompt.
+        // Tool-permission allowlist for the Boss session. Without these,
+        // Claude Code prompts before the Boss can run its own CLIs
+        // (`boss` for work-taxonomy CRUD, `bossctl` for control verbs)
+        // and we lose the Boss's ability to delegate or queue work.
+        // Read-only inspection tools (Read/Glob/Grep, gh PR/issue read
+        // verbs, jj log/status/diff) are also allowed; explicit
+        // Edit/Write/jj-push/git-push are not — the Boss delegates
+        // code work to workers per its system prompt.
         //
         // Unlike CLAUDE.md above, this file is merged rather than
-        // clobbered: an operator may have hand-added their own rules,
-        // and a blind overwrite on every start would silently drop them.
+        // clobbered: hand-added rules already in this file must
+        // survive an app restart, and a blind overwrite on every start
+        // would silently drop them.
         let settingsPath = claudeDir.appendingPathComponent("settings.local.json")
         writeBossSettingsLocalJson(to: settingsPath)
 
@@ -247,9 +247,30 @@ private let bossAutoModeAllow: [String] = [
 
 /// Writes the Boss coordinator session's `.claude/settings.local.json`. Merges the
 /// required allow-rules into whatever is already on disk — preserving any other keys
-/// and any operator-added rules — rather than clobbering the file, unlike `CLAUDE.md`.
-private func writeBossSettingsLocalJson(to path: URL) {
-    var root = existingJsonObject(at: path) ?? [:]
+/// and any hand-added rules — rather than clobbering the file, unlike `CLAUDE.md`.
+func writeBossSettingsLocalJson(to path: URL) {
+    var root: [String: Any]
+    switch existingJsonObject(at: path) {
+    case .absent:
+        root = [:]
+    case let .parsed(object):
+        root = object
+    case .malformed:
+        // Don't silently clobber a hand-edited file we can't parse (trailing
+        // comma, truncated write, etc.) — that's exactly the failure this
+        // merge behavior exists to prevent. Move it aside so nothing is lost,
+        // then proceed as if no file were present.
+        logger.error("Boss session settings.local.json is not valid JSON; preserving it as settings.local.json.bak before rewriting")
+        let backupPath = path.deletingLastPathComponent().appendingPathComponent("settings.local.json.bak")
+        let fm = FileManager.default
+        try? fm.removeItem(at: backupPath)
+        do {
+            try fm.moveItem(at: path, to: backupPath)
+        } catch {
+            logger.error("Failed to back up malformed settings.local.json: \(error, privacy: .public)")
+        }
+        root = [:]
+    }
 
     var permissions = root["permissions"] as? [String: Any] ?? [:]
     permissions["allow"] = mergedRules(
@@ -261,24 +282,43 @@ private func writeBossSettingsLocalJson(to path: URL) {
     var autoMode = root["autoMode"] as? [String: Any] ?? [:]
     autoMode["allow"] = mergedRules(
         existing: autoMode["allow"] as? [String],
+        // $defaults is force-included even if an existing autoMode.allow omits it,
+        // so the built-in classifier rules are always inherited on top of these
+        // extra entries rather than replaced by them.
         required: ["$defaults"] + bossAutoModeAllow
     )
     root["autoMode"] = autoMode
 
     guard JSONSerialization.isValidJSONObject(root),
           let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-    else { return }
-    try? data.write(to: path, options: .atomic)
+    else {
+        logger.error("Failed to serialize Boss session settings.local.json; leaving existing file untouched")
+        return
+    }
+    do {
+        try data.write(to: path, options: .atomic)
+    } catch {
+        logger.error("Failed to write Boss session settings.local.json: \(error, privacy: .public)")
+    }
 }
 
-private func existingJsonObject(at path: URL) -> [String: Any]? {
-    guard let data = try? Data(contentsOf: path) else { return nil }
-    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+private enum ExistingSettingsJson {
+    case absent
+    case malformed
+    case parsed([String: Any])
+}
+
+private func existingJsonObject(at path: URL) -> ExistingSettingsJson {
+    guard let data = try? Data(contentsOf: path) else { return .absent }
+    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        return .malformed
+    }
+    return .parsed(object)
 }
 
 /// Appends any `required` rule missing from `existing`, preserving `existing`'s
-/// order and any operator-added entries; never drops or reorders what's already there.
-private func mergedRules(existing: [String]?, required: [String]) -> [String] {
+/// order and any hand-added entries; never drops or reorders what's already there.
+func mergedRules(existing: [String]?, required: [String]) -> [String] {
     var merged = existing ?? []
     for rule in required where !merged.contains(rule) {
         merged.append(rule)
