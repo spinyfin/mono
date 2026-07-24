@@ -128,6 +128,36 @@ fn scope_changeset_is_parsed() {
 }
 
 #[test]
+fn scope_changeset_in_subdirectory_config_produces_diagnostic_and_is_not_scheduled() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("subdir")).expect("create dir");
+    fs::write(
+        temp.path().join("subdir/CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\nscope = \"changeset\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("subdir/a.rs"))
+        .expect("resolve checks");
+
+    // The check must not be silently scheduled: it's absent from the
+    // resolved set, and a diagnostic explains why.
+    assert!(
+        checks.get("boss/no-boss-isms").is_none(),
+        "a subdirectory-declared changeset-scope check must never be scheduled"
+    );
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("scope = changeset") && diagnostic.message.contains("boss/no-boss-isms")
+        }),
+        "expected a diagnostic naming the misplaced changeset-scope check, got {diagnostics:?}"
+    );
+}
+
+#[test]
 fn invalid_scope_produces_diagnostic() {
     let temp = tempdir().expect("create temp dir");
     fs::write(

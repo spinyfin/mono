@@ -37,7 +37,7 @@ impl ConfiguredCheck for ChangesetInspectingCheck {
 
         let mut findings = Vec::new();
         if let Some(desc) = changeset.pr_description.as_deref()
-            && desc.contains("T3124")
+            && desc.contains("LEAKED-MARKER")
         {
             findings.push(Finding {
                 fixable: false,
@@ -104,7 +104,7 @@ scope = "changeset"
             old_path: None,
         },
     ])
-    .with_pr_description(Some("Fixes T3124 by removing the leak.".to_owned()));
+    .with_pr_description(Some("Fixes LEAKED-MARKER by removing the leak.".to_owned()));
 
     let results = runner.run_changeset(&changeset).await.expect("run checks");
 
@@ -139,7 +139,7 @@ scope = "changeset"
     let call_count = Arc::new(Mutex::new(0));
     let runner = runner_with_changeset_check(&temp, Arc::clone(&call_count));
 
-    let changeset = ChangeSet::new(vec![]).with_pr_description(Some("Fixes T3124.".to_owned()));
+    let changeset = ChangeSet::new(vec![]).with_pr_description(Some("Fixes LEAKED-MARKER.".to_owned()));
     let results = runner.run_changeset(&changeset).await.expect("run checks");
 
     assert_eq!(
@@ -176,7 +176,7 @@ scope = "changeset"
         kind: ChangeKind::Modified,
         old_path: None,
     }])
-    .with_pr_description(Some("Fixes T3124.".to_owned()));
+    .with_pr_description(Some("Fixes LEAKED-MARKER.".to_owned()));
     let results = runner.run_changeset(&changeset).await.expect("run checks");
 
     assert_eq!(
@@ -248,4 +248,63 @@ scope = "changeset"
         .expect("list checks");
 
     assert_eq!(checks, vec!["boss/no-boss-isms".to_owned()]);
+}
+
+#[tokio::test]
+async fn changeset_scope_check_declared_only_in_subdirectory_config_is_never_scheduled() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("subdir")).expect("create dirs");
+    fs::write(temp.path().join("subdir/a.md"), "hello\n").expect("write file");
+    fs::write(
+        temp.path().join("subdir/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "boss/no-boss-isms"
+check = "changeset-inspecting"
+scope = "changeset"
+"#,
+    )
+    .expect("write config");
+
+    let call_count = Arc::new(Mutex::new(0));
+    let runner = runner_with_changeset_check(&temp, Arc::clone(&call_count));
+
+    // A changeset-scope check declared only under a subdirectory CHECKS file
+    // must not be silently scheduled: `list` surfaces the misconfiguration as
+    // an error (the same way any other config diagnostic does) rather than
+    // quietly listing nothing, and the check id itself is never listed.
+    let list_err = runner
+        .list_configured_checks(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("subdir/a.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .expect_err("listing must surface the misplaced `scope = changeset` declaration");
+    let list_err_message = list_err.to_string();
+    assert!(
+        list_err_message.contains("boss/no-boss-isms") && list_err_message.contains("scope = changeset"),
+        "expected the list error to name the misplaced check, got: {list_err_message}"
+    );
+
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: Path::new("subdir/a.md").to_path_buf(),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }])
+    .with_pr_description(Some("Fixes LEAKED-MARKER by removing the leak.".to_owned()));
+    let results = runner.run_changeset(&changeset).await.expect("run checks");
+
+    assert_eq!(
+        *call_count.lock().expect("lock call count"),
+        0,
+        "a changeset-scope check declared in a subdirectory config must never run"
+    );
+    // The check never runs, but the misconfiguration still surfaces as a
+    // diagnostic finding rather than vanishing silently.
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].findings[0].message.contains("scope = changeset"),
+        "expected a diagnostic finding about the misplaced scope, got {:?}",
+        results[0].findings
+    );
 }

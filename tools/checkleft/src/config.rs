@@ -470,6 +470,17 @@ impl ConfigResolver {
                 },
                 None => CheckScope::default(),
             };
+            if scope == CheckScope::Changeset && !check_config_dir.as_os_str().is_empty() {
+                resolved.push_diagnostic(config_check_diagnostic(
+                    configured_id.clone(),
+                    config_relative_path.clone(),
+                    format!(
+                        "`scope = changeset` is only honoured in the repo-root CHECKS file; check `{configured_id}` declared in {} will never be scheduled",
+                        config_relative_path.display()
+                    ),
+                ));
+                continue;
+            }
             resolved.upsert(CheckConfig {
                 check: check_name,
                 id: configured_id,
