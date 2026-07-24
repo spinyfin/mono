@@ -20,6 +20,7 @@ crate::stub_cube_client! { CleanRebaseCube {
             lease_id: "L1".to_owned(),
             workspace_id: "W1".to_owned(),
             workspace_path: std::path::PathBuf::from("/tmp/rung1-ws"),
+            dirty_verified: None,
         })
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<()> {
@@ -134,6 +135,7 @@ crate::stub_cube_client! { ConflictsCube {
             lease_id: "L2".to_owned(),
             workspace_id: "W2".to_owned(),
             workspace_path: std::path::PathBuf::from("/tmp/rung2-ws"),
+            dirty_verified: None,
         })
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<()> {

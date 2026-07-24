@@ -132,18 +132,67 @@ event.
 
 The capture is **best-effort and non-fatal**: a missing workspace path,
 an unavailable `jj`, or an empty diff is logged and swallowed, and the
-reap proceeds regardless. To replay the work into a fresh workspace:
+reap proceeds regardless.
 
-```
-git apply --3way "$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch"
-```
+Boss's own bookkeeping (`.boss/`, notably the `events-pending.jsonl`
+hook spool) is filtered out of the capture. Patch size is not a signal
+of value: three of the four patches taken at 14:42 PDT on 2026-07-23
+were 203 KB / 197 KB / 38 KB of nothing but that spool, and only an
+11 KB patch held real code.
 
 **Scope:** the patch captures _uncommitted_ working-copy changes only.
 Local commits the worker already `jj describe`d into ancestors of `@`
 are not captured (capturing `trunk..@` is a possible future
 enhancement), and branches already pushed to origin are already durable
-there. Stale patches under `recovery/` are not yet garbage-collected —
-GC is a follow-up.
+there.
+
+## Automatic recovery: cube first, patch second
+
+The engine replays these patches itself — you do not normally need to
+apply one by hand. `tools/boss/engine/core/src/recovery_apply.rs` is the
+read side, driven from `coordinator.rs::reconcile_workspace_recovery`
+on every resume dispatch:
+
+1. **Cube first.** The resume leases `--prefer <workspace> --allow-dirty`,
+   which reclaims the dead worker's own workspace _without_ resetting it.
+   Cube reports `dirty_verified` on the lease payload: `true` means the
+   working copy still held work existing on no remote, i.e. the work was
+   recovered in place, with its jj operation log intact. Nothing is
+   replayed — applying the patch on top would duplicate or conflict with
+   work that is already there.
+2. **Patch second.** Only when cube could _not_ recover — the lease
+   failed, or it succeeded with `dirty_verified: false` because the tree
+   had already been reset — is the patch applied (`git apply --3way`)
+   into whatever workspace the resuming worker actually got.
+
+The outcome is recorded three ways: a `workspace_recovery` dispatch
+event (`source` = `cube_in_place` | `patch`, with restored file and line
+counts); a `.boss/recovery-report.json` marker in the workspace, which
+the worker's `## STARTUP RECOVERY` prompt block reads so the worker
+knows it is resuming and what it is resuming _from_; and, on success, a
+rename of the patch to `<exec-id>.patch.applied` so a later restart does
+not replay it over the work it already restored.
+
+**A failed apply is loud.** It emits `workspace_recovery` with
+`outcome=error`, logs at ERROR, leaves the patch un-consumed for manual
+salvage, and writes a marker whose prompt block tells the worker
+explicitly not to assume anything was recovered. Recovery code that
+fails quietly is worse than none: the worker rebuilds from scratch while
+believing it is resuming.
+
+To replay a patch by hand (e.g. one left behind by a failed apply):
+
+```
+git apply --3way "$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch"
+```
+
+**Retention.** Patches are load bearing now, so GC must not race
+recovery. Applied patches are renamed to `*.patch.applied` at recovery
+time and are the safe thing to age out; an un-consumed `*.patch` is
+either awaiting a resume that has not happened yet or the residue of a
+failed apply, and is the one thing a human may still need. Boothby's
+recovery-patch GC (catalogue action #17) is scoped accordingly — see
+`docs/designs/boothby.md`.
 
 ## Recovery cheat-sheet
 

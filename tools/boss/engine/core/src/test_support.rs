@@ -369,6 +369,7 @@ crate::stub_cube_client! { AlwaysSucceedsCube {
             lease_id: "test-lease-1".to_owned(),
             workspace_path: PathBuf::from(format!("/tmp/{workspace_id}")),
             workspace_id,
+            dirty_verified: None,
         })
     }
     async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {

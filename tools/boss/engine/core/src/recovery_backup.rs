@@ -126,16 +126,35 @@ fn capture_workspace_diff(workspace_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Write `diff` to `<recovery_dir>/<exec-id>.patch` when it is non-empty.
+/// Write `diff` to `<recovery_dir>/<exec-id>.patch` when it holds real work.
 ///
 /// Creates `recovery_dir` if needed. An all-whitespace/empty diff means
 /// the workspace had no uncommitted work — there is nothing to back up,
-/// so no file is written and `Ok(None)` is returned. Otherwise the patch
-/// is written and its path returned.
+/// so no file is written and `Ok(None)` is returned. A diff holding
+/// *only* Boss's own bookkeeping is treated the same way: see the filter
+/// below. Otherwise the (filtered) patch is written and its path returned.
 pub fn write_patch_if_nonempty(recovery_dir: &Path, execution_id: &str, diff: &str) -> Result<Option<PathBuf>> {
     if diff.trim().is_empty() {
         return Ok(None);
     }
+    // Drop Boss's own bookkeeping (`.boss/events-pending.jsonl` and friends)
+    // at capture time as well as at apply time. Three of the four patches
+    // taken at 14:42 PDT on 2026-07-23 were 203 KB / 197 KB / 38 KB of
+    // nothing but that hook spool — patches that looked substantial, held no
+    // work, and would have replayed stale hook events into a fresh
+    // workspace. Filtering here makes the artifact on disk honest about what
+    // it holds; `recovery_apply` filters again so the ~86 patches already on
+    // disk are handled too.
+    let filtered = crate::recovery_apply::filter_bookkeeping(diff);
+    if filtered.is_empty() {
+        tracing::debug!(
+            execution_id,
+            filtered_paths = ?filtered.filtered_paths,
+            "recovery-backup: diff held only Boss bookkeeping; nothing worth capturing",
+        );
+        return Ok(None);
+    }
+    let diff = filtered.text.as_str();
     std::fs::create_dir_all(recovery_dir)
         .with_context(|| format!("failed to create recovery dir {}", recovery_dir.display()))?;
     let path = recovery_dir.join(patch_file_name(execution_id));
@@ -279,6 +298,51 @@ mod tests {
         assert_eq!(path, dir.path().join("exec_abc_3.patch"));
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, diff, "patch contents must match the captured diff verbatim");
+    }
+
+    /// Patch size is not a signal of value: a 200 KB capture of nothing but
+    /// the `.boss/` hook spool holds no work, and writing it would leave an
+    /// artifact that later looks like a recoverable crash.
+    #[test]
+    fn bookkeeping_only_diff_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let diff = "diff --git a/.boss/events-pending.jsonl b/.boss/events-pending.jsonl\n\
+                    --- a/.boss/events-pending.jsonl\n\
+                    +++ b/.boss/events-pending.jsonl\n\
+                    @@ -0,0 +1 @@\n\
+                    +{\"event\":\"Stop\"}\n";
+        assert!(
+            write_patch_if_nonempty(dir.path(), "exec_spool", diff)
+                .unwrap()
+                .is_none()
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(entries.is_empty(), "a bookkeeping-only diff must not be captured");
+    }
+
+    /// A mixed capture keeps the work and drops the spool.
+    #[test]
+    fn mixed_diff_is_captured_without_the_bookkeeping_section() {
+        let dir = TempDir::new().unwrap();
+        let diff = "diff --git a/.boss/events-pending.jsonl b/.boss/events-pending.jsonl\n\
+                    --- a/.boss/events-pending.jsonl\n\
+                    +++ b/.boss/events-pending.jsonl\n\
+                    @@ -0,0 +1 @@\n\
+                    +{\"event\":\"Stop\"}\n\
+                    diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -0,0 +1 @@\n\
+                    +fn real_work() {}\n";
+        let path = write_patch_if_nonempty(dir.path(), "exec_mixed", diff)
+            .unwrap()
+            .expect("real work must still be captured");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("fn real_work"), "the work must survive: {written}");
+        assert!(
+            !written.contains("events-pending"),
+            "the spool must not be captured: {written}"
+        );
     }
 
     #[test]

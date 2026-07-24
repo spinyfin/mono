@@ -489,6 +489,21 @@ pub enum Stage {
     /// the mainline item simply waits for the next drain, exactly as it
     /// does on ordinary pool exhaustion. `outcome=error` means teardown
     /// or requeue failed.
+    /// Post-lease recovery of a crashed worker's in-flight work, emitted
+    /// once per resume dispatch that had something to recover.
+    ///
+    /// `outcome=ok` with `details.source="cube_in_place"` is the good path:
+    /// cube re-leased the dead worker's own workspace with its dirty working
+    /// copy intact, so nothing was replayed. `details.source="patch"` means
+    /// cube could not recover and the saved patch was applied — `details`
+    /// then carries the restored file count and line counts, in human terms,
+    /// excluding Boss's own bookkeeping.
+    ///
+    /// `outcome=error` means the patch did NOT apply. That is deliberately a
+    /// loud, separate record rather than a silent fall-through: a worker
+    /// starting on a tree it believes was recovered is worse than one that
+    /// knows it must start over.
+    WorkspaceRecovery,
     AutomationPreempted,
 }
 
@@ -537,6 +552,7 @@ impl Stage {
             Stage::DispatchPaused => "dispatch_paused",
             Stage::DispatchResumed => "dispatch_resumed",
             Stage::AutomationPreempted => "automation_preempted",
+            Stage::WorkspaceRecovery => "workspace_recovery",
         }
     }
 }

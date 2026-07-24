@@ -114,6 +114,11 @@ struct RepoEnsurePayload {
 #[derive(Deserialize)]
 struct LeasePayload {
     workspace: LeaseWorkspace,
+    /// Cube's per-candidate health report. On an `--allow-dirty` reclaim it
+    /// holds exactly one entry carrying `dirty_verified` — see
+    /// [`lease_workspace`].
+    #[serde(default)]
+    health_check: Vec<LeaseHealthCheck>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +126,15 @@ struct LeaseWorkspace {
     lease_id: Option<String>,
     workspace_id: String,
     workspace_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct LeaseHealthCheck {
+    /// Present only on the `--allow-dirty` reclaim path. `Some(false)` means
+    /// cube handed the workspace over but its working copy held nothing left
+    /// to recover.
+    #[serde(default)]
+    dirty_verified: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +176,15 @@ pub async fn ensure_repo<T: CubeJsonTransport + ?Sized>(transport: &T, origin: &
     })
 }
 
+/// Lease a cube workspace.
+///
+/// When `allow_dirty` is set this is a *recovery* lease: cube reclaims the
+/// named workspace without resetting it. Note that a successful
+/// `--allow-dirty` lease does not establish that anything was recovered — a
+/// workspace that had already been reset is handed over just as happily. The
+/// returned [`CubeWorkspaceLease::dirty_verified`] is cube's verdict on
+/// whether the working copy really still held work; `Some(false)` is the
+/// signal to fall back to the engine's own recovery patch.
 pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     transport: &T,
     repo_id: &str,
@@ -201,10 +224,16 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
         .workspace
         .lease_id
         .context("cube workspace lease response missing lease_id")?;
+    // `dirty_verified` is cube's positive recovery check (see the flag docs
+    // in `cube workspace lease --help`). It is reported only on the
+    // `--allow-dirty` reclaim path; `None` elsewhere means "not applicable",
+    // NOT "nothing recovered".
+    let dirty_verified = payload.health_check.iter().find_map(|hc| hc.dirty_verified);
     Ok(CubeWorkspaceLease {
         lease_id,
         workspace_id: payload.workspace.workspace_id,
         workspace_path: payload.workspace.workspace_path,
+        dirty_verified,
     })
 }
 
@@ -466,6 +495,7 @@ mod tests {
                 lease_id: "lease-1".to_owned(),
                 workspace_id: "ws-1".to_owned(),
                 workspace_path: PathBuf::from("/tmp/ws-1"),
+                dirty_verified: None,
             }
         );
     }
@@ -499,6 +529,60 @@ mod tests {
                 "old-b",
             ]
         );
+    }
+
+    /// The recovery lease decodes cube's `dirty_verified` verdict: `true`
+    /// means cube handed back a working copy that still held unrecovered
+    /// work, so no patch fallback is needed.
+    #[tokio::test]
+    async fn lease_workspace_decodes_dirty_verified_true() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-r", "workspace_id": "ws-r", "workspace_path": "/tmp/ws-r" },
+            "health_check": [{ "workspace_id": "ws-r", "allow_dirty": true, "dirty_verified": true }],
+        }));
+        let lease = lease_workspace(&t, "repo-1", "resume", Some("ws-r"), true, &[])
+            .await
+            .unwrap();
+        assert_eq!(lease.dirty_verified, Some(true));
+    }
+
+    /// `dirty_verified: false` is the whole point of the field: the lease
+    /// succeeded, but cube recovered nothing and the caller must fall back to
+    /// its own patch rather than assume a resumed tree.
+    #[tokio::test]
+    async fn lease_workspace_decodes_dirty_verified_false() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-r", "workspace_id": "ws-r", "workspace_path": "/tmp/ws-r" },
+            "health_check": [{ "workspace_id": "ws-r", "allow_dirty": true, "dirty_verified": false }],
+        }));
+        let lease = lease_workspace(&t, "repo-1", "resume", Some("ws-r"), true, &[])
+            .await
+            .unwrap();
+        assert_eq!(lease.dirty_verified, Some(false));
+    }
+
+    /// A normal (non-recovery) lease reports no verdict at all. `None` must
+    /// stay distinguishable from `Some(false)`: "not applicable" is not
+    /// "nothing recovered".
+    #[tokio::test]
+    async fn lease_workspace_reports_no_verdict_on_a_normal_lease() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-n", "workspace_id": "ws-n", "workspace_path": "/tmp/ws-n" },
+            "health_check": [{ "workspace_id": "ws-n", "health": "clean", "skipped": false }],
+        }));
+        let lease = lease_workspace(&t, "repo-1", "task", None, false, &[]).await.unwrap();
+        assert_eq!(lease.dirty_verified, None);
+    }
+
+    /// Cube versions that predate the field (or a payload without a health
+    /// check at all) must decode cleanly rather than failing the lease.
+    #[tokio::test]
+    async fn lease_workspace_tolerates_a_payload_without_health_check() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-o", "workspace_id": "ws-o", "workspace_path": "/tmp/ws-o" },
+        }));
+        let lease = lease_workspace(&t, "repo-1", "task", None, false, &[]).await.unwrap();
+        assert_eq!(lease.dirty_verified, None);
     }
 
     #[tokio::test]

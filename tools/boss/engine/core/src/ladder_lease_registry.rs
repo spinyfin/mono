@@ -122,6 +122,7 @@ mod tests {
             lease_id: id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             workspace_path: std::path::PathBuf::from(format!("/tmp/{workspace_id}")),
+            dirty_verified: None,
         }
     }
 
