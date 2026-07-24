@@ -121,6 +121,11 @@ struct AttentionGroupCard: View {
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
     private var answeredCount: Int { members.filter(\.isAnswered).count }
     private var hasExtracted: Bool { members.contains { $0.confidenceSource == "extracted" } }
+    /// Provenance badge for a member staged from `boss propose
+    /// followup-task` (design: worker-proposal-api §"UI visibility and
+    /// provenance"). The id shown is the first member's — a group's
+    /// followup members share the same originating proposal in practice.
+    private var sourceProposalID: String? { members.compactMap(\.sourceProposalID).first }
     /// Highest member score — the card-level priority signal (design:
     /// notification-dedup-scoring.md §8). `1` when no item has been folded.
     private var maxScore: Int64 { members.map(\.score).max() ?? 1 }
@@ -160,6 +165,9 @@ struct AttentionGroupCard: View {
                 if hasExtracted {
                     AttentionChip(text: "Extracted", system: "sparkle.magnifyingglass", tint: .orange)
                 }
+                if let sourceProposalID {
+                    proposalBadge(sourceProposalID)
+                }
                 if maxScore > 1 {
                     AttentionChip(text: "×\(maxScore)", system: "flame.fill", tint: .red)
                         .help("\(maxScore) independent reports converged on this card's top item")
@@ -183,6 +191,34 @@ struct AttentionGroupCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+            }
+        }
+    }
+
+    /// Proposal provenance badge: badge → proposal → execution → originating
+    /// task (design: worker-proposal-api §"UI visibility and provenance").
+    /// The full proposal ledger is CLI-inspectable via `bossctl work
+    /// proposals list --execution-id …`, not surfaced in-app (deliberately —
+    /// "an app-side proposal-history inspector is a future nicety, not
+    /// v1"); tapping the badge jumps straight to the one hop the app can
+    /// resolve on its own: the originating task, via the same association
+    /// popover `associationLinks` uses (a followup group's
+    /// `associationTaskID` already points at it).
+    private func proposalBadge(_ proposalID: String) -> some View {
+        Button {
+            if group.associationTaskID != nil {
+                showingAssociationPopover = true
+            } else {
+                model.revealAttentionAssociation(group)
+            }
+        } label: {
+            AttentionChip(text: "Proposal", system: "shippingbox", tint: .purple)
+        }
+        .buttonStyle(.plain)
+        .help("Staged from \(proposalID) — tap to jump to the originating task")
+        .popover(isPresented: $showingAssociationPopover) {
+            if let task = model.attentionAssociationTask(group) {
+                WorkCardPopoverView(model: model, task: task)
             }
         }
     }

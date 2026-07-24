@@ -377,6 +377,17 @@ impl WorkerCompletionHandler {
         // a deferred-scope marker is never re-emitted on a later Stop.
         self.detect_and_record_deferred_scope(&execution).await;
 
+        // proposal_channel_error: a `boss propose` submission failed during
+        // this execution's Stop-boundary window. File an attention and
+        // count it — design §"Failure semantics": "the completion path
+        // records proposal_channel_error on the run outcome and files an
+        // engine-side attention, so the degradation is recorded, not
+        // inferred from prose." Runs alongside the other two detection
+        // passes above for the same reason: read-only against staged
+        // in-memory state, never touches PR state, so it is safe ahead of
+        // the running-status gate below.
+        self.detect_and_file_proposal_channel_error(&execution).await;
+
         // A probe minted on an earlier Stop can still be sitting undelivered in
         // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
         // `SendToPane` failed and was requeued for retry on the next

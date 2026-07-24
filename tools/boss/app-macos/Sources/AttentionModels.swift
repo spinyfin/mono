@@ -103,6 +103,13 @@ struct Attention: Identifiable, Codable, Hashable {
     /// into this canonical (design: notification-dedup-scoring.md). Drives
     /// the Notifications UI's priority badge and ordering.
     var score: Int64
+    /// Id (`prp_…`) of the `worker_proposals` row this member was staged
+    /// from, when it came in via `boss propose followup-task` rather than a
+    /// detector/manifest. `nil` for members created any other way. Drives
+    /// the Notifications-window proposal badge + provenance jump link
+    /// (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md
+    /// §"UI visibility and provenance").
+    var sourceProposalID: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -123,6 +130,7 @@ struct Attention: Identifiable, Codable, Hashable {
         case rationale
         case confidenceSource = "confidence_source"
         case score
+        case sourceProposalID = "source_proposal_id"
     }
 }
 
