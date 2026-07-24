@@ -802,7 +802,7 @@ pub async fn serve_with_merge_probe(
                 // Snapshot any uncommitted in-flight work to a durable
                 // patch before the workspace can be re-leased/reset.
                 // Best-effort and self-logging; never blocks the reaper.
-                crate::recovery_backup::backup_dead_execution(&execution);
+                boss_engine_recovery::recovery_backup::backup_dead_execution(&execution);
             }
             Err(err) => {
                 // Already-terminal rows are benign here — a parallel

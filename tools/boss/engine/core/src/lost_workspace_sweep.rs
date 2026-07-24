@@ -389,7 +389,7 @@ async fn reconcile_if_execution_dead_at(
     // uncommitted work from a prior run on a resumed execution — snapshot it
     // before the row becomes eligible for resume/reset, mirroring
     // `dead_pane_sweep::reconcile_if_pane_dead`'s backup-before-orphan.
-    let recovery_patch = crate::recovery_backup::backup_dead_execution(execution);
+    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
 
     let reconciled = crate::execution_liveness::finalize_gone_execution(
         work_db,

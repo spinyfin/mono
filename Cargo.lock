@@ -400,6 +400,7 @@ dependencies = [
  "boss-engine-live-status-redact",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
+ "boss-engine-recovery",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-engine-worker-policy",
@@ -541,6 +542,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "boss-engine-recovery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-log-files",
+ "boss-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

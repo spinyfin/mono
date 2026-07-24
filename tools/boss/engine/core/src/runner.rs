@@ -1417,7 +1417,7 @@ struct ExecutionPromptParams<'a> {
 /// ## What it says now
 ///
 /// When the engine recovered state into this workspace it drops a marker
-/// (`.boss/recovery-report.json`, see [`crate::recovery_apply`]); `report` is
+/// (`.boss/recovery-report.json`, see [`boss_engine_recovery::recovery_apply`]); `report` is
 /// that marker, already filtered to this execution. The block then states, in
 /// order:
 ///
@@ -1437,9 +1437,9 @@ struct ExecutionPromptParams<'a> {
 fn startup_recovery_block(
     prior_branch: &str,
     expected_branch_new: &str,
-    report: Option<&crate::recovery_apply::RecoveryReport>,
+    report: Option<&boss_engine_recovery::recovery_apply::RecoveryReport>,
 ) -> String {
-    use crate::recovery_apply::RecoverySource;
+    use boss_engine_recovery::recovery_apply::RecoverySource;
 
     let mut block = String::from("## STARTUP RECOVERY\n\n");
     block.push_str(
@@ -1647,7 +1647,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         prompt.push_str(&startup_recovery_block(
             prior_branch,
             &expected_branch_new,
-            crate::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id).as_ref(),
+            boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id).as_ref(),
         ));
     }
 
@@ -4289,8 +4289,12 @@ mod compose_prompt_tests {
     // to fall back to `jj new main@origin` — which moves `@` off any
     // recovered uncommitted state. These tests pin the fix.
 
-    fn apply_report(paths: &[&str], insertions: usize, deletions: usize) -> crate::recovery_apply::ApplyReport {
-        crate::recovery_apply::ApplyReport {
+    fn apply_report(
+        paths: &[&str],
+        insertions: usize,
+        deletions: usize,
+    ) -> boss_engine_recovery::recovery_apply::ApplyReport {
+        boss_engine_recovery::recovery_apply::ApplyReport {
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
             insertions,
             deletions,
@@ -4317,10 +4321,10 @@ mod compose_prompt_tests {
     /// it, and tell the worker to look before it leaps.
     #[test]
     fn recovery_block_reports_in_place_recovery() {
-        let report = crate::recovery_apply::RecoveryReport {
+        let report = boss_engine_recovery::recovery_apply::RecoveryReport {
             for_execution_id: "exec_new".to_owned(),
             from_execution_id: "exec_dead".to_owned(),
-            source: crate::recovery_apply::RecoverySource::CubeInPlace,
+            source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
             applied: None,
             patch_error: None,
         };
@@ -4341,10 +4345,10 @@ mod compose_prompt_tests {
     /// that only uncommitted edits came across.
     #[test]
     fn recovery_block_reports_patch_recovery_in_human_terms() {
-        let report = crate::recovery_apply::RecoveryReport {
+        let report = boss_engine_recovery::recovery_apply::RecoveryReport {
             for_execution_id: "exec_new".to_owned(),
             from_execution_id: "exec_dead".to_owned(),
-            source: crate::recovery_apply::RecoverySource::Patch,
+            source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
             applied: Some(apply_report(&["tools/cube/src/app.rs", "docs/x.md"], 120, 14)),
             patch_error: None,
         };
@@ -4364,10 +4368,10 @@ mod compose_prompt_tests {
     /// Silence would leave it believing it was resuming.
     #[test]
     fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
-        let report = crate::recovery_apply::RecoveryReport {
+        let report = boss_engine_recovery::recovery_apply::RecoveryReport {
             for_execution_id: "exec_new".to_owned(),
             from_execution_id: "exec_dead".to_owned(),
-            source: crate::recovery_apply::RecoverySource::Patch,
+            source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
             applied: None,
             patch_error: Some("error: patch does not apply".to_owned()),
         };
@@ -4390,10 +4394,10 @@ mod compose_prompt_tests {
     fn recovery_block_keeps_the_prior_branch_instructions() {
         for report in [
             None,
-            Some(crate::recovery_apply::RecoveryReport {
+            Some(boss_engine_recovery::recovery_apply::RecoveryReport {
                 for_execution_id: "e".to_owned(),
                 from_execution_id: "d".to_owned(),
-                source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
                 applied: None,
                 patch_error: None,
             }),
