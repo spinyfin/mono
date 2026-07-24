@@ -1,4 +1,40 @@
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Max length of `blocked_reason`, in grapheme clusters (not bytes, not
+/// `char`s — `🚧 Future` must cost 9, not more). The pill title-cases and
+/// hard-truncates at one line; anything longer belongs in `blocked_detail`
+/// instead, which is unlimited and rendered verbatim as a tooltip.
+///
+/// Measured against the kanban card's blocked pill at its default board
+/// column width: the reported bad input (`FUTURE — deferred scope per
+/// design doc; requires explicit operator approval to start`, 84
+/// graphemes) visibly truncates after 44 characters
+/// (`Future — Deferred Scope Per Design Doc; Requ…`). 40 sits just below
+/// that measured fit point — leaving a small margin for strings with
+/// wider average character width than the measured sample — while
+/// staying comfortably above every real label in use today (the longest
+/// built-in discriminator is `ci_failure_exhausted` at 20 graphemes, and
+/// the example custom tag `🚧 Future` is 8).
+pub(crate) const BLOCKED_REASON_MAX_GRAPHEMES: usize = 40;
+
+/// Reject a `blocked_reason` patch value that would render as a
+/// truncated, unrecoverable pill. Validates the incoming value only —
+/// never the value already stored on a row, so updating an unrelated
+/// field on a row with a pre-existing over-long `blocked_reason` (from
+/// before this limit existed) still succeeds.
+fn validate_blocked_reason_length(reason: &str) -> Result<()> {
+    let len = reason.graphemes(true).count();
+    if len > BLOCKED_REASON_MAX_GRAPHEMES {
+        bail!(
+            "blocked_reason is too long ({len} graphemes, max {BLOCKED_REASON_MAX_GRAPHEMES}): \
+             it renders as a short pill label and truncates anything longer. \
+             Put the full explanation in --blocked-detail instead — it has no length limit \
+             and renders verbatim as a tooltip on the pill."
+        );
+    }
+    Ok(())
+}
 
 impl WorkDb {
     pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
@@ -112,6 +148,13 @@ impl WorkDb {
     }
 
     pub(crate) fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
+        // Fail fast, before opening a transaction: validate the incoming
+        // value only (never a value already sitting in a row from before
+        // this limit existed — see `validate_blocked_reason_length`).
+        if let Some(reason) = patch.blocked_reason.as_deref() {
+            validate_blocked_reason_length(reason)?;
+        }
+        let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut task = query_task(&tx, id).require("task", id)?;
@@ -176,6 +219,7 @@ impl WorkDb {
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
         apply_optional_string_patch(&mut task.driver, patch.driver);
         apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
+        apply_optional_string_patch(&mut task.blocked_detail, patch.blocked_detail);
         if let Some(autostart) = patch.autostart {
             task.autostart = autostart;
         }
@@ -197,6 +241,27 @@ impl WorkDb {
         if task.status != TaskStatus::Archived {
             task.archived_reason = None;
         }
+        // Invariant: blocked_detail cannot outlive blocked_reason — a
+        // detail with nothing to explain is meaningless. Clear it
+        // whenever the row ends up with no reason, whether that's because
+        // this patch cleared blocked_reason directly or because it moved
+        // the status off `blocked` (which already nulled blocked_reason
+        // above).
+        if task.blocked_reason.is_none() {
+            task.blocked_detail = None;
+        }
+        // Reject rather than silently drop: if this patch explicitly asked
+        // to set a non-empty blocked_detail but the row has no
+        // blocked_reason to attach it to (the clear above just fired),
+        // that's very likely the caller forgetting --blocked-reason, not
+        // an intentional no-op.
+        if blocked_detail_patch_requests_set && task.blocked_reason.is_none() {
+            bail!(
+                "cannot set blocked_detail without a blocked_reason on {id}: \
+                 pass --blocked-reason alongside --blocked-detail (or update a task \
+                 that already has a blocked_reason set)"
+            );
+        }
 
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
@@ -215,7 +280,7 @@ impl WorkDb {
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
-                 archived_reason = ?17,
+                 archived_reason = ?17, blocked_detail = ?18,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -240,6 +305,7 @@ impl WorkDb {
                 task.blocked_attempt_id,
                 task.driver,
                 task.archived_reason,
+                task.blocked_detail,
             ],
         )?;
 

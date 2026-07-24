@@ -181,6 +181,35 @@ rust_test(
     ),
 )
 
+# End-to-end coverage for the blocked_reason grapheme-length limit and the
+# blocked_detail sibling field, driven against a real engine over its RPC
+# socket (not just in-process WorkDb calls).
+rust_test(
+    name = "blocked_reason_length_limit_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/blocked_reason_length_limit.rs",
+    ],
+    crate_root = "tests/blocked_reason_length_limit.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        ":harness",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # Regression test: boss uninstall with BOSS_INSTALL_ROOT set must not kill
 # the host engine. Drives the boss binary as a subprocess; no engine needed.
 rust_test(

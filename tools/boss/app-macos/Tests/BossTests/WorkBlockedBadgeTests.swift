@@ -94,11 +94,85 @@ final class WorkBlockedBadgeTests: XCTestCase {
         XCTAssertEqual(WorkBlockedBadge.label(forReason: "review_feedback"), "Review")
     }
 
+    // MARK: badgeTooltip — verbatim detail, falling back to raw reason
+
+    /// `blockedDetail` set: the tooltip shows it verbatim — no
+    /// title-casing, no truncation, identifiers preserved exactly.
+    func testBadgeTooltipShowsVerbatimDetailWhenSet() {
+        let task = makeTask(
+            status: "blocked",
+            blockedReason: "FUTURE",
+            blockedDetail: "deferred scope per design doc; requires explicit operator approval (pr_created)"
+        )
+        XCTAssertEqual(
+            WorkBlockedBadge.badgeTooltip(for: task),
+            "deferred scope per design doc; requires explicit operator approval (pr_created)"
+        )
+    }
+
+    /// No `blockedDetail`: the tooltip falls back to the raw (untitled,
+    /// untruncated) `blockedReason` rather than the transformed label —
+    /// this is what makes existing rows with prose already in the label
+    /// field readable via hover.
+    func testBadgeTooltipFallsBackToRawReasonWhenNoDetail() {
+        let task = makeTask(status: "blocked", blockedReason: "mystery_signal", blockedDetail: nil)
+        XCTAssertEqual(WorkBlockedBadge.badgeTooltip(for: task), "mystery_signal")
+    }
+
+    /// Non-blocked status: no tooltip, mirroring `badgeText`'s status gate.
+    func testBadgeTooltipHiddenWhenNotBlocked() {
+        let task = makeTask(status: "in_review", blockedReason: "merge_conflict", blockedDetail: "some detail")
+        XCTAssertNil(WorkBlockedBadge.badgeTooltip(for: task))
+    }
+
+    /// Neither reason nor detail: no tooltip.
+    func testBadgeTooltipNilWithNoReasonOrDetail() {
+        let task = makeTask(status: "blocked", blockedReason: nil, blockedDetail: nil)
+        XCTAssertNil(WorkBlockedBadge.badgeTooltip(for: task))
+    }
+
+    // MARK: hasMoreInfo — affordance dot gating
+
+    /// A known short discriminator with no detail: nothing more to show,
+    /// so no affordance dot.
+    func testHasMoreInfoFalseForKnownReasonWithoutDetail() {
+        let task = makeTask(status: "blocked", blockedReason: "dependency", blockedDetail: nil)
+        XCTAssertFalse(WorkBlockedBadge.hasMoreInfo(for: task))
+    }
+
+    /// A custom/freeform reason that hit the title-casing fallback: the
+    /// raw string is exactly what the tooltip fallback recovers, so this
+    /// counts as "more info" even without an explicit detail.
+    func testHasMoreInfoTrueForCustomReasonWithoutDetail() {
+        let task = makeTask(status: "blocked", blockedReason: "mystery_signal", blockedDetail: nil)
+        XCTAssertTrue(WorkBlockedBadge.hasMoreInfo(for: task))
+    }
+
+    /// Any reason with an explicit detail set: always "more info",
+    /// regardless of whether the reason itself is a known discriminator.
+    func testHasMoreInfoTrueWhenDetailSet() {
+        let task = makeTask(status: "blocked", blockedReason: "dependency", blockedDetail: "waiting on T42")
+        XCTAssertTrue(WorkBlockedBadge.hasMoreInfo(for: task))
+    }
+
+    /// No reason at all (legacy blocked row): no detail possible, no dot.
+    func testHasMoreInfoFalseWithNoReason() {
+        let task = makeTask(status: "blocked", blockedReason: nil, blockedDetail: nil)
+        XCTAssertFalse(WorkBlockedBadge.hasMoreInfo(for: task))
+    }
+
+    /// Non-blocked status never shows the dot, mirroring the other gates.
+    func testHasMoreInfoFalseWhenNotBlocked() {
+        let task = makeTask(status: "todo", blockedReason: "mystery_signal", blockedDetail: "detail")
+        XCTAssertFalse(WorkBlockedBadge.hasMoreInfo(for: task))
+    }
+
     // MARK: - Helpers
 
     private func makeTask(
         status: String,
         blockedReason: String?,
+        blockedDetail: String? = nil,
         id: String = "task_\(UUID().uuidString)"
     ) -> WorkTask {
         WorkTask(
@@ -115,7 +189,8 @@ final class WorkBlockedBadgeTests: XCTestCase {
             deletedAt: nil,
             createdAt: "2026-05-14T00:00:00Z",
             updatedAt: "2026-05-14T00:00:00Z",
-            blockedReason: blockedReason
+            blockedReason: blockedReason,
+            blockedDetail: blockedDetail
         )
     }
 }

@@ -215,6 +215,246 @@ fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
     let _ = std::fs::remove_file(path);
 }
 
+/// `blocked_reason` renders as a short pill label — a value longer than
+/// `BLOCKED_REASON_MAX_GRAPHEMES` is rejected up front, before any row is
+/// touched, with a message that names `blocked_detail` as the
+/// alternative. Covers the engine RPC write path directly (not just the
+/// CLI), so every client inherits the length limit.
+#[test]
+fn blocked_reason_over_length_limit_is_rejected() {
+    let path = temp_db_path("blocked-reason-over-limit");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
+
+    let too_long = "FUTURE — deferred scope per design doc; requires explicit operator approval to start";
+    // 84 graphemes — see `BLOCKED_REASON_MAX_GRAPHEMES`'s doc comment in
+    // `updates.rs`, which measured this exact string against the pill's
+    // rendered truncation point.
+    assert_eq!(
+        too_long.chars().count(),
+        84,
+        "fixture string must match the documented measurement"
+    );
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some(too_long.to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("too long"), "error should explain why: {message}");
+    assert!(
+        message.contains("blocked-detail") || message.contains("blocked_detail"),
+        "error should name the alternative field: {message}"
+    );
+
+    // Nothing was written: the row is untouched.
+    let conn = db.connect().unwrap();
+    let (status, blocked_reason): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, blocked_reason FROM tasks WHERE id = ?1",
+            rusqlite::params![chore.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "todo");
+    assert_eq!(blocked_reason, None);
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// The canonical short custom tag from the chore brief (`🚧 Future`, an
+/// emoji plus a word) must cost far fewer than the limit when measured in
+/// graphemes, and must be accepted.
+#[test]
+fn blocked_reason_short_custom_tag_with_emoji_succeeds() {
+    let path = temp_db_path("blocked-reason-emoji-tag");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
+
+    let updated = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some("🚧 Future".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let task = match updated {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected Chore, got {other:?}"),
+    };
+    assert_eq!(task.blocked_reason.as_deref(), Some("🚧 Future"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Validation applies to writes, not reads: a row that already carries an
+/// over-long `blocked_reason` (grandfathered from before this limit
+/// existed) must still load, and updating an unrelated field on it must
+/// still succeed — the pre-existing value is never re-validated.
+#[test]
+fn updating_unrelated_field_succeeds_despite_preexisting_over_long_blocked_reason() {
+    let path = temp_db_path("blocked-reason-preexisting-over-limit");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
+    let too_long = "FUTURE — deferred scope per design doc; requires explicit operator approval to start";
+
+    // Simulate a grandfathered row: written directly, bypassing the
+    // engine's validated write path (as if it predates this limit).
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = ?2 WHERE id = ?1",
+            rusqlite::params![chore.id, too_long],
+        )
+        .unwrap();
+    }
+
+    let updated = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                priority: Some("high".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let task = match updated {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected Chore, got {other:?}"),
+    };
+    assert_eq!(task.priority, "high");
+    assert_eq!(
+        task.blocked_reason.as_deref(),
+        Some(too_long),
+        "pre-existing over-long blocked_reason must survive an unrelated-field update untouched"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// `blocked_detail` cannot be set without an accompanying (or
+/// already-present) `blocked_reason` — rejected rather than silently
+/// dropped, so a caller who forgot `--blocked-reason` finds out.
+#[test]
+fn blocked_detail_without_blocked_reason_is_rejected() {
+    let path = temp_db_path("blocked-detail-no-reason");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_detail: Some("deferred scope per design doc".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("blocked_detail"),
+        "error should mention blocked_detail: {err}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Clearing `blocked_reason` (explicitly, or by moving the status off
+/// `blocked`) clears `blocked_detail` alongside it — a detail can't
+/// outlive its label. This is the "handle" branch, distinct from the
+/// reject-on-set-without-reason case above: nothing here was explicitly
+/// asked to be *set* on this patch, so silently clearing is correct.
+#[test]
+fn blocked_detail_cleared_when_blocked_reason_cleared() {
+    let path = temp_db_path("blocked-detail-cleared-with-reason");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some("ci_failure".into()),
+            blocked_detail: Some("waiting on a flaky integration suite".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let updated = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                blocked_reason: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let task = match updated {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected Chore, got {other:?}"),
+    };
+    assert_eq!(task.blocked_reason, None);
+    assert_eq!(task.blocked_detail, None, "detail must not outlive its cleared reason");
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// `blocked_detail` is stored and returned byte-for-byte verbatim
+/// alongside `blocked_reason` — no title-casing, no truncation,
+/// identifiers preserved exactly.
+#[test]
+fn blocked_detail_round_trips_verbatim_with_blocked_reason() {
+    let path = temp_db_path("blocked-detail-round-trip");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "C");
+    let detail = "deferred scope per design doc; requires explicit operator approval (pr_created, review_verdict)";
+
+    let updated = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some("🚧 Future".into()),
+                blocked_detail: Some(detail.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let task = match updated {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected Chore, got {other:?}"),
+    };
+    assert_eq!(task.blocked_reason.as_deref(), Some("🚧 Future"));
+    assert_eq!(task.blocked_detail.as_deref(), Some(detail));
+
+    // Re-fetch through query_task to confirm the extended mapper (the one
+    // `get_work_item` / `boss task show` use) reads the new column too.
+    let refetched = db.get_work_item(&chore.id).unwrap();
+    let task = match refetched {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected Chore, got {other:?}"),
+    };
+    assert_eq!(task.blocked_detail.as_deref(), Some(detail));
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn get_live_execution_returns_waiting_human_execution_for_work_item() {
     let db = WorkDb::open(temp_db_path("live-exec")).unwrap();

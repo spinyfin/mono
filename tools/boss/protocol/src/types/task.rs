@@ -495,6 +495,18 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
 
+    /// Long-form, verbatim explanation of `blocked_reason` — never
+    /// title-cased or truncated, rendered as a tooltip on the
+    /// `blocked_reason` pill. `blocked_reason` stays a short label (title-cased,
+    /// pill-rendered, length-limited); this field is where the prose goes.
+    /// `None` when there is nothing beyond the label — the tooltip then falls
+    /// back to showing the untruncated `blocked_reason` instead. Cleared
+    /// whenever `blocked_reason` is cleared (a detail can't outlive its
+    /// label). Not length-limited: this is precisely the field an
+    /// over-long `blocked_reason` should be redirected to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_detail: Option<String>,
+
     /// Per-PR override of the CI auto-fix attempt budget. `None` →
     /// inherit the product default (`products.ci_attempt_budget`,
     /// default 3). `Some(0)` means "notify only" (no auto-fix on this

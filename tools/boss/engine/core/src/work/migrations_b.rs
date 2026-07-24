@@ -1901,6 +1901,24 @@ pub(crate) fn migrate_tasks_dispatch_failure_columns(conn: &Connection) -> Resul
     Ok(())
 }
 
+/// Add `tasks.blocked_detail`: the verbatim long-form sibling of
+/// `blocked_reason`. `blocked_reason` stays a short, title-cased,
+/// pill-rendered label; `blocked_detail` carries the unmodified prose
+/// explanation, surfaced as a tooltip. `NULL` for every row that has no
+/// detail beyond its label (the overwhelming majority, and every row
+/// written before this column existed) — the app falls back to showing
+/// the untruncated `blocked_reason` in that case. Not backfilled: existing
+/// rows with prose already sitting in `blocked_reason` are left as-is
+/// rather than heuristically split, since there's no lossless way to tell
+/// "this is a short label" from "this is prose someone crammed into the
+/// label field" after the fact.
+pub(crate) fn migrate_tasks_blocked_detail_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "blocked_detail")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN blocked_detail TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Widen the `conflict_resolutions` idempotency key from
 /// `(work_item_id, base_sha_at_trigger)` to `(work_item_id,
 /// base_sha_at_trigger, head_sha_before)`.

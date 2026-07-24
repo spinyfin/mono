@@ -124,6 +124,16 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
 
+    /// Set or clear the `blocked_detail` field — the verbatim, untruncated
+    /// long-form explanation of `blocked_reason`, rendered as a tooltip on
+    /// the pill. `None` → leave unchanged. `Some("")` → clear (write NULL).
+    /// The engine clears this alongside `blocked_reason` whenever the
+    /// latter is cleared or the status leaves `blocked` — a detail can't
+    /// outlive its label. Unlike `blocked_reason`, this field has no
+    /// length limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_detail: Option<String>,
+
     /// Product-level default model. Only honoured on
     /// product-targeted updates; ignored when patching a task/chore/
     /// project. `None` → leave unchanged. `Some("")` → clear.
