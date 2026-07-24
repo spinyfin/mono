@@ -90,47 +90,6 @@ pub(crate) fn is_pass_conclusion(c: &str) -> bool {
     matches!(c.to_ascii_uppercase().as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED",)
 }
 
-/// Targeted companion to the broad [`Notify`]-based `kick` accepted by
-/// [`spawn_loop`]. Where the broad kick just says "sweep everything now",
-/// a targeted kick additionally names the PR that prompted it — the shape
-/// the doc's push-event and adaptive-per-PR-timer follow-ups
-/// (`tools/boss/docs/investigations/
-/// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9 items 3–4)
-/// need to reconcile exactly one PR instead of triggering a full sweep.
-///
-/// Firing it reconciles exactly the named PR(s) via [`reconcile_one`] —
-/// not a full [`run_one_pass`] sweep — subject to the same quiesce window
-/// as the broad kick.
-#[derive(Clone, Default)]
-pub struct PrReconcilerTargetedKick {
-    notify: Arc<Notify>,
-    pending: Arc<Mutex<Vec<String>>>,
-}
-
-impl PrReconcilerTargetedKick {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Request an immediate pass to reconcile `pr_url`. Subject to the same
-    /// quiesce window as the broad kick (see [`spawn_loop`]).
-    pub fn kick(&self, pr_url: impl Into<String>) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(pr_url.into());
-        self.notify.notify_one();
-    }
-
-    pub(crate) async fn notified(&self) {
-        self.notify.notified().await;
-    }
-
-    pub(crate) fn drain_pending(&self) -> Vec<String> {
-        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
-    }
-}
-
 /// A "no PR is due" placeholder wait — long enough to never race the
 /// periodic full-sweep interval or a kick, short enough to stay well
 /// under `tokio::time::sleep`'s max duration.
@@ -263,9 +222,11 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
 /// up the change soon enough and rapid window-toggle events don't
 /// result in repeated GitHub API calls.
 ///
-/// `targeted_kick` is the [`PrReconcilerTargetedKick`] companion — same
-/// quiesce window, but it reconciles just the named PR(s) via
-/// [`reconcile_one`] rather than triggering a full sweep.
+/// `pr_reconcile_requests` is the keyed companion to the broad `kick`:
+/// a subscription to the [`Event::PrReconcileRequested`] topic. Same
+/// quiesce window as the broad kick, but each received event reconciles
+/// just its named PR via [`reconcile_one`] rather than triggering a full
+/// sweep.
 ///
 /// The Trunk merge-queue observer
 /// ([`crate::trunk_queue_poller::TrunkQueueProbe`]) rides this same loop
@@ -286,15 +247,16 @@ pub fn spawn_loop(
     ),
     interval: Duration,
     metrics: Arc<Registry>,
-    // (broad kick, targeted kick) — bundled to keep the parameter count
-    // under clippy::too_many_arguments.
-    kicks: (Arc<Notify>, PrReconcilerTargetedKick),
+    // (broad kick, keyed PrReconcileRequested subscription) — bundled to
+    // keep the parameter count under clippy::too_many_arguments.
+    kicks: (Arc<Notify>, boss_event_bus::Subscription),
 ) -> tokio::task::JoinHandle<()> {
     let (cube_client, completion_handler, trunk_queue_api) = handlers;
-    let (kick, targeted_kick) = kicks;
+    let (kick, mut pr_reconcile_requests) = kicks;
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
+        let mut pr_requests_closed = false;
         let mut trunk_probe = crate::trunk_queue_poller::TrunkQueueProbe::new();
         let mut spec_schedule = crate::speculative_conflict::SpeculativeCheckSchedule::default();
         let mut stacking_schedule = crate::stacked_pr_structuring::StackingSchedule::default();
@@ -498,49 +460,64 @@ pub fn spawn_loop(
                         );
                         // continue listening; periodic sleep arm will eventually fire
                     }
-                    _ = targeted_kick.notified() => {
-                        let pr_urls = targeted_kick.drain_pending();
-                        let since_last = last_run_at.elapsed();
-                        if since_last < quiesce_window {
-                            tracing::debug!(
-                                ?pr_urls,
-                                since_last_ms = since_last.as_millis(),
-                                quiesce_ms = quiesce_window.as_millis(),
-                                "merge poller: targeted kick within quiesce window, absorbing",
-                            );
-                        } else {
-                            tracing::debug!(
-                                ?pr_urls,
-                                since_last_ms = since_last.as_millis(),
-                                "merge poller: targeted kick → reconciling named PR(s)",
-                            );
-                            for pr_url in pr_urls {
-                                let (outcome, tier) = reconcile_one(
-                                    work_db.as_ref(),
-                                    probe.as_ref(),
-                                    publisher.as_ref(),
-                                    Some(cube_client.as_ref()),
-                                    Some(completion_handler.as_ref()),
-                                    &pr_url,
-                                )
-                                .await;
-                                record_sweep_metrics(&metrics, &outcome);
-                                if outcome.total_transitions() > 0 {
-                                    tracing::info!(
+                    event = pr_reconcile_requests.recv(), if !pr_requests_closed => {
+                        match event {
+                            Some(Event::PrReconcileRequested { pr_url }) => {
+                                let since_last = last_run_at.elapsed();
+                                if since_last < quiesce_window {
+                                    tracing::debug!(
                                         pr_url,
-                                        merged = outcome.merged,
-                                        conflict_flagged = outcome.conflict_flagged,
-                                        conflict_cleared = outcome.conflict_cleared,
-                                        ci_flagged = outcome.ci_flagged,
-                                        ci_cleared = outcome.ci_cleared,
-                                        merge_queue_rebounced = outcome.merge_queue_rebounced,
-                                        "merge poller: targeted-kick reconcile transitions",
+                                        since_last_ms = since_last.as_millis(),
+                                        quiesce_ms = quiesce_window.as_millis(),
+                                        "merge poller: PrReconcileRequested within quiesce window, absorbing",
                                     );
+                                } else {
+                                    tracing::debug!(
+                                        pr_url,
+                                        since_last_ms = since_last.as_millis(),
+                                        "merge poller: PrReconcileRequested → reconciling named PR",
+                                    );
+                                    let (outcome, tier) = reconcile_one(
+                                        work_db.as_ref(),
+                                        probe.as_ref(),
+                                        publisher.as_ref(),
+                                        Some(cube_client.as_ref()),
+                                        Some(completion_handler.as_ref()),
+                                        &pr_url,
+                                    )
+                                    .await;
+                                    record_sweep_metrics(&metrics, &outcome);
+                                    if outcome.total_transitions() > 0 {
+                                        tracing::info!(
+                                            pr_url,
+                                            merged = outcome.merged,
+                                            conflict_flagged = outcome.conflict_flagged,
+                                            conflict_cleared = outcome.conflict_cleared,
+                                            ci_flagged = outcome.ci_flagged,
+                                            ci_cleared = outcome.ci_cleared,
+                                            merge_queue_rebounced = outcome.merge_queue_rebounced,
+                                            "merge poller: PrReconcileRequested reconcile transitions",
+                                        );
+                                    }
+                                    schedule.reschedule(&pr_url, tier, Instant::now());
                                 }
-                                schedule.reschedule(&pr_url, tier, Instant::now());
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "merge poller: pr_reconcile_requests subscription received an \
+                                     unexpected event kind (the subscribing filter should have excluded it)",
+                                );
+                            }
+                            None => {
+                                pr_requests_closed = true;
+                                tracing::warn!(
+                                    "merge poller: pr_reconcile_requests subscription closed \
+                                     (event bus dropped) — keyed PR reconcile requests will no \
+                                     longer be delivered; the periodic full sweep remains the backstop",
+                                );
                             }
                         }
-                        // continue listening; targeted reconcile is not a full sweep
+                        // continue listening; a keyed PR reconcile is not a full sweep
                     }
                 }
             }

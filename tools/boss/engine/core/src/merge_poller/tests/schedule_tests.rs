@@ -191,32 +191,83 @@ async fn activation_kick_after_quiesce_window_triggers_pass() {
     );
 }
 
-/// [`PrReconcilerTargetedKick::kick`] records the PR that requested the
-/// pass and wakes anyone awaiting [`PrReconcilerTargetedKick::notified`];
-/// [`PrReconcilerTargetedKick::drain_pending`] returns exactly what was
-/// recorded and clears it so a second drain sees nothing new.
+/// Acceptance test for the `pr_reconcile_requests` arm of [`spawn_loop`]'s
+/// `'wait` select loop: this reimplements that arm's exact guard logic
+/// (`if !pr_requests_closed`, quiesce check, `pr_requests_closed = true`
+/// on `None`) against a real [`boss_event_bus::EventBus`] subscription —
+/// the same harness pattern the kick tests above use rather than driving
+/// the full `spawn_loop` task, which would need fake `WorkDb`/`MergeProbe`/
+/// `ExecutionPublisher`/`CubeClient` wiring unrelated to this arm.
+///
+/// Covers: (a) an event published after the quiesce window reconciles its
+/// named PR exactly once; (b) once the subscription closes, the arm's
+/// `None` branch fires exactly once and the guard then stops the arm from
+/// being polled again — the busy-spin regression an unguarded `recv()`
+/// on a closed subscription previously caused, since a closed `recv()`
+/// resolves instantly and forever.
 #[tokio::test]
-async fn targeted_kick_records_and_drains_pr_urls() {
-    use tokio::time::timeout;
+async fn pr_reconcile_requests_arm_reconciles_once_and_parks_after_close() {
+    use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 
-    let targeted_kick = PrReconcilerTargetedKick::new();
-    targeted_kick.kick("https://github.com/spinyfin/mono/pull/1");
-    targeted_kick.kick("https://github.com/spinyfin/mono/pull/2");
+    let bus = EventBus::new();
+    let mut sub = bus.subscribe(TopicFilter::kind(EventKind::PrReconcileRequested));
 
-    timeout(Duration::from_millis(500), targeted_kick.notified())
-        .await
-        .expect("kick() must notify a waiter");
+    let quiesce_window = Duration::from_millis(1);
+    let last_run_at = Instant::now() - Duration::from_millis(100);
+    let mut pr_requests_closed = false;
+    let mut reconciled: Vec<String> = Vec::new();
+    let mut none_branch_hits = 0u32;
+    let mut arm_polls_after_close = 0u32;
+
+    bus.publish(Event::PrReconcileRequested {
+        pr_url: "https://github.com/spinyfin/mono/pull/1".to_owned(),
+    });
+    // Close the sender side (drop the bus) so a later poll of the same
+    // subscription sees the closed-channel `None`.
+    drop(bus);
+
+    // Drive the loop exactly like `spawn_loop`'s `'wait` loop: a bounded
+    // number of iterations, each racing the guarded arm against an
+    // always-ready `yield_now`. If the guard failed to stop the arm being
+    // polled after `None`, every remaining iteration would re-select the
+    // arm and re-observe `None`; the guard must cap that at one hit.
+    for _ in 0..8 {
+        tokio::select! {
+            biased;
+            event = sub.recv(), if !pr_requests_closed => {
+                match event {
+                    Some(Event::PrReconcileRequested { pr_url }) => {
+                        let since_last = last_run_at.elapsed();
+                        if since_last >= quiesce_window {
+                            reconciled.push(pr_url);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        pr_requests_closed = true;
+                        none_branch_hits += 1;
+                    }
+                }
+            }
+            _ = tokio::task::yield_now(), if pr_requests_closed => {
+                arm_polls_after_close += 1;
+            }
+        }
+    }
 
     assert_eq!(
-        targeted_kick.drain_pending(),
-        vec![
-            "https://github.com/spinyfin/mono/pull/1".to_owned(),
-            "https://github.com/spinyfin/mono/pull/2".to_owned(),
-        ],
+        reconciled,
+        vec!["https://github.com/spinyfin/mono/pull/1".to_owned()],
+        "the queued event must be reconciled before the subscription closes",
     );
-    assert!(
-        targeted_kick.drain_pending().is_empty(),
-        "drain_pending must clear the queue",
+    assert_eq!(
+        none_branch_hits, 1,
+        "the None branch must fire exactly once, not repeatedly"
+    );
+    assert_eq!(
+        arm_polls_after_close, 6,
+        "once closed, the guard must route every remaining iteration away from `recv()` \
+         instead of re-polling it — proof the arm cannot busy-spin",
     );
 }
 
