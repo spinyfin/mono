@@ -569,6 +569,17 @@ final class CommentLayer: NSObject, ObservableObject {
         // One-shot: a comment already carrying a nudge entry doesn't get a
         // second one on reclassification.
         if intent == .directive || intent == .largerChange {
+            // Mirrors the engine's re-home (`override_comment_intent`): the
+            // bucket-2 statuses only make sense for a question, so a comment
+            // reclassified onto the revise track returns to `.active`
+            // immediately — including from `.answering`, where the run is
+            // stood down rather than waited on. `.inRevision` is deliberately
+            // untouched: it's already claimed by a task whose directive is
+            // immutable.
+            if [.answering, .answered, .awaitingFollowup].contains(comments[index].status) {
+                comments[index].status = .active
+                comments[index].statusActor = "user"
+            }
             let alreadyNudged = comments[index].threadEntries.contains { $0.entryKind == .nudge }
             if !alreadyNudged {
                 comments[index].threadEntries.append(
@@ -581,12 +592,14 @@ final class CommentLayer: NSObject, ObservableObject {
                     )
                 )
             }
-        } else if intent == .question, comments[index].status != .answering {
+        } else if intent == .question, comments[index].status == .active {
             // Mirrors the engine's `classifying` → `answering` transition
             // (design § "Comment/thread state machine"): classification as
-            // `question` immediately spawns the answer agent. Guarded on not
-            // already `.answering` so reclassifying to `question` twice in a
-            // row doesn't spawn a second run.
+            // `question` immediately spawns the answer agent. Guarded on
+            // `.active`, mirroring the engine's `rehome_reclassified_comment`:
+            // a comment already `.answering`/`.answered`/`.awaitingFollowup`
+            // must not spawn a second run, and a comment claimed `.inRevision`
+            // must not spawn one behind the revision's back.
             comments[index].status = .answering
             runAnswerAgent(for: comment.id)
         }
@@ -713,13 +726,22 @@ final class CommentLayer: NSObject, ObservableObject {
 
     /// Applies the `CommentsReviseDoc` reply once it arrives. `Created` is
     /// already reflected by the invalidation-triggered `reload()` (the real
-    /// `revise_task_id` comes from the wire); the other outcomes don't touch
+    /// `revise_task_id` comes from the wire), so it normally needs no message
+    /// — unless the batch left comments behind, which the operator has no
+    /// other way to notice: the sidebar badge renders `intent` alone, so a
+    /// comment excluded on `status` still reads "Larger Change" next to a
+    /// success toast that never mentions it. The other outcomes don't touch
     /// any comment row, so they only need a transient message telling the
     /// operator why nothing changed.
     func applyReviseDocOutcome(_ outcome: ReviseDocOutcome) {
         switch outcome {
-        case .created:
-            return
+        case .created(_, _, let addressedCommentIds, let excludedCommentIds, _):
+            guard !excludedCommentIds.isEmpty else { return }
+            let addressed = "Addressing \(addressedCommentIds.count) comment\(addressedCommentIds.count == 1 ? "" : "s")"
+            let excluded = excludedCommentIds.count == 1
+                ? "1 other comment was left out (already in a revision, still answering, or its anchor was lost)."
+                : "\(excludedCommentIds.count) other comments were left out (already in a revision, still answering, or their anchors were lost)."
+            reviseDocMessage = "\(addressed). \(excluded)"
         case .noUnresolvedComments:
             reviseDocMessage = "No unresolved comments to revise."
         case .alreadyInFlight(let taskId):

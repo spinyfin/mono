@@ -330,6 +330,16 @@ pub enum ReviseDocOutcome {
         /// `"revision"` | `"chore"`.
         task_kind: String,
         addressed_comment_ids: Vec<String>,
+        /// Comments the operator can see badged `directive`/`larger_change`
+        /// on this artifact that this batch did **not** address, because
+        /// their `status` disqualified them (`in_revision` — already claimed
+        /// by an earlier batch; `orphaned` — the anchor no longer resolves;
+        /// `answering` — a live answer-agent run). The badge renders
+        /// `intent` alone, so without this the operator sees a plain success
+        /// toast for a batch that silently dropped comments they believe are
+        /// revisable. Empty in the common case.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded_comment_ids: Vec<String>,
         /// The chain root's PR (revision path), or `None` for a fresh
         /// chore that has not opened a PR yet.
         #[serde(default, skip_serializing_if = "Option::is_none")]

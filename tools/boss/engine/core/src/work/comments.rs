@@ -80,6 +80,36 @@ const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anch
      intent_overridden_by, revise_task_id, intent_classification_failed_at, \
      intent_classification_error";
 
+/// The one definition of "this comment is a `[Revise]` candidate": `active`
+/// status **and** a `directive`/`larger_change` intent. A SQL fragment rather
+/// than a Rust predicate because all three consumers are queries:
+/// [`WorkDb::comments_banner_state`]'s `unresolved_count`,
+/// [`query_revisable_comments`] (the batch's candidate read), and the guarded
+/// claim UPDATE in [`super::revise_doc`]. All three consumers must use this
+/// one definition; a divergence shows up as the banner counting a comment
+/// `[Revise]` then silently drops.
+///
+/// `intent` is deliberately not the only term. A comment badged
+/// `larger_change` whose `status` is `answering`/`in_revision`/`orphaned`
+/// genuinely is not ready for a batch; the fix for the reclassification bug is
+/// to re-home `status` on override (see [`WorkDb::override_comment_intent`]),
+/// never to loosen this predicate.
+pub(crate) fn revisable_comment_predicate() -> String {
+    format!("status = '{COMMENT_STATUS_ACTIVE}' AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')")
+}
+
+/// The complement of [`revisable_comment_predicate`] over the same intent set:
+/// comments the sidebar badges `directive`/`larger_change` whose `status`
+/// disqualifies them from a batch. Drives `ReviseDocOutcome::Created`'s
+/// `excluded_comment_ids` so the operator is told what the batch left behind
+/// instead of seeing an unqualified success.
+pub(crate) fn excluded_revisable_comment_predicate() -> String {
+    format!(
+        "status NOT IN ('{COMMENT_STATUS_ACTIVE}', '{COMMENT_STATUS_RESOLVED}', '{COMMENT_STATUS_DISMISSED}') \
+         AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+    )
+}
+
 const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
      (id, artifact_kind, artifact_id, doc_version, anchor_json, body, author, status, \
       status_actor, last_resolved_with, plain_text_projection_version, created_at, updated_at, \
@@ -183,12 +213,12 @@ impl WorkDb {
     pub fn comments_banner_state(&self, artifact_kind: &str, artifact_id: &str) -> Result<CommentsBannerState> {
         let owner = self.resolve_doc_owner(artifact_kind, artifact_id)?;
         let conn = self.connect()?;
+        let revisable = revisable_comment_predicate();
         let unresolved_count: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM work_comments
                  WHERE artifact_kind = ?1 AND artifact_id = ?2
-                   AND status = '{COMMENT_STATUS_ACTIVE}'
-                   AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+                   AND {revisable}"
             ),
             params![artifact_kind, artifact_id],
             |row| row.get(0),
@@ -297,10 +327,11 @@ impl WorkDb {
     /// isn't left silently stuck). Guarded on `status = 'answering'`,
     /// mirroring the design's idempotency table.
     ///
-    /// Reverse-edge case: [`Self::override_comment_intent`] has no status
-    /// guard, so a user can reclassify a comment away from `question` while
-    /// its answer-agent run is still in flight (still `answering`). When
-    /// that run finishes, landing on `answered` would strand the comment
+    /// Reverse-edge case: [`Self::reclassify_comment_intent`] (the follow-up
+    /// reclassifier) writes `intent` without touching `status`, so a comment
+    /// can be reclassified away from `question` while its answer-agent run is
+    /// still in flight (still `answering`). When that run finishes, landing
+    /// on `answered` would strand the comment
     /// off the `[Revise]` candidate pool exactly like the forward-direction
     /// bug this module fixes — there's no question left to await a
     /// follow-up on. So if `intent` is already `directive`/`larger_change`
@@ -537,22 +568,39 @@ impl WorkDb {
     /// classification, so no re-classification LLM call is triggered.
     ///
     /// Also has no status guard — it can fire from any comment status,
-    /// including mid-bucket-2 (`answered`/`awaiting_followup`). If the new
-    /// intent is revisable (`directive`/`larger_change`) and the comment is
-    /// currently sitting in one of those two statuses, this also resets
-    /// `status` back to `active` in the same write: those two statuses only
-    /// make sense for a `question` awaiting an answer/follow-up, and
-    /// leaving a revisable-intent comment stranded there would silently
-    /// exclude it from every `status = 'active'` consumer of comment intent
-    /// — `[Revise]`'s candidate query, its claim UPDATE, and the banner's
+    /// including mid-bucket-2 (`answering`/`answered`/`awaiting_followup`).
+    /// If the new intent is revisable (`directive`/`larger_change`) and the
+    /// comment is sitting in any of those three statuses, this also resets
+    /// `status` back to `active` in the same write: all three only make
+    /// sense for a `question` awaiting (or receiving) an answer, and leaving
+    /// a revisable-intent comment stranded there silently excludes it from
+    /// every consumer of [`revisable_comment_predicate`] — `[Revise]`'s
+    /// candidate query, its claim UPDATE, and the banner's
     /// `unresolved_count` (comment-triggered-document-revisions.md
     /// §"Reclassifying an answered question mid-flight"). The answer-agent's
     /// prior reply is preserved as thread context regardless (it isn't
     /// touched by this transition) — `compose_doc_comment_directive` pulls
     /// it in via [`Self::latest_answer_agent_run_for_comment`] once the
-    /// comment is claimed into a revision. A comment still `answering` (a
-    /// run genuinely in flight right now) is intentionally left alone here;
-    /// see [`Self::transition_comment_to_answered`] for that reverse edge.
+    /// comment is claimed into a revision.
+    ///
+    /// `answering` is included: a live run is stood down by the caller
+    /// (`handle_comments_set_intent`), so the status must move in this same
+    /// write — a comment left `answering` renders "Thinking…", is off the
+    /// unresolved count, and is dropped by `[Revise]` for as long as the run
+    /// lasts. The reverse edge in [`Self::transition_comment_to_answered`] is
+    /// retained as a backstop for any path that reclassifies without going
+    /// through that handler.
+    ///
+    /// `in_revision` is NOT reset: the comment has already been claimed by a
+    /// `[Revise]` batch whose directive was assembled once, at creation, and
+    /// is immutable. Pulling the comment out from under a live task would
+    /// leave that task addressing a comment it no longer owns and destroy the
+    /// `revise_task_id` provenance. The new intent takes effect on the next
+    /// cycle instead — reconciliation returns the comment to `active` (with
+    /// the overridden intent already in place) if the batch is abandoned. The
+    /// operator is told about this rather than left to infer it:
+    /// [`excluded_revisable_comment_predicate`] surfaces such comments in
+    /// `ReviseDocOutcome::Created`'s `excluded_comment_ids`.
     pub fn override_comment_intent(&self, comment_id: &str, intent: &str) -> Result<WorkComment> {
         match intent {
             INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
@@ -564,9 +612,9 @@ impl WorkDb {
             "UPDATE work_comments
              SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user',
                  intent_classification_failed_at = NULL, intent_classification_error = NULL,
-                 status = CASE WHEN status IN (?4, ?5) AND ?2 IN (?6, ?7) THEN ?8 ELSE status END,
-                 status_actor = CASE WHEN status IN (?4, ?5) AND ?2 IN (?6, ?7) THEN 'user' ELSE status_actor END,
-                 updated_at = CASE WHEN status IN (?4, ?5) AND ?2 IN (?6, ?7) THEN ?3 ELSE updated_at END
+                 status = CASE WHEN status IN (?4, ?5, ?9) AND ?2 IN (?6, ?7) THEN ?8 ELSE status END,
+                 status_actor = CASE WHEN status IN (?4, ?5, ?9) AND ?2 IN (?6, ?7) THEN 'user' ELSE status_actor END,
+                 updated_at = CASE WHEN status IN (?4, ?5, ?9) AND ?2 IN (?6, ?7) THEN ?3 ELSE updated_at END
              WHERE id = ?1",
             params![
                 comment_id,
@@ -577,6 +625,7 @@ impl WorkDb {
                 INTENT_DIRECTIVE,
                 INTENT_LARGER_CHANGE,
                 COMMENT_STATUS_ACTIVE,
+                COMMENT_STATUS_ANSWERING,
             ],
         )?;
         if n == 0 {
@@ -584,6 +633,29 @@ impl WorkDb {
         }
         query_comment(&conn, comment_id)?
             .with_context(|| format!("missing comment after intent override: {comment_id}"))
+    }
+
+    /// Every comment currently sitting `answering`, oldest first — the
+    /// candidate set for [`crate::stranded_answering_sweep`].
+    ///
+    /// `answering` is only ever meant to be transient: the answer agent runs,
+    /// its Stop hook fires, and `finalize_answer_agent` moves the comment on.
+    /// If that Stop never arrives (pane killed, engine restarted mid-run) the
+    /// comment sits here forever — invisible to the `[Revise]` banner and to
+    /// `query_revisable_comments`, with no operator-visible signal that
+    /// anything is wrong. Unlike the execution-centric reapers this cannot be
+    /// keyed on the in-memory live-worker registry (empty after a restart), so
+    /// it reads the durable comment rows instead.
+    pub fn list_answering_comments(&self) -> Result<Vec<WorkComment>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "SELECT {COMMENT_COLUMNS} FROM work_comments
+             WHERE status = ?1
+             ORDER BY updated_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![COMMENT_STATUS_ANSWERING], map_comment)?;
+        collect_rows(rows)
     }
 
     /// Persist a renderer-supplied re-anchor (the `comments_update_anchor`
@@ -870,11 +942,11 @@ pub(crate) fn query_revisable_comments(
     if matches!(comment_ids, Some(ids) if ids.is_empty()) {
         return Ok(Vec::new());
     }
+    let revisable = revisable_comment_predicate();
     let mut sql = format!(
         "SELECT {COMMENT_COLUMNS} FROM work_comments
          WHERE artifact_kind = ? AND artifact_id = ?
-           AND status = '{COMMENT_STATUS_ACTIVE}'
-           AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+           AND {revisable}"
     );
     let mut bind_params: Vec<&dyn rusqlite::ToSql> = vec![&artifact_kind, &artifact_id];
     if let Some(ids) = comment_ids {
@@ -887,6 +959,32 @@ pub(crate) fn query_revisable_comments(
     sql.push_str(" ORDER BY created_at ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(bind_params.as_slice(), map_comment)?;
+    collect_rows(rows)
+}
+
+/// The comments a `[Revise]` batch on this artifact leaves behind: badged
+/// `directive`/`larger_change` (so the operator reads them as revisable) but
+/// disqualified by `status` — `in_revision` (claimed by an earlier batch),
+/// `orphaned` (the anchor no longer resolves), or `answering` (a live
+/// answer-agent run). Exactly the complement of [`query_revisable_comments`]
+/// over the same intent set, minus the `resolved`/`dismissed` comments the
+/// sidebar already hides. Reported as `ReviseDocOutcome::Created`'s
+/// `excluded_comment_ids` so `[Revise]` never returns an unqualified success
+/// while quietly dropping comments the operator can see marked revisable.
+pub(crate) fn query_excluded_revisable_comment_ids(
+    conn: &Connection,
+    artifact_kind: &str,
+    artifact_id: &str,
+) -> Result<Vec<String>> {
+    let excluded = excluded_revisable_comment_predicate();
+    let sql = format!(
+        "SELECT id FROM work_comments
+         WHERE artifact_kind = ?1 AND artifact_id = ?2
+           AND {excluded}
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![artifact_kind, artifact_id], |row| row.get(0))?;
     collect_rows(rows)
 }
 
@@ -1477,28 +1575,148 @@ mod tests {
     }
 
     #[test]
-    fn override_comment_intent_does_not_touch_status_while_a_run_is_still_answering() {
+    fn override_comment_intent_rehomes_status_immediately_while_a_run_is_still_answering() {
         let db = mem_db();
         let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         db.transition_comment_to_answering(&comment.id).unwrap();
 
-        // A run is genuinely in flight right now — resetting to 'active'
-        // here would orphan it. See `transition_comment_to_answered` for
-        // how this reverse edge is handled once the run finishes.
+        // Standing the live run down is `handle_comments_set_intent`'s job;
+        // the status must move here, immediately, or the comment keeps
+        // showing "Thinking…", stays off the unresolved count, and `[Revise]`
+        // drops it for as long as the run lasts.
         let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
-        assert_eq!(overridden.status, "answering");
+        assert_eq!(overridden.status, "active");
+        assert_eq!(overridden.status_actor.as_deref(), Some("user"));
         assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
     }
 
     #[test]
-    fn transition_to_answered_lands_on_active_when_intent_already_overridden_mid_flight() {
+    fn override_comment_intent_leaves_a_claimed_comment_in_revision() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&comment.id, "directive", 0.9).unwrap();
+        // `set_comment_status` rejects `in_revision` (it's an engine-internal
+        // transition), so claim the comment the way a real batch does.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_comments SET status = 'in_revision', revise_task_id = 'task_1' WHERE id = ?1",
+                [&comment.id],
+            )
+            .unwrap();
+        }
+
+        // A claimed comment must not be yanked out from under the live task
+        // whose (immutable) directive already quotes it.
+        let overridden = db.override_comment_intent(&comment.id, "question").unwrap();
+        assert_eq!(overridden.status, "in_revision");
+        assert_eq!(overridden.revise_task_id.as_deref(), Some("task_1"));
+        assert_eq!(overridden.intent.as_deref(), Some("question"));
+    }
+
+    #[test]
+    fn overridden_answering_comment_immediately_counts_and_is_revisable() {
+        // The end-to-end assertion the unit-level status arithmetic never
+        // made: after a reclassification, does the comment actually show up
+        // in the two queries the banner and `[Revise]` read?
+        let db = mem_db();
+        let artifact_id = "pr_doc:git@github.com:o/r.git:main:x.md";
+        let mut create_input = input(artifact_id, "alpha", "", "");
+        create_input.artifact_kind = "pr_doc".to_owned();
+        let comment = db.create_comment(create_input).unwrap();
+        db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+
+        // Mid-flight: invisible to both consumers, which is correct — a live
+        // answer agent genuinely means "not ready".
+        assert_eq!(
+            db.comments_banner_state("pr_doc", artifact_id)
+                .unwrap()
+                .unresolved_count,
+            0
+        );
+        {
+            let conn = db.connect().unwrap();
+            assert!(
+                super::query_revisable_comments(&conn, "pr_doc", artifact_id, None)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        db.override_comment_intent(&comment.id, "larger_change").unwrap();
+
+        assert_eq!(
+            db.comments_banner_state("pr_doc", artifact_id)
+                .unwrap()
+                .unresolved_count,
+            1,
+            "a reclassified comment must count as unresolved immediately, not once its run ends",
+        );
+        let conn = db.connect().unwrap();
+        let revisable = super::query_revisable_comments(&conn, "pr_doc", artifact_id, None).unwrap();
+        assert_eq!(revisable.len(), 1);
+        assert_eq!(revisable[0].id, comment.id);
+    }
+
+    #[test]
+    fn excluded_revisable_query_reports_claimed_and_orphaned_comments_only() {
+        let db = mem_db();
+        let artifact_id = "pr_doc:git@github.com:o/r.git:main:x.md";
+        let make = |exact: &str| {
+            let mut create_input = input(artifact_id, exact, "", "");
+            create_input.artifact_kind = "pr_doc".to_owned();
+            db.create_comment(create_input).unwrap()
+        };
+        let active = make("active-one");
+        let claimed = make("claimed-one");
+        let orphaned = make("orphaned-one");
+        let answering = make("answering-one");
+        let resolved = make("resolved-one");
+        let question = make("question-one");
+        for c in [&active, &claimed, &orphaned, &answering, &resolved] {
+            db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+        }
+        db.set_comment_intent(&question.id, "question", 0.9).unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_comments SET status = 'in_revision', revise_task_id = 't1' WHERE id = ?1",
+                [&claimed.id],
+            )
+            .unwrap();
+        }
+        db.set_comment_status(&orphaned.id, "orphaned", Some("engine")).unwrap();
+        db.transition_comment_to_answering(&answering.id).unwrap();
+        db.set_comment_status(&resolved.id, "resolved", Some("user")).unwrap();
+
+        let conn = db.connect().unwrap();
+        let excluded = super::query_excluded_revisable_comment_ids(&conn, "pr_doc", artifact_id).unwrap();
+        assert!(
+            !excluded.contains(&active.id),
+            "an addressable comment is not an exclusion"
+        );
+        assert!(!excluded.contains(&question.id), "a question is not badged revisable");
+        assert!(
+            !excluded.contains(&resolved.id),
+            "a resolved comment is already hidden from the sidebar",
+        );
+        assert!(excluded.contains(&claimed.id));
+        assert!(excluded.contains(&orphaned.id));
+        assert!(excluded.contains(&answering.id));
+    }
+
+    #[test]
+    fn transition_to_answered_lands_on_active_when_intent_is_revisable_mid_flight() {
         let db = mem_db();
         let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         db.transition_comment_to_answering(&comment.id).unwrap();
 
-        // The user reclassifies away from 'question' while the answer-agent
-        // run is still in flight.
-        db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        // `override_comment_intent` now re-homes the status itself, so it
+        // can't set this state up. `reclassify_comment_intent` (the engine's
+        // follow-up reclassifier) writes `intent` without touching `status`,
+        // which is exactly the residual path this reverse edge backstops.
+        db.reclassify_comment_intent(&comment.id, "larger_change", 0.8).unwrap();
         assert_eq!(db.get_comment(&comment.id).unwrap().unwrap().status, "answering");
 
         // The run finishes: rather than landing on 'answered' (stranding

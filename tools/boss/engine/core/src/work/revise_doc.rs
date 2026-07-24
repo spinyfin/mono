@@ -104,12 +104,33 @@ impl WorkDb {
         };
 
         match self.claim_revisable_comments(&candidates, &task_id)? {
-            ClaimOutcome::Claimed(addressed_comment_ids) => Ok(ReviseDocOutcome::Created {
-                task_id,
-                task_kind,
-                addressed_comment_ids,
-                pr_url,
-            }),
+            ClaimOutcome::Claimed(addressed_comment_ids) => {
+                // Read the exclusions AFTER the claim so the comments this
+                // batch just moved to `in_revision` aren't reported as its
+                // own leftovers.
+                let excluded_comment_ids = {
+                    let conn = self.connect()?;
+                    comments::query_excluded_revisable_comment_ids(&conn, &input.artifact_kind, &input.artifact_id)?
+                        .into_iter()
+                        .filter(|id| !addressed_comment_ids.contains(id))
+                        .collect::<Vec<_>>()
+                };
+                if !excluded_comment_ids.is_empty() {
+                    tracing::info!(
+                        artifact_id = %input.artifact_id,
+                        task_id = %task_id,
+                        excluded = excluded_comment_ids.len(),
+                        "revise_doc: batch excluded comments badged directive/larger_change whose status disqualified them",
+                    );
+                }
+                Ok(ReviseDocOutcome::Created {
+                    task_id,
+                    task_kind,
+                    addressed_comment_ids,
+                    excluded_comment_ids,
+                    pr_url,
+                })
+            }
             ClaimOutcome::AlreadyInFlight(winner_task_id) => Ok(ReviseDocOutcome::AlreadyInFlight {
                 task_id: winner_task_id,
             }),
@@ -160,11 +181,11 @@ impl WorkDb {
             .collect::<Vec<_>>()
             .join(",");
 
+        let revisable = comments::revisable_comment_predicate();
         let update_sql = format!(
             "UPDATE work_comments
              SET status = '{COMMENT_STATUS_IN_REVISION}', revise_task_id = ?, status_actor = 'engine', updated_at = ?
-             WHERE id IN ({placeholders}) AND status = '{COMMENT_STATUS_ACTIVE}'
-               AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+             WHERE id IN ({placeholders}) AND {revisable}"
         );
         let mut update_params: Vec<&dyn rusqlite::ToSql> = vec![&task_id, &now];
         for id in &candidate_ids {
@@ -229,7 +250,14 @@ fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[Wor
         out.push_str(&comment.body);
         out.push('\n');
 
+        // Only a genuinely `replied` run is bridge context. A run the operator
+        // stood down by reclassifying the comment (`superseded`) is a question
+        // they retracted — feeding its answer into the directive would put a
+        // stale answer to a withdrawn question in front of the worker. Guarding
+        // on the status rather than on `reply_body` being present keeps that
+        // true even if a future terminal state starts carrying a partial body.
         if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
+            && run.status == ANSWER_AGENT_RUN_STATUS_REPLIED
             && let Some(reply) = run.reply_body.as_deref()
         {
             out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
@@ -398,11 +426,16 @@ mod tests {
             task_id,
             task_kind,
             addressed_comment_ids,
+            excluded_comment_ids,
             pr_url: outcome_pr_url,
         } = outcome
         else {
             panic!("expected Created, got {outcome:?}");
         };
+        assert!(
+            excluded_comment_ids.is_empty(),
+            "every revisable comment on this artifact was addressed",
+        );
         assert_eq!(task_kind, "revision");
         assert_eq!(outcome_pr_url.as_deref(), Some(pr_url.as_str()));
         assert_eq!(addressed_comment_ids.len(), 2);
@@ -1199,5 +1232,110 @@ mod tests {
         };
         assert!(task.description.contains("please change widget config"));
         assert!(task.description.contains("It lives in config.rs."));
+    }
+
+    /// Stand up a design-owned artifact whose owning task has an open PR —
+    /// the `Created`-producing branch of the decision table.
+    fn seed_open_pr_design_artifact(db: &WorkDb) -> String {
+        let (design, artifact_id) = seed_design_owned_artifact(db);
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/o/r/pull/1".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        artifact_id
+    }
+
+    #[test]
+    fn created_reports_revisable_looking_comments_the_batch_left_behind() {
+        let db = mem_db();
+        let artifact_id = seed_open_pr_design_artifact(&db);
+
+        let addressable = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&addressable.id, "larger_change", 0.9).unwrap();
+        // Badged `larger_change` in the sidebar, but its anchor is gone — so
+        // the batch cannot address it. An orphaned comment is still badged
+        // `larger_change` in the sidebar, so dropping it silently is
+        // indistinguishable from addressing it.
+        let orphaned = make_comment(&db, &artifact_id, "beta");
+        db.set_comment_intent(&orphaned.id, "larger_change", 0.9).unwrap();
+        db.set_comment_status(&orphaned.id, "orphaned", Some("engine")).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created {
+            addressed_comment_ids,
+            excluded_comment_ids,
+            ..
+        } = outcome
+        else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(addressed_comment_ids, vec![addressable.id]);
+        assert_eq!(
+            excluded_comment_ids,
+            vec![orphaned.id],
+            "a comment the operator sees badged revisable must be reported when it's dropped",
+        );
+    }
+
+    #[test]
+    fn a_superseded_answer_agent_reply_is_not_carried_into_the_directive() {
+        let db = mem_db();
+        let artifact_id = seed_open_pr_design_artifact(&db);
+
+        // A question whose answer agent was stood down when the operator
+        // reclassified the comment — the answer, if it had landed, would be
+        // an answer to a question they withdrew.
+        let comment = make_comment(&db, &artifact_id, "widget config");
+        db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        let run = db
+            .create_answer_agent_run(&comment.id, "pr_doc", &artifact_id, "v0", 0)
+            .unwrap();
+        // A stand-down carries no reply body; force one on to prove the guard
+        // keys on the run's terminal state and not merely on the body's absence.
+        db.complete_answer_agent_run(
+            &run.id,
+            ANSWER_AGENT_RUN_STATUS_SUPERSEDED,
+            Some("a stale answer to a retracted question"),
+            Some("reclassified"),
+        )
+        .unwrap();
+        let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        assert_eq!(overridden.status, "active");
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        let task = match db.get_work_item(&task_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert!(task.description.contains("please change widget config"));
+        assert!(
+            !task.description.contains("a stale answer to a retracted question"),
+            "a stood-down run's reply must not become revision context",
+        );
     }
 }

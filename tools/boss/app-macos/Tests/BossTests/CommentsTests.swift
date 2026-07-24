@@ -346,8 +346,47 @@ final class CommentLayerTests: XCTestCase {
 
     func testApplyReviseDocOutcomeCreatedLeavesMessageNil() {
         let layer = CommentLayer()
-        layer.applyReviseDocOutcome(.created(taskId: "rev_1", taskKind: "revision", addressedCommentIds: ["cmt_1"], prUrl: nil))
+        layer.applyReviseDocOutcome(
+            .created(taskId: "rev_1", taskKind: "revision", addressedCommentIds: ["cmt_1"], excludedCommentIds: [], prUrl: nil))
         XCTAssertNil(layer.reviseDocMessage)
+    }
+
+    /// A batch that drops comments the sidebar still badges `Larger Change`
+    /// must say so — the badge renders `intent` alone, so a silent success
+    /// toast is indistinguishable from "everything was addressed".
+    func testApplyReviseDocOutcomeCreatedReportsExcludedComments() {
+        let layer = CommentLayer()
+        layer.applyReviseDocOutcome(
+            .created(
+                taskId: "rev_1", taskKind: "revision",
+                addressedCommentIds: ["cmt_1", "cmt_2"], excludedCommentIds: ["cmt_3"], prUrl: nil))
+        XCTAssertEqual(
+            layer.reviseDocMessage,
+            "Addressing 2 comments. 1 other comment was left out (already in a revision, still answering, or its anchor was lost).")
+    }
+
+    func testApplyReviseDocOutcomeCreatedPluralisesExcludedComments() {
+        let layer = CommentLayer()
+        layer.applyReviseDocOutcome(
+            .created(
+                taskId: "rev_1", taskKind: "revision",
+                addressedCommentIds: ["cmt_1"], excludedCommentIds: ["cmt_2", "cmt_3"], prUrl: nil))
+        XCTAssertEqual(
+            layer.reviseDocMessage,
+            "Addressing 1 comment. 2 other comments were left out (already in a revision, still answering, or their anchors were lost).")
+    }
+
+    /// The engine omits `excluded_comment_ids` entirely when nothing was
+    /// dropped (`skip_serializing_if = "Vec::is_empty"`), so decoding must
+    /// tolerate its absence rather than failing the whole reply.
+    func testReviseDocOutcomeDecodesWithoutExcludedCommentIds() throws {
+        let json = """
+            {"type":"created","task_id":"rev_1","task_kind":"revision","addressed_comment_ids":["cmt_1"]}
+            """
+        let outcome = try JSONDecoder().decode(ReviseDocOutcome.self, from: Data(json.utf8))
+        XCTAssertEqual(
+            outcome,
+            .created(taskId: "rev_1", taskKind: "revision", addressedCommentIds: ["cmt_1"], excludedCommentIds: [], prUrl: nil))
     }
 
     func testApplyReviseDocOutcomeNoUnresolvedCommentsSetsMessage() {
@@ -378,6 +417,21 @@ final class CommentLayerTests: XCTestCase {
         try await Task.sleep(for: .seconds(2))
         XCTAssertEqual(layer.comments[0].status, .answered)
         XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
+    }
+
+    func testSetIntentToQuestionLeavesAClaimedCommentInRevision() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.reviseDoc()
+        XCTAssertEqual(layer.comments[0].status, .inRevision)
+
+        // Mirrors the engine's `rehome_reclassified_comment`, which guards the
+        // `question` spawn on `status == .active` so a claimed comment can't
+        // spawn an answer agent behind the revision's back.
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .inRevision)
+        XCTAssertTrue(layer.comments[0].threadEntries.allSatisfy { $0.entryKind != .answer })
     }
 
     func testPostFollowupIgnoredBeforeAnswered() {

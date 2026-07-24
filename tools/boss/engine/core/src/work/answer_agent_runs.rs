@@ -12,6 +12,14 @@
 
 use super::*;
 
+/// The apology entry standing in for the answer that never arrived. Shared by
+/// [`WorkDb::recover_unanswered_comment`]'s two callers (`finalize_answer_agent`
+/// and `stranded_answering_sweep::recover`) so the wording can't drift between
+/// them: from the operator's side these are the same event, and two different
+/// wordings for it would read as two different failures.
+pub(crate) const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish answering this question — the session ended before \
+     posting a reply. Please try again, or answer directly.";
+
 impl WorkDb {
     /// Column list for every `answer_agent_runs` SELECT. Order must match
     /// [`map_answer_agent_run`].
@@ -100,6 +108,67 @@ impl WorkDb {
         let cols = Self::answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Stand a comment's in-flight answer-agent run down because the operator
+    /// reclassified the comment away from `question`
+    /// (`handle_comments_set_intent`). Completes the `running` row as the
+    /// terminal [`ANSWER_AGENT_RUN_STATUS_SUPERSEDED`] with no `reply_body`,
+    /// returning the row it stood down (`None` when there was no live run —
+    /// the agent already replied, or never started).
+    ///
+    /// Being no longer `running` is what makes the stand-down stick against a
+    /// late reply: [`Self::running_answer_agent_run_for_comment`] stops
+    /// matching, so `CommentsPostAnswer` rejects the agent's reply instead of
+    /// posting a thread entry and dragging the comment back to `answered`, and
+    /// `finalize_answer_agent` takes its already-completed branch instead of
+    /// re-transitioning the comment. Carrying no `reply_body` is what keeps a
+    /// retracted question's answer out of `compose_doc_comment_directive`.
+    ///
+    /// Distinct from a `failed` completion on purpose: nothing went wrong, and
+    /// `CommentWithThread::answer_agent_failed` (which keys on the latest run
+    /// being `failed`) must not light up a failure state in the sidebar for a
+    /// run the operator themself retracted.
+    pub fn stand_down_answer_agent_run(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let Some(run) = self.running_answer_agent_run_for_comment(comment_id)? else {
+            return Ok(None);
+        };
+        self.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, None, Some("reclassified"))
+            .map(Some)
+    }
+
+    /// The comment's bound `answer_agent` execution while it is still
+    /// non-terminal (`ready` before dispatch, `running`/`waiting_human` after).
+    /// `None` once the execution reached a terminal status, or when the comment
+    /// never had one.
+    ///
+    /// Used by the stand-down path to cancel and release a run the operator
+    /// retracted, and by [`crate::stranded_answering_sweep`] to tell "the agent
+    /// is genuinely still working" from "the agent is gone and nothing will
+    /// ever move this comment". `get_live_execution_for_work_item` is not a
+    /// substitute: it deliberately matches only `running`/`waiting_human`, so
+    /// it misses a `ready` execution the coordinator has not dispatched yet —
+    /// precisely the window in which a reclassification is most likely.
+    pub fn live_answer_agent_execution_for_comment(&self, comment_id: &str) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+             WHERE work_item_id = ?1 AND kind = ?2
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let ids: Vec<String> = collect_rows(
+            stmt.query_map(params![comment_id, boss_protocol::EXECUTION_KIND_ANSWER_AGENT], |row| {
+                row.get(0)
+            })?,
+        )?;
+        for id in ids {
+            if let Some(execution) = query_execution(&conn, &id)?
+                && !execution.status.is_terminal()
+            {
+                return Ok(Some(execution));
+            }
+        }
+        Ok(None)
     }
 
     /// Fetch an answer-agent run by id.
@@ -210,6 +279,43 @@ impl WorkDb {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Recover a comment stuck `answering` whose answer-agent run ended
+    /// without ever posting a reply: mark `run_id` (if still `running`)
+    /// `failed` with `error_kind`, post the no-reply apology thread entry, and
+    /// transition the comment out of `answering`
+    /// ([`Self::transition_comment_to_answered`] folds a reclassified comment
+    /// straight into `active` instead of `answered`). Shared by
+    /// `CompletionHandler::finalize_answer_agent` (Stop fired, run still
+    /// `running`) and `stranded_answering_sweep::recover` (Stop never fired at
+    /// all) — the two paths differ only in `error_kind` and whether `run_id`
+    /// is still around to mark `failed`.
+    pub(crate) fn recover_unanswered_comment(
+        &self,
+        comment_id: &str,
+        run_id: Option<&str>,
+        error_kind: &str,
+    ) -> Result<WorkComment> {
+        if let Some(run_id) = run_id
+            && let Err(err) =
+                self.complete_answer_agent_run(run_id, ANSWER_AGENT_RUN_STATUS_FAILED, None, Some(error_kind))
+        {
+            tracing::warn!(comment_id, run_id, ?err, "failed to mark the stranded run 'failed'");
+        }
+
+        if let Err(err) = self.create_comment_thread_entry(
+            comment_id,
+            THREAD_ENTRY_KIND_ANSWER,
+            THREAD_ENTRY_AUTHOR_ENGINE,
+            ANSWER_AGENT_NO_REPLY_BODY,
+            None,
+            run_id,
+        ) {
+            tracing::warn!(comment_id, ?err, "failed to post the no-reply-posted thread entry");
+        }
+
+        self.transition_comment_to_answered(comment_id)
     }
 }
 
