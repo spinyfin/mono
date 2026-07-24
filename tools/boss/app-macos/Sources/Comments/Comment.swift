@@ -5,13 +5,9 @@ import Foundation
 /// revision/update-task path; `question` routes to the read-only answer
 /// agent. See `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
 ///
-/// The classifier originally split `revision` into `directive` (a small,
-/// clear edit) and `largerChange` (a substantive one) as separate cases, but
-/// every consumer treated them identically — there was no engine behavior,
-/// and no UI affordance, that differed based on which of the two a comment
-/// carried. Collapsed to one case so the operator picks between "this wants
-/// a doc change" and "this is a question" rather than a three-way choice
-/// with no actual difference between two of the options.
+/// Intent is a binary choice: "this wants a doc change" vs. "this is a
+/// question" — no engine behavior or UI affordance distinguishes a small
+/// edit from a substantive one.
 enum CommentIntent: String, CaseIterable, Equatable {
     case revision
     case question

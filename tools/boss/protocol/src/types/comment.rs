@@ -94,15 +94,10 @@ pub const RESOLVED_WITH_ORPHAN: &str = "orphan";
 /// later phases — see
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
 ///
-/// The classifier originally distinguished `directive` (a small, clear edit)
-/// from `larger_change` (a substantive one) as two separate values, but
-/// every consumer — the `[Revise]` batch predicate, the nudge trigger, the
-/// answered/active transitions, manual override — always matched the two
-/// together and never branched on which one a comment carried. The
-/// distinction cost the operator a real decision (a three-way classify
-/// dropdown) for zero behavioral difference, so it was collapsed into this
-/// single `revision` value; nothing downstream needs to know which kind of
-/// edit a comment asked for.
+/// Intent is a binary routing decision: nothing downstream — the
+/// `[Revise]` batch predicate, the nudge trigger, the answered/active
+/// transitions, manual override — distinguishes a small edit from a
+/// substantive one, so both are `revision`.
 pub const INTENT_REVISION: &str = "revision";
 pub const INTENT_QUESTION: &str = "question";
 

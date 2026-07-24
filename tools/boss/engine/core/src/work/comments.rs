@@ -1858,9 +1858,12 @@ mod tests {
         let db = mem_db();
         let comment = seed_answered_comment(&db);
         db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+        // The follow-up reply reclassifies as wanting a doc change.
+        db.reclassify_comment_intent(&comment.id, "revision", 0.9).unwrap();
 
         let bridged = db.transition_comment_awaiting_followup_to_active(&comment.id).unwrap();
         assert_eq!(bridged.status, "active");
+        assert_eq!(bridged.intent.as_deref(), Some("revision"));
         assert!(bridged.revise_task_id.is_none());
     }
 
@@ -1885,6 +1888,20 @@ mod tests {
 
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
         assert_eq!(reloaded.intent.as_deref(), Some("revision"));
+    }
+
+    #[test]
+    fn reclassify_comment_intent_overwrites_a_prior_classification_the_other_way() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&c.id, "revision", 0.9).unwrap();
+
+        let reclassified = db.reclassify_comment_intent(&c.id, "question", 0.8).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("question"));
+        assert_eq!(reclassified.intent_confidence, Some(0.8));
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("question"));
     }
 
     #[test]

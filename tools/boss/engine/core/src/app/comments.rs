@@ -1261,19 +1261,12 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
 /// bridge may already have posted one; a second identical entry would just
 /// duplicate the banner text in the thread.
 ///
-/// Scope-gated on [`WorkDb::resolve_doc_owner`] — the exact same gate the
-/// `[Revise]` banner (`comments_banner_state`) and `CommentsReviseDoc` use to
-/// decide whether a `[Revise]` affordance can ever appear for this artifact.
-/// Before this guard, the nudge (and hence "click [Revise] to start one")
-/// posted unconditionally, because the classifier itself runs unconditionally
-/// on every artifact kind (design's own documented "as-built divergence") —
-/// so a comment on an out-of-scope artifact (e.g. `artifact_kind =
-/// 'work_item'`, which the design permanently excludes from any
-/// comment-driven affordance) got a nudge pointing at a `[Revise]` button
-/// that could never exist. Bucket 2's `spawn_answer_agent` already learned
-/// this lesson (see its own scope-guard doc comment); this brings buckets 1&3
-/// in line with it rather than leaving the divergence for out-of-scope
-/// comments to keep dead-ending on a nonexistent button.
+/// Scope-gated on [`WorkDb::resolve_doc_owner`] — the same gate
+/// `comments_banner_state` and `CommentsReviseDoc` use to decide whether a
+/// `[Revise]` affordance can ever appear for this artifact. The classifier
+/// runs on every artifact kind, so without this gate a comment on an
+/// out-of-scope artifact (e.g. `artifact_kind = 'work_item'`) would be
+/// nudged toward a `[Revise]` button that can never appear.
 fn post_nudge_once(work_db: &Arc<WorkDb>, artifact_kind: &str, artifact_id: &str, comment_id: &str) {
     match work_db.resolve_doc_owner(artifact_kind, artifact_id) {
         Ok(Some(_)) => {}
@@ -2037,6 +2030,44 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry_kind, THREAD_ENTRY_KIND_NUDGE);
         assert_eq!(entries[0].body, NUDGE_BODY);
+    }
+
+    #[tokio::test]
+    async fn set_intent_on_an_out_of_scope_artifact_does_not_nudge() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        // `artifact_kind = "work_item"` never resolves via `resolve_doc_owner`
+        // (it only matches `pr_doc`), so a `[Revise]` affordance can never
+        // appear for this comment. Reclassifying it to `revision` must not
+        // post a nudge pointing at that nonexistent button.
+        let comment = work_db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id: "t1".into(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "work_item".into(),
+                author: "human".into(),
+                body: "What does this mean?".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
+
+        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
+
+        let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some(INTENT_REVISION));
+
+        let entries = work_db.list_comment_thread_entries(&comment.id).unwrap();
+        assert!(
+            entries.iter().all(|e| e.entry_kind != THREAD_ENTRY_KIND_NUDGE),
+            "an out-of-scope artifact must never get a nudge toward a nonexistent [Revise] button, got {entries:?}",
+        );
     }
 
     #[tokio::test]
