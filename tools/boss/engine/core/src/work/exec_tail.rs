@@ -508,6 +508,16 @@ impl WorkDb {
         let mut pending = PendingEvents::new();
         if n > 0 {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, work_item_id, "done", &now)?;
+            let updated =
+                query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
+            stage_project_impl_drained_on_terminal_transition(
+                &tx,
+                &mut pending,
+                updated.kind.clone(),
+                updated.project_id.as_deref(),
+                &task.status,
+                &updated.status,
+            )?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(n > 0)

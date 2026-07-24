@@ -373,7 +373,17 @@ impl WorkDb {
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        if status_changed && previous_status != updated.status {
+            stage_project_impl_drained_on_terminal_transition(
+                &tx,
+                &mut pending,
+                updated.kind.clone(),
+                updated.project_id.as_deref(),
+                &previous_status,
+                &updated.status,
+            )?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(task_to_item(updated))
     }
 }

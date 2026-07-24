@@ -619,6 +619,13 @@ struct ServerState {
     /// boot, mutated by `SetFeatureFlag` RPC, consulted by callers
     /// via `is_enabled(...)`. See `crate::feature_flags`.
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    /// Shared in-process event bus (see `boss_event_bus`). The same `Arc`
+    /// `work_db` publishes onto after its writes commit (see
+    /// `crate::event_publish`); reconciler subscriber loops wired in
+    /// `app/server.rs` (e.g. `project_postmortem_sweep`'s event-driven
+    /// arm) subscribe against this instance so producer and subscriber
+    /// never drift onto separate buses.
+    event_bus: Arc<boss_event_bus::EventBus>,
     /// Registry of capability IDs present in the current running
     /// build. Populated by `RegisterCapabilities` RPC when the macOS
     /// app connects, and by engine-side startup for engine-built
@@ -712,7 +719,14 @@ impl ServerState {
         trunk_client_override: Option<boss_trunk_client::TrunkClient>,
         direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
     ) -> Result<Arc<Self>> {
-        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
+        // Shared in-process event bus (see `boss_event_bus` and
+        // `crate::event_publish`). `work_db` publishes state-transition
+        // events after its writes commit; reconciler subscriber loops
+        // (e.g. `project_postmortem_sweep`'s event-driven arm, wired in
+        // `app/server.rs`) hold the same `Arc` so producer and subscriber
+        // share one bus instance.
+        let event_bus = Arc::new(boss_event_bus::EventBus::new());
+        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(Arc::clone(&event_bus)));
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         // One-time startup signal so the missing-API-key case is
         // immediately visible in engine stderr — the chore calls out
@@ -1114,6 +1128,7 @@ impl ServerState {
                 .ipc_logger(ipc_logger)
                 .self_weak(weak_self.clone())
                 .feature_flags(feature_flags_for_state)
+                .event_bus(Arc::clone(&event_bus))
                 .capability_registry(Arc::new(crate::feature_flags::CapabilityRegistry::new()))
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)

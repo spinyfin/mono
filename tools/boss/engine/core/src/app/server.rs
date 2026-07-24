@@ -1412,6 +1412,23 @@ pub async fn serve_with_merge_probe(
         server_state.feature_flags.clone(),
     );
 
+    // Event-driven half of the same reconciler (engine-event-bus design
+    // doc's Phase 0 pilot conversion): a project's last non-terminal impl
+    // task reaching terminal publishes `ProjectImplDrained` after that
+    // write's transaction commits (see `crate::event_publish` and the
+    // status-write call sites in `work/updates.rs` / `work/pr_flow.rs` /
+    // `work/exec_tail.rs`); this subscriber schedules the postmortem
+    // immediately instead of waiting out the 300 s interval above, which
+    // stays completely untouched as the backstop for any event this
+    // subscriber drops.
+    let coord_for_postmortem_event = server_state.execution_coordinator.clone();
+    let _project_postmortem_event_handle = crate::project_postmortem_sweep::spawn_event_loop(
+        server_state.work_db.clone(),
+        server_state.event_bus.clone(),
+        Arc::new(move || coord_for_postmortem_event.kick()),
+        server_state.feature_flags.clone(),
+    );
+
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,
     // for every enabled `schedule` automation that is due, compute its
     // cron/timezone occurrence, enforce the open-task gate, apply catch-up /

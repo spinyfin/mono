@@ -28,6 +28,70 @@ pub(crate) struct TriggerTaskSnapshot {
     pub completed_at: Option<String>,
 }
 
+/// Stage `Event::ProjectImplDrained { project_id }` onto `pending` if this
+/// status transition was the project's *last* non-terminal trigger task
+/// (`project_task`/`design`/`investigation`) reaching terminal. Must be
+/// called with the transaction that performed the status-write UPDATE,
+/// after that UPDATE has run but before the transaction commits — see
+/// `crate::event_publish`'s publish-after-commit seam, which is what
+/// actually flushes `pending` onto the bus once the caller's `tx.commit()`
+/// succeeds.
+///
+/// Deliberately does not replicate `project_postmortem_sweep::evaluate_project`'s
+/// dedup gate, archived-project skip, or "since last postmortem" cutoff —
+/// this is only the trigger-count check; the event-driven subscriber
+/// re-derives everything else from current DB state when it reacts to the
+/// event (events are hints, not commands — see the event-bus design doc).
+pub(crate) fn stage_project_impl_drained_on_terminal_transition(
+    tx: &Connection,
+    pending: &mut crate::event_publish::PendingEvents,
+    task_kind: TaskKind,
+    project_id: Option<&str>,
+    previous_status: &TaskStatus,
+    new_status: &TaskStatus,
+) -> Result<()> {
+    if previous_status.is_terminal() || !new_status.is_terminal() {
+        return Ok(());
+    }
+    if !matches!(
+        task_kind,
+        TaskKind::ProjectTask | TaskKind::Design | TaskKind::Investigation
+    ) {
+        return Ok(());
+    }
+    let Some(project_id) = project_id else {
+        return Ok(());
+    };
+    if project_has_open_trigger_tasks_in_tx(tx, project_id)? {
+        return Ok(());
+    }
+    pending.push(boss_event_bus::Event::ProjectImplDrained {
+        project_id: project_id.to_owned(),
+    });
+    Ok(())
+}
+
+/// True if `project_id` still has at least one live, non-terminal trigger
+/// task (`project_task`/`design`/`investigation`). Mirrors the WHERE clause
+/// of [`WorkDb::list_project_trigger_tasks`] but runs directly against an
+/// already-open `Connection`/`Transaction` so callers holding the shared
+/// connection's mutex guard (e.g. `update_task`, mid-transaction) don't
+/// deadlock trying to `WorkDb::connect()` again — see that method's doc
+/// comment on why a second `connect()` call from the same call stack
+/// deadlocks.
+fn project_has_open_trigger_tasks_in_tx(conn: &Connection, project_id: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks
+         WHERE project_id = ?1
+           AND kind IN ('project_task', 'design', 'investigation')
+           AND deleted_at IS NULL
+           AND status NOT IN ('done', 'archived', 'cancelled')",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 impl WorkDb {
     /// Every live (non-deleted) trigger-count task
     /// (`project_task`/`design`/`investigation`) for a project, with

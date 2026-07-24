@@ -167,6 +167,98 @@ pub fn spawn_loop(
     })
 }
 
+/// Subscribe to `ProjectImplDrained` and evaluate the named project
+/// immediately instead of waiting out [`PROJECT_POSTMORTEM_SWEEP_INTERVAL_SECS`].
+/// This is the event-driven half of the two-tier design (see the module
+/// doc and the engine-event-bus design doc's "Pilot conversion" task):
+/// [`spawn_loop`]'s periodic pass stays completely untouched as the
+/// backstop that recovers any event this subscriber drops (a panic, a full
+/// mailbox, an engine restart between publish and delivery).
+///
+/// Deliberately re-derives everything from current DB state rather than
+/// trusting the event payload beyond the `project_id` key — the event is a
+/// hint that impl work drained, not a command to schedule; the dedup gate,
+/// archived-project skip, and "since last postmortem" cutoff inside
+/// [`evaluate_project`] are the same ones the periodic sweep uses, so a
+/// project that also gets picked up by the next sweep tick is a no-op
+/// (idempotent: the dedup gate sees the postmortem this call already
+/// scheduled and skips).
+///
+/// `feature_flags` is checked per-event, mirroring [`spawn_loop`]'s
+/// per-pass check, so disabling the `project_postmortem_sweep` flag stops
+/// the event path immediately too — no live event-driven scheduling behind
+/// operators' backs while the kill switch is engaged.
+pub fn spawn_event_loop(
+    work_db: Arc<WorkDb>,
+    event_bus: Arc<boss_event_bus::EventBus>,
+    kick_fn: Arc<dyn Fn() + Send + Sync>,
+    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+) -> tokio::task::JoinHandle<()> {
+    boss_event_bus::spawn_supervised("project_postmortem_sweep_event", move || {
+        let work_db = Arc::clone(&work_db);
+        let event_bus = Arc::clone(&event_bus);
+        let kick_fn = Arc::clone(&kick_fn);
+        let feature_flags = Arc::clone(&feature_flags);
+        async move {
+            let mut subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+                boss_event_bus::EventKind::ProjectImplDrained,
+            ));
+            while let Some(event) = subscription.recv().await {
+                let boss_event_bus::Event::ProjectImplDrained { project_id } = event else {
+                    continue;
+                };
+                if !feature_flags.is_enabled("project_postmortem_sweep") {
+                    continue;
+                }
+                match evaluate_project_by_id(work_db.as_ref(), &project_id).await {
+                    Ok(true) => kick_fn(),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            project_id,
+                            ?err,
+                            "project-postmortem event: failed to evaluate project; the backstop sweep will retry",
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Evaluate exactly the one project named by a `ProjectImplDrained` event.
+/// Looks up the `Project`/`Product` rows the batch [`run_one_pass`] would
+/// already have in hand from its per-product scan, then delegates to
+/// [`evaluate_project`] for the actual decision (design-doc precondition,
+/// dedup gate, cutoff). Returns `true` iff a postmortem was scheduled.
+async fn evaluate_project_by_id(work_db: &WorkDb, project_id: &str) -> anyhow::Result<bool> {
+    let watermark = ensure_watermark(work_db)?;
+    let project = match work_db.get_project(project_id) {
+        Ok(project) => project,
+        Err(err) => {
+            // Deleted/never-existed project id racing the event — nothing
+            // to evaluate, and the backstop sweep has nothing to find
+            // either in that case.
+            tracing::debug!(
+                project_id,
+                ?err,
+                "project-postmortem event: project lookup failed; skipping"
+            );
+            return Ok(false);
+        }
+    };
+    if project.design_doc_path.as_deref().unwrap_or_default().is_empty() {
+        return Ok(false);
+    }
+    let Some(product) = work_db.get_product(&project.product_id)? else {
+        return Ok(false);
+    };
+    match evaluate_project(work_db, &product, &project, watermark).await? {
+        EvalOutcome::Scheduled => Ok(true),
+        EvalOutcome::Skipped | EvalOutcome::Evaluated => Ok(false),
+    }
+}
+
 /// Metadata-table key (see `WorkDb::get_metadata`/`set_metadata`) holding
 /// the sweep's high-water mark: the epoch-seconds instant this sweep first
 /// ever ran against this database. See [`ensure_watermark`] for why this
@@ -882,5 +974,132 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// Producer-side proof: draining a project's last live trigger task via
+    /// `WorkDb::update_work_item` publishes `ProjectImplDrained` onto
+    /// whatever bus the `WorkDb` was bound to (see `WorkDb::with_event_bus`)
+    /// once that write's transaction commits.
+    #[tokio::test]
+    async fn draining_last_trigger_task_publishes_project_impl_drained() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+
+        let bus = Arc::new(boss_event_bus::EventBus::new());
+        let db = db.with_event_bus(Arc::clone(&bus));
+        let mut subscription = bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::ProjectImplDrained,
+        ));
+
+        create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("ProjectImplDrained must be published before the timeout")
+            .expect("bus must not have been dropped");
+        assert_eq!(
+            event,
+            boss_event_bus::Event::ProjectImplDrained {
+                project_id: project.id.clone()
+            }
+        );
+    }
+
+    /// The event-driven half schedules the postmortem without waiting for
+    /// the 300 s sweep interval: publish-after-commit fires
+    /// `ProjectImplDrained` the moment the last trigger task's transaction
+    /// commits, and [`spawn_event_loop`]'s subscriber reacts immediately.
+    #[tokio::test]
+    async fn event_loop_schedules_postmortem_immediately_without_a_sweep_pass() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::feature_flags::FeatureFlagsStore;
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+        seed_watermark(&db, 0);
+
+        let bus = Arc::new(boss_event_bus::EventBus::new());
+        let db = Arc::new(db.with_event_bus(Arc::clone(&bus)));
+
+        let flags_dir = tempfile::TempDir::new().unwrap();
+        let feature_flags = Arc::new(FeatureFlagsStore::new(flags_dir.path().join("feature-flags.toml")));
+
+        let kick_calls = Arc::new(AtomicUsize::new(0));
+        let kick_calls_c = Arc::clone(&kick_calls);
+        let kick_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            kick_calls_c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let handle = spawn_event_loop(Arc::clone(&db), Arc::clone(&bus), kick_fn, feature_flags);
+        // Give the spawned subscriber loop a chance to reach
+        // `event_bus.subscribe(...)` before publishing — the bus has no
+        // replay, so a publish before the subscription exists would be
+        // dropped and this test would flake on scheduling order rather
+        // than testing the real behaviour.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+
+        let mut scheduled = false;
+        for _ in 0..200 {
+            if db.last_design_postmortem_for_project(&project.id).unwrap().is_some() {
+                scheduled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            scheduled,
+            "the event-driven subscriber must schedule a postmortem without a sweep pass ever running"
+        );
+        assert_eq!(
+            kick_calls.load(Ordering::SeqCst),
+            1,
+            "kick_fn must fire exactly once for the one postmortem the event path scheduled"
+        );
+
+        handle.abort();
+    }
+
+    /// Idempotency (engine-event-bus design doc, pilot-conversion task):
+    /// the event path and the periodic sweep can both observe the same
+    /// drain — the event path is not guaranteed to win the race in
+    /// production — and must still produce exactly one postmortem, because
+    /// the sweep's dedup gate (a live, still-open postmortem blocks a
+    /// duplicate) applies equally to a postmortem the event path already
+    /// created.
+    #[tokio::test]
+    async fn event_and_sweep_both_firing_creates_only_one_postmortem() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+        seed_watermark(&db, 0);
+        let task = create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+        db.force_completed_at_for_test(&task.id, 1_000).unwrap();
+
+        let scheduled_by_event = evaluate_project_by_id(&db, &project.id).await.unwrap();
+        assert!(scheduled_by_event, "event path must schedule the postmortem");
+        let first = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+
+        let outcome = run_one_pass(&db).await;
+        assert_eq!(
+            outcome.postmortems_created, 0,
+            "sweep must not double-schedule what the event path already created for the same drain"
+        );
+
+        let second = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+        assert_eq!(
+            first.id, second.id,
+            "exactly one postmortem must exist after both the event path and the sweep fire for the same drain"
+        );
     }
 }

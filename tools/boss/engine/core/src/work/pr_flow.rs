@@ -148,6 +148,16 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        if new_status != task.status {
+            stage_project_impl_drained_on_terminal_transition(
+                &tx,
+                &mut pending,
+                updated_task.kind.clone(),
+                updated_task.project_id.as_deref(),
+                &task.status,
+                &new_status,
+            )?;
+        }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
@@ -269,6 +279,16 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        if new_status != task.status {
+            stage_project_impl_drained_on_terminal_transition(
+                &tx,
+                &mut pending,
+                updated_task.kind.clone(),
+                updated_task.project_id.as_deref(),
+                &task.status,
+                &new_status,
+            )?;
+        }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
@@ -851,7 +871,15 @@ impl WorkDb {
         comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        stage_project_impl_drained_on_terminal_transition(
+            &tx,
+            &mut pending,
+            updated.kind.clone(),
+            updated.project_id.as_deref(),
+            &task.status,
+            &updated.status,
+        )?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(updated))
     }
 
@@ -910,7 +938,15 @@ impl WorkDb {
         block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        stage_project_impl_drained_on_terminal_transition(
+            &tx,
+            &mut pending,
+            updated.kind.clone(),
+            updated.project_id.as_deref(),
+            &task.status,
+            &updated.status,
+        )?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(updated))
     }
 
