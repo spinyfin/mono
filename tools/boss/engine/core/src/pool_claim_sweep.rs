@@ -87,6 +87,13 @@ use crate::work::WorkDb;
 /// is reclaimed within a minute, slow enough to be negligible overhead.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
+/// events are absorbed for this long before another out-of-cycle pass runs —
+/// mirrors the merge poller's kick-quiesce window so a burst of terminations
+/// (e.g. a batch stop) can't turn into a hot loop of full passes. The
+/// periodic `interval` tick remains the backstop regardless.
+const EVENT_QUIESCE: Duration = Duration::from_secs(5);
+
 /// Grace period after an execution's `finished_at` during which a still-
 /// claimed slot is left alone. A terminal execution's pool slot is
 /// normally freed within milliseconds (completion's `release_worker_pane`
@@ -139,28 +146,44 @@ impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so a pool wedged before an engine restart
 /// self-heals at boot without waiting for the first interval.
+///
+/// Also subscribes to [`Event::ExecutionTerminal`]: receiving one runs an
+/// out-of-cycle pass right away (subject to [`EVENT_QUIESCE`]) instead of
+/// waiting out the rest of `interval`, so a leaked claim whose execution
+/// just went terminal is reconciled as soon as its [`LEAK_GRACE_SECS`]
+/// grace period allows rather than at some arbitrary point in the next
+/// periodic cycle. The periodic tick remains the backstop: a dropped or
+/// coalesced event never leaves a leaked claim unreconciled for longer than
+/// `interval`.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
+    execution_terminal_events: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let live_states = Arc::clone(&live_states);
-        let coordinator = Arc::clone(&coordinator);
-        let dispatch_events = Arc::clone(&dispatch_events);
-        async move {
-            run_one_pass(
-                work_db.as_ref(),
-                live_states.as_ref(),
-                coordinator.clone(),
-                dispatch_events.as_ref(),
-            )
-            .await
-        }
-    })
+    crate::sweep_loop::spawn_sweep_loop_with_events(
+        interval,
+        EVENT_QUIESCE,
+        execution_terminal_events,
+        "pool-claim sweep",
+        move || {
+            let work_db = Arc::clone(&work_db);
+            let live_states = Arc::clone(&live_states);
+            let coordinator = coordinator.clone();
+            let dispatch_events = Arc::clone(&dispatch_events);
+            async move {
+                run_one_pass(
+                    work_db.as_ref(),
+                    live_states.as_ref(),
+                    coordinator,
+                    dispatch_events.as_ref(),
+                )
+                .await
+            }
+        },
+    )
 }
 
 /// Run a single pool-claim reconciliation pass over both pools. Returns
