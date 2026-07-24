@@ -280,44 +280,26 @@ impl WorkerCompletionHandler {
              nudging.",
         );
 
-        match self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: Some(execution.id.clone()),
-            work_item_id: None,
-            kind: kind.to_owned(),
-            status: None,
-            title: title.to_owned(),
-            body_markdown: body,
-            resolved_at: None,
-        }) {
-            Ok(item) => {
-                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item.product_id().to_string();
-                    self.publisher
-                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
-                        .await;
-                }
-            }
-            Err(err) => {
-                // Loud on purpose: a worker's `[blocked]` marker was correctly recognized and
-                // parsed, but the attention item never landed and the
-                // failure sat at `warn` — invisible enough that root-causing
-                // the missed suppression cost a full trace reconstruction.
-                // A recognized-but-unfiled marker means the auto-nudge loop
-                // will NOT be suppressed even though the worker did the
-                // right thing and asked for help; that is exactly the
-                // failure mode this whole module exists to prevent, so it
-                // gets `error` + an unmistakable prefix instead of a `warn`
-                // easily lost in routine log volume.
-                tracing::error!(
-                    execution_id = %execution.id,
-                    kind,
-                    marker_line = %signal.marker_line,
-                    ?err,
-                    "[engine-reconcile] worker escalation: RECOGNIZED marker failed to file as an \
-                     attention item — the auto-nudge loop will NOT be suppressed for this execution; \
-                     the marker is otherwise lost until a human reads the transcript by hand",
-                );
-            }
+        if let Err(err) = self.file_execution_attention(execution, kind, title, body).await {
+            // Loud on purpose: a worker's `[blocked]` marker was correctly recognized and
+            // parsed, but the attention item never landed and the
+            // failure sat at `warn` — invisible enough that root-causing
+            // the missed suppression cost a full trace reconstruction.
+            // A recognized-but-unfiled marker means the auto-nudge loop
+            // will NOT be suppressed even though the worker did the
+            // right thing and asked for help; that is exactly the
+            // failure mode this whole module exists to prevent, so it
+            // gets `error` + an unmistakable prefix instead of a `warn`
+            // easily lost in routine log volume.
+            tracing::error!(
+                execution_id = %execution.id,
+                kind,
+                marker_line = %signal.marker_line,
+                ?err,
+                "[engine-reconcile] worker escalation: RECOGNIZED marker failed to file as an \
+                 attention item — the auto-nudge loop will NOT be suppressed for this execution; \
+                 the marker is otherwise lost until a human reads the transcript by hand",
+            );
         }
         true
     }
@@ -502,30 +484,15 @@ impl WorkerCompletionHandler {
              vanishing.",
         );
 
-        match self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: Some(execution.id.clone()),
-            work_item_id: None,
-            kind: kind.to_owned(),
-            status: None,
-            title: "Worker deferred scope".to_owned(),
-            body_markdown: body,
-            resolved_at: None,
-        }) {
-            Ok(item) => {
-                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item.product_id().to_string();
-                    self.publisher
-                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
-                        .await;
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "deferred-scope: failed to file attention item (non-fatal)",
-                );
-            }
+        if let Err(err) = self
+            .file_execution_attention(execution, kind, "Worker deferred scope", body)
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "deferred-scope: failed to file attention item (non-fatal)",
+            );
         }
         true
     }
@@ -568,30 +535,20 @@ impl WorkerCompletionHandler {
             error_text = staged.error_text,
         );
 
-        match self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: Some(execution.id.clone()),
-            work_item_id: None,
-            kind: crate::proposal_channel_error::PROPOSAL_CHANNEL_ERROR_ATTENTION_KIND.to_owned(),
-            status: None,
-            title: "Worker's proposal submission failed".to_owned(),
-            body_markdown: body,
-            resolved_at: None,
-        }) {
-            Ok(item) => {
-                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item.product_id().to_string();
-                    self.publisher
-                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
-                        .await;
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "proposal_channel_error: failed to file attention item (non-fatal)",
-                );
-            }
+        if let Err(err) = self
+            .file_execution_attention(
+                execution,
+                crate::proposal_channel_error::PROPOSAL_CHANNEL_ERROR_ATTENTION_KIND,
+                "Worker's proposal submission failed",
+                body,
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "proposal_channel_error: failed to file attention item (non-fatal)",
+            );
         }
     }
 
