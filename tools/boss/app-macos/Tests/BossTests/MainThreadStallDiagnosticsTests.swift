@@ -183,6 +183,75 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertFalse(frame.contains(String(repeating: "X", count: 31)))
     }
 
+    // MARK: - Idle-event-loop false-positive filtering
+
+    func testIsIdleEventLoopStackTrueForBareSystemLeaf() {
+        // The exact shape that produced the false-stall flood: leaf is
+        // the Mach message wait, and every frame is a system image — no
+        // app code anywhere on the stack.
+        let frames = [
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 0, image: "libsystem_kernel.dylib", address: 1, symbol: "mach_msg_trap", offset: 0
+            ),
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 1, image: "AppKit", address: 2, symbol: "_nextEventMatchingMask", offset: 0
+            ),
+        ]
+        XCTAssertTrue(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: "Boss"))
+    }
+
+    func testIsIdleEventLoopStackFalseWhenAppFrameOnStack() {
+        // Same idle leaf, but the app's own image appears further up the
+        // stack (e.g. a run-loop-observer callback) — a real workload,
+        // not a bare idle wait, so this must not be filtered.
+        let frames = [
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 0, image: "libsystem_kernel.dylib", address: 1, symbol: "mach_msg_trap", offset: 0
+            ),
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 1, image: "Boss", address: 2, symbol: "someAppFunction", offset: 0
+            ),
+        ]
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: "Boss"))
+    }
+
+    func testIsIdleEventLoopStackFalseForGenuineAppHangLeaf() {
+        // A real hang: the leaf is in-app code, not the idle wait.
+        let frames = [
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 0, image: "Boss", address: 1, symbol: "expensiveLayoutPass", offset: 0
+            ),
+        ]
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: "Boss"))
+    }
+
+    func testIsIdleEventLoopStackFalseForEmptyBacktrace() {
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack([], appImage: "Boss"))
+    }
+
+    func testIsIdleEventLoopStackIgnoresAppFrameCheckWhenImageUnknown() {
+        // No app image to compare against (e.g. under `swift test`) —
+        // fall back to the leaf-symbol check alone.
+        let frames = [
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 0, image: "libsystem_kernel.dylib", address: 1, symbol: "mach_msg", offset: 0
+            ),
+        ]
+        XCTAssertTrue(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: nil))
+    }
+
+    func testFormatMapsSymbolicatedFramesToRenderedStrings() {
+        let frames = [
+            MainThreadBacktrace.SymbolicatedFrame(
+                index: 0, image: "Boss", address: 0x10, symbol: "foo", offset: 4
+            ),
+        ]
+        let rendered = MainThreadBacktrace.format(frames)
+        XCTAssertEqual(rendered, [
+            MainThreadBacktrace.formatFrame(index: 0, image: "Boss", address: 0x10, symbol: "foo", offset: 4),
+        ])
+    }
+
     // MARK: - Frame-drop tally
 
     func testFrameTallyComputesDrops() {
