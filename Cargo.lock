@@ -756,6 +756,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-timer-wheel"
+version = "0.1.0"
+dependencies = [
+ "boss-event-bus",
+ "tokio",
+]
+
+[[package]]
 name = "boss-transcript-markdown"
 version = "0.1.0"
 dependencies = [
