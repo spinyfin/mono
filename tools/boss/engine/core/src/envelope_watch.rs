@@ -402,17 +402,20 @@ pub fn spawn_timer_subscriber(
     })
 }
 
-/// Reconcile the timer-wheel against currently-live worker state: schedule
-/// (or reschedule — idempotent, see [`TimerWheel::schedule_after`]) a
+/// Reconcile the timer-wheel against currently-live worker state: schedule a
 /// deadline for every currently-live `Working` slot whose work item has an
-/// envelope, timed to elapse when that execution's envelope does, and cancel
-/// the deadline for any id in `scheduled_ids` that is no longer a candidate
-/// (finished, reaped, or its slot otherwise left `Working`) so the wheel
-/// never accumulates deadlines for executions that are done. `scheduled_ids`
-/// is updated in place to the new live set. Slots with no envelope, no
-/// `started_at`, or that are already terminal are skipped exactly like
-/// [`evaluate_slot`] would skip them; there's nothing to schedule for a slot
-/// that will never signal.
+/// envelope and that isn't already in `scheduled_ids` (its remaining time is
+/// recomputed from `started_epoch` each pass, so an already-scheduled slot's
+/// deadline hasn't meaningfully changed — skipping it avoids pushing a
+/// redundant entry onto the timer wheel's heap every interval), timed to
+/// elapse when that execution's envelope does, and cancel the deadline for
+/// any id in `scheduled_ids` that is no longer a candidate (finished, reaped,
+/// or its slot otherwise left `Working`) so the wheel never accumulates
+/// deadlines for executions that are done. `scheduled_ids` is updated in
+/// place to the new live set. Slots with no envelope, no `started_at`, or
+/// that are already terminal are skipped exactly like [`evaluate_slot`]
+/// would skip them; there's nothing to schedule for a slot that will never
+/// signal.
 fn reconcile_envelope_deadlines(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -446,9 +449,11 @@ fn reconcile_envelope_deadlines(
         let Some(envelope_secs) = thresholds.for_effort(effort) else {
             continue;
         };
-        let elapsed_secs = (now - started_epoch).max(0);
-        let remaining_secs = (envelope_secs - elapsed_secs).max(0) as u64;
-        timer_wheel.schedule_after(execution_id.clone(), Duration::from_secs(remaining_secs));
+        if !scheduled_ids.contains(&execution_id) {
+            let elapsed_secs = (now - started_epoch).max(0);
+            let remaining_secs = (envelope_secs - elapsed_secs).max(0) as u64;
+            timer_wheel.schedule_after(execution_id.clone(), Duration::from_secs(remaining_secs));
+        }
         current_ids.insert(execution_id);
     }
 
@@ -458,7 +463,7 @@ fn reconcile_envelope_deadlines(
     *scheduled_ids = current_ids;
 }
 
-/// Handle one `Timer{deadline_id}` event from [`schedule_envelope_deadlines`]:
+/// Handle one `Timer{deadline_id}` event from [`reconcile_envelope_deadlines`]:
 /// `deadline_id` is an execution id, so look up that slot's current live
 /// state (it may have gone terminal or been released since scheduling — in
 /// which case there's nothing to check) and run the identical single-slot
@@ -876,11 +881,11 @@ mod tests {
         assert_eq!(overrun_items(&db, &execution_id), 1, "still exactly one overrun item");
     }
 
-    /// The steady-state gap the high-severity finding identified: a slot
-    /// that starts `Working` *after* the subscriber's initial reconcile
-    /// pass — the overwhelming majority of executions in a long-running
-    /// engine — must still get a timer-wheel deadline, via the periodic
-    /// `reconcile_interval` tick, without waiting for a subscriber restart.
+    /// A slot that starts `Working` *after* the subscriber's initial
+    /// reconcile pass — the overwhelming majority of executions in a
+    /// long-running engine — must still get a timer-wheel deadline, via
+    /// the periodic `reconcile_interval` tick, without waiting for a
+    /// subscriber restart.
     /// This spawns the subscriber against an EMPTY registry (so its initial
     /// pass schedules nothing), then registers an over-envelope slot and
     /// asserts the fast path still files the overrun item, well inside the
