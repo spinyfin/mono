@@ -1506,3 +1506,61 @@ exclude_files = ["testdata/**"]
     let check = checks.get("format/oxc").expect("check exists");
     assert_eq!(check.exclude_patterns, vec!["testdata/**".to_owned()]);
 }
+
+#[test]
+fn invalid_glob_in_global_exclude_produces_diagnostic() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["[invalid-glob"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("invalid glob pattern") && d.message.contains("exclude")),
+        "expected diagnostic about invalid glob in global exclude; got {diagnostics:?}"
+    );
+    // No patterns should have been added.
+    assert!(checks.global_exclude_patterns().is_empty());
+}
+
+#[test]
+fn invalid_glob_in_per_check_exclude_produces_diagnostic_and_skips_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude = ["[invalid-glob"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/file.ts")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("invalid glob pattern") && d.message.contains("format/oxc")),
+        "expected diagnostic about invalid glob for check; got {diagnostics:?}"
+    );
+    // The check itself should be skipped (not added to resolved set).
+    assert!(
+        checks.get("format/oxc").is_none(),
+        "check with invalid exclude glob should be absent"
+    );
+}

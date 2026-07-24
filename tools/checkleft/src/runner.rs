@@ -1118,13 +1118,10 @@ impl Runner {
                     {
                         effective_policy.preserve_finding_severity = true;
                     }
-                    // An invalid exclude glob fails matcher construction; fall back to a
-                    // no-op matcher (excludes nothing) so a malformed pattern never
-                    // crashes the whole run — config validation surfaces it elsewhere.
-                    let exclusion_matcher = ExclusionMatcher::new(&effective_exclude_patterns).unwrap_or_else(|err| {
-                        tracing::warn!(check_id = %check.id, error = %err, "invalid exclude glob; treating as no exclusions");
-                        ExclusionMatcher::default()
-                    });
+                    // All patterns are validated during config resolution, so this
+                    // should never fail; the expect makes any regression immediately visible.
+                    let exclusion_matcher = ExclusionMatcher::new(&effective_exclude_patterns)
+                        .expect("glob patterns pre-validated during config resolution");
                     ScheduledCheckRun {
                         configured_check_id: check.id.clone(),
                         source_path: check.source_path.clone(),

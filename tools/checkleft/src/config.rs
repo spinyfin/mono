@@ -599,7 +599,18 @@ fn parse_global_exclude_patterns(
             Some("Add at least one glob pattern, or remove the `exclude` key entirely.".to_owned()),
         ));
     }
-    Ok(normalize_exclude_patterns(patterns, config_dir))
+    let normalized = normalize_exclude_patterns(patterns, config_dir);
+    if let Err(err) = ExclusionMatcher::new(&normalized) {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("invalid glob pattern in top-level `exclude`: {err}"),
+            None,
+            None,
+            Some("Fix the invalid glob pattern in the `exclude` list.".to_owned()),
+        ));
+    }
+    Ok(normalized)
 }
 
 /// Parse and validate per-check exclude patterns from a parsed check entry, returning
@@ -632,7 +643,20 @@ fn parse_per_check_exclude_patterns(
         .map(|p| normalize_exclude_patterns(p, config_dir))
         .unwrap_or_default();
     let legacy_patterns = extract_legacy_config_excludes(config, config_dir);
-    Ok([framework_patterns, legacy_patterns].concat())
+    let all = [framework_patterns, legacy_patterns].concat();
+    if let Err(err) = ExclusionMatcher::new(&all) {
+        return Err(config_file_diagnostic(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            format!("invalid glob pattern in `exclude` for check `{check_id}`: {err}"),
+            None,
+            None,
+            Some(format!(
+                "Fix the invalid glob pattern in the `exclude` list for check `{check_id}`."
+            )),
+        ));
+    }
+    Ok(all)
 }
 
 fn parse_checks_file(path: &Path, relative_path: &Path) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
@@ -1079,6 +1103,12 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 external_checks_file.source_label
             );
         }
+        if let Err(err) = ExclusionMatcher::new(patterns) {
+            bail!(
+                "invalid glob pattern in top-level `exclude` in {}: {err}",
+                external_checks_file.source_label
+            );
+        }
         resolved.global_exclude_patterns.extend(patterns.iter().cloned());
     }
 
@@ -1123,9 +1153,23 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             }
             let mut all = patterns.clone();
             all.extend(extract_legacy_config_excludes(&check.config, Path::new("")));
+            if let Err(err) = ExclusionMatcher::new(&all) {
+                bail!(
+                    "invalid glob pattern in `exclude` for check `{configured_id}` in {}: {err}",
+                    external_checks_file.source_label
+                );
+            }
             all
         } else {
-            extract_legacy_config_excludes(&check.config, Path::new(""))
+            let patterns = extract_legacy_config_excludes(&check.config, Path::new(""));
+            if let Err(err) = ExclusionMatcher::new(&patterns) {
+                bail!(
+                    "invalid glob pattern in legacy `config.exclude_files`/`config.exclude_globs` \
+                     for check `{configured_id}` in {}: {err}",
+                    external_checks_file.source_label
+                );
+            }
+            patterns
         };
         resolved.upsert(CheckConfig {
             check: check_name,
