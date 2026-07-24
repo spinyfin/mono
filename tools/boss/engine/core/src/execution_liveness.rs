@@ -176,33 +176,34 @@ pub fn execution_workspace_dir_missing(execution: &WorkExecution) -> bool {
 /// this is called.
 pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExecution, death_reason: &str) {
     let automation_id = &execution.work_item_id;
-    let (outcome, produced_task_id, detail) = match work_db.find_most_recent_open_task_for_automation(automation_id) {
-        Ok(Some(task)) => {
-            let detail = format!(
-                "produced task {} (recovered after pane death before Stop: {death_reason})",
-                task.short_label()
-            );
-            (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
-        }
-        Ok(None) => (
-            AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-            None,
-            format!("no task was produced (pane died before Stop: {death_reason})"),
-        ),
-        Err(err) => {
-            tracing::warn!(
-                execution_id = %execution.id,
-                automation_id = %automation_id,
-                error = %format!("{err:#}"),
-                "dead-triage reconcile: open-task lookup failed; recording failed_gave_up",
-            );
-            (
+    let (outcome, produced_task_id, detail) =
+        match work_db.find_most_recent_open_task_for_automation(automation_id, execution.created_epoch()) {
+            Ok(Some(task)) => {
+                let detail = format!(
+                    "produced task {} (recovered after pane death before Stop: {death_reason})",
+                    task.short_label()
+                );
+                (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
+            }
+            Ok(None) => (
                 AUTOMATION_OUTCOME_FAILED_GAVE_UP,
                 None,
                 format!("no task was produced (pane died before Stop: {death_reason})"),
-            )
-        }
-    };
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    automation_id = %automation_id,
+                    error = %format!("{err:#}"),
+                    "dead-triage reconcile: open-task lookup failed; recording failed_gave_up",
+                );
+                (
+                    AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                    None,
+                    format!("no task was produced (pane died before Stop: {death_reason})"),
+                )
+            }
+        };
 
     match work_db.finalize_automation_triage_run(&execution.id, outcome, produced_task_id.as_deref(), Some(&detail)) {
         Ok(true) => {}

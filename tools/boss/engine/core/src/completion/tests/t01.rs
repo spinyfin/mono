@@ -232,6 +232,137 @@ async fn on_stop_finalizes_triage_skip_when_final_message_lands_after_a_flush_ra
     );
 }
 
+/// Writes a no-marker final message to `execution_id`'s transcript: no
+/// `automation: task`/`automation: skip` marker, and no "nothing to do"
+/// language, so `finalize_automation_triage` lands on
+/// `TriageDecision::NoDecision` with `recover_skip_reason` unable to fire.
+fn write_no_marker_transcript(workspace: &Path, execution_id: &str) -> std::path::PathBuf {
+    let transcript_path = workspace.join(format!("transcript-{execution_id}.jsonl"));
+    let mut content = String::new();
+    content.push_str(&format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": "triage this repo for dead code"}]}
+        })
+    ));
+    content.push_str(&format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Investigated the repo for dead code \
+                candidates and made partial progress; ran out of context before finishing."}]}
+        })
+    ));
+    std::fs::write(&transcript_path, content.as_bytes()).unwrap();
+    transcript_path
+}
+
+#[tokio::test]
+async fn on_stop_excludes_earlier_run_task_and_records_failed_will_retry() {
+    // Pins the behaviour change the `not_before_epoch` bound exists for:
+    // a triage run that emits no marker and creates no task of its own,
+    // for an automation that already has an open task left by an
+    // *earlier* run, must NOT adopt that older task as its own — it must
+    // record `failed_will_retry`, not `produced_task`.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());
+
+    let earlier_task = db
+        .create_automation_task(&automation_id, "from an earlier triage run", None, &[], &[])
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET created_at = '100' WHERE id = ?1",
+            rusqlite::params![earlier_task.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = '200' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+    }
+
+    let transcript_path = write_no_marker_transcript(workspace.path(), &execution_id);
+    db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => {
+            assert_eq!(outcome, AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+        }
+        other => panic!("expected failed_will_retry, got {other:?}"),
+    }
+
+    let run = db
+        .automation_run_for_triage_execution(&execution_id)
+        .unwrap()
+        .expect("automation run row should exist");
+    assert_eq!(run.outcome, AUTOMATION_OUTCOME_FAILED_WILL_RETRY);
+    assert!(
+        run.produced_task_id.is_none(),
+        "must not adopt the earlier run's task: {:?}",
+        run.produced_task_id
+    );
+}
+
+#[tokio::test]
+async fn on_stop_recovers_task_created_by_this_run_as_produced_task() {
+    // Companion case pinning the other side of the `not_before_epoch`
+    // boundary: a task created no earlier than the execution being
+    // finalized is still recovered as `produced_task` via marker-recovery.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = '100' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+    }
+    let this_run_task = db
+        .create_automation_task(&automation_id, "created by this run", None, &[], &[])
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET created_at = '200' WHERE id = ?1",
+            rusqlite::params![this_run_task.id],
+        )
+        .unwrap();
+    }
+
+    let transcript_path = write_no_marker_transcript(workspace.path(), &execution_id);
+    db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => {
+            assert_eq!(outcome, AUTOMATION_OUTCOME_PRODUCED_TASK)
+        }
+        other => panic!("expected produced_task, got {other:?}"),
+    }
+
+    let run = db
+        .automation_run_for_triage_execution(&execution_id)
+        .unwrap()
+        .expect("automation run row should exist");
+    assert_eq!(run.outcome, AUTOMATION_OUTCOME_PRODUCED_TASK);
+    assert_eq!(run.produced_task_id.as_deref(), Some(this_run_task.id.as_str()));
+}
+
 #[tokio::test]
 async fn on_stop_finalizes_answer_agent_with_no_reply_as_failed_and_answered() {
     // Regression test for the "stranded running run" edge case: the
