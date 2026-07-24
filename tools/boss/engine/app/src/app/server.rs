@@ -1828,6 +1828,9 @@ async fn serve_scoped(
     // live-state registry) to close that gap. Runs every 60s and fires on
     // boot so a pool wedged before a restart self-heals without an
     // operator restart.
+    let pool_claim_execution_terminal_events = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
     let _pool_claim_sweep_handle = boss_engine_runtime::pool_claim_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
@@ -1835,6 +1838,7 @@ async fn serve_scoped(
         server_state.dispatch_events.clone(),
         boss_engine_runtime::pool_claim_sweep::DEFAULT_INTERVAL,
         server_state.clone(),
+        pool_claim_execution_terminal_events,
     );
 
     // Periodic terminal-work reconciler: reaps a LIVE worker pane whose
@@ -1852,6 +1856,9 @@ async fn serve_scoped(
     // outright via the shared `teardown_registry` mark (two-pass
     // confirmation on top of that, for anything unmarked), so an active
     // worker is never reaped. Runs every 60s.
+    let terminal_work_execution_terminal_events = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
     let _terminal_work_sweep_handle = boss_engine_runtime::terminal_work_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
@@ -1860,6 +1867,7 @@ async fn serve_scoped(
         server_state.dispatch_events.clone(),
         server_state.teardown_registry.clone(),
         boss_engine_runtime::terminal_work_sweep::DEFAULT_INTERVAL,
+        terminal_work_execution_terminal_events,
     );
 
     // Periodic husk-session reconciler: tmux is the physical inventory
