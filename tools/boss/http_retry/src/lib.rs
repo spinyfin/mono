@@ -76,6 +76,16 @@ pub fn jitter(delay: Duration) -> Duration {
 /// its caller's `CallConfig::timeout`, so one client serves callers with
 /// wildly different budgets (a 5 s live-status one-liner and a 180 s
 /// planning call).
+///
+/// Redirects are never followed. Every endpoint these callers hit is a
+/// direct API POST that has no legitimate reason to redirect; silently
+/// following one risks two things a caller can't see once it's happened:
+/// leaking the `x-api-token` / auth header to whatever host the redirect
+/// points at (reqwest only strips *sensitive* headers like `Authorization`
+/// on a cross-origin hop, not caller-defined ones), and treating a 200
+/// response from an unrelated page as if it came from the real API. A
+/// caller sees the 3xx directly and classifies it as an explicit error
+/// instead.
 pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -85,6 +95,7 @@ pub fn http_client() -> &'static reqwest::Client {
         // set — that's fine, we ignore it.
         let _ = rustls::crypto::ring::default_provider().install_default();
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest::Client::build should not fail with default config")
     })

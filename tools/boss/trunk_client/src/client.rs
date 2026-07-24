@@ -106,6 +106,14 @@ impl RawFailure {
                 TrunkError::Auth(format!("trunk returned {status}: {body}"))
             }
             RawFailure::Api { status: 404, body, .. } => TrunkError::NotFound(body),
+            // The client no longer follows redirects (see
+            // `boss_http_retry::http_client`), so a 3xx now arrives here
+            // instead of being silently followed to whatever page it
+            // points at and having that unrelated page's response mistaken
+            // for Trunk's own.
+            RawFailure::Api { status, body, .. } if (300..400).contains(&status) => {
+                TrunkError::Redirected(format!("status {status}: {body}"))
+            }
             // 429/5xx after retries are exhausted, and any other
             // unclassified non-2xx: the queue API isn't behaving.
             RawFailure::Api { status, body, .. } => {
@@ -153,14 +161,36 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// One round trip: POST `body` to `url` and return the decoded JSON, or a
-/// [`RawFailure`] classifying what went wrong.
+/// A 2xx response, not yet decoded. Kept as raw text (rather than decoded
+/// eagerly inside [`call_once`]) so the two downstream consumers can apply
+/// different rules: [`TrunkClient::call`] needs the body to be Trunk's
+/// documented JSON; [`TrunkClient::call_unit`] doesn't look at the body at
+/// all, so it never has a reason to fail on one.
+struct RawResponse {
+    status: u16,
+    content_type: String,
+    body_text: String,
+}
+
+/// First `max_chars` characters of `body`, with a trailing ellipsis if
+/// truncated. Keeps a spoofed HTML/error page useful as a diagnostic
+/// without dumping the whole thing into an error message or log line.
+fn snippet(body: &str, max_chars: usize) -> String {
+    let mut truncated: String = body.chars().take(max_chars).collect();
+    if body.chars().count() > max_chars {
+        truncated.push('…');
+    }
+    truncated
+}
+
+/// One round trip: POST `body` to `url` and return the raw 2xx response, or
+/// a [`RawFailure`] classifying what went wrong.
 async fn call_once<T: Serialize + ?Sized>(
     token: &str,
     url: &str,
     body: &T,
     timeout: Duration,
-) -> Result<Value, RawFailure> {
+) -> Result<RawResponse, RawFailure> {
     let response = boss_http_retry::http_client()
         .post(url)
         .header("x-api-token", token)
@@ -186,21 +216,24 @@ async fn call_once<T: Serialize + ?Sized>(
         });
     }
 
-    // Read as text first rather than `response.json()` directly: the three
-    // unit-returning verbs (submit/cancel/restart) discard the body, and
-    // Trunk's success response for those may be a 2xx with an empty body
-    // (e.g. `Content-Length: 0`, or a 204) rather than the documented bare
-    // `{}`. Treating that as a decode failure would surface `Transport` —
-    // exactly the variant a caller is most likely to retry — for a request
-    // Trunk actually accepted, risking a double-submit.
+    // Read the Content-Type before consuming `response` with `.text()` —
+    // it's the one signal available on a 2xx that the body might be a
+    // spoofed HTML/plaintext page rather than Trunk's real JSON response.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<none>")
+        .to_owned();
     let body_text = response
         .text()
         .await
         .map_err(|err| RawFailure::Decode(err.to_string()))?;
-    if body_text.trim().is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_str(&body_text).map_err(|err| RawFailure::Decode(err.to_string()))
+    Ok(RawResponse {
+        status: status.as_u16(),
+        content_type,
+        body_text,
+    })
 }
 
 /// Send `body` to `url`, retrying transient failures per `config.retry`.
@@ -209,12 +242,12 @@ async fn send_with_retry<T: Serialize + ?Sized>(
     url: &str,
     body: &T,
     config: &CallConfig,
-) -> Result<Value, TrunkError> {
+) -> Result<RawResponse, TrunkError> {
     let token = token_provider.token()?;
     let attempts = config.retry.max_attempts.max(1);
     for attempt in 1..=attempts {
         match call_once(token.expose_secret(), url, body, config.timeout).await {
-            Ok(value) => return Ok(value),
+            Ok(raw) => return Ok(raw),
             Err(err) if err.is_retryable() && attempt < attempts => {
                 let delay = retry_delay(&err, &config.retry, attempt);
                 tracing::warn!(
@@ -232,6 +265,28 @@ async fn send_with_retry<T: Serialize + ?Sized>(
         }
     }
     unreachable!("retry loop always returns on the final attempt")
+}
+
+/// Decode a raw 2xx body as JSON, for endpoints whose caller needs the
+/// parsed value. An empty body decodes to `Value::Null` — Trunk's success
+/// response for a couple of these endpoints has been observed as a 2xx
+/// with an empty body rather than the documented bare `{}`. A non-empty
+/// body that isn't JSON at all is [`TrunkError::NonJsonResponse`], carrying
+/// enough of the response (status, content type, a truncated snippet) to
+/// diagnose — distinct from a body that *is* JSON but the wrong shape,
+/// which stays a plain [`TrunkError::Decode`].
+fn decode_json(path: &str, raw: &RawResponse) -> Result<Value, TrunkError> {
+    if raw.body_text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&raw.body_text).map_err(|err| {
+        TrunkError::NonJsonResponse(format!(
+            "{path}: status {status}, content-type \"{content_type}\": {body} ({err})",
+            status = raw.status,
+            content_type = raw.content_type,
+            body = snippet(&raw.body_text, 200),
+        ))
+    })
 }
 
 // ── The client ────────────────────────────────────────────────────────────────
@@ -260,15 +315,45 @@ impl TrunkClient {
         Resp: DeserializeOwned,
     {
         let url = self.url(path);
-        let value = send_with_retry(self.token_provider.as_ref(), &url, request, &self.config).await?;
+        let raw = send_with_retry(self.token_provider.as_ref(), &url, request, &self.config).await?;
+        let value = decode_json(path, &raw)?;
         serde_json::from_value(value)
             .map_err(|err| TrunkError::Decode(format!("failed to decode {path} response: {err}")))
     }
 
-    /// `POST /v1/submitPullRequest` — enqueue a PR. Success is a bare `{}`.
-    pub async fn submit_pull_request(&self, request: &SubmitPullRequestRequest) -> Result<(), TrunkError> {
-        let _: Value = self.call("submitPullRequest", request).await?;
+    /// Send `request` to `path` and treat any 2xx as success without
+    /// looking at the body — used by the three fire-and-forget verbs
+    /// (`submitPullRequest`, `cancelPullRequest`,
+    /// `restartTestsOnPullRequest`) whose caller only cares whether Trunk
+    /// accepted the request, never the payload it answered with.
+    ///
+    /// This matters beyond convenience: a real, authenticated submit
+    /// (flunge#1102) was rejected client-side — its standing merge-queue
+    /// intent rolled back, and the Merging-lane state never written —
+    /// because the 2xx response body didn't parse as JSON, even though
+    /// Trunk had already accepted the PR and went on to merge it. The
+    /// token and enrollment were fine; only the response body was
+    /// unexpected. Requiring these three endpoints' bodies to parse as
+    /// JSON creates a false-negative surface with no corresponding safety
+    /// benefit, since the parsed value is discarded either way — whatever
+    /// shape a genuinely-successful response takes, this now recognizes it
+    /// without needing to match it. A redirect masquerading as a 2xx is
+    /// still caught: the client no longer follows redirects (see
+    /// `boss_http_retry::http_client`), so one surfaces as an explicit
+    /// [`TrunkError::Redirected`] via the normal non-2xx path instead of
+    /// being silently accepted here.
+    async fn call_unit<Req>(&self, path: &str, request: &Req) -> Result<(), TrunkError>
+    where
+        Req: Serialize + ?Sized,
+    {
+        let url = self.url(path);
+        send_with_retry(self.token_provider.as_ref(), &url, request, &self.config).await?;
         Ok(())
+    }
+
+    /// `POST /v1/submitPullRequest` — enqueue a PR. Success is any 2xx.
+    pub async fn submit_pull_request(&self, request: &SubmitPullRequestRequest) -> Result<(), TrunkError> {
+        self.call_unit("submitPullRequest", request).await
     }
 
     /// `POST /v1/getSubmittedPullRequest` — the queue's view of one PR.
@@ -292,14 +377,12 @@ impl TrunkClient {
 
     /// `POST /v1/cancelPullRequest` — dequeue a PR.
     pub async fn cancel_pull_request(&self, request: &TrunkPrLookup) -> Result<(), TrunkError> {
-        let _: Value = self.call("cancelPullRequest", request).await?;
-        Ok(())
+        self.call_unit("cancelPullRequest", request).await
     }
 
     /// `POST /v1/restartTestsOnPullRequest` — re-test a still-live entry.
     pub async fn restart_tests_on_pull_request(&self, request: &TrunkPrLookup) -> Result<(), TrunkError> {
-        let _: Value = self.call("restartTestsOnPullRequest", request).await?;
-        Ok(())
+        self.call_unit("restartTestsOnPullRequest", request).await
     }
 }
 
@@ -746,6 +829,90 @@ mod tests {
             .submit_pull_request(&request)
             .await
             .expect("a 2xx with an empty body is success, not a decode/transport error");
+    }
+
+    #[tokio::test]
+    async fn submit_pull_request_succeeds_on_a_2xx_with_a_non_json_body() {
+        // Regression test for flunge#1102: Trunk answered `submitPullRequest`
+        // with a 2xx whose body wasn't JSON, and the PR was still queued and
+        // merged. The old behavior rejected this client-side (rolling back
+        // the merge intent and leaving the Merging lane empty) even though
+        // Trunk had accepted the request.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(b"<html>not json</html>".to_vec(), "text/html"))
+            .mount(&server)
+            .await;
+
+        let request = SubmitPullRequestRequest::builder()
+            .repo(TrunkRepoRef::new("github.com", "brianduff", "flunge"))
+            .pr(TrunkPrRef::new(978))
+            .target_branch("main")
+            .build();
+        client(server.uri(), RetryPolicy::NONE)
+            .submit_pull_request(&request)
+            .await
+            .expect("a 2xx is success regardless of body shape for a fire-and-forget verb");
+    }
+
+    #[tokio::test]
+    async fn get_queue_surfaces_a_non_json_2xx_body_as_a_diagnosable_error() {
+        // Endpoints whose caller needs the parsed value must NOT get the
+        // same free pass as the fire-and-forget verbs: a non-JSON body here
+        // is still an error, but a distinct, diagnosable one instead of a
+        // bare serde parse error.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/getQueue"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(b"<html>login required</html>".to_vec(), "text/html"))
+            .mount(&server)
+            .await;
+
+        let request = GetQueueRequest::new(TrunkRepoRef::new("github.com", "brianduff", "flunge"), "main");
+        let err = client(server.uri(), RetryPolicy::NONE)
+            .get_queue(&request)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrunkError::NonJsonResponse(_)), "got {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("status 200"), "message missing status: {message}");
+        assert!(message.contains("text/html"), "message missing content-type: {message}");
+        assert!(
+            message.contains("login required"),
+            "message missing body snippet: {message}"
+        );
+        assert!(
+            message.contains("boss engine trunk status"),
+            "message missing remediation hint: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_3xx_response_is_not_followed_and_surfaces_as_redirected() {
+        // The shared client no longer follows redirects (see
+        // `boss_http_retry::http_client`) — a redirect landing on an
+        // unrelated page that then answers 200 is one way a non-JSON 2xx
+        // could arrive. Asserting the 3xx itself is what confirms the
+        // client can't be fooled that way anymore.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/getQueue"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "https://example.invalid/login")
+                    .set_body_string("redirecting…"),
+            )
+            .mount(&server)
+            .await;
+
+        let request = GetQueueRequest::new(TrunkRepoRef::new("github.com", "brianduff", "flunge"), "main");
+        let err = client(server.uri(), RetryPolicy::NONE)
+            .get_queue(&request)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrunkError::Redirected(_)), "got {err:?}");
+        assert!(err.to_string().contains("status 302"), "got {err}");
     }
 
     #[test]
