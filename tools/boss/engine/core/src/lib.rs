@@ -18,7 +18,7 @@ pub mod ci_watch;
 pub use boss_claude_client as claude_client;
 pub mod cli;
 pub mod comment_classifier;
-pub mod comments_anchor;
+pub use boss_comment_anchor as comments_anchor;
 pub mod completion;
 pub mod config;
 pub use boss_conflict_diagnosis as conflict_diagnosis;

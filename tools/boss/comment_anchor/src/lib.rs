@@ -22,8 +22,8 @@
 //! text, matching how the macOS renderer indexes its `AttributedString`.
 //!
 //! The resolver is a pure function with no I/O so it is exercised directly by
-//! unit tests here and reused by the cross-doc migration in
-//! [`crate::work`].
+//! unit tests here and reused by the cross-doc migration in the engine's
+//! `work` module.
 
 use std::collections::HashMap;
 
@@ -35,7 +35,8 @@ pub const DEFAULT_FUZZY_SCORE_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_FUZZY_SECOND_BEST_THRESHOLD: f64 = 0.7;
 
 /// Tunable fuzzy-anchoring thresholds. Read once per resolve pass from the
-/// engine env surface, mirroring [`crate::config`]'s `*_from_env` style:
+/// engine env surface, mirroring the engine `config` module's `*_from_env`
+/// style:
 ///
 /// - `BOSS_COMMENT_FUZZY_SCORE` → [`score_threshold`](Self::score_threshold)
 /// - `BOSS_COMMENT_FUZZY_SECOND_BEST` →

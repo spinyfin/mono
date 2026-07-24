@@ -310,6 +310,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-comment-anchor"
+version = "0.1.0"
+dependencies = [
+ "boss-protocol",
+]
+
+[[package]]
 name = "boss-conflict-diagnosis"
 version = "0.1.0"
 dependencies = [
@@ -378,6 +385,7 @@ dependencies = [
  "boss-ci-log-reader",
  "boss-claude-client",
  "boss-client",
+ "boss-comment-anchor",
  "boss-conflict-diagnosis",
  "boss-deterministic-resolvers",
  "boss-dispatch-events",
