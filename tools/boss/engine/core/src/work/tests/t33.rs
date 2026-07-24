@@ -151,6 +151,60 @@ fn list_abandoned_excludes_closed_task_statuses() {
 }
 
 #[test]
+fn list_abandoned_excludes_work_item_with_a_live_execution() {
+    let db = WorkDb::open(temp_db_path("abandoned-pr-live-worker")).unwrap();
+    let (_, chore_id, _terminal_exec) = make_terminal_chore(&db, "abandoned-pr-live", "todo", GRACE_SECS + 60);
+
+    // The reconcile sweep re-enqueued a fresh execution on the same work
+    // item after the task fell back to `todo` (autostart chore) — still
+    // running when this sweep pass runs.
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:foo/bar.git")
+            .build(),
+    )
+    .unwrap();
+
+    let candidates = db
+        .list_abandoned_pushed_branch_candidates(GRACE_SECS, LOOKBACK_SECS)
+        .unwrap();
+    assert!(
+        candidates.is_empty(),
+        "a work item with a live execution must never be a candidate — opening a PR from the \
+         dead run's stale branch would strand the running worker"
+    );
+}
+
+#[test]
+fn bind_pr_to_task_from_terminal_execution_refuses_work_item_with_live_execution() {
+    let db = WorkDb::open(temp_db_path("bind-pr-live-worker")).unwrap();
+    let (_, chore_id, _) = make_terminal_chore(&db, "bind-pr-live", "todo", GRACE_SECS + 60);
+
+    // A live execution appears on the work item between the candidate
+    // query and the bind call — the bind itself must also refuse.
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:foo/bar.git")
+            .build(),
+    )
+    .unwrap();
+
+    let updated = db
+        .bind_pr_to_task_from_terminal_execution(&chore_id, "https://github.com/foo/bar/pull/7")
+        .unwrap();
+    assert!(!updated, "must not bind while a live execution exists on the work item");
+
+    let (_, pr_url) = task_status_and_pr_url(&db, &chore_id);
+    assert_eq!(pr_url, None);
+}
+
+#[test]
 fn bind_pr_to_task_from_terminal_execution_transitions_todo_task_to_in_review() {
     let db = WorkDb::open(temp_db_path("bind-pr-todo")).unwrap();
     let (_, chore_id, _) = make_terminal_chore(&db, "bind-pr-todo", "todo", GRACE_SECS + 60);

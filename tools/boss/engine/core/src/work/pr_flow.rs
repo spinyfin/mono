@@ -647,6 +647,17 @@ impl WorkDb {
     /// IS NOT NULL` mirrors the late-PR query: the absence of a workspace
     /// path means the execution never reached pane-spawn and therefore never
     /// pushed anything.
+    ///
+    /// Single-live-worker guard: excludes any work item that currently has a
+    /// LIVE execution (any non-terminal [`ExecutionStatus`]). A terminated
+    /// execution's task commonly falls back to `todo` — the dispatchable
+    /// backlog status the reconcile sweep re-enqueues for autostart chores —
+    /// so a live execution frequently exists on the same work item shortly
+    /// after the terminal one that pushed the abandoned branch. Without this
+    /// guard the sweep would open a PR from the dead run's stale branch and
+    /// flip the task to `in_review` out from under the still-running worker
+    /// — the same race [`Self::advance_pending_review_task_to_in_review`]
+    /// guards against with an equivalent `NOT EXISTS` clause.
     pub fn list_abandoned_pushed_branch_candidates(
         &self,
         grace_secs: i64,
@@ -671,6 +682,14 @@ impl WorkDb {
                AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
                AND t.status NOT IN ('done', 'archived', 'cancelled')
                AND (t.pr_url IS NULL OR t.pr_url = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions live
+                 WHERE live.work_item_id = we.work_item_id
+                   AND live.status IN (
+                     'queued', 'ready', 'waiting_dependency', 'running',
+                     'waiting_human', 'waiting_review', 'waiting_merge'
+                   )
+               )
              ORDER BY we.finished_at ASC, we.id ASC",
         ))?;
         let rows = stmt.query_map(params![grace_cutoff, lookback_cutoff], |row| {
@@ -699,8 +718,11 @@ impl WorkDb {
     /// path must never overwrite.
     ///
     /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
-    /// already closed or already carried a `pr_url` (idempotent for
-    /// concurrent sweeps).
+    /// already closed, already carried a `pr_url`, or a live execution has
+    /// appeared on the work item since the candidate query ran (idempotent
+    /// for concurrent sweeps, and a no-op guard against the same
+    /// single-live-worker race the candidate query itself excludes — see
+    /// [`Self::list_abandoned_pushed_branch_candidates`]).
     pub fn bind_pr_to_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
@@ -715,7 +737,15 @@ impl WorkDb {
              WHERE id = ?1
                AND deleted_at IS NULL
                AND status NOT IN ('done', 'archived', 'cancelled')
-               AND (pr_url IS NULL OR pr_url = '')",
+               AND (pr_url IS NULL OR pr_url = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions live
+                 WHERE live.work_item_id = ?1
+                   AND live.status IN (
+                     'queued', 'ready', 'waiting_dependency', 'running',
+                     'waiting_human', 'waiting_review', 'waiting_merge'
+                   )
+               )",
             params![work_item_id, pr_url, now],
         )?;
         Ok(rows_changed > 0)

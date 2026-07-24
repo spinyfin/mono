@@ -10,9 +10,9 @@
 //! indistinguishable from work that never started, while a complete branch
 //! sat on GitHub. Recovery was entirely manual: enumerate `boss/*` refs on
 //! GitHub, diff against existing PR head refs, create the PRs by hand, and
-//! backfill `pr_url` via the `boss task update --pr-url` escape hatch. The
-//! only reason it was caught at all was an operator noticing a frozen
-//! console pane by chance — nothing in the engine detected the state.
+//! backfill `pr_url` via the `boss task update --pr-url` escape hatch.
+//! Nothing in the engine detected the state; it surfaced only because the
+//! stalled pane happened to be seen by chance.
 //!
 //! [`crate::completion`]'s on-Stop path and the merge poller's
 //! `list_recently_terminal_executions_pending_pr_detection` late-PR sweep
@@ -48,9 +48,9 @@
 //!    bind it — this alone recovers the "PR exists but is invisible" half
 //!    of the incident, independent of whatever `tasks.status` fell to.
 //! 2. If no PR exists, attempt to create one directly via the GitHub REST
-//!    API (`POST /repos/{slug}/pulls`). The engine has never had to do this
-//!    before (only workers open PRs), but during exactly the kind of outage
-//!    this sweep exists for, a worker cannot either. Idempotent by
+//!    API (`POST /repos/{slug}/pulls`). PR creation here is engine-side
+//!    rather than worker-side, because during a PR-create outage the
+//!    worker cannot open one either. Idempotent by
 //!    construction: the branch-keyed detector in step 1 runs immediately
 //!    before every create attempt, so a PR that appears between sweep
 //!    passes (a human, a recovering worker, or a concurrent pass) is bound
@@ -68,26 +68,28 @@
 //!
 //! This sweep runs on a deliberately slow, fixed interval
 //! ([`DEFAULT_INTERVAL`]) rather than tracking a per-execution exponential
-//! backoff window: the candidate set is always small (a handful of rows at
-//! most — this is a rare failure path, not a steady-state one), so a
-//! GitHub outage costs one API round-trip per candidate per interval, not a
+//! backoff window: this is a rare failure path, not a steady-state one, and
+//! [`MAX_LOOKBACK_SECS`] plus [`CommandPrAutoCreator`]'s branch-existence
+//! precheck and cached default-branch lookup keep the steady-state
+//! candidate set small and each candidate's per-pass cost low, so a GitHub
+//! outage costs a bounded number of API round-trips per interval, not a
 //! retry storm. A failed create attempt (transient — network/5xx/429 — or
 //! permanent — auth/permissions/an unexpected validation error) never marks
 //! the execution or task row failed or gives up: both are left completely
 //! untouched, and the sweep simply tries again next pass. The only durable
-//! consequence of a failure is operator-visible: after
+//! consequence of a failure surfaces after
 //! [`ESCALATE_AFTER_CONSECUTIVE_FAILURES`] consecutive failed attempts for
 //! the same execution (tracked in-memory — reset on engine restart,
 //! matching [`crate::transient_recovery`]'s nudge-tracking precedent) an
 //! attention item is filed naming the branch, the work item, and the last
-//! error, so the row is visible in the UI instead of silently reading as
+//! error, so the row is surfaced in the UI instead of silently reading as
 //! unstarted. It resolves automatically the moment a later pass succeeds.
 //!
 //! ## Duplicate-aware by construction
 //!
-//! The incident's T3323 worker independently pushed a second branch
-//! (`…_v2`) at the same commit as a workaround for the outage. This sweep
-//! never discovers or acts on that branch: detection is scoped to exactly
+//! During the outage one worker independently pushed a second branch
+//! (`…_v2`) at the same commit as a workaround. This sweep never discovers
+//! or acts on that branch: detection is scoped to exactly
 //! the engine-supplied canonical branch name
 //! ([`crate::completion::expected_branch_name`]) derived from the
 //! execution id, never a scan of arbitrary remote branches. A duplicate
@@ -99,12 +101,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use boss_github::gh_runner::{CommandGhRunner, GhRunner, GhRunnerError};
 use boss_protocol::WorkItem;
 
 use crate::completion::{CommandPrDetector, PrDetector, PrStatus, expected_branch_name, parse_repo_slug};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
 use crate::work::{LatePrCandidate, WorkDb};
 
 /// How often the sweep runs. Deliberately slower than most reconcilers
@@ -120,11 +124,18 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// backstop of last resort, not the primary detector.
 pub const TERMINATION_GRACE_SECS: i64 = 15 * 60;
 
-/// Upper bound on how far back the candidate query looks. Purely a query
-/// cost bound, not a give-up point — see
+/// Upper bound on how far back the candidate query looks. Also bounds how
+/// long a branch that was never pushed (`AutoCreateOutcome::NothingToCreate`
+/// — a quiet skip that writes no state, so nothing else ages it out) keeps
+/// getting re-probed every pass: at [`DEFAULT_INTERVAL`] this is roughly 288
+/// passes rather than the ~2000 a 7-day window would cost. A row that is
+/// still genuinely unresolved this long after its execution finished
+/// already has an open attention item from an earlier pass (the
+/// [`ESCALATE_AFTER_CONSECUTIVE_FAILURES`] path), so this is a query-cost
+/// and probe-volume bound, not a give-up point — see
 /// [`crate::work::WorkDb::list_abandoned_pushed_branch_candidates`]'s doc
 /// comment.
-pub const MAX_LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
+pub const MAX_LOOKBACK_SECS: i64 = 24 * 60 * 60;
 
 /// Consecutive failed auto-create attempts (transient or permanent) for the
 /// same execution before the sweep files an attention item.
@@ -161,14 +172,22 @@ pub(crate) trait PrAutoCreator: Send + Sync {
 /// Production [`PrAutoCreator`], backed by the `gh` CLI via ambient `gh
 /// auth` — the same convention every other GitHub call in the engine
 /// follows (see [`crate::completion::CommandPrDetector`]).
+///
+/// `default_branch_cache` caches `repos/{slug}` lookups by repo slug across
+/// every candidate and every pass this creator serves — the default branch
+/// essentially never changes, so there is no reason to re-fetch it once per
+/// candidate per 5-minute pass (see the module-level "request volume" note
+/// this cache and [`Self::branch_ref_exists`] together address).
 struct CommandPrAutoCreator {
     gh: Arc<dyn GhRunner>,
+    default_branch_cache: AsyncMutex<HashMap<String, String>>,
 }
 
 impl CommandPrAutoCreator {
     fn new() -> Self {
         Self {
             gh: Arc::new(CommandGhRunner),
+            default_branch_cache: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -187,19 +206,59 @@ impl CommandPrAutoCreator {
             .map(str::to_owned)
     }
 
+    /// `GET /repos/{slug}/git/ref/heads/{branch}` — a single cheap call that
+    /// tells us whether the branch was ever pushed at all, before paying for
+    /// the full existing-PR-recheck + default-branch + create cascade. A
+    /// clean 404 means the branch definitely does not exist on the remote
+    /// (never pushed): the common, permanent case for a candidate whose
+    /// worker died before pushing anything, and the one this precheck exists
+    /// to make cheap. Any other error is inconclusive (could be transient),
+    /// so the caller falls through to the full path rather than guessing.
+    async fn branch_ref_exists(&self, repo_slug: &str, branch: &str) -> Result<bool, GhRunnerError> {
+        match self
+            .gh
+            .rest_get(&format!("repos/{repo_slug}/git/ref/heads/{branch}"), None)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if err.http_status == Some(404) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn default_branch(&self, repo_slug: &str) -> Result<String, GhRunnerError> {
+        if let Some(cached) = self.default_branch_cache.lock().await.get(repo_slug) {
+            return Ok(cached.clone());
+        }
         let resp = self.gh.rest_get(&format!("repos/{repo_slug}"), None).await?;
-        resp.body
+        let branch = resp
+            .body
             .get("default_branch")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
-            .ok_or_else(|| GhRunnerError::transient(format!("repos/{repo_slug} response had no default_branch field")))
+            .ok_or_else(|| {
+                GhRunnerError::transient(format!("repos/{repo_slug} response had no default_branch field"))
+            })?;
+        self.default_branch_cache
+            .lock()
+            .await
+            .insert(repo_slug.to_owned(), branch.clone());
+        Ok(branch)
     }
 }
 
 #[async_trait]
 impl PrAutoCreator for CommandPrAutoCreator {
     async fn try_create(&self, repo_slug: &str, branch: &str, title: &str, body: &str) -> AutoCreateOutcome {
+        // Cheap precheck: a branch that was never pushed has nothing to
+        // open a PR for, and costs one API call to rule out instead of the
+        // four below. An inconclusive result (network blip, unexpected
+        // status) falls through to the full path rather than being treated
+        // as a false "doesn't exist".
+        if let Ok(false) = self.branch_ref_exists(repo_slug, branch).await {
+            return AutoCreateOutcome::NothingToCreate;
+        }
+
         // Immediate pre-create recheck (race safety): a PR opened by a
         // human, a recovering worker, or a concurrent sweep pass since the
         // caller's own `PrDetector` check a moment earlier.
@@ -237,12 +296,17 @@ impl PrAutoCreator for CommandPrAutoCreator {
                 },
             },
             Err(err) => {
-                // 422 covers two distinct cases GitHub does not otherwise
-                // disambiguate: "No commits between base and head" (nothing
-                // to create — quiet skip) and "A pull request already
-                // exists for owner:branch" (the exact race the pre-create
-                // recheck above is meant to catch, closed one API call
-                // later). Tell them apart by message text.
+                // 422 covers several distinct cases GitHub does not
+                // otherwise disambiguate by status code alone: "A pull
+                // request already exists for owner:branch" (the exact race
+                // the pre-create recheck above is meant to catch, closed
+                // one API call later), "No commits between base and head"
+                // (nothing to create — quiet skip), and other validation
+                // failures (a ruleset blocking the base, an invalid head,
+                // PR creation disabled) that need a human, not a silent
+                // skip. Tell them apart by message text; anything that
+                // isn't one of the first two known-benign cases is a real
+                // failure.
                 if err.http_status == Some(422) {
                     if err.message.to_lowercase().contains("already exists") {
                         return match self.existing_pr_url(repo_slug, branch).await {
@@ -253,10 +317,25 @@ impl PrAutoCreator for CommandPrAutoCreator {
                             },
                         };
                     }
-                    return AutoCreateOutcome::NothingToCreate;
+                    if err.message.to_lowercase().contains("no commits between") {
+                        return AutoCreateOutcome::NothingToCreate;
+                    }
+                    return AutoCreateOutcome::Failed {
+                        transient: false,
+                        message: err.message,
+                    };
                 }
+                // A 404 on the create call itself (as opposed to the
+                // branch-existence precheck above) means something GitHub
+                // considers missing at create time — most often a
+                // permissions/auth problem the token can't see past (GitHub
+                // returns 404, not 403, for a repo the token cannot access).
+                // That needs a human, not a quiet skip.
                 if err.http_status == Some(404) {
-                    return AutoCreateOutcome::NothingToCreate;
+                    return AutoCreateOutcome::Failed {
+                        transient: false,
+                        message: err.message,
+                    };
                 }
                 classify_gh_error(err)
             }
@@ -297,17 +376,51 @@ pub struct AbandonedBranchPrSweepOutcome {
     pub escalated: usize,
 }
 
-impl AbandonedBranchPrSweepOutcome {
+impl SweepOutcome for AbandonedBranchPrSweepOutcome {
     fn has_activity(&self) -> bool {
         self.recovered > 0 || self.created > 0 || self.failed > 0 || self.escalated > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            recovered = self.recovered,
+            created = self.created,
+            skipped_no_commits = self.skipped_no_commits,
+            failed = self.failed,
+            escalated = self.escalated,
+            "abandoned-branch-pr sweep: pass complete",
+        );
+    }
+}
+
+/// Which of the two idempotent-bind outcomes a `try_create`/detector result
+/// produced — replaces a stringly-typed `action: &'static str` flag so the
+/// two cases can't be confused with an unrelated string comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindAction {
+    /// A PR already existed and was bound to the work item.
+    Bound,
+    /// The engine opened a new PR and bound it to the work item.
+    Created,
+}
+
+impl BindAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            BindAction::Bound => "bound",
+            BindAction::Created => "created",
+        }
     }
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
-/// firing immediately on spawn. Mirrors [`crate::transient_recovery::spawn_loop`]'s
-/// shape: the per-execution failure-count map lives inside this task's own
-/// loop (not threaded through a generic sweep-loop helper) so it survives
-/// across passes without needing `Arc<Mutex<_>>`.
+/// using the shared [`crate::sweep_loop::spawn_sweep_loop`] scaffold. The
+/// per-execution failure-count map must survive across passes so
+/// consecutive-failure escalation works; it lives in an `Arc<Mutex<_>>` the
+/// pass closure borrows each iteration, mirroring how
+/// [`crate::terminal_work_sweep::spawn_loop`] threads its own cross-pass
+/// `seen_terminal` set through the same helper — a single task ever holds
+/// the lock, so there is no real contention.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     dispatch_events: Arc<dyn DispatchEventSink>,
@@ -315,35 +428,66 @@ pub fn spawn_loop(
 ) -> tokio::task::JoinHandle<()> {
     let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
     let pr_creator: Arc<dyn PrAutoCreator> = Arc::new(CommandPrAutoCreator::new());
-    tokio::spawn(async move {
-        let mut failure_counts: HashMap<String, u32> = HashMap::new();
-        loop {
-            let outcome = run_one_pass(
+    let failure_counts: Arc<AsyncMutex<HashMap<String, u32>>> = Arc::new(AsyncMutex::new(HashMap::new()));
+    spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let pr_detector = Arc::clone(&pr_detector);
+        let pr_creator = Arc::clone(&pr_creator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let failure_counts = Arc::clone(&failure_counts);
+        async move {
+            let mut failure_counts = failure_counts.lock().await;
+            run_one_pass(
                 work_db.as_ref(),
                 pr_detector.as_ref(),
                 pr_creator.as_ref(),
                 dispatch_events.as_ref(),
                 &mut failure_counts,
             )
-            .await;
-            if outcome.has_activity() {
-                tracing::info!(
-                    recovered = outcome.recovered,
-                    created = outcome.created,
-                    skipped_no_commits = outcome.skipped_no_commits,
-                    failed = outcome.failed,
-                    escalated = outcome.escalated,
-                    "abandoned-branch-pr sweep: pass complete",
-                );
-            }
-            tokio::time::sleep(interval).await;
+            .await
         }
     })
 }
 
+/// Deduplicate candidates by `work_item_id`, keeping the one with the
+/// newest `finished_at`. A work item with two terminal workspace-backed
+/// executions and no PR — the double-spawn shape
+/// [`crate::work::WorkDb::mark_execution_redundant`] produces, or exactly
+/// what a PR-create outage leaves behind when several attempts fail — would
+/// otherwise appear as two candidates in the same pass, each with a
+/// distinct engine-supplied branch, and reach [`PrAutoCreator::try_create`]
+/// twice: two PRs opened on GitHub for one task, with only the first bind
+/// succeeding and the second orphaned. [`list_abandoned_pushed_branch_candidates`]
+/// orders by `finished_at ASC, id ASC`, so a plain overwriting insert keeps
+/// the newest row per work item.
+///
+/// [`list_abandoned_pushed_branch_candidates`]: crate::work::WorkDb::list_abandoned_pushed_branch_candidates
+fn dedup_by_work_item(candidates: Vec<LatePrCandidate>) -> Vec<LatePrCandidate> {
+    let mut by_work_item: HashMap<String, LatePrCandidate> = HashMap::with_capacity(candidates.len());
+    for candidate in candidates {
+        by_work_item.insert(candidate.work_item_id.clone(), candidate);
+    }
+    by_work_item.into_values().collect()
+}
+
+/// Whether the work item already carries a non-empty `pr_url` right now.
+/// Used as an immediate pre-create recheck: a bind from earlier in the same
+/// pass (or a concurrent path) must suppress a second `try_create` call for
+/// the same work item, even after [`dedup_by_work_item`] — belt-and-suspenders
+/// alongside the dedup, and the only guard for a `pr_url` set by something
+/// other than this sweep between the candidate query and this point.
+fn work_item_pr_url_already_set(work_db: &WorkDb, work_item_id: &str) -> bool {
+    match work_db.get_work_item(work_item_id) {
+        Ok(WorkItem::Task(t)) | Ok(WorkItem::Chore(t)) => t.pr_url.as_deref().is_some_and(|url| !url.is_empty()),
+        _ => false,
+    }
+}
+
 /// Run a single sweep pass. `failure_counts` persists across calls (owned
 /// by the spawn loop) so consecutive-failure escalation survives from one
-/// pass to the next.
+/// pass to the next; entries for execution ids not seen this pass are
+/// pruned at the end so a row that resolves, ages out, or has its task
+/// closed does not leak in the map for the engine's lifetime.
 pub(crate) async fn run_one_pass(
     work_db: &WorkDb,
     pr_detector: &dyn PrDetector,
@@ -363,6 +507,8 @@ pub(crate) async fn run_one_pass(
             return outcome;
         }
     };
+    let candidates = dedup_by_work_item(candidates);
+    failure_counts.retain(|execution_id, _| candidates.iter().any(|c| &c.execution_id == execution_id));
 
     for candidate in &candidates {
         let expected_branch = expected_branch_name(
@@ -405,7 +551,7 @@ pub(crate) async fn run_one_pass(
                     dispatch_events,
                     candidate,
                     &url,
-                    "bound",
+                    BindAction::Bound,
                     &mut outcome,
                     failure_counts,
                 )
@@ -417,6 +563,12 @@ pub(crate) async fn run_one_pass(
             // not a fresh/merged one.
             PrStatus::Stale { .. } | PrStatus::EmptyDiff { .. } | PrStatus::Closed { .. } => {}
             PrStatus::None => {
+                // A bind from an earlier candidate in this same pass (or a
+                // concurrent path) may have already set `pr_url` — recheck
+                // immediately before paying for a create attempt.
+                if work_item_pr_url_already_set(work_db, &candidate.work_item_id) {
+                    continue;
+                }
                 let (title, body) = build_pr_title_body(work_db, candidate);
                 match pr_creator.try_create(&repo_slug, &expected_branch, &title, &body).await {
                     AutoCreateOutcome::AlreadyExists(url) => {
@@ -425,7 +577,7 @@ pub(crate) async fn run_one_pass(
                             dispatch_events,
                             candidate,
                             &url,
-                            "bound",
+                            BindAction::Bound,
                             &mut outcome,
                             failure_counts,
                         )
@@ -437,7 +589,7 @@ pub(crate) async fn run_one_pass(
                             dispatch_events,
                             candidate,
                             &url,
-                            "created",
+                            BindAction::Created,
                             &mut outcome,
                             failure_counts,
                         )
@@ -445,6 +597,17 @@ pub(crate) async fn run_one_pass(
                     }
                     AutoCreateOutcome::NothingToCreate => {
                         outcome.skipped_no_commits += 1;
+                        dispatch_events
+                            .emit(
+                                DispatchEvent::new(
+                                    Stage::AbandonedBranchPrRecovery,
+                                    Outcome::Skipped,
+                                    &candidate.execution_id,
+                                )
+                                .with_work_item(&candidate.work_item_id)
+                                .with_details(serde_json::json!({ "action": "nothing_to_create" })),
+                            )
+                            .await;
                     }
                     AutoCreateOutcome::Failed { transient, message } => {
                         outcome.failed += 1;
@@ -497,7 +660,7 @@ async fn bind_and_record(
     dispatch_events: &dyn DispatchEventSink,
     candidate: &LatePrCandidate,
     pr_url: &str,
-    action: &'static str,
+    action: BindAction,
     outcome: &mut AbandonedBranchPrSweepOutcome,
     failure_counts: &mut HashMap<String, u32>,
 ) {
@@ -513,23 +676,22 @@ async fn bind_and_record(
                     "abandoned-branch-pr sweep: failed to resolve attention item on recovery (non-fatal)",
                 );
             }
-            if action == "created" {
-                outcome.created += 1;
-            } else {
-                outcome.recovered += 1;
+            match action {
+                BindAction::Created => outcome.created += 1,
+                BindAction::Bound => outcome.recovered += 1,
             }
             tracing::info!(
                 execution_id = %candidate.execution_id,
                 work_item_id = %candidate.work_item_id,
                 pr_url,
-                action,
+                action = action.as_str(),
                 "abandoned-branch-pr sweep: bound recovered PR to work item",
             );
             dispatch_events
                 .emit(
                     DispatchEvent::new(Stage::AbandonedBranchPrRecovery, Outcome::Ok, &candidate.execution_id)
                         .with_work_item(&candidate.work_item_id)
-                        .with_details(serde_json::json!({ "action": action, "pr_url": pr_url })),
+                        .with_details(serde_json::json!({ "action": action.as_str(), "pr_url": pr_url })),
                 )
                 .await;
         }
@@ -548,7 +710,7 @@ async fn bind_and_record(
     }
 }
 
-/// File (idempotently) the operator-visible attention item raised once a
+/// File (idempotently) the attention item raised once a
 /// candidate's auto-create attempts have failed
 /// [`ESCALATE_AFTER_CONSECUTIVE_FAILURES`] times in a row.
 fn file_attention(
@@ -610,8 +772,11 @@ fn build_pr_title_body(work_db: &WorkDb, candidate: &LatePrCandidate) -> (String
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use boss_github::gh_runner::GhResponse;
     use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus, FinishExecutionRunInput};
 
     use super::*;
@@ -672,6 +837,48 @@ mod tests {
         (chore.id, exec.id)
     }
 
+    /// Add a second terminal, workspace-backed candidate execution onto an
+    /// existing chore (as created by [`make_candidate_chore`]), finished
+    /// `younger_by_secs` seconds more recently than the first — the
+    /// double-spawn shape [`dedup_by_work_item`] must collapse into a
+    /// single candidate.
+    fn add_second_candidate_execution(db: &WorkDb, chore_id: &str, younger_by_secs: i64) -> String {
+        let exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.to_owned())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:foo/bar.git")
+                    .build(),
+            )
+            .unwrap();
+        let (exec, run) = db
+            .start_execution_run(&exec.id, "agent-2", "repo-1", "lease-2", "ws-2", "/workspaces/ws-2")
+            .unwrap();
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+        db.mark_execution_redundant(&exec.id).unwrap();
+        {
+            let conn = db.connect().unwrap();
+            let backdated =
+                (boss_engine_utils::epoch_time::now_epoch_secs() - GRACE_SECS - 60 + younger_by_secs).to_string();
+            conn.execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![exec.id, backdated],
+            )
+            .unwrap();
+        }
+        exec.id
+    }
+
     fn task_status_and_pr_url(db: &WorkDb, work_item_id: &str) -> (String, Option<String>) {
         match db.get_work_item(work_item_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => (t.status.as_str().to_owned(), t.pr_url),
@@ -695,6 +902,7 @@ mod tests {
     /// each time.
     struct QueuePrAutoCreator {
         queue: StdMutex<Vec<AutoCreateOutcome>>,
+        calls: AtomicUsize,
     }
 
     impl QueuePrAutoCreator {
@@ -702,14 +910,98 @@ mod tests {
             outcomes.reverse();
             Self {
                 queue: StdMutex::new(outcomes),
+                calls: AtomicUsize::new(0),
             }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
         }
     }
 
     #[async_trait]
     impl PrAutoCreator for QueuePrAutoCreator {
         async fn try_create(&self, _repo_slug: &str, _branch: &str, _title: &str, _body: &str) -> AutoCreateOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.queue.lock().unwrap().pop().expect("no more queued outcomes")
+        }
+    }
+
+    /// Fake [`GhRunner`] driven by a fixed queue of GET/POST responses, one
+    /// per call in the order [`CommandPrAutoCreator::try_create`] issues
+    /// them. Exercises the production creator's own response-classification
+    /// logic (branch-existence precheck, 422/404 handling, default-branch
+    /// caching) without shelling out to `gh`.
+    struct FakeGhRunner {
+        gets: StdMutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
+        posts: StdMutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
+        get_calls: AtomicUsize,
+    }
+
+    impl FakeGhRunner {
+        fn new(
+            gets: Vec<std::result::Result<GhResponse, GhRunnerError>>,
+            posts: Vec<std::result::Result<GhResponse, GhRunnerError>>,
+        ) -> Self {
+            Self {
+                gets: StdMutex::new(gets.into_iter().collect()),
+                posts: StdMutex::new(posts.into_iter().collect()),
+                get_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_call_count(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl GhRunner for FakeGhRunner {
+        async fn graphql(
+            &self,
+            _query: &str,
+            _vars: &[(&str, &str)],
+            _token: Option<&str>,
+        ) -> std::result::Result<serde_json::Value, GhRunnerError> {
+            unimplemented!("try_create never calls graphql")
+        }
+
+        async fn rest_get(&self, _path: &str, _token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.gets
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("no more queued GET responses")
+        }
+
+        async fn rest_patch(
+            &self,
+            _path: &str,
+            _fields: &[(&str, &str)],
+            _token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            unimplemented!("try_create never calls rest_patch")
+        }
+
+        async fn rest_post(
+            &self,
+            _path: &str,
+            _body: &serde_json::Value,
+            _token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            self.posts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("no more queued POST responses")
+        }
+    }
+
+    fn creator_with_fake_gh(fake: Arc<FakeGhRunner>) -> CommandPrAutoCreator {
+        CommandPrAutoCreator {
+            gh: fake,
+            default_branch_cache: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -843,6 +1135,342 @@ mod tests {
         assert!(
             items.iter().all(|i| i.status != "open"),
             "the attention item must resolve once the branch is recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_executions_on_one_work_item_open_only_one_pr() {
+        let (_dir, db) = open_db();
+        let (chore_id, exec_a) = make_candidate_chore(&db, "dup-candidate");
+        let exec_b = add_second_candidate_execution(&db, &chore_id, 30);
+        assert_ne!(exec_a, exec_b);
+
+        let detector = FixedPrDetector(PrStatus::None);
+        let creator = QueuePrAutoCreator::new(vec![AutoCreateOutcome::Created(
+            "https://github.com/foo/bar/pull/55".to_owned(),
+        )]);
+        let sink = NoopDispatchEventSink;
+        let mut failures = HashMap::new();
+
+        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        assert_eq!(outcome.created, 1);
+        assert_eq!(
+            creator.calls(),
+            1,
+            "two terminal executions on one work item must reach try_create exactly once, not once per execution"
+        );
+
+        let (status, pr_url) = task_status_and_pr_url(&db, &chore_id);
+        assert_eq!(status, "in_review");
+        assert_eq!(pr_url.as_deref(), Some("https://github.com/foo/bar/pull/55"));
+    }
+
+    #[test]
+    fn dedup_by_work_item_keeps_the_newest_finished_candidate() {
+        let make = |work_item_id: &str, execution_id: &str| LatePrCandidate {
+            execution_id: execution_id.to_owned(),
+            work_item_id: work_item_id.to_owned(),
+            repo_remote_url: "git@github.com:foo/bar.git".to_owned(),
+            branch_naming: Default::default(),
+            worker_branch_prefix: None,
+        };
+        // Query order is `finished_at ASC, id ASC`, so the later entry in
+        // the input Vec is the newer row — the dedup must keep it.
+        let candidates = vec![make("wi-1", "exec-a"), make("wi-1", "exec-b"), make("wi-2", "exec-c")];
+
+        let deduped = dedup_by_work_item(candidates);
+        assert_eq!(deduped.len(), 2);
+        let wi1 = deduped.iter().find(|c| c.work_item_id == "wi-1").unwrap();
+        assert_eq!(
+            wi1.execution_id, "exec-b",
+            "must keep the newest (last-ordered) candidate per work item"
+        );
+        assert!(deduped.iter().any(|c| c.execution_id == "exec-c"));
+    }
+
+    #[test]
+    fn classify_gh_error_transient_cases() {
+        for status in [None, Some(0), Some(429), Some(503), Some(599)] {
+            let err = match status {
+                None => GhRunnerError::transient("boom"),
+                Some(s) => GhRunnerError::with_status(s, "boom"),
+            };
+            match classify_gh_error(err) {
+                AutoCreateOutcome::Failed { transient, .. } => {
+                    assert!(transient, "status {status:?} should classify as transient")
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_gh_error_permanent_cases() {
+        for status in [401, 403, 418] {
+            let err = GhRunnerError::with_status(status, "boom");
+            match classify_gh_error(err) {
+                AutoCreateOutcome::Failed { transient, .. } => {
+                    assert!(!transient, "status {status} should classify as permanent")
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn try_create_skips_expensively_when_branch_was_never_pushed() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![Err(GhRunnerError::with_status(404, "Not Found"))],
+            vec![],
+        ));
+        let creator = creator_with_fake_gh(fake.clone());
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_missing", "t", "b").await;
+        assert!(matches!(outcome, AutoCreateOutcome::NothingToCreate));
+        assert_eq!(
+            fake.get_call_count(),
+            1,
+            "a branch that was never pushed must be ruled out with a single call"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_create_opens_a_pr_on_the_happy_path() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+            ],
+            vec![Ok(GhResponse {
+                body: serde_json::json!({"html_url": "https://github.com/foo/bar/pull/1"}),
+            })],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_1", "t", "b").await;
+        match outcome {
+            AutoCreateOutcome::Created(url) => assert_eq!(url, "https://github.com/foo/bar/pull/1"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_create_binds_an_already_existing_pr_found_by_the_precheck() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([{"html_url": "https://github.com/foo/bar/pull/2"}]),
+                }),
+            ],
+            vec![],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_2", "t", "b").await;
+        match outcome {
+            AutoCreateOutcome::AlreadyExists(url) => assert_eq!(url, "https://github.com/foo/bar/pull/2"),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_create_422_already_exists_resolves_via_relookup() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([{"html_url": "https://github.com/foo/bar/pull/3"}]),
+                }),
+            ],
+            vec![Err(GhRunnerError::with_status(
+                422,
+                "A pull request already exists for foo:boss/exec_3",
+            ))],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_3", "t", "b").await;
+        match outcome {
+            AutoCreateOutcome::AlreadyExists(url) => assert_eq!(url, "https://github.com/foo/bar/pull/3"),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_create_422_no_commits_is_a_quiet_skip() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+            ],
+            vec![Err(GhRunnerError::with_status(
+                422,
+                "No commits between main and boss/exec_4",
+            ))],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_4", "t", "b").await;
+        assert!(matches!(outcome, AutoCreateOutcome::NothingToCreate));
+    }
+
+    #[tokio::test]
+    async fn try_create_422_other_validation_error_is_a_real_failure() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+            ],
+            vec![Err(GhRunnerError::with_status(
+                422,
+                "Validation Failed: 3 rulesets block this base",
+            ))],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_5", "t", "b").await;
+        match outcome {
+            AutoCreateOutcome::Failed { transient, .. } => {
+                assert!(
+                    !transient,
+                    "an unrecognised 422 must not be treated as nothing-to-create"
+                )
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_create_404_on_create_is_a_real_failure_not_a_quiet_skip() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+            ],
+            vec![Err(GhRunnerError::with_status(404, "Not Found"))],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_6", "t", "b").await;
+        match outcome {
+            AutoCreateOutcome::Failed { transient, .. } => {
+                assert!(
+                    !transient,
+                    "a 404 at create time (branch already confirmed to exist) needs a human"
+                )
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_create_missing_html_url_is_a_real_failure() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+            ],
+            vec![Ok(GhResponse {
+                body: serde_json::json!({}),
+            })],
+        ));
+        let creator = creator_with_fake_gh(fake);
+
+        let outcome = creator.try_create("foo/bar", "boss/exec_7", "t", "b").await;
+        match outcome {
+            AutoCreateOutcome::Failed { transient, .. } => assert!(!transient),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_branch_is_cached_across_try_create_calls_to_the_same_repo() {
+        let fake = Arc::new(FakeGhRunner::new(
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"default_branch": "main"}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!([]),
+                }),
+                // No third `default_branch` GET queued — the second
+                // try_create call must be served from the cache instead.
+            ],
+            vec![
+                Ok(GhResponse {
+                    body: serde_json::json!({"html_url": "https://github.com/foo/bar/pull/8"}),
+                }),
+                Ok(GhResponse {
+                    body: serde_json::json!({"html_url": "https://github.com/foo/bar/pull/9"}),
+                }),
+            ],
+        ));
+        let creator = creator_with_fake_gh(fake.clone());
+
+        let out1 = creator.try_create("foo/bar", "boss/exec_a", "t", "b").await;
+        assert!(matches!(out1, AutoCreateOutcome::Created(_)));
+        let out2 = creator.try_create("foo/bar", "boss/exec_b", "t", "b").await;
+        assert!(matches!(out2, AutoCreateOutcome::Created(_)));
+
+        assert_eq!(
+            fake.get_call_count(),
+            5,
+            "default_branch must be served from the in-memory cache on the second call to the same repo"
         );
     }
 }
