@@ -205,7 +205,18 @@ pub(crate) enum LadderOutcome {
     /// failures) or the rebase was clean-but-unpushed. The caller passes
     /// this to [`rung2_eligible`] to decide whether the next worker spawn
     /// should use rung 2's small-agent profile or climb straight to rung 3.
-    FellThrough { residual_conflict_files: Option<usize> },
+    ///
+    /// `reason` is the specific, true cause of the fall-through (e.g. "rung
+    /// 0 resolved every residual file but the push failed" vs. "rung 0
+    /// declined: no applicable resolver"), carried alongside the enum
+    /// variant so a caller logging the canonical routing verdict (see
+    /// [`log_routing_verdict`]) reports the real cause instead of a generic
+    /// stand-in — conflating distinct causes under one static message was
+    /// exactly the T2840 verdict-mislabel bug this field exists to prevent.
+    FellThrough {
+        residual_conflict_files: Option<usize>,
+        reason: &'static str,
+    },
     /// Rung 1 could not even be attempted this pass: leasing a workspace
     /// failed twice in a row (the initial attempt and one retry — see
     /// [`lease_rung1_workspace`]). This is deliberately distinct from
@@ -283,15 +294,11 @@ pub(crate) async fn try_mechanical_rungs(
             pr_url = %candidate.pr_url,
             "conflict_ladder: could not parse PR number; skipping rung 1",
         );
-        log_routing_verdict(
-            &candidate.work_item_id,
-            None,
-            &[],
-            "generic",
-            "could not parse a PR number from pr_url; mechanical rungs skipped",
-        );
+        let reason = "could not parse a PR number from pr_url; mechanical rungs skipped";
+        log_routing_verdict(&candidate.work_item_id, None, &[], "generic", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
+            reason,
         };
     };
     let pr_number = pr_number as u64;
@@ -317,15 +324,11 @@ pub(crate) async fn try_mechanical_rungs(
                 work_item_id = %candidate.work_item_id,
                 "conflict_ladder: no repo_remote_url resolves for work item; skipping rung 1",
             );
-            log_routing_verdict(
-                &candidate.work_item_id,
-                Some(pr_number),
-                &[],
-                "generic",
-                "no repo_remote_url resolves for this work item; mechanical rungs skipped",
-            );
+            let reason = "no repo_remote_url resolves for this work item; mechanical rungs skipped";
+            log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
+                reason,
             };
         }
         Err(err) => {
@@ -334,15 +337,11 @@ pub(crate) async fn try_mechanical_rungs(
                 ?err,
                 "conflict_ladder: failed to resolve repo_remote_url; skipping rung 1",
             );
-            log_routing_verdict(
-                &candidate.work_item_id,
-                Some(pr_number),
-                &[],
-                "generic",
-                "failed to resolve repo_remote_url; mechanical rungs skipped",
-            );
+            let reason = "failed to resolve repo_remote_url; mechanical rungs skipped";
+            log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
+                reason,
             };
         }
     };
@@ -356,15 +355,11 @@ pub(crate) async fn try_mechanical_rungs(
                 error = %format!("{err:#}"),
                 "conflict_ladder: ensure_repo failed; skipping rung 1",
             );
-            log_routing_verdict(
-                &candidate.work_item_id,
-                Some(pr_number),
-                &[],
-                "generic",
-                "ensure_repo failed; mechanical rungs skipped",
-            );
+            let reason = "ensure_repo failed; mechanical rungs skipped";
+            log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
+                reason,
             };
         }
     };
@@ -506,15 +501,11 @@ async fn run_rung1_in_lease(
             error = %format!("{err:#}"),
             "conflict_ladder: goto_workspace failed; falling through to worker",
         );
-        log_routing_verdict(
-            &candidate.work_item_id,
-            Some(pr_number),
-            &[],
-            "generic",
-            "goto_workspace failed; mechanical rungs unavailable",
-        );
+        let reason = "goto_workspace failed; mechanical rungs unavailable";
+        log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
+            reason,
         };
     }
 
@@ -527,15 +518,11 @@ async fn run_rung1_in_lease(
                 error = %format!("{err:#}"),
                 "conflict_ladder: engine-direct rebase failed; falling through to worker",
             );
-            log_routing_verdict(
-                &candidate.work_item_id,
-                Some(pr_number),
-                &[],
-                "generic",
-                "engine-direct rebase (rung 1) failed; mechanical rungs unavailable",
-            );
+            let reason = "engine-direct rebase (rung 1) failed; mechanical rungs unavailable";
+            log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
+                reason,
             };
         }
     };
@@ -577,15 +564,11 @@ async fn run_rung1_in_lease(
             pr = pr_number,
             "conflict_ladder: rung 1 rebased clean but reported unpushed; falling through to worker",
         );
-        log_routing_verdict(
-            &candidate.work_item_id,
-            Some(pr_number),
-            &[],
-            "generic",
-            "rung 1 rebased clean but the push was skipped upstream; mechanical resolution not landed",
-        );
+        let reason = "rung 1 rebased clean but the push was skipped upstream; mechanical resolution not landed";
+        log_routing_verdict(&candidate.work_item_id, Some(pr_number), &[], "generic", reason);
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
+            reason,
         };
     }
 
@@ -599,7 +582,7 @@ async fn run_rung1_in_lease(
     // rung 2 (a small focused agent, when the residue is bounded — see
     // `rung2_eligible`) and rung 3 (full worker, for a large/architectural
     // conflict).
-    if RUNG0_APPLY_LIVE {
+    let rung0_fallthrough_reason: &'static str = if RUNG0_APPLY_LIVE {
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr = pr_number,
@@ -633,8 +616,16 @@ async fn run_rung1_in_lease(
             &rebase.conflicted_files,
         )
         .await;
-        if !matches!(rung0_outcome, LadderOutcome::FellThrough { .. }) {
-            return rung0_outcome;
+        // Carry rung 0's own fall-through reason into the routing verdict
+        // below instead of a generic stand-in — collapsing every rung-0
+        // decline cause (no applicable resolver, a resolver failing
+        // operationally, or a resolved-but-unpushed result) into one static
+        // "did not resolve every residual file" message previously
+        // misdiagnosed a resolved-but-push-rejected result as an unresolved
+        // one (T2840).
+        match rung0_outcome {
+            LadderOutcome::FellThrough { reason, .. } => reason,
+            other => return other,
         }
     } else {
         // Rung 0 is compile-time gated off (see `RUNG0_APPLY_LIVE`). Emit one
@@ -649,7 +640,8 @@ async fn run_rung1_in_lease(
             rung0_apply_live = RUNG0_APPLY_LIVE,
             "conflict_ladder: rung 0 (deterministic resolvers) gated off; not attempted — climbing to rung 2/3",
         );
-    }
+        "rung 0 compile-gated off (RUNG0_APPLY_LIVE=false); falling through to rung 2/3"
+    };
 
     let residual_conflict_files = rebase.conflicted_files.len();
     tracing::info!(
@@ -664,14 +656,11 @@ async fn run_rung1_in_lease(
         Some(pr_number),
         &rebase.conflicted_files,
         "generic",
-        if RUNG0_APPLY_LIVE {
-            "rung 0 did not resolve every residual file; falling through to rung 2/3"
-        } else {
-            "rung 0 compile-gated off (RUNG0_APPLY_LIVE=false); falling through to rung 2/3"
-        },
+        rung0_fallthrough_reason,
     );
     LadderOutcome::FellThrough {
         residual_conflict_files: Some(residual_conflict_files),
+        reason: rung0_fallthrough_reason,
     }
 }
 
@@ -713,6 +702,7 @@ pub(crate) async fn attempt_rung0(
         );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
+            reason: "rung 0 could not parse a PR number from pr_url",
         };
     };
     let pr_number = pr_number as u64;
@@ -766,7 +756,7 @@ pub(crate) async fn attempt_rung0(
             // distinctly so the trace isn't misread as "rung 0 doesn't
             // apply here" when the real story is "rung 0's environment is
             // broken". Control flow is identical — both climb to the worker.
-            if failed.is_empty() {
+            let reason = if failed.is_empty() {
                 tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr = pr_number,
@@ -775,6 +765,8 @@ pub(crate) async fn attempt_rung0(
                     declined_files = ?per_file,
                     "conflict_ladder: rung 0 declined; climbing to worker",
                 );
+                "rung 0 declined: one or more residual files have no applicable deterministic \
+                 resolver, or a matched resolver declined"
             } else {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
@@ -786,9 +778,12 @@ pub(crate) async fn attempt_rung0(
                     first_failure = %failed.first().map(|f| f.reason.as_str()).unwrap_or_default(),
                     "conflict_ladder: rung 0 attempted but a resolver failed operationally (environment/tooling, not a decline); climbing to worker",
                 );
-            }
+                "rung 0 attempted but a resolver failed operationally (environment/tooling issue, \
+                 not a decline)"
+            };
             return LadderOutcome::FellThrough {
                 residual_conflict_files: None,
+                reason,
             };
         }
     };
@@ -802,6 +797,7 @@ pub(crate) async fn attempt_rung0(
         );
         return LadderOutcome::FellThrough {
             residual_conflict_files: None,
+            reason: "rung 0 resolved every residual file but pushing the resolution failed",
         };
     }
 
