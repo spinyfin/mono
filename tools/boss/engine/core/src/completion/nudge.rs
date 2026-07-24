@@ -26,7 +26,7 @@ impl WorkerCompletionHandler {
     /// unresolved `[effort-escalation]`/`[blocked]` attention item —
     /// dogging a worker that just told the coordinator it's stuck awaiting
     /// direction is exactly the failure this exists to prevent (incident
-    /// 2026-07-02, exec_18b5243e65ff188_2d / T2085).
+    /// 2026-07-02, exec_18b5243e65ff188_2d).
     pub(super) async fn nudge_or_park(
         &self,
         execution: &crate::work::WorkExecution,
@@ -52,7 +52,7 @@ impl WorkerCompletionHandler {
                 .await;
             return StopOutcome::EscalationPending { reason };
         }
-        // Build-wait suppression (2026-07-14 incident, T2608 / T2612): a
+        // Build-wait suppression (2026-07-14 log-volume incident): a
         // worker narrating that it is legitimately waiting on a
         // backgrounded build/test gate must not be nudged — each nudge
         // wakes it, gets an unproductive-but-honest "still building,
@@ -169,7 +169,7 @@ impl WorkerCompletionHandler {
             Some(url) => format!("A PR already exists for this work: {url}."),
             None => "No PR was produced.".to_owned(),
         };
-        // Legibility (2026-07-14 incident, T2608 / T2612): the parked/yellow
+        // Legibility (2026-07-14 log-volume incident): the parked/yellow
         // state — active, no live execution, autostart cleared — carries no
         // surfaced reason of its own; an operator staring at the row has no
         // way to tell it apart from an ordinary backlog item without opening

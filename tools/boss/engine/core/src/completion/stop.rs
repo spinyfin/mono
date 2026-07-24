@@ -59,7 +59,7 @@ impl WorkerCompletionHandler {
         // id. `expected_branch_name(execution_id, ...)` computes a
         // branch that structurally never exists for a revision, so the
         // work-item-suffix check below would always "mismatch" and
-        // discard a legitimate staged URL (2026-07-14 incident, T342 /
+        // discard a legitimate staged URL (2026-07-14 incident,
         // exec_18c2124d2f06d768_106d: `cube pr update`'s printed URL —
         // the chain root's real PR — was dropped here, and the
         // fallthrough to the SHA-delta gate is what actually caused the
@@ -256,11 +256,11 @@ impl WorkerCompletionHandler {
             return self.finalize_answer_agent(&execution).await;
         }
 
-        // P992: a `pr_review` reviewer execution never opens a PR. It reads
+        // A `pr_review` reviewer execution never opens a PR. It reads
         // the PR diff and emits structured findings; the producing task already
         // advanced to `in_review` on PR-open, so the Stop handler just finalises
-        // the reviewer execution (task 8 will also parse the ReviewResult and
-        // enqueue revisions when warranted).
+        // the reviewer execution (which also parses the ReviewResult and
+        // enqueues revisions when warranted).
         if execution.kind == ExecutionKind::PrReview {
             return self.finalize_pr_review_pass(&execution).await;
         }
@@ -446,13 +446,13 @@ impl WorkerCompletionHandler {
                     let is_revision_contribution = push_staged || !already_stop_seen;
                     if is_revision_contribution {
                         // Stamp the head we're about to finalize on; recheck_for_pr
-                        // uses this for T848 recovery if finalization fails transiently.
+                        // uses this to recover if finalization fails transiently.
                         if let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, &head_now) {
                             tracing::warn!(
                                 execution_id,
                                 ?err,
                                 "stop event: failed to stamp revision_stop_contributed_head; \
-                                 recheck_for_pr T848 recovery may not fire",
+                                 recheck_for_pr transient-failure recovery may not fire",
                             );
                         }
                         return self
@@ -657,7 +657,7 @@ impl WorkerCompletionHandler {
                 // permanently stuck in `waiting_human` — never reaching a
                 // terminal status even though the commit landed (the
                 // stuck-revision incident this branch exists to close; see
-                // T939 for the sibling fix that covered only case (a)).
+                // the sibling fix elsewhere in this module that covered only case (a)).
                 //
                 // Instead, fall back to the CI-state-based satisfied-
                 // deliverable gate: if the bound PR is currently open with
@@ -837,7 +837,7 @@ must not be asked to open one",
                         )
                         .await;
                 }
-                // Sanctioned no-op terminal (T1868): a primary-implementation
+                // Sanctioned no-op terminal: a primary-implementation
                 // worker (chore / task) that investigated and found the work
                 // ALREADY DONE — the change is already on `main`, `jj diff -r @`
                 // is empty, nothing to commit/push. We are at a real Stop

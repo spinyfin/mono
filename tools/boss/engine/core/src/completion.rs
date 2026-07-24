@@ -173,7 +173,7 @@ pub const CI_NO_PUSH_REASON: &str = "no_push_no_classification";
 /// caller whether a live worker slot was actually found and reaped — the
 /// signal that gates the cube-lease release in [`WorkerCompletionHandler::force_release`].
 ///
-/// The distinction exists to close the T981 mid-spawn-cancel collision:
+/// The distinction exists to close a mid-spawn-cancel collision:
 /// a worker whose pid has not yet materialized has no mapped slot, so the
 /// pane release is a no-op (`NoLiveWorker`). Freeing its cube lease at
 /// that point would hand a still-to-be-occupied workspace back to cube,
@@ -494,7 +494,7 @@ pub trait BranchVerifier: Send + Sync {
 
     /// Returns the total number of changed lines (additions + deletions)
     /// between `base` and `head` in `repo_slug`. Used by the no-op /
-    /// trivial-diff skip gate (P992 design §8) to detect pure rebases and
+    /// trivial-diff skip gate to detect pure rebases and
     /// trivially-small pushes that don't warrant a fresh reviewer pass.
     async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
 
@@ -540,7 +540,7 @@ impl BranchVerifier for CommandBranchVerifier {
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and return
 /// the total number of changed lines (additions + deletions) across all files
 /// in the comparison. Returns `0` when the diff is empty (pure rebase with no
-/// file-content changes). Used by the no-op skip gate (P992 design §8).
+/// file-content changes). Used by the no-op skip gate.
 async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
     let trimmed = gh_compare_jq(
         repo_slug,
@@ -760,7 +760,7 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
         }
     }
     if rows >= SCAN_LIMIT {
-        // Downgraded from `warn!` (2026-07-14 incident, T2608 / T2612): in a
+        // Downgraded from `warn!` (2026-07-14 log-volume incident): in a
         // busy repo with well over `SCAN_LIMIT` total PRs, hitting the row
         // cap is the expected steady state every single time the worker
         // genuinely has no PR yet — not evidence of a truncated search. This
@@ -956,7 +956,7 @@ pub struct WorkerCompletionHandler {
     /// [`DEFAULT_BUILD_WAIT_HORIZON_SECS`]; tests override it via
     /// [`Self::with_build_wait_horizon_secs`].
     build_wait_horizon_secs: i64,
-    /// Maximum number of automated reviewer passes per PR (P992 design §7).
+    /// Maximum number of automated reviewer passes per PR.
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances to human Review directly.
     /// Defaults to [`crate::config::DEFAULT_MAX_REVIEW_CYCLES`]; production
@@ -964,7 +964,7 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_max_review_cycles`].
     max_review_cycles: usize,
     /// Minimum changed-line count required to trigger a reviewer pass when
-    /// `last_reviewed_sha` is set (P992 design §8). Pushes whose effective
+    /// `last_reviewed_sha` is set. Pushes whose effective
     /// diff (new head vs. last-reviewed head) totals fewer lines than this
     /// threshold are skipped as trivial. Zero (the conservative default)
     /// means skip only when the diff is literally empty (pure rebase with
@@ -1053,7 +1053,7 @@ struct ConflictSignalPrefetch {
 pub enum ForceReleaseOutcome {
     /// No live worker pane was mapped (mid-spawn or already released).
     /// The cube lease is deliberately left held for the in-flight
-    /// `run_execution` to reap and release once its spawn settles (T981).
+    /// `run_execution` to reap and release once its spawn settles.
     HeldForInFlightSpawn,
     /// The pane was reaped but the execution held no lease columns —
     /// already released by a prior call, or never leased.
@@ -1101,7 +1101,7 @@ impl crate::coordinator::AutomationPreemptor for WorkerCompletionHandler {
     ///
     /// The `HeldForInFlightSpawn` → [`PreemptOutcome::MidSpawn`] mapping
     /// is the load-bearing one: `force_release` refuses to release a
-    /// mid-spawn worker's lease (T981 — cube would re-lease a workspace
+    /// mid-spawn worker's lease (cube would re-lease a workspace
     /// the in-flight spawn is about to occupy), so the dispatcher must
     /// learn that nothing was torn down and abandon the preemption rather
     /// than requeue work whose worker is still very much alive.
@@ -1354,14 +1354,14 @@ pub enum StopOutcome {
     /// "produce a PR" auto-nudge is suppressed for this execution (never
     /// queued via `nudge_or_park`) instead of dogging a worker that already
     /// declared itself stuck awaiting coordinator direction (incident
-    /// 2026-07-02, exec_18b5243e65ff188_2d / T2085). `reason` names the
+    /// 2026-07-02, exec_18b5243e65ff188_2d). `reason` names the
     /// pending signal kind(s). The execution stays `waiting_human`; no
     /// probe is sent. Resolving the attention item (coordinator ack)
     /// resumes normal nudging on the next Stop.
     EscalationPending { reason: String },
     /// The worker's Stop-boundary text matched the [`crate::build_wait`]
     /// heuristic — it is narrating that it is legitimately waiting on a
-    /// backgrounded build/test gate (2026-07-14 incident, T2608 / T2612:
+    /// backgrounded build/test gate (2026-07-14 log-volume incident:
     /// `exec_18c21add1416b5e8_3b`, `exec_18c21ba9b3fd2ef8_9e`). The
     /// "produce a PR" auto-nudge is suppressed — and, critically, the
     /// circuit breaker in [`crate::nudge_breaker`] is never even consulted,
@@ -1387,7 +1387,7 @@ pub enum StopOutcome {
     /// Detected by `try_finalize_satisfied_deliverable_on_stop` in
     /// the `NoContribution` branch of `on_stop_inner`. The execution
     /// is finalised and the worker reaped without nudging, preventing
-    /// the "nothing left to do" zombie loop (T740 follow-on).
+    /// the "nothing left to do" zombie loop.
     DeliverableSatisfied { pr_url: String },
     /// A CI-remediation worker classified the failure as flaky/infra and
     /// re-triggered the failing job (`boss engine ci mark-retriggered`),
@@ -1412,11 +1412,11 @@ pub enum StopOutcome {
     /// the comment doesn't sit in `answering` forever). The execution is
     /// finalised (`completed`) and its pane/workspace released either way.
     AnswerAgent { replied: bool },
-    /// P992 task 7: a primary-implementation worker's PR was detected and
+    /// A primary-implementation worker's PR was detected and
     /// an independent reviewer pass has been enqueued. The producing task
     /// remains in `active` (Doing column) until the reviewer resolves.
     ReviewerEnqueued { pr_url: String },
-    /// P992 task 7: a `pr_review` reviewer execution finished and the
+    /// A `pr_review` reviewer execution finished and the
     /// producing task has been advanced to `in_review`.
     ReviewPassCompleted { pr_url: String },
     /// A `pr_review` reviewer execution stopped without a readable
@@ -1428,13 +1428,13 @@ pub enum StopOutcome {
     /// the auto-nudge breaker — once it trips, the finalizer advances to
     /// `in_review` without a revision and files an attention.
     ReviewPassAwaitingResult,
-    /// P992 task 8: a `pr_review` reviewer execution found qualifying findings
+    /// A `pr_review` reviewer execution found qualifying findings
     /// (at least one `critical`/`high` severity or `regression` category) and
     /// created a revision task on the producing task. The producing task is
     /// advanced to `in_review`; the revision is dispatched on the general
     /// worker pool to apply the feedback. Nothing is posted to GitHub.
     ReviewPassRevisionCreated { pr_url: String, revision_task_id: String },
-    /// T1868: a primary-implementation worker (`chore_implementation` /
+    /// A primary-implementation worker (`chore_implementation` /
     /// `task_implementation`) verified its assigned work was already done —
     /// the change is already on `main`, the diff is empty, and there is
     /// genuinely nothing to commit/push/open a PR for — and emitted the
@@ -1674,7 +1674,7 @@ fn work_item_id(item: &WorkItem) -> String {
 }
 
 /// Whether completing a primary-implementation execution with a fresh PR
-/// should trigger an independent reviewer pass (P992 design §1). When this
+/// should trigger an independent reviewer pass. When this
 /// returns true, the producing task's column transition is held in
 /// `PendingReview`/Doing until the reviewer finalises.
 ///

@@ -127,7 +127,7 @@ async fn detector_uses_branch_naming_from_execution_row() {
 
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
         "expected ReviewerEnqueued; got {outcome:?}",
@@ -320,7 +320,7 @@ async fn noop_skip_gate_fails_open_on_head_oid_error() {
     );
 }
 
-// ── P992 task 13: end-to-end / integration tests ──────────────────────────
+// ── end-to-end / integration tests ──────────────────────────
 //
 // These tests exercise the complete produce→review→revise→re-review loop
 // and the termination conditions (cycle bound, no-op gate interaction).
@@ -432,14 +432,14 @@ async fn pr_review_pass_high_finding_creates_revision_with_correct_metadata() {
 }
 
 /// A `ReviewResult` with a `regression` category finding must trigger the
-/// engine's severity gate *regardless of severity level* — this is the
-/// T793 check (a live feature silently removed during a forward-port must
-/// be caught even if the reviewer rates it `low` severity).
+/// engine's severity gate *regardless of severity level* (a live feature
+/// silently removed during a forward-port must be caught even if the
+/// reviewer rates it `low` severity).
 #[tokio::test]
 async fn pr_review_regression_finding_creates_revision_at_low_severity_t793_check() {
     let workspace = tempdir().unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/88";
-    let json = t793_regression_review_result_json(pr_url);
+    let json = regression_class_finding_review_result_json(pr_url);
     let (_dir, db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
         pr_review_exec_fixture(workspace.path(), Some(&json));
 
@@ -451,11 +451,11 @@ async fn pr_review_regression_finding_creates_revision_at_low_severity_t793_chec
     assert!(
         matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
         "low-severity regression finding must still fire the severity gate \
-         and create a revision (T793 check); got {outcome:?}",
+         and create a revision; got {outcome:?}",
     );
 }
 
-/// T366 regression: two independent `pr_review` executions completing for
+/// Regression: two independent `pr_review` executions completing for
 /// the SAME producing task with the SAME reviewed head sha — the exact
 /// shape of the incident, where the enqueue-side race minted two review
 /// executions for one unchanged push before the dedup guard existed —
@@ -483,7 +483,7 @@ async fn duplicate_pr_review_passes_on_same_head_mint_only_one_revision() {
     // A second, INDEPENDENT pr_review execution for the SAME chore,
     // reviewing the SAME head sha ("sha_reviewed_abc123") — two reviewer
     // workers spawned for one unchanged push, each producing its own
-    // (differently worded) ReviewResult, exactly like the T366 incident.
+    // (differently worded) ReviewResult, exactly like the original incident.
     let json_b = serde_json::json!({
         "pr_url": pr_url,
         "head_sha": "sha_reviewed_abc123",
@@ -712,7 +712,7 @@ async fn pr_review_pass_reads_result_from_artifact_file() {
     );
 }
 
-/// Regression test for T1359: a reviewer that emits the ReviewResult as
+/// Regression test: a reviewer that emits the ReviewResult as
 /// **bare JSON** (no ` ```json ` fence) must still produce a revision when
 /// the severity gate fires. The extractor's bare-JSON scan (Strategy 3) must
 /// find and validate the object; the finalizer must NOT silently advance to
@@ -723,7 +723,7 @@ async fn pr_review_pass_bare_json_revision_warranted_true_creates_revision() {
     let pr_url = "https://github.com/spinyfin/mono/pull/88";
     let json = high_finding_review_result_json(pr_url);
 
-    // Transcript contains bare JSON (no fence) — the T1359 shape.
+    // Transcript contains bare JSON (no fence).
     let jsonl = make_bare_review_transcript_jsonl(&json);
     let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
         pr_review_exec_fixture_with_jsonl(workspace.path(), Some(&jsonl));
@@ -736,7 +736,7 @@ async fn pr_review_pass_bare_json_revision_warranted_true_creates_revision() {
     assert!(
         matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
         "bare-JSON reviewer output with a high finding must create a revision \
-         (T1359 regression); got {outcome:?}",
+         (bare-JSON regression); got {outcome:?}",
     );
 
     // Verify the revision was actually created and has the finding.
@@ -768,7 +768,7 @@ async fn pr_review_pass_bare_json_revision_warranted_true_creates_revision() {
     );
 }
 
-/// T1687/PR#1497 regression test: a reviewer that correctly identifies a
+/// PR#1497 regression test: a reviewer that correctly identifies a
 /// regression but fills `suspected_deletions` with descriptive strings
 /// (instead of `ReviewFinding` objects) must still parse and create a
 /// revision. Previously the serde type mismatch rejected the entire
@@ -777,7 +777,7 @@ async fn pr_review_pass_bare_json_revision_warranted_true_creates_revision() {
 async fn pr_review_pass_regression_with_string_deletions_creates_revision() {
     let workspace = tempdir().unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/88";
-    let json = t1687_regression_string_deletions_json(pr_url);
+    let json = string_shaped_deletions_review_result_json(pr_url);
     let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
         pr_review_exec_fixture(workspace.path(), Some(&json));
 
@@ -789,7 +789,7 @@ async fn pr_review_pass_regression_with_string_deletions_creates_revision() {
     assert!(
         matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
         "regression finding with string suspected_deletions must create a revision \
-         (T1687 fix); got {outcome:?}",
+         (string-deletions fix); got {outcome:?}",
     );
 
     let item = db.get_work_item(&chore_id).unwrap();
@@ -923,8 +923,7 @@ async fn pr_review_cycle_bound_skips_reviewer_and_creates_attention_item() {
 
 // ── Test: full produce → review → revise → re-review loop ────────────────
 
-/// End-to-end integration test for the complete automated-reviewer loop
-/// (P992 design §1, §4, §7, §8, §9, §10, task 13).
+/// End-to-end integration test for the complete automated-reviewer loop.
 ///
 /// Flow:
 ///   1. ChoreImplementation finishes → reviewer enqueued (PendingReview).
@@ -1187,7 +1186,7 @@ async fn revision_push_triggers_exactly_one_review() {
     );
 }
 
-/// (b) The motivating T192/rec_engine incident: a revision (CI-fix,
+/// (b) The motivating rec_engine incident: a revision (CI-fix,
 /// conflict-resolution, or operator-filed — this fixture uses a
 /// generic, non-reviewer-spawned `created_via`) pushes a commit that
 /// leaves two complete copies of the same module. The revision-
@@ -1313,7 +1312,7 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 
 // -----------------------------------------------------------
 // Deliverable-satisfied gate tests (zombie-worker / "nothing left to do"
-// loop fix, T740 follow-on).
+// loop fix).
 //
 // When a worker stops without pushing new commits (NoContribution),
 // but the bound PR is already in a satisfactory state — open with
@@ -1325,7 +1324,7 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 
 #[tokio::test]
 async fn on_stop_finalizes_satisfied_revision_when_pr_clean_and_sha_unchanged() {
-    // T1490 / T1486 regression: revision worker stopped without pushing
+    // Regression: revision worker stopped without pushing
     // (NoContribution — SHA unchanged), but the bound PR is open with
     // CI green and no conflict. The deliverable-satisfied gate must
     // finalize without nudging.
@@ -1427,7 +1426,7 @@ async fn on_stop_does_not_finalize_satisfied_revision_when_ci_inflight() {
 
 #[tokio::test]
 async fn on_stop_finalizes_satisfied_chore_when_pr_clean_and_sha_unchanged() {
-    // T1473 regression: a chore_implementation worker stopped without
+    // Regression: a chore_implementation worker stopped without
     // pushing new commits (PR was already open from a prior run,
     // NoContribution), but the PR is open with CI green and no conflict.
     // The deliverable-satisfied gate must finalize without nudging.
@@ -1515,9 +1514,9 @@ async fn on_stop_finalizes_satisfied_chore_when_pr_clean_and_sha_unchanged() {
     );
 }
 
-// ── T1503/T1496 regression: SHA-delta gate suppressed until Stop seen ───────
+// ── Regression: SHA-delta gate suppressed until Stop seen ───────
 
-/// Regression (T1503/T1496): the SHA-delta gate in `recheck_for_pr` must
+/// Regression: the SHA-delta gate in `recheck_for_pr` must
 /// NOT fire for a `revision_implementation` execution before `on_stop_inner`
 /// has been called (i.e. before `stop_seen` is stamped). Without this guard
 /// the gate fires the moment ANY worker pushes to the parent PR — including
@@ -1586,7 +1585,7 @@ async fn recheck_for_pr_sha_delta_suppressed_until_stop_seen() {
     );
 }
 
-/// T848 recovery: once `on_stop_inner` stamps `revision_stop_contributed_head`
+/// Transient-failure recovery: once `on_stop_inner` stamps `revision_stop_contributed_head`
 /// (the head it observed when the revision's own push was confirmed) and
 /// `recheck_for_pr` sees the same head still at the PR, it finalizes.
 /// This represents the recovery path: on_stop_inner detected the revision's
@@ -1728,7 +1727,7 @@ async fn recheck_for_pr_sha_delta_suppressed_when_baseline_matches_current_head(
     );
 }
 
-/// 2026-07-14 incident (T342 / exec_18c2124d2f06d768_106d) regression:
+/// 2026-07-14 incident (exec_18c2124d2f06d768_106d) regression:
 /// the pre-first-Stop suppression path in `recheck_for_pr` must NOT
 /// advance `pr_head_before` to the current head. `execution.status` is
 /// `waiting_human` for a worker's ENTIRE session, not just once it goes
@@ -1796,7 +1795,7 @@ async fn recheck_for_pr_pre_stop_suppression_does_not_clobber_pr_head_before_bas
 /// by a *different* worker (e.g. the parent chore's still-active worker)
 /// must NOT advance the revision to `in_review`.
 ///
-/// 2026-07-14 incident (T342) regression: the baseline must NOT be
+/// 2026-07-14 incident regression: the baseline must NOT be
 /// absorbed here either — this sweep cannot distinguish "the parent
 /// worker pushed" from "this revision's own worker pushed and just
 /// hasn't reached its Stop boundary yet" (`execution.status` is
@@ -1964,7 +1963,7 @@ async fn on_stop_foreign_push_post_stop_does_not_finalize_revision() {
 }
 
 /// Regression for the revision reap gap (2026-07-14 live incident,
-/// exec_18c2124d2f06d768_106d / T342): a revision worker's own push,
+/// exec_18c2124d2f06d768_106d): a revision worker's own push,
 /// staged via `StagedRevisionPushCache` (populated when the worker runs
 /// `cube pr update`, not the legacy direct `jj git push` — see
 /// `pr_url_capture::is_revision_push_command`), must be recognised as

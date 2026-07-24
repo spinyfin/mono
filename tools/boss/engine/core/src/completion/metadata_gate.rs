@@ -173,7 +173,7 @@ impl WorkerCompletionHandler {
     }
 
     /// Deliverable-satisfied finalization gate (zombie-worker / "nothing
-    /// left to do" loop fix, T740 follow-on).
+    /// left to do" loop fix).
     ///
     /// Called in the `NoContribution` branch of `on_stop_inner` after all
     /// per-kind signal-clearing and metadata-only gates have returned

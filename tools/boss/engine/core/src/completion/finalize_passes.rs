@@ -338,7 +338,7 @@ impl WorkerCompletionHandler {
         StopOutcome::AnswerAgent { replied }
     }
 
-    /// P992 task 8: finalise a `pr_review` reviewer execution when its Stop
+    /// Finalise a `pr_review` reviewer execution when its Stop
     /// hook fires. The reviewer never opens a PR; instead, it reads the
     /// producing task's PR diff and emits structured `ReviewResult` JSON in
     /// a fenced code block in its final message. This handler:
@@ -543,7 +543,7 @@ impl WorkerCompletionHandler {
         // re-prompting). Reap the engine-owned artifact either way.
         crate::structured_output::clear(&self.structured_output_dir, &execution.id);
 
-        // P992 task 9: extract head_sha before review_result is (potentially)
+        // Extract head_sha before review_result is (potentially)
         // consumed by the revision path below. Used to update last_reviewed_sha.
         let head_sha_for_cycle: Option<String> = review_result
             .as_ref()
@@ -554,8 +554,8 @@ impl WorkerCompletionHandler {
             .as_ref()
             .is_some_and(crate::pr_review::passes_severity_gate);
 
-        // incident-002 P2: rationale-independent both-parents deletion
-        // tripwire. For a conflict-resolution review, diff the resolution
+        // incident-002 postmortem action item: rationale-independent
+        // both-parents deletion tripwire. For a conflict-resolution review, diff the resolution
         // against BOTH merge parents; if it removed a surface a merged parent
         // added, halt auto-progression — the task is held in `blocked:
         // deletion_signoff` pending explicit operator sign-off instead of
@@ -590,7 +590,7 @@ impl WorkerCompletionHandler {
             }
         };
 
-        // P992 task 9: increment the review cycle counter and record
+        // Increment the review cycle counter and record
         // last_reviewed_sha. This happens regardless of whether a revision
         // was warranted — the cycle ticks on every completed reviewer pass.
         // A failure here is non-fatal (the task is already in in_review).
@@ -602,7 +602,7 @@ impl WorkerCompletionHandler {
         // `WorkDb::review_cycle_root_id`.
         let cycle_root_id = self.work_db.review_cycle_root_id(producing_task_id);
 
-        // T366: dedup at the revision-minting end too. If a prior COMPLETED
+        // Dedup at the revision-minting end too. If a prior COMPLETED
         // review pass already recorded this exact head sha as reviewed
         // (`last_reviewed_sha`), this pass is a redundant duplicate review of
         // unchanged code — e.g. two independent `pr_review` executions raced
@@ -642,7 +642,7 @@ impl WorkerCompletionHandler {
                 trigger,
                 "pr_review finalize: this pass reviewed a head sha a prior completed pass \
                  already recorded as reviewed; skipping review_cycle increment and findings \
-                 revision to avoid minting a duplicate (T366 duplicate-review guard)",
+                 revision to avoid minting a duplicate (duplicate-review guard)",
             );
         } else if let Err(err) = self
             .work_db
@@ -689,7 +689,7 @@ impl WorkerCompletionHandler {
         let product_id = completion.work_item.product_id().to_string();
         let work_item_id = work_item_id(&completion.work_item);
 
-        // incident-002 P2 gate: the deletion tripwire fired, so the task is now
+        // incident-002 postmortem gate: the deletion tripwire fired, so the task is now
         // held in `blocked: deletion_signoff`. File the operator sign-off
         // surface enumerating the removed merged-parent surfaces and stop — no
         // revision is created (deletion of merged code is an operator decision,
@@ -722,7 +722,7 @@ impl WorkerCompletionHandler {
             return StopOutcome::ReviewPassCompleted { pr_url };
         }
 
-        // P992 task 8: if the severity gate passed, create a revision on the
+        // If the severity gate passed, create a revision on the
         // producing task with the rendered findings as revision instructions.
         // The revision is dispatched on the general worker pool (autostart = true,
         // the default). Nothing is posted to GitHub — feedback stays inside Boss.
@@ -798,7 +798,7 @@ impl WorkerCompletionHandler {
         StopOutcome::ReviewPassCompleted { pr_url }
     }
 
-    /// incident-002 P2: compute the rationale-independent both-parents deletion
+    /// incident-002 postmortem: compute the rationale-independent both-parents deletion
     /// tripwire for a conflict-resolution review.
     ///
     /// Returns rendered description lines for each merged-parent surface the
@@ -970,8 +970,7 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// Evaluate the no-op / trivial-diff skip gate for the automated reviewer
-    /// (P992 design §8).
+    /// Evaluate the no-op / trivial-diff skip gate for the automated reviewer.
     ///
     /// Returns `Some(reason)` when the reviewer pass should be skipped,
     /// or `None` when a full review is warranted.

@@ -1075,7 +1075,7 @@ fn failing_check(name: &str) -> crate::merge_poller::RequiredCheckFailure {
     }
 }
 
-// ── P992 task 10: no-op / trivial-diff skip gate ──────────────────────────
+// ── No-op / trivial-diff skip gate ──────────────────────────
 //
 // Helper that creates a fixture with `last_reviewed_sha` already set on the
 // chore (simulating a prior review cycle) and stages a PR URL, then returns
@@ -1122,7 +1122,7 @@ fn make_review_transcript_jsonl(review_result_json: &str) -> String {
 }
 
 /// Build a JSONL transcript line containing `review_result_json` as **bare
-/// JSON** (no ` ```json ` fence). Simulates the T1359 failure mode where the
+/// JSON** (no ` ```json ` fence). Simulates the failure mode where the
 /// model emits the ReviewResult inline after prose without any code fence.
 fn make_bare_review_transcript_jsonl(review_result_json: &str) -> String {
     let text = format!(
@@ -1297,10 +1297,10 @@ fn high_finding_review_result_json(pr_url: &str) -> String {
     .to_string()
 }
 
-/// Produce a `ReviewResult` JSON with a LOW severity REGRESSION finding
-/// (the T793 check class). Even though the severity is low, the engine's
+/// Produce a `ReviewResult` JSON with a LOW severity REGRESSION finding.
+/// Even though the severity is low, the engine's
 /// gate must fire because `category = "regression"` overrides severity.
-fn t793_regression_review_result_json(pr_url: &str) -> String {
+fn regression_class_finding_review_result_json(pr_url: &str) -> String {
     serde_json::json!({
         "pr_url": pr_url,
         "head_sha": "sha_reviewed_abc123",
@@ -1334,10 +1334,10 @@ fn open_pr_checker() -> Arc<dyn crate::work::PrStateChecker> {
 }
 
 /// Produce a `ReviewResult` JSON where `suspected_deletions` is a string
-/// array — the T1687/PR#1497 shape that previously caused the serde
+/// array — the PR#1497 shape that previously caused the serde
 /// type-mismatch error "invalid type: string, expected struct ReviewFinding"
 /// and silently rejected the entire review.
-fn t1687_regression_string_deletions_json(pr_url: &str) -> String {
+fn string_shaped_deletions_review_result_json(pr_url: &str) -> String {
     serde_json::json!({
         "pr_url": pr_url,
         "head_sha": "sha_reviewed_abc123",
@@ -1355,7 +1355,7 @@ fn t1687_regression_string_deletions_json(pr_url: &str) -> String {
         ],
         "regression_check": {
             "performed": true,
-            // Reviewer filled this with strings — the T1687 shape.
+            // Reviewer filled this with strings instead of structured objects.
             "suspected_deletions": [
                 "config_dir-scoped exclude_files matching removed without replacement"
             ]
@@ -1365,7 +1365,7 @@ fn t1687_regression_string_deletions_json(pr_url: &str) -> String {
 }
 
 /// A `ReviewResult` JSON with a single `duplication`-category finding —
-/// the T192/rec_engine motivating incident (a crate extraction left two
+/// the rec_engine motivating incident (a crate extraction left two
 /// complete copies of the same module in the PR). Severity is
 /// deliberately `medium`: duplication forces a revision regardless of
 /// severity (see `passes_severity_gate`), so this also proves the

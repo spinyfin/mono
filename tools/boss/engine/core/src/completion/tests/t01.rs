@@ -344,7 +344,7 @@ async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
     } = TestHarness::new(db.clone(), detector);
     let outcome = handler.on_stop(&execution_id).await;
 
-    // P992 task 7: chore_implementation now enqueues a reviewer and holds
+    // chore_implementation now enqueues a reviewer and holds
     // the task in `active` until the reviewer resolves.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
@@ -434,7 +434,7 @@ async fn on_stop_uses_staged_pr_url_and_skips_detector() {
         )));
 
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds the task and enqueues reviewer.
+    // chore_implementation holds the task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
             if pr_url == "https://github.com/spinyfin/mono/pull/458"),
@@ -497,7 +497,7 @@ async fn on_stop_with_no_staged_url_still_falls_back_to_detector() {
     // empty cache. The detector must be invoked.
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds the task and enqueues reviewer.
+    // chore_implementation holds the task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
         "expected ReviewerEnqueued; got {outcome:?}",
@@ -547,7 +547,7 @@ async fn recheck_for_pr_uses_staged_pr_url_and_skips_detector() {
     // shortcut, recheck must succeed without ever touching the
     // detector.
     let outcome = handler.recheck_for_pr(&execution_id).await;
-    // P992 (regression fix): chore_implementation advances to in_review and
+    // chore_implementation advances to in_review and
     // enqueues an async reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
@@ -571,7 +571,7 @@ async fn recheck_for_pr_uses_staged_pr_url_and_skips_detector() {
 
 #[tokio::test]
 async fn recheck_for_pr_staged_url_rejected_on_branch_mismatch() {
-    // T520 / T523 regression: a staged URL whose PR belongs to a
+    // Regression: a staged URL whose PR belongs to a
     // different execution's branch must be silently dropped, and the
     // recheck must fall through to the cold-path detector (which
     // sees no PR for the correct branch) rather than incorrectly
@@ -588,7 +588,7 @@ async fn recheck_for_pr_staged_url_rejected_on_branch_mismatch() {
     let handler = handler
         .with_staged_pr_urls(staged_pr_urls.clone())
         // PR #579 belongs to a DIFFERENT execution's branch — simulate
-        // the mismatch that killed T520's worker.
+        // the mismatch that killed the worker in the original regression.
         .with_branch_verifier(StubBranchVerifier::ok("boss/exec_some_other_exec_id"));
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
@@ -918,7 +918,7 @@ async fn on_stop_staged_url_associates_prefix_divergent_branch() {
         .with_branch_verifier(StubBranchVerifier::ok(&divergent_branch));
 
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 (regression fix): chore_implementation advances to in_review and
+    // chore_implementation advances to in_review and
     // enqueues an async reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
@@ -1145,7 +1145,7 @@ async fn force_release_no_lease_skips_cube_release() {
     assert!(cube.release_calls.lock().await.is_empty());
 }
 
-/// T981 regression — the lease-release gate. When the pane releaser
+/// Regression test for the lease-release gate. When the pane releaser
 /// reports `NoLiveWorker` (the worker is still mid-spawn: no slot
 /// mapped, no pid to reap), `force_release` must NOT free the cube
 /// lease. Freeing it would hand a workspace the worker is about to
@@ -1178,7 +1178,7 @@ async fn force_release_mid_spawn_holds_cube_lease() {
     assert_eq!(execution.workspace_path.as_deref(), workspace.path().to_str());
 }
 
-/// T981 regression — `cancel_and_release` racing the spawn window.
+/// Regression test for `cancel_and_release` racing the spawn window.
 /// It cancels the execution row (so the reconciler won't redispatch)
 /// but, with the worker still mid-spawn, must leave the lease held —
 /// the in-flight run reaps + releases once its spawn settles.
@@ -1233,7 +1233,7 @@ async fn cancel_and_release_with_live_worker_releases_lease() {
 /// Regression guard for the "delete-while-doing" lifecycle bug: deleting a
 /// work item while its worker is actively running must tear down the worker
 /// fully — process kill, pool slot release, and cube lease release — not
-/// just mark the DB row terminal (the T1089 cancel-without-reap failure
+/// just mark the DB row terminal (a cancel-without-reap failure
 /// mode).
 ///
 /// `handle_delete_work_item` detects a live execution and spawns
@@ -1302,7 +1302,7 @@ async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execu
 /// complete into a zombie. `handle_delete_work_item` still spawns
 /// `cancel_and_release` here exactly as it does for the delete-while-doing
 /// case above; the pane releaser reports `NoLiveWorker` because no slot
-/// is mapped yet, which is the T981 gate: releasing the cube lease now
+/// is mapped yet, which is the mid-spawn lease-release gate: releasing the cube lease now
 /// would hand a workspace the in-flight spawn is about to occupy back to
 /// cube, causing a same-workspace collision the moment it lands. So the
 /// execution row is cancelled immediately (the reconciler will never
@@ -1363,7 +1363,7 @@ async fn duplicate_stop_after_pr_detection_is_idempotent() {
     let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
 
-    // P992 task 7: first Stop enqueues reviewer and holds task in active.
+    // first Stop enqueues reviewer and holds task in active.
     assert!(matches!(
         handler.on_stop(&execution_id).await,
         StopOutcome::ReviewerEnqueued { .. }
@@ -1547,7 +1547,7 @@ async fn cross_execution_attribution_uses_per_execution_branch_name() {
     let alice_outcome = alice_handler.on_stop(&alice_exec).await;
     let bob_outcome = bob_handler.on_stop(&bob_exec).await;
 
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     let alice_url = match alice_outcome {
         StopOutcome::ReviewerEnqueued { pr_url } => pr_url,
         other => panic!("alice expected ReviewerEnqueued, got {other:?}"),
@@ -1633,7 +1633,7 @@ async fn stale_stop_from_superseded_workspace_occupant_is_ignored() {
         "a leaked stale Stop must not release any cube lease",
     );
 
-    // P992 task 7: the live execution's Stop enqueues a reviewer and
+    // the live execution's Stop enqueues a reviewer and
     // holds the live chore in active.
     assert!(
         matches!(handler.on_stop(&live_exec).await, StopOutcome::ReviewerEnqueued { .. }),
@@ -1692,7 +1692,7 @@ async fn waiting_human_status_invokes_detector_with_expected_branch() {
 
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
         "expected ReviewerEnqueued; got {outcome:?}",
@@ -1917,7 +1917,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
     let outcome = handler.on_stop(&execution.id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     match outcome {
         StopOutcome::ReviewerEnqueued { pr_url } => {
             assert_eq!(
@@ -2009,7 +2009,7 @@ async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
         "the sweep must recover exactly one missed PR-open transition, got {outcome:?}",
     );
 
-    // P992 task 7: chore held in `active` with pr_url stamped
+    // chore held in `active` with pr_url stamped
     // (reviewer is enqueued to run the review pass).
     let item = db.get_work_item(&chore_id).unwrap();
     match item {

@@ -160,7 +160,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
         outcome2.pr_recheck_unresolved, 0,
         "no candidates should remain unresolved after the recovery pass",
     );
-    // P992 task 7: chore_implementation holds tasks in `active` while
+    // chore_implementation holds tasks in `active` while
     // reviewers are enqueued (not advanced to in_review yet).
     for chore_id in [c1.as_str(), chore2.id.as_str(), chore3.id.as_str()] {
         let item = db.get_work_item(chore_id).unwrap();
@@ -335,7 +335,7 @@ async fn on_stop_calls_detector_when_feature_flag_defaults_on() {
     let handler = handler.with_feature_flags(flags);
 
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
         "default-ON must still let `detect_pr` fire; got {outcome:?}",
@@ -371,7 +371,7 @@ async fn on_stop_calls_detector_when_feature_flag_defaults_on() {
 
 #[tokio::test]
 async fn resume_push_to_bound_pr_finalizes_without_nudge() {
-    // T495-style scenario: chore already had PR 606 bound from a
+    // Resume scenario: chore already had PR 606 bound from a
     // prior run, this run pushed a fix commit so the bound PR's
     // head moved during the run. The cold-path detector would
     // miss the PR (it searches by the new execution's branch
@@ -401,7 +401,7 @@ async fn resume_push_to_bound_pr_finalizes_without_nudge() {
     let handler = handler.with_branch_verifier(verifier);
 
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/606"),
         "SHA-delta gate must finalize the bound PR when the head moved; got {outcome:?}",
@@ -443,7 +443,7 @@ async fn resume_without_push_to_bound_pr_still_probes() {
     //
     // A PR is already bound, though, so the nudge must point the
     // worker at the *existing* PR (never `gh pr create`): this is
-    // the T541/T686 defect family. The first nudge fires under the
+    // this defect family (nudging with "create a PR" when one already exists). The first nudge fires under the
     // circuit-breaker cap.
     let workspace = tempdir().unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/606";
@@ -506,7 +506,7 @@ async fn new_pr_flow_still_falls_through_to_cold_detector() {
     let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
     let outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
         "expected ReviewerEnqueued; got {outcome:?}",
@@ -533,7 +533,7 @@ async fn resume_with_missing_snapshot_nudges_to_existing_pr_not_create() {
     // so the SHA-delta gate is inapplicable and the cold-path
     // branch detector runs — and misses the PR, because it searches
     // this execution's own branch. Pre-fix that false miss queued
-    // `PROBE_NO_PR` ("create a PR"); per T686 the bound PR must be
+    // `PROBE_NO_PR` ("create a PR"); the bound PR must be
     // resolved from the structured `pr_url` even with no snapshot,
     // so the worker is pointed at the existing PR instead.
     let workspace = tempdir().unwrap();
@@ -571,7 +571,7 @@ async fn resume_with_missing_snapshot_nudges_to_existing_pr_not_create() {
 // -----------------------------------------------------------
 // Auto-nudge circuit breaker (the Worf incident).
 //
-// exec_18b3945c5b7d7e78_1b (ci_remediation on chore T735) was sent
+// exec_18b3945c5b7d7e78_1b (ci_remediation on a chore) was sent
 // the "produce a PR" nudge 20 times because the chore's PR #869 was
 // bound on a sibling chore_implementation exec, not on the
 // remediation exec's own row — the branch-keyed cold-path search
@@ -820,7 +820,7 @@ async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
 }
 
 // -----------------------------------------------------------
-// T1868: sanctioned no-op terminal for chore_implementation.
+// Sanctioned no-op terminal for chore_implementation.
 //
 // A fresh chore_implementation worker whose work is already done on
 // main (empty diff, no PR) must be able to terminate cleanly. When it
@@ -960,7 +960,7 @@ async fn no_op_without_marker_still_nudges_to_produce_pr() {
 
 // -----------------------------------------------------------
 // Worker escalation/blocker detection (incident 2026-07-02,
-// exec_18b5243e65ff188_2d / T2085): a worker that emits an
+// exec_18b5243e65ff188_2d): a worker that emits an
 // `[effort-escalation]` or `[blocked]` marker on its Stop boundary must
 // get an attention item filed for the coordinator, and the "produce a
 // PR" auto-nudge must be suppressed while it is unresolved. A
@@ -1567,8 +1567,8 @@ async fn well_formed_deferred_scope_records_audit_line_and_attention_item() {
         &db,
         workspace.path(),
         &execution_id,
-        "Wired T8 and T9 as asked.\n\n\
-         [deferred-scope] summary=\"T11 wiring\" reason=\"needs new data plumbing, not just wiring\"\n",
+        "Wired the auth and billing modules as asked.\n\n\
+         [deferred-scope] summary=\"notifications wiring\" reason=\"needs new data plumbing, not just wiring\"\n",
     );
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
@@ -1585,7 +1585,7 @@ async fn well_formed_deferred_scope_records_audit_line_and_attention_item() {
                 t.description,
             );
             assert!(
-                t.description.contains("T11 wiring"),
+                t.description.contains("notifications wiring"),
                 "audit line must carry the deferred summary; got: {}",
                 t.description,
             );
@@ -1606,7 +1606,7 @@ async fn well_formed_deferred_scope_records_audit_line_and_attention_item() {
         .expect("a deferred_scope attention item must be filed");
     assert_eq!(item.status, "open");
     assert!(
-        item.body_markdown.contains("T11 wiring"),
+        item.body_markdown.contains("notifications wiring"),
         "attention body must carry the marker verbatim; got: {}",
         item.body_markdown,
     );
@@ -1651,7 +1651,7 @@ async fn deferred_scope_does_not_suppress_the_produce_a_pr_nudge() {
         &db,
         workspace.path(),
         &execution_id,
-        "[deferred-scope] summary=\"T11 wiring\" reason=\"needs new data plumbing\"\n",
+        "[deferred-scope] summary=\"notifications wiring\" reason=\"needs new data plumbing\"\n",
     );
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
@@ -1674,7 +1674,7 @@ async fn repeated_stops_do_not_duplicate_the_deferred_scope_record() {
         &db,
         workspace.path(),
         &execution_id,
-        "[deferred-scope] summary=\"T11 wiring\" reason=\"needs new data plumbing\"\n",
+        "[deferred-scope] summary=\"notifications wiring\" reason=\"needs new data plumbing\"\n",
     );
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
@@ -1846,7 +1846,7 @@ async fn coordinator_resolution_resumes_normal_nudging() {
 }
 
 // -----------------------------------------------------------
-// Build-wait suppression (2026-07-14 incident, T2608 / T2612:
+// Build-wait suppression (2026-07-14 log-volume incident:
 // `exec_18c21add1416b5e8_3b`, `exec_18c21ba9b3fd2ef8_9e`). A worker
 // narrating that it is legitimately waiting on a backgrounded
 // build/test gate must not be nudged — each nudge manufactured the
@@ -1963,7 +1963,7 @@ async fn build_wait_horizon_expiry_falls_back_to_normal_nudge() {
 //   1. execution.pr_url was not stamped (older exec) but chain root
 //      has a pr_url: chain-root lookup finds the bound PR. The
 //      SHA-delta gate is Inapplicable (no `pr_head_before` snapshot
-//      either), so the stuck-revision fix (T2130) routes this
+//      either), so the stuck-revision fix routes this
 //      through the satisfied-deliverable gate instead of the old
 //      "push to existing PR" nudge — see
 //      `revision_on_stop_no_pr_head_before_snapshot_*` above for the
@@ -1996,7 +1996,7 @@ async fn revision_with_null_execution_pr_url_falls_back_to_chain_root_pr() {
         StopOutcome::AwaitingInput,
         "revision with no execution.pr_url and no SHA-delta baseline must await quietly",
     );
-    // T2130 fix: with no `pr_head_before` snapshot to compare against and
+    // Stuck-revision fix: with no `pr_head_before` snapshot to compare against and
     // no wired merge probe (satisfied-deliverable check is inconclusive),
     // the revision must NOT be nudged at all — in particular it must
     // never receive PROBE_NO_PR (there is a chain-root PR; `gh pr create`
@@ -2143,7 +2143,7 @@ async fn nudge_breaker_resets_after_worker_finally_opens_pr() {
         })
         .await;
     let final_outcome = handler.on_stop(&execution_id).await;
-    // P992 task 7: chore_implementation holds task and enqueues reviewer.
+    // chore_implementation holds task and enqueues reviewer.
     assert!(
         matches!(final_outcome, StopOutcome::ReviewerEnqueued { .. }),
         "the worker's real PR must finalize; got {final_outcome:?}",

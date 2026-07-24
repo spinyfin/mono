@@ -18,10 +18,10 @@ impl WorkerCompletionHandler {
     ) -> StopOutcome {
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
-        // P992 tasks 7 & 9: for reviewer-triggering executions with a fresh
+        // For reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass
-        // instead of immediately advancing to human Review (design §1).
-        // Task 9 adds: check the cycle bound first — if review_cycle has
+        // instead of immediately advancing to human Review.
+        // This also checks the cycle bound first — if review_cycle has
         // already reached max_review_cycles, skip the reviewer and proceed
         // to InReview with a sticky attention item for the human.
         // If the pr_review execution cannot be created (DB error), fall back
@@ -42,8 +42,8 @@ impl WorkerCompletionHandler {
                     } else {
                         "primary_push"
                     };
-                    // P992 tasks 9 & 10: read cycle state once — used by both
-                    // the no-op gate (task 10) and the cycle-bound check (task 9).
+                    // Read cycle state once — used by both
+                    // the no-op gate and the cycle-bound check below.
                     // Tracked on the review-cycle root (chain root for a
                     // revision, the task itself otherwise) so cycle-bound and
                     // no-op-skip state accumulates across the whole revision
@@ -68,7 +68,7 @@ impl WorkerCompletionHandler {
                             }
                         };
 
-                    // P992 task 10: no-op / trivial-diff skip gate. Runs before
+                    // No-op / trivial-diff skip gate. Runs before
                     // the cycle-bound check so a pure rebase doesn't consume a
                     // cycle slot or surface an attention item.
                     let noop_skip_reason = self
@@ -85,7 +85,7 @@ impl WorkerCompletionHandler {
                         );
                         false
                     } else {
-                        // P992 task 9: cycle bound check.
+                        // Cycle bound check.
                         let cycle_bound_reached = (review_cycle as usize) >= max_cycles;
 
                         if cycle_bound_reached {
@@ -116,7 +116,7 @@ impl WorkerCompletionHandler {
                             });
                             false
                         } else {
-                            // T366: dedup-and-insert atomically, closing the race where
+                            // Dedup-and-insert atomically, closing the race where
                             // two independent completion triggers (the Stop-hook path
                             // and the merge-poller's `pr_recheck` sweep) each observe
                             // the producing execution as not-yet-terminal around the

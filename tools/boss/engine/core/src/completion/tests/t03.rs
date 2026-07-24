@@ -123,7 +123,7 @@ async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
 // -----------------------------------------------------------
 // Revision task completion via SHA-delta gate in recheck_for_pr
 //
-// Reproduces T848: a revision worker pushed its commit to the parent
+// Reproduces a regression where a revision worker pushed its commit to the parent
 // PR but the revision task stayed in `doing` (active). The on_stop SHA
 // delta gate failed transiently; the merge-poller's recheck_for_pr had
 // no SHA-delta fallback, so the revision was stranded forever.
@@ -137,7 +137,7 @@ async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
 
 #[tokio::test]
 async fn recheck_for_pr_sha_delta_advances_revision_to_in_review() {
-    // T848 regression: revision worker pushed a commit to the parent
+    // Regression: revision worker pushed a commit to the parent
     // PR (head SHA changed), but `on_stop` failed to detect it (GitHub
     // API timeout during SHA fetch). The merge-poller's `recheck_for_pr`
     // should advance the revision to `in_review` on the next sweep via
@@ -148,7 +148,7 @@ async fn recheck_for_pr_sha_delta_advances_revision_to_in_review() {
     // None for revisions (they never open their own PR), so the revision
     // stayed in `active` indefinitely.
     //
-    // The SHA-delta gate is gated on `stop_seen` (T1503/T1496 fix): it only
+    // The SHA-delta gate is gated on `stop_seen`: it only
     // fires after `on_stop_inner` has been called at least once. Here we
     // stamp `stop_seen` manually to simulate a prior on_stop that failed
     // transiently — this is the recovery path the gate is designed for.
@@ -265,7 +265,7 @@ async fn recheck_for_pr_sha_unchanged_leaves_revision_active() {
 }
 
 // -----------------------------------------------------------
-// 2026-07-14 incident (T342 / exec_18c2124d2f06d768_106d): a revision
+// 2026-07-14 incident (exec_18c2124d2f06d768_106d): a revision
 // worker's fix was pushed and its Stop was terminal, but the row was
 // neither reaped nor advanced. Root-caused to three chained defects,
 // each regression-guarded below:
@@ -720,7 +720,7 @@ async fn recheck_finalizes_metadata_only_revision_after_ci_greens_when_marked() 
 
 #[tokio::test]
 async fn recheck_does_not_finalize_unmarked_revision_even_with_green_ci() {
-    // The #1262 regression guard (T1256 R1 dead worker, T1265 R2 live
+    // The #1262 regression guard (round 1: dead worker, round 2: live
     // worker). The bound PR head is unchanged and CI is GREEN, but
     // on_stop never stamped the marker (the worker died / was reaped
     // before reaching a clean Stop with an operator-visible delta). The
@@ -776,20 +776,20 @@ async fn recheck_does_not_finalize_unmarked_revision_even_with_green_ci() {
 }
 
 // -----------------------------------------------------------
-// T939 regression: revision on_stop with pr_head_before set
+// Regression: revision on_stop with pr_head_before set
 //
 // When on_stop fires for a revision_implementation execution in
 // waiting_human status with pr_head_before captured at execution start:
 //   1. SHA-delta Contributed (worker pushed) → finalize directly, no nudge.
 //   2. SHA-delta Inapplicable due to transient API failure → return quietly,
 //      no nudge (avoids the probe loop: probe → response → Stop → nudge →
-//      repeat that kept Crusher stuck in T939).
+//      repeat that kept Crusher stuck).
 // The merge poller's recheck_for_pr handles case 2 when the API recovers.
 // -----------------------------------------------------------
 
 #[tokio::test]
 async fn revision_on_stop_sha_delta_contributed_finalizes_with_no_nudge() {
-    // T939 ideal path: the revision worker pushed commits to the parent PR
+    // Ideal path: the revision worker pushed commits to the parent PR
     // branch (head SHA moved). on_stop detects the contribution via the
     // SHA-delta gate and finalizes without queuing any nudge probe.
     let workspace = tempdir().unwrap();
@@ -858,7 +858,7 @@ async fn revision_on_stop_sha_delta_contributed_finalizes_with_no_nudge() {
 
 #[tokio::test]
 async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
-    // T939 regression fix: when on_stop fires for a revision_implementation
+    // Regression fix: when on_stop fires for a revision_implementation
     // execution in waiting_human with pr_head_before set, but the GitHub
     // API fails transiently (SHA-delta gate → Inapplicable), the engine
     // must NOT queue a nudge probe. Queuing a probe causes the worker to
@@ -892,7 +892,7 @@ async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
     assert!(
         probes.snapshot().is_empty(),
         "revision must NOT be nudged when SHA-delta fails with pr_head_before set \
-         (T939 regression guard); got {:?}",
+         (regression guard); got {:?}",
         probes.snapshot(),
     );
     // Execution must still be waiting_human — not completed, not parked.
@@ -905,7 +905,7 @@ async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
 }
 
 // -----------------------------------------------------------
-// Stuck-revision-on-Stop regression (T2130 / exec_18b5d1ea40c1380_45b):
+// Stuck-revision-on-Stop regression (exec_18b5d1ea40c1380_45b):
 // a revision worker pushes its fix commit to the parent PR and stops
 // cleanly, but `pr_head_before` was NEVER captured for this execution
 // (the dispatch-time `on_execution_started` snapshot failed, or the
@@ -938,7 +938,7 @@ async fn revision_on_stop_no_pr_head_before_snapshot_finalizes_via_satisfied_del
         "0000000000000000000000000000000000000000",
     );
     // Simulate a dispatch-time snapshot that never landed: no baseline
-    // exists for this execution's whole lifetime, unlike the T939
+    // exists for this execution's whole lifetime, unlike the sibling regression
     // fixtures above which all carry a valid `pr_head_before`.
     {
         let conn = db.connect().unwrap();
@@ -974,7 +974,7 @@ async fn revision_on_stop_no_pr_head_before_snapshot_finalizes_via_satisfied_del
         "on_stop must finalize a revision with no SHA-delta baseline once the bound PR is \
          satisfied (CI clean, no conflict); got {outcome:?}",
     );
-    // No nudge — the T939-class probe loop must not fire for this case either.
+    // No nudge — the same-class probe loop must not fire for this case either.
     assert!(
         probes.snapshot().is_empty(),
         "no probe must fire when the revision finalises via the satisfied-deliverable gate; \
@@ -1229,7 +1229,7 @@ async fn revision_merge_queue_rejection_still_falls_through_to_nudge() {
 
 #[tokio::test]
 async fn conflict_revision_signal_cleared_retires_attempt_and_finalises() {
-    // Riker scenario (T927 / exec_18b431dc9b016e88_1a regression):
+    // Riker scenario (exec_18b431dc9b016e88_1a regression):
     // conflict-resolution revision worker stops without pushing because
     // the conflict was already resolved by a sibling. The SHA-delta gate
     // returns NoContribution; the signal-cleared gate must detect the PR
@@ -1589,10 +1589,9 @@ async fn conflict_revision_with_terminal_attempt_is_not_second_guessed() {
     );
 }
 
-
 #[tokio::test]
 async fn conflict_revision_on_stop_no_baseline_finalizes_without_false_failure() {
-    // Second manifestation of the T2130 incident class (operator note,
+    // Second manifestation of the same incident class (operator note,
     // 2026-07-02): two conflict-resolution revision workers resolved
     // their conflicts, pushed the merge commit, posted a resolution
     // comment, and stopped cleanly — then the engine marked BOTH
@@ -1914,10 +1913,9 @@ async fn conflict_revision_superseded_attempt_not_refused_on_no_contribution_pat
     );
 }
 
-
 #[tokio::test]
 async fn conflict_revision_finalizes_on_mergeability_alone_even_when_ci_not_clean() {
-    // 2026-07-03 incident (exec_18be836b10baae8_35 / T2154): the periodic
+    // 2026-07-03 incident (exec_18be836b10baae8_35): the periodic
     // merge-poller sweep (`conflict_watch::on_resolved`) can retire the
     // `conflict_resolutions` ledger row to `succeeded` and snap the
     // parent chore back to `in_review` on its own schedule, independent
@@ -2070,7 +2068,7 @@ async fn conflict_revision_awaiting_input_leaves_attempt_pending() {
 
 #[tokio::test]
 async fn ci_revision_target_check_cleared_retires_despite_other_failing() {
-    // T57 / linkedin-multiproduct/rdev-base-image#440 regression: a
+    // linkedin-multiproduct/rdev-base-image#440 regression: a
     // CI-remediation revision worker fixed the "Pull Request Description"
     // check via a metadata-only `gh pr edit` (NO commit → SHA-delta gate
     // returns NoContribution). The target check is now green, but the PR

@@ -93,7 +93,7 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Override the automated-reviewer cycle cap (P992 design §7).
+    /// Override the automated-reviewer cycle cap.
     /// Production wires in `WorkConfig.max_review_cycles` via `app.rs`;
     /// tests that need to exercise the cycle-bound path set it low.
     pub fn with_max_review_cycles(mut self, max: usize) -> Self {
@@ -110,7 +110,7 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Override the trivial-diff skip threshold (P992 design §8).
+    /// Override the trivial-diff skip threshold.
     /// Production wires in `WorkConfig.min_review_changed_lines` via `app.rs`;
     /// tests that exercise the trivial-diff path set it to a small value.
     pub fn with_min_review_changed_lines(mut self, min: u64) -> Self {
@@ -119,7 +119,7 @@ impl WorkerCompletionHandler {
     }
 
     /// Override the PR state checker used by `finalize_pr_review_pass` when
-    /// creating a revision (P992 task 8). Tests inject
+    /// creating a revision. Tests inject
     /// `FakePrStateChecker::always(Open)` to avoid live `gh` calls.
     #[cfg(test)]
     pub(super) fn with_pr_state_checker(mut self, checker: Arc<dyn crate::work::PrStateChecker>) -> Self {
@@ -171,23 +171,23 @@ impl WorkerCompletionHandler {
     }
 
     /// Whether the rung-1 engine-direct mechanical rebase is enabled on the
-    /// conflict-watch path (T4). Read by the merge poller's conflict sweep to
+    /// conflict-watch path. Read by the merge poller's conflict sweep to
     /// decide whether to hand `on_conflict_detected` a live `CubeClient` for
     /// the escalation ladder. Default OFF (see the flag registry).
     pub fn mechanical_rebase_enabled(&self) -> bool {
         self.feature_flags.is_enabled("conflict_ladder_mechanical_rebase")
     }
 
-    /// Whether the speculative conflict-prediction sweep is enabled (Layer 4
-    /// / T10). Read by the merge poller's periodic loop to decide whether to
+    /// Whether the speculative conflict-prediction sweep is enabled (Layer 4).
+    /// Read by the merge poller's periodic loop to decide whether to
     /// run [`crate::speculative_conflict::run_speculative_pass`] alongside
     /// the normal full sweep. Default OFF (see the flag registry).
     pub fn speculative_conflict_prediction_enabled(&self) -> bool {
         self.feature_flags.is_enabled("speculative_conflict_prediction")
     }
 
-    /// Whether the stacked-PR auto-structuring sweep is enabled (Layer 4 /
-    /// T11). Read by the merge poller's periodic loop to decide whether to
+    /// Whether the stacked-PR auto-structuring sweep is enabled (Layer 4).
+    /// Read by the merge poller's periodic loop to decide whether to
     /// run [`crate::stacked_pr_structuring::run_stacking_pass`] alongside the
     /// normal full sweep. Default OFF (see the flag registry).
     pub fn stacked_pr_auto_structuring_enabled(&self) -> bool {

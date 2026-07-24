@@ -31,7 +31,7 @@ impl WorkerCompletionHandler {
         if !execution.status.is_live() {
             return StopOutcome::AlreadyTerminal;
         }
-        // P992 task 7: reviewer executions never open a PR; skip the
+        // Reviewer executions never open a PR; skip the
         // PR-detection recheck entirely. The reviewer's Stop path already
         // drives its resolution via finalize_pr_review_pass.
         if execution.kind == ExecutionKind::PrReview {
@@ -95,14 +95,14 @@ impl WorkerCompletionHandler {
         // executions: the cold-path branch-keyed detector always returns None
         // for revisions because they have no branch of their own. The SHA-delta
         // gate is therefore the only fallback that can advance a revision from
-        // `active` to `in_review` when `on_stop_inner` failed transiently (T848).
+        // `active` to `in_review` when `on_stop_inner` failed transiently.
         //
         // For `revision_implementation` executions the `Contributed` arm uses
         // `revision_stop_contributed_head` (stamped by `on_stop_inner` when it
         // confirmed the revision's own push) as the finalization gate:
         //
-        // - `head_now == revision_stop_contributed_head` → T848 recovery: the
-        //   revision pushed this exact head, on_stop_inner attempted finalization
+        // - `head_now == revision_stop_contributed_head` → transient on_stop_inner
+        //   failure recovery: the revision pushed this exact head, on_stop_inner attempted finalization
         //   but failed transiently; retry now.
         // - `head_now != revision_stop_contributed_head` (including NULL) → head
         //   moved from a *different* worker (parent chore's concurrent push);
@@ -120,14 +120,14 @@ impl WorkerCompletionHandler {
                     .get_revision_stop_contributed_head(execution_id)
                     .unwrap_or(None);
                 if committed_head.as_deref() == Some(head_now.as_str()) {
-                    // T848 recovery: on_stop_inner confirmed this head was the
-                    // revision's own push; finalize now.
+                    // Transient on_stop_inner failure recovery: on_stop_inner confirmed
+                    // this head was the revision's own push; finalize now.
                     tracing::info!(
                         execution_id,
                         pr_url = %pr_url,
                         head_now = %head_now,
                         "pr-recheck: revision_stop_contributed_head matches current head — \
-                         finalising (T848 recovery)",
+                         finalising (transient on_stop_inner failure recovery)",
                     );
                     return self
                         .finalize_pr_transition(
@@ -147,7 +147,7 @@ impl WorkerCompletionHandler {
                 // idle (PaneSpawnRunner sets it at pane spawn), so this
                 // periodic sweep can land between the worker's push and its
                 // own Stop event. Do NOT mutate `pr_head_before` here —
-                // 2026-07-14 incident (T342 / exec_18c2124d2f06d768_106d):
+                // 2026-07-14 incident (exec_18c2124d2f06d768_106d):
                 // a poller sweep raced a live worker's in-flight push,
                 // absorbed the just-pushed head as the new baseline here,
                 // and when the worker's own on_stop ran moments later its
@@ -244,7 +244,7 @@ impl WorkerCompletionHandler {
         // 100-PR API cap looking for a branch that can never exist). Every
         // inconclusive sweep landed here and burned that futile scan before
         // reaching the exact same `AwaitingInput` outcome a quiet skip
-        // reaches directly (2026-07-14 incident, T342 /
+        // reaches directly (2026-07-14 incident,
         // exec_18c2124d2f06d768_106d — the poller looped this scan every
         // sweep until an unrelated recovery path noticed the PR had
         // merged). Skip straight to that outcome instead.

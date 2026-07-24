@@ -31,7 +31,7 @@ impl WorkerCompletionHandler {
         // still mid-spawn (no slot mapped yet, no pid to reap) reports
         // `NoLiveWorker` — releasing its lease now would hand a
         // workspace it is about to occupy back to cube, which re-leases
-        // it into a same-workspace collision (T981). In that case the
+        // it into a same-workspace collision. In that case the
         // lease stays held; the in-flight `run_execution` reaps the
         // worker once its spawn settles and releases the lease then.
         if matches!(
