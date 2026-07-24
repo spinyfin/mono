@@ -17,7 +17,7 @@ crate::register_counter!(
 );
 
 /// Increment the per-product, per-class conflict counter for one
-/// newly-classified conflict event (Layer 0 telemetry, T5 — see
+/// newly-classified conflict event (Layer 0 telemetry — see
 /// `tools/boss/docs/designs/merge-conflict-reduction-and-fast-
 /// resolution-for-parallel-tasks.md`, "Counters — must be scopable
 /// per-product"). `product_id` isn't a fixed set known at compile

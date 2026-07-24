@@ -555,7 +555,7 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
         },
         // Fast-fail: a terminally-failed required check surfaces `Failing`
         // immediately, even while another required check is still running.
-        // This is the T1150 regression fix: commit 1 had these two cases
+        // This is a prior regression fix: it had these two cases
         // returning `InFlight`, which hid real failures until the slowest
         // check finished. If a future change reintroduces the "wait for
         // all terminal" gate, these cases will fail and catch the regression.
@@ -603,11 +603,11 @@ fn parse_probe_covers_ci_leaf_set_matrix() {
                 }],
             },
         },
-        // Regression test for the exact T1150 scenario: a fast check
+        // Regression test for the exact prior-regression scenario: a fast check
         // (e.g. checkleft in 4s) fails terminally while a slow check
         // (e.g. bazel-test) is still running. Must surface Failing at once.
         Case {
-            label: "fast-check terminal fail + slow check running → Failing (T1150 regression)",
+            label: "fast-check terminal fail + slow check running → Failing (prior regression)",
             rollup: serde_json::json!([
                 failing_check("buildkite/mono/checks", "FAILURE", "https://buildkite.com/acme/mono/builds/99"),
                 {
@@ -1236,13 +1236,13 @@ fn parse_probe_surfaces_auto_merge_request() {
     assert_eq!(probe_absent.auto_merge_enabled_at, None);
 }
 
-/// T2467/mono#1904 note: while a PR sits in the merge queue,
+/// mono#1904 note: while a PR sits in the merge queue,
 /// `mergeStateStatus` commonly reads `UNKNOWN` (GitHub is mid-recompute
 /// against the synthetic merge commit). `classify_state`'s conflict
 /// predicate requires *both* `mergeable == CONFLICTING` and
 /// `mergeStateStatus == DIRTY`, so an `UNKNOWN` `mergeStateStatus` can
 /// never trip it regardless of `mergeable` — this pins that down for the
-/// specific queued case (T1752's prior art covers the general
+/// specific queued case (prior art covers the general
 /// UNKNOWN-must-not-be-MERGEABLE rule; this covers the newer
 /// UNKNOWN-must-not-be-CONFLICT-while-queued rule from the same design
 /// note) so conflict_watch never misfires a `blocked: merge_conflict`

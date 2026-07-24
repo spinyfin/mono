@@ -59,10 +59,10 @@ pub struct SweepOutcome {
     /// `blocked: merge_conflict` / `blocked: ci_failure` loop after
     /// observing the PR is still dirty/red. Recovers the invariant
     /// violation where a parent rests `blocked` with no signal while its
-    /// PR conflicts/fails (the T795 / PR #1077 strand).
+    /// PR conflicts/fails (the PR #1077 strand).
     pub stranded_blocked_recanonicalized: usize,
     /// Number of tasks advanced from `active` to `in_review` by the
-    /// reviewer-fallback sweep: tasks held in Doing (P992 `PendingReview`)
+    /// reviewer-fallback sweep: tasks held in Doing (`PendingReview`)
     /// whose `pr_review` execution either finished without advancing them
     /// or has been running past the stale threshold. Ensures the hold
     /// always resolves so no card is stranded in Doing forever.
@@ -312,7 +312,7 @@ pub async fn run_one_pass(
     // for this product.
     run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
 
-    // P992 reviewer-fallback sweep: tasks held in `active` (PendingReview)
+    // reviewer-fallback sweep: tasks held in `active` (PendingReview)
     // while waiting for an AI reviewer pass that has since finished or timed
     // out. Ensures the hold always resolves so no card is stranded in Doing.
     // Timeout: 10 minutes — long enough for the reviewer to complete normally,
@@ -600,7 +600,7 @@ pub(crate) async fn sweep_pending_pr(
                 "merge poller: recovered missed PR-open (PR already merged) for waiting_human worker",
             );
         }
-        // P992 task 7: the PR was detected and an independent reviewer pass
+        // The PR was detected and an independent reviewer pass
         // was enqueued; the producing task is held in active. Count this as a
         // recovery since the producing execution is finalized and progressing.
         StopOutcome::ReviewerEnqueued { pr_url } => {
@@ -667,13 +667,13 @@ pub(crate) async fn sweep_pending_pr(
         // P3b: an answer_agent outcome only comes from the on-Stop
         // finalizer, never from a PR-detection recheck.
         | StopOutcome::AnswerAgent { .. }
-        // P992 task 7: ReviewerEnqueued is handled in its own arm above.
+        // ReviewerEnqueued is handled in its own arm above.
         // ReviewPassCompleted/ReviewPassRevisionCreated/ReviewPassAwaitingResult
         // only come from on-Stop (reviewer finalisation).
         | StopOutcome::ReviewPassCompleted { .. }
         | StopOutcome::ReviewPassRevisionCreated { .. }
         | StopOutcome::ReviewPassAwaitingResult
-        // T1868: the no-op terminal is only reachable on the on-Stop path
+        // The no-op terminal is only reachable on the on-Stop path
         // (it reads the worker's transcript for the NO_CHANGES_NEEDED marker),
         // never from a PR-detection recheck.
         | StopOutcome::NoChangesNeeded { .. }
@@ -744,13 +744,13 @@ pub(crate) async fn sweep_late_pr(
         // P3b: an answer_agent outcome only comes from the on-Stop
         // finalizer, never from a late-PR recheck.
         | StopOutcome::AnswerAgent { .. }
-        // P992 task 7/8: reviewer-related outcomes are handled on the on-Stop
+        // reviewer-related outcomes are handled on the on-Stop
         // path; covered here for exhaustiveness.
         | StopOutcome::ReviewerEnqueued { .. }
         | StopOutcome::ReviewPassCompleted { .. }
         | StopOutcome::ReviewPassRevisionCreated { .. }
         | StopOutcome::ReviewPassAwaitingResult
-        // T1868: the no-op terminal is only reachable on the on-Stop path,
+        // The no-op terminal is only reachable on the on-Stop path,
         // never from a late-PR recheck.
         | StopOutcome::NoChangesNeeded { .. }
         // EscalationPending is only reachable via `nudge_or_park` on the
@@ -827,7 +827,7 @@ pub(crate) async fn sweep_one(
                     // known-open; feed that observation to the gate via a
                     // static checker rather than a redundant `gh pr view`.
                     //
-                    // Escalation ladder (T4): hand `on_conflict_detected` a live
+                    // Escalation ladder: hand `on_conflict_detected` a live
                     // `CubeClient` for the rung-1 engine-direct rebase only when
                     // the `conflict_ladder_mechanical_rebase` flag is enabled.
                     // Off (or no completion handler) → `None` preserves the
@@ -1259,7 +1259,7 @@ pub(crate) async fn maybe_clear_blocked(
             return;
         }
     };
-    // Drift guard (T230): if `task_blocked_signals` is empty but the task
+    // Drift guard: if `task_blocked_signals` is empty but the task
     // still has a non-null `blocked_reason`, the signals table and the
     // scalar got out of sync (e.g. the polymorphic-clear path cleared the
     // signal row before the parent task was cleared). Fall back to the
@@ -1430,7 +1430,7 @@ pub(crate) async fn update_pr_poll_state(
     let raw_merge_queue_state = merge_queue_state_str(probe.in_merge_queue, probe.auto_merge_enabled);
     let raw_merge_queue_detail = merge_queue_detail_json(probe);
 
-    // mono#2023 / T2675: GitHub keeps auto-merge armed (and a merge-queue
+    // mono#2023: GitHub keeps auto-merge armed (and a merge-queue
     // entry alive) while required checks are red — "merge when ready" just
     // waits, it never disarms. Left alone, that strands the card in the
     // macOS kanban's "Merging" section (`merge_queue_state != None` is what
@@ -1509,7 +1509,7 @@ pub(crate) async fn update_pr_poll_state(
         );
     }
 
-    // Lane-demotion trace (mono#2023 / T2675): one log line each way so a
+    // Lane-demotion trace (mono#2023): one log line each way so a
     // card bouncing between Merging and Review because CI is flapping
     // (fail → success → fail) is diagnosable from the trace, mirroring the
     // existing blocked↔in_review flap logging convention used elsewhere in
@@ -1562,7 +1562,7 @@ pub(crate) async fn update_pr_poll_state(
     // still `blocked` or carries an active CI signal/attempt to retire. When
     // CI goes green at a *new* head and the engine's own block was already
     // quiesced (or never armed a side-table signal), no retire fires and the
-    // chip is stranded on an earlier head's failure (the T52 leak). The poll
+    // chip is stranded on an earlier head's failure (a prior leak). The poll
     // observes the truth — `fail → success` at the current head — so broadcast
     // `CiFailureCleared` here as a head-keyed safety net. This is idempotent
     // with any retire-path clear that already ran this sweep: the macOS
@@ -1653,7 +1653,7 @@ pub(crate) async fn mark_merged(
         .await;
 
         // Auto-populate the project's implementation tasks from the merged
-        // design doc (P783 task 7). `on_design_pr_merged` above has just
+        // design doc. `on_design_pr_merged` above has just
         // written the project's design-doc pointer, so the Populator reads
         // it fresh. The enqueue is cheap and synchronous — it spawns the
         // multi-second Planner call on a background task so the poller loop
@@ -1740,12 +1740,12 @@ pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
     pr_number_from_url(pr_url).map(|n| n as i64)
 }
 
-/// P992 reviewer-fallback: advance a task from `active` to `in_review` when
+/// Reviewer-fallback: advance a task from `active` to `in_review` when
 /// its AI reviewer pass has either finished without advancing it (missed Stop
 /// hook) or has been running past the stale threshold (timeout). Ensures the
 /// `PendingReview` hold always resolves so no card is stranded in Doing.
 ///
-/// Incident (2026-07-04, T2235 / PR spinyfin/mono#1766): this fallback used
+/// Incident (2026-07-04, PR spinyfin/mono#1766): this fallback used
 /// to ONLY unstick the kanban lane, silently leaving the PR with no
 /// completed AI review — indistinguishable in the UI from a task that was
 /// reviewed and found clean. Advancing the task now also (a) re-enqueues a
@@ -1838,7 +1838,7 @@ pub(crate) async fn sweep_stalled_reviewer(
             // `advance_pending_review_task_to_in_review` refused to advance
             // because a live non-reviewer execution (an implementation/CI
             // resume) is still working the task — advancing then would strand
-            // that worker in the Review lane (T1577 incident).
+            // that worker in the Review lane (a prior Review-lane incident).
         }
         Err(err) => {
             tracing::warn!(

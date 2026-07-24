@@ -329,7 +329,7 @@ fn classify_ci_collapses_leaves() {
     // Mixed: a terminal failure alongside an in-flight required check
     // surfaces `Failing` IMMEDIATELY (fast-fail). `Fail` dominates
     // `InFlight` for terminal failures — see the function's doc comment
-    // and the T1150 regression note. Hiding a real failure until the
+    // and the prior regression note. Hiding a real failure until the
     // slowest check finishes defeats fast detection; anti-phantom
     // protection lives in the reconcile/withdraw path, not here.
     let mixed = [
@@ -492,4 +492,4 @@ fn leaf_matches_check_name_no_match_is_false() {
     assert!(!leaf_matches_check_name(&leaf, &["ci/lint", "ci/build"]));
 }
 
-// ── record_conflict_class_counter (Layer 0 / T5 per-product counters) ──
+// ── record_conflict_class_counter (Layer 0 per-product counters) ──

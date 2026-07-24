@@ -348,7 +348,7 @@ pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 /// commit 3): a remediation spawned on a terminal failure that a later CI run
 /// then clears is auto-withdrawn and the badge is reset to the authoritative
 /// state. Do NOT re-add a "wait for all checks terminal" gate here — that was
-/// the regression (T1150 commit 1). Phantom prevention belongs in withdraw,
+/// a prior regression. Phantom prevention belongs in withdraw,
 /// not in detection delay.
 ///
 /// Excludes Trunk's own bookkeeping check (`"Trunk Merge Queue (<branch>)"`,
@@ -420,7 +420,7 @@ pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&
     // Fast-fail: a terminal required-check failure surfaces `Failing`
     // immediately, even while other required checks are still running.
     // `Fail` dominates `InFlight` for terminal failures (restoring the
-    // pre-T1150-commit-1 behaviour). Anti-phantom protection lives in the
+    // pre-regression-fix behaviour). Anti-phantom protection lives in the
     // reconcile/withdraw path, not here — see `on_ci_in_flight_supersedes_failure`.
     if !failures.is_empty() {
         return OpenPrCiStatus::Failing { failures };

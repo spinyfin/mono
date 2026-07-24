@@ -155,10 +155,10 @@ fn make_chore_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, Strin
     (product.id, chore.id)
 }
 
-/// Build a `kind = 'chore'` row held `active` (P992 `PendingReview`)
+/// Build a `kind = 'chore'` row held `active` (`PendingReview`)
 /// with a `pr_review` execution in the given terminal-but-not-completed
 /// status — the reviewer-fallback candidate shape
-/// `list_tasks_with_stalled_reviewer` targets (T2235 / PR #1766: a
+/// `list_tasks_with_stalled_reviewer` targets (PR #1766: a
 /// `pr_review` pane-spawn failure left the execution `failed` while the
 /// task stayed `active`).
 fn make_chore_active_with_dead_review(db: &WorkDb, name: &str, pr_url: &str, review_status: &str) -> (String, String) {

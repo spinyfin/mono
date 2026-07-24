@@ -580,7 +580,7 @@ async fn sweep_with_attempt_runs_retire_path_end_to_end() {
 
 #[tokio::test]
 async fn stranded_blocked_parent_with_dirty_pr_regains_signal_and_respawns_revision() {
-    // Regression for the T795 / PR #1077 strand, parameterised over both
+    // Regression for the PR #1077 strand, parameterised over both
     // signal kinds so a conflict-only or ci-only regression cannot hide.
     //
     // Setup: the parent ran an earlier remediation (an attempt + revision
@@ -1110,7 +1110,7 @@ async fn budget_exhausted_surfaces_attention_item() {
 ///      persisted `ci_required_state` is `"in_progress"` — never `"fail"`.
 ///      (Note: a rollup with a *terminal* failing leaf + a still-running
 ///      check now correctly classifies as `Failing` immediately — see the
-///      T1150 fast-fail fix and `fast-check terminal fail + slow check
+///      prior fast-fail fix and `fast-check terminal fail + slow check
 ///      running` matrix case. This test uses a pure in-flight probe with
 ///      no failing leaves at all.)
 ///   2. A `Failing` probe spawns exactly one remediation and the attempt
@@ -1412,7 +1412,7 @@ async fn opt_out_label_blocks_conflict_flip_through_sweep() {
     assert!(publisher.lifecycle_reasons().await.is_empty());
 }
 
-/// T230 scenario integration test: worker B resolved against stale main
+/// Drift-guard scenario integration test: worker B resolved against stale main
 /// SHA (already-succeeded crz), but PR is still CONFLICTING. The next
 /// merge-poller sweep must:
 ///   1. Detect the stale-base situation (succeeded crz + CONFLICTING PR).
@@ -2030,7 +2030,7 @@ async fn cross_flow_conflict_then_ci_fires_in_order() {
     }
 }
 
-/// T2381/PR#1861 end-to-end regression: a merge-queue rebounce whose fix
+/// PR#1861 end-to-end regression: a merge-queue rebounce whose fix
 /// revision settles must not strand the parent invisibly in
 /// `blocked: ci_failure`. Once its fix revision is spawned, the parent
 /// must be back in `list_chores_pending_merge_check`'s `in_review`
@@ -2086,7 +2086,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
 
     // Step 2: the revision force-pushed a rebase; the next sweep's probe
     // reports the PR's own CI as fully green but CONFLICTING against a
-    // now-stale base (T2381's exact observed state).
+    // now-stale base (the exact observed state from the PR#1861 regression).
     let probe = StubProbe::new();
     probe.states.lock().unwrap().insert(
         pr.into(),
@@ -2369,9 +2369,9 @@ async fn ci_resolved_without_handler_does_not_stop_worker() {
     assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
 }
 
-// ----- parse_dequeue_event_nodes (merge-queue reason case T770/T771) -----
+// ----- parse_dequeue_event_nodes (merge-queue reason case) -----
 
-/// Acceptance test for T831 / the CI-status invalidation gap: once a
+/// Acceptance test for the CI-status invalidation gap: once a
 /// failure is recorded (`ci_required_state = "fail"`, `blocked: ci_failure`),
 /// a subsequent clean probe must propagate the recovery transition — the
 /// `blocked_ci` re-poll set must re-check the PR and update the task's
@@ -2568,7 +2568,7 @@ async fn clean_poll_without_prior_failure_does_not_emit_clear() {
 /// pending `ci_remediations` rows must be abandoned so the macOS kanban
 /// clears the "ci failing" badge. Without this cleanup the pending row
 /// causes the badge to reappear on every `sendListCiRemediations` call
-/// (T831 repro path).
+/// (a real repro path from the CI-status invalidation gap).
 #[tokio::test]
 async fn merge_of_ci_blocked_pr_clears_badge() {
     let dir = tempdir().unwrap();

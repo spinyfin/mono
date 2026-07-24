@@ -220,9 +220,8 @@ fn merge_queue_detail_json_queued_takes_precedence_over_auto_merge_for_section_o
 // ── renumber_merge_queue (mono#1997: whole-queue renumbering) ──────────
 
 /// Reproduces the reported bug directly: four members whose stored
-/// `merge_queue_detail.position` is duplicated (two cards both `#2`,
-/// mirroring T2613/T2614) and missing (mirroring T2621's clock-icon-but-
-/// no-number card) because each was written in isolation by its own
+/// `merge_queue_detail.position` is duplicated (two cards both `#2`)
+/// and missing (a clock-icon-but-no-number card) because each was written in isolation by its own
 /// probe. A single `renumber_merge_queue` pass must re-derive a unique,
 /// contiguous `1..N` ranking across every currently queued member —
 /// ordered by `enqueued_at` — and only touch (and only publish a change
@@ -238,9 +237,9 @@ async fn renumber_merge_queue_repairs_duplicate_and_missing_positions() {
 
     seed_queued(&db, &a, Some(1), "2026-07-15T10:00:00Z", "QUEUED");
     seed_queued(&db, &b, Some(2), "2026-07-15T10:01:00Z", "QUEUED");
-    // Duplicate of `b`'s position, enqueued later, failed — mirrors T2614.
+    // Duplicate of `b`'s position, enqueued later, failed.
     seed_queued(&db, &c, Some(2), "2026-07-15T10:02:00Z", "UNMERGEABLE");
-    // Missing position entirely, enqueued last — mirrors T2621.
+    // Missing position entirely, enqueued last.
     seed_queued(&db, &d, None, "2026-07-15T10:03:00Z", "QUEUED");
 
     let publisher = RecordingPublisher::default();
@@ -451,7 +450,7 @@ async fn mid_queue_member_leaving_renumbers_remaining_siblings_via_update_pr_pol
     );
 }
 
-/// Regression (mono#2023 / T2675): GitHub keeps auto-merge armed while
+/// Regression (mono#2023): GitHub keeps auto-merge armed while
 /// required checks are red, so a naive write of the raw probe would
 /// leave `merge_queue_state = Some("auto_merge_enabled")` right next to
 /// `ci_required_state = "fail"` — stranding the card in the macOS

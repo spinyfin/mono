@@ -341,7 +341,7 @@ pub fn spawn_loop(
             // real probe.
             schedule.seed_defaults(current_pr_candidate_urls(work_db.as_ref()), last_run_at);
 
-            // Layer 4 / T10: piggyback the speculative conflict-prediction
+            // Layer 4: piggyback the speculative conflict-prediction
             // sweep on this same full-sweep cadence. Gated by its own
             // feature flag (default OFF) — off, this is a single cheap
             // local-DB read with no cube/GitHub activity.
@@ -363,7 +363,7 @@ pub fn spawn_loop(
                 }
             }
 
-            // Layer 4 / T11: stacked-PR auto-structuring. Also piggybacks on
+            // Layer 4: stacked-PR auto-structuring. Also piggybacks on
             // the full-sweep cadence and its own default-OFF feature flag —
             // off, this block is skipped entirely (not even the local-DB
             // read below runs). On, `stacking_schedule.pass_due` gates the
