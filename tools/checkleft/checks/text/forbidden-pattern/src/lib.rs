@@ -21,6 +21,7 @@
 //!
 //! ```json
 //! {
+//!   "surfaces": ["files", "changeset"],
 //!   "patterns": [
 //!     {
 //!       "name": "internal-work-item-id",
@@ -39,8 +40,56 @@
 //! `"error"`; any other value is a config error). Because matching is done
 //! per line, a pattern containing a literal newline can never match and is
 //! rejected as a config error.
+//!
+//! `surfaces` controls which text sources every configured pattern is
+//! evaluated against. It is a list containing one or both of:
+//!
+//! * `"files"` — scan the content of changed, non-deleted files (the
+//!   long-standing behaviour). This is the default when `surfaces` is
+//!   omitted, so existing configs are unaffected.
+//! * `"changeset"` — additionally scan the PR description and the
+//!   joined-range commit-description string carried on
+//!   [`checkleft_check_sdk::ChangeSet`]. Either, both, or neither may be
+//!   present on a given run: `commit_description` is set whenever the VCS can
+//!   supply one, while `pr_description` depends on the host having resolved
+//!   the PR (it is reliably absent, for example, when running from a jj
+//!   workspace with no `.git` at its root — see
+//!   `tools/checkleft/docs/investigations/locationless-and-virtual-path-finding-rendering.md`).
+//!   A check run must not treat an absent PR description as "clean"; it
+//!   simply means that surface was not scanned this run.
+//!
+//! `surfaces` entries are additive — `["files", "changeset"]` scans both;
+//! `["changeset"]` scans only the PR/commit text and skips file content
+//! entirely. An unrecognized surfaces value is a config error.
+//!
+//! `surfaces` is deliberately named differently from the framework-level,
+//! per-check `scope` key that CHECKS files use to control *scheduling*
+//! (`files` | `changeset`, see `CheckScope` in `tools/checkleft/src/config.rs`
+//! and `Runner::schedule_changeset_scope_runs` in
+//! `tools/checkleft/src/runner.rs`). The two are unrelated and must not be
+//! confused: the framework `scope` decides *whether this check runs at all*
+//! for a given changeset, while this check's `surfaces` decides *which text*
+//! the check reads once it does run. In particular, if this check's config
+//! sets `"surfaces": ["changeset"]` (to scan PR/commit text) but the CHECKS
+//! entry leaves the framework `scope` at its default of `files`, the check is
+//! only scheduled when some changed file matches its file selector — on a
+//! changeset that touches no matching file, the PR/commit text is never
+//! scanned and the run reports no findings. A CHECKS entry that wants
+//! changeset-text scanning to run unconditionally must set the framework
+//! `scope: changeset` as well.
+//!
+//! Matches found in the PR description or commit description have no
+//! changed-file location to point at, so they are reported as bare
+//! locationless findings (`Finding::location == None`) rather than being
+//! attached to a synthetic path. This is a deliberate choice, not an
+//! oversight: `checkleft`'s changeset-scoping filter silently discards any
+//! finding whose location path is not one of the run's changed files, so a
+//! synthetic path (e.g. `<pr-description>`) would be dropped before it ever
+//! reached an output surface. Locationless findings are the one shape the
+//! framework explicitly preserves for a non-file subject; see the
+//! investigation doc above for the full analysis.
 
-use checkleft_check_sdk::{ChangeKind, CheckInput, Finding, Severity, check};
+use checkleft_check_sdk::{ChangeKind, ChangeSet, CheckInput, Finding, Severity, check};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -48,6 +97,32 @@ use serde::Deserialize;
 struct Config {
     #[serde(default)]
     patterns: Vec<PatternConfig>,
+    #[serde(default)]
+    surfaces: Option<Vec<String>>,
+}
+
+/// Which text surfaces the configured patterns are evaluated against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Files,
+    Changeset,
+}
+
+/// Where a changeset-scoped match was found, for use in the finding's
+/// remediation text (the finding itself carries no location).
+#[derive(Clone, Copy)]
+enum ChangesetSource {
+    PrDescription,
+    CommitDescription,
+}
+
+impl ChangesetSource {
+    fn label(self) -> &'static str {
+        match self {
+            ChangesetSource::PrDescription => "PR description",
+            ChangesetSource::CommitDescription => "commit description",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -64,6 +139,16 @@ struct CompiledPattern {
     message: String,
     severity: Severity,
     regex: Regex,
+}
+
+impl CompiledPattern {
+    fn finding(&self) -> Finding {
+        match self.severity {
+            Severity::Error => Finding::error(self.message.clone()),
+            Severity::Warning => Finding::warning(self.message.clone()),
+            Severity::Info => Finding::info(self.message.clone()),
+        }
+    }
 }
 
 #[check(
@@ -96,9 +181,40 @@ pub fn forbidden_pattern_check(input: CheckInput) -> Vec<Finding> {
         }
     };
 
+    let surfaces = match parse_surfaces(cfg.surfaces.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![Finding::error(format!(
+                "invalid text/forbidden-pattern check config: {e}"
+            ))];
+        }
+    };
+
     let mut findings = Vec::new();
 
-    for file in &input.changeset.changed_files {
+    if surfaces.contains(&Surface::Files) {
+        scan_files(&input.changeset, &patterns, &mut findings);
+    }
+
+    if surfaces.contains(&Surface::Changeset) {
+        if let Some(pr_description) = &input.changeset.pr_description {
+            scan_changeset_text(pr_description, ChangesetSource::PrDescription, &patterns, &mut findings);
+        }
+        if let Some(commit_description) = &input.changeset.commit_description {
+            scan_changeset_text(
+                commit_description,
+                ChangesetSource::CommitDescription,
+                &patterns,
+                &mut findings,
+            );
+        }
+    }
+
+    findings
+}
+
+fn scan_files(changeset: &ChangeSet, patterns: &[CompiledPattern], findings: &mut Vec<Finding>) {
+    for file in &changeset.changed_files {
         if file.kind == ChangeKind::Deleted {
             continue;
         }
@@ -109,23 +225,70 @@ pub fn forbidden_pattern_check(input: CheckInput) -> Vec<Finding> {
 
         for (index, line) in content.lines().enumerate() {
             let line_number = (index + 1) as u32;
-            for pattern in &patterns {
+            for pattern in patterns {
                 for m in pattern.regex.find_iter(line) {
                     let column = (line[..m.start()].chars().count() + 1) as u32;
-                    let finding = match pattern.severity {
-                        Severity::Error => Finding::error(pattern.message.clone()),
-                        Severity::Warning => Finding::warning(pattern.message.clone()),
-                        Severity::Info => Finding::info(pattern.message.clone()),
-                    }
-                    .at_column(file.path.clone(), line_number, column)
-                    .with_remediation(format!("matched forbidden pattern `{}`", pattern.name));
+                    let finding = pattern
+                        .finding()
+                        .at_column(file.path.clone(), line_number, column)
+                        .with_remediation(format!("matched forbidden pattern `{}`", pattern.name));
                     findings.push(finding);
                 }
             }
         }
     }
+}
 
-    findings
+/// Scan a changeset-level text blob (PR description or joined commit
+/// description) against every pattern, emitting bare locationless findings.
+///
+/// These findings intentionally carry no `Location`: `checkleft`'s
+/// changeset-scoping filter drops any finding whose location path is not one
+/// of the run's changed files, so a synthetic path would be silently
+/// discarded before reaching any output surface. See the module docs for the
+/// full rationale.
+///
+/// Like `scan_files`, this uses `find_iter` rather than `is_match`, so
+/// multiple distinct matches of the same pattern on one line each produce
+/// their own finding, and each finding's remediation names the matched text
+/// (there is no column to report for a locationless finding, so naming the
+/// match is what lets a reviewer tell two same-line matches apart).
+fn scan_changeset_text(text: &str, source: ChangesetSource, patterns: &[CompiledPattern], findings: &mut Vec<Finding>) {
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        for pattern in patterns {
+            for m in pattern.regex.find_iter(line) {
+                let finding = pattern.finding().with_remediation(format!(
+                    "matched forbidden pattern `{}` in {} (line {line_number}): `{}`",
+                    pattern.name,
+                    source.label(),
+                    m.as_str(),
+                ));
+                findings.push(finding);
+            }
+        }
+    }
+}
+
+fn parse_surfaces(surfaces: Option<&[String]>) -> Result<Vec<Surface>, String> {
+    let Some(surfaces) = surfaces else {
+        return Ok(vec![Surface::Files]);
+    };
+
+    if surfaces.is_empty() {
+        return Err("`surfaces` must not be empty when present".to_owned());
+    }
+
+    surfaces
+        .iter()
+        .map(|s| match s.as_str() {
+            "files" => Ok(Surface::Files),
+            "changeset" => Ok(Surface::Changeset),
+            other => Err(format!(
+                "`surfaces` entries must be one of `files`, `changeset`; got `{other}`"
+            )),
+        })
+        .collect()
 }
 
 fn compile_patterns(patterns: &[PatternConfig]) -> Result<Vec<CompiledPattern>, String> {
@@ -192,6 +355,25 @@ mod tests {
                 file_diffs: vec![],
                 commit_description: None,
                 pr_description: None,
+                change_id: None,
+                repository: None,
+                base_files: vec![],
+            },
+            config_json.to_owned(),
+        )
+    }
+
+    fn make_changeset_input(
+        pr_description: Option<&str>,
+        commit_description: Option<&str>,
+        config_json: &str,
+    ) -> CheckInput {
+        CheckInput::__from_parts(
+            ChangeSet {
+                changed_files: vec![],
+                file_diffs: vec![],
+                commit_description: commit_description.map(str::to_owned),
+                pr_description: pr_description.map(str::to_owned),
                 change_id: None,
                 repository: None,
                 base_files: vec![],
@@ -371,5 +553,125 @@ mod tests {
         ));
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("newline"));
+    }
+
+    // ── scope: changeset (PR description / commit description) ─────────────
+
+    #[test]
+    fn default_scope_does_not_scan_changeset_text() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("see task ZZ3124 for context"),
+            Some("see task ZZ3124 for context"),
+            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn changeset_scope_flags_pr_description_with_locationless_finding() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("this fixes ZZ3124"),
+            None,
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"Internal work-item ids must not leak."}]}"#,
+        ));
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "Internal work-item ids must not leak.");
+        assert!(findings[0].location.is_none());
+        assert!(findings[0].remediations[0].contains("PR description"));
+    }
+
+    #[test]
+    fn changeset_scope_flags_commit_description_with_locationless_finding() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            None,
+            Some("fix stuff\n\nsee ZZ4242 for details"),
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].location.is_none());
+        assert!(findings[0].remediations[0].contains("commit description"));
+        assert!(findings[0].remediations[0].contains("line 3"));
+    }
+
+    #[test]
+    fn changeset_scope_with_absent_pr_description_scans_commit_description_only() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            None,
+            Some("see ZZ5555"),
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].location.is_none());
+    }
+
+    #[test]
+    fn changeset_scope_with_no_descriptions_present_yields_no_findings() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            None,
+            None,
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn surfaces_files_and_changeset_scans_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_file(dir.path(), "notes.md", "see task ZZ3124 for context\n");
+
+        let mut input = make_changeset_input(
+            Some("also ZZ9999 here"),
+            None,
+            r#"{"surfaces":["files","changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        );
+        input.changeset.changed_files.push(ChangedFile {
+            path: path.clone(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        });
+
+        let findings = forbidden_pattern_check(input);
+
+        assert_eq!(findings.len(), 2);
+        let file_finding = findings.iter().find(|f| f.location.is_some()).unwrap();
+        assert_eq!(file_finding.location.as_ref().unwrap().path, path);
+        assert!(findings.iter().any(|f| f.location.is_none()));
+    }
+
+    #[test]
+    fn rejects_empty_surfaces_list() {
+        let findings = forbidden_pattern_check(make_input(
+            vec![],
+            r#"{"surfaces":[],"patterns":[{"name":"foo","pattern":"bar","message":"baz"}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("surfaces"));
+    }
+
+    #[test]
+    fn rejects_unknown_surfaces_value() {
+        let findings = forbidden_pattern_check(make_input(
+            vec![],
+            r#"{"surfaces":["everywhere"],"patterns":[{"name":"foo","pattern":"bar","message":"baz"}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("surfaces"));
+        assert!(findings[0].message.contains("everywhere"));
+    }
+
+    #[test]
+    fn changeset_scope_flags_each_match_on_a_line_separately() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("leaked ZZ1111 and ZZ2222 on one line"),
+            None,
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings[0].remediations[0].contains("ZZ1111"));
+        assert!(findings[1].remediations[0].contains("ZZ2222"));
     }
 }
