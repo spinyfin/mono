@@ -284,6 +284,24 @@ extension ChatViewModel {
     /// O(this product's items). This was the dominant unattributed cost in
     /// the `apply` population-timing segment (see the ui-stall diagnostics
     /// this fix responds to).
+    ///
+    /// Mutations are staged on a local `var merged` and published with a
+    /// single assignment at the end, not one `taskRuntimesByID[id] = ...`
+    /// per element. `@Published`'s setter has observable side effects
+    /// (`objectWillChange.send()`), so the compiler cannot synthesize an
+    /// in-place `_modify` accessor for it the way it would for a plain
+    /// stored property — every subscript write on the property directly
+    /// desugars to a get (temp = taskRuntimesByID), mutate, set
+    /// (taskRuntimesByID = temp) sequence. That get leaves the dictionary
+    /// with two owners (the property's storage and `temp`) for the
+    /// duration of the mutate step, so each write forces a full
+    /// copy-on-write of the *entire accumulated dictionary* — the
+    /// `WorkTaskRuntimeVwcp`/`VWOc` value-witness-copy frames dominating the
+    /// captured 250-300ms stalls — not just the handful of keys actually
+    /// changing. Staging on a local var keeps the dictionary uniquely
+    /// referenced across every mutation (in-place, O(1) amortized each) and
+    /// triggers exactly one CoW copy and one `objectWillChange` for the
+    /// whole merge, regardless of how many runtimes changed.
     func mergeTaskRuntimes(
         _ runtimes: [WorkTaskRuntime],
         for productID: String,
@@ -292,12 +310,14 @@ extension ChatViewModel {
     ) {
         let productItemIDs = Set(tasks.map(\.id) + chores.map(\.id))
         let freshRuntimeIDs = Set(runtimes.map(\.workItemID))
+        var merged = taskRuntimesByID
         for id in productItemIDs where !freshRuntimeIDs.contains(id) {
-            taskRuntimesByID.removeValue(forKey: id)
+            merged.removeValue(forKey: id)
         }
         for runtime in runtimes {
-            taskRuntimesByID[runtime.workItemID] = runtime
+            merged[runtime.workItemID] = runtime
         }
+        taskRuntimesByID = merged
     }
 
     func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
