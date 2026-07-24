@@ -632,9 +632,22 @@ fn parse_jj_remote_list_url(output: &str, remote_name: &str) -> Option<String> {
 /// (`/local/mirror`-style path) and the real GitHub upstream lives under a
 /// separately-named remote (see
 /// `tools/cube/src/app/reset.rs::detect_upstream_tracking_remote`, which
-/// applies the same origin-first-then-scan strategy). Those are exactly the
-/// workspaces this jj path exists to support, so a strict origin-only lookup
-/// would keep failing silently in them.
+/// resolves the upstream by URL rather than by the name `origin`, for the
+/// same reason). Those are exactly the workspaces this jj path exists to
+/// support, so a strict origin-only lookup would keep failing silently in
+/// them.
+///
+/// This duplicates `git_utils::repo_slug::parse_github_remote`, which
+/// already solves this exact problem (and is itself the consolidation of
+/// three prior copies of this logic). It is not reused here because
+/// `tools/checkleft` is a published crate (see its `Cargo.toml` — docs.rs
+/// metadata, a curated `include` list, no first-party path deps at all)
+/// while `lib/rust/git_utils` is not published to crates.io; adding a path
+/// dependency on it would break `cargo publish` for checkleft. If
+/// `git_utils` becomes publishable (or checkleft stops being published),
+/// this function and `parse_repo_slug_from_remote_url` below should be
+/// deleted in favor of `git_utils::repo_slug::{parse_github_remote,
+/// parse_github_slug}`.
 fn resolve_jj_repo_slug_from_remote_list(output: &str, preferred_remote: &str) -> Option<String> {
     if let Some(slug) =
         parse_jj_remote_list_url(output, preferred_remote).and_then(|url| parse_repo_slug_from_remote_url(&url))
@@ -650,17 +663,20 @@ fn resolve_jj_repo_slug_from_remote_list(output: &str, preferred_remote: &str) -
     })
 }
 
+/// Parse a GitHub remote URL into an `owner/repo` slug.
+///
+/// Splits on the literal `github.com` host (rather than matching a fixed set
+/// of user/scheme prefixes) so that SSO/auth-identity-prefixed remotes such
+/// as `org-127256988@github.com:owner/repo.git` and
+/// `ssh://org-127256988@github.com/owner/repo.git` — which cube workspaces
+/// carry (see `tools/cube/src/app/repo.rs`) — resolve just as well as plain
+/// `git@github.com:` / `https://github.com/` remotes.
 fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
-    let remote_url = remote_url.trim();
-    let repo_path = if let Some(stripped) = remote_url.strip_prefix("git@github.com:") {
-        stripped
-    } else if let Some(stripped) = remote_url.strip_prefix("https://github.com/") {
-        stripped
-    } else {
-        remote_url.strip_prefix("ssh://git@github.com/")?
-    };
+    let remote_url = remote_url.trim().trim_end_matches('/');
+    let remote_url = remote_url.strip_suffix(".git").unwrap_or(remote_url);
+    let (_, after_host) = remote_url.split_once("github.com")?;
+    let repo_path = after_host.trim_start_matches([':', '/']);
 
-    let repo_path = repo_path.trim_end_matches(".git").trim_matches('/');
     let parts: Vec<_> = repo_path.split('/').collect();
     if parts.len() != 2 || parts.iter().any(|part| part.is_empty()) {
         return None;
@@ -851,6 +867,18 @@ R docs/old.md => docs/new.md
         );
         assert_eq!(
             parse_repo_slug_from_remote_url("ssh://git@github.com/example/flunge.git"),
+            Some("example/flunge".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_repo_slug_from_sso_auth_prefixed_remote_urls() {
+        assert_eq!(
+            parse_repo_slug_from_remote_url("org-127256988@github.com:example/flunge.git"),
+            Some("example/flunge".to_owned())
+        );
+        assert_eq!(
+            parse_repo_slug_from_remote_url("ssh://org-127256988@github.com/example/flunge.git"),
             Some("example/flunge".to_owned())
         );
     }
