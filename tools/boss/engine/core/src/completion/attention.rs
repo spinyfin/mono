@@ -1,7 +1,6 @@
-//! Split out of `completion.rs`. Inherent methods on
-//! [`WorkerCompletionHandler`]. Structural move only — no behavioural
-//! change; see [`super`] for the handler struct, shared types, traits,
-//! and free helpers this module reaches via `use super::*`.
+//! Inherent methods on [`WorkerCompletionHandler`]; reaches the handler
+//! struct, shared types, traits, and free helpers via `use super::*` (see
+//! [`super`]).
 //!
 //! One helper: the execution-scoped attention-item filing shared by every
 //! call site in this module tree that records something about a *run*
