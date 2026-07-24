@@ -675,12 +675,6 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
-    /// Kick signal for the automation scheduler loop. Notified by any
-    /// automation mutation handler (create, update, enable, disable,
-    /// delete) so the scheduler recomputes its min-next-fire sleep
-    /// immediately on state change rather than waiting out its current
-    /// interval. See [`crate::automation_scheduler::spawn_loop`].
-    automation_scheduler_kick: Arc<Notify>,
     /// Secret token written to the control-token file at startup. A
     /// frontend `Shutdown { token }` RPC must match this value to
     /// trigger graceful exit. `None` only in tests / in-process
@@ -895,8 +889,8 @@ impl ServerState {
         let metrics_for_coordinator = metrics_registry.clone();
         let pr_reconciler_kick = Arc::new(Notify::new());
         let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
-        let automation_scheduler_kick = Arc::new(Notify::new());
-        let automation_scheduler_kick_for_state = automation_scheduler_kick.clone();
+        let event_bus = Arc::new(boss_event_bus::EventBus::new());
+        let event_bus_for_state = event_bus.clone();
         let shutdown_trigger = Arc::new(Notify::new());
         let shutdown_trigger_for_state = shutdown_trigger.clone();
         let control_token_for_state = control_token.clone();
@@ -1113,7 +1107,7 @@ impl ServerState {
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
                 .pr_reconciler_kick(pr_reconciler_kick_for_state)
-                .automation_scheduler_kick(automation_scheduler_kick_for_state)
+                .event_bus(event_bus_for_state)
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)
