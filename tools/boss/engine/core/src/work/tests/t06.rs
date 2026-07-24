@@ -219,7 +219,7 @@ fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
 /// `BLOCKED_REASON_MAX_GRAPHEMES` is rejected up front, before any row is
 /// touched, with a message that names `blocked_detail` as the
 /// alternative. Covers the engine RPC write path directly (not just the
-/// CLI), per T3098-adjacent chore's enforcement requirement.
+/// CLI), so every client inherits the length limit.
 #[test]
 fn blocked_reason_over_length_limit_is_rejected() {
     let path = temp_db_path("blocked-reason-over-limit");
