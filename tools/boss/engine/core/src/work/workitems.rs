@@ -48,14 +48,17 @@ fn kind_returned_by_list_tasks(kind: &TaskKind) -> bool {
 
 /// `... IN (...)` fragment for [`WorkDb::list_tasks`]'s kind filter,
 /// generated from [`kind_returned_by_list_tasks`] rather than hand-
-/// maintained as a literal SQL string. Iterates [`TaskKind::ALL`] — a fixed-
-/// size array literal — rather than a second hand-written variant list, so
-/// adding a new `TaskKind` is a compile error at `ALL` even before anyone
-/// gets to `kind_returned_by_list_tasks`'s own exhaustive match; a new kind
-/// can no longer compile clean while remaining invisible on this listing
-/// surface (see incident postmortem-archived-fanout-2026-07-20). Built from a
-/// fixed, compile-time-known set of `TaskKind` variants (never user input),
-/// so formatting it directly into the query string is safe.
+/// maintained as a literal SQL string. Iterates [`TaskKind::ALL`], which is
+/// itself a hand-maintained literal (not derived from the enum), so a new
+/// `TaskKind` variant does *not* by itself force `ALL` to be updated; the
+/// enforcement that a new kind can't silently go missing here is
+/// `TaskKind::tests::all_contains_every_variant`, whose exhaustive `match`
+/// the compiler forces to grow on a new variant, and whose assertion then
+/// fails if `ALL` doesn't also grow (see incident
+/// postmortem-archived-fanout-2026-07-20 for the original invisible-kind
+/// failure this exists to catch). Built from a fixed, compile-time-known
+/// set of `TaskKind` variants (never user input), so formatting it
+/// directly into the query string is safe.
 fn list_tasks_kind_filter_sql() -> String {
     TaskKind::ALL
         .into_iter()

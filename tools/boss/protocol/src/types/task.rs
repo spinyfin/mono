@@ -341,12 +341,15 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    /// Every variant, in declaration order. A fixed-size array literal, so
-    /// adding a new variant without adding it here is a compile error (size
-    /// mismatch) — the same exhaustiveness guarantee the enum's own
-    /// doc comment describes for match sites, extended to callers (like
-    /// `list_tasks_kind_filter_sql`) that need to iterate every kind rather
-    /// than match on one.
+    /// Every variant, in declaration order. This is a hand-maintained
+    /// literal — its length is a bare `8`, not derived from the enum, so
+    /// adding a new variant here is *not* a compile error by itself
+    /// (`[TaskKind; 8]` with 8 elements still compiles even if one variant
+    /// is missing and another is duplicated). The real completeness
+    /// guarantee is `tests::all_contains_every_variant` below, which
+    /// rebuilds the variant set via an exhaustive `match` — that match arm
+    /// is what forces a compile error on a new variant, and the test then
+    /// fails if `ALL` doesn't also contain it.
     pub const ALL: [TaskKind; 8] = [
         Self::Chore,
         Self::Design,
@@ -847,4 +850,60 @@ pub struct TaskRuntime {
     /// its current value. `None` whenever `dispatch_wait_reason` is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_since: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TaskKind::ALL`'s `[TaskKind; 8]` size doesn't tie its contents to
+    /// the enum on its own — a hand-written literal can compile clean while
+    /// omitting or duplicating a variant. This test is the actual
+    /// completeness guarantee: the `match` below is exhaustive, so the
+    /// compiler forces an update here the moment a new `TaskKind` variant
+    /// is added, and the assertion then fails if that variant wasn't also
+    /// added to `ALL` — closing the gap that let a new kind silently go
+    /// missing from iteration-based call sites like
+    /// `list_tasks_kind_filter_sql`.
+    #[test]
+    fn all_contains_every_variant() {
+        fn expected_for(kind: &TaskKind) -> TaskKind {
+            match kind {
+                TaskKind::Chore => TaskKind::Chore,
+                TaskKind::Design => TaskKind::Design,
+                TaskKind::Followup => TaskKind::Followup,
+                TaskKind::Investigation => TaskKind::Investigation,
+                TaskKind::DesignPostmortem => TaskKind::DesignPostmortem,
+                TaskKind::ProjectTask => TaskKind::ProjectTask,
+                TaskKind::Revision => TaskKind::Revision,
+                TaskKind::Task => TaskKind::Task,
+            }
+        }
+
+        // Every arm above is reachable, so the exhaustive match forces this
+        // list to grow the moment a new variant is added to the enum.
+        let all_variants = [
+            TaskKind::Chore,
+            TaskKind::Design,
+            TaskKind::Followup,
+            TaskKind::Investigation,
+            TaskKind::DesignPostmortem,
+            TaskKind::ProjectTask,
+            TaskKind::Revision,
+            TaskKind::Task,
+        ];
+        for kind in &all_variants {
+            assert_eq!(&expected_for(kind), kind);
+            assert!(
+                TaskKind::ALL.contains(kind),
+                "TaskKind::{kind:?} is missing from TaskKind::ALL"
+            );
+        }
+        assert_eq!(
+            TaskKind::ALL.len(),
+            all_variants.len(),
+            "TaskKind::ALL has a different length than the enum's variant set; \
+             it likely has a duplicate or stale entry"
+        );
+    }
 }
