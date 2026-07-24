@@ -484,7 +484,10 @@ use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;
 pub(crate) use dep_helpers::*;
-pub(crate) use design_postmortem::{TriggerTaskSnapshot, stage_project_impl_drained_on_terminal_transition};
+pub(crate) use design_postmortem::{
+    TriggerTaskSnapshot, stage_project_impl_drained_on_terminal_transition,
+    stage_project_impl_drained_on_trigger_task_deleted,
+};
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
 pub(crate) use exec_status_helpers::*;

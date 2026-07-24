@@ -188,6 +188,16 @@ pub fn spawn_loop(
 /// per-pass check, so disabling the `project_postmortem_sweep` flag stops
 /// the event path immediately too — no live event-driven scheduling behind
 /// operators' backs while the kill switch is engaged.
+///
+/// Per `boss_event_bus::spawn_supervised`'s documented contract ("Each
+/// invocation is expected to run a full reconcile pass before settling into
+/// its `Subscription::recv` loop, so a post-panic restart reconciles
+/// exactly like a fresh boot"), every attempt — including a post-panic
+/// restart, not just the first spawn — subscribes first (closing the
+/// window where an event published during the pass would be missed) and
+/// then runs one [`run_one_pass`] before entering the recv loop, so a
+/// `ProjectImplDrained` dropped during the panic/backoff/resubscribe gap is
+/// recovered immediately rather than waiting out the 300 s backstop.
 pub fn spawn_event_loop(
     work_db: Arc<WorkDb>,
     event_bus: Arc<boss_event_bus::EventBus>,
@@ -203,6 +213,12 @@ pub fn spawn_event_loop(
             let mut subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
                 boss_event_bus::EventKind::ProjectImplDrained,
             ));
+            if feature_flags.is_enabled("project_postmortem_sweep") {
+                let outcome = run_one_pass(work_db.as_ref()).await;
+                if outcome.postmortems_created > 0 {
+                    kick_fn();
+                }
+            }
             while let Some(event) = subscription.recv().await {
                 let boss_event_bus::Event::ProjectImplDrained { project_id } = event else {
                     continue;
@@ -994,6 +1010,165 @@ mod tests {
         ));
 
         create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("ProjectImplDrained must be published before the timeout")
+            .expect("bus must not have been dropped");
+        assert_eq!(
+            event,
+            boss_event_bus::Event::ProjectImplDrained {
+                project_id: project.id.clone()
+            }
+        );
+    }
+
+    /// Negative branch of the producer-side proof above: a project with
+    /// two open trigger tasks must publish nothing when only one of them
+    /// drains — the single most load-bearing guard in
+    /// `stage_project_impl_drained_on_terminal_transition`
+    /// (`project_has_open_trigger_tasks_in_tx`), since a regression here
+    /// would spam a `ProjectImplDrained` (and therefore a postmortem) for
+    /// every task completion instead of only the project's last one.
+    #[tokio::test]
+    async fn no_event_while_another_trigger_task_is_still_open() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+
+        let task_a = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(&product_id)
+                    .project_id(&project.id)
+                    .name("impl a")
+                    .build(),
+            )
+            .unwrap();
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(&product_id)
+                .project_id(&project.id)
+                .name("impl b")
+                .build(),
+        )
+        .unwrap();
+
+        let bus = Arc::new(boss_event_bus::EventBus::new());
+        let db = db.with_event_bus(Arc::clone(&bus));
+        let mut subscription = bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::ProjectImplDrained,
+        ));
+
+        db.update_work_item(
+            &task_a.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                pr_url: Some("https://github.com/o/r/pull/1".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), subscription.recv()).await;
+        assert!(
+            result.is_err(),
+            "must not publish ProjectImplDrained while another trigger task is still open"
+        );
+    }
+
+    /// Coverage for the most-travelled production drain path
+    /// (`record_worker_pr_completion`, driving a PR-completion status write
+    /// via a worker execution rather than `update_work_item`): draining a
+    /// project's last live trigger task through it must publish
+    /// `ProjectImplDrained` too, proving the `new_status != task.status`
+    /// guard plus the `updated_task.kind`/`project_id` plumbing at that call
+    /// site actually fires — only `update_task`'s call site had coverage
+    /// before this test.
+    #[tokio::test]
+    async fn draining_last_trigger_task_via_worker_pr_completion_publishes_event() {
+        use crate::work::{RequestExecutionInput, WorkerPrCompletionTarget};
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+
+        let task = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(&product_id)
+                    .project_id(&project.id)
+                    .name("impl")
+                    .build(),
+            )
+            .unwrap();
+
+        let bus = Arc::new(boss_event_bus::EventBus::new());
+        let db = db.with_event_bus(Arc::clone(&bus));
+        let mut subscription = bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::ProjectImplDrained,
+        ));
+
+        let exec = db
+            .request_execution(RequestExecutionInput::builder().work_item_id(task.id.clone()).build())
+            .unwrap();
+        db.start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+
+        db.record_worker_pr_completion(
+            &exec.id,
+            "https://github.com/o/r/pull/1",
+            None,
+            WorkerPrCompletionTarget::Done,
+        )
+        .unwrap()
+        .expect("execution was live");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("ProjectImplDrained must be published before the timeout")
+            .expect("bus must not have been dropped");
+        assert_eq!(
+            event,
+            boss_event_bus::Event::ProjectImplDrained {
+                project_id: project.id.clone()
+            }
+        );
+    }
+
+    /// Deletion-path sibling of [`draining_last_trigger_task_publishes_project_impl_drained`]:
+    /// soft-deleting a project's *last* open trigger task (rather than
+    /// completing it) must publish `ProjectImplDrained` too, since
+    /// `evaluate_project`'s trigger-count query filters `deleted_at IS
+    /// NULL` the same as a genuine completion — a delete-driven drain is
+    /// otherwise invisible to the event path and stalls out to the 300 s
+    /// backstop.
+    #[tokio::test]
+    async fn soft_deleting_last_open_trigger_task_publishes_project_impl_drained() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+
+        let task = db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(&product_id)
+                    .project_id(&project.id)
+                    .name("impl")
+                    .build(),
+            )
+            .unwrap();
+
+        let bus = Arc::new(boss_event_bus::EventBus::new());
+        let db = db.with_event_bus(Arc::clone(&bus));
+        let mut subscription = bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::ProjectImplDrained,
+        ));
+
+        db.delete_work_item(&task.id).unwrap();
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
             .await

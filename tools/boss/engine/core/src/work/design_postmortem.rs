@@ -71,6 +71,51 @@ pub(crate) fn stage_project_impl_drained_on_terminal_transition(
     Ok(())
 }
 
+/// Stage `Event::ProjectImplDrained { project_id }` onto `pending` when
+/// soft-deleting a task removes the project's *last* open trigger task.
+/// Deletion is not a status write, so it cannot go through
+/// [`stage_project_impl_drained_on_terminal_transition`]'s
+/// previous-status/new-status transition check — this is the deletion-path
+/// sibling: it fires whenever a trigger-kind task that was itself still
+/// open (`status` not terminal) is tombstoned and, after that tombstone,
+/// [`project_has_open_trigger_tasks_in_tx`] finds no more open trigger
+/// tasks (the `deleted_at IS NULL` filter that query and
+/// `list_project_trigger_tasks` share means the just-deleted row no longer
+/// counts). Must be called with the transaction that performed the
+/// `deleted_at` UPDATE, after that UPDATE has run but before the
+/// transaction commits — same publish-after-commit contract as the
+/// terminal-transition sibling.
+pub(crate) fn stage_project_impl_drained_on_trigger_task_deleted(
+    tx: &Connection,
+    pending: &mut crate::event_publish::PendingEvents,
+    task_kind: TaskKind,
+    project_id: Option<&str>,
+    status: &TaskStatus,
+) -> Result<()> {
+    if status.is_terminal() {
+        // Already excluded from the open-trigger-task count before the
+        // delete — tombstoning it changes nothing about whether the
+        // project's impl work just drained.
+        return Ok(());
+    }
+    if !matches!(
+        task_kind,
+        TaskKind::ProjectTask | TaskKind::Design | TaskKind::Investigation
+    ) {
+        return Ok(());
+    }
+    let Some(project_id) = project_id else {
+        return Ok(());
+    };
+    if project_has_open_trigger_tasks_in_tx(tx, project_id)? {
+        return Ok(());
+    }
+    pending.push(boss_event_bus::Event::ProjectImplDrained {
+        project_id: project_id.to_owned(),
+    });
+    Ok(())
+}
+
 /// True if `project_id` still has at least one live, non-terminal trigger
 /// task (`project_task`/`design`/`investigation`). Mirrors the WHERE clause
 /// of [`WorkDb::list_project_trigger_tasks`] but runs directly against an
@@ -332,5 +377,92 @@ mod tests {
             .unwrap();
         let found = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
         assert_eq!(found.id, second.id, "must return the most recently created postmortem");
+    }
+
+    fn new_project(db: &WorkDb, product_id: &str) -> boss_protocol::Project {
+        db.create_project(
+            CreateProjectInput::builder()
+                .product_id(product_id)
+                .name("Alpha")
+                .no_design_task(true)
+                .build(),
+        )
+        .unwrap()
+    }
+
+    /// Negative branch: a `chore`/`revision`-kind task going terminal must
+    /// never stage `ProjectImplDrained`, even with a project id and a
+    /// genuine non-terminal→terminal transition — only
+    /// `project_task`/`design`/`investigation` count toward the trigger.
+    #[test]
+    fn terminal_transition_ignores_non_trigger_task_kinds() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_named(&db, "Boss");
+        let project = new_project(&db, &product.id);
+        let conn = db.connect().unwrap();
+
+        for kind in [
+            TaskKind::Chore,
+            TaskKind::Revision,
+            TaskKind::Followup,
+            TaskKind::DesignPostmortem,
+        ] {
+            let mut pending = crate::event_publish::PendingEvents::new();
+            stage_project_impl_drained_on_terminal_transition(
+                &conn,
+                &mut pending,
+                kind.clone(),
+                Some(project.id.as_str()),
+                &TaskStatus::Todo,
+                &TaskStatus::Done,
+            )
+            .unwrap();
+            assert!(
+                pending.is_empty(),
+                "non-trigger kind {kind:?} must never stage an event"
+            );
+        }
+    }
+
+    /// Negative branch: a status write that is not a genuine
+    /// non-terminal→terminal transition — either the previous status was
+    /// already terminal (terminal→terminal re-write) or the new status is
+    /// not terminal at all — must never stage `ProjectImplDrained`,
+    /// regardless of task kind or open-trigger-task state.
+    #[test]
+    fn terminal_transition_ignores_non_transitions() {
+        let (_dir, db) = open_db();
+        let product = create_test_product_named(&db, "Boss");
+        let project = new_project(&db, &product.id);
+        let conn = db.connect().unwrap();
+
+        // terminal -> terminal re-write (e.g. `done` -> `archived`).
+        let mut pending = crate::event_publish::PendingEvents::new();
+        stage_project_impl_drained_on_terminal_transition(
+            &conn,
+            &mut pending,
+            TaskKind::ProjectTask,
+            Some(project.id.as_str()),
+            &TaskStatus::Done,
+            &TaskStatus::Archived,
+        )
+        .unwrap();
+        assert!(pending.is_empty(), "terminal -> terminal must never stage an event");
+
+        // non-terminal -> non-terminal (no completion happened at all).
+        let mut pending = crate::event_publish::PendingEvents::new();
+        stage_project_impl_drained_on_terminal_transition(
+            &conn,
+            &mut pending,
+            TaskKind::ProjectTask,
+            Some(project.id.as_str()),
+            &TaskStatus::Todo,
+            &TaskStatus::Active,
+        )
+        .unwrap();
+        assert!(
+            pending.is_empty(),
+            "non-terminal -> non-terminal must never stage an event"
+        );
     }
 }

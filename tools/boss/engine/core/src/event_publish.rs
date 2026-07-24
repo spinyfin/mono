@@ -29,8 +29,12 @@
 //! subscribers rather than publish in-txn itself.
 //!
 //! Execution-terminal transitions in `work/` stage through
-//! `stage_execution_terminal` and commit via [`commit_and_publish`];
-//! host-disable transitions publish directly (no enclosing transaction).
+//! `stage_execution_terminal` and commit via [`commit_and_publish`], as does
+//! `ProjectImplDrained`, staged by
+//! `work::design_postmortem::stage_project_impl_drained_on_terminal_transition`
+//! from the same status-write paths in `work/updates.rs`, `work/pr_flow.rs`,
+//! and `work/exec_tail.rs`. Host-disable transitions publish directly (no
+//! enclosing transaction).
 
 use boss_event_bus::{Event, EventBus};
 
