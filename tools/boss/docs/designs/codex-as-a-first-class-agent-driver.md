@@ -5,17 +5,20 @@
 - **Depends on:** [P1422 — agent-driver abstraction](agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md)
 - **Supersedes intent of:** [P284 — Copilot CLI as alternative worker backend](copilot-cli-as-alternative-worker-backend.md) (its "JSON stream schema spike" method is reused here)
 - **Boss tree verified at:** `7859b6c4` (`main`), 2026-07-24
-- **Codex verified at:** `codex-cli 0.137.0`, `macos-aarch64`, standalone install, `~/.local/bin/codex`
+- **Codex verified at:** `codex-cli 0.145.0`, `macos-aarch64`, standalone install, `~/.local/bin/codex`
+- **Previously verified at:** `codex-cli 0.137.0` — every claim re-run on 0.145.0; see [Version delta](#version-delta-01370--01450)
 
 ## TL;DR / verdict
 
 Codex is a **better** fit for the P1422 abstraction than the abstraction currently assumes, and a **worse** fit for the parts of Boss that never went through the abstraction at all.
 
-The brief's highest-severity claim — _"Codex has no Stop hook, so a Codex worker would never complete"_ — **is wrong for 0.137.0, but the conclusion it drives is still right, for a different reason.** Codex emits `turn.started` / `turn.completed` as native, typed events on its `--json` stdout stream, so turn boundaries are strictly _better_ than Claude's (in-band and structural, not a hook that must be installed). Codex 0.137.0 also ships a stable, Claude-wire-compatible hooks system — including a `Stop` hook.
+The brief's highest-severity claim — _"Codex has no Stop hook, so a Codex worker would never complete"_ — **is wrong, but the conclusion it drives is still right, for a different reason.** Codex emits `turn.started` / `turn.completed` as native, typed events on its `--json` stdout stream, so turn boundaries are strictly _better_ than Claude's (in-band and structural, not a hook that must be installed). Codex also ships a stable, Claude-wire-compatible hooks system — including a `Stop` hook.
 
 The real blocker is one layer down: **Boss's only progress ingress is a unix socket fed by the `boss-event` shim, which only exists because Claude can be made to run a command on every hook.** Codex's signal arrives on the worker's _stdout_, which the engine currently does not read at all. So the gap is not "Codex lacks turn boundaries" — it is **"`ProgressObservation` abstracts event _normalisation_ but not event _transport_."** That is the single amendment that most changes P1422's remaining work.
 
-Second finding, and the one I want a human to look at: **I could not get any Codex hook to fire under `codex exec`, in nine configurations.** Hooks exist, are `stable`, are documented, and their schemas are compiled into the binary — but a hook pointing at a nonexistent binary produced no diagnostic at all. See [Open question OQ-1](#oq-1-do-codex-hooks-fire-under-codex-exec). **This design therefore assumes no working hooks in v1** and routes every guardrail through a mechanism that does not need them.
+Second finding, revised on 0.145.0: **Codex hooks do fire under `codex exec`, and `PreToolUse` deny genuinely blocks a command before it runs.** On 0.137.0 no hook fired in nine configurations; on 0.145.0 the _identical_ configuration fires reliably. That resolves the original OQ-1 — but it does **not** change the chosen design, because hooks fail **open and silently** in two independent ways: an untrusted hook is skipped with no warning, and a hook whose command does not exist produces no diagnostic. A guardrail carrier that can silently evaporate is not one Boss can rely on. See [OQ-1](#oq-1-hook-trust-provisioning).
+
+**The `PATH`-shim design is therefore retained, and is now better justified than when hooks appeared not to work at all**: shims are the load-bearing guardrail, and hooks become defence-in-depth that Boss may additionally declare.
 
 Third finding: that mechanism already half-exists. Boss prepends `BOSS_BIN_DIR` to the worker's `PATH` (`engine/core/src/runner/pane_spawn.rs:382`). Moving Boss's command-level guardrails from `PreToolUse` hooks into **`PATH` shims** makes them driver-agnostic, closes a real hole in the Claude path (a hook cannot see a command run inside a subshell), and is the reason most work-item kinds can be Codex-eligible without hooks at all.
 
@@ -30,14 +33,16 @@ Third finding: that mechanism already half-exists. Boss prepends `BOSS_BIN_DIR` 
 
 - **Implementing the load balancer.** Out of scope by operator direction. This doc identifies the seams it attaches to and specifies nothing about policy.
 - **Removing or de-privileging the Claude path.** Claude remains the reference driver and the default.
-- **Codex Cloud, `codex app-server`, `codex mcp-server`, `codex remote-control`.** v1 drives `codex exec` only. The app-server is a strictly richer surface and a plausible v2 (see [Alternative 3](#alternative-3-drive-codex-app-server-over-jsonrpc)).
+- **Codex Cloud, `codex app-server`, `codex mcp-server`, `codex remote-control`.** v1 drives `codex exec` only. The app-server is a strictly richer surface and a plausible v2 (see [Alternative 3](#alternative-3-drive-codex-app-server-over-json-rpc)).
 - **App-side / Swift changes.** The kanban already reads abstract `WorkerActivity`; nothing app-side needs to know which driver ran.
 - **Remote/SSH dispatch for Codex.** `engine/core/remote/boss-remote-run.sh:84,159,162` is 100% hardcoded Claude. Deferred, and filed as such.
 - **Re-litigating the P1422 capability vocabulary.** The 12 capabilities are the right decomposition; this doc changes signatures and adds two, it does not re-open the model.
 
 ## Method
 
-Everything about Codex below was established by **running `codex-cli 0.137.0` on this host on 2026-07-24**, not from recollection. Where a claim comes from the binary's embedded generated schemas rather than an observed run, it is marked _(binary)_. Where I could not establish something, it is an explicit open question rather than an assertion.
+Everything about Codex below was established by **running Codex on this host on 2026-07-24**, not from recollection. Where a claim comes from the binary's embedded generated schemas rather than an observed run, it is marked _(binary)_. Where I could not establish something, it is an explicit open question rather than an assertion.
+
+The doc was first written against `0.137.0`. On operator request, **every Codex claim was then re-run against `0.145.0`** — the version now installed — rather than having the version string bumped. The body below states 0.145.0 behaviour; [Version delta](#version-delta-01370--01450) reports what moved, because the churn across eight minor versions is itself a design input.
 
 Boss-side claims were re-verified against `7859b6c4` by locating symbols, not line numbers. **The brief's ground-truth section has already drifted**: the dispatch gate it cites as `engine/core/src/runner.rs:1320-1335` is now `engine/core/src/runner/worker_spawn.rs:597-601` — `runner.rs` has been split into a module directory. Treat the line numbers in _this_ doc the same way.
 
@@ -45,31 +50,130 @@ The spike harness (isolated `CODEX_HOME`, throwaway git repo, hook handler loggi
 
 ---
 
+## Version delta: 0.137.0 → 0.145.0
+
+The whole spike was re-run on 0.145.0. **Two deltas change the design, one changes a task's scope, and the rest are drift** — but the drift is the point: eight minor versions moved the event stream three times without any version marker on the wire, which converts [OQ-2](#oq-2) from a precaution into an evidenced requirement.
+
+### Deltas that change the design
+
+**D-1 — `-a/--ask-for-approval` is gone from `codex exec`. This design's launch command would have failed outright.**
+
+```
+$ codex exec --json -a never -C "$REPO" "..."
+error: unexpected argument '-a' found
+```
+
+Approval policy is now fixed for headless exec: a debug-log capture of a real run shows `approval_policy=Never` with no flag supplied. The requirement the flag encoded — _"any other policy can block a headless worker forever waiting for an approval nobody will give"_ — is now satisfied **by default**. The [execution shape](#execution-shape) drops the flag. Removing a stable flag in a minor release is also the single clearest argument for pinning.
+
+**D-2 — Hooks fire. `PreToolUse` deny genuinely blocks. [OQ-1](#oq-1-hook-trust-provisioning) is resolved and inverted.**
+
+The configuration that produced nothing across nine variants on 0.137.0 fires reliably on 0.145.0. All three probed events delivered Claude-shaped payloads:
+
+````jsonl
+{"session_id":"019f95c2-…","transcript_path":"…/rollout-2026-07-24T13-13-28-019f95c2-….jsonl","cwd":"…","hook_event_name":"SessionStart","model":"gpt-5.5","permission_mode":"bypassPermissions","source":"startup"}
+{"session_id":"019f95c2-…","turn_id":"019f95c2-…","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo hooktest"},"tool_use_id":"call_HZE8…"}
+{"session_id":"019f95c2-…","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Output:\n\n```text\nhooktest\n```"}
+````
+
+A deny handler blocked the command **before execution**, and the reason reached the model:
+
+```
+ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: BOSS GUARDRAIL: this command is blocked by policy.. Command: echo shouldbeblocked
+```
+
+Three details matter more than the headline:
+
+- `tool_name` is **`Bash`** and `permission_mode` is **`bypassPermissions`** — Claude's exact vocabulary, not a lookalike. Boss's existing hook payload parsing is closer to reusable than assumed.
+- **`transcript_path` _is_ stamped on hook payloads.** [G-9](#g-9-transcriptaccess) and [A-6](#proposed-p1422-amendments) assumed Codex offers no such field and the path must be derived from `thread_id` + `CODEX_HOME`. That derivation is still needed for the hookless path, but it is no longer the only option.
+- The hook payload's `session_id` and the stream's `thread_id` carried the **identical value** (`019f95c2-f090-7910-b9cc-8d8363aeb9c3`). The doc previously inferred these were the same concept under two names; that is now observed, not inferred.
+
+**Why this does not change the chosen approach.** Hooks fail **open, silently, in two independent ways**:
+
+| Failure mode                | Observed behaviour                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------ |
+| Hook not trusted            | Command runs normally. **No warning, no stream event, no log line.**                 |
+| Hook command does not exist | Turn completes normally. **No diagnostic** — the 0.137.0 control reproduces exactly. |
+
+Hooks run only under `--dangerously-bypass-hook-trust` or a persisted trust record — `[hooks] trusted_hash`, a real key (`--strict-config` accepts it; `HookStateToml.trusted_hash` _(binary)_). A wrong or stale hash is indistinguishable from no hooks at all. For a guardrail carrier that is disqualifying: Boss rewrites worker config per run, so a hash that goes stale would silently disarm every guardrail with no signal. `PATH` shims fail **closed** — a missing shim means the real binary is not on `PATH` and the command errors loudly.
+
+So [Guardrail integrity](#guardrail-integrity) stands unchanged, and [Alternative 1](#alternative-1-replicate-the-claude-architecture--make-codex-emit-hook-callbacks) is still rejected — now on fail-open semantics rather than on non-functioning hooks, which is a stronger reason.
+
+**Deny-only is unchanged**, so nothing in [G-6](#g-6-tooluseinterception) about rewriting relaxes: `unsupported permissionDecision:allow` and `unsupported permissionDecision:ask` are both still present _(binary)_, and `updatedInput` still requires the rejected `allow`. Tool-input rewriting remains unreachable via Codex hooks.
+
+### Delta that changes a task's scope
+
+**D-3 — `codex exec review` is a native non-interactive review mode**, with `--base <BRANCH>`, `--commit <SHA>`, `--uncommitted`, and `--title`; there is a `codex-auto-review` model in the catalog. [T-25](#t-25-codex-eligibility-for-review-and-conflict-resolution-kinds) assumed review would be an ordinary `codex exec` run under `--sandbox read-only`. It should evaluate this purpose-built surface first — it may be a better fit for Boss's review kind than a general exec run, and it is the one place Codex offers something Boss's Claude path has no direct analogue for.
+
+### Stream drift — all silent, all additive
+
+Envelope types are unchanged (`thread.started`, `turn.started`, `item.started`, `item.completed`, `turn.completed`), and there is **still no schema version field**. Underneath that stable surface, three things moved:
+
+| #   | Change                                                                                                                                       | Consequence                                                                                                                      |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| D-4 | `usage` gained **`cache_write_input_tokens`**                                                                                                | [Load-balancing seam 2](#load-balancing-seams) enumerates the usage fields; it must treat the set as open, not fixed.            |
+| D-5 | Item IDs are now **0-based** (`item_0`); the 0.137.0 capture began at `item_1`                                                               | The [T-12](#t-12-codexdriver-progress-normaliser) normaliser must not assume a 1-based index or derive ordering from the number. |
+| D-6 | `item.completed` with `type:"error"` now carries **operational warnings**, not just turn failures (the trust-bypass notice arrives this way) | T-12 must not treat every `error` item as a failed turn, or trust-bypass warnings will abort healthy workers.                    |
+
+`TurnItem` grew from ten variants to **fourteen** _(binary)_ — adding `DynamicToolCall`, `CollabAgentToolCall`, `Extension`, `EnteredReviewMode`. Hook events grew from ten to **eleven**, adding `SessionEnd` _(binary)_. T-12 and [T-22](#t-22-extend-the-reference-driver-conformance-harness-a-12-amends-t1483) must both treat these enums as open and ignore-with-logging on unknown variants.
+
+One genuinely useful addition: **`--strict-config`** _("Error out when config.toml contains fields that are not recognized by this version of Codex")_. That is a real conformance assertion Boss can run in T-22 to detect a config-schema break at startup rather than at runtime. It does **not** cover the event stream, which remains unversioned.
+
+### Model and effort — [G-4](#g-4-modelandeffortmenu) needs restating
+
+The reasoning ladder is **per-model, and up to six levels**, not the flat three recorded against 0.137.0. From `codex debug models`:
+
+| Model                     | Default  | Supported reasoning levels             |
+| ------------------------- | -------- | -------------------------------------- |
+| `gpt-5.6-sol`             | `low`    | `low, medium, high, xhigh, max, ultra` |
+| `gpt-5.6-terra`           | `medium` | `low, medium, high, xhigh, max, ultra` |
+| `gpt-5.6-luna`            | `medium` | `low, medium, high, xhigh, max`        |
+| `gpt-5.5`                 | `medium` | `low, medium, high, xhigh`             |
+| `gpt-5.4`, `gpt-5.4-mini` | `medium` | `low, medium, high, xhigh`             |
+| `gpt-5.3-codex-spark`     | `high`   | `low, medium, high, xhigh`             |
+| `codex-auto-review`       | `medium` | `low, medium, high, xhigh`             |
+
+G-4 previously read: _"3-value reasoning effort against Boss's 5-value ladder is exactly the `Degrade` case."_ That is no longer true — the range now **meets or exceeds** Boss's 5-value ladder on the newer models and varies per model within one catalog. The capability is therefore not a fixed degrade at all; the menu must be **sourced per-model at runtime**. The doc already recommended reading `codex debug models` rather than hardcoding a table — that recommendation was a convenience before and is **load-bearing now**, and it is exactly the kind of table that would have been wrong within eight minor versions.
+
+### Re-verified unchanged
+
+`CODEX_HOME` isolation is still complete (the spike home grew its own `sessions/`, `state_5.sqlite`, `logs_2.sqlite`, `skills/`, `plugins/`, `models_cache.json`; nothing leaked to `~/.codex`). Auth is still `File` mode with `auth.json` inside `CODEX_HOME`. Sandbox is still three modes, and a live run confirms what was previously a binary-only claim: `sandbox_policy=WorkspaceWrite { writable_roots: [], network_access: false, exclude_tmpdir_env_var: false, exclude_slash_tmp: false }`. Rollout paths keep the `sessions/YYYY/MM/DD/rollout-<ISO8601>-<thread_id>.jsonl` shape. The stdin gotcha still applies — `< /dev/null` is still required.
+
+Worth noting for the [coexistence hazard](#migration-and-coexistence): `external_config_migration_prompts` still exists, and 0.145.0 adds an `external_agent_memory_import` feature plus an `external_agent_config_imports` table in `state_5.sqlite` — a **second** Claude-import vector beyond config, pointed at agent memory. `codex doctor` now reports 0.145.0 as current (`latest version status: current version is not older`).
+
+One clarification the stdout-reader work depends on, checked explicitly because [T-05](#t-05-engine-side-stdout-jsonl-progress-reader) rests on it: **`--json` events go to stdout and the human-readable `Reading additional input from stdin...` notice goes to stderr.** The JSONL stream is uncontaminated, so the reader needs no filtering.
+
+---
+
 ## What Codex actually is
 
 ### Invocation and headless mode
 
-`codex exec` is a real, first-class non-interactive mode — not a scraped TUI. Verified flags (`codex exec --help`, 0.137.0):
+`codex exec` is a real, first-class non-interactive mode — not a scraped TUI. Verified flags (`codex exec --help`, 0.145.0):
 
-| Flag                                                                | Meaning                                                              |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `--json`                                                            | Emit events to stdout as JSONL                                       |
-| `-o, --output-last-message <FILE>`                                  | Write the agent's last message to a file                             |
-| `--output-schema <FILE>`                                            | JSON Schema describing the model's final response shape              |
-| `-C, --cd <DIR>`                                                    | Working root                                                         |
-| `--add-dir <DIR>`                                                   | Additional writable directories                                      |
-| `-s, --sandbox <read-only\|workspace-write\|danger-full-access>`    | Sandbox policy                                                       |
-| `-a, --ask-for-approval <untrusted\|on-failure\|on-request\|never>` | Approval policy                                                      |
-| `--dangerously-bypass-approvals-and-sandbox`                        | No sandbox, no prompts                                               |
-| `-m, --model <MODEL>`                                               | Model                                                                |
-| `-c, --config <key=value>`                                          | Per-invocation config override (dotted path, TOML-parsed value)      |
-| `-p, --profile <NAME>`                                              | Layer `$CODEX_HOME/<NAME>.config.toml` over the base config          |
-| `--ignore-user-config`                                              | Do not load `$CODEX_HOME/config.toml` (auth still uses `CODEX_HOME`) |
-| `--ephemeral`                                                       | Do not persist session files                                         |
-| `--skip-git-repo-check`                                             | Allow running outside a git repo                                     |
-| `--dangerously-bypass-hook-trust`                                   | Run enabled hooks without persisted trust                            |
+| Flag                                                             | Meaning                                                              |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------- | ------ |
+| `--json`                                                         | Emit events to stdout as JSONL                                       |
+| `-o, --output-last-message <FILE>`                               | Write the agent's last message to a file                             |
+| `--output-schema <FILE>`                                         | JSON Schema describing the model's final response shape              |
+| `-C, --cd <DIR>`                                                 | Working root                                                         |
+| `--add-dir <DIR>`                                                | Additional writable directories                                      |
+| `-s, --sandbox <read-only\|workspace-write\|danger-full-access>` | Sandbox policy                                                       |
+| `--dangerously-bypass-approvals-and-sandbox`                     | No sandbox, no prompts                                               |
+| `-m, --model <MODEL>`                                            | Model                                                                |
+| `-c, --config <key=value>`                                       | Per-invocation config override (dotted path, TOML-parsed value)      |
+| `-p, --profile <NAME>`                                           | Layer `$CODEX_HOME/<NAME>.config.toml` over the base config          |
+| `--ignore-user-config`                                           | Do not load `$CODEX_HOME/config.toml` (auth still uses `CODEX_HOME`) |
+| `--ephemeral`                                                    | Do not persist session files                                         |
+| `--skip-git-repo-check`                                          | Allow running outside a git repo                                     |
+| `--dangerously-bypass-hook-trust`                                | Run enabled hooks without persisted trust                            |
+| `--ignore-rules`                                                 | Do not load user or project execpolicy `.rules` files                |
+| `--strict-config`                                                | Error on config fields this version does not recognise               |
+| `--enable / --disable <FEATURE>`                                 | Equivalent to `-c features.<name>=true                               | false` |
+| `-i, --image <FILE>...`                                          | Attach image(s) to the initial prompt                                |
 
-`codex exec resume [--last | <id>]` resumes a session.
+**`-a/--ask-for-approval` no longer exists on `codex exec`** — it was removed between 0.137.0 and 0.145.0, and passing it is a hard error. Headless exec now runs `approval_policy=Never` unconditionally (observed in a debug-log capture), which is what Boss wanted anyway. See [D-1](#deltas-that-change-the-design).
+
+`codex exec resume [--last | <id>]` resumes a session. `codex exec review` runs a native non-interactive code review ([D-3](#delta-that-changes-a-tasks-scope)).
 
 **Operational gotcha, verified.** The prompt may be a positional argument _or_ stdin. When stdin is neither a TTY nor redirected, Codex prints `Reading additional input from stdin...` and consumes it. Every spawn Boss issues must redirect `< /dev/null`. This bit the first spike run.
 
@@ -78,21 +182,23 @@ The spike harness (isolated `CODEX_HOME`, throwaway git repo, hook handler loggi
 Real capture (`codex exec --json`, prompt: _"Run the shell command 'echo probe' and report its output."_):
 
 ````jsonl
-{"type":"thread.started","thread_id":"019f9599-bbca-73a2-88b6-442d7f815538"}
+{"type":"thread.started","thread_id":"019f95c2-7197-7432-a9c0-f22eb0293766"}
 {"type":"turn.started"}
-{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo probe'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
-{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo probe'","aggregated_output":"probe\n","exit_code":0,"status":"completed"}}
-{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"`echo probe` output:\n\n```text\nprobe\n```"}}
-{"type":"turn.completed","usage":{"input_tokens":25572,"cached_input_tokens":25344,"output_tokens":107,"reasoning_output_tokens":0}}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc 'echo probe'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc 'echo probe'","aggregated_output":"probe\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"`echo probe` output:\n\n```text\nprobe\n```"}}
+{"type":"turn.completed","usage":{"input_tokens":26318,"cached_input_tokens":14080,"cache_write_input_tokens":0,"output_tokens":49,"reasoning_output_tokens":0}}
 ````
 
-Observed envelope types: `thread.started`, `turn.started`, `turn.completed`, `item.started`, `item.completed`. Observed item types: `agent_message`, `command_execution`, `error`. The full item enum _(binary, `codex_protocol::items::TurnItem`)_ is `UserMessage`, `HookPrompt`, `AgentMessage`, `Reasoning`, `WebSearch`, `ImageView`, `ImageGeneration`, `FileChange`, `McpToolCall`, `ContextCompaction`.
+Observed envelope types: `thread.started`, `turn.started`, `turn.completed`, `item.started`, `item.completed`. Observed item types: `agent_message`, `command_execution`, `error`. The full item enum _(binary, `codex_protocol::items::TurnItem`)_ is `UserMessage`, `HookPrompt`, `AgentMessage`, `Reasoning`, `DynamicToolCall`, `CollabAgentToolCall`, `WebSearch`, `ImageView`, `Extension`, `ImageGeneration`, `EnteredReviewMode`, `FileChange`, `McpToolCall`, `ContextCompaction` — fourteen variants, up from ten on 0.137.0.
 
 Three things matter here:
 
 1. **Turn boundaries are native and in-band.** `turn.started` / `turn.completed` are structural stream events. Nothing needs installing. This is a stronger signal than Claude's `Stop` hook, which depends on a settings file being written correctly and a shim binary being on `PATH`.
 2. **`turn.completed` carries token usage.** Boss gets per-turn accounting for free — directly useful to the future balancer's rate-limit state.
-3. **The stream is not versioned.** No schema version field on any envelope. Codex 0.137.0 is installed here; 0.145.0 is already available (`codex doctor`). Boss must pin and conformance-test the version it drives.
+3. **The stream is not versioned, and it demonstrably drifts.** No schema version field on any envelope, yet across eight minor versions `usage` gained a field, item IDs changed base, `error` items took on a second meaning, and the item enum grew by four variants — every one of them silently. Boss must pin the version it drives and conformance-test it ([D-4 through D-6](#stream-drift--all-silent-all-additive)).
+
+A fourth point, verified because the whole transport design depends on it: **the JSONL goes to stdout, and only to stdout.** The one human-readable line Codex emits (`Reading additional input from stdin...`) goes to stderr, so a reader attached to stdout sees clean JSONL with no filtering.
 
 ### Session, turn, and transcript identity
 
@@ -161,9 +267,9 @@ The two "lost" rows are what [Guardrail integrity](#guardrail-integrity) resolve
 
 This determines the `ToolUseInterception` disposition, so I went at it hard.
 
-**What is certainly true.** `codex features list` reports `hooks   stable   true`. The binary embeds generated JSON Schemas for **ten** hook events, as `<event>.command.input` / `<event>.command.output` pairs: `pre-tool-use`, `post-tool-use`, `permission-request`, `pre-compact`, `post-compact`, `session-start`, `user-prompt-submit`, `subagent-start`, `subagent-stop`, `stop`.
+**What is certainly true.** `codex features list` reports `hooks   stable   true`. The binary embeds generated JSON Schemas for **eleven** hook events, as `<event>.command.input` / `<event>.command.output` pairs: `pre-tool-use`, `post-tool-use`, `permission-request`, `pre-compact`, `post-compact`, `session-start`, `session-end`, `user-prompt-submit`, `subagent-start`, `subagent-stop`, `stop`. (`session-end` is new in 0.145.0.)
 
-The wire format is **deliberately Claude-Code-compatible**. `PreToolUse` input carries `hook_event_name`, `session_id`, `transcript_path`, `cwd`, `model`, `permission_mode`, `tool_name`, `tool_input`, `tool_use_id`, plus Codex's `turn_id`. `permission_mode` is Claude's exact enum: `default | acceptEdits | plan | dontAsk | bypassPermissions`. Output is `hookSpecificOutput` / `hookEventName` / `permissionDecision` / `permissionDecisionReason` / `decision` / `reason` / `continue` / `systemMessage` / `stopReason` / `suppressOutput`. The `stop.command.output` schema even carries the comment:
+The wire format is **deliberately Claude-Code-compatible**, and on 0.145.0 this is confirmed against live payloads rather than only against the embedded schemas. `PreToolUse` input carries `hook_event_name`, `session_id`, `transcript_path`, `cwd`, `model`, `permission_mode`, `tool_name`, `tool_input`, `tool_use_id`, plus Codex's `turn_id` — and an observed capture shows `tool_name: "Bash"` and `permission_mode: "bypassPermissions"`, i.e. Claude's literal tool name and enum value. `permission_mode` is Claude's exact enum: `default | acceptEdits | plan | dontAsk | bypassPermissions`. Output is `hookSpecificOutput` / `hookEventName` / `permissionDecision` / `permissionDecisionReason` / `decision` / `reason` / `continue` / `systemMessage` / `stopReason` / `suppressOutput`. The `stop.command.output` schema even carries the comment:
 
 > _"Claude requires `reason` when `decision` is `block`; we enforce that semantic rule during output parsing rather than in the JSON schema."_
 
@@ -194,15 +300,21 @@ statusMessage = "Description"
 Handlers may also live in a per-layer `hooks.json`; both in one layer loads both with a warning. Project-local hooks load only when the `.codex/` layer is trusted; user-level hooks are independent of project trust.
 
 <a id="oq-1-do-codex-hooks-fire-under-codex-exec"></a>
-**What I could not establish — and this is the finding.** _I never got a hook to fire under `codex exec`._ Nine configurations: `hooks.json` at `$CODEX_HOME`; `hooks.json` at `<project>/.codex/`; TOML `[[hooks.PreToolUse]]` (CamelCase, per the docs); TOML `[[hooks.pre_tool_use]]` (snake_case, per binary strings); with `matcher = "*"`, `matcher = ".*"`, and no matcher; `command` as a shell string with an argument and as a bare executable path; with and without `--dangerously-bypass-hook-trust`. `SessionStart`, `PreToolUse`, and `Stop` all silent every time.
+**Hooks fire on 0.145.0 — and did not on 0.137.0.** On the older version no hook fired in nine configurations (`hooks.json` at `$CODEX_HOME`; `hooks.json` at `<project>/.codex/`; TOML `[[hooks.PreToolUse]]` CamelCase; TOML `[[hooks.pre_tool_use]]` snake_case; `matcher = "*"`, `matcher = ".*"`, and none; `command` as a shell string and as a bare executable path; with and without `--dangerously-bypass-hook-trust`). On 0.145.0 the **first** of those configurations — CamelCase TOML, `matcher = ".*"`, with the trust-bypass flag — fires `SessionStart`, `PreToolUse`, and `Stop` reliably, and a deny decision blocks the command before it executes. Payloads and evidence are in [D-2](#deltas-that-change-the-design).
 
-The decisive control: a hook whose `command` was `/definitely/not/a/real/binary-xyz` produced **no error, no warning, no stream event**. And `--dangerously-bypass-hook-trust`'s warning fires **even with zero hooks configured**, so it is not evidence that anything loaded.
+**The trust gate is the operative constraint, and it fails open.** Hooks run only if trusted. Trust comes from either `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash` record (`HookStateToml` _(binary)_; `--strict-config` accepts the key, so it is real). Without trust, the hook is **skipped in complete silence** — the command runs, and there is no warning, no stream event, and no log line. Separately, a hook whose command does not exist also produces **no diagnostic**: the 0.137.0 control (`command = "/definitely/not/a/real/binary-xyz"`) reproduces exactly on 0.145.0, completing the turn as if nothing were configured.
 
-Two readings fit: hooks are wired only into the TUI / `app-server` paths and not `codex exec`; or activation needs an undocumented step. I am not going to guess between them. **This design assumes hooks do not work in `codex exec`**, which is the safe assumption — if the spike ([T-01](#t-01-codex-hook-activation-spike)) shows they do, capability declarations get _upgraded_, and nothing designed here has to be undone.
+Both failure modes are silent and fail-open. That is why this resolution does **not** move guardrails onto hooks: Boss regenerates worker config every run, so a `trusted_hash` that goes stale — or a shim path that moves — would disarm every guardrail with nothing to observe. `PATH` shims fail closed, which is the property a guardrail needs.
+
+**What remains open is trust _provisioning_, not activation:** how to compute and persist `trusted_hash` so a Boss worker gets hooks without shipping `--dangerously-bypass-hook-trust`. That flag is not an acceptable default — it also trusts **project-local** `.codex/` hooks from the repository under work, which in Boss's threat model is attacker-controllable content. See [OQ-1](#oq-1-hook-trust-provisioning) and the re-scoped [T-01](#t-01-codex-hook-trust-provisioning).
 
 ### Model and effort
 
-`-m/--model`; `model_reasoning_effort` in config (`low` / `medium` / `high` observed; `-c model_reasoning_effort=...` per invocation). Config also carries `plan_mode_reasoning_effort`, `model_verbosity`, `model_supports_reasoning_summaries` _(binary)_. Default model on this host is `gpt-5.5`. `codex debug models` renders the raw model catalog as JSON — that is the right source for a `ModelMenu`, rather than a hardcoded table.
+`-m/--model`; `model_reasoning_effort` in config (`-c model_reasoning_effort=...` per invocation). Config also carries `plan_mode_reasoning_effort`, `model_verbosity`, `model_supports_reasoning_summaries` _(binary)_.
+
+The reasoning ladder is **per-model and runs up to six levels** — `low, medium, high, xhigh, max, ultra` on `gpt-5.6-sol` / `gpt-5.6-terra`, four on `gpt-5.5` — so it is not a single fixed vocabulary that Boss can map once. The full catalog is tabulated in the [version delta](#model-and-effort--g-4-needs-restating); on 0.137.0 only `low` / `medium` / `high` were observed.
+
+`codex debug models` renders the raw model catalog as JSON, including each model's `supported_reasoning_levels` and `default_reasoning_level` — that is the right source for a `ModelMenu`, rather than a hardcoded table. Between 0.137.0 and 0.145.0 both the model list and the effort ladder changed, so a hardcoded table would already be stale.
 
 ### Claude-Code interop — a coexistence hazard
 
@@ -223,7 +335,7 @@ Classification per the brief: **(a)** implementable against the current trait, *
 | G-3  | `PermissionPolicy`      | 3 sandbox modes, 4 approval policies           | **(b)** | Trait is a file path; Codex needs argv+env |
 | G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)** | Blocked only by T3326                      |
 | G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)** | **Transport is not abstracted** — top gap  |
-| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, unverified             | **(d)** | Degrade; relocate guardrails               |
+| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(d)** | Degrade; relocate guardrails               |
 | G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)** | Native, but no trait method                |
 | G-8  | `StructuredOutput`      | `--output-schema`, `--output-last-message`     | **(b)** | Better than Claude's; no trait method      |
 | G-9  | `TranscriptAccess`      | rollout JSONL, Codex line schema               | **(b)** | Trait method exists but is dead code       |
@@ -263,7 +375,9 @@ The problem for Codex is the **signature**: `async fn write_permission_config(&s
 
 Re-verified: `menu_for_driver(_driver_slug: &str)` still discards its argument and returns Claude's menu unconditionally (`engine/effort/src/lib.rs:110-112`). `SpawnConfig.claude_effort` is still Claude-named (`engine/effort/src/lib.rs:34`, set at `:182`, consumed at `:62`).
 
-Codex fits the `ModelMenu` model cleanly — 3-value reasoning effort against Boss's 5-value ladder is exactly the `Degrade` case the capability model anticipates. **T3326 is correctly scoped and sufficient**, provided it also renames `claude_effort` to a driver-neutral name (`effort_value`); otherwise the Claude-ism just moves.
+Codex fits the `ModelMenu` model cleanly, but **not as the fixed `Degrade` case this doc originally recorded**. On 0.145.0 the effort ladder is per-model and reaches six values (`low, medium, high, xhigh, max, ultra`) — meeting or exceeding Boss's 5-value ladder on the newer models, and varying between models within one catalog. So the mapping is neither a uniform degrade nor a static table: it must be resolved per selected model from `codex debug models` at runtime.
+
+**T3326 remains correctly scoped**, with two riders: it must rename `claude_effort` to a driver-neutral name (`effort_value`), otherwise the Claude-ism just moves; and the menu it builds must be **per-model**, not per-driver, or Codex's newer models will be silently capped at Boss's older assumption about their ceiling.
 
 ### G-5 `ProgressObservation` — the top gap
 
@@ -299,11 +413,13 @@ Finally, `progress_fidelity()` (`engine/driver/src/claude.rs:482`) still has **n
 
 ### G-6 `ToolUseInterception`
 
-Given [OQ-1](#oq-1-do-codex-hooks-fire-under-codex-exec), the Codex driver **does not declare this capability** in v1, landing on the default disposition `Degrade` (`engine/driver/src/lib.rs:92`).
+Codex hooks **do** fire on 0.145.0 and `PreToolUse` deny genuinely blocks a command pre-execution ([D-2](#deltas-that-change-the-design)). Nonetheless the Codex driver **does not declare this capability** in v1, landing on the default disposition `Degrade` (`engine/driver/src/lib.rs:92`) — because a capability Boss declares is one Boss promises to enforce, and Codex hooks fail **open and silently** when untrusted or misconfigured. Declaring `ToolUseInterception` on a mechanism that can evaporate without a signal would be a worse outcome than declaring it absent and carrying the guardrails somewhere that fails closed.
 
-That default is dangerous as things stand: the degrade path exists as **types only**. `PostHocInterceptionFn` and `PostHocInterceptionAction` (`engine/driver/src/lib.rs:497-525`) have **zero engine callers** — re-verified. A driver landing on `Degrade` today silently loses editorial enforcement, the path guard, the revision-PR guard, and the checkleft push guard. **Silent loss of guardrails is not acceptable**, per the brief and per basic prudence.
+This is a change of _reason_, not of _decision_: the original basis was "hooks appear not to work at all", and the current basis is "hooks work but cannot be relied upon to have worked". Both land on `PATH` shims as the guardrail carrier.
 
-Even in the optimistic case where hooks do fire, Codex's `PreToolUse` is **deny-only** — so the _rewrite_ half of editorial enforcement (`PreToolUseDecision::AllowWithRewrite`, `engine/core/src/editorial_hook.rs:78-81`) is unreachable regardless. Usefully, that enum already distinguishes two rewrite paths:
+That default disposition is nevertheless dangerous as things stand: the degrade path exists as **types only**. `PostHocInterceptionFn` and `PostHocInterceptionAction` (`engine/driver/src/lib.rs:497-525`) have **zero engine callers** — re-verified. A driver landing on `Degrade` today silently loses editorial enforcement, the path guard, the revision-PR guard, and the checkleft push guard. **Silent loss of guardrails is not acceptable**, per the brief and per basic prudence.
+
+Even now that hooks fire, Codex's `PreToolUse` is still **deny-only** — re-verified on 0.145.0, where `unsupported permissionDecision:allow` and `unsupported permissionDecision:ask` both persist _(binary)_ — so the _rewrite_ half of editorial enforcement (`PreToolUseDecision::AllowWithRewrite`, `engine/core/src/editorial_hook.rs:78-81`) is unreachable regardless. Usefully, that enum already distinguishes two rewrite paths:
 
 - `AllowWithRewrite { updated_command: Some(cmd) }` — needs `updatedInput`. **Unavailable under Codex.**
 - `AllowWithRewrite { updated_command: None }` — the redaction landed in a `--body-file` overwritten on disk. **Works without any rewrite capability.**
@@ -318,7 +434,7 @@ The brief rates this the highest-severity gap on the premise that Codex cannot s
 
 The gap is therefore not severity-of-absence but **shape**: there is no trait method, so completion is hardwired to a Claude-hook-derived event. T3325 (add a `TurnBoundary` trait method + engine synthesizer) is **correctly scoped but mis-prioritised** — for Codex the synthesizer is unnecessary; what is needed is the trait method plus the [G-5](#g-5-progressobservation--the-top-gap) stdout transport, and then `turn.completed` maps straight onto `WorkerEvent::Stop`. The synthesizer is still worth building for a hypothetical third driver with neither hooks nor turn events, but it is not on Codex's critical path and should not gate it.
 
-One genuine subtlety: Claude's `Stop` fires per _assistant turn_ within a session; Codex's `codex exec` is **one turn per process**, exiting after `turn.completed`. Boss's probe/nudge loop assumes it can inject a follow-up prompt into a live session (`engine/core/app/pane_delivery.rs`). Under Codex that becomes `codex exec resume`, i.e. a **new process**, not a message into a running one. This is a real lifecycle difference and the main reason [T-08](#t-08-codex-driver-probe-and-nudge-via-exec-resume) is its own task.
+One genuine subtlety: Claude's `Stop` fires per _assistant turn_ within a session; Codex's `codex exec` is **one turn per process**, exiting after `turn.completed`. Boss's probe/nudge loop assumes it can inject a follow-up prompt into a live session (`engine/core/app/pane_delivery.rs`). Under Codex that becomes `codex exec resume`, i.e. a **new process**, not a message into a running one. This is a real lifecycle difference and the main reason [T-17](#t-17-controlverbs-on-the-trait-plus-codex-probenudge-via-exec-resume-a-7) is its own task.
 
 ### G-8 `StructuredOutput`
 
@@ -336,6 +452,8 @@ Two consequences:
 `normalize_transcript_entry` (`engine/driver/src/claude.rs:606-616`) is **never called** — re-verified. `engine/core/src/live_status.rs` passes raw JSONL straight to redaction. `engine/transcript-tail/src/lib.rs:1-8` documents itself as _"Incremental JSONL tail-watcher for claude transcript files"_ and hard-assumes that shape.
 
 Codex rollouts are also JSONL, so the tailer is reusable — but path discovery is the problem. Claude's path is discovered because Claude stamps `transcript_path` on hook payloads (`engine/core/src/events_socket.rs`, `live_status_loop.rs`). Codex's `--json` stream does **not** carry `transcript_path` (verified — no such field in any captured envelope). It is derivable as `$CODEX_HOME/sessions/<Y>/<M>/<D>/rollout-*-<thread_id>.jsonl`, and since the driver owns `CODEX_HOME` it can compute it from `thread_id` on `thread.started`.
+
+Codex's **hook** payloads _do_ carry `transcript_path` — confirmed on 0.145.0 ([D-2](#deltas-that-change-the-design)) — but that is not a usable discovery route here, because this design deliberately does not depend on hooks having fired. Derivation from `thread_id` stays the primary mechanism precisely because it works whether or not hooks are trusted.
 
 **Fix:** add a `transcript_path_for_session(&self, session_id) -> Option<PathBuf>` to the trait so discovery is driver-supplied rather than hook-derived, and actually **call** `normalize_transcript_entry` in `live_status.rs` — otherwise Codex transcript lines reach Claude-shaped redaction and summarisation logic.
 
@@ -362,6 +480,8 @@ For a Codex worker these sentences **assert a guarantee that is false**. That is
 ## Guardrail integrity
 
 Boss's safety properties are enforced today through Claude's `PreToolUse` hook. The brief requires an explicit refuse-vs-degrade call per guardrail. My answer for four of the five is **neither** — relocate the enforcement to a mechanism that does not depend on hooks.
+
+This section is unchanged by the 0.145.0 finding that Codex hooks _do_ work ([D-2](#deltas-that-change-the-design)). The requirement was never "use whatever mechanism exists"; it is that a guardrail must fail **closed**. Codex hooks fail open and silently when untrusted or misconfigured, so they can supplement the shims but must not be what the guarantee rests on.
 
 ### The `PATH`-shim insight
 
@@ -405,7 +525,7 @@ So editorial enforcement is **fully preserved** under a `PATH` shim — better t
 
 Configure Codex hooks to invoke the existing `boss-event` shim, reusing the unix socket, `events_socket.rs`, and the whole ingress path unchanged. Codex's hook payloads are Claude-wire-compatible, so `normalize_progress_event` would need only light adaptation. Zero new engine machinery.
 
-**Rejected.** It is blocked on [OQ-1](#oq-1-do-codex-hooks-fire-under-codex-exec) — I could not make a single hook fire. Even if hooks work, this is the wrong dependency: it makes Boss's progress ingress contingent on the most fragile, least-documented part of Codex's surface, when Codex is _already_ handing Boss a typed, in-band, structural event stream on stdout that requires no installation and cannot be misconfigured. It would also entrench the assumption that progress arrives via callback, which is exactly the abstraction gap ([G-5](#g-5-progressobservation--the-top-gap)) this project exists to surface.
+**Rejected — and the 0.145.0 delta strengthens the rejection rather than weakening it.** This was originally rejected partly because no hook could be made to fire. Hooks now demonstrably do fire ([D-2](#deltas-that-change-the-design)), so that objection is gone — but the decisive one remains and is now better evidenced: an untrusted or misconfigured hook is skipped in **complete silence**. Routing progress ingress through that mechanism would mean a worker that silently reports nothing and never completes, with no signal to distinguish it from a hung agent. It is the wrong dependency for the same underlying reason it was before: it makes Boss's progress ingress contingent on the most fragile, least-observable part of Codex's surface, when Codex is _already_ handing Boss a typed, in-band, structural event stream on stdout that requires no installation, no trust record, and cannot be silently skipped. It would also entrench the assumption that progress arrives via callback, which is exactly the abstraction gap ([G-5](#g-5-progressobservation--the-top-gap)) this project exists to surface.
 
 ### Alternative 2: Post-hoc-only guardrails via the existing `Degrade` path
 
@@ -431,16 +551,19 @@ Drive `codex exec --json` as a pane-embedded worker, with **stdout JSONL as the 
 CODEX_HOME=<run-dir>/codex-home \
   codex exec --json \
     --sandbox workspace-write \
-    --ask-for-approval never \
     -C <workspace> \
     -m <model> \
-    -c model_reasoning_effort=<low|medium|high> \
+    -c model_reasoning_effort=<resolved-per-model> \
     -o <run-dir>/last-message.txt \
     "$(cat AGENTS-initial-prompt.txt)" \
     < /dev/null
 ```
 
-`--ask-for-approval never` is required: any other policy can block a headless worker forever waiting for an approval nobody will give. Sandbox stays `workspace-write` (not `danger-full-access`) — that is what makes the Boss-data-dir guard structural.
+**No `--ask-for-approval`.** The flag was removed from `codex exec` between 0.137.0 and 0.145.0 and now produces a hard argument error; headless exec runs `approval_policy=Never` unconditionally, which is exactly the property Boss needed (any other policy can block a headless worker forever waiting for an approval nobody will give). This is the one place where the version delta would have broken the design outright rather than merely dating it — see [D-1](#deltas-that-change-the-design).
+
+Sandbox stays `workspace-write` (not `danger-full-access`) — that is what makes the Boss-data-dir guard structural. `model_reasoning_effort` is resolved against the selected model's `supported_reasoning_levels` rather than assumed, since the ladder is per-model and now reaches `ultra` on some models.
+
+`--strict-config` is worth adding once Boss's Codex config generation is stable: it turns an unrecognised config key into a startup error instead of a silently ignored setting, which is a cheap guard against exactly the config drift observed across these two versions.
 
 ### The four engine seams this needs
 
@@ -455,7 +578,7 @@ Provided: `Spawn`, `WorkspaceProvisioning`, `PermissionPolicy`, `ModelAndEffortM
 
 Not provided: `ToolUseInterception` (→ `Degrade`, guardrails carried by `PATH` shims), `ToolProvisioning` (→ `Degrade`, unused for every driver).
 
-If [T-01](#t-01-codex-hook-activation-spike) shows hooks fire, `ToolUseInterception` can be upgraded to provided-with-deny-only. Nothing above needs revisiting.
+Hooks firing on 0.145.0 does **not** by itself upgrade `ToolUseInterception`. The upgrade condition is not "do hooks fire" — that is now answered — but **"can Boss provision hook trust deterministically, and detect when a hook did not run"**. Until [T-01](#t-01-codex-hook-trust-provisioning) settles that, a declared capability would be a promise Boss cannot keep, because an untrusted hook is silently skipped. If T-01 succeeds, `ToolUseInterception` upgrades to provided-with-deny-only and hooks become defence-in-depth alongside the shims; nothing above needs revisiting either way.
 
 ### Which work-item kinds are Codex-eligible
 
@@ -474,7 +597,7 @@ Phased, with an acceptance criterion per phase. Refusals here are expressed thro
 Design _for_, do not design _now_. Three seams, with attachment points:
 
 1. **Per-driver capacity accounting.** Slots are one global pool today. The seam is the dispatch gate at `engine/core/src/runner/worker_spawn.rs:597` — it already resolves `(kind, driver)` and is the natural place for an in-flight count keyed by driver slug. Requirement on this project: **do not add a second, driver-blind admission path.** The stdout-reader work must not spawn workers outside this gate.
-2. **Per-provider rate-limit state.** Codex hands this over for free: `turn.completed` carries `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens` (verified in the capture above), and the binary carries `RateLimitSnapshot` / `RateLimitWindow` types. The seam is the progress reader — it should record per-turn usage against the driver rather than discarding it. Claude has no equivalent in-band signal, which is itself worth knowing before a balancer assumes symmetry.
+2. **Per-provider rate-limit state.** Codex hands this over for free: `turn.completed` carries `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens` (verified in the capture above), and the binary carries `RateLimitSnapshot` / `RateLimitWindow` types. The seam is the progress reader — it should record per-turn usage against the driver rather than discarding it. **Treat the usage field set as open:** `cache_write_input_tokens` was added between 0.137.0 and 0.145.0 with no wire signal ([D-4](#stream-drift--all-silent-all-additive)), so a balancer that destructures a fixed set of counters will break on the next upgrade. Claude has no equivalent in-band signal, which is itself worth knowing before a balancer assumes symmetry.
 3. **Capability-aware routing.** `CapabilityResolver::check_dispatch` already computes exactly the predicate a balancer needs ("can driver D run kind K"). It must stay a **pure, side-effect-free query** so a balancer can call it speculatively across candidate drivers before choosing. Requirement on this project: do not make `check_dispatch` mutate state or log dispatch decisions as a side effect.
 
 ### Migration and coexistence
@@ -482,23 +605,27 @@ Design _for_, do not design _now_. Three seams, with attachment points:
 - **Per-host auth.** `CODEX_HOME/auth.json`, symlinked from a host-level credential. No env-var collision with Claude. `unset ANTHROPIC_API_KEY` becomes driver-supplied ([G-1](#g-1-spawn)).
 - **Config collisions.** Solved by per-worker `CODEX_HOME`. Without it, concurrent workers race on `~/.codex/config.toml`'s project-trust registry.
 - **Workspace layout.** Codex uses `AGENTS.md` and `.codex/`; Claude uses `CLAUDE.md` and `.claude/`. They do not collide _by name_ — but Codex's `external_agent_config.detect` actively looks for `.claude/settings.json`, `CLAUDE.md`, and `hooks.json` and offers to import them. The Codex driver must disable that import (`external_config_migration_prompts`). A workspace that has run both drivers will contain both `.claude/` and `.codex/`; both must be engine-gitignored.
+- **A second import vector, new in 0.145.0.** Alongside config import, 0.145.0 adds an `external_agent_memory_import` feature (currently _under development_, default off) and an `external_agent_config_imports` table in `state_5.sqlite`. Suppressing config-migration prompts is therefore not a one-time fix — the surface is growing, and the Codex driver should assert its intended import posture explicitly rather than relying on a single flag's default. Per-worker `CODEX_HOME` limits the blast radius, since the import bookkeeping lives in the run's own state DB.
 - **Cube.** Nothing in `cube`'s workspace provisioning assumes an agent — it manages jj workspaces, leases, and PRs. `cube pr create` is agent-neutral and is, usefully, the enforcement point the [`PATH`-shim design](#guardrail-integrity) leans on. **No cube changes required**, which is a genuinely good outcome and worth stating explicitly.
 
 ---
 
 ## Risks / open questions
 
+<a id="oq-1-hook-trust-provisioning"></a>
+**OQ-1 — How does Boss provision Codex hook trust, and detect a hook that did not run?** The original form of this question ("do hooks fire under `codex exec`?") is **answered: they do, on 0.145.0**, and `PreToolUse` deny genuinely blocks. What replaces it is narrower and more operational. Hooks run only when trusted, via `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash`; an untrusted hook is skipped in complete silence, as is a hook whose command is missing. The bypass flag is not an acceptable default because it would also trust project-local `.codex/` hooks originating in the repository under work. So: what is `trusted_hash` computed over, can Boss stamp it deterministically when it regenerates worker config, and is there any observable signal that a configured hook did not fire? Until that last part has an answer, hooks cannot carry a guardrail. → [T-01](#t-01-codex-hook-trust-provisioning).
+
 <a id="oq-2"></a>
-**OQ-1 — Do Codex hooks fire under `codex exec`?** The one I most want resolved. Hooks are `stable`, documented, and schema-complete in the binary, but nine configurations produced nothing, and a deliberately-broken hook command produced no diagnostic. If they _do_ work, `ToolUseInterception` upgrades to deny-only and `PATH` shims become defence-in-depth rather than the sole carrier. If they do not, this design is already correct. Either way it should be settled before Phase 2. → [T-01](#t-01-codex-hook-activation-spike).
+**OQ-2 — Version pinning and churn. Now evidenced rather than precautionary.** The `--json` stream still carries **no schema version**, and re-running this analysis across 0.137.0 → 0.145.0 produced four concrete breaks in eight minor versions: a removed flag that would have made the prescribed launch command fail (`-a`), an added `usage` field, a changed item-ID base, a second meaning for `error` items, plus four new `TurnItem` variants and a new hook event. None of it was announced on the wire. This is no longer a hypothetical risk — it is the observed release cadence. Recommendation firms up accordingly: **pin the tested version, add `--strict-config` for the config half, and gate upgrades on the conformance harness (T1483 / [T-22](#t-22-extend-the-reference-driver-conformance-harness-a-12-amends-t1483))**. Note `--strict-config` covers config keys only; nothing validates the event stream, so the harness remains the sole defence there. "Pin the agent CLI version" is still a policy decision with operational cost, and still the operator's call.
 
 <a id="oq-3-what-is-the-codex-rules-execpolicy-format"></a>
-**OQ-2 — Version pinning and churn.** 0.137.0 is installed; 0.145.0 is already out. The `--json` stream carries **no schema version**. An unpinned Codex upgrade could silently change the event vocabulary and break progress observation with no compile-time signal. I recommend pinning the tested version and gating upgrades on the conformance harness (T1483) — but "pin the agent CLI version" is a policy decision with operational cost, and it is the operator's call.
+**OQ-3 — What is the Codex `.rules` execpolicy format?** On 0.145.0 `--ignore-rules` is a **documented** `codex exec` flag (_"Do not load user or project execpolicy `.rules` files"_) rather than the binary-string inference it was on 0.137.0, which raises confidence that the system is real and reachable. It might restore some per-command deny fidelity natively, reducing reliance on `PATH` shims. Still unexamined — I did not want to design against a surface I had not run.
 
-**OQ-3 — What is the Codex `.rules` execpolicy format?** `--ignore-rules` and parse-error strings confirm a per-user/per-project execpolicy system exists. It might restore some per-command deny fidelity natively, which would reduce reliance on `PATH` shims. Unexamined — I did not want to design against a surface I had not run.
+**OQ-6 — Is `codex exec review` a better substrate for Boss's review kind than a plain read-only exec run?** New in this pass ([D-3](#delta-that-changes-a-tasks-scope)). It is purpose-built, takes `--base` / `--commit` / `--uncommitted`, and has a dedicated `codex-auto-review` model. It may also impose its own output shape that does not match Boss's `ReviewResult`. Unexamined; folded into [T-25](#t-25-codex-eligibility-for-review-and-conflict-resolution-kinds).
 
 **OQ-4 — Rollout disk growth.** `~/.codex` on this host holds 279 active + 241 archived rollouts at ~865 MB. Per-worker `CODEX_HOME` multiplies this across workspaces. `--ephemeral` avoids it entirely but would forfeit `TranscriptAccess`. Needs a retention policy; not a v1 blocker.
 
-**OQ-5 — `codex exec` is one turn per process.** Claude's probe/nudge injects into a live session; Codex requires `codex exec resume`, a new process. I believe this is tractable ([T-08](#t-08-codex-driver-probe-and-nudge-via-exec-resume)) but it is the least-validated part of this design — I did not spike resume-based probing, and pane lifecycle across a process restart is exactly where surprises live.
+**OQ-5 — `codex exec` is one turn per process.** Claude's probe/nudge injects into a live session; Codex requires `codex exec resume`, a new process. I believe this is tractable ([T-17](#t-17-controlverbs-on-the-trait-plus-codex-probenudge-via-exec-resume-a-7)) but it is the least-validated part of this design — I did not spike resume-based probing, and pane lifecycle across a process restart is exactly where surprises live.
 
 **Risk — the `PATH`-shim relocation is a change to the Claude path.** It touches live guardrails on the driver that runs everything today. It is a net improvement (it closes the subshell-evasion hole) but it is not risk-free, and it lands before any Codex value is visible. I think this ordering is correct and non-negotiable — shipping Codex first means shipping it unguarded — but it is worth a human agreeing before [T-02](#t-02-relocate-command-guardrails-to-path-shims-claude-path) starts.
 
@@ -539,19 +666,57 @@ CODEX_HOME="$CH" codex exec --json --sandbox workspace-write -C "$REPO" \
   "Run the shell command 'echo probe' and report its output." < /dev/null
 ```
 
-Confirms: JSONL envelopes, `thread.started` / `turn.started` / `turn.completed`, `command_execution` items with `aggregated_output`, per-turn `usage`, and full `CODEX_HOME` isolation (the spike home grows its own `sessions/`, `state_5.sqlite`, `skills/`).
+Confirms: JSONL envelopes, `thread.started` / `turn.started` / `turn.completed`, `command_execution` items with `aggregated_output`, per-turn `usage`, and full `CODEX_HOME` isolation (the spike home grows its own `sessions/`, `state_5.sqlite`, `skills/`, `plugins/`).
 
-For the hook investigation, add to `$CH/config.toml`:
+### Hooks: firing, and failing silently
+
+A handler that logs its stdin, wired to three events:
 
 ```toml
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "/definitely/not/a/real/binary-xyz"
-timeout = 5
+command = "/path/to/hooklog.sh"
+timeout = 10
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/path/to/hooklog.sh"
+timeout = 10
 ```
 
-and run with `--dangerously-bypass-hook-trust`. Observed on 0.137.0: **no error, no warning, no stream event** — the basis for [OQ-1](#oq-1-do-codex-hooks-fire-under-codex-exec).
+Run with `--dangerously-bypass-hook-trust` on **0.145.0** and all three events deliver Claude-shaped payloads. Run the **same** config **without** the flag and the hooks are skipped with no warning of any kind — the single most important observation in this appendix.
+
+To reproduce the deny path, have the handler emit:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "BOSS GUARDRAIL: this command is blocked by policy."
+  }
+}
+```
+
+The command is blocked before execution and the reason reaches the model.
+
+The original 0.137.0 control still reproduces as a **silent** failure on 0.145.0 — swap the handler for `command = "/definitely/not/a/real/binary-xyz"` and the turn completes with no error, no warning, and no stream event. Together these two silences ([OQ-1](#oq-1-hook-trust-provisioning)) are why hooks do not carry guardrails in this design.
+
+### Version-delta harness
+
+To re-run this analysis against a future version, the checks that actually moved between 0.137.0 and 0.145.0 are worth running first:
+
+```sh
+codex exec --help | grep -c ask-for-approval        # 0 on 0.145.0 — flag removed
+codex debug models | jq '.models[] | {slug, supported_reasoning_levels}'
+codex features list | grep -E 'hooks|plugins'
+CODEX_HOME="$CH" codex exec --json … | jq -c 'select(.type=="turn.completed") | .usage'
+```
+
+and diff the `TurnItem` / hook-event enums out of the binary's embedded schemas.
 
 ---
 
@@ -559,9 +724,9 @@ and run with `--dangerously-bypass-hook-trust`. Observed on 0.137.0: **no error,
 
 Dependency-ordered. Effort hints are per-entry, each sized to one reviewable PR by one worker in one session.
 
-### T-01 Codex hook activation spike
+### T-01 Codex hook trust provisioning
 
-Determine empirically whether Codex hooks fire under `codex exec` in the pinned version, or only under the TUI / `app-server`. Try `app-server` and TUI paths for contrast, check `$CODEX_HOME/hook_outputs`, and inspect `HookRunSummary` reporting. Output is a written finding plus a reproducible harness, not code. This is unknown-format discovery and gates whether `ToolUseInterception` can ever be declared for Codex; it does not gate the rest of v1, which assumes hooks do not work.
+**Re-scoped by the 0.145.0 delta pass.** The original question — do hooks fire under `codex exec`? — is answered: they do, and `PreToolUse` deny blocks pre-execution ([D-2](#deltas-that-change-the-design)). What remains is trust provisioning. Determine what `[hooks] trusted_hash` is computed over (`HookStateToml`), whether Boss can stamp it deterministically when it regenerates worker config each run, and — the part that actually gates the capability — whether there is **any** observable signal distinguishing "hook ran and allowed" from "hook was silently skipped". Also assess the blast radius of `--dangerously-bypass-hook-trust`, which trusts project-local `.codex/` hooks from the repo under work. Check `$CODEX_HOME/hook_outputs` and the binary's `hook_started` / `hook_completed` / `hook_denied` / `hook_run_id` telemetry vocabulary as candidate signals. Output is a written finding plus a reproducible harness, not code. Gates whether `ToolUseInterception` can be declared for Codex; does not gate the rest of v1, which does not rely on hooks.
 
 - **Effort:** `small`
 - **Depends on:** none
@@ -651,6 +816,8 @@ Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/nu
 
 Map Codex's stream envelopes onto `WorkerEvent`: `thread.started`, `turn.started`, `turn.completed`, `item.started` / `item.completed` across the `TurnItem` variants. Consumes T-05's transport and T-06's turn boundary. This is where a Codex worker first becomes observable end-to-end.
 
+Three constraints from the 0.145.0 delta pass, each a real trap: item IDs are **0-based** and must not be treated as ordinal or 1-based; `item.completed` with `type:"error"` carries **operational warnings as well as** turn failures, so it must not be mapped unconditionally to a failed turn; and the `TurnItem` enum grew by four variants across eight minor versions, so unknown variants must be ignored-with-logging rather than rejected.
+
 - **Effort:** `large`
 - **Depends on:** T-05, T-06, T-11
 - **Scope:** in-scope
@@ -731,6 +898,8 @@ Replace the hardcoded _"A PreToolUse hook blocks these"_ at `worker_setup.rs:309
 
 Add cross-transport conformance: assert stdout-JSONL and hook ingress produce identical `WorkerEvent` sequences, that a turn boundary drives completion identically from either source, and that the pinned agent-CLI version is verified. This is a validation campaign over the implementations above and is deliberately sequenced after them.
 
+The 0.137.0 → 0.145.0 delta pass gives this task its concrete regression set — every one of these actually happened, unannounced, in eight minor versions: a removed CLI flag, an added `usage` counter, a changed item-ID base, a widened meaning for `error` items, four new `TurnItem` variants, and a new hook event. The harness should assert on the flags it depends on, tolerate additive stream fields and unknown enum variants, and fail loudly on removals. Add `--strict-config` to catch the config half at startup; nothing validates the event stream, so this harness is the only defence there.
+
 - **Effort:** `large`
 - **Depends on:** T-12, T-14, T-15, T-16, T-17
 - **Scope:** in-scope
@@ -753,7 +922,7 @@ Phase 2: enable the document-producing kinds via `KindRequirements` once the str
 
 ### T-25 Codex eligibility for review and conflict-resolution kinds
 
-Phase 3: verify `--sandbox read-only` is a genuine reviewer-read-only equivalent (including that the worker demonstrably cannot write), and that structured `ReviewResult` output round-trips.
+Phase 3: verify `--sandbox read-only` is a genuine reviewer-read-only equivalent (including that the worker demonstrably cannot write), and that structured `ReviewResult` output round-trips. **Additionally evaluate `codex exec review`** — a native non-interactive review mode found in the 0.145.0 pass, with `--base` / `--commit` / `--uncommitted` and a dedicated `codex-auto-review` model ([D-3](#delta-that-changes-a-tasks-scope), [OQ-6](#risks--open-questions)). It may fit Boss's review kind better than a general exec run, or may impose an output shape that does not match `ReviewResult`; decide between the two rather than defaulting to the general path.
 
 - **Effort:** `medium`
 - **Depends on:** T-24
