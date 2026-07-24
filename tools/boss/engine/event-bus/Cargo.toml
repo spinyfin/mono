@@ -1,0 +1,11 @@
+[package]
+name = "boss-event-bus"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
