@@ -1,28 +1,32 @@
 import Foundation
 
-/// Mirrors the engine's `INTENT_DIRECTIVE` / `INTENT_QUESTION` /
-/// `INTENT_LARGER_CHANGE` constants (`boss-protocol/src/types.rs`). A
-/// `directive`/`largerChange` classification routes to the revision/
-/// update-task path; `question` routes to the read-only answer agent.
-/// See `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
+/// Mirrors the engine's `INTENT_REVISION` / `INTENT_QUESTION` constants
+/// (`boss-protocol/src/types.rs`). A `revision` classification routes to the
+/// revision/update-task path; `question` routes to the read-only answer
+/// agent. See `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
+///
+/// The classifier originally split `revision` into `directive` (a small,
+/// clear edit) and `largerChange` (a substantive one) as separate cases, but
+/// every consumer treated them identically — there was no engine behavior,
+/// and no UI affordance, that differed based on which of the two a comment
+/// carried. Collapsed to one case so the operator picks between "this wants
+/// a doc change" and "this is a question" rather than a three-way choice
+/// with no actual difference between two of the options.
 enum CommentIntent: String, CaseIterable, Equatable {
-    case directive
+    case revision
     case question
-    case largerChange = "larger_change"
 
     var displayName: String {
         switch self {
-        case .directive: return "Directive"
+        case .revision: return "Revision"
         case .question: return "Question"
-        case .largerChange: return "Larger Change"
         }
     }
 
     var symbolName: String {
         switch self {
-        case .directive: return "arrow.right.circle"
+        case .revision: return "arrow.right.circle"
         case .question: return "questionmark.circle"
-        case .largerChange: return "shippingbox.circle"
         }
     }
 }
@@ -46,7 +50,7 @@ enum CommentStatus: String, Equatable {
     case answered
     /// An operator follow-up was posted and awaits reclassification —
     /// loops back to `.answering` (another question) or bridges to
-    /// `.active` (directive/larger_change).
+    /// `.active` (revision).
     case awaitingFollowup = "awaiting_followup"
     /// The renderer could no longer resolve this comment's anchor against the
     /// current doc; the engine recorded the flip. Shown in the sidebar with an
@@ -174,7 +178,7 @@ struct Comment: Identifiable, Equatable {
     /// The `[Revise]`-track chip state, derived from `status` /
     /// `reviseTaskId` / thread history — mirrors the engine's comment state
     /// machine (design § "Comment/thread state machine"). `nil` when the
-    /// comment isn't on the directive/larger_change track at all.
+    /// comment isn't on the revision track at all.
     var revisionChipState: RevisionChipState? {
         switch status {
         case .inRevision:
@@ -263,7 +267,7 @@ extension Comment {
 /// The four `[Revise]`-track chip states 2f renders, per the design's
 /// comment/thread state machine.
 enum RevisionChipState: Equatable {
-    /// Classified `directive`/`larger_change`; nudge posted, `[Revise]` not
+    /// Classified `revision`; nudge posted, `[Revise]` not
     /// yet clicked.
     case nudged
     case inRevision(taskId: String)

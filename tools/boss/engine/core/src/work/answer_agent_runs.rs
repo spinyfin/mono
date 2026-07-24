@@ -199,7 +199,7 @@ impl WorkDb {
 
     /// The most recent answer-agent run for a comment (by `created_at`, then
     /// `id` as a stable tiebreak). Drives the bridging path — when a follow-up
-    /// reclassifies to `directive`/`larger_change`, the latest run's
+    /// reclassifies to `revision`, the latest run's
     /// `reply_body` (if any) is appended to the revision directive — and the
     /// per-comment concurrency guard (at most one live run per comment).
     pub fn latest_answer_agent_run_for_comment(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {

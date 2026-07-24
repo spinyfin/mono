@@ -899,7 +899,7 @@ extension EngineClient {
     }
 
     /// The `[Revise]`-banner action: batch-address every unaddressed
-    /// directive/larger_change comment on the artifact. Engine replies
+    /// `revision` comment on the artifact. Engine replies
     /// `comments_revise_doc_result`.
     func sendCommentsReviseDoc(artifactKind: String, artifactId: String) {
         sendLine([

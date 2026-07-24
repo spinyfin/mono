@@ -1,8 +1,8 @@
 //! Detached-async LLM intent classifier wired off `CommentsCreate` — Phase 1
 //! task 1a of `comment-triggered-document-revisions.md` ("intent columns +
 //! async classifier plumbing"). A cheap, single-shot Claude call that reads
-//! one comment's body + anchor and returns one of `directive` / `question` /
-//! `larger_change` plus a confidence score.
+//! one comment's body + anchor and returns one of `revision` / `question`
+//! plus a confidence score.
 //!
 //! Scoping this call to the comment itself (not the full document, not repo
 //! context) matches the design's framing: "a fast, cheap, single-call step,
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use boss_protocol::{CommentAnchor, CommentThreadEntry, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION};
+use boss_protocol::{CommentAnchor, CommentThreadEntry, INTENT_QUESTION, INTENT_REVISION};
 
 use boss_claude_client::{self as claude_client, CallConfig, Message, MessagesRequest};
 
@@ -75,13 +75,13 @@ pub struct Classification {
 fn build_prompt(body: &str, anchor: &CommentAnchor) -> String {
     format!(
         "You classify a reviewer's comment on a design/investigation document into \
-exactly one of three intents:\n\
+exactly one of two intents:\n\
 \n\
-- \"directive\": a clear, small, actionable instruction to change the doc (e.g. \
-\"typo, should be X\", \"reword this sentence\", \"add a link to Y here\").\n\
-- \"larger_change\": wants a substantive change but isn't a one-line edit (e.g. \
-\"this section needs a new alternative considered\", \"rethink this approach\", \
-\"this whole section is missing an important case\").\n\
+- \"revision\": wants the doc changed — anything from a clear, small, actionable \
+instruction (e.g. \"typo, should be X\", \"reword this sentence\", \"add a link to Y \
+here\") to a substantive change that isn't a one-line edit (e.g. \"this section needs \
+a new alternative considered\", \"rethink this approach\", \"this whole section is \
+missing an important case\").\n\
 - \"question\": asks something rather than asking for an edit (e.g. \"why did you \
 choose X over Y?\", \"what does this mean?\", \"does this handle Z?\"). Not a \
 request to change the doc.\n\
@@ -93,7 +93,7 @@ Comment:\n\
 > {body}\n\
 \n\
 Respond with ONLY a JSON object — no explanation, no markdown fences — of the exact \
-shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\": \
+shape: {{\"intent\": \"revision\"|\"question\", \"confidence\": \
 <number between 0.0 and 1.0>}}. Do not wrap the JSON in a code fence.",
         prefix = anchor.prefix,
         exact = anchor.exact,
@@ -103,7 +103,7 @@ shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\
 }
 
 /// Render a follow-up reply's classification prompt (P3c "Reclassifying
-/// follow-ups"): the same three-intent rubric as [`build_prompt`], but with
+/// follow-ups"): the same two-intent rubric as [`build_prompt`], but with
 /// the original comment plus the thread's prior turns as context ahead of
 /// the reply actually being classified — design § "The classifier":
 /// "for a reply — the prior thread turns."
@@ -119,13 +119,13 @@ fn build_followup_prompt(
     }
     format!(
         "You classify a reviewer's follow-up reply in an ongoing thread on a design/investigation \
-document comment, into exactly one of three intents:\n\
+document comment, into exactly one of two intents:\n\
 \n\
-- \"directive\": a clear, small, actionable instruction to change the doc (e.g. \
-\"typo, should be X\", \"reword this sentence\", \"add a link to Y here\").\n\
-- \"larger_change\": wants a substantive change but isn't a one-line edit (e.g. \
-\"this section needs a new alternative considered\", \"rethink this approach\", \
-\"this whole section is missing an important case\").\n\
+- \"revision\": wants the doc changed — anything from a clear, small, actionable \
+instruction (e.g. \"typo, should be X\", \"reword this sentence\", \"add a link to Y \
+here\") to a substantive change that isn't a one-line edit (e.g. \"this section needs \
+a new alternative considered\", \"rethink this approach\", \"this whole section is \
+missing an important case\").\n\
 - \"question\": asks something rather than asking for an edit (e.g. \"why did you \
 choose X over Y?\", \"what does this mean?\", \"does this handle Z?\"). Not a \
 request to change the doc.\n\
@@ -142,7 +142,7 @@ Follow-up reply to classify:\n\
 > {followup_body}\n\
 \n\
 Respond with ONLY a JSON object — no explanation, no markdown fences — of the exact \
-shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\": \
+shape: {{\"intent\": \"revision\"|\"question\", \"confidence\": \
 <number between 0.0 and 1.0>}}. Do not wrap the JSON in a code fence.",
         prefix = anchor.prefix,
         exact = anchor.exact,
@@ -211,7 +211,7 @@ fn parse_classifier_reply(text: &str) -> Result<Classification, String> {
         .map_err(|e| format!("failed to parse classifier JSON reply: {e} (raw: {text})"))?;
 
     match reply.intent.as_str() {
-        INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+        INTENT_REVISION | INTENT_QUESTION => {}
         other => return Err(format!("classifier returned unknown intent: {other}")),
     }
 
@@ -279,9 +279,8 @@ mod tests {
         let prompt = build_prompt("why does this retry three times?", &anchor);
         assert!(prompt.contains("the retry logic"));
         assert!(prompt.contains("why does this retry three times?"));
-        assert!(prompt.contains("directive"));
+        assert!(prompt.contains("revision"));
         assert!(prompt.contains("question"));
-        assert!(prompt.contains("larger_change"));
     }
 
     #[test]
@@ -319,9 +318,8 @@ mod tests {
         assert!(prompt.contains("why does this retry three times?"));
         assert!(prompt.contains("The retry backoff is exponential because…"));
         assert!(prompt.contains("ok, please document that in the doc then"));
-        assert!(prompt.contains("directive"));
+        assert!(prompt.contains("revision"));
         assert!(prompt.contains("question"));
-        assert!(prompt.contains("larger_change"));
     }
 
     #[test]
@@ -364,16 +362,16 @@ mod tests {
 
     #[test]
     fn parse_reply_tolerates_a_bare_fenced_reply() {
-        let raw = "```\n{\"intent\": \"directive\", \"confidence\": 0.8}\n```";
+        let raw = "```\n{\"intent\": \"revision\", \"confidence\": 0.8}\n```";
         let classification = parse_classifier_reply(raw).unwrap();
-        assert_eq!(classification.intent, "directive");
+        assert_eq!(classification.intent, "revision");
     }
 
     #[test]
     fn parse_reply_tolerates_prose_wrapped_json() {
-        let raw = "Here's the classification: {\"intent\": \"larger_change\", \"confidence\": 0.6} Hope that helps!";
+        let raw = "Here's the classification: {\"intent\": \"revision\", \"confidence\": 0.6} Hope that helps!";
         let classification = parse_classifier_reply(raw).unwrap();
-        assert_eq!(classification.intent, "larger_change");
+        assert_eq!(classification.intent, "revision");
     }
 
     #[test]
@@ -384,7 +382,7 @@ mod tests {
 
     #[test]
     fn parse_reply_accepts_each_recognised_intent() {
-        for intent in [INTENT_DIRECTIVE, INTENT_QUESTION, INTENT_LARGER_CHANGE] {
+        for intent in [INTENT_REVISION, INTENT_QUESTION] {
             let raw = format!(r#"{{"intent": "{intent}", "confidence": 0.5}}"#);
             let classification = parse_classifier_reply(&raw).unwrap();
             assert_eq!(classification.intent, intent);
@@ -399,13 +397,13 @@ mod tests {
 
     #[test]
     fn parse_reply_clamps_an_over_range_confidence_to_one() {
-        let classification = parse_classifier_reply(r#"{"intent": "directive", "confidence": 1.5}"#).unwrap();
+        let classification = parse_classifier_reply(r#"{"intent": "revision", "confidence": 1.5}"#).unwrap();
         assert_eq!(classification.confidence, 1.0);
     }
 
     #[test]
     fn parse_reply_clamps_a_negative_confidence_to_zero() {
-        let classification = parse_classifier_reply(r#"{"intent": "larger_change", "confidence": -0.3}"#).unwrap();
+        let classification = parse_classifier_reply(r#"{"intent": "revision", "confidence": -0.3}"#).unwrap();
         assert_eq!(classification.confidence, 0.0);
     }
 }

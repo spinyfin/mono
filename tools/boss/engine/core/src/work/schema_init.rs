@@ -625,6 +625,11 @@ impl WorkDb {
         // followup-group member from. Additive, independent of every other
         // table. Implementation task 6 of the worker-proposal-api design.
         migrate_attentions_source_proposal_id(conn)?;
+        // Comment intent taxonomy collapse: the classifier's retired
+        // `directive`/`larger_change` split re-homed onto the single
+        // `revision` intent value (nothing downstream ever branched on which
+        // of the two a comment carried). Data-only, no schema change.
+        migrate_collapse_directive_larger_change_intent(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

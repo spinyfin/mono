@@ -235,12 +235,12 @@ enum ReviseDocOutcome: Equatable, Sendable {
     /// the addressed comments were flipped to `in_revision`.
     ///
     /// `excludedCommentIds` are comments the sidebar badges
-    /// `directive`/`larger_change` that the batch did NOT address because
+    /// `revision` that the batch did NOT address because
     /// their `status` disqualified them. The badge renders `intent` alone, so
     /// without surfacing these the operator sees an unqualified success for a
     /// batch that dropped comments they can see marked as revisable.
     case created(taskId: String, taskKind: String, addressedCommentIds: [String], excludedCommentIds: [String], prUrl: String?)
-    /// No `active` comment on the artifact carries a `directive`/`larger_change`
+    /// No `active` comment on the artifact carries a `revision`
     /// intent — idempotent no-op.
     case noUnresolvedComments
     /// A prior `CommentsReviseDoc` call already claimed every candidate comment.

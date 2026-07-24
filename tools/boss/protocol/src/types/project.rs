@@ -232,7 +232,7 @@ pub struct ResolveProjectDesignDocOutput {
 /// PR lifecycle. Returned by the engine's `resolve_doc_owner` reverse
 /// resolver (`tools/boss/engine/core`), which gates both classifier
 /// eligibility (only `Design`/`Investigation`-owned docs are classified) and
-/// the directive/larger-change revision-vs-chore routing decision. Design:
+/// the revision-vs-chore routing decision. Design:
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 /// §"The revision-vs-general-task decision".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,7 +262,7 @@ pub struct CommentsBannerState {
     /// True iff `doc_kind` is `Some` (a design/investigation-owned doc)
     /// and `unresolved_count > 0`.
     pub revisable: bool,
-    /// `active` comments with `intent ∈ {directive, larger_change}` —
+    /// `active` comments with `intent = revision` —
     /// the same candidate set `[Revise]` itself batches.
     pub unresolved_count: i64,
     /// Comments currently claimed by an in-flight revision/chore
@@ -297,7 +297,7 @@ pub enum DocOwnerPrLifecycle {
 }
 
 /// Input to the `CommentsReviseDoc` RPC: batch-address every unaddressed
-/// `directive`/`larger_change` comment on a `pr_doc` artifact. Design:
+/// `revision` comment on a `pr_doc` artifact. Design:
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 /// §"Engine RPC surface".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
@@ -309,7 +309,7 @@ pub struct ReviseDocInput {
     /// `pr_doc:<repo_remote_url>:<branch>:<path>`.
     pub artifact_id: String,
     /// `None` (v1 default) addresses every `active` comment on the artifact
-    /// classified `directive`/`larger_change`. Reserved for a future subset
+    /// classified `revision`. Reserved for a future subset
     /// selection (design §"Batch scope"); a caller-supplied id outside that
     /// set is silently excluded, never an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,7 +330,7 @@ pub enum ReviseDocOutcome {
         /// `"revision"` | `"chore"`.
         task_kind: String,
         addressed_comment_ids: Vec<String>,
-        /// Comments the operator can see badged `directive`/`larger_change`
+        /// Comments the operator can see badged `revision`
         /// on this artifact that this batch did **not** address, because
         /// their `status` disqualified them (`in_revision` — already claimed
         /// by an earlier batch; `orphaned` — the anchor no longer resolves;
@@ -345,8 +345,7 @@ pub enum ReviseDocOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pr_url: Option<String>,
     },
-    /// No `active` comment on the artifact carries a `directive`/
-    /// `larger_change` intent — idempotent no-op.
+    /// No `active` comment on the artifact carries a `revision` intent — idempotent no-op.
     NoUnresolvedComments,
     /// A prior `CommentsReviseDoc` call already claimed every candidate
     /// comment between this call's read and its guarded update.

@@ -1837,6 +1837,27 @@ pub(crate) fn migrate_work_comments_revise_task_id_column(conn: &Connection) -> 
     Ok(())
 }
 
+/// One-time data migration: collapse the classifier's retired `directive` /
+/// `larger_change` intent split onto the single `INTENT_REVISION` ("revision")
+/// value. Every consumer of `intent` (the `[Revise]` batch predicate, the
+/// nudge trigger, the `answered`/`active` transitions, manual override)
+/// always matched the two together and never branched on which one a comment
+/// carried, so the distinction was a three-way choice in the UI for zero
+/// behavioral difference — collapsed in `boss-protocol`'s `INTENT_*`
+/// constants and the classifier prompt. This migration re-homes existing rows
+/// so they keep matching `revisable_comment_predicate` (`intent = 'revision'`)
+/// after the collapse, rather than silently falling out of the `[Revise]`
+/// candidate pool. Data-only, no schema change. Idempotent: only rows still
+/// carrying one of the two retired values are touched, so a second run
+/// affects zero rows.
+pub(crate) fn migrate_collapse_directive_larger_change_intent(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE work_comments SET intent = 'revision' WHERE intent IN ('directive', 'larger_change')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// One-time data migration (Phase 2 task 2e, magic-wand removal, of
 /// `comment-triggered-document-revisions.md`): retires every `work_comments`
 /// row left in `status = 'dispatched'` by the now-deleted magic-wand

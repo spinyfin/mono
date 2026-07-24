@@ -338,7 +338,7 @@ pub enum FrontendRequest {
     /// critical path, mirroring `CommentsCreate`'s classifier dispatch —
     /// reclassifies the follow-up with the accumulated thread as context.
     /// `question` re-enters bucket 2 (`awaiting_followup → answering`,
-    /// answer agent runs again); `directive`/`larger_change` bridges into
+    /// answer agent runs again); `revision` bridges into
     /// the bucket-1&3 path (`awaiting_followup → active`), carrying the
     /// thread's answer-agent reply into the next `[Revise]` batch's
     /// directive.
@@ -362,7 +362,7 @@ pub enum FrontendRequest {
         plain_text_projection_version: i64,
     },
 
-    /// Batch-address every unaddressed `directive`/`larger_change` comment
+    /// Batch-address every unaddressed `revision` comment
     /// on a design/investigation-owned `pr_doc` artifact: creates a
     /// revision (open PR) or chore (merged/closed/no-PR) — the
     /// `[Revise]`-banner action. App-or-Boss tier. Replies with
@@ -381,7 +381,7 @@ pub enum FrontendRequest {
     /// classification design § "Misclassification / override".
     CommentsSetIntent {
         comment_id: String,
-        /// `directive` | `question` | `larger_change`.
+        /// `revision` | `question`.
         intent: String,
     },
 
