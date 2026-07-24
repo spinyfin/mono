@@ -1,7 +1,7 @@
 # `forbidden-patterns` and `require-companion-change`: decided design
 
-Status: decided.
-Date: 2026-06-14.
+- Status: decided.
+- Date: 2026-06-14.
 
 > **Implementation note (forbidden-patterns).** The mono-side change landed the generic check as a **wasm bundle** check under the `file/` namespace — `file/forbidden-patterns` — rather than a native rename. It ships in the single multiplexed preinstalled component alongside `file/size` and `file/ifchange`, following the same authorship pattern (an rlib check crate wired into `checkleft-preinstalled-bundle`). The native `forbidden-imports-deps` implementation was removed outright rather than kept as a deprecated alias (one implementation, not two); the flunge-side `CHECKS.yaml` migration to `check: file/forbidden-patterns` is a separate flunge change. The `rules`-array config surface in §1.1 is preserved exactly, so the flunge config below applies as written (only the `check:` id becomes `file/forbidden-patterns`). The `require-companion-change` half of this doc is unaffected and tracked separately.
 
