@@ -72,7 +72,7 @@ impl StageThresholds {
 
 /// Default Boss state root used by the file-scan readers when the
 /// caller didn't override it. Mirrors the writer's default (see
-/// [`boss_dispatch_events::JsonlFileSink`] callers in `app.rs`).
+/// [`boss_dispatch_events::JsonlFileSink`] callers in `boss_engine`'s `app.rs`).
 /// Delegates to `boss-log-files` so the `~/Library/Application Support/Boss`
 /// location is defined once and shared with the log-path resolvers.
 pub fn default_state_root() -> Option<PathBuf> {
@@ -357,8 +357,8 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
         // "became ready to dispatch". Previously, a timeline with none
         // was dropped entirely — but that is exactly the worst-waiter
         // class (an execution stuck BEFORE its first dispatch attempt,
-        // e.g. the `status_transition` -> `request_recorded` gap; see
-        // T2692, 2026-07-15's post-pause backlog). Anchor on the
+        // e.g. the `status_transition` -> `request_recorded` gap, as seen
+        // in the 2026-07-15 post-pause backlog). Anchor on the
         // earliest event we DO have instead of skipping — `evs` is
         // non-empty (it only exists in `by_execution` because at least
         // one event referenced this execution_id) and preserves file
@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(report.blocked_now[1].wait_so_far_ms, 100);
     }
 
-    /// The pre-request_recorded blind spot (T2692, 2026-07-15): an
+    /// The pre-request_recorded blind spot (first seen 2026-07-15): an
     /// execution that never received a `request_recorded` event — e.g. it
     /// is stuck between `status_transition` and its first dispatch
     /// attempt — must still show up as blocked, with its wait measured
