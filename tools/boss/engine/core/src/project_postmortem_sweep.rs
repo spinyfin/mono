@@ -69,33 +69,32 @@
 //! project-scoped task through its parent project's lane — which is
 //! filtered to non-archived projects by default. Scheduling a postmortem
 //! against an archived project would therefore create a live work item
-//! (with a dispatched, token-burning worker) that the operator has no way
-//! to see or steer. `evaluate_project` skips any project whose `status`
-//! is [`ProjectStatus::Archived`] before doing anything else.
+//! (with a dispatched, token-burning worker) that is not visible or
+//! steerable on the board. `evaluate_project` skips any project whose
+//! `status` is [`ProjectStatus::Archived`] before doing anything else.
 //!
 //! ## Boot-time-backfill bound (incident postmortem-archived-fanout-2026-07-20)
 //!
 //! This sweep fires immediately on spawn (see [`spawn_loop`]) so a wave
 //! that finished while the engine was briefly down is reconciled at boot.
-//! Without a bound, that same immediacy meant the sweep's *first-ever* pass
-//! against a database that predates this feature would find every
-//! already-drained project in the system's history — regardless of how
-//! long ago it drained — and fan a postmortem out to each one at once: 24
-//! fired in a four-second window on 2026-07-20, 20 of them against already-
-//! archived projects. [`ensure_watermark`] persists a fixed instant (the
-//! first-ever pass's wall-clock time) via the engine's metadata KV; a
-//! project with no postmortem history only counts trigger-task completions
-//! *after* that instant, so pre-existing history is never backfilled while
-//! a genuinely new wave — including one from a brief outage — still fires
-//! normally, because it completed after the watermark. The watermark is
-//! set once and never moves again.
+//! [`ensure_watermark`] persists a fixed instant (the first-ever pass's
+//! wall-clock time) via the engine's metadata KV; a project with no
+//! postmortem history only counts trigger-task completions *after* that
+//! instant, so pre-existing history is never backfilled while a genuinely
+//! new wave — including one from a brief outage — still fires normally,
+//! because it completed after the watermark. The watermark is set once and
+//! never moves again. See the kanban design doc for the incident this
+//! bound closes.
 //!
 //! ## Kill switch
 //!
 //! [`spawn_loop`] re-checks the `project_postmortem_sweep` feature flag
 //! every pass (not just at spawn time), so disabling it takes effect
 //! within one [`PROJECT_POSTMORTEM_SWEEP_INTERVAL_SECS`] without a rebuild
-//! or engine restart.
+//! or engine restart. The flag is flipped live via the debug pane's
+//! feature-flag toggle (the `SetFeatureFlag` RPC); hand-editing the
+//! on-disk `feature-flags.toml` requires an engine restart to be picked up,
+//! since the store is only loaded once at boot.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,8 +143,7 @@ impl crate::sweep_loop::SweepOutcome for ProjectPostmortemSweepOutcome {
 ///
 /// `feature_flags` is re-checked every pass (not just at spawn time) so
 /// flipping the `project_postmortem_sweep` kill switch off takes effect
-/// within one `interval` without restarting the engine — see incident
-/// postmortem-archived-fanout-2026-07-20.
+/// within one `interval` without restarting the engine.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     interval: Duration,
@@ -178,24 +176,15 @@ const WATERMARK_METADATA_KEY: &str = "project_postmortem_sweep_watermark";
 /// Establish (on first call, ever, against this database) or read back the
 /// sweep's high-water mark, persisted via the engine's generic metadata KV.
 ///
-/// Without this, a project that has *never* had a postmortem gets a `None`
-/// cutoff, and the "since last postmortem" filter below treats `None` as
-/// "count every trigger-task completion in the project's entire history" —
-/// see the `(None, Some(_)) => true` arm in `evaluate_project`. That is the
-/// correct behaviour for a project a human just finished today, but on the
-/// first pass after this feature was deployed it meant *every* already-
-/// drained project in the database — regardless of how long ago it
-/// drained — qualified at once. 24 postmortems fired in a four-second
-/// window on 2026-07-20 because of exactly this.
-///
-/// The fix: a project with no postmortem history is bounded by this
-/// watermark instead of by "all of time". The watermark is set once, the
-/// first time the sweep ever runs against a given database, and never
-/// moves again — so a wave that completes while the engine is briefly
-/// down is still `> watermark` and reconciles normally on the next boot
-/// (the behaviour the module doc's "fires immediately on spawn" comment
-/// describes), while a project that drained months or years before the
-/// feature existed is `<= watermark` and is correctly never backfilled.
+/// A project with no postmortem history is bounded by this watermark rather
+/// than by all of time, so a database that predates this feature is never
+/// retroactively backfilled. Set once, the first time the sweep ever runs
+/// against a given database, and never moves again: a wave that completes
+/// while the engine is briefly down is still `> watermark` and reconciles
+/// normally on the next boot (the behaviour the module doc's "fires
+/// immediately on spawn" comment describes), while a project that drained
+/// before the feature existed is `<= watermark` and is correctly never
+/// backfilled. See incident postmortem-archived-fanout-2026-07-20.
 fn ensure_watermark(work_db: &WorkDb) -> anyhow::Result<i64> {
     if let Some(existing) = work_db.get_metadata(WATERMARK_METADATA_KEY)? {
         return existing.parse::<i64>().with_context(|| {
@@ -299,8 +288,8 @@ async fn evaluate_project(
         // parent project's lane, and archived projects are filtered out of
         // that lane by default (`ChatViewModel.projectsForSelectedProduct`).
         // A postmortem scheduled here would be a live work item with a
-        // dispatched worker that the operator cannot see or steer, so skip
-        // rather than create one nobody can act on.
+        // dispatched worker that is not visible or steerable on the board,
+        // so skip rather than create work nobody can act on.
         return Ok(EvalOutcome::Skipped);
     }
     let tasks = work_db.list_project_trigger_tasks(&product.id, &project.id)?;
@@ -313,30 +302,28 @@ async fn evaluate_project(
         return Ok(EvalOutcome::Skipped);
     }
 
-    let last_postmortem = work_db.last_design_postmortem_for_project(&project.id)?;
-    if let Some(ref lp) = last_postmortem
-        && lp.deleted_at.is_none()
+    if let Some(ref lp) = work_db.last_live_design_postmortem_for_project(&project.id)?
         && !lp.status.is_terminal()
     {
         // Dedup gate: a *live* postmortem for this project is still open.
-        // A deleted-but-still-non-terminal row does not gate — the
-        // operator deleted it, so it must not block a future one forever.
+        // A deleted row never gates, live or not — deletion is an explicit
+        // dismissal and must not block a future postmortem forever. Uses
+        // the live-only query rather than `last_design_postmortem_for_project`
+        // so a newer deleted row can never mask an older, still-open live one.
         return Ok(EvalOutcome::Evaluated);
     }
-    // Cutoff anchor: prefer the last postmortem's completion time, falling
-    // back to its creation time when it never completed (including a
-    // deleted-before-completing row — see `last_design_postmortem_for_project`'s
-    // doc comment on why deletion must not erase this boundary), and
-    // finally to the sweep's `watermark` when the project has *never* had a
-    // postmortem at all. That last fallback is the boot-time-backfill
-    // bound: without it, "never had one" fell through the `(None, _)` arm
-    // below as "count every trigger-task completion in project history",
-    // which is what fanned out across archived projects on 2026-07-20.
-    // `watermark` is a fixed instant (first-ever sweep pass against this
-    // database, see `ensure_watermark`), so a project that drained before
-    // the feature existed is correctly never backfilled, while a wave that
-    // completes after the watermark — including one that finishes during a
-    // brief engine outage — still fires normally.
+    // Cutoff anchor: prefer the last postmortem's completion time (any
+    // postmortem, tombstone included — see
+    // `last_design_postmortem_for_project`'s doc comment), falling back to
+    // its creation time when it never completed, and finally to the
+    // sweep's `watermark` when the project has *never* had a postmortem at
+    // all. That last fallback is the boot-time-backfill bound: a project
+    // with no postmortem history is bounded by this watermark rather than
+    // by all of time, so a database that predates this feature is never
+    // retroactively backfilled — while a wave that completes after the
+    // watermark, including one that finishes during a brief engine outage,
+    // still fires normally.
+    let last_postmortem = work_db.last_design_postmortem_for_project(&project.id)?;
     let cutoff: i64 = last_postmortem
         .as_ref()
         .and_then(|lp| epoch_secs(lp.completed_at.as_deref()).or_else(|| epoch_secs(Some(lp.created_at.as_str()))))
@@ -785,5 +772,115 @@ mod tests {
             !pm.description.contains("pull/1"),
             "the pre-watermark PR must not be pulled into the backfill-bounded postmortem's brief"
         );
+    }
+
+    /// Defect 4 (delete re-arms the trigger): soft-deleting the project's
+    /// only postmortem must not make the next pass treat the already-
+    /// reviewed wave of work as new and re-schedule against it.
+    #[tokio::test]
+    async fn deleting_postmortem_does_not_recreate_on_next_pass() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+        seed_watermark(&db, 0);
+        let task = create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+        db.force_completed_at_for_test(&task.id, 1_000).unwrap();
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+        assert_eq!(outcome.postmortems_created, 1);
+        let first_pm = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+
+        db.delete_work_item(&first_pm.id).unwrap();
+
+        let outcome = run_one_pass(db.as_ref()).await;
+        assert_eq!(
+            outcome.postmortems_created, 0,
+            "deleting the only postmortem must not re-arm the trigger for already-reviewed work"
+        );
+    }
+
+    /// Boundary companion to the test above: the deleted postmortem's
+    /// cutoff anchor must still gate genuinely *new* work — a trigger-task
+    /// completion that postdates the deleted row's `created_at` must fire
+    /// normally, pinning the fix as a boundary rather than a blanket
+    /// suppression of every future postmortem for the project.
+    #[tokio::test]
+    async fn new_work_after_deleted_postmortem_still_triggers() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+        seed_watermark(&db, 0);
+        let task1 = create_done_project_task(&db, &product_id, &project.id, "impl 1", "https://github.com/o/r/pull/1");
+        db.force_completed_at_for_test(&task1.id, 1_000).unwrap();
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+        assert_eq!(outcome.postmortems_created, 1);
+        let first_pm = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+        db.delete_work_item(&first_pm.id).unwrap();
+
+        let cutoff: i64 = first_pm.created_at.parse().unwrap();
+        let task2 = create_done_project_task(&db, &product_id, &project.id, "impl 2", "https://github.com/o/r/pull/2");
+        db.force_completed_at_for_test(&task2.id, cutoff + 10).unwrap();
+
+        let outcome = run_one_pass(db.as_ref()).await;
+        assert_eq!(
+            outcome.postmortems_created, 1,
+            "work completing after the deleted postmortem's cutoff anchor must still trigger"
+        );
+        let second_pm = db.last_design_postmortem_for_project(&project.id).unwrap().unwrap();
+        assert_ne!(second_pm.id, first_pm.id);
+        assert!(second_pm.description.contains("pull/2"));
+    }
+
+    /// Defect 3 (kill switch): with `project_postmortem_sweep` disabled via
+    /// [`crate::feature_flags::FeatureFlagsStore`], [`spawn_loop`] must not
+    /// run a pass or invoke `kick_fn`, even though the project is a genuine
+    /// trigger candidate.
+    #[tokio::test(start_paused = true)]
+    async fn spawn_loop_flag_disabled_skips_pass_and_never_kicks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::feature_flags::FeatureFlagsStore;
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+        seed_watermark(&db, 0);
+        let task = create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+        db.force_completed_at_for_test(&task.id, 1_000).unwrap();
+        let db = Arc::new(db);
+
+        let flags_dir = tempfile::TempDir::new().unwrap();
+        let feature_flags = Arc::new(FeatureFlagsStore::new(flags_dir.path().join("feature-flags.toml")));
+        feature_flags.set("project_postmortem_sweep", false).unwrap();
+
+        let kick_calls = Arc::new(AtomicUsize::new(0));
+        let kick_calls_c = Arc::clone(&kick_calls);
+        let kick_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            kick_calls_c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let handle = spawn_loop(Arc::clone(&db), Duration::from_secs(300), kick_fn, feature_flags);
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            db.last_design_postmortem_for_project(&project.id).unwrap().is_none(),
+            "kill switch: no postmortem must be created while the flag is disabled"
+        );
+        assert_eq!(
+            kick_calls.load(Ordering::SeqCst),
+            0,
+            "kick_fn must never fire while the sweep is disabled"
+        );
+
+        handle.abort();
     }
 }

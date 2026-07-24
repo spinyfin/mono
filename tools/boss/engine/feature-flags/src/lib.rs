@@ -207,7 +207,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              auto-schedules a design_postmortem task — and dispatches a worker for it — whenever a \
              project's implementation work drains to zero. Kill switch for incident \
              `postmortem-archived-fanout-2026-07-20`, where the sweep's boot-time backfill pass fanned \
-             out across archived projects with no operator visibility. DEFAULT ON: the archived-project \
+             out across archived projects, where the resulting work was invisible on the board. DEFAULT ON: the archived-project \
              filter, bounded backfill, and delete-safe dedup gate this flag guards are the actual fix; \
              disable only if the sweep needs to be stopped again without a rebuild.",
         category: "postmortem",

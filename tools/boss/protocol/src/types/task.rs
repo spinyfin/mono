@@ -341,6 +341,23 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// Every variant, in declaration order. A fixed-size array literal, so
+    /// adding a new variant without adding it here is a compile error (size
+    /// mismatch) — the same exhaustiveness guarantee the enum's own
+    /// doc comment describes for match sites, extended to callers (like
+    /// `list_tasks_kind_filter_sql`) that need to iterate every kind rather
+    /// than match on one.
+    pub const ALL: [TaskKind; 8] = [
+        Self::Chore,
+        Self::Design,
+        Self::Followup,
+        Self::Investigation,
+        Self::DesignPostmortem,
+        Self::ProjectTask,
+        Self::Revision,
+        Self::Task,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Chore => "chore",
