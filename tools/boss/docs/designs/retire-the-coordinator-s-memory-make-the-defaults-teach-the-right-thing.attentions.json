@@ -12,12 +12,7 @@
   },
   {
     "question_type": "yes_no",
-    "prompt": "D6a — take-the-conn persistence. The prompt says take-the-conn mode persists until explicitly revoked; a later memory quotes you saying the opposite ('you're taking the conn a bit too easily'). Should take-the-conn PERSIST until explicitly revoked? (No = it should be single-use / decay, and the prompt-surgery task will invert the rule.)",
-    "anchor": "the-six-decisions"
-  },
-  {
-    "question_type": "yes_no",
-    "prompt": "D6b — the 3-call tripwire. The prompt says any investigation needing a third tool call moves to a background agent; a memory records you saying an investigation chore wasn't needed there. Confirm the reconciliation: the prompt should state explicitly that spawning a background SUBAGENT is not the same as filing an investigation CHORE, and the tripwire means the former, not the latter?",
+    "prompt": "D6 — take-the-conn persistence. The prompt says take-the-conn mode persists until explicitly revoked; a later memory quotes you saying the opposite ('you're taking the conn a bit too easily'). Should take-the-conn PERSIST until explicitly revoked? (No = it should be single-use / decay, and the prompt-surgery item will invert the rule.)",
     "anchor": "the-six-decisions"
   },
   {
