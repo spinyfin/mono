@@ -989,7 +989,7 @@
           "FILE:@@//tools/boss/client/Cargo.toml 162a37e415af1e4bdc0af5a545ed22a42e38a1771783cfed628d3d091a3b1cbd",
           "FILE:@@//tools/boss/log-files/Cargo.toml fbd57630f6057756be37768106ad72d0978076d45f91a64635ed41656555c8a4",
           "FILE:@@//tools/boss/protocol/Cargo.toml 1e067da5c17b3fb161e7c1a5814d33854032ee61db2ee700ea7e4f260eb7fa29",
-          "FILE:@@//tools/boss/engine/core/Cargo.toml e60d415c5b1618e49b52894ed864d86e4d342ce8c05fcf6ca4a894d2a8f9d1c7",
+          "FILE:@@//tools/boss/engine/core/Cargo.toml ee0e1e6d53f8c4696a20605d9f16f3ce40701bc9ff5425f6342e031082339b0e",
           "FILE:@@//tools/boss/build-provenance/Cargo.toml 6e6f160d24b95b4e7dbf21e65078fd513ddfb16b52135ce5f17cceed25947376",
           "FILE:@@//tools/boss/engine/ci-log-reader/Cargo.toml ec509c3a5616373d5ee5e1e6269468d38c61a30c70ac0c53969571f3ebcfeeb1",
           "FILE:@@//tools/boss/github/Cargo.toml 977727b918bed67a190c8bb035e6647aa7213f6bb2c7834c748a8ef518ced4cf",

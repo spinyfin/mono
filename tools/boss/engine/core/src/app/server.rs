@@ -1630,9 +1630,9 @@ pub async fn serve_with_merge_probe(
     // runtime (many unit tests construct `ServerState` outside one), so it
     // is initialized here via `get_or_init`, the first point in `serve`
     // that's guaranteed to be inside one.
-    let envelope_watch_event_bus = server_state.envelope_event_bus.clone();
+    let envelope_watch_event_bus = server_state.event_bus.clone();
     let envelope_watch_timer_wheel = server_state
-        .envelope_timer_wheel
+        .timer_wheel
         .get_or_init(|| Arc::new(boss_timer_wheel::TimerWheel::spawn(envelope_watch_event_bus.clone())))
         .clone();
     let _envelope_watch_timer_handle = crate::envelope_watch::spawn_timer_subscriber(

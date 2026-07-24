@@ -628,7 +628,10 @@ struct ServerState {
     /// transitions onto it. The merge poller subscribes to the
     /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
     /// the broad `pr_reconciler_kick` sweep; `orphan_sweep::spawn_event_subscriber`
-    /// is another subscriber, wired in `app::server::serve`.
+    /// is another subscriber, wired in `app::server::serve`. The envelope-watch
+    /// timer subscriber consumes the `Timer` topic fed by `timer_wheel` below —
+    /// every producer and consumer shares this exact instance instead of
+    /// each standing up a private bus nothing else can reach.
     #[builder(default = Arc::new(EventBus::new()))]
     event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,
@@ -1059,26 +1062,16 @@ struct ServerState {
     /// SIGTERM-style shutdown signal and exits the same graceful path
     /// when either fires.
     shutdown_trigger: Arc<Notify>,
-    /// The single shared in-process `EventBus` the event-bus design doc
-    /// calls for (§Approach). `EventBus::new` spawns no background task, so
-    /// this is constructible outside a live Tokio runtime and can live on
-    /// `ServerState` from construction — every producer
-    /// (`event_publish::commit_and_publish`) and consumer (currently only
-    /// the envelope-watch timer subscriber; automation cron is the design
-    /// doc's next planned consumer, task 13) shares this exact instance
-    /// instead of each standing up a private bus nothing else can reach.
-    #[builder(default)]
-    envelope_event_bus: Arc<EventBus>,
-    /// The shared timer-wheel feeding `envelope_event_bus`'s `Timer` topic.
-    /// Unlike `EventBus::new`, `TimerWheel::spawn` spawns its background
-    /// delivery task, which requires a live Tokio runtime — many unit tests
+    /// The shared timer-wheel feeding `event_bus`'s `Timer` topic. Unlike
+    /// `EventBus::new`, `TimerWheel::spawn` spawns its background delivery
+    /// task, which requires a live Tokio runtime — many unit tests
     /// construct `ServerState` outside one. So this starts empty and `serve`
     /// initializes it (via `get_or_init`) once the runtime is confirmed
     /// live, right before spawning the first consumer that needs it. Tests
     /// that never call `serve` never touch this and so never spawn the
     /// wheel's background task.
     #[builder(default)]
-    envelope_timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
+    timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
 }
 
 impl ServerState {
