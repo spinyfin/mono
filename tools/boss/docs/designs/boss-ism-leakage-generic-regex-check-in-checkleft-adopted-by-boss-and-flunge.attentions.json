@@ -1,0 +1,42 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Roll out editorial enforcement in two stages — enable the flag in observe/audit mode first to measure false positives on the live fleet, then flip the hook to Block-and-deny only after the audit trail looks clean?",
+    "anchor": "editorial-layer-enable-extend-unify-staged-rollout-design-decision-1"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Accept the whole-pushed-range joined commit-message string for v1 (no per-commit granularity, which would need a WIT change and make the work 'large')?",
+    "anchor": "commit-messages-joined-range-string-is-sufficient-for-v1-design-decision-3"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the 'the operator' / actor-reference pattern ship initially, given its innocent senses (mathematical/language operator)?",
+    "choices": [
+      "Block (deny/force-fix like the id pattern)",
+      "Warn only at first, promote to Block after measuring false positives",
+      "Leave it out of v1 and rely on the reviewer for actor references"
+    ],
+    "anchor": "false-positive-policy-design-decision-5"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "What should the coordinator do about ids it injects into the worker description (runner.rs:3751)?",
+    "choices": [
+      "Keep injecting ids but mark them explicitly as internal / not-for-repetition",
+      "Stop injecting ids into the description entirely",
+      "Change nothing — rely on the deterministic gates alone"
+    ],
+    "anchor": "coordinator-id-injection-design-decision-6"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the checkleft-config regex and the engine's BOSS_ID_RE be kept from drifting across the wasm/config boundary?",
+    "choices": [
+      "Canonical CHECKS fragment + a byte-identity self-test asserting the config pattern equals BOSS_ID_RE's source string",
+      "Invest in a shared source of truth generated for both surfaces",
+      "Accept documented duplication with no automated check"
+    ],
+    "anchor": "one-shared-pattern-definition-design-decision-anti-drift"
+  }
+]
