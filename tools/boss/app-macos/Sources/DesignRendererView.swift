@@ -139,122 +139,42 @@ struct DesignRendererContent: Codable, Hashable {
     }
 }
 
-/// In-app markdown viewer for a project's pointed-at design doc. Reads
-/// the file from a leased cube workspace and renders it with the same
-/// Textual + Boss style stack the Designs tab uses, so the doc renders
-/// identically to that surface (chore #12 acceptance). Read-only:
-/// `design-producing-tasks` Q6 owns the Approve / Revoke affordances
-/// and lands them on its own case of [[DesignRendererSource]].
+/// In-app markdown viewer for a project's pointed-at design doc, and the File ▸
+/// Open / `open -a Boss` local-file surface. Reads the file from disk and renders
+/// it through the shared [[MarkdownDocumentChrome]] — the same chrome the kanban
+/// "Read full description", async design-doc, and Designs-tab viewers use, so a
+/// doc looks identical however it is opened. Read-only: `design-producing-tasks`
+/// Q6 owns the Approve / Revoke affordances and lands them on its own case of
+/// [[DesignRendererSource]].
+///
+/// This view keeps only the disk-read concern (the 5 MB guard + async load);
+/// every visual and interactive concern (background, header, ⌘F, comments,
+/// questions panel) lives in the chrome.
 struct DesignRendererView: View {
     let content: DesignRendererContent
 
     @EnvironmentObject private var model: ChatViewModel
-    @Environment(\.colorScheme) private var colorScheme
     @State private var source: String = ""
     @State private var loadError: String?
-    /// Stable across re-renders via `@State` (a plain stored `let`/`var`
-    /// would be reinitialized — losing the captured `NSScrollView` — every
-    /// time SwiftUI reconstructs this view struct). Handed to
-    /// `DesignRendererMarkdownContent` so it can preserve scroll position
-    /// across the forced `StructuredText` remount on comment changes.
-    @State private var scrollController = MarkdownScrollController()
 
     private var questionGroups: [AttentionGroup] {
         model.openQuestionGroupsForDocPath(content.filePath)
     }
 
-    private var viewerBackground: Color {
-        colorScheme == .dark ? Color(white: 0.06) : .white
-    }
-
-    private var viewerForeground: Color {
-        colorScheme == .dark ? .white : .black
-    }
-
     var body: some View {
-        HStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    header
-                    Divider()
-                    body(of: content)
-                }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 20)
-                .frame(maxWidth: 720)
-                .frame(maxWidth: .infinity)
-                .background(MarkdownScrollViewCapture(controller: scrollController))
-            }
-            .textSelection(.enabled)
-            .background(viewerBackground)
-            .foregroundStyle(viewerForeground)
-            .task(id: content.filePath) {
-                await load()
-            }
-            .withComments(
-                artifact: content.commentArtifact,
-                source: source,
-                baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent()
-            )
-
-            if !questionGroups.isEmpty {
-                Divider()
-                DesignQuestionsPanel(groups: questionGroups)
-                    .frame(width: 320)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(content.title)
-                    .font(.title3.weight(.semibold))
-                Spacer(minLength: 12)
-                if let url = URL(string: content.webURL), !content.webURL.isEmpty {
-                    Link(destination: url) {
-                        Label("Open on GitHub", systemImage: "arrow.up.right.square")
-                            .font(.callout)
-                    }
-                    .buttonStyle(.link)
-                    .accessibilityIdentifier("design-renderer-github-link")
-                }
-            }
-            HStack(spacing: 8) {
-                if !content.repoLabel.isEmpty {
-                    Text(content.repoLabel)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-                Text(content.filePath)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(content.filePath)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func body(of content: DesignRendererContent) -> some View {
-        if let loadError {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(loadError)
-                    .foregroundStyle(.red)
-                    .font(.callout)
-                if let url = URL(string: content.webURL), !content.webURL.isEmpty {
-                    Link("Open on GitHub instead", destination: url)
-                        .font(.callout)
-                }
-            }
-        } else {
-            DesignRendererMarkdownContent(
-                source: source,
-                baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent(),
-                scrollController: scrollController
-            )
+        MarkdownDocumentChrome(
+            title: content.title,
+            repoLabel: content.repoLabel.isEmpty ? nil : content.repoLabel,
+            subtitle: content.filePath,
+            webURL: content.webURL.isEmpty ? nil : content.webURL,
+            source: source,
+            loadError: loadError,
+            baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent(),
+            artifact: content.commentArtifact,
+            questionGroups: questionGroups
+        )
+        .task(id: content.filePath) {
+            await load()
         }
     }
 
@@ -291,60 +211,5 @@ struct DesignRendererView: View {
             self.loadError = "Failed to read \(path): \(error.localizedDescription)"
             self.source = ""
         }
-    }
-}
-
-/// Inner content view for `DesignRendererView` that reads comment highlights from the
-/// environment (injected by `.withComments()` on the parent ScrollView) and switches to
-/// `HighlightingMarkdownParser` when comments are present. Mirrors the pattern used by
-/// `MarkdownViewerScrollContent` so both surfaces highlight consistently.
-private struct DesignRendererMarkdownContent: View {
-    let source: String
-    let baseURL: URL?
-    /// Captured/restores the enclosing `NSScrollView`'s offset around the
-    /// forced remount below, so highlight updates don't reset the reader's
-    /// scroll position back to the top of the document.
-    let scrollController: MarkdownScrollController
-
-    @Environment(\.commentedAnchors) private var commentedAnchors
-    @Environment(\.commentFlashAnchor) private var commentFlashAnchor
-    /// Monotonically-increasing counter bumped whenever the highlight state
-    /// changes. Used as the `.id()` for `StructuredText` to force a fresh
-    /// parse when comments are added/removed or the flash text changes.
-    @State private var parseVersion: Int = 0
-
-    var body: some View {
-        StructuredText(source, parser: markdownParser)
-            .bossMarkdown()
-            .textual.textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .id(parseVersion)
-            .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
-            .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
-    }
-
-    /// See `MarkdownViewerScrollContent.bumpParseVersionPreservingScroll`
-    /// (DesignsView.swift) for why this capture/restore is needed: AppKit
-    /// resets an `NSScrollView`'s document offset to the top when SwiftUI
-    /// tears down and rebuilds its document view content, which is exactly
-    /// what happens here on every `.id()` change.
-    private func bumpParseVersionPreservingScroll() {
-        let offset = scrollController.currentOffset()
-        parseVersion &+= 1
-        guard let offset else { return }
-        DispatchQueue.main.async {
-            scrollController.restoreOffset(offset)
-        }
-    }
-
-    private var markdownParser: any MarkupParser {
-        if commentedAnchors.isEmpty && commentFlashAnchor == nil {
-            return AttributedStringMarkdownParser.markdown(baseURL: baseURL)
-        }
-        return HighlightingMarkdownParser(
-            highlightedAnchors: commentedAnchors,
-            flashingAnchor: commentFlashAnchor,
-            baseURL: baseURL
-        )
     }
 }

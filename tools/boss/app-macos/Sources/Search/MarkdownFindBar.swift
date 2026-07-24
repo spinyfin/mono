@@ -100,7 +100,7 @@ final class MarkdownScrollController {
     /// Current scroll offset, in the clip view's own (flipped) coordinate
     /// space. Used to snapshot the viewport position before a forced
     /// `StructuredText` remount (see `parseVersion` in
-    /// `MarkdownViewerScrollContent`/`DesignRendererMarkdownContent`) so it
+    /// `MarkdownDocumentColumn`) so it
     /// can be restored once the remount lands, instead of leaving AppKit's
     /// default post-remount scroll offset (top-of-document) in place.
     func currentOffset() -> CGPoint? {
