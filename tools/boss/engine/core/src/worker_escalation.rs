@@ -1,6 +1,6 @@
 //! Worker Stop-boundary escalation/blocker signal detection.
 //!
-//! Background: incident 2026-07-02 (`exec_18b5243e65ff188_2d`, T2085) — a
+//! Background: incident 2026-07-02 (`exec_18b5243e65ff188_2d`) — a
 //! worker hit a bazel blocker, did exactly the right thing (stopped,
 //! emitted an `[effort-escalation]` marker, refused to push unvalidated
 //! code, asked for guidance), and the system did nothing with it. Nothing

@@ -1,8 +1,7 @@
 //! Execution runner.
 //!
-//! The pane-spawn [`ExecutionRunner`] and its supporting machinery, split out
-//! of a single oversized `runner.rs` into functionally grouped sibling
-//! modules:
+//! The pane-spawn [`ExecutionRunner`] and its supporting machinery, grouped
+//! into sibling modules:
 //!
 //! - [`pane_spawn`] — the [`PaneSpawnRunner`] `ExecutionRunner` impl plus the
 //!   boss-event shim install/resolve helpers.

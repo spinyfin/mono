@@ -1,6 +1,6 @@
 //! Worker Stop-boundary deferred-scope marker detection.
 //!
-//! Root cause (T222/PR #765, recovered weeks later as Flunge T254): a worker
+//! Root cause (PR #765, recovered weeks later): a worker
 //! legitimately narrowed its task's scope mid-execution — it wired part of
 //! the brief and deferred the rest because it needed new data plumbing, not
 //! just wiring. The only record of the deferred remainder was a prose
