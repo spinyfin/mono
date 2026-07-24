@@ -1,6 +1,6 @@
 # Flunge Buildkite Pipeline — Reference
 
-Audit of flunge's `.buildkite/` setup, captured for the engineer who will land mono's `.buildkite/` skeleton (Boss CI #2). Source: `~/Documents/dev/flunge/.buildkite/` and the live GitHub branch-protection config on `brianduff/flunge`.
+Audit of flunge's `.buildkite/` setup, captured for the engineer who will land mono's `.buildkite/` skeleton (Boss CI #2). Source: the `brianduff/flunge` default branch and its live GitHub branch-protection config, verified 2026-07-24.
 
 The parent design doc (`boss-ci-buildkite-pipeline-mirroring-flunge.md`) describes the _target_ mono pipeline. This doc describes the _current_ flunge pipeline. Where the two disagree, see "Where mono should diverge" at the bottom — those gaps are the load-bearing decisions for #2.
 
@@ -58,15 +58,15 @@ Notes:
 - `frontend-tests` and `ios-bazel-build` are independent of the bazel chain — they run in parallel with everything else.
 - The `no-ci-steps` step exists so the umbrella `buildkite/flunge-ci` check still goes green for, say, a docs-only PR; without it the check would never report and merge would block forever.
 
-No buildkite plugins are referenced in `pipeline.yml` itself. Plugins appear only via the iOS cache block emitted dynamically.
+No buildkite plugins are referenced in `flunge-ci.stub.yml` itself. Plugins appear only via the iOS cache block emitted dynamically.
 
 ## `lib.sh` — shared helpers
 
-Sourced by every step script. Three exported behaviours worth knowing:
+Sourced by every step script. Four exported behaviours worth knowing:
 
 - `ci_repo_root` — `cd` to the repo root regardless of where buildkite drops the working dir.
 - `is_pr_build` — true iff `BUILDKITE_PULL_REQUEST` is set to something other than `false`.
-- `detect_base_ref` / `changed_files_since` — PR builds resolve to `git merge-base origin/<base> <commit>`; non-PR builds fall back to `HEAD^`. Used both for the dispatcher's path filtering and for `checks.sh` to scope to changed paths.
+- `detect_base_ref` / `changed_files_since` — PR builds resolve to `git merge-base origin/<base> <commit>`; non-PR builds fall back to `HEAD^`. Used by the dispatcher's path filtering only; `run_checks.sh` does not call either helper — checkleft does its own scenario classification (see below).
 - `buildkite_bazel_args` + `run_bazel_with_buildkite_args` — wrap `bazel <cmd>` with `--config=ci-linux` on Linux or `--config=ci-darwin` on Darwin (both defined in `.ci.bazelrc`). Remote execution/`--config=remote` is **not** activated by this wrapper; both platforms run bazel locally with disk-cache only. `buildkite_bazel_startup_args` separately points Linux's bazel output root at a fast SSD volume on specific hosts (`zoologist`/`empiricist`), gated on a buildkite agent host tag.
 
 ## Per-step scripts
@@ -86,15 +86,13 @@ Sourced by every step script. Three exported behaviours worth knowing:
 1. `bazel test --build_tests_only //cli/...`.
 2. `bazel build //cli/...` for untested binaries/libs.
 
-There is no separate `bazel build //checks:flunge_checks` step — that target is not referenced here.
-
 ### `run_frontend_tests.sh`
 
 `cd frontend && npm ci && npm run build && npm run test`. No bazel involvement. Uses whatever Node ships on the agent.
 
 ### `run_frontend_bazel_tests.sh`
 
-`bazel test --build_tests_only //frontend/...` with the wrapped args, run as a separate step from `run_frontend_tests.sh`. Not mentioned in earlier versions of this doc's steps table.
+`bazel test --build_tests_only //frontend/...` with the wrapped args, run as a separate step from `run_frontend_tests.sh`.
 
 ### `run_ios_bazel_build.sh`
 
@@ -224,7 +222,5 @@ infrastructure/buildkite/pipelines/
 ```
 
 `.bazelrc` (top-level) — disk cache + a `config:remote` group are defined here; `.ci.bazelrc` (imported from it) adds the `ci-linux`/`ci-darwin` configs CI actually uses. The CI scripts opt in via `--config=ci-linux` or `--config=ci-darwin`, not `--config=ci --config=remote`.
-
-There is a release-only pipeline noted above (`release-prod-scheduled.pipeline.yml`) not previously listed here; not relevant to mono's PR CI, same as the other release pipelines.
 
 No `.buildkite/hooks/`, no agent-side scripts in this repo. All bootstrap is agent-image-provided.
