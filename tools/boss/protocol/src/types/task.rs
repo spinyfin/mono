@@ -340,64 +340,66 @@ pub enum TaskKind {
     Task,
 }
 
-impl TaskKind {
-    /// Every variant, in declaration order. This is a hand-maintained
-    /// literal — its length is a bare `8`, not derived from the enum, so
-    /// adding a new variant here is *not* a compile error by itself
-    /// (`[TaskKind; 8]` with 8 elements still compiles even if one variant
-    /// is missing and another is duplicated). The real completeness
-    /// guarantee is `tests::all_contains_every_variant` below, which
-    /// rebuilds the variant set via an exhaustive `match` — that match arm
-    /// is what forces a compile error on a new variant, and the test then
-    /// fails if `ALL` doesn't also contain it.
-    pub const ALL: [TaskKind; 8] = [
-        Self::Chore,
-        Self::Design,
-        Self::Followup,
-        Self::Investigation,
-        Self::DesignPostmortem,
-        Self::ProjectTask,
-        Self::Revision,
-        Self::Task,
-    ];
+/// Generates `TaskKind::ALL`, `TaskKind::as_str`, and `TaskKind::from_str`
+/// from one variant list, so there is exactly one hand-authored place that
+/// can go stale when a new `TaskKind` variant is added (instead of the
+/// previous scheme, where `ALL` was a second literal that could silently
+/// omit a variant while everything else still compiled and tested clean —
+/// see incident postmortem-archived-fanout-2026-07-20, where
+/// `design_postmortem` and `followup` were invisible on every listing
+/// surface for exactly that reason).
+///
+/// The enforcement is real, not aspirational: `as_str`'s match below
+/// expands to `match self { Self::Chore => "chore", ... }` with one arm per
+/// entry in this invocation. The compiler checks that expansion for
+/// exhaustiveness against the *actual* `TaskKind` enum above — if a new
+/// variant is added there but not to this macro invocation, `as_str` (and
+/// `from_str`) fail to compile with "non-exhaustive patterns". There is no
+/// way to add a variant to the enum without also adding it here, and `ALL`
+/// is built from this same list, so it cannot fall out of sync with it.
+macro_rules! task_kind_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl TaskKind {
+            /// Every variant, generated from the list above this macro's
+            /// invocation — not a separately hand-maintained literal.
+            pub const ALL: &'static [TaskKind] = &[$(TaskKind::$variant),+];
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Chore => "chore",
-            Self::Design => "design",
-            Self::Followup => "followup",
-            Self::Investigation => "investigation",
-            Self::DesignPostmortem => "design_postmortem",
-            Self::ProjectTask => "project_task",
-            Self::Revision => "revision",
-            Self::Task => "task",
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $str),+
+                }
+            }
         }
-    }
+
+        impl std::str::FromStr for TaskKind {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($str => Ok(Self::$variant),)+
+                    other => Err(format!(
+                        "unknown task kind: `{other}`; expected one of: {}",
+                        [$($str),+].join(", ")
+                    )),
+                }
+            }
+        }
+    };
+}
+
+task_kind_variants! {
+    Chore => "chore",
+    Design => "design",
+    Followup => "followup",
+    Investigation => "investigation",
+    DesignPostmortem => "design_postmortem",
+    ProjectTask => "project_task",
+    Revision => "revision",
+    Task => "task",
 }
 
 impl std::fmt::Display for TaskKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for TaskKind {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "chore" => Ok(Self::Chore),
-            "design" => Ok(Self::Design),
-            "followup" => Ok(Self::Followup),
-            "investigation" => Ok(Self::Investigation),
-            "design_postmortem" => Ok(Self::DesignPostmortem),
-            "project_task" => Ok(Self::ProjectTask),
-            "revision" => Ok(Self::Revision),
-            "task" => Ok(Self::Task),
-            other => Err(format!(
-                "unknown task kind: `{other}`; expected one of: \
-                 chore, design, followup, investigation, design_postmortem, project_task, revision, task"
-            )),
-        }
     }
 }
 
@@ -856,54 +858,18 @@ pub struct TaskRuntime {
 mod tests {
     use super::*;
 
-    /// `TaskKind::ALL`'s `[TaskKind; 8]` size doesn't tie its contents to
-    /// the enum on its own — a hand-written literal can compile clean while
-    /// omitting or duplicating a variant. This test is the actual
-    /// completeness guarantee: the `match` below is exhaustive, so the
-    /// compiler forces an update here the moment a new `TaskKind` variant
-    /// is added, and the assertion then fails if that variant wasn't also
-    /// added to `ALL` — closing the gap that let a new kind silently go
-    /// missing from iteration-based call sites like
-    /// `list_tasks_kind_filter_sql`.
+    /// `TaskKind::ALL` is generated by the `task_kind_variants!` macro
+    /// invocation above (see its doc comment), which the compiler already
+    /// forces to stay in sync with the enum's variant set — a variant
+    /// missing from that invocation fails the crate build, not just this
+    /// test. What the compiler does *not* catch is the same variant being
+    /// listed twice in that invocation (a duplicate match arm is only an
+    /// `unreachable_patterns` warning, not a hard error), which would leave
+    /// a stale/duplicate entry in `ALL`. This test guards that remaining
+    /// gap.
     #[test]
-    fn all_contains_every_variant() {
-        fn expected_for(kind: &TaskKind) -> TaskKind {
-            match kind {
-                TaskKind::Chore => TaskKind::Chore,
-                TaskKind::Design => TaskKind::Design,
-                TaskKind::Followup => TaskKind::Followup,
-                TaskKind::Investigation => TaskKind::Investigation,
-                TaskKind::DesignPostmortem => TaskKind::DesignPostmortem,
-                TaskKind::ProjectTask => TaskKind::ProjectTask,
-                TaskKind::Revision => TaskKind::Revision,
-                TaskKind::Task => TaskKind::Task,
-            }
-        }
-
-        // Every arm above is reachable, so the exhaustive match forces this
-        // list to grow the moment a new variant is added to the enum.
-        let all_variants = [
-            TaskKind::Chore,
-            TaskKind::Design,
-            TaskKind::Followup,
-            TaskKind::Investigation,
-            TaskKind::DesignPostmortem,
-            TaskKind::ProjectTask,
-            TaskKind::Revision,
-            TaskKind::Task,
-        ];
-        for kind in &all_variants {
-            assert_eq!(&expected_for(kind), kind);
-            assert!(
-                TaskKind::ALL.contains(kind),
-                "TaskKind::{kind:?} is missing from TaskKind::ALL"
-            );
-        }
-        assert_eq!(
-            TaskKind::ALL.len(),
-            all_variants.len(),
-            "TaskKind::ALL has a different length than the enum's variant set; \
-             it likely has a duplicate or stale entry"
-        );
+    fn all_has_no_duplicate_entries() {
+        let unique: std::collections::HashSet<_> = TaskKind::ALL.iter().collect();
+        assert_eq!(unique.len(), TaskKind::ALL.len(), "TaskKind::ALL has a duplicate entry");
     }
 }
