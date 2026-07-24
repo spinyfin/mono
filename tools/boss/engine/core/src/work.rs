@@ -422,14 +422,14 @@ pub struct WorkDb {
     /// cloned freely across the engine, and an arm on one handle must be
     /// visible to the mutation that runs through another.
     boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
-    /// The engine event bus this `WorkDb` (and every clone of it) publishes
-    /// state-transition events onto — see `crate::event_publish`. Defaults
-    /// to a private bus with no subscribers when `WorkDb` is opened
-    /// directly; callers that want other subsystems to observe published
-    /// events (e.g. `ServerState`) construct the bus themselves and inject
-    /// it via [`Self::with_event_bus`] so every clone shares the one
-    /// instance subscribers attach to.
-    event_bus: Arc<EventBus>,
+    /// Event bus state-write paths publish onto after their transaction
+    /// commits (see `crate::event_publish`). Defaults to a private,
+    /// unsubscribed bus at construction — production wiring replaces it via
+    /// [`Self::with_event_bus`] with the same instance `ServerState` holds,
+    /// so producers here and the subscriber loops in `app/server.rs` share
+    /// one bus. Tests that never call `with_event_bus` publish into a bus
+    /// nobody listens on, which is harmless.
+    event_bus: Arc<boss_event_bus::EventBus>,
 }
 
 impl Clone for WorkDb {
@@ -522,7 +522,7 @@ use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;
 pub(crate) use dep_helpers::*;
-pub(crate) use design_postmortem::TriggerTaskSnapshot;
+pub(crate) use design_postmortem::{TriggerTaskSnapshot, stage_project_impl_drained_on_terminal_transition};
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
 pub(crate) use driver_allocation::*;

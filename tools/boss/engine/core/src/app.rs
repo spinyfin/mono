@@ -1001,7 +1001,16 @@ impl ServerState {
         cube_client_override: Option<Arc<dyn CubeClient>>,
         execution_runner_override: Option<Arc<dyn ExecutionRunner>>,
     ) -> Result<Arc<Self>> {
-        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
+        // Shared in-process event bus (see `boss_event_bus` and
+        // `crate::event_publish`). `work_db` publishes state-transition
+        // events after its writes commit; reconciler subscriber loops
+        // (e.g. `project_postmortem_sweep`'s event-driven arm, wired in
+        // `app/server.rs`) hold the same `Arc` so producer and subscriber
+        // share one bus instance.
+        let event_bus = Arc::new(boss_event_bus::EventBus::new());
+        let work_db = Arc::new(
+            WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(Arc::clone(&event_bus)),
+        );
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         // Resolve the engine's own inference provider once, here, and install
         // it process-wide so paths too deep to thread a handle through (the
@@ -1365,7 +1374,7 @@ impl ServerState {
             // `server_state.execution_coordinator`) instead of standing up
             // a second, unreachable one — see the boot-time wiring check in
             // `serve_with_merge_probe`.
-            execution_coordinator_inner.set_event_bus(Arc::new(boss_event_bus::EventBus::new()));
+            execution_coordinator_inner.set_event_bus(Arc::clone(&event_bus));
             // Bounded merge_order dispatch stagger (direction 2, default off).
             // Already clamped to MAX_MERGE_ORDER_STAGGER_SECS at config load.
             execution_coordinator_inner.set_merge_order_stagger_secs(cfg.work.merge_order_stagger_secs);
@@ -1463,6 +1472,7 @@ impl ServerState {
                 .ipc_logger(ipc_logger)
                 .self_weak(weak_self.clone())
                 .feature_flags(feature_flags_for_state)
+                .event_bus(Arc::clone(&event_bus))
                 .capability_registry(Arc::new(crate::feature_flags::CapabilityRegistry::new()))
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
