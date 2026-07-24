@@ -146,7 +146,9 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -265,7 +267,9 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -388,7 +392,9 @@ impl WorkDb {
         }
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(IdleAbandonmentCompletion {
             execution: updated_execution,
             work_item: task.map(task_to_item),

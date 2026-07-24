@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use boss_event_bus::{Event, EventBus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+
+use crate::event_publish::{PendingEvents, commit_and_publish};
 
 /// How long sqlite will internally retry on `SQLITE_BUSY` before
 /// surfacing the error to the caller. We funnel concurrent CLI writes
@@ -390,6 +393,14 @@ pub struct WorkDb {
     /// cloned freely across the engine, and an arm on one handle must be
     /// visible to the mutation that runs through another.
     boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
+    /// The engine event bus this `WorkDb` (and every clone of it) publishes
+    /// state-transition events onto — see `crate::event_publish`. Defaults
+    /// to a private bus with no subscribers when `WorkDb` is opened
+    /// directly; callers that want other subsystems to observe published
+    /// events (e.g. `ServerState`) construct the bus themselves and inject
+    /// it via [`Self::with_event_bus`] so every clone shares the one
+    /// instance subscribers attach to.
+    event_bus: Arc<EventBus>,
 }
 
 impl Clone for WorkDb {
@@ -399,6 +410,7 @@ impl Clone for WorkDb {
             memory: self.memory.clone(),
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
+            event_bus: Arc::clone(&self.event_bus),
         }
     }
 }

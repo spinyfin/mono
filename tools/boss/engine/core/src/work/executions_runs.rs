@@ -63,7 +63,9 @@ impl WorkDb {
             reason = "explicit cancel",
             "execution terminalized: cancel",
         );
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(updated)
     }
 
@@ -138,7 +140,9 @@ impl WorkDb {
             reason = %reason,
             "execution terminalized: orphan reap",
         );
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(updated)
     }
 
@@ -1033,7 +1037,9 @@ impl WorkDb {
             reason = %error_text,
             "execution terminalized: fail start",
         );
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((execution, run))
     }
 
@@ -1119,6 +1125,7 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
+        let mut pending = PendingEvents::new();
         if matches!(outcome, PreStartFailureOutcome::PermanentFail) {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(
@@ -1129,8 +1136,9 @@ impl WorkDb {
                 reason = %error_text,
                 "execution terminalized: pre-start failure exhausted retries",
             );
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((execution, run, outcome))
     }
 
@@ -1263,6 +1271,7 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, run_id).require("run", run_id)?;
+        let mut pending = PendingEvents::new();
         if execution_status.is_terminal() {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(
@@ -1273,8 +1282,9 @@ impl WorkDb {
                 reason = "finish_execution_run",
                 "execution terminalized: run finish",
             );
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((execution, run, attention_item))
     }
 
@@ -1338,7 +1348,9 @@ impl WorkDb {
         )?;
 
         let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(updated))
     }
 
@@ -1873,5 +1885,99 @@ impl WorkDb {
             bail!("unknown run: {run_id}");
         }
         query_run(&conn, run_id).require("run", run_id)
+    }
+}
+
+#[cfg(test)]
+mod event_bus_tests {
+    use boss_event_bus::TopicFilter;
+
+    use super::*;
+    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db};
+    use crate::work::CreateChoreInput;
+
+    fn ready_execution(db: &WorkDb) -> WorkExecution {
+        let product = create_test_product(db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        create_ready_chore_execution(db, chore.id)
+    }
+
+    #[tokio::test]
+    async fn cancel_execution_publishes_execution_terminal() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.cancel_execution(&execution.id).unwrap();
+
+        let event = sub.recv().await.expect("ExecutionTerminal published after cancel");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_execution_orphaned_publishes_execution_terminal() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.mark_execution_orphaned(&execution.id, "worker pane died").unwrap();
+
+        let event = sub.recv().await.expect("ExecutionTerminal published after orphan reap");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_execution_does_not_publish_on_error() {
+        // Cancelling an already-terminal execution bails before ever
+        // touching the DB, so this test covers only the reject-before-any-write
+        // path: a failed call must not leave a stray event on the bus. It does
+        // NOT exercise "a staged event is dropped when the enclosing
+        // transaction rolls back after staging" for a real `work/` producer —
+        // that guarantee is covered generically (against a synthetic
+        // producer) by `event_publish.rs`'s own `drops_events_when_commit_fails`
+        // / `drops_events_when_commit_never_runs` tests.
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        db.mark_execution_orphaned(&execution.id, "reap").unwrap();
+
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+        assert!(
+            db.cancel_execution(&execution.id).is_err(),
+            "cancelling a terminal execution must fail"
+        );
+
+        // Give any errant publish a chance to land before asserting absence.
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no ExecutionTerminal should be published when cancel_execution errors");
     }
 }

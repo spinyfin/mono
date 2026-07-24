@@ -71,7 +71,11 @@ impl WorkDb {
         } else {
             false
         };
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        if cancelled {
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(cancelled)
     }
 
@@ -129,7 +133,11 @@ impl WorkDb {
             )?;
             affected > 0
         };
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        if exec_cancelled {
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((exec_cancelled, task_demoted))
     }
 
