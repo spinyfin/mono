@@ -465,13 +465,11 @@ impl WorkerCompletionHandler {
 
         // Read the reviewer's ReviewResult. PRIMARY channel: the engine-owned
         // structured-output artifact the reviewer wrote, schema-validated here
-        // via `ReviewResult::from_json`. TRANSITIONAL FALLBACK: scrape the
-        // transcript's final message (fenced / bare JSON) — this covers remote
-        // workers, whose artifact is written on the remote host and not
-        // readable here, and any local artifact-write failure. The legacy
-        // scraper (`extract_review_result` + the balanced-brace hack) is kept
-        // only as this fallback and can be deleted once the artifact path is
-        // proven in production.
+        // via `ReviewResult::from_json`. TRANSITIONAL FALLBACK: ask the Claude
+        // driver's fallback producer to recover the JSON from the transcript's
+        // final message (fenced / bare) — this covers remote workers, whose
+        // artifact is written on the remote host and not readable here, and
+        // any local artifact-write failure.
         //
         // `last_parse_error` captures the serde error from the last failed
         // parse attempt across both channels so it can be included verbatim

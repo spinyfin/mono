@@ -81,7 +81,7 @@ pub enum StructuredOutputKind {
     /// (`boss_pr_review::ReviewResult`).
     ReviewResult,
     /// A triage agent's decision. Wire form: [`TriageOutcome`] —
-    /// `{"decision":"task","task_id":"T42"}` or
+    /// `{"decision":"task","task_id":"<task id>"}` or
     /// `{"decision":"skip","reason":"…"}`.
     TriageDecision,
     /// Optional follow-on work proposals from an implementer. Wire form: a

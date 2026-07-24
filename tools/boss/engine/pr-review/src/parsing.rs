@@ -91,24 +91,31 @@ pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Optio
 /// first (fenced blocks the reviewer plainly meant as output, then bare
 /// objects found in prose, latest first).
 ///
-/// The returned error is from the first failing candidate that plausibly *was*
-/// the review result — either explicitly fenced, or carrying the
-/// `revision_warranted` field — so an unrelated JSON object quoted in the
-/// reviewer's prose never becomes the message the reviewer is re-prompted
-/// with.
+/// The returned error prefers the first failing candidate that carries the
+/// `revision_warranted` field — the strongest signal that it *was* the
+/// reviewer's `ReviewResult` rather than an unrelated JSON object quoted in
+/// prose — and only falls back to the first failing explicitly-fenced
+/// candidate when no `revision_warranted`-bearing candidate failed. This
+/// keeps a plain non-JSON fenced block (which `json_object_candidates` also
+/// marks explicit) from shadowing the real `ReviewResult` parse error that
+/// should reach the reviewer re-prompt.
 pub fn review_result_from_candidates(candidates: &[FallbackCandidate]) -> (Option<ReviewResult>, Option<String>) {
-    let mut first_error: Option<String> = None;
+    let mut named_error: Option<String> = None;
+    let mut explicit_error: Option<String> = None;
     for candidate in candidates {
         match ReviewResult::from_json(&candidate.payload) {
             Ok(result) => return (Some(result), None),
             Err(err) => {
-                if first_error.is_none() && (candidate.explicit || candidate.payload.contains("revision_warranted")) {
-                    first_error = Some(err.to_string());
+                if named_error.is_none() && candidate.payload.contains("revision_warranted") {
+                    named_error = Some(err.to_string());
+                }
+                if explicit_error.is_none() && candidate.explicit {
+                    explicit_error = Some(err.to_string());
                 }
             }
         }
     }
-    (None, first_error)
+    (None, named_error.or(explicit_error))
 }
 
 /// Engine severity gate.
@@ -506,6 +513,32 @@ mod tests {
         assert!(result.is_none(), "malformed JSON must not produce a result");
         let err_text = err.expect("error text must be returned for a malformed fenced block");
         assert!(!err_text.is_empty(), "error text must not be empty; got: {err_text}",);
+    }
+
+    /// Regression: a plain (non-JSON) fenced block earlier in the message
+    /// must not shadow the real `ReviewResult` parse error from a later
+    /// malformed bare `ReviewResult` — the reviewer re-prompt needs the
+    /// specific field error, not a generic "expected value" from the junk
+    /// fenced prose.
+    #[test]
+    fn extract_review_result_verbose_prefers_named_error_over_unrelated_fenced_block() {
+        let text = concat!(
+            "```\n",
+            "not json\n",
+            "```\n\n",
+            "{\"pr_url\":\"https://github.com/org/repo/pull/1\",",
+            "\"head_sha\":\"abc\",\"summary\":\"s\",\"revision_warranted\":true,",
+            "\"findings\":\"not-an-array\",",
+            "\"regression_check\":{\"performed\":true,\"suspected_deletions\":[]}}\n",
+        );
+        let (result, err) = extract_review_result_verbose(text);
+        assert!(result.is_none(), "malformed JSON must not produce a result");
+        let err_text = err.expect("error text must be returned");
+        assert!(
+            err_text.contains("not-an-array"),
+            "error must name the malformed ReviewResult field's bad value, not a generic \
+             \"expected value\" error from the junk fenced block; got: {err_text}",
+        );
     }
 
     fn make_finding(severity: ReviewFindingSeverity, category: ReviewFindingCategory) -> ReviewFinding {

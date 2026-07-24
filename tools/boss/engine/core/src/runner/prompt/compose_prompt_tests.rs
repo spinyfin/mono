@@ -60,8 +60,7 @@ fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
                 .pr_template_set(&crate::pr_template::PrTemplateSet::default())
                 .build(),
         );
-        let expected_path =
-            crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
+        let expected_path = crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
         assert!(
             prompt.contains(&expected_path),
             "prompt must name the PR-URL artifact path ({expected_path}):\n{prompt}",

@@ -36,21 +36,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 use boss_engine_gh_invocation::{GhNoun, classify};
+use boss_engine_structured_output::pr_url::find_first_pr_url;
 use regex::Regex;
-
-/// Canonical PR URL pattern: `https://github.com/<owner>/<repo>/pull/<N>`.
-/// Owner / repo accept `[A-Za-z0-9._-]+` (GitHub's actual character
-/// set). The PR number is captured but the function returns the full
-/// matched URL so callers can use it verbatim.
-///
-/// Trailing path components (`/files`, `/commits`, `#issuecomment-…`,
-/// query strings) are *not* matched into the canonical form — the
-/// regex stops at the digit run, so a URL like
-/// `https://github.com/owner/repo/pull/123/files` returns
-/// `https://github.com/owner/repo/pull/123`.
-static PR_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+").expect("PR URL regex compiles")
-});
 
 /// Captures the `owner/repo` slug from a PR URL.
 static PR_URL_SLUG_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -123,7 +110,7 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
 pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> Option<String> {
     let scan = |field: &str| -> Option<String> {
         let text = tool_response.get(field)?.as_str()?;
-        PR_URL_RE.find(text).map(|m| m.as_str().to_owned())
+        find_first_pr_url(text)
     };
     scan("stdout").or_else(|| scan("stderr"))
 }

@@ -113,7 +113,7 @@ fn strip_ci_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// Like [`strip_ci_prefix`] but requires a trailing word boundary so `task`
-/// matches `task T1` but not `taskforce`.
+/// matches `task <id>` but not `taskforce`.
 fn strip_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = strip_ci_prefix(s, keyword)?;
     if rest.is_empty() || rest.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
