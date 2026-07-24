@@ -55,6 +55,15 @@ impl PendingEvents {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Consume `self`, yielding every staged event. For the rare
+    /// non-transactional producer that has no `Transaction` to hand
+    /// [`commit_and_publish`] — its single `Connection::execute` write
+    /// already auto-committed, so there's nothing left to gate the
+    /// publish on; the caller publishes each event immediately instead.
+    pub fn drain(self) -> Vec<Event> {
+        self.0
+    }
 }
 
 /// Commit `tx`, and only if the commit succeeds, publish every event staged

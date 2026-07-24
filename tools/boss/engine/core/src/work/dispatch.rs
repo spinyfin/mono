@@ -179,11 +179,21 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut healed = Vec::new();
+        let mut pending = PendingEvents::new();
         let now = now_string();
         for (work_item_id, product_id) in candidates {
             // Abandon any non-terminal executions so they don't get
             // picked up by the dispatcher after the demote. Terminal
             // executions are left alone — they're already settled.
+            let abandoned_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM work_executions
+                     WHERE work_item_id = ?1
+                       AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
+                )?;
+                stmt.query_map(params![work_item_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'abandoned',
@@ -192,6 +202,9 @@ impl WorkDb {
                    AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
                 params![work_item_id, now],
             )?;
+            for execution_id in &abandoned_ids {
+                stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+            }
             // Demote the kanban status. Use a guarded update so we
             // don't race a concurrent move to `done`/`archived`.
             // Stamps `last_status_actor = 'engine'` so the kanban can
@@ -215,7 +228,7 @@ impl WorkDb {
                 });
             }
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(healed)
     }
 
@@ -249,6 +262,7 @@ impl WorkDb {
         };
         let now = now_string();
         let mut abandoned = Vec::new();
+        let mut pending = PendingEvents::new();
         for (execution_id, work_item_id) in candidates {
             let updated = tx.execute(
                 "UPDATE work_executions
@@ -259,13 +273,14 @@ impl WorkDb {
                 params![execution_id, now],
             )?;
             if updated > 0 {
+                stage_execution_terminal(&mut pending, &tx, &execution_id, &work_item_id)?;
                 abandoned.push(AbandonedStrandedExecution {
                     execution_id,
                     work_item_id,
                 });
             }
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(abandoned)
     }
 
@@ -1243,6 +1258,10 @@ impl WorkDb {
                 reason = "redundant duplicate execution",
                 "execution terminalized: mark redundant",
             );
+            // No open `Transaction` here — `conn` auto-commits each
+            // statement, so the UPDATE above is already durable and this
+            // publish carries no rollback risk.
+            publish_execution_terminal(&self.event_bus, &conn, execution_id, &existing.work_item_id)?;
         }
         Ok(())
     }
@@ -1333,7 +1352,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        tx.execute(
+        let execution_rows = tx.execute(
             "UPDATE work_executions
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
@@ -1341,6 +1360,10 @@ impl WorkDb {
                AND status = 'ready'",
             params![execution_id, now],
         )?;
+        let mut pending = PendingEvents::new();
+        if execution_rows > 0 {
+            stage_execution_terminal(&mut pending, &tx, execution_id, task_id)?;
+        }
         let task_rows = tx.execute(
             "UPDATE tasks
                 SET status             = 'in_review',
@@ -1355,7 +1378,7 @@ impl WorkDb {
         if task_rows > 0 {
             cascade_dependents_after_prereq_status_change(&tx, task_id, "in_review", &now)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(task_rows > 0)
     }
 
@@ -1445,4 +1468,50 @@ fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<Stri
     member_ids.push(root_id.clone());
     member_ids.extend(collect_chain_revision_ids_including_deleted(conn, &root_id)?);
     Ok(member_ids)
+}
+
+#[cfg(test)]
+mod event_bus_tests {
+    use boss_event_bus::TopicFilter;
+
+    use super::*;
+    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db};
+    use crate::work::CreateChoreInput;
+
+    #[tokio::test]
+    async fn mark_execution_redundant_publishes_execution_terminal() {
+        // `mark_execution_redundant` writes through a plain auto-committing
+        // `Connection`, not a `Transaction` — the non-tx `publish_execution_terminal`
+        // path this test exercises.
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        let execution = create_ready_chore_execution(&db, chore.id);
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.mark_execution_redundant(&execution.id).unwrap();
+
+        let event = sub
+            .recv()
+            .await
+            .expect("ExecutionTerminal published after mark_execution_redundant");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
 }

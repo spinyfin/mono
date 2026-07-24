@@ -32,6 +32,64 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
     })
 }
 
+/// Stage an [`Event::ExecutionTerminal`] for publish once the caller's
+/// transaction commits. Call immediately after writing `work_executions`'s
+/// `status` column to a terminal value, passing the row's own id and its
+/// `work_item_id` (task id). Resolves `host_id` with its own read so
+/// callers don't have to thread it through — `work_executions.host_id` is
+/// nullable until a run first picks a host, so this falls back to
+/// `"local"` (the engine's historical default host) rather than publish an
+/// event with an empty id.
+///
+/// `pool_claim` is always published as `None`: whether an execution still
+/// holds a worker-pool slot is runtime state owned by the
+/// `ExecutionCoordinator`'s `WorkerPool`, not a DB column this DB-layer
+/// helper can see. Per the event-bus design's "events are hints, not
+/// commands" contract, a future `pool_claim_sweep` subscriber re-reads the
+/// live pool state itself rather than trusting this field for correctness.
+pub(crate) fn stage_execution_terminal(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    execution_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let host_id: Option<String> = conn
+        .query_row(
+            "SELECT host_id FROM work_executions WHERE id = ?1",
+            params![execution_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    pending.push(Event::ExecutionTerminal {
+        execution_id: execution_id.to_owned(),
+        task_id: task_id.to_owned(),
+        host_id: host_id.unwrap_or_else(|| "local".to_owned()),
+        pool_claim: None,
+    });
+    Ok(())
+}
+
+/// Publish an [`Event::ExecutionTerminal`] immediately — for the rarer
+/// terminal-write call sites that mutate `work_executions` through a plain
+/// (auto-committing) [`Connection`] rather than an explicit `Transaction`,
+/// so there is no commit to gate the publish on. Same field resolution as
+/// [`stage_execution_terminal`]; callers must invoke this only *after* the
+/// write that made the transition already succeeded.
+pub(crate) fn publish_execution_terminal(
+    bus: &EventBus,
+    conn: &Connection,
+    execution_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let mut pending = PendingEvents::new();
+    stage_execution_terminal(&mut pending, conn, execution_id, task_id)?;
+    for event in pending.drain() {
+        bus.publish(event);
+    }
+    Ok(())
+}
+
 pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,

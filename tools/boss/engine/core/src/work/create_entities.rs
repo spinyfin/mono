@@ -17,6 +17,7 @@ impl WorkDb {
             memory: None,
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
         };
         db.init()?;
         Ok(db)
@@ -36,9 +37,24 @@ impl WorkDb {
             memory: Some(anchor),
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
+            event_bus: Arc::new(EventBus::new()),
         };
         db.init()?;
         Ok(db)
+    }
+
+    /// Replace this handle's event bus with `bus`, so every clone shares
+    /// the same instance a subscriber elsewhere (e.g. `ServerState`)
+    /// attaches to. Chainable — call right after [`Self::open`] /
+    /// [`Self::open_in_memory`].
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = bus;
+        self
+    }
+
+    /// The event bus this `WorkDb` publishes state-transition events onto.
+    pub fn event_bus(&self) -> &Arc<EventBus> {
+        &self.event_bus
     }
 
     pub fn path(&self) -> &Path {
