@@ -18,7 +18,7 @@ use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{ExecutionKind, ExecutionStatus, WorkItemBinding};
 
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
-use super::worker_spawn::{ComposedWorkerSpawn, compose_worker_spawn};
+use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
@@ -302,13 +302,13 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            (
+            WorkerSpawnOpts {
                 editorial_enabled,
-                self.cfg.work.max_review_embed_diff_lines,
+                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
                 worker_signal_proposals_seam_enabled,
                 deferred_scope_proposals_seam_enabled,
                 followup_proposals_seam_enabled,
-            ),
+            },
         )
         .await?;
 

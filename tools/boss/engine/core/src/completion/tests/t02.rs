@@ -1895,17 +1895,25 @@ async fn deferred_scope_proposals_first_flag_off_matches_pre_migration_behavior_
 // -----------------------------------------------------------
 // Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
 // implementation task 10): `followup_proposals_seam` makes the followups
-// block in `finalize_pr_transition` read proposals-first, skipping the
-// entire legacy structured-output-artifact / `FOLLOWUPS:` sentinel chain
-// (`attentions_detector::reconcile_task_followups`) whenever this
-// execution already carries a `followup_task` proposal. Mirrors the
+// block in `finalize_pr_transition` read proposals-first. Unlike the
+// worker-signal / deferred-scope seams, this is NOT an execution-scoped
+// skip-or-run gate — follow-ups are inherently multi-item and the prompt
+// sanctions a worker mixing `boss propose followup-task` calls with the
+// legacy structured-output-artifact / `FOLLOWUPS:` sentinel fallback
+// within a single run. So the legacy chain
+// (`attentions_detector::reconcile_task_followups`) always runs; a
+// follow-up it detects that a `followup_task` proposal already staged
+// (same `proposed_name`) is deduped away by
+// `WorkDb::reconcile_attentions`'s content-key dedup — which already scans
+// every existing member of the group, proposal-staged ones included — a
+// genuinely new one still lands and counts as a fallback hit. Mirrors the
 // `deferred_scope_proposals_seam` tests above, but through the
 // PR-detected `finalize_pr_transition` path (followups only reconcile at
 // PR completion) rather than a bare `on_stop`.
 // -----------------------------------------------------------
 
 #[tokio::test]
-async fn followup_proposals_first_flag_skips_legacy_detection_when_a_proposal_already_exists() {
+async fn followup_proposals_first_flag_dedupes_the_proposal_covered_item_but_still_lands_a_new_legacy_item() {
     let workspace = tempdir().unwrap();
     let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
     // The worker already called `boss propose followup-task` — this
@@ -1921,14 +1929,19 @@ async fn followup_proposals_first_flag_skips_legacy_detection_when_a_proposal_al
     })
     .unwrap()
     .unwrap();
-    // The final message also carries a legacy FOLLOWUPS: block with a
-    // DIFFERENT follow-up — proposals-first must skip this entirely, not
-    // just dedup it away.
+    // The final message also carries a legacy FOLLOWUPS: block: one entry
+    // that re-describes the SAME follow-up already staged via the
+    // proposal (same `proposed_name` — e.g. the worker's second `boss
+    // propose` call for it failed, so it fell back per the prompt's
+    // sanctioned fallback), and one that is a genuinely DIFFERENT
+    // follow-up the proposal channel never saw. Content dedup must drop
+    // the first and keep the second — a whole-execution skip would have
+    // silently dropped both.
     write_assistant_transcript(
         &db,
         workspace.path(),
         &execution_id,
-        "Done.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Unrelated legacy followup\", \"proposed_description\": \"should never land\"}]\n```\n",
+        "Done.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Add retry to the X client\", \"proposed_description\": \"duplicate of the staged proposal\"}, {\"proposed_name\": \"A second, distinct follow-up\", \"proposed_description\": \"never made it through boss propose\"}]\n```\n",
     );
 
     let flags_dir = tempdir().unwrap();
@@ -1951,18 +1964,28 @@ async fn followup_proposals_first_flag_skips_legacy_detection_when_a_proposal_al
         .list_attention_groups(&product_id, None, Some(&chore_id), Some("followup"), None)
         .unwrap();
     assert_eq!(groups.len(), 1, "expected exactly one followup group; got {groups:?}");
-    let members = db.list_attentions_for_group(&groups[0].id).unwrap();
+    let mut names: Vec<Option<String>> = db
+        .list_attentions_for_group(&groups[0].id)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.proposed_name)
+        .collect();
+    names.sort();
     assert_eq!(
-        members.len(),
-        1,
-        "the proposal's synchronous stage already put one member in the group; the legacy \
-         FOLLOWUPS: block must not add a second one; got {members:?}",
+        names,
+        vec![
+            Some("A second, distinct follow-up".to_owned()),
+            Some("Add retry to the X client".to_owned()),
+        ],
+        "the proposal-covered item must not duplicate, but the genuinely new legacy item must \
+         still land",
     );
-    assert_eq!(members[0].proposed_name.as_deref(), Some("Add retry to the X client"));
     assert_eq!(
         metrics.counter_value("worker_proposals.fallback_hit.followup_task"),
-        Some(0),
-        "no fallback hit expected — an existing followup_task proposal covered this execution",
+        Some(1),
+        "one genuinely new follow-up came from the legacy path, so the fallback-hit counter \
+         must count exactly that one — not zero (data loss) and not two (the deduped item is \
+         not a fallback hit)",
     );
 }
 

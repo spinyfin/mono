@@ -34,8 +34,8 @@ use crate::cube_commands::CubeJsonTransport;
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
-    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, bazel_prepush_gate_text, compose_worker_spawn,
-    work_item_name, work_item_task_kind,
+    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, WorkerSpawnOpts, bazel_prepush_gate_text,
+    compose_worker_spawn, work_item_name, work_item_task_kind,
 };
 use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
@@ -681,23 +681,26 @@ impl HostAdapter for SshHostAdapter {
             work_item,
             workspace_path,
             cube_change_id,
-            // Editorial controls and the worker-proposal-seam prompt gate both
+            // Editorial controls and every worker-proposal-seam prompt gate
             // default OFF on the remote path: SshHostAdapter does not hold a
             // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
-            // docs), so this hardcodes `false` regardless of the engine's own
-            // (local) read of `worker_signal_proposals_seam` — the remote
-            // worker always gets the legacy `[blocked]` / `[effort-escalation]`
-            // marker text, even when the engine's read path is
-            // proposals-first. That marker then always counts as a fallback
-            // hit in `worker_proposals.fallback_hit.*` — see the caveat on
-            // those counters' declaration in `completion.rs` before using them
-            // as an exit criterion. Wire feature flags into the remote path
-            // alongside the cross-host config work (PR3/PR4). The fourth
-            // `false` mirrors the same hardcoding for
-            // `deferred_scope_proposals_seam` (design implementation task 9);
-            // the fifth mirrors it again for `followup_proposals_seam`
-            // (design implementation task 10).
-            (false, self.cfg.work.max_review_embed_diff_lines, false, false, false),
+            // docs), so these all hardcode `false` regardless of the
+            // engine's own (local) read of `worker_signal_proposals_seam` /
+            // `deferred_scope_proposals_seam` / `followup_proposals_seam` —
+            // the remote worker always gets the legacy marker/artifact text,
+            // even when the engine's read path is proposals-first. That
+            // marker/artifact then always counts as a fallback hit in
+            // `worker_proposals.fallback_hit.*` — see the caveat on those
+            // counters' declaration in `completion.rs` before using them as
+            // an exit criterion. Wire feature flags into the remote path
+            // alongside the cross-host config work (PR3/PR4).
+            WorkerSpawnOpts {
+                editorial_enabled: false,
+                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
+                worker_signal_proposals_seam_enabled: false,
+                deferred_scope_proposals_seam_enabled: false,
+                followup_proposals_seam_enabled: false,
+            },
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by

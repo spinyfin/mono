@@ -60,13 +60,13 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// task 10): [`followups_emission_block`]. `false` (the flag's registry
     /// default) reproduces the exact structured-output-artifact-primary /
     /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `boss propose
-    /// followup-task` instead. This is the OTHER half of the flag: the
-    /// engine's read path
-    /// (`crate::completion::WorkerCompletionHandler::execution_has_followup_task_proposal`,
-    /// consumed by `crate::completion::pr_transition`'s followups block) is
-    /// gated by the same flag name read directly from `FeatureFlagsStore`;
-    /// gating the prompt too is what makes "flag off" restore today's
-    /// behavior exactly, prompt included.
+    /// followup-task` instead. This is the OTHER half of the flag:
+    /// `crate::completion::pr_transition`'s followups block, which counts a
+    /// fallback hit whenever its legacy chain lands a follow-up not already
+    /// covered by a `followup_task` proposal, is gated by the same flag
+    /// name read directly from `FeatureFlagsStore`; gating the prompt too
+    /// is what makes "flag off" restore today's behavior exactly, prompt
+    /// included.
     #[builder(default)]
     followup_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
@@ -1288,12 +1288,11 @@ fn design_questions_manifest_block() -> String {
 /// completion surfaces it for the human.
 ///
 /// `seam_enabled` mirrors the `followup_proposals_seam` feature flag — the
-/// same flag
-/// [`crate::completion::WorkerCompletionHandler::execution_has_followup_task_proposal`]
-/// reads for the engine's read path, threaded here so the two halves of the
-/// migration move together: a worker must never be taught a verb the engine
-/// won't yet read proposals-first for, and flipping the flag off must
-/// restore today's behavior exactly, prompt included.
+/// same flag `crate::completion::pr_transition`'s followups block reads for
+/// the engine's read path, threaded here so the two halves of the migration
+/// move together: a worker must never be taught a verb the engine won't yet
+/// read proposals-first for, and flipping the flag off must restore today's
+/// behavior exactly, prompt included.
 ///
 /// `seam_enabled = false` reproduces the pre-migration directive verbatim:
 /// **write** a JSON array to the engine-owned artifact at `output_path` (see
