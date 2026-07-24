@@ -162,6 +162,7 @@ impl WorkDb {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 autostart INTEGER NOT NULL DEFAULT 1,
+                deferred INTEGER NOT NULL DEFAULT 0,
                 priority TEXT NOT NULL DEFAULT 'medium',
                 repo_remote_url TEXT,
                 created_via TEXT NOT NULL DEFAULT 'unknown',
@@ -282,6 +283,7 @@ impl WorkDb {
         )?;
         migrate_work_executions_v3(conn)?;
         migrate_tasks_autostart(conn)?;
+        migrate_tasks_deferred(conn)?;
         migrate_last_status_actor(conn)?;
         migrate_tasks_priority(conn)?;
         migrate_project_design_doc_columns(conn)?;

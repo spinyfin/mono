@@ -678,6 +678,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .name(name)
                     .maybe_description(description)
                     .autostart(!ctx.no_autostart)
+                    .deferred(args.deferred)
                     .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
@@ -797,6 +798,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .name(name)
                     .maybe_description(description)
                     .autostart(!ctx.no_autostart)
+                    .deferred(args.deferred)
                     .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
@@ -1069,6 +1071,10 @@ pub(crate) async fn run_update_leaf(
         model_override,
         driver,
         autostart: args.autostart,
+        // `--deferred false` approves a future-scope item; `--deferred true`
+        // re-parks it. `None` (flag omitted) leaves the classification
+        // unchanged.
+        deferred: args.deferred,
         // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
         // maps to NULL in the engine (clears the field).
         blocked_reason: args.blocked_reason,
@@ -1080,7 +1086,7 @@ pub(crate) async fn run_update_leaf(
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, --blocked-reason, or --blocked-detail",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, --deferred, --blocked-reason, or --blocked-detail",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {

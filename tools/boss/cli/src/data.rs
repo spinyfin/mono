@@ -456,6 +456,7 @@ pub(crate) async fn run_create_investigation(
             .name(name.clone())
             .maybe_description(description)
             .autostart(!ctx.no_autostart)
+            .deferred(args.deferred)
             .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
             .created_via("cli")
             .maybe_repo_remote_url(args.repo_remote_url)
@@ -966,6 +967,12 @@ pub(crate) struct BulkCreateItem {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) autostart: Option<bool>,
+    /// Per-item deferred / future-scope override. Omitted → `false` (not
+    /// future scope). When `true`, the created item is parked as future
+    /// scope: visible and auto-unblocked, but never auto-dispatched until
+    /// explicitly approved. See [`boss_protocol::Task::deferred`].
+    #[serde(default)]
+    pub(crate) deferred: Option<bool>,
     #[serde(default)]
     pub(crate) project_id: Option<String>,
     /// Per-item priority override. Omitted → engine default
@@ -1067,6 +1074,7 @@ pub(crate) async fn run_task_create_many(
                 .name(item.name)
                 .maybe_description(normalize_non_empty(Some(item.description)))
                 .autostart(item.autostart.unwrap_or(default_autostart))
+                .deferred(item.deferred.unwrap_or(false))
                 .depends_on(depends_on)
                 .maybe_priority(item.priority)
                 .created_via(CREATED_VIA_CLI)
@@ -1116,6 +1124,7 @@ pub(crate) async fn run_chore_create_many(
                 .name(item.name)
                 .maybe_description(normalize_non_empty(Some(item.description)))
                 .autostart(item.autostart.unwrap_or(default_autostart))
+                .deferred(item.deferred.unwrap_or(false))
                 .depends_on(depends_on)
                 .maybe_priority(item.priority)
                 .created_via(CREATED_VIA_CLI)
@@ -2145,6 +2154,7 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.dispatch_preamble.is_some()
         || patch.worker_branch_prefix.is_some()
         || patch.autostart.is_some()
+        || patch.deferred.is_some()
         || patch.blocked_reason.is_some()
         || patch.blocked_detail.is_some();
 

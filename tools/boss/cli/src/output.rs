@@ -891,6 +891,9 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     println!("Name: {}", task.name);
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status.display_label());
+    if task.deferred {
+        println!("Deferred: yes (future scope — awaiting approval to dispatch)");
+    }
     if let Some(reason) = task.archived_reason.as_deref() {
         println!("Archived reason: {reason}");
     }

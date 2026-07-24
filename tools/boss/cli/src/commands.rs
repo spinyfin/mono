@@ -1972,6 +1972,15 @@ pub(crate) struct TaskCreateArgs {
     #[arg(long = "depends-on", value_delimiter = ',')]
     pub(crate) depends_on: Vec<String>,
 
+    /// File this task as deferred / future scope: created and visible in
+    /// the backlog but never auto-dispatched (on any path — normal
+    /// reconcile, dependency auto-unblock, or automation retry) until a
+    /// human explicitly approves it (`bossctl work start`, a kanban drag,
+    /// or `boss task update --deferred false`). Use for work that is real
+    /// but explicitly not yet in scope.
+    #[arg(long = "deferred", default_value_t = false)]
+    pub(crate) deferred: bool,
+
     /// Mark this task as produced by an automation's triage phase. Accepts
     /// an automation selector — a canonical `auto_…` id (resolves on its
     /// own) or an `A<n>` short id (requires `--product`). The engine stamps
@@ -2135,6 +2144,12 @@ pub(crate) struct ChoreCreateArgs {
     /// create→`depend add` race.
     #[arg(long = "depends-on", value_delimiter = ',')]
     pub(crate) depends_on: Vec<String>,
+
+    /// File this chore as deferred / future scope. See
+    /// `boss task create --deferred` for the full description: visible in
+    /// the backlog but never auto-dispatched until explicitly approved.
+    #[arg(long = "deferred", default_value_t = false)]
+    pub(crate) deferred: bool,
 }
 
 /// Args for `boss task create-investigation`.
@@ -2173,6 +2188,11 @@ pub(crate) struct InvestigationCreateArgs {
 
     #[arg(long = "force-duplicate", default_value_t = false)]
     pub(crate) force_duplicate: bool,
+
+    /// File this investigation as deferred / future scope. See
+    /// `boss task create --deferred` for the full description.
+    #[arg(long = "deferred", default_value_t = false)]
+    pub(crate) deferred: bool,
 }
 
 /// Args for `boss task create-revision`.
@@ -2506,6 +2526,14 @@ pub(crate) struct TaskUpdateArgs {
     /// `--autostart false` parks it in the backlog until you re-enable it.
     #[arg(long, value_name = "BOOL")]
     pub(crate) autostart: Option<bool>,
+
+    /// Mark or unmark this item as deferred / future scope. `--deferred
+    /// false` approves it — pulls it into scope so the engine can dispatch
+    /// it again; `--deferred true` parks it as future scope (auto-unblocked
+    /// and visible, but never auto-dispatched until approved). Distinct
+    /// from `--autostart`, which is a one-shot dispatch-timing pause.
+    #[arg(long, value_name = "BOOL")]
+    pub(crate) deferred: Option<bool>,
 
     /// Set or clear the blocked reason on this item. Accepts any engine
     /// reason value (`merge_conflict`, `ci_failure`, `ci_failure_exhausted`,

@@ -225,6 +225,7 @@ extension EngineClient {
             blockedAttemptID: payload["blocked_attempt_id"] as? String,
             shortID: (payload["short_id"] as? NSNumber)?.intValue,
             autostart: (payload["autostart"] as? Bool) ?? false,
+            deferred: (payload["deferred"] as? Bool) ?? false,
             ciRequiredState: payload["ci_required_state"] as? String,
             ciRequiredDetail: payload["ci_required_detail"] as? String,
             reviewRequiredState: payload["review_required_state"] as? String,

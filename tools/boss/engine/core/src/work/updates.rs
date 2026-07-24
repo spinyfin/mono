@@ -223,6 +223,14 @@ impl WorkDb {
         if let Some(autostart) = patch.autostart {
             task.autostart = autostart;
         }
+        // Approving (`--deferred false`) pulls a future-scope item into
+        // scope so the reconciler/cascade can mint a `ready` execution for
+        // it again; `--deferred true` re-parks it. `task.deferred` was
+        // loaded from the row by `query_task`, so writing it back below
+        // never clobbers an unrelated update.
+        if let Some(deferred) = patch.deferred {
+            task.deferred = deferred;
+        }
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
@@ -280,7 +288,7 @@ impl WorkDb {
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
-                 archived_reason = ?17, blocked_detail = ?18,
+                 archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -306,8 +314,19 @@ impl WorkDb {
                 task.driver,
                 task.archived_reason,
                 task.blocked_detail,
+                task.deferred as i64,
             ],
         )?;
+
+        // Re-classifying an item as deferred pulls it out of the dispatch
+        // pool immediately: abandon any not-yet-live execution so a row that
+        // was already queued (`ready` / `waiting_dependency`) can't dispatch
+        // before the reconcile gate next runs. A live worker
+        // (`running` / `waiting_human`) is left alone — it self-retires. The
+        // reconcile guard (`work_item_is_deferred`) then keeps it parked.
+        if patch.deferred == Some(true) {
+            abandon_pending_executions(&tx, id, &task.updated_at)?;
+        }
 
         if status_changed && previous_status != task.status {
             cascade_dependents_after_prereq_status_change(&tx, id, task.status.as_str(), &task.updated_at)?;

@@ -2499,6 +2499,9 @@ struct WorkBoardCardView: View {
                        !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         EffortChip(effortLevel: effortLevel)
                     }
+                    if task.deferred {
+                        FutureScopeBadge()
+                    }
                     if let projectName, !projectName.isEmpty {
                         WorkStatusBadge(text: projectName)
                     }
@@ -2793,6 +2796,14 @@ struct WorkBoardCardView: View {
         if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return Color.orange.opacity(0.08)
         }
+        // Future-scope items get a muted neutral fill so parked work reads as
+        // "set aside" at a glance, distinct from genuinely-queued backlog
+        // cards. Ranked below `blocked` so a deferred-and-gated card still
+        // shows the blocked-orange chrome (the "Future" badge conveys the
+        // classification either way).
+        if task.deferred {
+            return Color.secondary.opacity(0.10)
+        }
         switch boardStyle {
         case .classic, .airy:
             return Color(nsColor: .windowBackgroundColor)
@@ -2814,6 +2825,11 @@ struct WorkBoardCardView: View {
         }
         if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return .orange
+        }
+        // Soft muted outline reinforces the parked/future-scope treatment
+        // established by `cardBackground` and the "Future" badge.
+        if task.deferred {
+            return Color.secondary.opacity(0.45)
         }
         switch boardStyle {
         case .classic:
@@ -5805,6 +5821,33 @@ private struct ReviewingAIBadge: View {
         .layoutPriority(-1)
         .help("An AI reviewer pass is running on this PR. The card will move to Review once the pass completes (typically within a minute).")
         .accessibilityLabel("AI reviewing PR")
+    }
+}
+
+/// Badge for a task filed as deferred / future scope (`deferred == true`).
+/// Deliberately muted (secondary tint, "moon" glyph) so parked future work
+/// reads as "set aside" at a glance and is visually distinct from a
+/// genuinely-queued backlog card. Distinct from the AI `[deferred-scope]`
+/// attention marker (`DeferredScopeCardBadge`) — this reflects the durable
+/// per-row `deferred` classification, not a transient AI flag.
+private struct FutureScopeBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "moon.zzz.fill")
+                .font(.caption2)
+            Text("Future")
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(Color.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
+        .layoutPriority(-1)
+        .help("Filed as future scope — parked until explicitly approved. The engine keeps it visible and unblocks its dependencies, but never auto-dispatches it. Approve with a drag to Doing, `bossctl work start`, or `boss task update --deferred false`.")
+        .accessibilityLabel("Deferred: future scope")
     }
 }
 
