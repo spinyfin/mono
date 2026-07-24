@@ -1621,22 +1621,27 @@ pub async fn serve_with_merge_probe(
 
     // Timer-wheel fast path for the envelope watchdog (event-bus design doc,
     // Phase 3): schedules a per-execution deadline for each live `Working`
-    // slot at subscribe/reconcile time and re-checks that one execution as
-    // soon as its `Timer{deadline_id}` fires, instead of waiting out the
-    // sweep's next 60s tick. The sweep above stays as the untouched backstop
-    // — this is a latency win, not a replacement. The event bus and the
-    // timer-wheel it feeds are constructed here (inside a live Tokio
-    // runtime, since `TimerWheel::spawn` spawns its background loop) rather
-    // than on `ServerState`, which many unit tests construct outside of a
-    // runtime; envelope_watch is currently their only in-process consumer.
-    let envelope_watch_event_bus = Arc::new(boss_event_bus::EventBus::new());
-    let envelope_watch_timer_wheel = Arc::new(boss_timer_wheel::TimerWheel::spawn(envelope_watch_event_bus.clone()));
+    // slot, re-reconciling on a floor interval so slots that start working
+    // after the initial pass still get one, and re-checks a slot as soon as
+    // its `Timer{deadline_id}` fires, instead of waiting out the sweep's
+    // next 60s tick. The sweep above stays as the untouched backstop — this
+    // is a latency win, not a replacement. The bus lives on `ServerState`
+    // from construction; the wheel's background task needs a live Tokio
+    // runtime (many unit tests construct `ServerState` outside one), so it
+    // is initialized here via `get_or_init`, the first point in `serve`
+    // that's guaranteed to be inside one.
+    let envelope_watch_event_bus = server_state.envelope_event_bus.clone();
+    let envelope_watch_timer_wheel = server_state
+        .envelope_timer_wheel
+        .get_or_init(|| Arc::new(boss_timer_wheel::TimerWheel::spawn(envelope_watch_event_bus.clone())))
+        .clone();
     let _envelope_watch_timer_handle = crate::envelope_watch::spawn_timer_subscriber(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
         envelope_watch_timer_wheel,
         envelope_watch_event_bus,
         crate::envelope_watch::EnvelopeThresholds::from_env(|k| std::env::var_os(k)),
+        crate::envelope_watch::DEFAULT_RECONCILE_INTERVAL,
     );
 
     // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`

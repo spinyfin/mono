@@ -38,6 +38,7 @@
 //! worker-session pipeline today; duration is the cost signal T298 showed
 //! dominates — ~42% of that run was model thinking time, not builds.)
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
@@ -326,26 +327,38 @@ fn evaluate_slot(
     SlotOutcome::Signaled
 }
 
+/// Floor on how often [`spawn_timer_subscriber`] re-reconciles the
+/// timer-wheel against live worker state, matching the design doc's
+/// "event-first with a 60s floor" (line 104). This is what makes the fast
+/// path actually fast in steady state: without a recurring reconcile, only
+/// the boot-recovered cohort present at subscribe time would ever get a
+/// deadline, and every execution dispatched afterwards would depend on the
+/// 60s sweep alone.
+pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Subscribe to the timer-wheel's `Event::Timer` topic for a fast per-
 /// execution envelope recheck, racing the 60s sweep [`spawn_loop`] keeps
 /// running as the untouched backstop.
 ///
 /// Each attempt (initial start, or restart after a panic — see
-/// [`spawn_supervised`]) schedules one deadline per currently-live `Working`
-/// slot that has an envelope, then processes `Timer` events forever: a
-/// `Timer{deadline_id}` whose id names a still-live slot triggers exactly the
-/// same [`evaluate_slot`] check `run_one_pass` runs for that slot, so the two
-/// paths share one idempotency guard ([`execution_already_signaled`]). A slot
-/// that starts working after this attempt's initial scheduling pass has no
-/// timer-wheel deadline until the next restart — the sweep is what catches
-/// it in the meantime, exactly as the design doc's "the bus never replaces a
-/// sweep; it races it" invariant expects.
+/// [`spawn_supervised`]) runs an initial [`reconcile_envelope_deadlines`]
+/// pass, then loops forever selecting between two triggers: a
+/// `Timer{deadline_id}` event (fast path — triggers exactly the same
+/// [`evaluate_slot`] check `run_one_pass` runs for that slot, so the two
+/// paths share one idempotency guard, [`execution_already_signaled`]) and a
+/// `reconcile_interval` tick, which re-runs `reconcile_envelope_deadlines`
+/// so a slot that started `Working` after the last reconcile — the common
+/// case in a long-running engine — gets a deadline within one interval
+/// instead of never. The periodic 60s sweep remains the untouched backstop
+/// either way, exactly the design doc's "the bus never replaces a sweep; it
+/// races it" invariant.
 pub fn spawn_timer_subscriber(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
     timer_wheel: Arc<TimerWheel>,
     event_bus: Arc<EventBus>,
     thresholds: EnvelopeThresholds,
+    reconcile_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     spawn_supervised("envelope_watch_timer", move || {
         let work_db = Arc::clone(&work_db);
@@ -354,36 +367,71 @@ pub fn spawn_timer_subscriber(
         let event_bus = Arc::clone(&event_bus);
         async move {
             let mut subscription = event_bus.subscribe(TopicFilter::kind(EventKind::Timer));
-            schedule_envelope_deadlines(&work_db, &live_states, &timer_wheel, &thresholds);
-            while let Some(event) = subscription.recv().await {
-                let Event::Timer { deadline_id } = event else {
-                    continue;
-                };
-                handle_timer_deadline(&work_db, &live_states, &thresholds, &deadline_id);
+            // Ids currently holding a live timer-wheel deadline, tracked
+            // across reconcile passes so a slot that leaves `Working`
+            // (completes, errors, is reaped) gets its deadline actively
+            // cancelled instead of sitting in the wheel until it fires —
+            // otherwise deadlines would grow unbounded for the process
+            // lifetime once scheduling runs continuously.
+            let mut scheduled_ids: HashSet<String> = HashSet::new();
+            reconcile_envelope_deadlines(&work_db, &live_states, &timer_wheel, &thresholds, &mut scheduled_ids);
+
+            let mut reconcile_tick = tokio::time::interval(reconcile_interval);
+            reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; the reconcile pass above
+            // already covered that instant, so consume it without redoing
+            // the work.
+            reconcile_tick.tick().await;
+
+            loop {
+                tokio::select! {
+                    event = subscription.recv() => {
+                        let Some(event) = event else { break };
+                        let Event::Timer { deadline_id } = event else {
+                            continue;
+                        };
+                        scheduled_ids.remove(&deadline_id);
+                        handle_timer_deadline(&work_db, &live_states, &thresholds, &deadline_id);
+                    }
+                    _ = reconcile_tick.tick() => {
+                        reconcile_envelope_deadlines(&work_db, &live_states, &timer_wheel, &thresholds, &mut scheduled_ids);
+                    }
+                }
             }
         }
     })
 }
 
-/// Schedule a timer-wheel deadline — keyed by execution id — for every
-/// currently-live `Working` slot whose work item has an envelope, timed to
-/// elapse when that execution's envelope does. Slots with no envelope, no
+/// Reconcile the timer-wheel against currently-live worker state: schedule
+/// (or reschedule — idempotent, see [`TimerWheel::schedule_after`]) a
+/// deadline for every currently-live `Working` slot whose work item has an
+/// envelope, timed to elapse when that execution's envelope does, and cancel
+/// the deadline for any id in `scheduled_ids` that is no longer a candidate
+/// (finished, reaped, or its slot otherwise left `Working`) so the wheel
+/// never accumulates deadlines for executions that are done. `scheduled_ids`
+/// is updated in place to the new live set. Slots with no envelope, no
 /// `started_at`, or that are already terminal are skipped exactly like
 /// [`evaluate_slot`] would skip them; there's nothing to schedule for a slot
 /// that will never signal.
-fn schedule_envelope_deadlines(
+fn reconcile_envelope_deadlines(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     timer_wheel: &TimerWheel,
     thresholds: &EnvelopeThresholds,
+    scheduled_ids: &mut HashSet<String>,
 ) {
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let mut current_ids: HashSet<String> = HashSet::new();
     for state in live_states.snapshot() {
         if state.activity != WorkerActivity::Working {
             continue;
         }
         let execution_id = state.run_id.clone();
-        let Ok(execution) = work_db.get_execution(&execution_id) else {
+        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+            work_db,
+            &execution_id,
+            "envelope-watch: failed to look up execution; not scheduling deadline",
+        ) else {
             continue;
         };
         if execution.status.is_terminal() {
@@ -400,8 +448,14 @@ fn schedule_envelope_deadlines(
         };
         let elapsed_secs = (now - started_epoch).max(0);
         let remaining_secs = (envelope_secs - elapsed_secs).max(0) as u64;
-        timer_wheel.schedule_after(execution_id, Duration::from_secs(remaining_secs));
+        timer_wheel.schedule_after(execution_id.clone(), Duration::from_secs(remaining_secs));
+        current_ids.insert(execution_id);
     }
+
+    for stale_id in scheduled_ids.difference(&current_ids) {
+        timer_wheel.cancel(stale_id);
+    }
+    *scheduled_ids = current_ids;
 }
 
 /// Handle one `Timer{deadline_id}` event from [`schedule_envelope_deadlines`]:
@@ -795,6 +849,7 @@ mod tests {
             timer_wheel.clone(),
             event_bus.clone(),
             EnvelopeThresholds::default(),
+            DEFAULT_RECONCILE_INTERVAL,
         );
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -819,5 +874,59 @@ mod tests {
         );
         assert_eq!(outcome.already_signaled, 1);
         assert_eq!(overrun_items(&db, &execution_id), 1, "still exactly one overrun item");
+    }
+
+    /// The steady-state gap the high-severity finding identified: a slot
+    /// that starts `Working` *after* the subscriber's initial reconcile
+    /// pass — the overwhelming majority of executions in a long-running
+    /// engine — must still get a timer-wheel deadline, via the periodic
+    /// `reconcile_interval` tick, without waiting for a subscriber restart.
+    /// This spawns the subscriber against an EMPTY registry (so its initial
+    /// pass schedules nothing), then registers an over-envelope slot and
+    /// asserts the fast path still files the overrun item, well inside the
+    /// 60s sweep's own interval.
+    #[tokio::test]
+    async fn timer_subscriber_schedules_slots_that_start_after_initial_reconcile() {
+        let (_dir, db) = crate::test_support::open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "oversize chore");
+        set_effort(&db, &work_item_id, EffortLevel::Small); // 15 min envelope
+        let execution_id = create_execution_started_secs_ago(&db, &work_item_id, 20 * 60);
+
+        // Empty at subscribe time: the initial reconcile pass has nothing
+        // to schedule.
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+
+        let event_bus = Arc::new(EventBus::new());
+        let timer_wheel = Arc::new(TimerWheel::spawn(event_bus.clone()));
+
+        // A short reconcile interval so the test doesn't wait out a
+        // production-sized floor.
+        let _subscriber_handle = spawn_timer_subscriber(
+            db.clone(),
+            live_states.clone(),
+            timer_wheel.clone(),
+            event_bus.clone(),
+            EnvelopeThresholds::default(),
+            Duration::from_millis(20),
+        );
+
+        // The slot starts working only now — after the subscriber's
+        // one-shot initial scheduling pass already ran.
+        register_working_slot(&live_states, 1, &execution_id, &work_item_id);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while overrun_items(&db, &execution_id) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("periodic reconcile must schedule and fire a deadline for the post-boot slot");
+
+        assert_eq!(
+            overrun_items(&db, &execution_id),
+            1,
+            "exactly one overrun item from the reconciled timer path"
+        );
     }
 }
