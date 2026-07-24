@@ -1985,7 +1985,11 @@ async fn live_status_debug(socket_path: &Option<String>, json: bool) -> Result<(
 
 fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
     println!("live-status pipeline debug");
-    println!("  engine_build_sha:           {}", report.engine_build_sha);
+    println!(
+        "  engine_build_sha:           {}{}",
+        report.engine_build_sha,
+        if report.engine_build_dirty { " (dirty)" } else { "" },
+    );
     println!("  engine_build_time:          {}", report.engine_build_time);
     println!("  engine_binary_fingerprint:  {}", report.engine_binary_fingerprint,);
     println!("  engine_process_started_at:  {}", report.engine_process_started_at,);

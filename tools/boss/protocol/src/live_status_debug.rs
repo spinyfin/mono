@@ -23,13 +23,22 @@ use serde::{Deserialize, Serialize};
 /// user's machine was stale relative to a recently-merged PR.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveStatusDebugReport {
-    /// Short git SHA (or `unknown`) of the engine binary, baked in
-    /// at compile time. Compare against the most recent commit on
-    /// the branch the engine was rebuilt from to detect a stale
-    /// binary.
+    /// Full git commit sha (or `unknown`) of the engine binary, baked
+    /// in at compile time — long enough to feed directly to
+    /// `git merge-base --is-ancestor <sha> main` to check whether the
+    /// running engine contains a given fix.
     pub engine_build_sha: String,
-    /// ISO-8601 UTC timestamp the engine binary was built at, baked
-    /// in at compile time.
+    /// `true` if `engine_build_sha` was built from a working tree with
+    /// uncommitted changes (or, in a jj workspace, unresolved conflicts
+    /// on the built commit). `false` for a clean build, and for a Cargo
+    /// (non-Bazel) build where provenance isn't stamped at all.
+    pub engine_build_dirty: bool,
+    /// ISO-8601 UTC timestamp of the build that last produced this
+    /// commit's provenance stamp, baked in at compile time. Bazel does
+    /// not re-run the stamping action just because wall-clock time
+    /// passed, so this may lag behind a later rebuild of the *same*
+    /// commit — use `engine_binary_fingerprint` to tell two builds of
+    /// the same commit apart.
     pub engine_build_time: String,
     /// Runtime fingerprint of the engine binary's on-disk content
     /// (short SHA-256 of `current_exe()` bytes). Survives a bazel
@@ -223,6 +232,7 @@ mod tests {
     fn report_round_trips_through_serde() {
         let original = LiveStatusDebugReport {
             engine_build_sha: "abc1234".into(),
+            engine_build_dirty: false,
             engine_build_time: "2026-05-11T20:00:00Z".into(),
             engine_binary_fingerprint: "ffeedd00".into(),
             engine_process_started_at: "2026-05-12T06:45:38Z".into(),
@@ -275,6 +285,7 @@ mod tests {
         // rename them.
         let report = LiveStatusDebugReport {
             engine_build_sha: "deadbeef".into(),
+            engine_build_dirty: false,
             engine_build_time: "2026-05-11T20:00:00Z".into(),
             engine_binary_fingerprint: "cafebabe".into(),
             engine_process_started_at: "2026-05-11T20:00:00Z".into(),
@@ -286,6 +297,7 @@ mod tests {
         };
         let text = serde_json::to_string(&report).unwrap();
         assert!(text.contains("\"engine_build_sha\":\"deadbeef\""), "{text}");
+        assert!(text.contains("\"engine_build_dirty\":false"), "{text}");
         assert!(text.contains("\"engine_binary_fingerprint\":\"cafebabe\""), "{text}");
         assert!(
             text.contains("\"engine_process_started_at\":\"2026-05-11T20:00:00Z\""),
@@ -340,6 +352,7 @@ mod tests {
         // command the chore brief calls out.
         let full = LiveStatusDebugReport {
             engine_build_sha: "deadbeef".into(),
+            engine_build_dirty: false,
             engine_build_time: "2026-05-12T20:00:00Z".into(),
             engine_binary_fingerprint: "cafebabe".into(),
             engine_process_started_at: "2026-05-12T20:00:00Z".into(),

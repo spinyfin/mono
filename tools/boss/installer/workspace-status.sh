@@ -12,6 +12,40 @@ set -euo pipefail
 
 SHA=$(jj log --no-graph -r @ -T 'commit_id.short(7)' 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
+# Full (unabbreviated) commit sha, for `engine::build_provenance` — long
+# enough to feed straight to `git merge-base --is-ancestor <sha> main`
+# without any abbreviation-collision risk. $SHA (short) above stays as-is;
+# it's embedded in the .pkg filename and callers of that are unaffected.
+FULL_SHA=$(jj log --no-graph -r @ -T 'commit_id' 2>/dev/null || git rev-parse HEAD 2>/dev/null || echo "unknown")
+
+# Working-tree dirty flag for `engine::build_provenance`.
+#   - jj workspace: jj auto-snapshots every file edit into `@` on every jj
+#     invocation, so there is no git-style "uncommitted changes" state to
+#     detect; the one genuinely-broken build state jj can be in is `@`
+#     carrying unresolved conflicts, so that's what "dirty" means here.
+#   - plain git checkout: the standard uncommitted-changes (tracked or
+#     untracked) signal via `git status --porcelain`.
+if [ -d ".jj" ]; then
+    if [ "$(jj log --no-graph -r @ -T 'if(conflict, "true", "false")' 2>/dev/null)" = "true" ]; then
+        DIRTY=true
+    else
+        DIRTY=false
+    fi
+else
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        DIRTY=true
+    else
+        DIRTY=false
+    fi
+fi
+
+# Build wall-clock time. Deliberately NOT written to stable-status.txt (see
+# the build_info_rs note below) — it goes to volatile-status.txt instead,
+# which Bazel already regenerates on every build without that forcing a
+# rebuild of unrelated actions; only `build_provenance_rs` (a dedicated,
+# intentionally-small genrule/crate — see its own doc comment) reads it.
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
 # Compute a semantic version string from git tags (boss-v* prefix).
 # Release build (exact tag match): boss-v1.0.4 → "1.0.4"
 # Dev build (commits past tag):    boss-v1.0.4-16-gf3be785 → "1.0.4-dev-<SHA>"
@@ -57,6 +91,7 @@ fi
 #   - boss_short_version_plist: STABLE_BOSS_VERSION / STABLE_BOSS_BASE_VERSION
 #   - boss_pkg_unsigned:        STABLE_BOSS_GIT_SHA (embedded in the .pkg filename)
 #   - build_info_rs:            STABLE_BOSS_BASE_VERSION only
+#   - build_provenance_rs:      STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY
 #
 # IMPORTANT: do not add a per-build or per-commit value (wall-clock time, full
 # git SHA, dev-suffixed version) to anything build_info_rs reads. That file is
@@ -67,10 +102,26 @@ fi
 # full version remain here solely for the terminal packaging actions above,
 # which are cheap and do not recompile Rust. (A wall-clock STABLE_BOSS_BUILD_TIME
 # used to live here; it was the prime offender and has been removed.)
+#
+# STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY are read ONLY by
+# `build_provenance_rs`, which stamps its own dedicated, single-purpose
+# `boss-build-provenance` crate — never `build_info_rs`/engine_lib directly.
+# That keeps the stamping logically separate from engine_lib's own source,
+# but does NOT protect engine_lib's action cache the way build_info_rs's
+# byte-stable output does: engine_lib still recompiles whenever the commit
+# sha changes, because engine_lib depends on this crate's compiled output.
+# See that crate's own doc comment for the verified detail.
 echo "STABLE_BOSS_VERSION $BOSS_VERSION"
 echo "STABLE_BOSS_BASE_VERSION $BOSS_BASE_VERSION"
 echo "STABLE_BOSS_GIT_SHA $SHA"
+echo "STABLE_BOSS_GIT_SHA_FULL $FULL_SHA"
+echo "STABLE_BOSS_GIT_DIRTY $DIRTY"
 
 # Goes to volatile-status.txt — not used for version stamping but kept for
 # build tooling compatibility.
 echo "BUILD_EMBED_LABEL $BOSS_BASE_VERSION"
+
+# Goes to volatile-status.txt. Read ONLY by `build_provenance_rs`'s tiny,
+# dedicated crate (see above) — regenerating on every build is expected and
+# does not force a recompile of anything else.
+echo "BOSS_BUILD_TIME $BUILD_TIME"

@@ -1563,40 +1563,51 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        // AI #6 running-status gate (incident 001 §5): in Claude Code
-        // the `Stop` hook fires after every assistant turn, not just
-        // at worker exit. With no staged URL on a still-`running`
-        // execution we MUST NOT fall through to `detect_pr` — the
-        // worker is alive and any positive result would race against
-        // its own in-flight push.
-        //
-        // Note: `waiting_human` is set immediately at pane spawn
-        // (PaneSpawnRunner), NOT at worker exit — the worker is still
-        // actively running turns when in `waiting_human`. This gate
-        // is useful only as a coarse filter: `running` executions are
-        // between their start_execution_run and finish_execution_run
-        // calls and are guaranteed not to be pane-based workers.
-        if execution.status != ExecutionStatus::WaitingHuman {
-            tracing::debug!(
-                execution_id,
-                status = %execution.status,
-                "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
-            );
-            return StopOutcome::RunningNoStagedPr;
-        }
-
-        // Worker escalation/blocker detection (incident 2026-07-02,
-        // exec_18b5243e65ff188_2d / T2085): a worker that emitted an
-        // `[effort-escalation]` or `[blocked]` marker on this genuinely-
-        // terminal Stop gets an attention item filed for the coordinator
-        // *before* any nudge decision below is made — `nudge_or_park`
+        // Worker escalation/blocker detection: a worker that emitted an
+        // `[effort-escalation]` or `[blocked]` marker on this Stop gets
+        // an attention item filed for the coordinator *before* any
+        // status-gate or nudge decision below is made — `nudge_or_park`
         // consults the same store and suppresses the "produce a PR" loop
         // while the item is unresolved. Best-effort: filing failures are
-        // logged and swallowed, never block completion.
+        // logged loudly (see `file_worker_signal_attention`) and
+        // swallowed, never block completion.
+        //
+        // Deliberately runs BEFORE the running-status gate below: a pane
+        // worker's Stop can land while `execution.status` is still
+        // `running` rather than `waiting_human` — the coordinator flips
+        // it to `waiting_human` only after `PaneSpawnRunner::run_execution`
+        // returns from its spawn-ack round trip, but the pane (and the
+        // claude process inside it) is already live and can emit its
+        // first Stop before that round trip resolves. `running` and
+        // `waiting_human` are the two `ExecutionStatus::is_live()`
+        // values a pane-based worker can hold at Stop; detection must
+        // cover both so a marker emitted in that narrow startup window
+        // isn't silently missed. Marker detection itself never touches
+        // PR state, so running it ahead of the gate carries none of the
+        // race the gate below guards against.
         self.detect_and_file_worker_signals(&execution).await;
 
-        // Flunge T308 (exec_18c1c0a92f0bda38_570, 2026-07-13): a probe
-        // minted on an earlier Stop can still be sitting undelivered in
+        // Deferred-scope detection: a worker that deliberately narrowed
+        // its task's scope and declared it via a `[deferred-scope]`
+        // marker gets that recorded durably — both on the work item's
+        // own description and as a coordinator-visible attention item —
+        // so the deferral is a tracked decision
+        // rather than a prose sentence that dies with the transcript. Unlike
+        // the escalation/blocker pair above, this never suppresses the
+        // "produce a PR" nudge: the worker already produced its (narrower)
+        // deliverable.
+        //
+        // Runs BEFORE the running-status gate below for the same reason
+        // `detect_and_file_worker_signals` does: it only reads the
+        // transcript and records an attention item, never touches PR
+        // state, so a `[deferred-scope]` marker emitted while `running`
+        // (the same narrow pane-startup window, or for the whole
+        // lifetime of a `pr_review` reviewer pane) is still captured
+        // instead of being silently dropped — and unlike `[blocked]`,
+        // a deferred-scope marker is never re-emitted on a later Stop.
+        self.detect_and_record_deferred_scope(&execution).await;
+
+        // A probe minted on an earlier Stop can still be sitting undelivered in
         // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
         // `SendToPane` failed and was requeued for retry on the next
         // Stop). `dispatch_probe_on_stop` pops whatever is queued for a
@@ -1611,16 +1622,34 @@ impl WorkerCompletionHandler {
             self.probe_queuer.clear_pending_probes(execution_id);
         }
 
-        // Deferred-scope detection (T222/PR #765, recovered as Flunge T254):
-        // a worker that deliberately narrowed its task's scope and declared
-        // it via a `[deferred-scope]` marker gets that recorded durably —
-        // both on the work item's own description and as a coordinator-
-        // visible attention item — so the deferral is a tracked decision
-        // rather than a prose sentence that dies with the transcript. Unlike
-        // the escalation/blocker pair above, this never suppresses the
-        // "produce a PR" nudge: the worker already produced its (narrower)
-        // deliverable.
-        self.detect_and_record_deferred_scope(&execution).await;
+        // AI #6 running-status gate (incident 001 §5): in Claude Code
+        // the `Stop` hook fires after every assistant turn, not just
+        // at worker exit. With no staged URL on a still-`running`
+        // execution we MUST NOT fall through to `detect_pr` — the
+        // worker is alive and any positive result would race against
+        // its own in-flight push.
+        //
+        // Note: `waiting_human` is set immediately at pane spawn
+        // (PaneSpawnRunner), NOT at worker exit — the worker is still
+        // actively running turns when in `waiting_human`. This gate
+        // is useful only as a coarse filter for the PR-detection
+        // fallthrough below: a worker in `running` (either between its
+        // `start_execution_run`/`finish_execution_run` calls, or a
+        // `pr_review` reviewer pane, which the design deliberately keeps
+        // in `running` — see `RunWaitState::ReviewerPaneAlive`) never
+        // falls through to `detect_pr`/the nudge loop. Marker detection
+        // above already ran regardless of this gate, so a `[blocked]` or
+        // `[deferred-scope]` signal from a `running` worker is still filed
+        // and visible to the coordinator even though this Stop parks here
+        // as a no-op.
+        if execution.status != ExecutionStatus::WaitingHuman {
+            tracing::debug!(
+                execution_id,
+                status = %execution.status,
+                "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
+            );
+            return StopOutcome::RunningNoStagedPr;
+        }
 
         // Resume-bounce SHA-delta gate: when the chore already has a
         // PR bound to it (`task.pr_url` populated by an earlier run's
@@ -5115,10 +5144,24 @@ status is otherwise left unchanged for re-dispatch or manual review."
                 }
             }
             Err(err) => {
-                tracing::warn!(
+                // Loud on purpose: a worker's `[blocked]` marker was correctly recognized and
+                // parsed, but the attention item never landed and the
+                // failure sat at `warn` — invisible enough that root-causing
+                // the missed suppression cost a full trace reconstruction.
+                // A recognized-but-unfiled marker means the auto-nudge loop
+                // will NOT be suppressed even though the worker did the
+                // right thing and asked for help; that is exactly the
+                // failure mode this whole module exists to prevent, so it
+                // gets `error` + an unmistakable prefix instead of a `warn`
+                // easily lost in routine log volume.
+                tracing::error!(
                     execution_id = %execution.id,
+                    kind,
+                    marker_line = %signal.marker_line,
                     ?err,
-                    "worker escalation: failed to file attention item; signal will not block nudges",
+                    "[engine-reconcile] worker escalation: RECOGNIZED marker failed to file as an \
+                     attention item — the auto-nudge loop will NOT be suppressed for this execution; \
+                     the marker is otherwise lost until a human reads the transcript by hand",
                 );
             }
         }
@@ -10747,9 +10790,72 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     #[tokio::test]
+    async fn blocked_marker_files_attention_even_while_execution_still_running() {
+        // A worker can emit the sanctioned `[blocked]` marker while
+        // `execution.status` is still `running` — briefly between
+        // `start_execution_run` and the coordinator's post-spawn-ack flip
+        // to `waiting_human`, and unconditionally for a `pr_review`
+        // reviewer pane (`RunWaitState::ReviewerPaneAlive` keeps it in
+        // `running` for the pane's whole lifetime, by design). A
+        // `[blocked]` marker emitted in either state must still be filed as
+        // an attention item; it must not sit behind the `waiting_human`-only
+        // gate that used to skip `detect_and_file_worker_signals` entirely
+        // for any execution not in exactly that one status.
+        let workspace = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Detect worker stop while running");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let (execution, _run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Running,
+            "fixture must leave the execution in `running` — the state under test",
+        );
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution.id,
+            "[blocked] reason=\"design doc marks this deferred; need coordinator confirmation before pulling it into scope\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+
+        let outcome = handler.on_stop(&execution.id).await;
+        assert!(
+            matches!(outcome, StopOutcome::RunningNoStagedPr),
+            "a `running` execution still falls through the PR-detection gate as a no-op; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no produce-a-PR nudge may be queued for a running execution",
+        );
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .count(),
+            1,
+            "the [blocked] marker must be filed as an attention item even though \
+             `execution.status` is `running`, not `waiting_human`; got {items:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn blocked_marker_on_first_stop_clears_any_stale_queued_probe() {
-        // Flunge T308 (exec_18c1c0a92f0bda38_570, 2026-07-13): the
-        // completion handler correctly refuses to *queue a new*
+        // The completion handler correctly refuses to *queue a new*
         // produce-a-PR nudge once `[blocked]` is detected (the case
         // above), but `dispatch_probe_on_stop` in the real event loop
         // pops and delivers whatever is already sitting in the run's
@@ -11149,9 +11255,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     // -----------------------------------------------------------
-    // Deferred-scope declaration (Flunge T254, root-caused to T222/PR #765):
-    // a worker that emits a `[deferred-scope]` marker must get a durable
-    // audit line on the work item's description AND a coordinator-visible
+    // Deferred-scope declaration: a worker that emits a `[deferred-scope]`
+    // marker must get a durable audit line on the work item's description
+    // AND a coordinator-visible
     // attention item — but, unlike escalation/blocker markers, must NOT
     // suppress the "produce a PR" nudge: the worker already produced its
     // (narrower) deliverable.

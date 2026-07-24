@@ -85,7 +85,12 @@ def _boss_pkg_unsigned_impl(ctx):
     # install time on the target machine.
     command = (
         "set -euo pipefail\n" +
-        "SHA=$(grep STABLE_BOSS_GIT_SHA " + info_file.path +
+        # Anchored on '^STABLE_BOSS_GIT_SHA ' (trailing space) so this does not
+        # also match the STABLE_BOSS_GIT_SHA_FULL line below it — an
+        # unanchored grep would return both lines, giving $SHA an embedded
+        # newline that word-splits the unquoted Boss-${SHA}.pkg argument
+        # further down and breaks productbuild's argv.
+        "SHA=$(grep '^STABLE_BOSS_GIT_SHA ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
         # Step 1: component package (intermediate; named to match distribution.xml pkg-ref)
@@ -181,7 +186,7 @@ def _build_info_rs_impl(ctx):
     # Info.plist by boss_short_version_plist. So nothing of value is lost here.
     command = (
         "set -euo pipefail\n" +
-        "VERSION=$(grep STABLE_BOSS_BASE_VERSION " + info_file.path +
+        "VERSION=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
         "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
@@ -224,10 +229,91 @@ when a new boss-v* release tag is cut, so this file stays byte-stable across
 commits and the crates that compile it in keep hitting the Bazel action cache.
 
 BOSS_GIT_SHA and BOSS_BUILD_TIME are emitted as the literal "unknown" on purpose:
-stamping per-commit / per-build values here forced a full recompile of engine_lib
-on every CI build. The reliable runtime build identity is
+stamping per-commit / per-build values directly into this file — which is
+`include!`d straight into engine_lib's own source — forced a full recompile of
+engine_lib on every CI build. The reliable runtime build identity is
 engine::build_info::binary_fingerprint(); the user-facing release version is
-stamped separately into Info.plist by boss_short_version_plist.
+stamped separately into Info.plist by boss_short_version_plist. The real,
+checkable build sha/dirty/build-time DO get stamped — see `build_provenance_rs`
+below, which stamps them into a separate, dedicated crate instead of here for
+logical separation. NOTE: that separate crate does NOT achieve the same cache
+isolation this file achieves — engine_lib still recompiles on every commit
+because of it; see `build_provenance_rs`'s own doc comment below.
+""",
+)
+
+# ── build_provenance_rs ───────────────────────────────────────────────────────
+
+def _build_provenance_rs_impl(ctx):
+    """Emits a Rust source file with the real build sha/dirty/build-time."""
+    output = ctx.actions.declare_file(ctx.attr.out)
+
+    # ctx.info_file (stable-status.txt) carries the commit-derived facts;
+    # ctx.version_file (volatile-status.txt) carries the wall-clock build
+    # time, which Bazel already regenerates on every build regardless of
+    # what else changed. Both are read here — and ONLY here, never by
+    # build_info_rs above — so this per-commit/per-build stamping stays out
+    # of engine_lib's own source and lives in its own small, dedicated
+    # crate (`boss-build-provenance`) instead. NOTE: that crate boundary is
+    # for logical separation only — it does NOT protect engine_lib's Bazel
+    # action cache; engine_lib still recompiles whenever the commit sha
+    # changes. See that crate's own doc comment for the verified detail,
+    # and the `LiveStatusDebugReport.engine_build_sha` doc comment for how
+    # this is surfaced to an operator.
+    command = (
+        "set -euo pipefail\n" +
+        "SHA=$(grep '^STABLE_BOSS_GIT_SHA_FULL ' " + ctx.info_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "[ -z \"$SHA\" ] && SHA=unknown\n" +
+        "DIRTY=$(grep '^STABLE_BOSS_GIT_DIRTY ' " + ctx.info_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "[ \"$DIRTY\" = \"true\" ] && DIRTY=true || DIRTY=false\n" +
+        "BUILD_TIME=$(grep '^BOSS_BUILD_TIME ' " + ctx.version_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n" +
+        "printf 'pub const GIT_SHA: &str = \"%s\";\\n" +
+        "pub const GIT_DIRTY: bool = %s;\\n" +
+        "pub const BUILD_TIME: &str = \"%s\";\\n' " +
+        "\"$SHA\" \"$DIRTY\" \"$BUILD_TIME\" > " + output.path + "\n"
+    )
+
+    ctx.actions.run_shell(
+        inputs = [ctx.info_file, ctx.version_file],
+        outputs = [output],
+        command = command,
+        mnemonic = "BuildProvenanceRs",
+        progress_message = "Generating build_provenance_generated.rs",
+    )
+
+    return [DefaultInfo(files = depset([output]))]
+
+build_provenance_rs = rule(
+    implementation = _build_provenance_rs_impl,
+    attrs = {
+        "out": attr.string(
+            mandatory = True,
+            doc = "Output filename for the generated Rust source file.",
+        ),
+    },
+    doc = """
+Generates a Rust source file containing the engine's real build provenance.
+
+Emits:
+  pub const GIT_SHA: &str = "<full commit sha>";
+  pub const GIT_DIRTY: bool = <true|false>;
+  pub const BUILD_TIME: &str = "<ISO-8601 UTC>";
+
+Unlike `build_info_rs` (which deliberately stamps "unknown" for these same
+concepts to protect engine_lib's compile cache), this rule feeds a dedicated,
+otherwise-empty `boss-build-provenance` crate — see that crate's BUILD.bazel
+and doc comment. This keeps the per-commit/per-build stamping logically
+separate from engine_lib's own source, but it does NOT protect engine_lib's
+Bazel action cache: engine_lib still recompiles whenever the commit sha
+changes, because rustc's compiled interface (`.rmeta`) for this crate's
+trivial getter functions embeds the constant values they return. Verified
+empirically (build twice with only the commit sha changed; `engine_lib`
+recompiles both times, with `pipelined_compilation` enabled). See that
+crate's own doc comment for detail.
 """,
 )
 
@@ -249,9 +335,9 @@ def _boss_short_version_plist_impl(ctx):
     # version string. When not stamped, fallbacks are "0.0.0" / "dev" respectively.
     command = (
         "set -euo pipefail\n" +
-        "V=$(grep STABLE_BOSS_VERSION " + info_file.path +
+        "V=$(grep '^STABLE_BOSS_VERSION ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "B=$(grep STABLE_BOSS_BASE_VERSION " + info_file.path +
+        "B=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$V\" ] && V=dev\n" +
         "[ -z \"$B\" ] && B=0.0.0\n" +

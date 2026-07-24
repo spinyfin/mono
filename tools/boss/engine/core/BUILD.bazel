@@ -37,6 +37,7 @@ rust_library(
     ],
     deps = [
         "//lib/rust/git_utils",
+        "//tools/boss/build-provenance",
         "//tools/boss/claude_client",
         "//tools/boss/engine/automation-dedup",
         "//tools/boss/engine/automation-schedule",

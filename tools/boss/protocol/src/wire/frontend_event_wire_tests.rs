@@ -260,6 +260,7 @@ fn automation_run() -> AutomationRun {
 fn live_status_debug_report() -> crate::LiveStatusDebugReport {
     crate::LiveStatusDebugReport {
         engine_build_sha: "abc123".into(),
+        engine_build_dirty: false,
         engine_build_time: "2026-01-01T00:00:00Z".into(),
         engine_binary_fingerprint: "def456".into(),
         engine_process_started_at: "2026-01-01T00:00:00Z".into(),

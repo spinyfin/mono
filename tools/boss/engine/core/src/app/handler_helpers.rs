@@ -306,6 +306,7 @@ pub(super) fn build_live_status_debug_report(
 
     LiveStatusDebugReport {
         engine_build_sha: crate::build_info::git_sha().to_owned(),
+        engine_build_dirty: crate::build_info::git_dirty(),
         engine_build_time: crate::build_info::build_time().to_owned(),
         engine_binary_fingerprint: crate::build_info::binary_fingerprint().to_owned(),
         engine_process_started_at: crate::build_info::process_started_at().to_owned(),
