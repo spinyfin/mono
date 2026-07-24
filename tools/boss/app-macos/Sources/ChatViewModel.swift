@@ -16,7 +16,9 @@ final class ChatViewModel: ObservableObject {
     /// work-tree merges) still resolve when a product was archived in
     /// another session; surfaces that let the user *select* a product
     /// should read [[activeProducts]] instead.
-    @Published var products: [WorkProduct] = []
+    @Published var products: [WorkProduct] = [] {
+        didSet { invalidateWorkCache() }
+    }
 
     /// Non-archived subset of [[products]], in the same sort order.
     /// This is what the sidebar Product picker, the Designs picker, and
@@ -2151,6 +2153,12 @@ final class ChatViewModel: ObservableObject {
     /// same pattern as `cachedGatingPrereqs`.
     var cachedInReviewRevisionsByParentID: [String: [WorkTask]]?
     var cachedDoneRevisionsByParentID: [String: [WorkTask]]?
+    /// Backing storage for `workBoardRepoMode` (ChatViewModel+BoardHelpers).
+    /// `nil` means "invalidated — rebuild on next read". `WorkBoardRepoMode.compute`
+    /// scans every visible card and used to re-run on each kanban render/scroll
+    /// frame as a top-of-stack main-thread leaf; same pattern as
+    /// `cachedInReviewRevisionsByParentID`.
+    var cachedWorkBoardRepoMode: WorkBoardRepoMode?
 
     func invalidateWorkCache() {
         cachedVisibleItems = nil
@@ -2162,6 +2170,7 @@ final class ChatViewModel: ObservableObject {
         cachedGatingPrereqs = nil
         cachedInReviewRevisionsByParentID = nil
         cachedDoneRevisionsByParentID = nil
+        cachedWorkBoardRepoMode = nil
     }
 
     /// Inline drag-refusal banner shown next to the source card when a
