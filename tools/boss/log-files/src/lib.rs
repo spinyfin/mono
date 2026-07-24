@@ -35,8 +35,9 @@ mod reader;
 mod segments;
 
 pub use paths::{
-    AUDIT_PATH_ENV, ENGINE_AUDIT_FILENAME, ENGINE_TRACE_FILENAME, LogSource, audit_path_override,
-    default_audit_log_path, default_state_root, resolve_log_source_path,
+    AUDIT_PATH_ENV, CONTROL_TOKEN_FILENAME, ENGINE_AUDIT_FILENAME, ENGINE_TRACE_FILENAME, EVENTS_SOCKET_FILENAME,
+    LogSource, STATE_DB_FILENAME, audit_path_override, default_audit_log_path, default_control_token_path,
+    default_events_socket_path, default_state_db_path, default_state_root, resolve_log_source_path,
 };
 pub use reader::{collect_tail_lines, read_file_lines, read_new_content};
 pub use segments::{

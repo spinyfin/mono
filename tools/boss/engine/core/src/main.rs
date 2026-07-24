@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use boss_engine::app;
+use boss_engine::app::{self, DEFAULT_SOCKET_PATH, isolation::IsolationPaths};
 use boss_engine::audit::{self, StartContext};
 use boss_engine::build_info;
 use boss_engine::cli::Cli;
@@ -55,17 +55,51 @@ impl Write for DualLogWriter {
 
 /// Path for the structured-JSON engine trace file consumed by the Activity
 /// Log viewer in the macOS app. Lives alongside other Boss state files.
-fn engine_trace_jsonl_path() -> Option<PathBuf> {
-    Some(boss_log_files::default_state_root()?.join(boss_log_files::ENGINE_TRACE_FILENAME))
+///
+/// A test fixture gets a stem-scoped filename in its own directory. Otherwise
+/// it would take over the canonical `engine-trace.jsonl` name and push the
+/// live engine's stream into a rotated file — the same "fixture writes into
+/// production's state" family as the events-socket steal, just quieter.
+fn engine_trace_jsonl_path(isolation: &IsolationPaths) -> Option<PathBuf> {
+    // The trace log has no env override at all, so production's location is
+    // the only thing this ever resolves to — and a fixture must be moved off it.
+    let production = production_state_file(boss_log_files::ENGINE_TRACE_FILENAME);
+    isolation.scope_if_production(
+        production.clone(),
+        production.as_deref(),
+        boss_log_files::ENGINE_TRACE_FILENAME,
+    )
 }
 
-fn resolve_log_path() -> PathBuf {
-    std::env::var("BOSS_ENGINE_LOG_PATH")
+/// Path for the engine lifecycle audit log. A fixture is moved off
+/// production's file, but a deliberately-set `BOSS_ENGINE_AUDIT_PATH` still
+/// wins — the same rule the events socket follows.
+fn engine_audit_log_path(isolation: &IsolationPaths) -> Option<PathBuf> {
+    let production = production_state_file(boss_log_files::ENGINE_AUDIT_FILENAME);
+    isolation.scope_if_production(
+        boss_log_files::default_audit_log_path(),
+        production.as_deref(),
+        boss_log_files::ENGINE_AUDIT_FILENAME,
+    )
+}
+
+/// Where production would keep `filename` under its state root, ignoring any
+/// env override. The isolation guard compares against this to tell a
+/// deliberate override apart from an inherited production path.
+fn production_state_file(filename: &str) -> Option<PathBuf> {
+    Some(boss_log_files::default_state_root()?.join(filename))
+}
+
+fn resolve_log_path(isolation: &IsolationPaths) -> PathBuf {
+    let resolved = std::env::var("BOSS_ENGINE_LOG_PATH")
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
+    isolation
+        .scope_if_production(Some(resolved.clone()), Some(Path::new(DEFAULT_LOG_PATH)), "engine.log")
+        .unwrap_or(resolved)
 }
 
 fn open_log_file(path: &Path) -> Result<File> {
@@ -93,7 +127,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let log_path = resolve_log_path();
+    // Parse the CLI before logging is wired up: the socket path decides
+    // whether this process is a test fixture, and a fixture's trace / audit /
+    // text logs must not land on the production engine's files. Clap prints
+    // its own usage errors to stderr, so nothing is lost by parsing first.
+    let cli = Cli::parse();
+    let isolation = IsolationPaths::derive(cli.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH));
+
+    let log_path = resolve_log_path(&isolation);
     let file_writer = match open_log_file(&log_path) {
         Ok(file) => Some(Arc::new(Mutex::new(file))),
         Err(err) => {
@@ -119,7 +160,7 @@ async fn main() -> Result<()> {
     // timestamped backup; a size-based rotation fires mid-run when the
     // threshold is crossed.
     let (trace_max_bytes, trace_max_files) = trace_rotation::trace_rotation_config();
-    let (json_trace_path, json_state_arc) = match engine_trace_jsonl_path() {
+    let (json_trace_path, json_state_arc) = match engine_trace_jsonl_path(&isolation) {
         None => (PathBuf::new(), Arc::new(Mutex::new(None))),
         Some(path) => {
             trace_rotation::rotate_on_startup(&path, trace_max_files);
@@ -153,15 +194,14 @@ async fn main() -> Result<()> {
 
     tracing::info!(log_path = %log_path.display(), "boss-engine logging initialized");
 
-    if let Some(audit_path) = audit::default_audit_log_path() {
+    if let Some(audit_path) = engine_audit_log_path(&isolation) {
         audit::set_audit_path(audit_path);
     }
 
-    audit::record_start(build_start_context());
+    audit::record_start(build_start_context(&isolation));
 
     install_audit_panic_hook();
 
-    let cli = Cli::parse();
     let result = app::run(cli).await;
 
     let reason = match &result {
@@ -173,20 +213,27 @@ async fn main() -> Result<()> {
     result
 }
 
-fn build_start_context() -> StartContext {
+fn build_start_context(isolation: &IsolationPaths) -> StartContext {
     let argv: Vec<String> = std::env::args().collect();
     let parent_command = parent_command_line();
     let engine_version = std::env::var("BOSS_ENGINE_VERSION")
         .ok()
         .or_else(|| option_env!("CARGO_PKG_VERSION").map(|s| s.to_owned()));
-    let state_db_path = std::env::var_os("BOSS_DB_PATH")
-        .map(PathBuf::from)
-        .or_else(default_state_db_path);
+    // Prefer the isolation-derived db path so a fixture's audit `start` row
+    // names the db it actually opened, not production's — otherwise this
+    // record is actively misleading in exactly the forensic scenario the
+    // isolation guard exists for (working out which engine touched which
+    // file after the fact).
+    let state_db_path = isolation.derived.db.clone().or_else(|| {
+        std::env::var_os("BOSS_DB_PATH")
+            .map(PathBuf::from)
+            .or_else(boss_log_files::default_state_db_path)
+    });
     let prior_state_db_size = state_db_path
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    let socket_paths = collect_known_socket_paths();
+    let socket_paths = collect_known_socket_paths(isolation);
     StartContext {
         argv,
         engine_version,
@@ -216,11 +263,7 @@ fn parent_command_line() -> Option<String> {
     if line.is_empty() { None } else { Some(line) }
 }
 
-fn default_state_db_path() -> Option<PathBuf> {
-    Some(boss_log_files::default_state_root()?.join("state.db"))
-}
-
-fn collect_known_socket_paths() -> Vec<PathBuf> {
+fn collect_known_socket_paths(isolation: &IsolationPaths) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     // Frontend socket: BOSS_SOCKET_PATH overrides the default; the
     // engine itself reads `cli.socket_path`, but the env mirrors the
@@ -228,13 +271,24 @@ fn collect_known_socket_paths() -> Vec<PathBuf> {
     if let Some(p) = std::env::var_os("BOSS_SOCKET_PATH") {
         paths.push(PathBuf::from(p));
     } else {
-        paths.push(PathBuf::from("/tmp/boss-engine.sock"));
+        paths.push(PathBuf::from(DEFAULT_SOCKET_PATH));
     }
 
-    if let Some(p) = std::env::var_os("BOSS_EVENTS_SOCKET") {
-        paths.push(PathBuf::from(p));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join("Library/Application Support/Boss/events.sock"));
+    // Prefer the isolation-derived events socket so a fixture's audit record
+    // names the socket it actually bound, not production's (this resolver
+    // re-reads $BOSS_EVENTS_SOCKET, which a fixture pane inherits pointed at
+    // production). Falls back to that env/production resolution only for a
+    // production start, where it's correct by definition.
+    let events_socket = isolation
+        .derived
+        .events_socket
+        .clone()
+        .unwrap_or_else(boss_engine::runner::engine_events_socket_path);
+    // `engine_events_socket_path` returns `PathBuf::default()` (empty) when
+    // HOME is unset and no override is set; pushing that would record an
+    // empty path in the audit log instead of nothing at all.
+    if !events_socket.as_os_str().is_empty() {
+        paths.push(events_socket);
     }
 
     paths

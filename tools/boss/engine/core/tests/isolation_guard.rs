@@ -3,30 +3,49 @@
 //! Issue from 2026-05-24: a Swift XCTest spawned an additional Rust engine
 //! binary alongside the live production engine. Because only `--socket-path`
 //! was overridden, the test engine silently bound to the *production*
-//! `events.sock`, DB, and pid file — causing corrupted state on T651.
+//! `events.sock`, DB, and pid file — corrupting the live engine's state
+//! (see #756).
 //!
-//! The fix: when `--socket-path` is non-default, `run_server` derives
-//! isolated paths for `BOSS_EVENTS_SOCKET`, `BOSS_DB_PATH`, and
-//! `BOSS_ENGINE_PID_PATH` from the socket's directory + stem.  This module
-//! validates that derivation and the resulting isolation at the `serve()` level.
+//! The fix: when `--socket-path` is non-default, `IsolationPaths::derive`
+//! derives isolated paths for the DB, events socket, pid file, and
+//! engine-control token from the socket's directory + stem, and
+//! `ensure_isolated` refuses to start if any resolved path still lands on
+//! production.
 //!
 //! Issue from 2026-07: the engine-control token was resolved via
 //! `default_token_path()` entirely outside this isolation machinery, so a
 //! worker-launched fixture engine wrote — and then, on its own shutdown,
 //! deleted — the production control token. The token is now derived
-//! alongside pid/db/events-socket (see the `token_*` tests below), and
-//! `write_token_file` independently refuses to clobber a token still owned
-//! by a live engine (see `fixture_cannot_overwrite_live_production_token`)
+//! alongside pid/db/events-socket (see the `token` tests below), and
+//! `write_token_file` independently refuses to clobber a token still owned by
+//! a live engine (see `fixture_cannot_overwrite_or_delete_live_production_token`)
 //! as defense in depth for the case where derivation is bypassed or
 //! misconfigured.
+//!
+//! ## What this file used to *not* test
+//!
+//! Until 2026-07-23 every test here handed explicit paths straight to
+//! `serve()` and asserted those explicit paths differed — i.e. it tested that
+//! `serve` uses its arguments. `IsolationPaths::derive` was never called, so
+//! the derivation shipped with zero coverage on any field, and the
+//! stand-down-on-any-override bug survived into a production outage: a fixture
+//! launched from inside a worker pane inherited `BOSS_EVENTS_SOCKET` pointing
+//! at production, the guard read that as operator intent, and the fixture
+//! unlinked and rebound the live engine's socket.
+//!
+//! The `derive` section below closes that gap at the integration boundary;
+//! `app::isolation`'s own unit tests cover the derivation matrix exhaustively.
 
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
+use boss_engine::app::isolation::{
+    DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH, EnginePaths, IsolationOverrides, IsolationPaths,
+};
 use boss_engine::app::{process_is_alive, run, serve};
 use boss_engine::cli::Cli;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
@@ -88,7 +107,119 @@ impl Drop for TestEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests — IsolationPaths derivation (no engine started)
+// IsolationPaths derivation (no engine started)
+// ---------------------------------------------------------------------------
+
+const FIXTURE_SOCKET: &str = "/tmp/boss-test-guard-1234.sock";
+
+/// A model of the production engine's paths that does not depend on the
+/// harness's real `$HOME` (the bazel sandbox pins it to `/tmp`).
+fn production() -> EnginePaths {
+    EnginePaths::under_state_root(
+        Path::new("/Users/tester/Library/Application Support/Boss"),
+        Path::new(DEFAULT_PID_PATH),
+    )
+}
+
+fn derive(overrides: IsolationOverrides) -> IsolationPaths {
+    IsolationPaths::derive_from(FIXTURE_SOCKET, &overrides, &production())
+}
+
+/// The four paths the fixture socket above derives when nothing stands in
+/// its way. The control token is included, which the pre-2026-07-23 guard
+/// resolved outside itself and therefore clobbered.
+fn all_derived() -> EnginePaths {
+    EnginePaths {
+        db: Some(PathBuf::from("/tmp/boss-test-guard-1234.db")),
+        events_socket: Some(PathBuf::from("/tmp/boss-test-guard-1234.events.sock")),
+        pid: Some(PathBuf::from("/tmp/boss-test-guard-1234.pid")),
+        control_token: Some(PathBuf::from("/tmp/boss-test-guard-1234.control-token")),
+    }
+}
+
+/// The production socket derives nothing — a production engine resolves its
+/// paths through the ordinary env / home-dir logic.
+#[test]
+fn derive_stands_down_entirely_for_the_production_socket() {
+    let paths = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+    assert!(!paths.is_test_fixture);
+    assert_eq!(paths.derived, EnginePaths::default());
+}
+
+#[test]
+fn derive_isolates_all_four_paths_when_no_env_is_set() {
+    let paths = derive(IsolationOverrides::default());
+    assert!(paths.is_test_fixture);
+    assert_eq!(paths.derived, all_derived());
+}
+
+/// **The 2026-07-23 regression.** A fixture started from inside a worker pane
+/// inherits `BOSS_EVENTS_SOCKET` pointing at the production socket. That is
+/// inherited environment, not operator intent: derive over it.
+#[test]
+fn derive_ignores_env_that_merely_repeats_the_production_default() {
+    let prod = production();
+    let paths = derive(IsolationOverrides {
+        db_path: prod.db,
+        events_socket: prod.events_socket,
+        pid_path: prod.pid,
+        control_token_path: prod.control_token,
+    });
+    assert_eq!(
+        paths.derived,
+        all_derived(),
+        "inherited production paths must not suppress derivation on any field"
+    );
+}
+
+/// The other half of the rule: a developer who deliberately points
+/// `BOSS_EVENTS_SOCKET` at a private path still gets that path. This is why
+/// the fix is an equality test and not a blanket refusal.
+#[test]
+fn derive_honours_env_that_names_a_private_path() {
+    let paths = derive(IsolationOverrides {
+        events_socket: Some(PathBuf::from("/tmp/my-own-events.sock")),
+        ..IsolationOverrides::default()
+    });
+    assert_eq!(paths.derived.events_socket, None, "the caller's explicit choice wins");
+}
+
+/// A fixture whose resolved paths still collide with production refuses to
+/// start, and says which environment variable to fix.
+#[test]
+fn fixture_refuses_to_start_when_a_resolved_path_is_production() {
+    let prod = production();
+    let paths = derive(IsolationOverrides::default());
+
+    paths
+        .ensure_isolated(&all_derived())
+        .expect("fully isolated fixture starts");
+
+    let stolen_socket = EnginePaths {
+        events_socket: prod.events_socket,
+        ..all_derived()
+    };
+    let err = paths
+        .ensure_isolated(&stolen_socket)
+        .expect_err("a fixture must never bind production's events socket");
+    let msg = format!("{err}");
+    assert!(msg.contains("BOSS_EVENTS_SOCKET"), "must name the env var; got: {msg}");
+
+    let stolen_token = EnginePaths {
+        control_token: prod.control_token,
+        ..all_derived()
+    };
+    let err = paths
+        .ensure_isolated(&stolen_token)
+        .expect_err("a fixture must never overwrite production's control token");
+    assert!(
+        format!("{err}").contains("BOSS_ENGINE_CONTROL_TOKEN_PATH"),
+        "must name the control-token env var; got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — process liveness helper
 // ---------------------------------------------------------------------------
 
 /// `process_is_alive` reports true for this running process and false for
@@ -255,7 +386,11 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
 async fn run_derives_isolated_token_path_for_test_fixture() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let socket_path = temp.path().join("boss-test-token-iso.sock");
-    let expected_token_path = temp.path().join("boss-test-token-iso.token");
+    // `.control-token`, not `.token`: every derived field is now named after
+    // the production file it stands in for (`engine-control.token`), so the
+    // fixture's token sits alongside `.db` / `.events.sock` / `.pid` under one
+    // naming rule. See `app::isolation::IsolationPaths::derive_from`.
+    let expected_token_path = temp.path().join("boss-test-token-iso.control-token");
 
     let cli = Cli {
         socket_path: Some(socket_path.to_string_lossy().into_owned()),
@@ -373,5 +508,167 @@ async fn fixture_cannot_overwrite_or_delete_live_production_token() -> Result<()
     );
 
     prod_join.abort();
+    Ok(())
+}
+
+/// A live process holding the frontend socket must be refused, not stolen —
+/// the frontend socket is what the macOS app and `bossctl` connect to, so
+/// stealing it is at least as damaging as stealing the events socket.
+#[tokio::test]
+async fn refuses_to_steal_a_live_frontend_socket() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let shared_socket = temp.path().join("shared.sock");
+
+    // "Live" engine: owns the frontend socket for real, stays running.
+    let live_db = temp.path().join("live.db");
+    let live_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(live_db)
+        .build();
+    let live_cfg = Arc::new(RuntimeConfig::from_parts(live_work, None));
+    let live_sock_c = shared_socket.clone();
+    let live_join = tokio::spawn(async move { serve(live_cfg, live_sock_c, None, None, None, None).await });
+    if !wait_for_socket(shared_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        live_join.abort();
+        return Err(anyhow!("live engine never bound socket"));
+    }
+    let before_ino = std::fs::metadata(&shared_socket)?.ino();
+
+    // Second engine attempts to bind the SAME frontend socket path (an
+    // isolation bug, or a second engine that resolved the same path).
+    let second_socket = shared_socket.clone();
+    let second_db = temp.path().join("second.db");
+    let second_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(second_db)
+        .build();
+    let second_cfg = Arc::new(RuntimeConfig::from_parts(second_work, None));
+    let second_result = serve(second_cfg, second_socket, None, None, None, None).await;
+
+    let err = second_result.expect_err("must not steal a live listener's frontend socket");
+    assert!(format!("{err:#}").contains("live process"), "unexpected error: {err:#}");
+
+    // The live engine's socket file must be untouched — same inode, still
+    // reachable — not unlinked-and-recreated by the refused steal attempt.
+    let after_ino = std::fs::metadata(&shared_socket)?.ino();
+    assert_eq!(
+        after_ino, before_ino,
+        "live engine's frontend socket must be the same inode, not recreated"
+    );
+    assert!(
+        wait_for_socket(shared_socket.to_str().unwrap(), Duration::from_secs(1)).await,
+        "live engine's frontend socket must remain reachable after the refused steal attempt"
+    );
+
+    live_join.abort();
+    Ok(())
+}
+
+/// Regression test for the ordering bug: when the events socket has a live
+/// listener, `serve()` must refuse BEFORE writing the control-token file,
+/// unlinking/rebinding the frontend socket, or writing the pid file — not
+/// after, which would leave the live engine's frontend socket unlinked and
+/// its token/pid files deleted by the refusing process's own guards on
+/// unwind.
+#[tokio::test]
+async fn events_socket_collision_is_refused_before_any_destructive_write() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+
+    // "Live" engine: owns the events socket, plus its own frontend socket,
+    // pid file, and control-token file, and stays running throughout.
+    let live_socket = temp.path().join("live.sock");
+    let live_events = temp.path().join("shared-events.sock");
+    let live_pid = temp.path().join("live.pid");
+    let live_token = temp.path().join("live.control-token");
+    let live_db = temp.path().join("live.db");
+    let live_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(live_db)
+        .build();
+    let live_cfg = Arc::new(RuntimeConfig::from_parts(live_work, None));
+    let live_sock_c = live_socket.clone();
+    let live_pid_c = live_pid.clone();
+    let live_events_c = live_events.clone();
+    let live_token_c = live_token.clone();
+    let live_join = tokio::spawn(async move {
+        serve(
+            live_cfg,
+            live_sock_c,
+            Some(live_pid_c),
+            Some(live_events_c),
+            Some(live_token_c),
+            None,
+        )
+        .await
+    });
+    if !wait_for_socket(live_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        live_join.abort();
+        return Err(anyhow!("live engine never bound socket"));
+    }
+
+    let frontend_ino_before = std::fs::metadata(&live_socket)?.ino();
+    let token_before = std::fs::read_to_string(&live_token)?;
+    let pid_before = std::fs::read_to_string(&live_pid)?;
+
+    // Second engine: distinct frontend socket, pid, and token paths, but the
+    // SAME events socket the live engine already holds — mirrors the
+    // orphaned-engine restart path, where a new engine reuses the events
+    // socket of an engine still alive but no longer tracked by pid.
+    let second_socket = temp.path().join("second.sock");
+    let second_pid = temp.path().join("second.pid");
+    let second_token = temp.path().join("second.control-token");
+    let second_db = temp.path().join("second.db");
+    let second_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(second_db)
+        .build();
+    let second_cfg = Arc::new(RuntimeConfig::from_parts(second_work, None));
+    let second_result = serve(
+        second_cfg,
+        second_socket.clone(),
+        Some(second_pid.clone()),
+        Some(live_events.clone()),
+        Some(second_token.clone()),
+        None,
+    )
+    .await;
+
+    let err = second_result.expect_err("must refuse to start when the events socket is already live");
+    assert!(format!("{err:#}").contains("live process"), "unexpected error: {err:#}");
+
+    // None of the second engine's own files were left behind: the refusal
+    // happened before any of them were created.
+    assert!(
+        !second_socket.exists(),
+        "refused start must not have bound its own frontend socket"
+    );
+    assert!(!second_pid.exists(), "refused start must not have written a pid file");
+    assert!(
+        !second_token.exists(),
+        "refused start must not have written a control-token file"
+    );
+
+    // The live engine's own files are untouched.
+    let frontend_ino_after = std::fs::metadata(&live_socket)?.ino();
+    assert_eq!(
+        frontend_ino_after, frontend_ino_before,
+        "live engine's frontend socket must be the same inode, not clobbered by the refused second start"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&live_token)?,
+        token_before,
+        "live engine's control-token file must be unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&live_pid)?,
+        pid_before,
+        "live engine's pid file must be unchanged"
+    );
+    assert!(
+        wait_for_socket(live_socket.to_str().unwrap(), Duration::from_secs(1)).await,
+        "live engine's frontend socket must remain reachable throughout"
+    );
+
+    live_join.abort();
     Ok(())
 }

@@ -89,8 +89,7 @@ pub fn default_token_path() -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed));
         }
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Boss/engine-control.token"))
+    boss_log_files::default_control_token_path()
 }
 
 /// Generate a fresh 32-byte hex-encoded token. Backed by

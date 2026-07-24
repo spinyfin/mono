@@ -131,19 +131,53 @@ pub trait ExecutionRunner: Send + Sync {
     ) -> Result<RunOutcome>;
 }
 
-/// Absolute path of the engine's local events socket — where worker hook
-/// shims connect. Honours the `BOSS_EVENTS_SOCKET` override and otherwise
-/// falls back to the stable `~/Library/Application Support/Boss` location.
-/// Shared by the local `PaneSpawnRunner` and the remote
-/// `SshHostAdapterProvider` (the target of each remote run's reverse
-/// `ssh -R` forward), so both agree on one path.
+/// Absolute path of the events socket this engine bound — where worker hook
+/// shims connect, and the target of each remote run's reverse `ssh -R`
+/// forward. Read from the config `serve` stamped the bound path onto, so the
+/// local `PaneSpawnRunner`, the remote `SshHostAdapterProvider`, and the
+/// engine-restart reattacher all agree on the one socket that is actually
+/// listening.
+///
+/// Callers must NOT re-derive this from `$BOSS_EVENTS_SOCKET`. That was the
+/// second half of the 2026-07-23 outage: a test-fixture engine that correctly
+/// isolated its own socket would still have handed its workers the production
+/// path, because this resolver read the environment rather than the binding.
+///
+/// The fallback covers the one shape where nothing was bound —
+/// `serve(..., events_socket_path: None, ...)`, used by in-process tests that
+/// never spawn a real worker. It re-reads the environment when it fires,
+/// which is exactly the read the rest of this module exists to avoid, so it
+/// logs a warning: a live caller hitting this path is a regression in the
+/// "nothing but config load re-reads `$BOSS_EVENTS_SOCKET`" invariant, and
+/// should be visible in the log rather than only in a worker's `settings.json`.
+pub fn bound_events_socket_path(cfg: &RuntimeConfig) -> PathBuf {
+    match cfg.work.events_socket_path.clone() {
+        Some(path) => path,
+        None => {
+            tracing::warn!(
+                "bound_events_socket_path: no events socket bound on the config; \
+                 falling back to re-reading $BOSS_EVENTS_SOCKET / the production default. \
+                 Every real engine start should bind one via `serve`; seeing this outside \
+                 an in-process test that never spawns a worker is a regression.",
+            );
+            engine_events_socket_path()
+        }
+    }
+}
+
+/// Resolve the events socket from the environment: `BOSS_EVENTS_SOCKET` if
+/// set, otherwise the production `~/Library/Application Support/Boss`
+/// location.
+///
+/// This is the *seed* for [`crate::config::WorkConfig::events_socket_path`]
+/// and the last-resort fallback in [`bound_events_socket_path`]. Everything
+/// that needs to know where the engine is listening goes through the config;
+/// see that field's doc comment.
 pub fn engine_events_socket_path() -> PathBuf {
-    if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
+    if let Ok(override_path) = std::env::var(crate::config::EVENTS_SOCKET_ENV) {
         return override_path.into();
     }
-    boss_log_files::default_state_root()
-        .unwrap_or_default()
-        .join("events.sock")
+    boss_log_files::default_events_socket_path().unwrap_or_default()
 }
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
@@ -202,7 +236,7 @@ impl PaneSpawnRunner {
     }
 
     fn events_socket_path(&self) -> PathBuf {
-        engine_events_socket_path()
+        bound_events_socket_path(&self.cfg)
     }
 
     fn boss_event_binary(&self) -> PathBuf {
@@ -6732,6 +6766,94 @@ mod pane_spawn_tests {
             input.env.iter().any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
             "expected BOSS_EVENTS_SOCKET to be set"
         );
+    }
+
+    /// Workers must be told about the socket the engine actually bound, which
+    /// lives on the config, and NOT about whatever `$BOSS_EVENTS_SOCKET`
+    /// happens to say in the engine's own environment.
+    ///
+    /// This is the second half of the 2026-07-23 outage: `PaneSpawnRunner`
+    /// re-resolved the socket from the environment, so even a fixture that had
+    /// correctly isolated its own socket would have baked the production path
+    /// into every worker's `settings.json` — sending their hooks to the live
+    /// engine. The bazel test env pins `HOME=/tmp` (see `engine_lib_test` in
+    /// `BUILD.bazel`) and does not set `BOSS_EVENTS_SOCKET` at all, so
+    /// `engine_events_socket_path()` falls back to
+    /// `/tmp/Library/Application Support/Boss/events.sock` — a path that
+    /// cannot collide with the test's `TempDir`-rooted config path. That is
+    /// what makes `assert_ne!` below meaningful: a regression that re-resolved
+    /// the socket from the environment would still fail loudly, just because
+    /// the two paths live in unrelated directories rather than because the
+    /// env var was deliberately mismatched.
+    #[tokio::test]
+    async fn spawn_env_uses_the_bound_socket_from_config_not_the_environment() {
+        let workspace = TempDir::new().unwrap();
+        let bound = workspace.path().join("boss-test-fixture.events.sock");
+
+        let (spawner, weak, _cfg, work_db) = spawn_test_env(&workspace);
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .events_socket_path(bound.clone())
+                .build(),
+            None,
+        ));
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
+        runner.set_server_state(weak);
+        runner
+            .run_execution(
+                "worker-1",
+                &sample_execution(workspace.path()),
+                &sample_chore(),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        let input = spawner.spawn_input();
+        let socket = input
+            .env
+            .iter()
+            .find(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET")
+            .expect("BOSS_EVENTS_SOCKET must be set on every worker spawn");
+        assert_eq!(
+            socket.value,
+            bound.display().to_string(),
+            "workers must be pointed at the socket this engine bound",
+        );
+        assert_ne!(
+            socket.value,
+            engine_events_socket_path().display().to_string(),
+            "the runner must not re-resolve the socket from $BOSS_EVENTS_SOCKET",
+        );
+    }
+
+    #[test]
+    fn bound_events_socket_path_prefers_the_config_over_the_environment() {
+        let work = crate::config::WorkConfig::builder()
+            .cwd(PathBuf::from("/tmp"))
+            .db_path(PathBuf::from("/tmp/state.db"))
+            .events_socket_path(PathBuf::from("/tmp/bound.events.sock"))
+            .build();
+        let cfg = crate::config::RuntimeConfig::from_parts(work, None);
+        assert_eq!(bound_events_socket_path(&cfg), PathBuf::from("/tmp/bound.events.sock"));
+    }
+
+    /// Only the "this engine bound no events socket" shape (in-process
+    /// `serve(..., None, ...)`) falls back to the environment resolver.
+    #[test]
+    fn bound_events_socket_path_falls_back_when_nothing_was_bound() {
+        let work = crate::config::WorkConfig::builder()
+            .cwd(PathBuf::from("/tmp"))
+            .db_path(PathBuf::from("/tmp/state.db"))
+            .build();
+        let cfg = crate::config::RuntimeConfig::from_parts(work, None);
+        assert_eq!(bound_events_socket_path(&cfg), engine_events_socket_path());
     }
 
     /// The engine is now the source of truth for which slot a
