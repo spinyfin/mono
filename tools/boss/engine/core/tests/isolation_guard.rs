@@ -483,7 +483,7 @@ async fn fixture_cannot_overwrite_or_delete_live_production_token() -> Result<()
 
     let err = fixture_result.expect_err("fixture engine must refuse to start when the token path is already live");
     assert!(
-        format!("{err:#}").contains("still owned by live engine"),
+        format!("{err:#}").contains("still has a live listener"),
         "unexpected error: {err:#}"
     );
 
