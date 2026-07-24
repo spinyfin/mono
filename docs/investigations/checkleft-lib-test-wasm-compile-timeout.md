@@ -2,8 +2,11 @@
 
 **Status:** resolved. The build-time `.cwasm` AOT fixture (direction 1 below)
 landed per this investigation. Re-profiling afterward (2026-07-03) found the
-fixture wasn't the whole story: three tests in
-`src/external/runtime/tests.rs` (`call_declared_exclusions_times_out_when_deadline_exhausted`,
+fixture wasn't the whole story, and a follow-up fix plus a test-shard split
+closed the remainder — details below.
+
+Three tests in `src/external/runtime/tests.rs`
+(`call_declared_exclusions_times_out_when_deadline_exhausted`,
 `call_evaluate_exclusion_times_out_when_deadline_exhausted`,
 `call_declared_exclusions_timeout_error_names_check_and_budget`) called
 `compile_component` directly instead of going through the AOT-cache-aware
@@ -16,6 +19,7 @@ was also split into `checkleft_lib_test_{declarative,wasm,rest}` shards (see
 (the declarative parity e2e and the wasm/component-model tests) run as
 independent, `timeout = "moderate"` Bazel actions instead of serializing
 inside one `size = "small"` binary.
+
 **Date:** 2026-06-14
 **Target:** `//tools/checkleft:checkleft_lib_test` (`rust_test`, `size = "small"` → hard 60 s Bazel timeout)
 **Context:** the target timed out on the wasm-consolidation work (PR #1502 / T1695, buildkite 3252), was clawed back to ~48 s by R1 (T1703), and ~48 s for a "small" unit-test target is suspect.
