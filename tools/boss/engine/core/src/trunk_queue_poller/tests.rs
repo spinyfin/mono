@@ -474,7 +474,7 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
     assert_eq!(detail["state"], "pending");
     assert_eq!(detail["position"], 2);
     assert_eq!(detail["section_order"], 1);
-    assert_eq!(detail["queue_state"], "RUNNING");
+    assert_eq!(detail["queue_state"], "running");
     // `enqueued_at` is RFC 3339, per the field's documented contract on
     // the app side, derived from when Boss submitted the PR.
     let enqueued_at = detail["enqueued_at"].as_str().expect("an enqueued_at timestamp");
@@ -1178,7 +1178,7 @@ async fn a_paused_queue_files_one_attention_item_per_episode() {
     assert_eq!(first.attentions_filed, 1);
     // A paused queue still reports positions — the card keeps rendering,
     // now carrying the queue-level state the app's banner reads.
-    assert_eq!(stored_detail(&db, &task_id)["queue_state"], "PAUSED");
+    assert_eq!(stored_detail(&db, &task_id)["queue_state"], "paused");
 
     // Still paused on the next cycle — the same problem, not a new one.
     let second = probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await;
@@ -1197,7 +1197,7 @@ async fn a_paused_queue_files_one_attention_item_per_episode() {
             TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND.to_owned(),
         ]
     );
-    assert_eq!(stored_detail(&db, &task_id)["queue_state"], "DRAINING");
+    assert_eq!(stored_detail(&db, &task_id)["queue_state"], "draining");
 }
 
 #[tokio::test]

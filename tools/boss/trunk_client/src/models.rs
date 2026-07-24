@@ -84,6 +84,20 @@ pub enum TrunkPriority {
     Name(String),
 }
 
+/// `readiness` on a `TrunkPullRequest`: an object, not the enum-like string
+/// this client originally guessed at. Real wire shape observed against
+/// `github.com/brianduff/flunge`:
+/// `{hasImpactedTargets:false, requiresImpactedTargets:false,
+/// doesBaseBranchMatch:true, gitHubMergeability:"mergeable"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrunkReadiness {
+    pub has_impacted_targets: bool,
+    pub requires_impacted_targets: bool,
+    pub does_base_branch_match: bool,
+    pub git_hub_mergeability: String,
+}
+
 // ── State enums (unknown-variant tolerant) ────────────────────────────────────
 
 /// One of the eight documented PR states in the Trunk queue, or
@@ -153,10 +167,10 @@ pub enum TrunkQueueState {
 impl From<String> for TrunkQueueState {
     fn from(value: String) -> Self {
         match value.as_str() {
-            "RUNNING" => Self::Running,
-            "PAUSED" => Self::Paused,
-            "DRAINING" => Self::Draining,
-            "SWITCHING_MODES" => Self::SwitchingModes,
+            "running" => Self::Running,
+            "paused" => Self::Paused,
+            "draining" => Self::Draining,
+            "switching_modes" => Self::SwitchingModes,
             _ => Self::Unknown(value),
         }
     }
@@ -165,10 +179,10 @@ impl From<String> for TrunkQueueState {
 impl From<TrunkQueueState> for String {
     fn from(value: TrunkQueueState) -> Self {
         match value {
-            TrunkQueueState::Running => "RUNNING".to_owned(),
-            TrunkQueueState::Paused => "PAUSED".to_owned(),
-            TrunkQueueState::Draining => "DRAINING".to_owned(),
-            TrunkQueueState::SwitchingModes => "SWITCHING_MODES".to_owned(),
+            TrunkQueueState::Running => "running".to_owned(),
+            TrunkQueueState::Paused => "paused".to_owned(),
+            TrunkQueueState::Draining => "draining".to_owned(),
+            TrunkQueueState::SwitchingModes => "switching_modes".to_owned(),
             TrunkQueueState::Unknown(raw) => raw,
         }
     }
@@ -208,7 +222,7 @@ pub struct TrunkPullRequest {
     pub id: String,
     pub state: TrunkPrState,
     #[serde(default)]
-    pub readiness: Option<String>,
+    pub readiness: Option<TrunkReadiness>,
     #[serde(default)]
     pub state_changed_at: Option<String>,
     #[serde(default)]
@@ -316,10 +330,10 @@ mod tests {
     #[test]
     fn queue_state_round_trips_known_variants() {
         let cases = [
-            (TrunkQueueState::Running, "RUNNING"),
-            (TrunkQueueState::Paused, "PAUSED"),
-            (TrunkQueueState::Draining, "DRAINING"),
-            (TrunkQueueState::SwitchingModes, "SWITCHING_MODES"),
+            (TrunkQueueState::Running, "running"),
+            (TrunkQueueState::Paused, "paused"),
+            (TrunkQueueState::Draining, "draining"),
+            (TrunkQueueState::SwitchingModes, "switching_modes"),
         ];
         for (state, wire) in cases {
             let value = serde_json::to_value(&state).unwrap();
@@ -331,9 +345,9 @@ mod tests {
 
     #[test]
     fn queue_state_tolerates_unknown_variants() {
-        let parsed: TrunkQueueState = serde_json::from_value(json!("QUARANTINED")).unwrap();
-        assert_eq!(parsed, TrunkQueueState::Unknown("QUARANTINED".to_owned()));
-        assert_eq!(serde_json::to_value(&parsed).unwrap(), json!("QUARANTINED"));
+        let parsed: TrunkQueueState = serde_json::from_value(json!("quarantined")).unwrap();
+        assert_eq!(parsed, TrunkQueueState::Unknown("quarantined".to_owned()));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json!("quarantined"));
     }
 
     // ── request serialization ─────────────────────────────────────────────
