@@ -172,14 +172,15 @@ pub use boss_protocol::{
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyDirection, DependencyEdge,
     DependencyFilter, DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel,
     EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput,
-    INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN,
-    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus,
-    RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput,
-    ReviseDocOutcome, SetProjectDesignDocInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER,
-    THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
+    FollowupMemberOverride, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION, LAST_STATUS_ACTOR_BOOTHBY,
+    LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
+    ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind,
+    ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
+    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
+    TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
+    is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses

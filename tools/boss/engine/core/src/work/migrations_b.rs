@@ -1573,6 +1573,21 @@ pub(crate) fn migrate_attentions_score_and_merges(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// Add `source_proposal_id` to `attentions`: provenance back to the
+/// `worker_proposals` row a `followup_task` proposal staged this member
+/// from, mirroring the existing `confidence_source` provenance field.
+/// `NULL` for members created by every other path (detectors, manifests,
+/// the plain `CreateAttention` RPC).
+///
+/// Design: `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
+/// §"UI visibility and provenance" (implementation task 6).
+pub(crate) fn migrate_attentions_source_proposal_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "attentions", "source_proposal_id")? {
+        conn.execute("ALTER TABLE attentions ADD COLUMN source_proposal_id TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Create the `planner_runs` audit-ledger table and its UNIQUE partial
 /// index (the per-project idempotency gate).
 ///

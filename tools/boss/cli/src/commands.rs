@@ -825,6 +825,16 @@ pub(crate) struct AttentionActionArgs {
     /// actioned.
     #[arg(long)]
     pub(crate) skip_unanswered: bool,
+    /// Per-member edits to apply before task creation, as a JSON object
+    /// mapping member id (`atn_…`) to an override: `{"field": value, ...}`
+    /// with any of `name`, `description`, `effort`, `work_kind`,
+    /// `product_id`, `project_id`. Lets the human edit a followup's
+    /// name/scope/effort, or re-parent it to a different product/project,
+    /// before the task is created — the change is recorded on the
+    /// resulting proposal's `decision_reason`. Example:
+    /// `--overrides '{"atn_abc": {"name": "Better title", "product_id": "prod_xyz"}}'`.
+    #[arg(long)]
+    pub(crate) overrides: Option<String>,
     /// Proceed without the interactive confirmation prompt.
     #[arg(long)]
     pub(crate) confirm: bool,

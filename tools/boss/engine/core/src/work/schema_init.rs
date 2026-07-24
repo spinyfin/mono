@@ -618,6 +618,11 @@ impl WorkDb {
         // the scheduler's retry deadline is measured from, distinct from
         // `started_at` which the retry upsert rewrites on every attempt.
         migrate_automation_runs_first_attempted_at_column(conn)?;
+        // `attentions.source_proposal_id`: provenance back to the
+        // `worker_proposals` row a `followup_task` proposal staged a
+        // followup-group member from. Additive, independent of every other
+        // table. Implementation task 6 of the worker-proposal-api design.
+        migrate_attentions_source_proposal_id(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

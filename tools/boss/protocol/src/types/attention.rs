@@ -69,6 +69,14 @@ pub struct Attention {
     /// detected work-item duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_work_item_id: Option<String>,
+    /// Id (`prp_…`) of the `worker_proposals` row this member was staged
+    /// from, when it came in via `boss propose followup-task` rather than a
+    /// detector/manifest. Follows the same provenance pattern as
+    /// [`Self::confidence_source`]: `None` for members created any other
+    /// way. Drives the Notifications-window proposal badge + provenance
+    /// jump link (design §"UI visibility and provenance").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_proposal_id: Option<String>,
 }
 
 /// One attention group — the human-actionable unit of the Attentions
@@ -151,6 +159,37 @@ pub struct AttentionGroup {
     /// Originating design/impl task (jump-back target for the UI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_task_id: Option<String>,
+}
+
+/// Per-member edit the human applies at the batch-accept gesture, before
+/// task creation — the "filed-with-modifications" half of the
+/// per-proposal disposition vocabulary (design §"Disposition of the folded
+/// follow-up-proposal project": "the accept gesture must let the human edit
+/// name/scope/effort and re-parent an out-of-scope proposal before creation,
+/// recording what changed in `decision_reason`"). Every field is optional:
+/// `None` keeps the member's stored `proposed_*` value, or (for
+/// `product_id`/`project_id`) the originating task's own product/project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct FollowupMemberOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Effort hint (`"trivial"` … `"max"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// `"task"` | `"chore"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_kind: Option<String>,
+    /// Re-parent to a different product than the originating task's own —
+    /// "re-parent an out-of-scope proposal" per the design. Requires
+    /// `project_id` to also be set when the target product needs the
+    /// followup filed as a project task rather than a product-level chore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// One row of the `attention_merges` provenance ledger. Records every fold
@@ -280,6 +319,9 @@ pub struct CreateAttentionInput {
     /// omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_source: Option<String>,
+    /// See [`Attention::source_proposal_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_proposal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]

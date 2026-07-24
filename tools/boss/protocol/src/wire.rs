@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse, HostedPaneEntry};
@@ -12,11 +14,11 @@ use crate::types::{
     CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState,
-    EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
+    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
+    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
     WorkerTierDenial,
 };
@@ -179,6 +181,14 @@ pub enum FrontendRequest {
         /// row explicitly.
         #[serde(default)]
         skip_unanswered: bool,
+        /// Per-member edits to apply before task creation, keyed by
+        /// member (`atn_…`) id — the "filed-with-modifications" /
+        /// re-parenting half of the accept gesture. Ignored for `question`
+        /// groups (only `followup` groups produce per-member artifacts).
+        /// An id with no matching accepted member is silently ignored: it
+        /// can name a member the caller skipped in the same call.
+        #[serde(default)]
+        member_overrides: HashMap<String, FollowupMemberOverride>,
     },
 
     /// Declare a `blocks` edge from `dependent` to `prerequisite`.
