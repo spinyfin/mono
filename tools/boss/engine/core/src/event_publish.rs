@@ -123,7 +123,6 @@ mod tests {
             // `tx` and `pending` both drop here without `commit_and_publish`.
         }
 
-        conn.execute("SELECT 1", []).ok();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .expect("count rows");
@@ -139,6 +138,54 @@ mod tests {
                 host_id: "unrelated".to_string()
             },
             "only the unrelated post-rollback publish should arrive; the staged DispatchReady must never appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn drops_events_when_commit_fails() {
+        // Force `tx.commit()` itself to return `Err` (a deferred foreign-key
+        // violation, checked at COMMIT rather than at the offending INSERT)
+        // and assert `commit_and_publish` propagates the error without
+        // publishing the staged event.
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute("PRAGMA foreign_keys = ON", [])
+            .expect("enable foreign keys");
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)", [])
+            .expect("create parent table");
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+            )",
+            [],
+        )
+        .expect("create child table");
+
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(TopicFilter::all());
+
+        let tx = conn.transaction().expect("open txn");
+        tx.execute("INSERT INTO child (id, parent_id) VALUES (1, 999)", [])
+            .expect("deferred FK insert succeeds inside the txn");
+        let mut pending = PendingEvents::new();
+        pending.push(Event::DispatchReady);
+
+        let result = commit_and_publish(tx, pending, &bus);
+        assert!(
+            result.is_err(),
+            "commit must fail: deferred FK violation is checked at COMMIT"
+        );
+
+        bus.publish(Event::HostDisabled {
+            host_id: "unrelated".to_string(),
+        });
+        let event = sub.recv().await.expect("unrelated event still delivered");
+        assert_eq!(
+            event,
+            Event::HostDisabled {
+                host_id: "unrelated".to_string()
+            },
+            "only the unrelated post-failure publish should arrive; the staged DispatchReady must never appear"
         );
     }
 }

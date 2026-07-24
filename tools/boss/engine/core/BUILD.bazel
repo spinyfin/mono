@@ -107,7 +107,7 @@ rust_binary(
 # //third_party/patches (see MODULE.bazel single_version_override). One
 # cfg(test) compile of the crate + 11 parallel shard executions, vs the
 # previous layout's 4 filter-partitioned rust_test targets = 4 full compiles.
-# See docs/investigations/rust-test-sharding-engine-lib-test.md (T2856) for
+# See docs/investigations/rust-test-sharding-engine-lib-test.md for
 # the correctness gate and before/after measurements this adoption is based on.
 #
 # size = "small" / timeout = "moderate" (300 s):
