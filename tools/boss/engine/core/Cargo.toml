@@ -22,6 +22,7 @@ chrono = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
+boss-dispatch-events = { path = "../dispatch-events" }
 boss-editorial = { path = "../editorial" }
 boss-engine-design-docs = { path = "../design-docs" }
 boss-engine-driver = { path = "../driver" }
