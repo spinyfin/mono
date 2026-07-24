@@ -47,9 +47,9 @@ extension ChatViewModel {
     /// Apply a `product_design_doc_content` reply.
     ///
     /// Replies are keyed by their full `(repo, path, ref)` triple rather
-    /// than written into a single "current document" slot, so a slow
-    /// fetch that lands after the operator has clicked elsewhere updates
-    /// its own entry and leaves the visible document alone.
+    /// than written into a single "current document" slot, so a fetch
+    /// that lands after the selection has moved on updates its own
+    /// entry and leaves the visible document alone.
     func applyProductDesignDocContent(ref: DesignDocRef, content: DesignDocContent) {
         designDocContentByRef[ref] = content
     }

@@ -30,9 +30,8 @@ pub(super) async fn handle_list_product_design_docs(ctx: Dispatch, req: Frontend
         unreachable!()
     };
 
-    // The repo comes from the product row, never from the product's
-    // name — deriving a path or a repo from the name is exactly the bug
-    // this replaced.
+    // The repo comes from the product row's `repo_remote_url`, never
+    // from the product's name.
     let product = match work_db.get_product(&product_id) {
         Ok(Some(product)) => product,
         Ok(None) => {
