@@ -456,6 +456,7 @@ impl ConfigResolver {
                     continue;
                 }
             };
+            let scope_explicit = check.scope.is_some();
             let scope = match check.scope.as_deref() {
                 Some(raw) => match parse_check_scope(raw) {
                     Ok(scope) => scope,
@@ -468,9 +469,22 @@ impl ConfigResolver {
                         continue;
                     }
                 },
-                None => CheckScope::default(),
+                // No `scope` key: an ancestor CHECKS file (typically the repo root, the
+                // only place `scope = changeset` is honoured) may already have resolved
+                // this id to `Changeset`. Inherit that rather than silently defaulting to
+                // `Files` — otherwise a subdirectory override that only tweaks e.g.
+                // `policy` flips the check to files scope for that subtree, and it ends
+                // up scheduled twice (once as changeset at the root, once as files here).
+                None => resolved
+                    .get(&configured_id)
+                    .map(|existing| existing.scope)
+                    .unwrap_or_default(),
             };
-            if scope == CheckScope::Changeset && !check_config_dir.as_os_str().is_empty() {
+            // Only an *explicit* `scope = changeset` in a subdirectory is rejected — it
+            // can never be honoured there. An inherited `Changeset` scope (no `scope` key
+            // in this file) is expected and must fall through to the upsert below so the
+            // override still merges into the single root-scheduled changeset check.
+            if scope_explicit && scope == CheckScope::Changeset && !check_config_dir.as_os_str().is_empty() {
                 resolved.push_diagnostic(config_check_diagnostic(
                     configured_id.clone(),
                     config_relative_path.clone(),

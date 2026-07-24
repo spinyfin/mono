@@ -40,6 +40,18 @@ const MAX_ANNOTATION_TITLE_CHARS: usize = 255;
 /// practice; this guards a pathological message from 422-ing an entire batch.
 const MAX_ANNOTATION_MESSAGE_BYTES: usize = 64 * 1024;
 
+/// GitHub's `output.summary` ceiling (characters), per the Check Runs API. An
+/// over-long summary fails the check-run *create* request outright (unlike an
+/// over-long annotation, which only spoils one batch), so the assembled summary
+/// is truncated to this after all bullets are appended.
+const MAX_SUMMARY_CHARS: usize = 65535;
+
+/// Ceiling on a single locationless finding's message when rendered as a
+/// summary bullet. A few hundred characters is plenty for a summary line, and
+/// keeping each bullet short is what keeps the whole summary under
+/// [`MAX_SUMMARY_CHARS`] even with the full [`LOCATIONLESS_SUMMARY_CAP`] of them.
+const MAX_SUMMARY_BULLET_MESSAGE_CHARS: usize = 300;
+
 /// The Check Runs API `annotation_level` string for an [`AnnotationLevel`].
 fn annotation_level_str(level: AnnotationLevel) -> &'static str {
     match level {
@@ -111,7 +123,12 @@ pub fn output_title(counts: FindingCounts) -> String {
 /// the PR description) never becomes a SARIF result or an inline annotation —
 /// both require a path — so `output.summary` is its only channel into the
 /// GitHub UI. Appends one bullet per locationless finding beneath the counts
-/// line, per the locationless-rendering investigation's recommendation.
+/// line.
+///
+/// The assembled body is truncated to [`MAX_SUMMARY_CHARS`] before being
+/// returned: unlike an over-long annotation (which only fails to attach, and
+/// only spoils one batch), an over-long summary is on the check-run *create*
+/// request and would 422 the whole run.
 pub fn output_summary(counts: FindingCounts, results: &[CheckResult]) -> String {
     if counts.total() == 0 {
         return "checkleft found no findings.".to_owned();
@@ -132,7 +149,7 @@ pub fn output_summary(counts: FindingCounts, results: &[CheckResult]) -> String 
         summary.push_str("\n\n");
         summary.push_str(&locationless.join("\n"));
     }
-    summary
+    truncate_chars(&summary, MAX_SUMMARY_CHARS)
 }
 
 /// Maximum locationless findings listed in the check-run summary body. Findings
@@ -149,7 +166,14 @@ fn locationless_summary_lines(results: &[CheckResult]) -> Vec<String> {
                 .findings
                 .iter()
                 .filter(|finding| finding.location.is_none())
-                .map(move |finding| format!("- `{}`: {}", result.check_id, finding.message))
+                .map(move |finding| {
+                    // Collapse newlines so a multi-line message can't break the
+                    // Markdown bullet, then cap length so one pathological
+                    // message can't blow the overall summary size on its own.
+                    let collapsed = finding.message.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let message = truncate_chars(&collapsed, MAX_SUMMARY_BULLET_MESSAGE_CHARS);
+                    format!("- `{}`: {message}", result.check_id)
+                })
         })
         .collect();
     cap_with_log(lines, LOCATIONLESS_SUMMARY_CAP, "check-run summary")
@@ -545,6 +569,33 @@ mod tests {
         let counts = count_findings(&results);
         let summary = output_summary(counts, &results);
         assert_eq!(summary.matches("boss/no-boss-isms").count(), LOCATIONLESS_SUMMARY_CAP);
+    }
+
+    #[test]
+    fn summary_truncates_a_pathological_locationless_message() {
+        let huge_message = "x".repeat(MAX_SUMMARY_CHARS * 2);
+        let results = vec![result(
+            "boss/no-boss-isms",
+            vec![finding_no_location(Severity::Error, &huge_message)],
+        )];
+        let counts = count_findings(&results);
+        let summary = output_summary(counts, &results);
+        assert!(summary.chars().count() <= MAX_SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn summary_collapses_multiline_locationless_messages() {
+        let results = vec![result(
+            "boss/no-boss-isms",
+            vec![finding_no_location(
+                Severity::Error,
+                "first line\nsecond line\r\nthird line",
+            )],
+        )];
+        let counts = count_findings(&results);
+        let summary = output_summary(counts, &results);
+        assert_eq!(summary.matches('\n').count(), 2, "only the counts/bullets separator");
+        assert!(summary.contains("- `boss/no-boss-isms`: first line second line third line"));
     }
 
     #[test]

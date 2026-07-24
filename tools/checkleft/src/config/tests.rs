@@ -158,6 +158,43 @@ fn scope_changeset_in_subdirectory_config_produces_diagnostic_and_is_not_schedul
 }
 
 #[test]
+fn subdirectory_override_without_scope_inherits_root_changeset_scope() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\nscope = \"changeset\"\n",
+    )
+    .expect("write root config");
+    fs::create_dir_all(temp.path().join("subdir")).expect("create dir");
+    fs::write(
+        temp.path().join("subdir/CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\n\n[checks.policy]\nseverity = \"warning\"\n",
+    )
+    .expect("write subdirectory config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("subdir/a.rs"))
+        .expect("resolve checks");
+
+    // The override (no `scope` key) must inherit the root's `Changeset` scope,
+    // not silently reset to `Files` — otherwise the check gets scheduled twice
+    // (once as changeset at the root, once as files here).
+    let check = checks.get("boss/no-boss-isms").expect("check present");
+    assert_eq!(check.scope, CheckScope::Changeset);
+
+    // No misplacement diagnostic: this is an inherited scope, not an explicit
+    // (and invalid) `scope = changeset` declared in a subdirectory.
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("scope = changeset")),
+        "inheriting scope from the root should not produce a misplacement diagnostic, got {diagnostics:?}"
+    );
+}
+
+#[test]
 fn invalid_scope_produces_diagnostic() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
