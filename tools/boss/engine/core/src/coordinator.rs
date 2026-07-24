@@ -637,14 +637,6 @@ pub struct CommandCubeClient {
     cfg: Arc<RuntimeConfig>,
 }
 
-fn shell_quote(arg: &str) -> String {
-    if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') {
-        format!("\"{}\"", arg.replace('"', "\\\""))
-    } else {
-        arg.to_owned()
-    }
-}
-
 /// Strip the trailing jj conflict-type descriptor (e.g. `"    2-sided
 /// conflict"` or `"    2-sided conflict including 1 deletion"`) that `jj
 /// resolve --list` glues onto each path, column-aligned with whitespace
@@ -902,7 +894,7 @@ impl CubeClient for CommandCubeClient {
         let cmd = std::iter::once(agent.cube.command.as_str())
             .chain(agent.cube.args.iter().map(String::as_str))
             .chain(args.iter().copied())
-            .map(shell_quote)
+            .map(crate::ssh_transport::shell_quote)
             .collect::<Vec<_>>()
             .join(" ");
         let cwd = self.cfg.work.cwd.display().to_string();
