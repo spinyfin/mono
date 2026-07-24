@@ -590,6 +590,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-event-bus"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "boss-feature-flags"
 version = "0.1.0"
 dependencies = [
