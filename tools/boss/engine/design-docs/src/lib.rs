@@ -8,12 +8,10 @@
 //!
 //! # Why the repo comes from the product, not its name
 //!
-//! The tab previously derived a local clone path from the product name
-//! (`~/Documents/dev/<name>`) and rendered an error when that directory
-//! was absent — which is the normal case, since checkouts are
-//! cube-managed and live elsewhere. Nothing here touches the local
-//! filesystem: the repo is read from the product's configured
-//! `repo_remote_url`, and GitHub is the only source consulted.
+//! The repo is read from the product's configured `repo_remote_url`
+//! and never inferred from the product name; nothing here touches the
+//! local filesystem, so the tab works whether or not a clone exists on
+//! this machine. GitHub is the only source consulted.
 //!
 //! # Caching, and why it cannot go stale
 //!
@@ -144,6 +142,11 @@ impl DesignDocsService {
     /// Fetch one document's body at the exact `git_ref` the listing was
     /// read at. Always read through to GitHub — bodies are never cached.
     pub async fn fetch_markdown_doc(&self, repo_remote_url: &str, path: &str, git_ref: &str) -> DesignDocContent {
+        if !is_markdown_path(path) {
+            return DesignDocContent::Failed {
+                reason: format!("`{path}` is not a markdown file."),
+            };
+        }
         let Ok((owner, repo)) = git_utils::repo_slug::parse_github_owner_repo(repo_remote_url) else {
             return DesignDocContent::Failed {
                 reason: format!("`{repo_remote_url}` is not a github.com remote."),
@@ -670,6 +673,21 @@ mod tests {
             .await
         {
             DesignDocContent::Failed { reason } => assert!(reason.contains("not a github.com remote"), "got: {reason}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetching_a_non_markdown_path_is_rejected_before_any_fetch() {
+        // The source is wired to fail every call; if the guard did not
+        // short-circuit before reaching it, this would come back as the
+        // source's classified failure instead of the markdown-guard one.
+        let svc = service(FakeSource::failing(
+            TreeApiErrorKind::Unreachable,
+            "should never be called",
+        ));
+        match svc.fetch_markdown_doc(FLUNGE, "src/main.rs", "sha1").await {
+            DesignDocContent::Failed { reason } => assert!(reason.contains("not a markdown file"), "got: {reason}"),
             other => panic!("expected Failed, got {other:?}"),
         }
     }

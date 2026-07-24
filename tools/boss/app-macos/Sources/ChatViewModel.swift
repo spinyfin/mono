@@ -289,9 +289,10 @@ final class ChatViewModel: ObservableObject {
     /// a spinner without losing the previously-loaded listing underneath.
     @Published var designDocsLoadingProductIDs: Set<String> = []
     /// Fetched document bodies keyed by their full `(repo, path, ref)`
-    /// triple. Keyed by the triple rather than held in a single
-    /// "current document" slot so a slow fetch landing after the
-    /// operator clicked elsewhere cannot overwrite the visible document.
+    /// triple. Keyed by the full triple rather than a single "current
+    /// document" slot, so a fetch that lands after the selection has
+    /// moved on updates its own entry instead of overwriting what is
+    /// on screen.
     @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
     /// The document the Designs tab reader pane is showing, if any.
     @Published var selectedDesignDocRef: DesignDocRef?

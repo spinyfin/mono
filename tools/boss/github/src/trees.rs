@@ -229,23 +229,14 @@ where
 ///
 /// Routed through the Contents API with the `raw` media type rather
 /// than the blobs API so GitHub does the base64 decoding; the response
-/// body is the file's bytes verbatim.
+/// body is the file's bytes verbatim. Argv construction is shared with
+/// `contents::fetch_repo_file` via [`crate::contents::raw_content_args`]
+/// so there is exactly one place that knows the Contents-API invocation
+/// shape; this function keeps its own `TreeApiError` classification.
 pub async fn fetch_blob_text(owner: &str, repo: &str, path: &str, git_ref: &str) -> TreeResult<String> {
-    let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
-    // `--method GET` keeps `-f ref=` in the query string: gh switches to
-    // POST as soon as a field is added otherwise. Same reasoning (and the
-    // same slashed-ref encoding benefit) as `contents::fetch_repo_file`.
-    let stdout = gh_api(&[
-        "api",
-        &endpoint,
-        "--method",
-        "GET",
-        "-f",
-        &format!("ref={git_ref}"),
-        "-H",
-        "Accept: application/vnd.github.raw",
-    ])
-    .await?;
+    let (_endpoint, args) = crate::contents::raw_content_args(owner, repo, path, git_ref);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let stdout = gh_api(&arg_refs).await?;
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 

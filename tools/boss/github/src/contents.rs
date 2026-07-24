@@ -5,29 +5,41 @@
 
 use crate::gh_runner::gh_output;
 
+/// Build the endpoint and full `gh api` argv for a raw-content GET against
+/// the Contents API: `repos/{owner}/{repo}/contents/{path}` with `ref=` in
+/// the query string and the raw media type.
+///
+/// Shared by [`fetch_repo_file`] and [`crate::trees::fetch_blob_text`] so
+/// the endpoint shape and argv (in particular `--method GET`, required so
+/// `-f ref=` lands in the query string instead of gh switching to POST once
+/// a field is added — which also makes gh URL-encode slashed branch/ref
+/// names like `boss/exec_*` correctly) live in exactly one place; each
+/// caller applies its own error classification to the result.
+pub(crate) fn raw_content_args(owner: &str, repo: &str, path: &str, git_ref: &str) -> (String, Vec<String>) {
+    let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
+    let args = vec![
+        "api".to_owned(),
+        endpoint.clone(),
+        "--method".to_owned(),
+        "GET".to_owned(),
+        "-f".to_owned(),
+        format!("ref={git_ref}"),
+        "-H".to_owned(),
+        "Accept: application/vnd.github.raw".to_owned(),
+    ];
+    (endpoint, args)
+}
+
 /// Fetch the raw content of `path` from `owner/repo` at `ref_name` using
 /// `gh api`.
 ///
 /// Returns `Ok(Some(content))` on success, `Ok(None)` when the file does not
 /// exist at that ref (HTTP 404 — the common "no file at this branch" case),
 /// and `Err` only on a real transport or tool failure.
-///
-/// `--method GET` is required so `-f ref=` lands in the query string (gh
-/// otherwise switches to POST once a field is added), which also makes gh
-/// URL-encode slashed branch / ref names like `boss/exec_*` correctly.
 pub async fn fetch_repo_file(owner: &str, repo: &str, path: &str, ref_name: &str) -> anyhow::Result<Option<String>> {
-    let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
-    let output = gh_output(&[
-        "api",
-        &endpoint,
-        "--method",
-        "GET",
-        "-f",
-        &format!("ref={ref_name}"),
-        "-H",
-        "Accept: application/vnd.github.raw",
-    ])
-    .await?;
+    let (endpoint, args) = raw_content_args(owner, repo, path, ref_name);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = gh_output(&arg_refs).await?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     classify_contents_response(output.status.success(), &output.stdout, &stderr)
