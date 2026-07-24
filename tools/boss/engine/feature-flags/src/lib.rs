@@ -269,6 +269,25 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "deferred_scope_proposals_seam",
+        description: "Read worker_proposals rows before falling back to the legacy [deferred-scope] \
+             marker parser in detect_and_record_deferred_scope (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, implementation task 9 — the \
+             deferred-scope seam migration, following the recipe `worker_signal_proposals_seam` \
+             established). When on, an execution that already carries a worker_proposals row of kind \
+             deferred_scope whose summary/reason match a detected marker skips that marker — \
+             SubmitProposal's synchronous apply pipeline already wrote the audit line and attention item \
+             at submission time, so re-parsing would just re-file the same event. When no such proposal \
+             exists, the legacy marker parser still runs exactly as before, and every time it does the \
+             worker_proposals.fallback_hit.deferred_scope counter increments and a WARN logs — the \
+             counter is this seam's explicit exit criterion for eventually deleting the marker parser. \
+             DEFAULT OFF: enable per operator once the proposal path is validated in staging. Kill \
+             switch: set false to restore the pre-migration marker-only detection exactly.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_rpc_tier",
         description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
              worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
@@ -695,6 +714,30 @@ mod tests {
         let store2 = make_store(&tmp);
         store2.load().unwrap();
         assert!(store2.is_enabled("worker_signal_proposals_seam"));
+    }
+
+    #[test]
+    fn deferred_scope_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("deferred_scope_proposals_seam"),
+            "deferred_scope_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "deferred_scope_proposals_seam")
+            .expect("deferred_scope_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "completion");
+
+        store.set("deferred_scope_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("deferred_scope_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("deferred_scope_proposals_seam"));
     }
 
     #[test]
