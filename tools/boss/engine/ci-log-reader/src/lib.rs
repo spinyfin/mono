@@ -549,6 +549,19 @@ async fn run_capture(binary: &str, args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fake script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake script");
+        }
+        path
+    }
+
     // ---------- URL parsing -------------------------------------------------
 
     #[test]
@@ -727,7 +740,6 @@ mod tests {
     #[tokio::test]
     async fn find_trunk_merge_eviction_build_uses_full_coordinates_via_fake_bk() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let script = r#"#!/bin/sh
 if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=1" ]; then
     cat <<'JSON'
@@ -738,14 +750,7 @@ fi
 echo "unhandled args: $@" 1>&2
 exit 2
 "#;
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", script);
 
         let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
             .await
@@ -763,7 +768,6 @@ exit 2
     #[tokio::test]
     async fn find_trunk_merge_eviction_build_falls_through_to_page_two() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let page_one_path = dir.path().join("page1.json");
         // Page 1: exactly 100 non-matching builds (a full page, so the
         // lookup must not stop here). Page 2: the actual match.
@@ -797,14 +801,7 @@ exit 2
 "#,
             page_one = page_one_path.display(),
         );
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", &script);
 
         let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
             .await
@@ -818,7 +815,6 @@ exit 2
     #[tokio::test]
     async fn find_trunk_merge_eviction_build_returns_none_when_exhausted() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let script = r#"#!/bin/sh
 if [ "$1" = "api" ]; then
     echo "[]"
@@ -827,14 +823,7 @@ fi
 echo "unhandled args: $@" 1>&2
 exit 2
 "#;
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", script);
 
         let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
             .await
@@ -914,6 +903,30 @@ exit 2
         );
     }
 
+    #[test]
+    fn reader_for_buildkite_default_binaries_wire_bk() {
+        // Host-independent coverage of the one-line delegation in
+        // `reader_for` (`reader_for_with_binaries(provider, target_url, "bk",
+        // "gh")`): a swap or typo of either literal compiles and passes every
+        // other test here, and would only break in production. Uses the
+        // trait's own `worker_cli_invocation_hint` accessor rather than a
+        // spawn, so it's hermetic on all three host states.
+        let r = reader_for(
+            CiProvider::Buildkite,
+            "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
+        );
+        assert_eq!(
+            r.worker_cli_invocation_hint("j"),
+            "bk job log --pipeline mypipeline --build-number 1329 j"
+        );
+    }
+
+    #[test]
+    fn reader_for_github_actions_default_binaries_wire_gh() {
+        let r = reader_for(CiProvider::GithubActions, "x");
+        assert_eq!(r.worker_cli_invocation_hint("j"), "gh run view --log-failed --job j");
+    }
+
     #[tokio::test]
     async fn reader_for_buildkite_with_canonical_url_builds_working_reader() {
         // Confirms the canonical URL resolves to a real `BuildkiteLogReader`
@@ -925,23 +938,19 @@ exit 2
         // (installed vs. absent, configured vs. not), none of which this
         // test is about.
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let script = r#"#!/bin/sh
 if [ "$1" = "job" ] && [ "$2" = "log" ]; then
+    if [ "$3" != "--pipeline" ] || [ "$5" != "--build-number" ]; then
+        echo "missing --pipeline/--build-number flags: $@" 1>&2
+        exit 3
+    fi
     echo "coordinates: pipeline=$4 build=$6 job=$7"
     exit 0
 fi
 echo "unhandled args: $@" 1>&2
 exit 2
 "#;
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", script);
 
         let r = reader_for_with_binaries(
             CiProvider::Buildkite,
@@ -966,16 +975,8 @@ exit 2
         // constructed reader actually invokes `gh` with the expected args —
         // the `UnknownProviderReader` fallback would never spawn anything.
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("gh");
         let script = "#!/bin/sh\necho \"invoked: $@\"\nexit 0\n";
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "gh", script);
 
         let r = reader_for_with_binaries(
             CiProvider::GithubActions,
@@ -1001,17 +1002,6 @@ exit 2
     #[cfg(unix)]
     mod fake_cli_integration {
         use super::*;
-        use std::os::unix::fs::PermissionsExt;
-        use std::path::{Path, PathBuf};
-
-        fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-            let path = dir.join(name);
-            std::fs::write(&path, body).expect("write fake script");
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake script");
-            path
-        }
 
         // ---- Buildkite ----------------------------------------------------
 
