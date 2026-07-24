@@ -1214,6 +1214,26 @@ pub async fn serve_with_merge_probe(
         Duration::from_secs(60),
     );
 
+    // Timer-wheel fast path for the envelope watchdog (event-bus design doc,
+    // Phase 3): schedules a per-execution deadline for each live `Working`
+    // slot at subscribe/reconcile time and re-checks that one execution as
+    // soon as its `Timer{deadline_id}` fires, instead of waiting out the
+    // sweep's next 60s tick. The sweep above stays as the untouched backstop
+    // — this is a latency win, not a replacement. The event bus and the
+    // timer-wheel it feeds are constructed here (inside a live Tokio
+    // runtime, since `TimerWheel::spawn` spawns its background loop) rather
+    // than on `ServerState`, which many unit tests construct outside of a
+    // runtime; envelope_watch is currently their only in-process consumer.
+    let envelope_watch_event_bus = Arc::new(boss_event_bus::EventBus::new());
+    let envelope_watch_timer_wheel = Arc::new(boss_timer_wheel::TimerWheel::spawn(envelope_watch_event_bus.clone()));
+    let _envelope_watch_timer_handle = crate::envelope_watch::spawn_timer_subscriber(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        envelope_watch_timer_wheel,
+        envelope_watch_event_bus,
+        crate::envelope_watch::EnvelopeThresholds::from_env(|k| std::env::var_os(k)),
+    );
+
     // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
     // that never reported a shell pid AND never received a single hook
     // event — proof no worker process ever came up at all, distinct from
