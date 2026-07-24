@@ -43,7 +43,6 @@ checks:
         - tools/boss/engine/core/src/coordinator.rs
         - tools/boss/engine/core/src/merge_poller.rs
         - tools/boss/engine/core/src/runner.rs
-        - tools/boss/cli/src/main.rs
         - tools/cube/src/app.rs
         - tools/boss/app-macos/Sources/ContentView.swift
     policy:
