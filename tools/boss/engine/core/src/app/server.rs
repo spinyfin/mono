@@ -935,6 +935,9 @@ pub async fn serve_with_merge_probe(
     let merge_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
     let trunk_queue_api: Arc<dyn crate::trunk_queue_poller::TrunkQueueApi> =
         Arc::new(server_state.trunk_client.clone());
+    let pr_reconcile_requests = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::PrReconcileRequested));
     let _merge_handle = spawn_merge_poller(
         server_state.work_db.clone(),
         merge_probe,
@@ -946,10 +949,7 @@ pub async fn serve_with_merge_probe(
         ),
         Duration::from_secs(60),
         server_state.metrics.clone(),
-        (
-            server_state.pr_reconciler_kick.clone(),
-            server_state.pr_reconciler_targeted_kick.clone(),
-        ),
+        (server_state.pr_reconciler_kick.clone(), pr_reconcile_requests),
     );
 
     // Periodic dead-PID reconciler: detects worker slots whose backing

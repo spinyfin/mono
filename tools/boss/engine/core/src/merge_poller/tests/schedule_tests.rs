@@ -191,32 +191,51 @@ async fn activation_kick_after_quiesce_window_triggers_pass() {
     );
 }
 
-/// [`PrReconcilerTargetedKick::kick`] records the PR that requested the
-/// pass and wakes anyone awaiting [`PrReconcilerTargetedKick::notified`];
-/// [`PrReconcilerTargetedKick::drain_pending`] returns exactly what was
-/// recorded and clears it so a second drain sees nothing new.
+/// The `PrReconcilerTargetedKick` `Notify`+`Vec<String>` queue was
+/// replaced by a keyed `PrReconcileRequested{pr_url}` event-bus topic:
+/// a subscriber filtered on [`EventKind::PrReconcileRequested`] receives
+/// exactly the PR urls published to it, in order, and is not woken by
+/// unrelated topics — the property [`spawn_loop`]'s wait loop now
+/// relies on in place of the old struct's `kick`/`notified`/`drain_pending`.
 #[tokio::test]
-async fn targeted_kick_records_and_drains_pr_urls() {
+async fn pr_reconcile_requested_topic_delivers_keyed_pr_urls() {
+    use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
     use tokio::time::timeout;
 
-    let targeted_kick = PrReconcilerTargetedKick::new();
-    targeted_kick.kick("https://github.com/spinyfin/mono/pull/1");
-    targeted_kick.kick("https://github.com/spinyfin/mono/pull/2");
+    let bus = EventBus::new();
+    let mut sub = bus.subscribe(TopicFilter::kind(EventKind::PrReconcileRequested));
 
-    timeout(Duration::from_millis(500), targeted_kick.notified())
-        .await
-        .expect("kick() must notify a waiter");
+    bus.publish(Event::PrReconcileRequested {
+        pr_url: "https://github.com/spinyfin/mono/pull/1".to_owned(),
+    });
+    bus.publish(Event::PrReconcileRequested {
+        pr_url: "https://github.com/spinyfin/mono/pull/2".to_owned(),
+    });
+    // An unrelated topic must not be delivered to this subscriber.
+    bus.publish(Event::HostDisabled {
+        host_id: "unrelated".to_owned(),
+    });
 
-    assert_eq!(
-        targeted_kick.drain_pending(),
-        vec![
-            "https://github.com/spinyfin/mono/pull/1".to_owned(),
-            "https://github.com/spinyfin/mono/pull/2".to_owned(),
-        ],
-    );
+    for expected in [
+        "https://github.com/spinyfin/mono/pull/1",
+        "https://github.com/spinyfin/mono/pull/2",
+    ] {
+        let event = timeout(Duration::from_millis(500), sub.recv())
+            .await
+            .expect("publish() must deliver to a matching subscriber")
+            .expect("bus is still alive");
+        assert_eq!(
+            event,
+            Event::PrReconcileRequested {
+                pr_url: expected.to_owned()
+            }
+        );
+    }
+
+    // Nothing else queued — the unrelated `HostDisabled` was filtered out.
     assert!(
-        targeted_kick.drain_pending().is_empty(),
-        "drain_pending must clear the queue",
+        timeout(Duration::from_millis(50), sub.recv()).await.is_err(),
+        "subscriber must not receive events outside its topic filter",
     );
 }
 

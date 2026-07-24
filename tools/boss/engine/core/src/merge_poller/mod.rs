@@ -46,6 +46,7 @@ use async_trait::async_trait;
 use serde_json;
 use tokio::sync::Notify;
 
+use boss_event_bus::Event;
 pub use boss_github::{CiProvider, RequiredCheckFailure};
 use boss_github::{fetch_failing_checks_for_commit, parse_provider_job_id, provider_for_url};
 

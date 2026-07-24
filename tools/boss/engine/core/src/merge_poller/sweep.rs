@@ -345,9 +345,9 @@ pub async fn run_one_pass(
 /// Reconcile exactly one PR instead of sweeping every candidate (doc
 /// `github-event-detection-webhooks-vs-polling-2026-07-08.md` §9 item 3).
 /// This is the targeted entry point [`PrPollSchedule`]'s per-PR adaptive
-/// timer and [`PrReconcilerTargetedKick`] both drive: rather than waking
-/// the whole reconciler because one PR needs attention, reconcile just
-/// that PR.
+/// timer and the `PrReconcileRequested` event-bus topic both drive:
+/// rather than waking the whole reconciler because one PR needs
+/// attention, reconcile just that PR.
 ///
 /// Scopes every per-PR candidate list [`run_one_pass`] considers —
 /// [`WorkDb::list_chores_pending_merge_check`],
