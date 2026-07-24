@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-engine-metrics-registry = { path = "../metrics-registry" }
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
 

@@ -52,6 +52,28 @@ pub enum EventKind {
     Timer,
 }
 
+impl EventKind {
+    /// Stable per-kind topic name used in the mailbox drop-counter
+    /// metric (`bus_events_dropped_total.<topic>`, see
+    /// [`crate::EventBus`]) and anywhere else a topic needs a
+    /// metric-name-safe string. Snake_case mirror of the variant name.
+    pub fn topic_name(&self) -> &'static str {
+        match self {
+            EventKind::TaskTerminal => "task_terminal",
+            EventKind::ProjectImplDrained => "project_impl_drained",
+            EventKind::ExecutionTerminal => "execution_terminal",
+            EventKind::PrMerged => "pr_merged",
+            EventKind::HostDisabled => "host_disabled",
+            EventKind::DependencyPrereqsSatisfied => "dependency_prereqs_satisfied",
+            EventKind::TransientErrorIdle => "transient_error_idle",
+            EventKind::AnswerAgentDied => "answer_agent_died",
+            EventKind::PrReconcileRequested => "pr_reconcile_requested",
+            EventKind::DispatchReady => "dispatch_ready",
+            EventKind::Timer => "timer",
+        }
+    }
+}
+
 impl Event {
     pub fn kind(&self) -> EventKind {
         match self {
@@ -66,6 +88,30 @@ impl Event {
             Event::PrReconcileRequested { .. } => EventKind::PrReconcileRequested,
             Event::DispatchReady => EventKind::DispatchReady,
             Event::Timer { .. } => EventKind::Timer,
+        }
+    }
+
+    /// The entity a mailbox coalesces this event against: two pending
+    /// events of the same [`EventKind`] with the same key collapse to
+    /// the newest one instead of growing the mailbox under pressure
+    /// (events are state hints, not commands, so dropping a superseded
+    /// one loses nothing — the subscriber re-reads current state
+    /// anyway). Events with no natural entity id (singleton signals
+    /// like `DispatchReady`) share one fixed key so at most one stays
+    /// pending at a time.
+    pub fn coalesce_key(&self) -> String {
+        match self {
+            Event::TaskTerminal { task_id, .. } => task_id.clone(),
+            Event::ProjectImplDrained { project_id } => project_id.clone(),
+            Event::ExecutionTerminal { execution_id, .. } => execution_id.clone(),
+            Event::PrMerged { pr_url, .. } => pr_url.clone(),
+            Event::HostDisabled { host_id } => host_id.clone(),
+            Event::DependencyPrereqsSatisfied { task_id } => task_id.clone(),
+            Event::TransientErrorIdle { execution_id } => execution_id.clone(),
+            Event::AnswerAgentDied { execution_id } => execution_id.clone(),
+            Event::PrReconcileRequested { pr_url } => pr_url.clone(),
+            Event::DispatchReady => String::new(),
+            Event::Timer { deadline_id } => deadline_id.clone(),
         }
     }
 }
