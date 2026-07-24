@@ -82,25 +82,6 @@ pub fn default_recovery_dir() -> Option<PathBuf> {
     Some(boss_log_files::default_state_root()?.join("recovery"))
 }
 
-/// Map an execution id to a safe single-segment patch filename.
-///
-/// Execution ids are already `exec_<hex>_<n>`-shaped, but we defensively
-/// replace anything outside `[A-Za-z0-9_-]` with `_` so a hostile or
-/// malformed id can never escape the recovery directory via `/` or `..`.
-fn patch_file_name(execution_id: &str) -> String {
-    let stem: String = execution_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{stem}.patch")
-}
-
 /// Capture `jj diff --git` for the workspace's working copy.
 ///
 /// Runs with `current_dir` set to the workspace so it operates on that
@@ -157,7 +138,7 @@ pub fn write_patch_if_nonempty(recovery_dir: &Path, execution_id: &str, diff: &s
     let diff = filtered.text.as_str();
     std::fs::create_dir_all(recovery_dir)
         .with_context(|| format!("failed to create recovery dir {}", recovery_dir.display()))?;
-    let path = recovery_dir.join(patch_file_name(execution_id));
+    let path = recovery_dir.join(crate::recovery_apply::patch_file_name(execution_id));
     std::fs::write(&path, diff.as_bytes())
         .with_context(|| format!("failed to write recovery patch {}", path.display()))?;
     Ok(Some(path))
@@ -255,25 +236,6 @@ mod tests {
             None => unsafe { std::env::remove_var(RECOVERY_DIR_ENV) },
         }
         assert_eq!(resolved, Some(PathBuf::from("/tmp/boss-recovery-test")));
-    }
-
-    // ── patch_file_name ───────────────────────────────────────────
-
-    #[test]
-    fn patch_file_name_keeps_well_formed_execution_id() {
-        assert_eq!(
-            patch_file_name("exec_18b434effe0b8340_b"),
-            "exec_18b434effe0b8340_b.patch"
-        );
-    }
-
-    #[test]
-    fn patch_file_name_sanitizes_path_separators_and_traversal() {
-        // A `/` or `..` in the id must never escape the recovery dir.
-        let name = patch_file_name("../../etc/passwd");
-        assert_eq!(name, "______etc_passwd.patch");
-        assert!(!name.contains('/'));
-        assert!(!name.contains(".."));
     }
 
     // ── write_patch_if_nonempty ───────────────────────────────────

@@ -197,9 +197,16 @@ pub fn find_patch(recovery_dir: &Path, execution_id: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Same sanitisation as `recovery_backup::patch_file_name` — anything outside
-/// `[A-Za-z0-9_-]` becomes `_` so a malformed id cannot escape the directory.
-fn patch_file_name(execution_id: &str) -> String {
+/// Map an execution id to a safe single-segment patch filename.
+///
+/// Execution ids are already `exec_<hex>_<n>`-shaped, but we defensively
+/// replace anything outside `[A-Za-z0-9_-]` with `_` so a hostile or
+/// malformed id can never escape the recovery directory via `/` or `..`.
+///
+/// This is the single canonical home for the naming; the backup path
+/// ([`crate::recovery_backup`]) calls it so a patch it writes is the one
+/// [`find_patch`] locates here.
+pub(crate) fn patch_file_name(execution_id: &str) -> String {
     let stem: String = execution_id
         .chars()
         .map(|c| {
@@ -437,6 +444,25 @@ mod tests {
     #[test]
     fn post_image_path_rejects_a_non_header_line() {
         assert_eq!(post_image_path("+++ b/src/main.rs"), None);
+    }
+
+    // ── patch_file_name ───────────────────────────────────────────
+
+    #[test]
+    fn patch_file_name_keeps_well_formed_execution_id() {
+        assert_eq!(
+            patch_file_name("exec_18b434effe0b8340_b"),
+            "exec_18b434effe0b8340_b.patch"
+        );
+    }
+
+    #[test]
+    fn patch_file_name_sanitizes_path_separators_and_traversal() {
+        // A `/` or `..` in the id must never escape the recovery dir.
+        let name = patch_file_name("../../etc/passwd");
+        assert_eq!(name, "______etc_passwd.patch");
+        assert!(!name.contains('/'));
+        assert!(!name.contains(".."));
     }
 
     // ── filter_bookkeeping ────────────────────────────────────────
