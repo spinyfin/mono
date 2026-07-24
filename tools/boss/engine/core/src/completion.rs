@@ -63,10 +63,7 @@ use crate::merge_poller::{
 };
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
-use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, PendingMergeCheck, THREAD_ENTRY_KIND_ANSWER, WorkDb,
-    WorkItem, WorkerPrCompletionTarget,
-};
+use crate::work::{CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget};
 #[cfg(test)]
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
@@ -2667,41 +2664,15 @@ must not be asked to open one",
         let comment_id = execution.work_item_id.clone();
         let replied = match self.work_db.running_answer_agent_run_for_comment(&comment_id) {
             Ok(Some(run)) => {
-                if let Err(err) = self.work_db.complete_answer_agent_run(
-                    &run.id,
-                    ANSWER_AGENT_RUN_STATUS_FAILED,
-                    None,
-                    Some("no_reply_posted"),
-                ) {
+                if let Err(err) = self
+                    .work_db
+                    .recover_unanswered_comment(&comment_id, Some(&run.id), "no_reply_posted")
+                {
                     tracing::warn!(
                         execution_id = %execution.id,
                         run_id = %run.id,
                         ?err,
-                        "answer-agent finalizer: failed to mark the stranded run 'failed'",
-                    );
-                }
-                if let Err(err) = self.work_db.create_comment_thread_entry(
-                    &comment_id,
-                    THREAD_ENTRY_KIND_ANSWER,
-                    "engine",
-                    "I wasn't able to finish answering this question — the session ended before \
-                     posting a reply. Please try again, or answer directly.",
-                    None,
-                    Some(&run.id),
-                ) {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        run_id = %run.id,
-                        ?err,
-                        "answer-agent finalizer: failed to post the no-reply-posted thread entry",
-                    );
-                }
-                if let Err(err) = self.work_db.transition_comment_to_answered(&comment_id) {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        comment_id = %comment_id,
-                        ?err,
-                        "answer-agent finalizer: failed to transition the comment to 'answered'",
+                        "answer-agent finalizer: failed to recover the comment from its unanswered run",
                     );
                 }
                 false
@@ -6859,6 +6830,7 @@ mod tests {
     use super::*;
     use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
     use crate::test_support::*;
+    use crate::work::{ANSWER_AGENT_RUN_STATUS_FAILED, THREAD_ENTRY_KIND_ANSWER};
 
     #[test]
     fn tail_snippet_collapses_whitespace_and_keeps_tail() {

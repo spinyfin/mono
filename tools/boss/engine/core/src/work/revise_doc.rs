@@ -1258,8 +1258,9 @@ mod tests {
         let addressable = make_comment(&db, &artifact_id, "alpha");
         db.set_comment_intent(&addressable.id, "larger_change", 0.9).unwrap();
         // Badged `larger_change` in the sidebar, but its anchor is gone — so
-        // the batch cannot address it. Before this, `[Revise]` reported a
-        // flat success and the operator had no way to know.
+        // the batch cannot address it. An orphaned comment is still badged
+        // `larger_change` in the sidebar, so dropping it silently is
+        // indistinguishable from addressing it.
         let orphaned = make_comment(&db, &artifact_id, "beta");
         db.set_comment_intent(&orphaned.id, "larger_change", 0.9).unwrap();
         db.set_comment_status(&orphaned.id, "orphaned", Some("engine")).unwrap();

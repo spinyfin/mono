@@ -592,12 +592,14 @@ final class CommentLayer: NSObject, ObservableObject {
                     )
                 )
             }
-        } else if intent == .question, comments[index].status != .answering {
+        } else if intent == .question, comments[index].status == .active {
             // Mirrors the engine's `classifying` → `answering` transition
             // (design § "Comment/thread state machine"): classification as
-            // `question` immediately spawns the answer agent. Guarded on not
-            // already `.answering` so reclassifying to `question` twice in a
-            // row doesn't spawn a second run.
+            // `question` immediately spawns the answer agent. Guarded on
+            // `.active`, mirroring the engine's `rehome_reclassified_comment`:
+            // a comment already `.answering`/`.answered`/`.awaitingFollowup`
+            // must not spawn a second run, and a comment claimed `.inRevision`
+            // must not spawn one behind the revision's back.
             comments[index].status = .answering
             runAnswerAgent(for: comment.id)
         }

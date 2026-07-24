@@ -85,10 +85,9 @@ const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anch
 /// than a Rust predicate because all three consumers are queries:
 /// [`WorkDb::comments_banner_state`]'s `unresolved_count`,
 /// [`query_revisable_comments`] (the batch's candidate read), and the guarded
-/// claim UPDATE in [`super::revise_doc`]. Those three were previously three
-/// independently-formatted string literals that happened to agree; a divergence
-/// between them shows up as the banner counting a comment `[Revise]` then
-/// silently drops, so they share one const.
+/// claim UPDATE in [`super::revise_doc`]. All three consumers must use this
+/// one definition; a divergence shows up as the banner counting a comment
+/// `[Revise]` then silently drops.
 ///
 /// `intent` is deliberately not the only term. A comment badged
 /// `larger_change` whose `status` is `answering`/`in_revision`/`orphaned`
@@ -99,7 +98,7 @@ pub(crate) fn revisable_comment_predicate() -> String {
     format!("status = '{COMMENT_STATUS_ACTIVE}' AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')")
 }
 
-/// The complement of [`REVISABLE_COMMENT_PREDICATE`] over the same intent set:
+/// The complement of [`revisable_comment_predicate`] over the same intent set:
 /// comments the sidebar badges `directive`/`larger_change` whose `status`
 /// disqualifies them from a batch. Drives `ReviseDocOutcome::Created`'s
 /// `excluded_comment_ids` so the operator is told what the batch left behind
@@ -328,10 +327,11 @@ impl WorkDb {
     /// isn't left silently stuck). Guarded on `status = 'answering'`,
     /// mirroring the design's idempotency table.
     ///
-    /// Reverse-edge case: [`Self::override_comment_intent`] has no status
-    /// guard, so a user can reclassify a comment away from `question` while
-    /// its answer-agent run is still in flight (still `answering`). When
-    /// that run finishes, landing on `answered` would strand the comment
+    /// Reverse-edge case: [`Self::reclassify_comment_intent`] (the follow-up
+    /// reclassifier) writes `intent` without touching `status`, so a comment
+    /// can be reclassified away from `question` while its answer-agent run is
+    /// still in flight (still `answering`). When that run finishes, landing
+    /// on `answered` would strand the comment
     /// off the `[Revise]` candidate pool exactly like the forward-direction
     /// bug this module fixes — there's no question left to await a
     /// follow-up on. So if `intent` is already `directive`/`larger_change`
@@ -583,18 +583,13 @@ impl WorkDb {
     /// it in via [`Self::latest_answer_agent_run_for_comment`] once the
     /// comment is claimed into a revision.
     ///
-    /// `answering` is included deliberately, reversing this method's original
-    /// behaviour. It used to be excluded on the theory that a live run must
-    /// not be orphaned, with the reverse edge deferred to
-    /// [`Self::transition_comment_to_answered`] — but "deferred to run
-    /// termination" is exactly the operator-visible bug: the comment kept
-    /// showing "Thinking…", stayed off the unresolved count, and `[Revise]`
-    /// dropped it, for as long as the agent kept running. The status must
-    /// re-home *immediately*; standing the live run down is the caller's job
-    /// (`handle_comments_set_intent` supersedes the `answer_agent_runs` row
-    /// and cancels the bound execution). The reverse edge in
-    /// `transition_comment_to_answered` is retained as a backstop for any
-    /// path that reclassifies without going through that handler.
+    /// `answering` is included: a live run is stood down by the caller
+    /// (`handle_comments_set_intent`), so the status must move in this same
+    /// write — a comment left `answering` renders "Thinking…", is off the
+    /// unresolved count, and is dropped by `[Revise]` for as long as the run
+    /// lasts. The reverse edge in [`Self::transition_comment_to_answered`] is
+    /// retained as a backstop for any path that reclassifies without going
+    /// through that handler.
     ///
     /// `in_revision` is NOT reset: the comment has already been claimed by a
     /// `[Revise]` batch whose directive was assembled once, at creation, and
@@ -1585,12 +1580,10 @@ mod tests {
         let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         db.transition_comment_to_answering(&comment.id).unwrap();
 
-        // This assertion is the inverse of what it used to be. Leaving a
-        // reclassified comment `answering` until its run terminated was the
-        // operator-visible bug: it kept showing "Thinking…", stayed off the
-        // unresolved count, and `[Revise]` silently dropped it, for as long
-        // as the agent kept running. Standing the live run down is
-        // `handle_comments_set_intent`'s job; the status must move here.
+        // Standing the live run down is `handle_comments_set_intent`'s job;
+        // the status must move here, immediately, or the comment keeps
+        // showing "Thinking…", stays off the unresolved count, and `[Revise]`
+        // drops it for as long as the run lasts.
         let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
         assert_eq!(overridden.status, "active");
         assert_eq!(overridden.status_actor.as_deref(), Some("user"));

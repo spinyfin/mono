@@ -240,12 +240,38 @@ async fn spawn_answer_agent(
     request_id: &str,
     comment: &WorkComment,
 ) {
+    // Usually `0` (a comment's first classification into bucket 2), but a
+    // manual reclassification back to `question` can re-enter a comment that
+    // already has run history (e.g. from an earlier follow-up loop) — compute
+    // the next turn the same way `respawn_answer_agent_for_followup` does so
+    // `thread_turn` stays a monotonic counter across both entry points.
+    let next_turn = match work_db.latest_answer_agent_run_for_comment(&comment.id) {
+        Ok(Some(run)) => run.thread_turn + 1,
+        Ok(None) => 0,
+        Err(err) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: failed to look up the latest run; defaulting thread_turn to 0",
+            );
+            0
+        }
+    };
+
     let repo_remote_url = match resolve_answer_agent_repo(work_db, comment) {
         AnswerAgentRepoResolution::Resolved(url) => url,
         AnswerAgentRepoResolution::OutOfScope => return,
         AnswerAgentRepoResolution::Failed(error_kind) => {
-            record_answer_agent_spawn_failure(server_state, work_db, session_id, request_id, comment, 0, error_kind)
-                .await;
+            record_answer_agent_spawn_failure(
+                server_state,
+                work_db,
+                session_id,
+                request_id,
+                comment,
+                next_turn,
+                error_kind,
+            )
+            .await;
             return;
         }
     };
@@ -269,7 +295,7 @@ async fn spawn_answer_agent(
         request_id,
         comment,
         &repo_remote_url,
-        0,
+        next_turn,
         "comment_answer_agent_spawned",
         WorkDb::transition_comment_answering_to_active,
     )
@@ -1030,9 +1056,9 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 }
 
 /// Manually reclassify a comment's intent (the sidebar badge's override
-/// control), and **re-home** it: the operator's requirement is that switching
-/// a comment's classification lands it exactly where it would have been had it
-/// been classified that way to begin with. `intent` alone is only the label;
+/// control), and **re-home** it: switching a comment's classification must
+/// land it exactly where it would have been had it been classified that way
+/// to begin with. `intent` alone is only the label;
 /// `status` is the field every consumer actually gates on
 /// (`revisable_comment_predicate`), and the nudge thread entry is what the
 /// sidebar's chip and banner gate on — so all three have to move together.
@@ -1042,7 +1068,7 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 ///
 /// | before | new intent | what happens |
 /// |---|---|---|
-/// | `answering` | `directive`/`larger_change` | stand the live run down (`superseded`), cancel + release its execution, `→ active` (in `override_comment_intent`'s own write, not deferred to run termination), post the nudge |
+/// | `answering` | `directive`/`larger_change` | stand the live run down (`superseded`) and cancel + release its execution *before* the override write, then `→ active`, post the nudge |
 /// | `answered`/`awaiting_followup` | `directive`/`larger_change` | `→ active`, post the nudge |
 /// | `active` | `directive`/`larger_change` | post the nudge (no status change needed) |
 /// | `active` | `question` | spawn the answer agent → `answering` |
@@ -1053,12 +1079,12 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 /// [`WorkDb::override_comment_intent`] for why (immutable directive, live
 /// claiming task, `revise_task_id` provenance) and how the operator is told.
 ///
-/// Everything after the `override_comment_intent` write is best-effort: the
-/// reclassification itself has already landed durably, so a failure to stand a
-/// run down or post a nudge is logged and the response still goes out. The
-/// answer-agent spawn is awaited rather than detached because
-/// `spawn_answer_agent` is itself only bookkeeping plus a coordinator kick —
-/// the agent runs out-of-process.
+/// The `answering`-run stand-down runs *before* the `override_comment_intent`
+/// write (see `stand_down_answer_agent`'s doc for why); everything else is
+/// best-effort relative to that write — a failure to stand a run down or post
+/// a nudge is logged and the response still goes out. The answer-agent spawn
+/// is awaited rather than detached because `spawn_answer_agent` is itself only
+/// bookkeeping plus a coordinator kick — the agent runs out-of-process.
 pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -1092,6 +1118,15 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
         }
     };
 
+    // Stand the live run down *before* the override write: if this happened
+    // after, a `CommentsPostAnswer` landing in between would still see a
+    // `running` run, complete it `replied`, and feed the retracted question's
+    // answer into the revise directive. Standing it down first means the
+    // reply can only win this race if it genuinely beat the reclassification.
+    if status_before == COMMENT_STATUS_ANSWERING && matches!(intent.as_str(), INTENT_DIRECTIVE | INTENT_LARGER_CHANGE) {
+        stand_down_answer_agent(&server_state, &work_db, &comment_id).await;
+    }
+
     let overridden = match work_db.override_comment_intent(&comment_id, &intent) {
         Ok(comment) => comment,
         Err(err) => {
@@ -1100,15 +1135,7 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
         }
     };
 
-    rehome_reclassified_comment(
-        &server_state,
-        &work_db,
-        &session_id,
-        &request_id,
-        &overridden,
-        &status_before,
-    )
-    .await;
+    rehome_reclassified_comment(&server_state, &work_db, &session_id, &request_id, &overridden).await;
 
     // Re-read: the routing side effects above may have moved `status` again
     // (a `question` override spawns the answer agent → `answering`), and the
@@ -1125,32 +1152,26 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
     .await;
 }
 
-/// Run the routing side effects for a manual reclassification — the part
-/// `handle_comments_set_intent` used to skip entirely. `status_before` is the
-/// comment's status prior to [`WorkDb::override_comment_intent`]'s write;
-/// `comment` is the row as that write left it.
+/// Run the routing side effects for a manual reclassification that don't have
+/// to precede the override write. `status_before` is the comment's status
+/// prior to [`WorkDb::override_comment_intent`]'s write; `comment` is the row
+/// as that write left it. The `answering`-run stand-down runs earlier, in
+/// `handle_comments_set_intent`, before the override write itself.
 async fn rehome_reclassified_comment(
     server_state: &Arc<ServerState>,
     work_db: &Arc<WorkDb>,
     session_id: &str,
     request_id: &str,
     comment: &WorkComment,
-    status_before: &str,
 ) {
     match comment.intent.as_deref() {
-        Some(INTENT_DIRECTIVE | INTENT_LARGER_CHANGE) => {
-            if status_before == COMMENT_STATUS_ANSWERING {
-                stand_down_answer_agent(server_state, work_db, comment).await;
-            }
-            // A claimed comment stays claimed (see the table above): no nudge,
-            // because the chip already reads `in_revision` and a nudge would
-            // make it read `reopened` once the batch reconciles.
-            if comment.status == COMMENT_STATUS_ACTIVE {
-                post_nudge_once(work_db, &comment.id);
-            }
+        // A claimed comment stays claimed (see the table above): no nudge,
+        // because the chip already reads `in_revision` and a nudge would make
+        // it read `reopened` once the batch reconciles.
+        Some(INTENT_DIRECTIVE | INTENT_LARGER_CHANGE) if comment.status == COMMENT_STATUS_ACTIVE => {
+            post_nudge_once(work_db, &comment.id);
         }
-        // Bucket 2 was previously unreachable via override entirely. The
-        // `active` guard is load-bearing: `transition_comment_to_answering`
+        // The `active` guard is load-bearing: `transition_comment_to_answering`
         // only accepts that source status, and re-affirming `question` on a
         // comment already `answering`/`answered`/`awaiting_followup` (or one
         // claimed `in_revision`) must not start a second run.
@@ -1176,34 +1197,34 @@ async fn rehome_reclassified_comment(
 ///    already-terminal row, which is an expected outcome here (the agent may
 ///    have finished between the read and this call), so it is logged at debug.
 ///
-/// The comment itself is already `active` by this point —
-/// [`WorkDb::override_comment_intent`] moves it in the same write as the
-/// intent, so the sidebar's count, chip, and `[Revise]` eligibility flip
-/// immediately rather than waiting on any of this.
-async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<WorkDb>, comment: &WorkComment) {
-    match work_db.stand_down_answer_agent_run(&comment.id) {
+/// This runs *before* [`WorkDb::override_comment_intent`]'s write, so the run
+/// is superseded while the comment is still `answering` — a `CommentsPostAnswer`
+/// racing the reclassification can only complete the run `replied` if it
+/// genuinely beat this call, not the override write.
+async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<WorkDb>, comment_id: &str) {
+    match work_db.stand_down_answer_agent_run(comment_id) {
         Ok(Some(run)) => tracing::info!(
-            comment_id = %comment.id,
+            comment_id,
             run_id = %run.id,
             "comment reclassified away from 'question': answer-agent run superseded",
         ),
         Ok(None) => tracing::debug!(
-            comment_id = %comment.id,
+            comment_id,
             "comment reclassified away from 'question': no running answer-agent run to stand down",
         ),
         Err(err) => tracing::warn!(
-            comment_id = %comment.id,
+            comment_id,
             err = %err,
             "comment reclassified away from 'question': failed to supersede the running answer-agent run",
         ),
     }
 
-    let execution = match work_db.live_answer_agent_execution_for_comment(&comment.id) {
+    let execution = match work_db.live_answer_agent_execution_for_comment(comment_id) {
         Ok(Some(execution)) => execution,
         Ok(None) => return,
         Err(err) => {
             tracing::warn!(
-                comment_id = %comment.id,
+                comment_id,
                 err = %err,
                 "comment reclassified away from 'question': failed to look up the bound answer-agent execution",
             );
@@ -1213,7 +1234,7 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
 
     if let Err(err) = work_db.cancel_execution(&execution.id) {
         tracing::debug!(
-            comment_id = %comment.id,
+            comment_id,
             execution_id = %execution.id,
             err = %err,
             "comment reclassified away from 'question': answer-agent execution was already terminal",
@@ -1221,7 +1242,7 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
         return;
     }
     tracing::info!(
-        comment_id = %comment.id,
+        comment_id,
         execution_id = %execution.id,
         "comment reclassified away from 'question': answer-agent execution cancelled",
     );
@@ -1246,10 +1267,10 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
 /// The nudge is what `revisionChipState` (macOS `Comment.swift`) gates the
 /// "Nudge sent" chip and the "click [Revise] to start one" banner on — a
 /// comment that reaches `active` with a revisable intent and no nudge renders
-/// chip-less and visibly unlike its peers, which is half of what the operator
-/// saw. Idempotent because a comment can be reclassified back and forth, and
-/// because the classifier or the follow-up bridge may already have posted one;
-/// a second identical entry would just duplicate the banner text in the thread.
+/// chip-less and visibly unlike its peers. Idempotent because a comment can be
+/// reclassified back and forth, and because the classifier or the follow-up
+/// bridge may already have posted one; a second identical entry would just
+/// duplicate the banner text in the thread.
 fn post_nudge_once(work_db: &Arc<WorkDb>, comment_id: &str) {
     match work_db.list_comment_thread_entries(comment_id) {
         Ok(entries) if entries.iter().any(|e| e.entry_kind == THREAD_ENTRY_KIND_NUDGE) => return,
@@ -1907,8 +1928,7 @@ mod tests {
         }
     }
 
-    // --- Manual reclassification re-homes the comment (T2265 follow-up:
-    // `CommentsSetIntent` used to write `intent` and run zero routing) ---
+    // --- Manual reclassification: the routing side effects of CommentsSetIntent ---
 
     async fn set_intent(
         server_state: &Arc<ServerState>,
@@ -2025,7 +2045,6 @@ mod tests {
         let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
-        // Bucket 2 was previously unreachable via override entirely.
         let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
         work_db
             .override_comment_intent(&comment.id, INTENT_LARGER_CHANGE)
@@ -2046,6 +2065,49 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "an execution must be queued for the coordinator to dispatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_intent_to_question_after_reclassification_continues_the_thread_turn_counter() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
+
+        // A prior follow-up turn already on the books (thread_turn 0),
+        // completed before this reclassification.
+        let prior_run = work_db
+            .create_answer_agent_run(
+                &comment.id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                &comment.doc_version,
+                0,
+            )
+            .unwrap();
+        work_db
+            .complete_answer_agent_run(
+                &prior_run.id,
+                boss_protocol::ANSWER_AGENT_RUN_STATUS_REPLIED,
+                Some("first answer"),
+                None,
+            )
+            .unwrap();
+
+        work_db
+            .override_comment_intent(&comment.id, INTENT_LARGER_CHANGE)
+            .unwrap();
+
+        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_QUESTION).await;
+
+        let run = work_db
+            .running_answer_agent_run_for_comment(&comment.id)
+            .unwrap()
+            .expect("a fresh run must be tracking the re-affirmed question");
+        assert_eq!(
+            run.thread_turn, 1,
+            "thread_turn must continue from run history, not restart at 0"
         );
     }
 

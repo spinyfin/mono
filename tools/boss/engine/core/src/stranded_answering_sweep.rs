@@ -39,13 +39,16 @@
 //!   or never created; and
 //! - it still has a `running` `answer_agent_runs` row, i.e. no reply ever landed.
 //!
-//! Recovery is deliberately identical to `finalize_answer_agent`'s
-//! no-reply-posted path — mark the run `failed` with a distinguishing
-//! `error_kind`, post the same apology thread entry so the thread isn't
-//! silently stuck, then `transition_comment_to_answered`, which is intent-aware
-//! and lands a comment already reclassified to `directive`/`larger_change` on
-//! `active` instead. This sweep is a *substitute for a Stop that never came*,
-//! not a second, divergent recovery policy.
+//! Recovery shares [`WorkDb::recover_unanswered_comment`] with
+//! `finalize_answer_agent`'s no-reply-posted path: mark the run `failed` with a
+//! distinguishing `error_kind`, post the apology thread entry so the thread
+//! isn't silently stuck, then `transition_comment_to_answered`, which is
+//! intent-aware and lands a comment already reclassified to
+//! `directive`/`larger_change` on `active` instead. This sweep is a
+//! *substitute for a Stop that never came*, not a second, divergent recovery
+//! policy — except when the answer already landed (the run went `replied` or
+//! `superseded` but the comment's transition didn't follow), in which case
+//! only the transition runs; see `recover`.
 //!
 //! ## Safety
 //!
@@ -68,9 +71,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER, WorkComment,
-};
+use boss_protocol::{ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, WorkComment};
 
 use crate::sweep_loop::{SweepOutcome, confirm_two_pass};
 use crate::work::WorkDb;
@@ -82,13 +83,6 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// Distinct from `finalize_answer_agent`'s `no_reply_posted` so a run whose
 /// Stop hook never fired at all is attributable in the run history.
 pub const STRANDED_ERROR_KIND: &str = "stranded_no_stop";
-
-/// The apology entry standing in for the answer that never arrived. Kept
-/// verbatim in sync with `finalize_answer_agent`'s text: from the operator's
-/// side these are the same event, and two different wordings for it would read
-/// as two different failures.
-const STRANDED_THREAD_BODY: &str = "I wasn't able to finish answering this question — the session ended before \
-     posting a reply. Please try again, or answer directly.";
 
 /// Counts from one pass; logged at `info` when any recovery occurred.
 #[derive(Debug, Default)]
@@ -203,27 +197,48 @@ fn is_stranded(work_db: &WorkDb, comment: &WorkComment) -> bool {
     }
 }
 
-/// Apply `finalize_answer_agent`'s no-reply-posted recovery to one stranded
-/// comment. Returns whether the comment actually left `answering`.
+/// Recover one stranded comment. Returns whether the comment actually left
+/// `answering`.
+///
+/// If the latest run already reached `replied` or `superseded`, the real
+/// answer (or the reclassification that superseded it) already reached the
+/// thread — only the comment's transition didn't follow. Posting the apology
+/// in that case would land it directly under a real answer, so this skips
+/// straight to the transition. Otherwise this is a genuine no-reply-ever-came
+/// stranding, and it shares [`WorkDb::recover_unanswered_comment`] with
+/// `finalize_answer_agent`'s no-reply-posted path.
 fn recover(work_db: &WorkDb, comment: &WorkComment) -> bool {
-    let run_id = match work_db.running_answer_agent_run_for_comment(&comment.id) {
-        Ok(Some(run)) => {
-            if let Err(err) = work_db.complete_answer_agent_run(
-                &run.id,
-                ANSWER_AGENT_RUN_STATUS_FAILED,
-                None,
-                Some(STRANDED_ERROR_KIND),
-            ) {
+    let latest_run = work_db.latest_answer_agent_run_for_comment(&comment.id).ok().flatten();
+    let answer_already_landed = latest_run.as_ref().is_some_and(|run| {
+        matches!(
+            run.status.as_str(),
+            ANSWER_AGENT_RUN_STATUS_REPLIED | ANSWER_AGENT_RUN_STATUS_SUPERSEDED
+        )
+    });
+
+    if answer_already_landed {
+        return match work_db.transition_comment_to_answered(&comment.id) {
+            Ok(recovered) => {
                 tracing::warn!(
                     comment_id = %comment.id,
-                    run_id = %run.id,
-                    ?err,
-                    "stranded-answering sweep: failed to mark the stranded run 'failed'",
+                    status = %recovered.status,
+                    "stranded-answering sweep: recovered a comment whose answer had already landed",
                 );
+                true
             }
-            Some(run.id)
-        }
-        Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    ?err,
+                    "stranded-answering sweep: failed to transition an already-answered comment out of 'answering'",
+                );
+                false
+            }
+        };
+    }
+
+    let run_id = match work_db.running_answer_agent_run_for_comment(&comment.id) {
+        Ok(run) => run.map(|run| run.id),
         Err(err) => {
             tracing::warn!(
                 comment_id = %comment.id,
@@ -234,22 +249,7 @@ fn recover(work_db: &WorkDb, comment: &WorkComment) -> bool {
         }
     };
 
-    if let Err(err) = work_db.create_comment_thread_entry(
-        &comment.id,
-        THREAD_ENTRY_KIND_ANSWER,
-        THREAD_ENTRY_AUTHOR_ENGINE,
-        STRANDED_THREAD_BODY,
-        None,
-        run_id.as_deref(),
-    ) {
-        tracing::warn!(
-            comment_id = %comment.id,
-            ?err,
-            "stranded-answering sweep: failed to post the stranded-recovery thread entry",
-        );
-    }
-
-    match work_db.transition_comment_to_answered(&comment.id) {
+    match work_db.recover_unanswered_comment(&comment.id, run_id.as_deref(), STRANDED_ERROR_KIND) {
         Ok(recovered) => {
             tracing::warn!(
                 comment_id = %comment.id,
@@ -273,7 +273,10 @@ fn recover(work_db: &WorkDb, comment: &WorkComment) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::{CommentAnchor, CreateCommentInput, INTENT_LARGER_CHANGE, INTENT_QUESTION};
+    use boss_protocol::{
+        ANSWER_AGENT_RUN_STATUS_FAILED, CommentAnchor, CreateCommentInput, INTENT_LARGER_CHANGE, INTENT_QUESTION,
+        THREAD_ENTRY_KIND_ANSWER,
+    };
     use std::path::PathBuf;
 
     fn mem_db() -> WorkDb {
@@ -375,6 +378,47 @@ mod tests {
         let second = run_one_pass(&db, &mut seen).await;
         assert_eq!(second.recovered, 1);
         assert_eq!(db.get_comment(&comment_id).unwrap().unwrap().status, "answered");
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_post_an_apology_over_an_answer_that_already_landed() {
+        let db = mem_db();
+        let comment_id = seed_answering(&db, INTENT_QUESTION);
+        let run = db.running_answer_agent_run_for_comment(&comment_id).unwrap().unwrap();
+        // Mirrors `CommentsPostAnswer`: the run completed and the real answer
+        // was posted, but the comment's `answering -> answered` transition
+        // failed, so the comment is still `answering` with a `replied` run.
+        db.complete_answer_agent_run(
+            &run.id,
+            boss_protocol::ANSWER_AGENT_RUN_STATUS_REPLIED,
+            Some("here you go"),
+            None,
+        )
+        .unwrap();
+        db.create_comment_thread_entry(
+            &comment_id,
+            boss_protocol::THREAD_ENTRY_KIND_ANSWER,
+            "engine",
+            "here you go",
+            None,
+            Some(&run.id),
+        )
+        .unwrap();
+        let mut seen = HashSet::new();
+
+        run_one_pass(&db, &mut seen).await;
+        let second = run_one_pass(&db, &mut seen).await;
+        assert_eq!(second.recovered, 1);
+
+        let recovered = db.get_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(recovered.status, "answered");
+        let entries = db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the real answer must not be followed by an apology entry"
+        );
+        assert_eq!(entries[0].body, "here you go");
     }
 
     #[tokio::test]

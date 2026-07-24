@@ -12,6 +12,14 @@
 
 use super::*;
 
+/// The apology entry standing in for the answer that never arrived. Shared by
+/// [`WorkDb::recover_unanswered_comment`]'s two callers (`finalize_answer_agent`
+/// and `stranded_answering_sweep::recover`) so the wording can't drift between
+/// them: from the operator's side these are the same event, and two different
+/// wordings for it would read as two different failures.
+pub(crate) const ANSWER_AGENT_NO_REPLY_BODY: &str = "I wasn't able to finish answering this question — the session ended before \
+     posting a reply. Please try again, or answer directly.";
+
 impl WorkDb {
     /// Column list for every `answer_agent_runs` SELECT. Order must match
     /// [`map_answer_agent_run`].
@@ -271,6 +279,43 @@ impl WorkDb {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Recover a comment stuck `answering` whose answer-agent run ended
+    /// without ever posting a reply: mark `run_id` (if still `running`)
+    /// `failed` with `error_kind`, post the no-reply apology thread entry, and
+    /// transition the comment out of `answering`
+    /// ([`Self::transition_comment_to_answered`] folds a reclassified comment
+    /// straight into `active` instead of `answered`). Shared by
+    /// `CompletionHandler::finalize_answer_agent` (Stop fired, run still
+    /// `running`) and `stranded_answering_sweep::recover` (Stop never fired at
+    /// all) — the two paths differ only in `error_kind` and whether `run_id`
+    /// is still around to mark `failed`.
+    pub(crate) fn recover_unanswered_comment(
+        &self,
+        comment_id: &str,
+        run_id: Option<&str>,
+        error_kind: &str,
+    ) -> Result<WorkComment> {
+        if let Some(run_id) = run_id
+            && let Err(err) =
+                self.complete_answer_agent_run(run_id, ANSWER_AGENT_RUN_STATUS_FAILED, None, Some(error_kind))
+        {
+            tracing::warn!(comment_id, run_id, ?err, "failed to mark the stranded run 'failed'");
+        }
+
+        if let Err(err) = self.create_comment_thread_entry(
+            comment_id,
+            THREAD_ENTRY_KIND_ANSWER,
+            THREAD_ENTRY_AUTHOR_ENGINE,
+            ANSWER_AGENT_NO_REPLY_BODY,
+            None,
+            run_id,
+        ) {
+            tracing::warn!(comment_id, ?err, "failed to post the no-reply-posted thread entry");
+        }
+
+        self.transition_comment_to_answered(comment_id)
     }
 }
 

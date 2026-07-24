@@ -419,6 +419,21 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
     }
 
+    func testSetIntentToQuestionLeavesAClaimedCommentInRevision() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.reviseDoc()
+        XCTAssertEqual(layer.comments[0].status, .inRevision)
+
+        // Mirrors the engine's `rehome_reclassified_comment`, which guards the
+        // `question` spawn on `status == .active` so a claimed comment can't
+        // spawn an answer agent behind the revision's back.
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .inRevision)
+        XCTAssertTrue(layer.comments[0].threadEntries.allSatisfy { $0.entryKind != .answer })
+    }
+
     func testPostFollowupIgnoredBeforeAnswered() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
