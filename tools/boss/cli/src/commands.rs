@@ -354,7 +354,7 @@ pub(crate) enum ProjectCommand {
 
 /// Subcommands under `boss task ...`.
 ///
-/// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
+/// The kind-agnostic verbs (`show`, `update`, `move`, `cancel`, `delete`,
 /// `restore`, `depend`, `bind-pr`) operate on any leaf work item by id. A chore
 /// *is* a kind of task — the engine already knows the kind from the
 /// id, so the noun is permissive. The same verbs are mirrored under
@@ -409,6 +409,10 @@ pub(crate) enum TaskCommand {
     Update(TaskUpdateArgs),
     /// Move any leaf work item (task or chore) into a different status.
     Move(TaskMoveArgs),
+    /// Cancel any leaf work item (task or chore) by id. Shorthand for
+    /// `boss task move --to cancelled`: sets the terminal `Cancelled`
+    /// status without soft-deleting the row (unlike `delete`).
+    Cancel(TaskIdArg),
     /// Delete any leaf work item (task or chore) by id.
     Delete(TaskDeleteArgs),
     /// Restore a soft-deleted leaf work item (task or chore) — the
@@ -463,7 +467,11 @@ pub(crate) enum TaskCommand {
     /// The worker's deliverable is a new commit on the *parent task's*
     /// existing PR branch — no new PR is opened. Gated: the parent task
     /// must have an open, unmerged PR; the gate fires against the chain
-    /// root's PR even when `--parent` itself is a revision.
+    /// root's PR even when `--parent` itself is a revision. If a worker
+    /// elsewhere in the chain still looks live (`running`/`waiting_human`),
+    /// a stderr advisory is printed after creation — the new revision is
+    /// still created and queued to run after it; this is visibility only,
+    /// not a block.
     #[command(name = "create-revision")]
     CreateRevision(RevisionCreateArgs),
     /// List `kind = 'revision'` tasks for a product. Revisions are excluded
@@ -493,6 +501,8 @@ pub(crate) enum ChoreCommand {
     Update(TaskUpdateArgs),
     /// Alias for `boss task move`. Accepts any leaf work item id.
     Move(TaskMoveArgs),
+    /// Alias for `boss task cancel`. Accepts any leaf work item id.
+    Cancel(TaskIdArg),
     /// Alias for `boss task delete`. Accepts any leaf work item id.
     Delete(TaskDeleteArgs),
     /// Alias for `boss task restore`. Accepts any leaf work item id.
@@ -2783,6 +2793,7 @@ pub(crate) enum TaskStatusArg {
     Review,
     Done,
     Archived,
+    Cancelled,
 }
 
 /// `boss task|chore move --to`. Same board-name-primary,
@@ -2799,6 +2810,7 @@ pub(crate) enum MoveTarget {
     Done,
     Blocked,
     Archived,
+    Cancelled,
 }
 
 impl ProductStatus {
@@ -2861,6 +2873,7 @@ impl TaskStatusArg {
             Self::Review => "review",
             Self::Done => "done",
             Self::Archived => "archived",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -2883,6 +2896,7 @@ impl MoveTarget {
             Self::Done => "done",
             Self::Blocked => "blocked",
             Self::Archived => "archived",
+            Self::Cancelled => "cancelled",
         }
     }
 }

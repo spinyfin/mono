@@ -675,6 +675,39 @@ fn move_target_accepts_board_name_primary() {
 }
 
 #[test]
+fn move_target_accepts_cancelled() {
+    let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "cancelled"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Move(args),
+        } => assert!(matches!(args.target, MoveTarget::Cancelled)),
+        _ => panic!("expected task move command"),
+    }
+}
+
+#[test]
+fn parses_task_cancel_command() {
+    let cli = Cli::parse_from(["boss", "task", "cancel", "T441"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Cancel(args),
+        } => assert_eq!(args.id, "T441"),
+        _ => panic!("expected task cancel command"),
+    }
+}
+
+#[test]
+fn parses_chore_cancel_command() {
+    let cli = Cli::parse_from(["boss", "chore", "cancel", "task_1"]);
+    match cli.command {
+        Commands::Chore {
+            command: ChoreCommand::Cancel(args),
+        } => assert_eq!(args.id, "task_1"),
+        _ => panic!("expected chore cancel command"),
+    }
+}
+
+#[test]
 fn parses_task_depend_add_with_product() {
     let cli = Cli::parse_from(["boss", "task", "depend", "add", "T2075", "T2074", "--product", "boss"]);
     match cli.command {

@@ -142,7 +142,10 @@ enum Command {
     /// Equivalent to `bossctl pause state`.
     State,
     /// Inspect the dispatch-pipeline event stream (file-scan only —
-    /// works when the engine is wedged).
+    /// works when the engine is wedged), and pause/resume/inspect
+    /// dispatch specifically via its `pause`/`resume`/`state` subcommands
+    /// (see top-level `bossctl pause`/`resume`/`state` to act on every
+    /// system at once instead of dispatch alone).
     Dispatch {
         #[command(subcommand)]
         action: DispatchAction,

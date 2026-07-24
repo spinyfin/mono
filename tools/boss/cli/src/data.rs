@@ -579,7 +579,7 @@ pub(crate) async fn run_create_revision(
     let task = create_revision_rpc(
         client,
         CreateRevisionInput::builder()
-            .parent_task_id(parent_id)
+            .parent_task_id(parent_id.clone())
             .description(description.clone())
             .maybe_name(name)
             .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
@@ -593,12 +593,68 @@ pub(crate) async fn run_create_revision(
             .build(),
     )
     .await?;
+    warn_if_chain_has_live_worker(client, &parent_id).await;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
         if !ctx.quiet {
             println!("created revision T{}: {}", task.short_id.unwrap_or(0), description);
         }
     })?;
     Ok(())
+}
+
+/// Best-effort advisory printed after `create-revision` succeeds: if any
+/// execution anywhere in the parent's revision chain (the chain root itself
+/// or a sibling revision) is still `running`/`waiting_human`, a worker may
+/// still be actively landing commits on the shared PR branch. The engine
+/// already serializes dispatch for back-to-back revisions on the same PR
+/// (see coordinator dispatch gating), so this is visibility only — it does
+/// not block or delay the new revision.
+///
+/// Failures here (chain-root resolution or the executions lookup) are
+/// swallowed: this is a courtesy notice, not part of the create-revision
+/// contract, so a transient RPC hiccup must not fail an otherwise-successful
+/// creation.
+async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str) {
+    let Some(chain_root_id) = resolve_chain_root_id(client, parent_id).await else {
+        return;
+    };
+    let Ok(executions) = list_executions_for_chain(client, &chain_root_id).await else {
+        return;
+    };
+    let live: Vec<String> = executions
+        .iter()
+        .filter(|e| e.status.is_live())
+        .map(|e| format!("{} ({})", e.work_item_id, e.status.as_str()))
+        .collect();
+    if !live.is_empty() {
+        eprintln!(
+            "warning: a worker still appears to be active on this PR's revision chain: {}. It may \
+             still be landing commits — the new revision is queued to run after it, but check for \
+             conflicts once both have landed.",
+            live.join(", "),
+        );
+    }
+}
+
+/// Walk `parent_task_id` links up from `task_id` to the chain root (the
+/// first ancestor with no `parent_task_id`), capped at 20 hops to mirror
+/// the engine's own chain-walk cap (`revision_helpers.rs`). Returns `None`
+/// on any lookup failure or unresolvable chain — callers treat this as
+/// "skip the advisory", not an error.
+async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> Option<String> {
+    let mut current = task_id.to_owned();
+    for _ in 0..20 {
+        let item = get_work_item(client, &current).await.ok()?;
+        let parent_task_id = match &item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.parent_task_id.clone(),
+            _ => None,
+        };
+        match parent_task_id {
+            Some(parent) => current = parent,
+            None => return Some(current),
+        }
+    }
+    None
 }
 
 pub(crate) async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
@@ -1389,10 +1445,28 @@ pub(crate) async fn list_executions_for_item(
     client: &mut BossClient,
     work_item_id: &str,
 ) -> Result<Vec<WorkExecution>, CliError> {
+    list_executions_for_item_impl(client, work_item_id, false).await
+}
+
+/// Like [`list_executions_for_item`] but also pulls in every revision task's
+/// executions for `work_item_id`'s revision chain (`work_item_id` must be
+/// the chain root — see `ListExecutions.include_revision_chain`).
+pub(crate) async fn list_executions_for_chain(
+    client: &mut BossClient,
+    chain_root_id: &str,
+) -> Result<Vec<WorkExecution>, CliError> {
+    list_executions_for_item_impl(client, chain_root_id, true).await
+}
+
+async fn list_executions_for_item_impl(
+    client: &mut BossClient,
+    work_item_id: &str,
+    include_revision_chain: bool,
+) -> Result<Vec<WorkExecution>, CliError> {
     match client
         .send_request(&FrontendRequest::ListExecutions {
             work_item_id: Some(work_item_id.to_owned()),
-            include_revision_chain: false,
+            include_revision_chain,
         })
         .await
         .map_err(CliError::internal)?

@@ -736,6 +736,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
+        TaskCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         TaskCommand::Reorder(args) => {
@@ -843,6 +844,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
         ChoreCommand::Show(args) => run_show_leaf(&mut client, ctx, args, true).await,
         ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         ChoreCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
@@ -1117,6 +1119,25 @@ pub(crate) async fn run_move_leaf(
     let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Moved {label}"), &item, None, false);
+    })
+}
+
+/// Shared handler for `boss task cancel` and `boss chore cancel`.
+/// Shorthand for `run_move_leaf` with a fixed `cancelled` target.
+pub(crate) async fn run_cancel_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskIdArg,
+) -> Result<(), CliError> {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
+    let patch = WorkItemPatch {
+        status: Some("cancelled".to_owned()),
+        ..WorkItemPatch::default()
+    };
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
+    let item = with_display_status(item);
+    print_entity(ctx, &serde_json::json!({ label: item }), || {
+        print_task_details(&format!("Cancelled {label}"), &item, None, false);
     })
 }
 
