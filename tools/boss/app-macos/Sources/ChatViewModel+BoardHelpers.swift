@@ -214,11 +214,20 @@ extension ChatViewModel {
     /// presentation, matching the rule "every visible card resolves
     /// to the same URL".
     var workBoardRepoMode: WorkBoardRepoMode {
-        guard let product = selectedProduct else { return .none }
-        return WorkBoardRepoMode.compute(
-            productRepoURL: product.repoRemoteURL,
-            cards: visibleWorkItems
-        )
+        if let cached = cachedWorkBoardRepoMode {
+            return cached
+        }
+        let computed: WorkBoardRepoMode
+        if let product = selectedProduct {
+            computed = WorkBoardRepoMode.compute(
+                productRepoURL: product.repoRemoteURL,
+                cards: visibleWorkItems
+            )
+        } else {
+            computed = .none
+        }
+        cachedWorkBoardRepoMode = computed
+        return computed
     }
 
     /// Distinct repo URLs known under a product, ordered by recency
