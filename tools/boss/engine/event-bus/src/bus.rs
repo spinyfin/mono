@@ -214,23 +214,42 @@ impl EventBus {
     /// Fan `event` out to every matching subscriber. Non-blocking: never
     /// awaits, never blocks the caller on a slow or stalled subscriber.
     pub fn publish(&self, event: Event) {
-        let subscribers = self.subscribers.lock().expect("event bus subscriber lock poisoned");
+        let mut subscribers = self.subscribers.lock().expect("event bus subscriber lock poisoned");
+        // A dropped `Subscription` leaves its `Mailbox` referenced only by
+        // this `Subscriber` entry (strong count 1): nothing will ever
+        // drain it again, so every future matching publish would just
+        // fill it up and then count as a drop forever. Prune those before
+        // fanning out so the drop counter stays a signal of real
+        // backpressure, not orphaned subscribers.
+        subscribers.retain(|subscriber| Arc::strong_count(&subscriber.mailbox) > 1);
+        // Tally drops locally instead of touching the registry (a heap
+        // allocation plus its counters write lock) on every dropped
+        // event while still holding the subscribers lock -- under a
+        // pathological burst that would serialize every other publisher
+        // behind both locks. Every subscriber in one `publish` call sees
+        // the same `event`, so a single count-and-record after the
+        // subscribers guard is released covers the whole fan-out.
+        let mut dropped = 0u64;
         for subscriber in subscribers.iter() {
             if !subscriber.filter.matches(&event) {
                 continue;
             }
             if let SendOutcome::Dropped = subscriber.mailbox.try_send(event.clone()) {
-                self.record_drop(event.kind());
+                dropped += 1;
             }
+        }
+        drop(subscribers);
+        if dropped > 0 {
+            self.record_drop(event.kind(), dropped);
         }
     }
 
-    fn record_drop(&self, kind: EventKind) {
+    fn record_drop(&self, kind: EventKind, count: u64) {
         let Some(registry) = &self.metrics else {
             return;
         };
         let name = format!("{DROPPED_COUNTER_PREFIX}.{}", kind.topic_name());
-        registry.counter_inc_by_dynamic(&name, DROPPED_COUNTER_DESCRIPTION, 1);
+        registry.counter_inc_by_dynamic(&name, DROPPED_COUNTER_DESCRIPTION, count);
     }
 }
 

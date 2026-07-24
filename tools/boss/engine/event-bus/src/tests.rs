@@ -92,12 +92,6 @@ async fn topic_filter_with_multiple_kinds_matches_any() {
     );
 }
 
-// `full_mailbox_drops_event_instead_of_blocking` (which used to publish
-// two identical events into a capacity-1 mailbox) is removed: under the
-// always-coalesce behaviour those two events coalesce rather than drop,
-// so the case is now covered by `full_mailbox_drops_distinct_key_event_and_counts_it`
-// below, which uses two distinct keys and also asserts the drop counter.
-
 #[tokio::test]
 async fn full_mailbox_coalesces_same_key_event_instead_of_dropping() {
     // Capacity 1, filled with a pending event for task_1. A second event
@@ -277,6 +271,42 @@ async fn pending_index_rebases_correctly_after_a_pop_with_multiple_keys_resident
 }
 
 #[tokio::test]
+async fn publish_prunes_a_dropped_subscription_instead_of_counting_it_forever() {
+    // A subscriber that goes away (its `Subscription` dropped, e.g. the
+    // reconciler task exited) must stop being fanned out to. Before the
+    // orphan is pruned, its mailbox fills once and then every later
+    // matching publish would count as a drop forever, even though
+    // nothing is actually falling behind -- there is no consumer left to
+    // ever catch up.
+    let registry = Arc::new(Registry::new());
+    let bus = EventBus::with_metrics(registry.clone());
+    let sub = bus.subscribe_with_capacity(TopicFilter::kind(EventKind::TaskTerminal), 1);
+
+    // Fills the orphan's one mailbox slot while the subscription is still
+    // alive; not itself a drop.
+    bus.publish(Event::TaskTerminal {
+        task_id: "task_1".to_string(),
+        project_id: "proj_1".to_string(),
+    });
+    drop(sub);
+
+    // Every one of these has a distinct coalesce key, so pre-pruning
+    // behaviour would count each as a drop against the orphaned mailbox.
+    for i in 0..5 {
+        bus.publish(Event::TaskTerminal {
+            task_id: format!("task_{i}"),
+            project_id: "proj_1".to_string(),
+        });
+    }
+
+    assert_eq!(
+        registry.counter_value("bus_events_dropped_total.task_terminal"),
+        None,
+        "the orphaned subscriber must be pruned before it can rack up phantom drops"
+    );
+}
+
+#[tokio::test]
 async fn drop_counter_is_independent_per_topic() {
     let registry = Arc::new(Registry::new());
     let bus = EventBus::with_metrics(registry.clone());
@@ -349,13 +379,14 @@ async fn recv_parked_before_drop_still_wakes_up_with_none() {
     // to register with `Notify` and genuinely park -- queue empty, bus
     // not yet closed -- before the bus is dropped from the main task.
     // `Mailbox::close` must still wake it, or this hangs and the test
-    // times out. Note this cannot deterministically hit the specific
-    // lock-release-then-register interleaving that made the lost-wakeup
-    // bug possible -- that window is far too narrow for a wall-clock
+    // times out. Note this cannot deterministically hit the narrow
+    // window between a `recv` releasing the state lock and awaiting
+    // `notified()` -- that window is far too narrow for a wall-clock
     // sleep to land in reliably -- so it does not by itself prove that
-    // bug fixed; `Mailbox::close`'s use of `notify_one` (which stores a
-    // permit even for a not-yet-registered waiter, unlike
-    // `notify_waiters`) is what closes that window.
+    // window is safe. The invariant that closes it: `Mailbox::close`
+    // must use `notify_one`, which stores a permit for a not-yet-
+    // registered waiter; `notify_waiters` would let a `recv` in that
+    // window miss the close and hang.
     let bus = EventBus::new();
     let mut sub = bus.subscribe(TopicFilter::kind(EventKind::DispatchReady));
 
