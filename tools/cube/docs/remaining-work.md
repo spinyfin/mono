@@ -58,8 +58,8 @@ directly.
 ### Already landed
 
 - ✓ Fix the `head_commit` template parsing bug — `current_workspace_commit`
-  now uses `--no-graph -r @` (`app.rs:659`); covered by tests in
-  `app.rs` (e.g. line 1075).
+  now uses `--no-graph -r @` (`app/jj.rs`); covered by tests in
+  `app/tests/`.
 - ✓ Drop the `--database` CLI flag from the prereq list — superseded
   by the single-global-database principle above.
 - ✓ Add lease lifecycle: TTL (default 1800s, set on `claim_workspace`),
@@ -78,9 +78,9 @@ force-release` frees a stuck lease without running the workspace
   now clones a fresh workspace (from `repo.source` if set, else from
   `repo.origin`) when no free slot is available, picks the next
   numeric id (`<prefix>{max+1:03}`), syncs it into the registry, and
-  leases it. Implemented in `app.rs::auto_create_workspace`.
+  leases it. Implemented in `app/provision.rs::auto_create_workspace`.
 - ✓ Implement `cube workspace setup` and lease-time provisioning
-  (`setup.rs`, `app.rs::run_setup_for_workspace`). Reads
+  (`setup.rs`, `app/provision.rs::run_setup_for_workspace`). Reads
   `<workspace>/.cube/setup.yaml`, runs steps under `on-create` /
   `on-fingerprint-change` / `always` policies, persists per-step
   fingerprints in the new `workspace_setup` table, and surfaces
@@ -94,21 +94,21 @@ doc are unbuilt and not required for Boss V2 (which drives `jj` / `gh`
 / `git` directly inside leased workspaces). They are still cube's
 broader roadmap.
 
-- [ ] **`change checkout`** (`app.rs:542`, `NotImplemented`).
+- [ ] **`change checkout`** (`app/change.rs`, `NotImplemented`).
       `change create` and `change info` are already implemented
-      (`app.rs:474`, `app.rs:545`); only `checkout` remains to round
+      (`app/change.rs`); only `checkout` remains to round
       out the local change-graph commands.
-- [ ] **`stack rebase`** (`app.rs:559`, `NotImplemented`). Subtree
+- [ ] **`stack rebase`** (`app/change.rs::run_stack`, `NotImplemented`). Subtree
       and linear rebase with descendant rewrite tracking.
-- [ ] **`pr sync`** (`app.rs:566`, `NotImplemented`). Export changes
+- [ ] **`pr sync`** (`app/change.rs::run_pr`, `NotImplemented`). Export changes
       to deterministic Git branches, push, create / update PRs,
       manage base-branch retargeting.
-- [ ] **`pr merge`** (`app.rs:566`, `NotImplemented`). Stacked merge
+- [ ] **`pr merge`** (`app/change.rs::run_pr`, `NotImplemented`). Stacked merge
       with branch pinning, descendant retargeting, and reopen-on-orphan
       recovery — the core value-add over hand-rolled `gh pr merge`.
-- [ ] **`graph`** (`app.rs:573`, `NotImplemented`). Local change
+- [ ] **`graph`** (`app/dispatch.rs`, `NotImplemented`). Local change
       graph view.
-- [ ] **`doctor`** (`app.rs:579`, `NotImplemented`). Diagnostic
+- [ ] **`doctor`** (`app/dispatch.rs`, `NotImplemented`). Diagnostic
       command for stale leases, metadata drift, deleted base branches,
       and rebase conflicts.
 
