@@ -4,32 +4,35 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "dispatch-events",
+    name = "dispatch-reader",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_dispatch_events",
+    crate_name = "boss_dispatch_reader",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/dispatch-reader:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/dispatch-events",
         "//tools/boss/engine/utils",
+        "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "dispatch-events_test",
+    name = "dispatch-reader_test",
     size = "small",
-    crate = ":dispatch-events",
+    crate = ":dispatch-reader",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/dispatch-events",
         "//tools/boss/engine/utils",
+        "//tools/boss/log-files",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

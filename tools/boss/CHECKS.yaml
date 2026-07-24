@@ -42,8 +42,6 @@ checks:
         - bossctl/src/main.rs::MetricRow
         - client/src/lib.rs::Discovery
         - engine/core/src/audit.rs::StartContext
-        - engine/core/src/dispatch_reader.rs::GhostActiveEntry
-        - engine/core/src/dispatch_reader.rs::StalledStage
         - github_tracker/src/lib.rs::UpstreamItem
         - engine/core/src/host_registry.rs::Host
         - engine/core/src/live_status_loop.rs::SlotDebugSnapshot

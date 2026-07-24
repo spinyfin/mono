@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/dispatch-reader:__pkg__",
         "//tools/boss/engine/recovery:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

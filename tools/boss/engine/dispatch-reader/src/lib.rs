@@ -1,10 +1,10 @@
-//! Read-side companion to [`crate::dispatch_events`].
+//! Read-side companion to [`boss_dispatch_events`].
 //!
 //! The dispatch pipeline emits JSONL events into
 //! `<state-root>/dispatch-events/current.jsonl` and per-execution
 //! mirrors at `<state-root>/executions/<id>/dispatch.jsonl`. The
 //! engine itself never reads those back — the writer is fire-and-
-//! forget. This module is the read path that `bossctl dispatch tail`
+//! forget. This crate is the read path that `bossctl dispatch tail`
 //! / `diagnose` / `ghost-active` go through. It is deliberately
 //! file-scan-only: it does NOT touch the engine RPC, so it works
 //! when the engine is wedged.
@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
+use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
 
 /// Per-stage stalled-detection thresholds. The watchdog used to apply
 /// a single global threshold to every stage, but the cube-lease
@@ -72,7 +72,7 @@ impl StageThresholds {
 
 /// Default Boss state root used by the file-scan readers when the
 /// caller didn't override it. Mirrors the writer's default (see
-/// [`crate::dispatch_events::JsonlFileSink`] callers in `app.rs`).
+/// [`boss_dispatch_events::JsonlFileSink`] callers in `boss_engine`'s `app.rs`).
 /// Delegates to `boss-log-files` so the `~/Library/Application Support/Boss`
 /// location is defined once and shared with the log-path resolvers.
 pub fn default_state_root() -> Option<PathBuf> {
@@ -137,7 +137,8 @@ fn parse_lines<R: BufRead>(reader: R) -> Result<Vec<DispatchEvent>> {
 /// Surfaced by [`ghost_active`] for inspection through `bossctl
 /// dispatch ghost-active`. Detection is event-shape only: we don't
 /// need DB access to spot a timeline that just stops.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct GhostActiveEntry {
     pub execution_id: String,
     pub work_item_id: Option<String>,
@@ -356,8 +357,8 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
         // "became ready to dispatch". Previously, a timeline with none
         // was dropped entirely — but that is exactly the worst-waiter
         // class (an execution stuck BEFORE its first dispatch attempt,
-        // e.g. the `status_transition` -> `request_recorded` gap; see
-        // T2692, 2026-07-15's post-pause backlog). Anchor on the
+        // e.g. the `status_transition` -> `request_recorded` gap, as seen
+        // in the 2026-07-15 post-pause backlog). Anchor on the
         // earliest event we DO have instead of skipping — `evs` is
         // non-empty (it only exists in `by_execution` because at least
         // one event referenced this execution_id) and preserves file
@@ -506,7 +507,8 @@ fn percentile_ms(sorted_ascending: &[u128], pct: f64) -> u128 {
 /// `stage_stalled` event. Carries enough context for the writer to
 /// emit a fully-populated `DispatchEvent` without re-reading the
 /// timeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct StalledStage {
     pub execution_id: String,
     pub work_item_id: Option<String>,
@@ -734,11 +736,11 @@ fn stall_to_emit_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch_events::{DispatchEvent, JsonlFileSink, Outcome, Stage};
+    use boss_dispatch_events::{DispatchEvent, JsonlFileSink, Outcome, Stage};
     use tempfile::TempDir;
 
     async fn write(sink: &JsonlFileSink, ev: DispatchEvent) {
-        use crate::dispatch_events::DispatchEventSink;
+        use boss_dispatch_events::DispatchEventSink;
         sink.emit(ev).await;
     }
 
@@ -1114,7 +1116,7 @@ mod tests {
         assert_eq!(report.blocked_now[1].wait_so_far_ms, 100);
     }
 
-    /// The pre-request_recorded blind spot (T2692, 2026-07-15): an
+    /// The pre-request_recorded blind spot (first seen 2026-07-15): an
     /// execution that never received a `request_recorded` event — e.g. it
     /// is stuck between `status_transition` and its first dispatch
     /// attempt — must still show up as blocked, with its wait measured
