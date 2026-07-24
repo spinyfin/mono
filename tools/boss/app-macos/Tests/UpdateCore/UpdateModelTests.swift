@@ -573,6 +573,68 @@ final class UpdateModelTests: XCTestCase {
         XCTAssertEqual(
             model.downloadState, .installedPendingRelaunch(version: Self.mockVersion, willRelaunch: false))
     }
+
+    // MARK: - Cancellation of in-flight staging
+
+    /// A newer version superseding an in-flight download must cancel the older
+    /// staging `Task` (mirroring `DownloadTaskRunner`'s cancellation of the
+    /// underlying `URLSessionDownloadTask`) and leave `downloadState` on the
+    /// newer version's terminal state rather than stuck reporting the cancelled one.
+    func testSupersedingDownloadCancelsInFlightStagingAndLeavesSaneTerminalState() async throws {
+        let v1 = VersionTuple(major: 1, minor: 0, patch: 98)
+        let v2 = VersionTuple(major: 1, minor: 0, patch: 99)
+        let recorder = CancellationTrackingRecorder()
+
+        let callIndex = FetchCounter()
+        let fetcher = HTTPFetcher { _ in
+            await callIndex.increment()
+            let index = await callIndex.value
+            let tag = index == 1 ? "boss-v1.0.98" : "boss-v1.0.99"
+            return try UpdateModelTests.mockAvailableResponse(tag: tag)
+        }
+        let checker = UpdateChecker(currentVersionString: "1.0.0", fullVersionString: "1.0.0", fetcher: fetcher)
+
+        let stager = UpdateStager { update, _ in
+            if update.version == v1 {
+                // Mimic a real in-flight download that notices cancellation cooperatively
+                // rather than resolving immediately, bounded so a stalled test fails loudly.
+                var waited = 0
+                while !Task.isCancelled && waited < 1000 {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                    waited += 1
+                }
+                await recorder.markV1Observed(cancelled: Task.isCancelled)
+                return nil
+            }
+            await recorder.markV2Staged()
+            return update.version
+        }
+
+        let model = UpdateModel(checker: checker, defaults: defaults, jitterRange: 0...0, stager: stager)
+
+        await model.checkNow()  // lastCheckResult = .available(v1); notify mode never auto-stages.
+        model.downloadAvailableUpdate()  // begins staging v1, which blocks until cancelled.
+
+        var startedV1 = false
+        for _ in 0..<50 {
+            if case .downloading(let v, _) = model.downloadState, v == v1 { startedV1 = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(startedV1, "expected staging of v1 to start before it is superseded")
+
+        await model.checkNow()  // lastCheckResult = .available(v2)
+        model.downloadAvailableUpdate()  // supersedes v1: cancels its task, begins staging v2.
+
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(
+            model.downloadState, .readyToInstall(version: v2),
+            "must land on v2's ready state, not stuck reporting the cancelled v1 download")
+        let v1Cancelled = await recorder.v1WasCancelled
+        XCTAssertTrue(v1Cancelled, "the superseded v1 staging must observe cancellation")
+        let v2Staged = await recorder.v2Staged
+        XCTAssertTrue(v2Staged)
+    }
 }
 
 // MARK: - Helpers
@@ -648,6 +710,31 @@ extension UpdateModelTests {
             throw URLError(.notConnectedToInternet)
         }
     }
+
+    /// A raw GitHub releases-list HTTP response advertising a single available
+    /// release `tag`, for tests that need distinct successive versions (unlike
+    /// `mockResponse(for:)`, which always reports the fixed `boss-v1.0.99`).
+    private nonisolated static func mockAvailableResponse(tag: String) throws -> (Data, HTTPURLResponse) {
+        let url = UpdateChecker.releasesURL
+        // `selectBestRelease` requires the asset name to be exactly
+        // "Boss-<major>.<minor>.<patch>.zip" — derive it from the tag rather than
+        // duplicating the "boss-v" prefix.
+        let version = String(tag.dropFirst("boss-v".count))
+        let release: [String: Any] = [
+            "tag_name": tag,
+            "draft": false,
+            "prerelease": false,
+            "body": "Mock release notes",
+            "assets": [[
+                "name": "Boss-\(version).zip",
+                "size": 1024,
+                "browser_download_url":
+                    "https://github.com/spinyfin/mono/releases/download/\(tag)/Boss-\(version).zip",
+            ]],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: [release])
+        return (data, HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
 }
 
 // MARK: - UpdateCheckResult convenience sentinel
@@ -691,6 +778,19 @@ actor ProgressGate {
         continuation?.resume()
         continuation = nil
     }
+}
+
+// MARK: - Cancellation-observing recorder
+
+/// Records whether the superseded (v1) staging closure observed `Task.isCancelled`
+/// before returning, and whether the superseding (v2) staging closure ran to
+/// completion. Backs `testSupersedingDownloadCancelsInFlightStagingAndLeavesSaneTerminalState`.
+actor CancellationTrackingRecorder {
+    private(set) var v1WasCancelled = false
+    private(set) var v2Staged = false
+
+    func markV1Observed(cancelled: Bool) { v1WasCancelled = cancelled }
+    func markV2Staged() { v2Staged = true }
 }
 
 // MARK: - Recording stager

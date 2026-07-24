@@ -129,7 +129,7 @@ struct AssetDownloader: Sendable {
     /// `didWriteData` callbacks — there is no other way to observe transfer
     /// progress. A background-configured session (survives app suspension,
     /// resumable) can be slotted in here later without touching
-    /// `UpdateDownloader` — that lifecycle concern belongs to the app layer (T2),
+    /// `UpdateDownloader` — that lifecycle concern belongs to the app layer,
     /// not this leaf module.
     static let live = AssetDownloader { url, onProgress in
         try await DownloadTaskRunner.run(url: url, onProgress: onProgress)
@@ -149,6 +149,10 @@ private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @u
     private let lock = NSLock()
     private var continuation: CheckedContinuation<URL, Error>?
     private var coalescer = DownloadProgressCoalescer()
+    /// Set once `run` creates the session; invalidated in `finish` once the
+    /// transfer reaches a terminal state so the session doesn't keep this
+    /// delegate (and its retained `onProgress` closure) alive indefinitely.
+    private var session: URLSession?
 
     private init(onProgress: @escaping @Sendable (DownloadProgress) -> Void) {
         self.onProgress = onProgress
@@ -157,6 +161,8 @@ private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @u
     static func run(url: URL, onProgress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
         let delegate = DownloadTaskRunner(onProgress: onProgress)
         let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        // Safe without the lock: no delegate callback can fire until `task.resume()` below.
+        delegate.session = session
         let task = session.downloadTask(with: url)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -174,7 +180,12 @@ private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @u
         lock.lock()
         let pending = continuation
         continuation = nil
+        let sessionToInvalidate = session
+        session = nil
         lock.unlock()
+        // The task is already terminal (success, failure, or cancellation) by
+        // the time finish() runs, so finishTasksAndInvalidate() is safe here.
+        sessionToInvalidate?.finishTasksAndInvalidate()
         switch result {
         case .success(let url): pending?.resume(returning: url)
         case .failure(let error): pending?.resume(throwing: error)
