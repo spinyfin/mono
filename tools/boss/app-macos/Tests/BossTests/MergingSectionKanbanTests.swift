@@ -74,7 +74,7 @@ final class MergingSectionKanbanTests: XCTestCase {
     func testMergingSectionSetsQueueBannerTextWhenTrunkQueuePaused() {
         var task = makeTask(id: "task_trunk", status: "in_review", mergeQueueState: "queued", sectionOrder: 1)
         task.mergeQueueDetail = #"""
-        {"source":"trunk","state":"testing","position":1,"enqueued_at":null,"queue_state":"PAUSED","section_order":1}
+        {"source":"trunk","state":"testing","position":1,"enqueued_at":null,"queue_state":"paused","section_order":1}
         """#
 
         let section = ChatViewModel.mergingSection(items: [task])
@@ -84,7 +84,7 @@ final class MergingSectionKanbanTests: XCTestCase {
     func testMergingSectionQueueBannerTextNilWhenTrunkQueueRunning() {
         var task = makeTask(id: "task_trunk", status: "in_review", mergeQueueState: "queued", sectionOrder: 1)
         task.mergeQueueDetail = #"""
-        {"source":"trunk","state":"testing","position":1,"enqueued_at":null,"queue_state":"RUNNING","section_order":1}
+        {"source":"trunk","state":"testing","position":1,"enqueued_at":null,"queue_state":"running","section_order":1}
         """#
 
         let section = ChatViewModel.mergingSection(items: [task])
