@@ -22,7 +22,7 @@
   },
   {
     "question_type": "yes_no",
-    "prompt": "D2 — prompt-amendment mechanism. Should coordinator-prompt amendments ride on P2948's worker proposal API (i.e. add 'coordinator prompt' as a proposable target), rather than keeping today's file-a-chore-that-edits-a-Swift-string loop?",
+    "prompt": "D2 — prompt-amendment mechanism. Should coordinator-prompt amendments ride on the worker proposal API (i.e. add 'coordinator prompt' as a proposable target), rather than keeping today's file-a-chore-that-edits-a-Swift-string loop?",
     "anchor": "the-six-decisions"
   }
 ]
