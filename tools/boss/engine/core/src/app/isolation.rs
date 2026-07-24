@@ -165,10 +165,12 @@ pub struct IsolationPaths {
     /// when a deliberate env override won for it, in which case the caller
     /// keeps whatever that override named.
     ///
-    /// `control_token` is here because it used to be resolved outside the
-    /// guard entirely: a fixture overwrote production's token file and
-    /// `ControlTokenGuard::drop` deleted it on shutdown, leaving every
-    /// engine-control path broken until the next production restart.
+    /// `control_token`'s isolated path is derived here alongside `db` /
+    /// `events_socket` / `pid`, so a test-fixture engine authenticates
+    /// against its own token rather than production's.
+    /// `crate::engine_control` layers write- and delete-time ownership
+    /// checks (socket-liveness reconciliation on write, token+inode identity
+    /// on delete) on top of this derivation.
     pub derived: EnginePaths,
     /// Directory the derived paths live in; also the fixture's state root for
     /// trace / audit logs.

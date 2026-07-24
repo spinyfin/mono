@@ -51,7 +51,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -155,8 +155,7 @@ fn existing_token_is_live(path: &Path, existing: &ControlTokenFile) -> bool {
 /// path-file-only recovery when the other engine is genuinely still
 /// running. This is the fix for the 2026-07 incident where a
 /// worker-launched fixture engine overwrote — and, on its own shutdown,
-/// then deleted — the production control token (issue: engine-control
-/// token writable and deletable by any worker-launched engine).
+/// then deleted — the production control token.
 ///
 /// A prior file that fails to parse, or whose socket is no longer
 /// answering, is stale (e.g. left behind by a previous engine that
@@ -232,29 +231,59 @@ fn sibling_tmp_path(path: &Path) -> PathBuf {
 /// RAII guard that removes the token file when dropped — both on
 /// graceful return and on panic-unwind.
 ///
-/// Only removes the file if it still holds *exactly* what this engine
-/// wrote: both the pid and the token string must match. Pid alone is
-/// necessary but insufficient — a fixture that (due to a bug upstream)
-/// resolved and wrote the *production* token path is, by pid, always
-/// "the writer" of that path, so a pid-only check would still let it
-/// delete production's token on shutdown. Comparing the full token
-/// establishes ownership at the path level: this guard only ever
-/// removes the exact secret it minted, never merely a file that
-/// happens to share its pid.
+/// Refuses to delete a file that some other writer replaced at this path
+/// after we wrote ours. Pid and token matching alone do *not* establish
+/// that: `write_token_file` always installs via `rename`, but nothing
+/// stops some other engine from later reclaiming the same path and, by
+/// coincidence or because it copied our content, ending up with a file
+/// that carries the same pid and token bytes we minted. What actually
+/// distinguishes "the file I created" from "a file that now sits at the
+/// path I wrote to" is device+inode identity, captured at construction
+/// time and compared again at drop — a `rename` always produces a fresh
+/// inode, so a later replacement is caught even if pid and token happen
+/// to match. The pid/token comparison is kept as a second, independent
+/// check: it survives even if inode capture failed (e.g. the file was
+/// briefly missing right after we wrote it).
 pub struct ControlTokenGuard {
     path: PathBuf,
     pid: u32,
     token: String,
+    /// Device+inode of `path` at construction time, i.e. right after
+    /// `write_token_file` renamed our temp file into place. `None` if the
+    /// stat failed (in which case `Drop` falls back to the pid/token
+    /// check alone).
+    identity: Option<(u64, u64)>,
 }
 
 impl ControlTokenGuard {
+    /// Captures `path`'s current device+inode (the file this guard is
+    /// responsible for) alongside the pid/token this engine minted. Must
+    /// be called immediately after `write_token_file` installs the file,
+    /// so the captured identity is that of the file we just wrote, not
+    /// some earlier occupant of the path.
     pub fn new(path: PathBuf, pid: u32, token: String) -> Self {
-        Self { path, pid, token }
+        let identity = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
+        Self {
+            path,
+            pid,
+            token,
+            identity,
+        }
     }
 }
 
 impl Drop for ControlTokenGuard {
     fn drop(&mut self) {
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        if let Some(identity) = self.identity
+            && (metadata.dev(), metadata.ino()) != identity
+        {
+            // Some other writer replaced the file at this path since we
+            // wrote it — never touch a file we didn't create.
+            return;
+        }
         let Ok(raw) = std::fs::read_to_string(&self.path) else {
             return;
         };
@@ -366,12 +395,16 @@ mod tests {
         assert!(path.exists(), "guard with mismatched pid must not remove the file");
     }
 
-    /// Path-level ownership regression: pid matching alone is not enough.
-    /// A guard must only remove the file if the token it recorded at
-    /// creation still matches what's on disk — otherwise a fixture that
-    /// (due to an isolation bug) wrote at the *production* token path
-    /// would delete production's token on shutdown simply because its
-    /// own pid matches what it itself wrote there.
+    /// Exercises the pid/token comparison in isolation from the inode
+    /// check: a guard constructed with a token that does not match what's
+    /// on disk must not delete the file, purely on the strength of that
+    /// mismatch. Note this state is a hypothetical, not one `serve()` can
+    /// produce — in practice a guard is always constructed with the exact
+    /// token `write_token_file` just wrote (see `app/server.rs`), so this
+    /// pins the pid/token fallback's own behavior rather than modeling a
+    /// reachable production regression. `guard_leaves_file_replaced_at_the_same_path_even_with_matching_pid_and_token`
+    /// below covers the regression that IS reachable: a second writer
+    /// replacing the file at this path.
     #[test]
     fn guard_leaves_file_with_matching_pid_but_mismatched_token() {
         let dir = TempDir::new().unwrap();
@@ -391,6 +424,39 @@ mod tests {
         assert!(
             path.exists(),
             "guard must not remove a file whose token no longer matches what it minted, even if the pid matches"
+        );
+    }
+
+    /// The regression that IS reachable: some other writer replaces the
+    /// file at this path after we constructed our guard, and the
+    /// replacement happens to carry byte-for-byte the same pid and token
+    /// we minted (e.g. a reclamation race that copies forward the prior
+    /// content). Pid+token comparison alone would wrongly treat this as
+    /// "our file" and delete it; device+inode identity — captured at
+    /// guard-construction time — catches it because `write_token_file`
+    /// always installs via `rename`, which mints a fresh inode.
+    #[test]
+    fn guard_leaves_file_replaced_at_the_same_path_even_with_matching_pid_and_token() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("engine-control.token");
+        let contents = ControlTokenFile {
+            token: "shared-token".into(),
+            socket_path: "/x".into(),
+            pid: 99,
+        };
+        write_token_file(&path, &contents).unwrap();
+        let guard = ControlTokenGuard::new(path.clone(), 99, "shared-token".into());
+
+        // Some other writer replaces the file at this path with
+        // byte-for-byte the same pid/token our guard recorded. `socket_path`
+        // here is dead, so `write_token_file` treats the existing file as
+        // stale and reclaims it — installing a fresh inode via `rename`.
+        write_token_file(&path, &contents).unwrap();
+
+        drop(guard);
+        assert!(
+            path.exists(),
+            "guard must not remove a file that was replaced at this path, even with matching pid/token"
         );
     }
 
