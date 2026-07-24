@@ -134,9 +134,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use boss_event_bus::Event;
+
 use crate::coordinator::CubeClient;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::sweep_loop::SweepOutcome as _;
 use crate::teardown_registry::{TeardownRegistry, TeardownState};
 use crate::work::WorkDb;
 
@@ -145,6 +148,13 @@ use crate::work::WorkDb;
 /// candidate to persist across two consecutive passes, this interval also
 /// sets the minimum confirmation delay before a strand is reaped.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
+/// events are absorbed for this long before another out-of-cycle pass runs —
+/// mirrors the merge poller's kick-quiesce window so a burst of terminations
+/// can't turn into a hot loop of full passes. The periodic `interval` tick
+/// remains the backstop regardless.
+const EVENT_QUIESCE: Duration = Duration::from_secs(5);
 
 /// Tears down a live worker pane bound to a run id. Implemented by
 /// [`crate::app::ServerState`] (delegating to `release_worker_pane`);
@@ -213,6 +223,16 @@ impl crate::sweep_loop::SweepOutcome for TerminalWorkSweepOutcome {
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
 /// threading the cross-pass candidate set so the two-pass confirmation
 /// guard survives between passes.
+///
+/// Also subscribes to [`Event::ExecutionTerminal`]: receiving one runs an
+/// out-of-cycle pass right away (subject to [`EVENT_QUIESCE`]) instead of
+/// waiting out the rest of `interval`. This still goes through the same
+/// [`run_one_pass`] and shared `seen_terminal` set as the periodic tick, so
+/// the two-pass confirmation guard is never bypassed — a strand is only
+/// reaped once it has survived two consecutive passes regardless of what
+/// triggered them. The periodic tick remains the backstop: a dropped or
+/// coalesced event never leaves a strand unreconciled for longer than
+/// `interval`.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -221,25 +241,13 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     teardown_registry: Arc<TeardownRegistry>,
     interval: Duration,
+    mut execution_terminal_events: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    // Candidates observed terminal+live on the previous pass. A candidate is
-    // reaped only once it appears in two consecutive passes, so this set is
-    // the confirmation memory that must survive across passes. The shared
-    // loop helper builds a fresh future per pass, so the set lives in an
-    // `Arc<Mutex>` it can borrow each iteration — a single task ever holds
-    // the lock, so there is no real contention.
-    let seen_terminal: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let live_states = Arc::clone(&live_states);
-        let reaper = Arc::clone(&reaper);
-        let cube_client = Arc::clone(&cube_client);
-        let dispatch_events = Arc::clone(&dispatch_events);
-        let teardown_registry = Arc::clone(&teardown_registry);
-        let seen_terminal = Arc::clone(&seen_terminal);
-        async move {
-            let mut seen_terminal = seen_terminal.lock().await;
-            run_one_pass(
+    tokio::spawn(async move {
+        let mut seen_terminal: HashSet<String> = HashSet::new();
+        let mut events_closed = false;
+        loop {
+            let outcome = run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 reaper.as_ref(),
@@ -248,7 +256,52 @@ pub fn spawn_loop(
                 teardown_registry.as_ref(),
                 &mut seen_terminal,
             )
-            .await
+            .await;
+            if outcome.has_activity() {
+                outcome.log();
+            }
+
+            let last_run_at = tokio::time::Instant::now();
+            'wait: loop {
+                let remaining = interval.saturating_sub(last_run_at.elapsed());
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => break 'wait,
+                    event = execution_terminal_events.recv(), if !events_closed => {
+                        match event {
+                            Some(Event::ExecutionTerminal { execution_id, .. }) => {
+                                let since_last = last_run_at.elapsed();
+                                if since_last >= EVENT_QUIESCE {
+                                    tracing::debug!(
+                                        execution_id,
+                                        since_last_ms = since_last.as_millis(),
+                                        "terminal-work sweep: ExecutionTerminal received, running an immediate pass",
+                                    );
+                                    break 'wait;
+                                }
+                                tracing::debug!(
+                                    execution_id,
+                                    since_last_ms = since_last.as_millis(),
+                                    quiesce_ms = EVENT_QUIESCE.as_millis(),
+                                    "terminal-work sweep: ExecutionTerminal within quiesce window, absorbing",
+                                );
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "terminal-work sweep: execution_terminal_events subscription received an \
+                                     unexpected event kind (the subscribing filter should have excluded it)",
+                                );
+                            }
+                            None => {
+                                events_closed = true;
+                                tracing::warn!(
+                                    "terminal-work sweep: execution_terminal_events subscription closed \
+                                     (event bus dropped) — the periodic sweep remains the backstop",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     })
 }

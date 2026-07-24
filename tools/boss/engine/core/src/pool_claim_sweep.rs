@@ -77,15 +77,25 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use boss_event_bus::Event;
+
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::sweep_loop::SweepOutcome as _;
 use crate::work::WorkDb;
 
 /// How often the pool-claim reconciler runs. 60s mirrors the dead-pid
 /// and stale-worker sweeps — fast enough that a leaked automation slot
 /// is reclaimed within a minute, slow enough to be negligible overhead.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
+/// events are absorbed for this long before another out-of-cycle pass runs —
+/// mirrors the merge poller's kick-quiesce window so a burst of terminations
+/// (e.g. a batch stop) can't turn into a hot loop of full passes. The
+/// periodic `interval` tick remains the backstop regardless.
+const EVENT_QUIESCE: Duration = Duration::from_secs(5);
 
 /// Grace period after an execution's `finished_at` during which a still-
 /// claimed slot is left alone. A terminal execution's pool slot is
@@ -139,26 +149,78 @@ impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so a pool wedged before an engine restart
 /// self-heals at boot without waiting for the first interval.
+///
+/// Also subscribes to [`Event::ExecutionTerminal`]: receiving one runs an
+/// out-of-cycle pass right away (subject to [`EVENT_QUIESCE`]) instead of
+/// waiting out the rest of `interval`, so a leaked claim whose execution
+/// just went terminal is reconciled as soon as its [`LEAK_GRACE_SECS`]
+/// grace period allows rather than at some arbitrary point in the next
+/// periodic cycle. The periodic tick remains the backstop: a dropped or
+/// coalesced event never leaves a leaked claim unreconciled for longer than
+/// `interval`.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
+    mut execution_terminal_events: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let live_states = Arc::clone(&live_states);
-        let coordinator = Arc::clone(&coordinator);
-        let dispatch_events = Arc::clone(&dispatch_events);
-        async move {
-            run_one_pass(
+    tokio::spawn(async move {
+        let mut events_closed = false;
+        loop {
+            let outcome = run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
             )
-            .await
+            .await;
+            if outcome.has_activity() {
+                outcome.log();
+            }
+
+            let last_run_at = tokio::time::Instant::now();
+            'wait: loop {
+                let remaining = interval.saturating_sub(last_run_at.elapsed());
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => break 'wait,
+                    event = execution_terminal_events.recv(), if !events_closed => {
+                        match event {
+                            Some(Event::ExecutionTerminal { execution_id, .. }) => {
+                                let since_last = last_run_at.elapsed();
+                                if since_last >= EVENT_QUIESCE {
+                                    tracing::debug!(
+                                        execution_id,
+                                        since_last_ms = since_last.as_millis(),
+                                        "pool-claim sweep: ExecutionTerminal received, running an immediate pass",
+                                    );
+                                    break 'wait;
+                                }
+                                tracing::debug!(
+                                    execution_id,
+                                    since_last_ms = since_last.as_millis(),
+                                    quiesce_ms = EVENT_QUIESCE.as_millis(),
+                                    "pool-claim sweep: ExecutionTerminal within quiesce window, absorbing",
+                                );
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "pool-claim sweep: execution_terminal_events subscription received an \
+                                     unexpected event kind (the subscribing filter should have excluded it)",
+                                );
+                            }
+                            None => {
+                                events_closed = true;
+                                tracing::warn!(
+                                    "pool-claim sweep: execution_terminal_events subscription closed \
+                                     (event bus dropped) — the periodic sweep remains the backstop",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     })
 }
