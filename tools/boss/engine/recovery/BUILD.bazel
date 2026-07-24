@@ -4,30 +4,34 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "log-files",
+    name = "recovery",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_log_files",
+    crate_name = "boss_engine_recovery",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
-        "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/recovery:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/log-files",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "log-files_test",
+    name = "recovery_test",
     size = "small",
-    crate = ":log-files",
+    crate = ":recovery",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/log-files",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

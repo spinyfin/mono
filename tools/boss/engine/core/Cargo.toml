@@ -37,6 +37,7 @@ boss-engine-planner-validation = { path = "../planner-validation" }
 boss-pr-review = { path = "../pr-review" }
 boss-pr-template = { path = "../pr-template" }
 boss-engine-proposal-validation = { path = "../proposal-validation" }
+boss-engine-recovery = { path = "../recovery" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
 boss-engine-day-rotated-log = { path = "../day-rotated-log" }

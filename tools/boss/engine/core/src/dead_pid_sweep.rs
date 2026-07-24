@@ -695,7 +695,7 @@ async fn reap_dead_execution(
     // durable patch before the slot is released and the workspace
     // becomes eligible for re-lease/reset. Best-effort: a failed or
     // empty capture returns None and never blocks the reap.
-    let recovery_patch = crate::recovery_backup::backup_dead_execution(execution);
+    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
 
     // Append [engine-reconcile] audit line to the task description
     // so a human inspecting the chore can see why it was reset (and

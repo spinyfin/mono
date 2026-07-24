@@ -37,6 +37,7 @@ members = [
   "tools/boss/engine/planner-validation",
   "tools/boss/engine/pr-review",
   "tools/boss/engine/proposal-validation",
+  "tools/boss/engine/recovery",
   "tools/boss/engine/worker-policy",
   "tools/boss/log-files",
   "tools/boss/protocol",

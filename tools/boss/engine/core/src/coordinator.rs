@@ -5247,13 +5247,13 @@ impl ExecutionCoordinator {
     /// disk, a DB error) yields `None`: recovery is a precaution layered on
     /// top of dispatch and must never be able to break it.
     fn recovery_patch_for_resume(&self, execution: &WorkExecution) -> Option<(String, PathBuf)> {
-        let recovery_dir = crate::recovery_backup::default_recovery_dir()?;
+        let recovery_dir = boss_engine_recovery::recovery_backup::default_recovery_dir()?;
         let prior = self
             .work_db
             .get_prior_orphaned_execution(&execution.work_item_id, &execution.id)
             .ok()
             .flatten()?;
-        let patch = crate::recovery_apply::find_patch(&recovery_dir, &prior.id)?;
+        let patch = boss_engine_recovery::recovery_apply::find_patch(&recovery_dir, &prior.id)?;
         Some((prior.id, patch))
     }
 
@@ -5297,10 +5297,10 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     lease,
-                    crate::recovery_apply::RecoveryReport {
+                    boss_engine_recovery::recovery_apply::RecoveryReport {
                         for_execution_id: execution.id.clone(),
                         from_execution_id: String::new(),
-                        source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
                         applied: None,
                         patch_error: None,
                     },
@@ -5317,10 +5317,10 @@ impl ExecutionCoordinator {
                 execution,
                 worker_id,
                 lease,
-                crate::recovery_apply::RecoveryReport {
+                boss_engine_recovery::recovery_apply::RecoveryReport {
                     for_execution_id: execution.id.clone(),
                     from_execution_id: dead_execution_id,
-                    source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                    source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
                     applied: None,
                     patch_error: None,
                 },
@@ -5331,7 +5331,7 @@ impl ExecutionCoordinator {
         }
 
         // ── 2. patch fallback ────────────────────────────────────────────
-        match crate::recovery_apply::apply_recovery_patch(&lease.workspace_path, &patch_path) {
+        match boss_engine_recovery::recovery_apply::apply_recovery_patch(&lease.workspace_path, &patch_path) {
             Ok(Some(applied)) => {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -5344,10 +5344,10 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     lease,
-                    crate::recovery_apply::RecoveryReport {
+                    boss_engine_recovery::recovery_apply::RecoveryReport {
                         for_execution_id: execution.id.clone(),
                         from_execution_id: dead_execution_id,
-                        source: crate::recovery_apply::RecoverySource::Patch,
+                        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
                         applied: Some(applied),
                         patch_error: None,
                     },
@@ -5378,7 +5378,7 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                crate::recovery_apply::mark_patch_consumed(&patch_path);
+                boss_engine_recovery::recovery_apply::mark_patch_consumed(&patch_path);
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -5408,10 +5408,10 @@ impl ExecutionCoordinator {
                     .await;
                 // Deliberately NOT marked consumed: the patch is the only
                 // copy of the work and a human may still salvage it by hand.
-                let report = crate::recovery_apply::RecoveryReport {
+                let report = boss_engine_recovery::recovery_apply::RecoveryReport {
                     for_execution_id: execution.id.clone(),
                     from_execution_id: dead_execution_id,
-                    source: crate::recovery_apply::RecoverySource::Patch,
+                    source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
                     applied: None,
                     patch_error: Some(message),
                 };
@@ -5435,12 +5435,12 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
         lease: &CubeWorkspaceLease,
-        report: crate::recovery_apply::RecoveryReport,
+        report: boss_engine_recovery::recovery_apply::RecoveryReport,
         consume_patch: Option<&Path>,
     ) {
         let source = match report.source {
-            crate::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
-            crate::recovery_apply::RecoverySource::Patch => "patch",
+            boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
+            boss_engine_recovery::recovery_apply::RecoverySource::Patch => "patch",
         };
         let restored = report.applied.as_ref().map(|a| a.summary());
         if let Err(err) = report.write(&lease.workspace_path) {
@@ -5466,7 +5466,7 @@ impl ExecutionCoordinator {
             )
             .await;
         if let Some(patch) = consume_patch {
-            crate::recovery_apply::mark_patch_consumed(patch);
+            boss_engine_recovery::recovery_apply::mark_patch_consumed(patch);
         }
     }
 
@@ -9921,7 +9921,7 @@ mod tests {
         std::fs::write(ws.join("hello.txt"), "recovered work\n").unwrap();
         let recovery_dir = dir.path().join("recovery");
         std::fs::create_dir_all(&recovery_dir).unwrap();
-        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+        unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
 
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let (dead_id, resume) = seed_resume_pair(&db);
@@ -9933,9 +9933,12 @@ mod tests {
             .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(true)))
             .await;
 
-        let report = crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
+        let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
             .expect("an in-place recovery must still be reported to the worker");
-        assert_eq!(report.source, crate::recovery_apply::RecoverySource::CubeInPlace);
+        assert_eq!(
+            report.source,
+            boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace
+        );
         assert_eq!(report.from_execution_id, dead_id);
         assert!(report.applied.is_none(), "nothing was replayed");
         assert!(report.patch_error.is_none());
@@ -9950,7 +9953,7 @@ mod tests {
         assert!(!patch.exists());
         assert!(recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
 
-        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+        unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
     }
 
     /// Cube could NOT recover (`dirty_verified: false` — the tree had already
@@ -9973,7 +9976,7 @@ mod tests {
         }
         let recovery_dir = dir.path().join("recovery");
         std::fs::create_dir_all(&recovery_dir).unwrap();
-        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+        unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
 
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let (dead_id, resume) = seed_resume_pair(&db);
@@ -9990,8 +9993,11 @@ mod tests {
             "recovered work\n",
             "the patch must actually restore the work into the workspace",
         );
-        let report = crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).expect("report");
-        assert_eq!(report.source, crate::recovery_apply::RecoverySource::Patch);
+        let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).expect("report");
+        assert_eq!(
+            report.source,
+            boss_engine_recovery::recovery_apply::RecoverySource::Patch
+        );
         let applied = report.applied.expect("a patch recovery must report what it restored");
         assert_eq!(applied.paths, ["hello.txt"]);
         assert_eq!((applied.insertions, applied.deletions), (1, 1));
@@ -10000,7 +10006,7 @@ mod tests {
             "a consumed patch must not be replayed on a later restart"
         );
 
-        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+        unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
     }
 
     /// A patch that does not apply must be loud: the worker is told recovery
@@ -10024,7 +10030,7 @@ mod tests {
         }
         let recovery_dir = dir.path().join("recovery");
         std::fs::create_dir_all(&recovery_dir).unwrap();
-        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+        unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
 
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let (dead_id, resume) = seed_resume_pair(&db);
@@ -10048,7 +10054,7 @@ mod tests {
             .reconcile_workspace_recovery(&resume, "worker-1", &lease_for(&ws, Some(false)))
             .await;
 
-        let report = crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
+        let report = boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id)
             .expect("a failed recovery must still be reported — silence would let the worker assume success");
         assert!(report.applied.is_none());
         let err = report.patch_error.expect("the failure must be carried to the worker");
@@ -10060,7 +10066,7 @@ mod tests {
         assert!(!recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
         let _ = dead_id;
 
-        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+        unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
     }
 
     /// A patch of nothing but Boss's own hook spool restores nothing, and
@@ -10079,7 +10085,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let recovery_dir = dir.path().join("recovery");
         std::fs::create_dir_all(&recovery_dir).unwrap();
-        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+        unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
 
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let (dead_id, resume) = seed_resume_pair(&db);
@@ -10100,12 +10106,12 @@ mod tests {
             .await;
 
         assert!(
-            crate::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).is_none(),
+            boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &resume.id).is_none(),
             "a bookkeeping-only patch restores nothing and must not claim a recovery",
         );
         assert!(!patch.exists(), "the spent patch is still retired");
 
-        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+        unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
     }
 
     /// A normal (non-resume) dispatch must not touch the recovery machinery
@@ -10124,7 +10130,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let recovery_dir = dir.path().join("recovery");
         std::fs::create_dir_all(&recovery_dir).unwrap();
-        unsafe { std::env::set_var(crate::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
+        unsafe { std::env::set_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV, &recovery_dir) };
 
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let (dead_id, _resume) = seed_resume_pair(&db);
@@ -10144,10 +10150,10 @@ mod tests {
             .reconcile_workspace_recovery(&fresh, "worker-1", &lease_for(&ws, None))
             .await;
 
-        assert!(crate::recovery_apply::RecoveryReport::read_for(&ws, &fresh.id).is_none());
+        assert!(boss_engine_recovery::recovery_apply::RecoveryReport::read_for(&ws, &fresh.id).is_none());
         assert!(patch.exists(), "an unrelated execution's patch must be left alone");
 
-        unsafe { std::env::remove_var(crate::recovery_backup::RECOVERY_DIR_ENV) };
+        unsafe { std::env::remove_var(boss_engine_recovery::recovery_backup::RECOVERY_DIR_ENV) };
     }
 
     /// Issue #962 -- the UI-crash resume reclaims a stale lease.

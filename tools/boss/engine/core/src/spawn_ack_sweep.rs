@@ -350,7 +350,7 @@ pub(crate) async fn reap_never_started_spawn(
     // Snapshot any uncommitted workspace work to a durable patch before the
     // slot is released and the workspace becomes eligible for re-lease/reset.
     // Best-effort: a false-live spawn typically has nothing to back up.
-    let recovery_patch = crate::recovery_backup::backup_dead_execution(execution);
+    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
 
     // Append an [engine-reconcile] audit line to the work item's description
     // so a human inspecting the chore can see why it was reset.
