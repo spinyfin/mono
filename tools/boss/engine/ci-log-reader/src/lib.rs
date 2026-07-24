@@ -139,8 +139,8 @@ impl CiLogReader for BuildkiteLogReader {
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
         format!(
-            "bk job log --pipeline {} --build-number {} {job_id}",
-            self.pipeline_slug, self.build_number
+            "{} job log --pipeline {} --build-number {} {job_id}",
+            self.binary, self.pipeline_slug, self.build_number
         )
     }
 }
@@ -192,7 +192,7 @@ impl CiLogReader for GithubActionsLogReader {
     }
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
-        format!("gh run view --log-failed --job {job_id}")
+        format!("{} run view --log-failed --job {job_id}", self.binary)
     }
 }
 
@@ -738,6 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_trunk_merge_eviction_build_uses_full_coordinates_via_fake_bk() {
         let dir = tempfile::tempdir().unwrap();
         let script = r#"#!/bin/sh
@@ -766,6 +767,7 @@ exit 2
     /// this closes: a busy org can push the episode build past the first
     /// 100 org-wide failed/failing builds.
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_trunk_merge_eviction_build_falls_through_to_page_two() {
         let dir = tempfile::tempdir().unwrap();
         let page_one_path = dir.path().join("page1.json");
@@ -813,6 +815,7 @@ exit 2
     /// No match on any searched page degrades to `Ok(None)` rather than an
     /// error — the caller falls back to generic worker instructions.
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_trunk_merge_eviction_build_returns_none_when_exhausted() {
         let dir = tempfile::tempdir().unwrap();
         let script = r#"#!/bin/sh
@@ -907,10 +910,11 @@ exit 2
     fn reader_for_buildkite_default_binaries_wire_bk() {
         // Host-independent coverage of the one-line delegation in
         // `reader_for` (`reader_for_with_binaries(provider, target_url, "bk",
-        // "gh")`): a swap or typo of either literal compiles and passes every
-        // other test here, and would only break in production. Uses the
-        // trait's own `worker_cli_invocation_hint` accessor rather than a
-        // spawn, so it's hermetic on all three host states.
+        // "gh")`). `worker_cli_invocation_hint` reads `self.binary`, so a
+        // swap or typo of either literal now genuinely fails this test
+        // instead of only showing up in production. Uses the trait's own
+        // `worker_cli_invocation_hint` accessor rather than a spawn, so it's
+        // hermetic on all three host states.
         let r = reader_for(
             CiProvider::Buildkite,
             "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
@@ -919,15 +923,37 @@ exit 2
             r.worker_cli_invocation_hint("j"),
             "bk job log --pipeline mypipeline --build-number 1329 j"
         );
+
+        // Pin the coupling itself: a fake binary name must show up verbatim
+        // in the hint, proving the hint isn't just a hardcoded "bk" literal.
+        let r = reader_for_with_binaries(
+            CiProvider::Buildkite,
+            "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
+            "FAKEBK",
+            "gh",
+        );
+        assert_eq!(
+            r.worker_cli_invocation_hint("j"),
+            "FAKEBK job log --pipeline mypipeline --build-number 1329 j"
+        );
     }
 
     #[test]
     fn reader_for_github_actions_default_binaries_wire_gh() {
         let r = reader_for(CiProvider::GithubActions, "x");
         assert_eq!(r.worker_cli_invocation_hint("j"), "gh run view --log-failed --job j");
+
+        // Pin the coupling itself: a fake binary name must show up verbatim
+        // in the hint, proving the hint isn't just a hardcoded "gh" literal.
+        let r = reader_for_with_binaries(CiProvider::GithubActions, "x", "bk", "FAKEGH");
+        assert_eq!(
+            r.worker_cli_invocation_hint("j"),
+            "FAKEGH run view --log-failed --job j"
+        );
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn reader_for_buildkite_with_canonical_url_builds_working_reader() {
         // Confirms the canonical URL resolves to a real `BuildkiteLogReader`
         // wired with the right coordinates (not the `UnparseableCoordinatesReader`
@@ -966,6 +992,7 @@ exit 2
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn reader_for_github_actions_ignores_target_url() {
         // GithubActionsLogReader doesn't need target_url; confirm dispatch
         // still builds a working (non-fallback) reader regardless of its
