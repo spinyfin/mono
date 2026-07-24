@@ -37,7 +37,7 @@ pub const EFFORT_ESCALATION_MARKER: &str = "[effort-escalation]";
 
 /// `[blocked]` marker prefix — the new blocker convention this module
 /// introduces. Documented for workers in
-/// [`crate::runner::worker_escalation_protocol_directive`].
+/// [`crate::runner::prompt::worker_escalation_protocol_directive`].
 pub const BLOCKED_MARKER: &str = "[blocked]";
 
 /// Engine-owned `work_attention_items.kind` for a filed `[effort-escalation]` signal.
