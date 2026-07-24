@@ -177,6 +177,9 @@ pub struct StartWorkerInput {
     /// method on the run goes through one object. Tests may pass any
     /// registered (or stub) driver.
     pub driver: Arc<dyn AgentDriver>,
+    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored
+    /// unless `worker_kind` is [`WorkerKind::Triage`].
+    pub automation_outcome_proposals_seam_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -321,6 +324,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         execution_kind: input.execution_kind.clone(),
         task_kind: input.task_kind.clone(),
         worker_kind: input.worker_kind.clone(),
+        automation_outcome_proposals_seam_enabled: input.automation_outcome_proposals_seam_enabled,
     };
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
     spawner
@@ -660,6 +664,7 @@ mod tests {
             driver: crate::driver::DriverRegistry::default()
                 .require(crate::effort::ENGINE_DEFAULT_DRIVER)
                 .expect("engine default driver is always registered"),
+            automation_outcome_proposals_seam_enabled: false,
         }
     }
 

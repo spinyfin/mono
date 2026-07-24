@@ -542,6 +542,27 @@ impl WorkerCompletionHandler {
         );
     }
 
+    /// Count one legacy-chain hit for the automation-triage-outcome seam
+    /// (design implementation task 11) and log a WARN. Called by
+    /// `finalize_automation_triage` only when `automation_outcome_proposals_seam`
+    /// is on, no `automation_outcome` proposal existed for the execution, AND
+    /// `finalize_automation_triage_run` actually recorded the legacy-derived
+    /// outcome (`Ok(true)`) — mirroring
+    /// [`Self::record_deferred_scope_fallback_hit`]'s discipline of not
+    /// re-incrementing were this finalizer ever re-entered for an
+    /// already-finalized execution. `detail` carries the same human-readable
+    /// detail string the legacy path recorded onto the `automation_runs` row,
+    /// so the WARN is diagnosable without a second lookup.
+    pub(super) fn record_automation_outcome_fallback_hit(&self, execution: &crate::work::WorkExecution, detail: &str) {
+        self.record_proposal_fallback_hit(
+            execution,
+            &AUTOMATION_OUTCOME_FALLBACK_HIT,
+            "automation_outcome_proposals_seam",
+            "automation_outcome",
+            detail,
+        );
+    }
+
     /// Consume this execution's staged `proposal_channel_error` (if any —
     /// see [`crate::proposal_channel_error`]), file an attention for it, and
     /// increment `worker_proposals.channel_error`. Design §"Failure

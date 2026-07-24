@@ -331,6 +331,33 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "automation_outcome_proposals_seam",
+        description: "Read the automation_outcome worker_proposals row before falling back to the legacy \
+             automation: task/skip marker parser, recover_skip_reason, and the \
+             find_most_recent_open_task_for_automation open-task recovery heuristic in \
+             finalize_automation_triage (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md, \
+             implementation task 11 — the automation-triage-outcome seam migration, the worst-failing seam in \
+             the design's inventory: a measurement of 67 consecutive produced_task finalizations found none \
+             decided by a valid marker). When on, a triage execution that already carries an automation_outcome \
+             proposal (submitted via `boss propose automation-outcome --produced-task <id>` or `--skip --reason \
+             \"...\"`, run after the triage worker's direct, still-sanctioned `boss task create --automation` \
+             call) is finalized straight from that proposal's already-decided disposition — task 6's applier \
+             (apply_automation_outcome) provenance-checked a produced_task outcome (task exists + \
+             source_automation_id match) and auto-applied a skip outcome synchronously at submission time, so \
+             this read never re-derives or re-guesses the decision, and a produced_task proposal rejected for \
+             provenance mismatch finalizes failed_will_retry via that rejection rather than falling through to \
+             the open-task guess. Only when no automation_outcome proposal exists does the legacy marker-parse \
+             + recovery-heuristic chain still run exactly as before, and every time it does the \
+             worker_proposals.fallback_hit.automation_outcome counter increments and a WARN logs — the counter \
+             is this seam's explicit exit criterion for eventually deleting the marker parser and the recovery \
+             heuristics (T2945's diagnosis becomes moot once that deletion lands). DEFAULT OFF: enable per \
+             operator once the proposal path is validated in staging. Kill switch: set false to restore the \
+             pre-migration marker/recovery-only behavior exactly, prompt included.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_rpc_tier",
         description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
              worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
@@ -805,6 +832,30 @@ mod tests {
         let store2 = make_store(&tmp);
         store2.load().unwrap();
         assert!(store2.is_enabled("followup_proposals_seam"));
+    }
+
+    #[test]
+    fn automation_outcome_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("automation_outcome_proposals_seam"),
+            "automation_outcome_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "automation_outcome_proposals_seam")
+            .expect("automation_outcome_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "completion");
+
+        store.set("automation_outcome_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("automation_outcome_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("automation_outcome_proposals_seam"));
     }
 
     #[test]

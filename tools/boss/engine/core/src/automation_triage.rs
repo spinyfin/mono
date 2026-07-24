@@ -158,7 +158,12 @@ impl TriageContext {
 /// Render the "Recently filed / in-flight automation work" block, or an
 /// empty string when `context` has nothing to report (the common case —
 /// most triage runs have no overlapping sibling activity).
-fn render_context_block(context: &TriageContext) -> String {
+///
+/// `seam_enabled` mirrors the `automation_outcome_proposals_seam` feature
+/// flag (see [`render_triage_preamble`]'s doc) — it decides whether the
+/// duplicate-skip example teaches the legacy `automation: skip` marker or
+/// `boss propose automation-outcome --skip`.
+fn render_context_block(context: &TriageContext, seam_enabled: bool) -> String {
     if context.in_flight.is_empty() && context.recently_merged.is_empty() {
         return String::new();
     }
@@ -166,11 +171,21 @@ fn render_context_block(context: &TriageContext) -> String {
         "## Recently filed / in-flight automation work\n\n\
 This lists work filed or merged by **any** automation on this product, not just this \
 one — check it before you decide. If your candidate overlaps one of these (same \
-file(s), same symbol, or clearly the same fix), do NOT create a new task. Instead end \
-your final message with:\n\n\
-```\nautomation: skip — duplicate of <ref>\n```\n\n\
-citing the referenced id, e.g. `automation: skip — duplicate of T2572`.\n\n",
+file(s), same symbol, or clearly the same fix), do NOT create a new task. Instead \
+",
     );
+    block.push_str(&if seam_enabled {
+        "declare the outcome as a skip:\n\n\
+```\nboss propose automation-outcome --skip --reason \"duplicate of <ref>\"\n```\n\n\
+citing the referenced id, e.g. `boss propose automation-outcome --skip --reason \
+\"duplicate of T2572\"`.\n\n"
+            .to_owned()
+    } else {
+        "end your final message with:\n\n\
+```\nautomation: skip — duplicate of <ref>\n```\n\n\
+citing the referenced id, e.g. `automation: skip — duplicate of T2572`.\n\n"
+            .to_owned()
+    });
     if !context.in_flight.is_empty() {
         block.push_str("Open (in flight):\n\n");
         for t in &context.in_flight {
@@ -260,15 +275,30 @@ impl TriageDecision {
 ///
 /// `decision_artifact_path` is the engine-owned file the agent writes its
 /// decision to — the primary channel
-/// ([`StructuredOutputKind::TriageDecision`]). The marker line stays in the
-/// prompt as the driver's fallback, so an agent that writes only one of the
-/// two is still understood.
+/// ([`StructuredOutputKind::TriageDecision`]). The matching marker/verb line
+/// stays in the prompt as the driver's fallback, so an agent that writes only
+/// one of the two is still understood.
+///
+/// `automation_outcome_proposals_seam_enabled` mirrors the
+/// `automation_outcome_proposals_seam` feature flag (composed with the
+/// `worker_proposals` master flag) — the same flag
+/// [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`]
+/// reads for the engine's read path (design implementation task 11),
+/// threaded here so the two halves of the migration move together: a
+/// triage worker must never be taught a verb the engine won't yet read
+/// proposals-first for, and flipping the flag off must restore today's
+/// marker-only preamble exactly. `false` teaches the legacy `automation:
+/// task` / `automation: skip` markers verbatim; `true` teaches `boss
+/// propose automation-outcome --produced-task <id>` / `--skip --reason
+/// "..."` instead, submitted right after the still-sanctioned, direct `boss
+/// task create --automation` call this design does not mediate.
 pub fn render_triage_preamble(
     automation: &Automation,
     product_name: &str,
     siblings: &[crate::work::AutomationSiblingTask],
     context: &TriageContext,
     decision_artifact_path: &str,
+    automation_outcome_proposals_seam_enabled: bool,
 ) -> String {
     let a_id = automation
         .short_id
@@ -279,7 +309,13 @@ pub fn render_triage_preamble(
          --target-file <path/to/file> [--target-file <path/to/other/file> ...]",
         automation.id
     );
-    let context_block = render_context_block(context);
+    let context_block = render_context_block(context, automation_outcome_proposals_seam_enabled);
+    let already_tracked = render_already_tracked_section(siblings, automation_outcome_proposals_seam_enabled);
+    let decision_section = render_decision_section(
+        &create_cmd,
+        decision_artifact_path,
+        automation_outcome_proposals_seam_enabled,
+    );
     format!(
         "You are a maintenance **triage** agent for automation `{a_id}` on product \
 \"{product_name}\". Your session cwd is already a fresh checkout of this product's \
@@ -292,7 +328,31 @@ You are explicitly allowed to conclude that nothing appropriate \
 exists — that is a normal, expected outcome on most runs.\n\n\
 {already_tracked}\
 {context_block}\
-## You MUST report exactly one decision\n\n\
+{decision_section}",
+        a_id = a_id,
+        product_name = product_name,
+        instruction = automation.standing_instruction.trim(),
+        already_tracked = already_tracked,
+        context_block = context_block,
+        decision_section = decision_section,
+    )
+}
+
+/// Render the "you must end this run with exactly one outcome" section
+/// through the end of the preamble (single-shot mandate, lightweight-triage
+/// guidance, and hard guardrails) — kept as one coherent unit rather than
+/// word-by-word conditionals, since the prose throughout names whichever
+/// decision-declaration mechanism is active.
+///
+/// See [`render_triage_preamble`]'s doc for what `seam_enabled` gates, and
+/// what `decision_artifact_path` is.
+/// `false` reproduces the pre-migration `automation: task` / `automation:
+/// skip` marker-only text (plus the file-artifact contract); `true` teaches
+/// `boss propose automation-outcome` instead.
+fn render_decision_section(create_cmd: &str, decision_artifact_path: &str, seam_enabled: bool) -> String {
+    if !seam_enabled {
+        return format!(
+            "## You MUST report exactly one decision\n\n\
 Report it **both ways**, and make them agree:\n\n\
 1. **Write it to `{decision_artifact_path}`** — one JSON \
 object, either `{{\"decision\": \"task\", \"task_id\": \"T42\"}}` or \
@@ -364,13 +424,84 @@ decision marker (and, if applicable, the one `boss task create --automation` cal
 `boss task create --automation` call in this run will be rejected.\n\
 - **Emit exactly one marker line**, as the very last line of your final message. \
 Zero markers (or more than one) is treated as an inconclusive run and retried — it \
-is NOT a skip.\n",
-        a_id = a_id,
-        product_name = product_name,
-        instruction = automation.standing_instruction.trim(),
-        already_tracked = render_already_tracked_section(siblings),
-        context_block = context_block,
-        create_cmd = create_cmd,
+is NOT a skip.\n"
+        );
+    }
+    format!(
+        "## You MUST report exactly one decision\n\n\
+Report it **both ways**, and make them agree:\n\n\
+1. **Write it to `{decision_artifact_path}`** with the `Write` tool — one JSON \
+object, either `{{\"decision\": \"task\", \"task_id\": \"T42\"}}` or \
+`{{\"decision\": \"skip\", \"reason\": \"<one line>\"}}`. That path is outside \
+the repo, so it never pollutes anything, and it is the channel the engine reads \
+first.\n\
+2. **Also declare the outcome with `boss propose automation-outcome`** (below), \
+as your terminal act. Submission is synchronous and validated immediately: a \
+malformed or provenance-mismatched call fails/rejects right away with a typed \
+reason you can act on, unlike the file the engine only reads after you've moved \
+on.\n\n\
+- **If there is work to do** — create exactly **one** task, then declare it:\n\n\
+  ```\n  {create_cmd}\n  ```\n\n\
+  **Declare every file you expect the task to touch** with one `--target-file <path>` \
+per file (repeatable; paths relative to the repo root). This is not optional prose — \
+the engine uses your declared files as the key for a duplicate-detection gate that \
+compares against every other automation's already-open work on this product. \
+Omitting a file you know you'll touch weakens that gate for every automation on this \
+product, not just this run. Add `--target-symbol <name>` (repeatable, optional) if \
+you can also name the specific function/type you're targeting.\n\n\
+  The command prints the new task id (e.g. `T42`). Then declare the outcome:\n\n\
+  ```\n  boss propose automation-outcome --produced-task T42\n  ```\n\n\
+  **If the create command fails with a `duplicate-suspect of Txxxx` error**, do NOT \
+retry with a different name or description — the engine has already determined your \
+candidate is a near-certain duplicate of open task `Txxxx` and filed an attention item \
+for an operator to review. Declare the outcome as a skip instead:\n\n\
+  ```\n  boss propose automation-outcome --skip --reason \"duplicate of Txxxx\"\n  ```\n\n\
+- **If there is nothing appropriate to do right now**, declare it as a skip:\n\n\
+  ```\n  boss propose automation-outcome --skip --reason \"<one-line reason>\"\n  ```\n\n\
+## Single-shot mandate — no sub-agents, no deferral\n\n\
+This run is **single-shot**: the investigation AND the outcome declaration must both \
+happen within this session. The session ends the moment you stop responding.\n\n\
+- **Do NOT use the `Agent` tool.** Spawning a sub-agent provides no resume \
+mechanism — the session will hang waiting for a result that never returns.\n\
+- **Do NOT end any turn with deferred intent** such as \"I'll create the task \
+next\", \"Let me investigate further\", or \"I'll wait for the agent to finish\". \
+If you state an intent like \"Let me create the task\", you must follow through \
+immediately in that same turn — do not stop before you do.\n\
+- **Do NOT wait for any external process or event.** All investigation must \
+happen inline using read-only tool calls (`grep`/`find`/`cat`, `Bash`, `Read`, \
+`WebSearch`). Finish the investigation before you make your decision.\n\
+- **If you create a task** with `boss task create --automation`, declare it with \
+`boss propose automation-outcome --produced-task <id>` **in the same response**, \
+immediately after the tool call returns with the task id. Do not stop between the \
+tool call and the declaration.\n\n\
+## Keep it lightweight — decide, then stop\n\n\
+Triage is a quick judgement call, NOT an exhaustive verification. Your job is to \
+decide whether a concrete task is derivable — not to prove the repository's \
+state. A few targeted, read-only checks are enough.\n\n\
+- **Decide the moment you have enough signal, then STOP.** Declare the outcome as \
+soon as you can tell whether actionable work exists. Do NOT run \"one more \
+confirming check\": re-proving a verdict you already hold is exactly how these \
+runs burn their whole budget and end with no declaration.\n\
+- **Do NOT launch repo-wide or whole-repo build / clippy / lint / checkleft / \
+test sweeps, and do NOT run a long build in the background and then idle-poll \
+waiting for it.** Waiting in a loop on a backgrounded build consumes the entire \
+session and produces no decision — this is the dominant reason these runs fail.\n\
+- **If you cannot cheaply confirm that actionable work exists, `skip`.** An \
+inconclusive quick check is grounds to skip, not to escalate to a heavier \
+sweep — the automation fires again on its next schedule. A `skip` is a \
+successful, expected outcome; burning the whole session and stopping without a \
+declaration is the only real failure here.\n\n\
+## Hard guardrails\n\n\
+- **Do NOT do the work yourself.** Do not edit files, do not commit, do not open a \
+PR. A separate worker executes the task you create. Your only deliverable is the \
+outcome declaration (and, if applicable, the one `boss task create --automation` \
+call).\n\
+- **Create at most one task.** The automation enforces an open-task cap; a second \
+`boss task create --automation` call in this run will be rejected.\n\
+- **Declare exactly one outcome**, as your terminal act. A run that ends with zero \
+declarations is treated as inconclusive and retried — it is NOT a skip. If you call \
+`boss propose automation-outcome` more than once (you revised your decision), only \
+the latest call's outcome is used.\n"
     )
 }
 
@@ -380,7 +511,12 @@ is NOT a skip.\n",
 /// Empty is the common case on a healthy automation, and an empty section
 /// would be worse than none: "Already tracked: (none)" reads as licence to
 /// file, which is not the nudge this is for.
-fn render_already_tracked_section(siblings: &[crate::work::AutomationSiblingTask]) -> String {
+///
+/// `seam_enabled` mirrors the `automation_outcome_proposals_seam` feature
+/// flag (see [`render_triage_preamble`]'s doc) — it decides whether the
+/// already-tracked skip example teaches the legacy `automation: skip`
+/// marker or `boss propose automation-outcome --skip`.
+fn render_already_tracked_section(siblings: &[crate::work::AutomationSiblingTask], seam_enabled: bool) -> String {
     if siblings.is_empty() {
         return String::new();
     }
@@ -408,9 +544,19 @@ runs that filed them:\n\n",
 again** — even if you would word the title differently, and even if the existing \
 task is only partly done. Re-filing is the single most expensive failure mode here: \
 it dispatches a second worker onto work already in progress, produces a competing \
-PR, and leaves a human to untangle which one to keep. End the run with:\n\n\
-        ```\n  automation: skip — already tracked as T<n>\n  ```\n\n\
-        Judgement calls:\n\n\
+PR, and leaves a human to untangle which one to keep. ",
+    );
+    section.push_str(&if seam_enabled {
+        "Declare it as a skip:\n\n\
+        ```\n  boss propose automation-outcome --skip --reason \"already tracked as T<n>\"\n  ```\n\n"
+            .to_owned()
+    } else {
+        "End the run with:\n\n\
+        ```\n  automation: skip — already tracked as T<n>\n  ```\n\n"
+            .to_owned()
+    });
+    section.push_str(
+        "Judgement calls:\n\n\
         - **Same file or module, different angle** (\"split it\" vs \"add tests to \
 it\") — treat as already tracked and skip. The open task's worker is in that file \
 already.\n\
@@ -443,7 +589,14 @@ run.\n\n",
 /// marker contract and the no-work / no-PR posture, and omits the PR-delivery
 /// mandate entirely (the [`crate::worker_setup::triage_deny_rules`] denylist is
 /// the suspenders to this belt).
-pub fn render_triage_claude_md(lease_id: &str) -> String {
+///
+/// `automation_outcome_proposals_seam_enabled` mirrors the
+/// `automation_outcome_proposals_seam` feature flag — see
+/// [`render_triage_preamble`]'s doc for what it gates; the same flag value
+/// must be threaded to both functions for one spawn so the worker's
+/// preamble and CLAUDE.md never disagree about which decision-declaration
+/// mechanism is live.
+pub fn render_triage_claude_md(lease_id: &str, automation_outcome_proposals_seam_enabled: bool) -> String {
     format!(
         "# Boss triage rules\n\
          \n\
@@ -452,7 +605,30 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          concrete, actionable task can be derived from an automation's standing\n\
          instruction right now in this repository.\n\
          \n\
-         ## Triage mandate (HARD CONSTRAINT)\n\
+         {decision_contract}\
+         ## Your workspace\n\
+         \n\
+         - Cube lease id: `{lease}`\n\
+         \n\
+         Lease held for the lifetime of this run. Do not lease, release,\n\
+         or mutate cube state.\n\
+         \n\
+         {boundaries_and_coordinator}",
+        decision_contract = claude_md_decision_contract(automation_outcome_proposals_seam_enabled),
+        lease = lease_id,
+        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
+    )
+}
+
+/// Render the triage CLAUDE.md's "Triage mandate" through "Do NOT do the
+/// work" sections — kept as one coherent unit (rather than word-by-word
+/// conditionals) since the prose throughout names whichever
+/// decision-declaration mechanism is active. Mirrors
+/// [`render_decision_section`]'s two-branch shape; see
+/// [`render_triage_preamble`]'s doc for what `seam_enabled` gates.
+fn claude_md_decision_contract(seam_enabled: bool) -> String {
+    if !seam_enabled {
+        return "## Triage mandate (HARD CONSTRAINT)\n\
          \n\
          **There is NO pull-request deliverable for a triage run.** Your only\n\
          deliverable is a single decision marker.\n\
@@ -525,18 +701,90 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          none of that applies to a triage run. Investigate read-only (`grep`,\n\
          `find`, `cat`, `jj log`/`show`/`diff`, etc.), then create at most one\n\
          task and emit your marker.\n\
+         \n"
+        .to_owned();
+    }
+    "## Triage mandate (HARD CONSTRAINT)\n\
          \n\
-         ## Your workspace\n\
+         **There is NO pull-request deliverable for a triage run.** Your only\n\
+         deliverable is a single outcome declaration, submitted with `boss\n\
+         propose automation-outcome`.\n\
          \n\
-         - Cube lease id: `{lease}`\n\
+         Your terminal act MUST be exactly one of these two declarations:\n\
          \n\
-         Lease held for the lifetime of this run. Do not lease, release,\n\
-         or mutate cube state.\n\
+         - `boss propose automation-outcome --produced-task <id>` — after\n\
+           creating **exactly one** task with\n\
+           `boss task create --automation <automation-id> --name \"…\" --description \"…\" \\`\n\
+           `  --target-file <path> [--target-file <path> ...]` (repeat `--target-file`\n\
+           once per file you expect to touch — declaring targets is required, not\n\
+           optional; the command prints the new task id, e.g. `T42`). If this fails\n\
+           with `duplicate-suspect of Txxxx`, do not retry — declare\n\
+           `boss propose automation-outcome --skip --reason \"duplicate of Txxxx\"`\n\
+           instead.\n\
+         - `boss propose automation-outcome --skip --reason \"<one-line reason>\"` —\n\
+           when nothing appropriate exists right now (a normal, expected outcome on\n\
+           most runs).\n\
          \n\
-         {boundaries_and_coordinator}",
-        lease = lease_id,
-        boundaries_and_coordinator = crate::prompt_fragments::boundaries_and_coordinator_fragment(),
-    )
+         Submission is synchronous and validated immediately: a malformed or\n\
+         provenance-mismatched call fails/rejects right away with a typed reason\n\
+         you can act on. A run that ends with zero declarations is treated as\n\
+         inconclusive and retried — it is NOT a skip. Concluding \"nothing to do\"\n\
+         is a `--skip` declaration, never a silent end.\n\
+         \n\
+         ## Single-shot mandate — no sub-agents, no deferral\n\
+         \n\
+         This run is **single-shot**: investigation AND the outcome declaration\n\
+         must both happen within this session. The session ends the moment you\n\
+         stop.\n\
+         \n\
+         - **Do NOT use the `Agent` tool.** Sub-agents provide no resume\n\
+           mechanism — spawning one will hang the session indefinitely.\n\
+         - **Do NOT defer to a later turn.** If you say \"I'll create the task\n\
+           next\" or \"Let me wait for the agent\", you must complete that action\n\
+           immediately in the same turn — the session will NOT give you another.\n\
+         - **If you run `boss task create --automation`**, declare it with\n\
+           `boss propose automation-outcome --produced-task <id>` in the **same\n\
+           response**, right after the tool call returns the task id. Do not stop\n\
+           between the two.\n\
+         \n\
+         ## Keep it lightweight — decide, then stop\n\
+         \n\
+         Triage is a quick judgement call, NOT an exhaustive verification.\n\
+         Decide whether a concrete task is derivable; do not try to prove the\n\
+         repository's state. A few targeted, read-only checks are enough.\n\
+         \n\
+         - **Decide the moment you have enough signal, then STOP.** Declare the\n\
+           outcome as soon as you can tell whether actionable work exists. Do\n\
+           NOT run \"one more confirming check\" — re-proving a verdict you\n\
+           already hold is how these runs burn their whole budget and stop\n\
+           with no declaration.\n\
+         - **Do NOT launch repo-wide build / clippy / lint / checkleft / test\n\
+           sweeps, and do NOT background a long build and idle-poll waiting on\n\
+           it.** Waiting in a loop on a backgrounded build consumes the whole\n\
+           session and yields no decision — the dominant failure mode here.\n\
+         - **If you cannot cheaply confirm actionable work exists, `--skip`.**\n\
+           An inconclusive quick check is grounds to skip, not to escalate to\n\
+           a heavier sweep — the automation re-fires on its schedule. A skip\n\
+           is a successful outcome; stopping with no declaration is the failure.\n\
+         \n\
+         ## Do NOT do the work (tool calls for these are denied)\n\
+         \n\
+         A separate worker executes the task you create. You only decide and\n\
+         declare the outcome. Forbidden here:\n\
+         \n\
+         - Editing or writing any file (`Edit`, `Write`).\n\
+         - Committing or pushing (`jj git push`, `git push`).\n\
+         - Opening, merging, closing, editing, or commenting on a PR\n\
+           (`gh pr create/merge/close/edit/comment/review`) or running\n\
+           `cube pr create`/`cube pr update`.\n\
+         - Filing or updating GitHub issues.\n\
+         \n\
+         Do NOT create a PR, do NOT push a branch, and do NOT print a PR URL —\n\
+         none of that applies to a triage run. Investigate read-only (`grep`,\n\
+         `find`, `cat`, `jj log`/`show`/`diff`, etc.), then create at most one\n\
+         task and declare the outcome.\n\
+         \n"
+    .to_owned()
 }
 
 /// Resolve the decision a triage agent reached, file first.
@@ -774,6 +1022,7 @@ mod tests {
             &[],
             &TriageContext::default(),
             ARTIFACT_PATH,
+            false,
         );
         assert!(
             preamble.contains(ARTIFACT_PATH),
@@ -791,7 +1040,7 @@ mod tests {
 
     #[test]
     fn triage_claude_md_restates_marker_contract_and_omits_pr_mandate() {
-        let md = render_triage_claude_md("lease_abc");
+        let md = render_triage_claude_md("lease_abc", false);
         // The lease id is surfaced so a confused worker can describe itself.
         assert!(md.contains("lease_abc"));
         // Restates the marker contract (the whole point of the triage run).
@@ -826,9 +1075,9 @@ mod tests {
 
     #[test]
     fn triage_claude_md_forbids_sub_agents_and_deferral() {
-        let md = render_triage_claude_md("lease_xyz");
-        // Must explicitly forbid spawning a sub-agent and explain why
-        // (the hang mode: no resume mechanism once one is spawned).
+        let md = render_triage_claude_md("lease_xyz", false);
+        // Must explicitly name the Agent tool and explain why it is forbidden
+        // (the hang mode: no resume mechanism once a sub-agent is spawned).
         assert!(
             md.contains("sub-agent") || md.contains("sub agent"),
             "triage CLAUDE.md must forbid spawning a sub-agent",
@@ -848,7 +1097,7 @@ mod tests {
 
     #[test]
     fn triage_claude_md_requires_early_decision_and_forbids_heavy_sweeps() {
-        let md = render_triage_claude_md("lease_lw");
+        let md = render_triage_claude_md("lease_lw", false);
         let lower = md.to_lowercase();
         // Decide-then-stop: emit the marker the moment the verdict is known.
         assert!(
@@ -875,6 +1124,50 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------
+    // Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
+    // implementation task 11): `automation_outcome_proposals_seam` teaches
+    // `boss propose automation-outcome` instead of the legacy `automation:
+    // task`/`automation: skip` markers, in both the triage preamble and
+    // CLAUDE.md. Mirrors the `deferred_scope_proposals_seam` /
+    // `followup_proposals_seam` prompt tests for the earlier seams.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn triage_claude_md_teaches_legacy_markers_when_seam_is_off() {
+        let md = render_triage_claude_md("lease_seam_off", false);
+        assert!(md.contains("automation: task <id>"));
+        assert!(md.contains("automation: skip — <one-line reason>"));
+        assert!(
+            !md.contains("boss propose automation-outcome"),
+            "seam off: must not teach a verb the engine won't yet read proposals-first for:\n{md}",
+        );
+    }
+
+    #[test]
+    fn triage_claude_md_teaches_boss_propose_verb_when_seam_is_on() {
+        let md = render_triage_claude_md("lease_seam_on", true);
+        assert!(
+            md.contains("boss propose automation-outcome --produced-task <id>"),
+            "seam on: must teach the produced-task verb form:\n{md}",
+        );
+        assert!(
+            md.contains("boss propose automation-outcome --skip --reason \"<one-line reason>\""),
+            "seam on: must teach the skip verb form with a worked example:\n{md}",
+        );
+        assert!(
+            !md.contains("automation: task <id>"),
+            "seam on: must not also teach the legacy marker grammar:\n{md}",
+        );
+        assert!(
+            !md.contains("automation: skip — <one-line reason>"),
+            "seam on: must not also teach the legacy marker grammar:\n{md}",
+        );
+        // The lease id and no-PR posture still surface regardless of the seam.
+        assert!(md.contains("lease_seam_on"));
+        assert!(md.contains("no pull-request deliverable") || md.contains("NO pull-request deliverable"));
+    }
+
     #[test]
     fn preamble_requires_early_decision_and_forbids_heavy_sweeps() {
         let automation = Automation::builder()
@@ -890,7 +1183,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
         let lower = preamble.to_lowercase();
         // Decide-then-stop.
         assert!(
@@ -938,9 +1231,13 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
-        // Must explicitly forbid spawning a sub-agent and name the hang risk
-        // (no resume mechanism once one is spawned) so the worker understands why.
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+        // Must explicitly name the Agent tool and explain the hang risk.
+        assert!(
+            preamble.contains("Agent"),
+            "preamble must name the Agent tool to tell the worker not to use it",
+        );
+        // Must name the failure mode (sub-agent hang) so the worker understands why.
         assert!(
             preamble.contains("sub-agent") || preamble.contains("sub agent"),
             "preamble must forbid spawning a sub-agent",
@@ -979,7 +1276,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
 
         let marker_lines: Vec<&str> = preamble
             .lines()
@@ -1017,6 +1314,42 @@ mod tests {
     }
 
     #[test]
+    fn preamble_teaches_boss_propose_verb_when_seam_is_on() {
+        let automation = Automation::builder()
+            .id("auto_rt_seam")
+            .short_id(10i64)
+            .product_id("prod_1")
+            .name("clippy sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("fix any clippy warnings")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build();
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, true);
+        assert!(
+            preamble.contains("boss propose automation-outcome --produced-task T42"),
+            "seam on: preamble must teach the produced-task verb with a worked example:\n{preamble}",
+        );
+        assert!(
+            preamble.contains("boss propose automation-outcome --skip --reason \"duplicate of Txxxx\""),
+            "seam on: preamble must teach the duplicate-skip verb form:\n{preamble}",
+        );
+        assert!(
+            preamble.contains("boss propose automation-outcome --skip --reason \"<one-line reason>\""),
+            "seam on: preamble must teach the generic-skip verb form:\n{preamble}",
+        );
+        assert!(
+            !preamble
+                .lines()
+                .any(|line| line.trim().to_lowercase().starts_with("automation:")),
+            "seam on: preamble must not also teach the legacy marker grammar:\n{preamble}",
+        );
+    }
+
+    #[test]
     fn preamble_includes_contract_and_canonical_selector() {
         let automation = Automation::builder()
             .id("auto_123")
@@ -1031,7 +1364,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
         assert!(preamble.contains("triage"));
         assert!(preamble.contains("A3"));
         assert!(preamble.contains("My Product"));
@@ -1062,7 +1395,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
         assert!(
             preamble.contains("--target-file"),
             "preamble must include --target-file on the create command example",
@@ -1189,6 +1522,7 @@ mod tests {
             &siblings,
             &TriageContext::default(),
             ARTIFACT_PATH,
+            false,
         );
 
         assert!(preamble.contains("Already tracked"), "section heading missing");
@@ -1214,6 +1548,30 @@ mod tests {
         );
     }
 
+    /// Companion to `preamble_lists_already_tracked_tasks`: with the seam on,
+    /// the already-tracked dedup skip example must teach `boss propose
+    /// automation-outcome --skip`, not the legacy marker.
+    #[test]
+    fn preamble_already_tracked_section_teaches_boss_propose_verb_when_seam_is_on() {
+        let siblings = [sibling(101, "Split engine/core/src/app.rs", "active", None)];
+        let preamble = render_triage_preamble(
+            &dedup_automation(),
+            "My Product",
+            &siblings,
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            true,
+        );
+        assert!(
+            preamble.contains("boss propose automation-outcome --skip --reason \"already tracked as T<n>\""),
+            "seam on: must show the boss propose form of the already-tracked skip:\n{preamble}",
+        );
+        assert!(
+            !preamble.contains("automation: skip — already tracked as T<n>"),
+            "seam on: must not also show the legacy marker form:\n{preamble}",
+        );
+    }
+
     /// The section must still leave room for genuinely new findings — this
     /// is a dedup nudge, not a cap.
     #[test]
@@ -1225,6 +1583,7 @@ mod tests {
             &siblings,
             &TriageContext::default(),
             ARTIFACT_PATH,
+            false,
         );
         assert!(
             preamble.contains("Genuinely different target"),
@@ -1246,6 +1605,7 @@ mod tests {
             &[],
             &TriageContext::default(),
             ARTIFACT_PATH,
+            false,
         );
         assert!(
             !preamble.contains("Already tracked"),

@@ -686,10 +686,11 @@ impl HostAdapter for SshHostAdapter {
             // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
             // docs), so these all hardcode `false` regardless of the
             // engine's own (local) read of `worker_signal_proposals_seam` /
-            // `deferred_scope_proposals_seam` / `followup_proposals_seam` —
-            // the remote worker always gets the legacy marker/artifact text,
-            // even when the engine's read path is proposals-first. That
-            // marker/artifact then always counts as a fallback hit in
+            // `deferred_scope_proposals_seam` / `followup_proposals_seam` /
+            // `automation_outcome_proposals_seam` — the remote worker always
+            // gets the legacy marker/artifact text, even when the engine's
+            // read path is proposals-first. That marker/artifact then
+            // always counts as a fallback hit in
             // `worker_proposals.fallback_hit.*` — see the caveat on those
             // counters' declaration in `completion.rs` before using them as
             // an exit criterion. Wire feature flags into the remote path
@@ -700,6 +701,7 @@ impl HostAdapter for SshHostAdapter {
                 worker_signal_proposals_seam_enabled: false,
                 deferred_scope_proposals_seam_enabled: false,
                 followup_proposals_seam_enabled: false,
+                automation_outcome_proposals_seam_enabled: false,
             },
         )
         .await?;
@@ -728,6 +730,11 @@ impl HostAdapter for SshHostAdapter {
             // so a reviewer/triage/answer-agent dispatched remotely still gets
             // its reduced surface instead of silently becoming Standard.
             worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
+            // Mirrors the `WorkerSpawnOpts` hardcoding above: a remotely
+            // dispatched triage worker always gets the legacy marker-only
+            // CLAUDE.md, since SshHostAdapter has no FeatureFlagsStore to
+            // read `automation_outcome_proposals_seam` from.
+            automation_outcome_proposals_seam_enabled: false,
         };
         // Resolve the same driver `compose_worker_spawn` already validated
         // against the registry — settings wiring (ProgressObservation +
