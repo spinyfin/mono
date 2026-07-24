@@ -151,7 +151,7 @@ One clarification the stdout-reader work depends on, checked explicitly because 
 `codex exec` is a real, first-class non-interactive mode — not a scraped TUI. Verified flags (`codex exec --help`, 0.145.0):
 
 | Flag                                                             | Meaning                                                              |
-| ---------------------------------------------------------------- | -------------------------------------------------------------------- | ------ |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------- |
 | `--json`                                                         | Emit events to stdout as JSONL                                       |
 | `-o, --output-last-message <FILE>`                               | Write the agent's last message to a file                             |
 | `--output-schema <FILE>`                                         | JSON Schema describing the model's final response shape              |
@@ -168,7 +168,7 @@ One clarification the stdout-reader work depends on, checked explicitly because 
 | `--dangerously-bypass-hook-trust`                                | Run enabled hooks without persisted trust                            |
 | `--ignore-rules`                                                 | Do not load user or project execpolicy `.rules` files                |
 | `--strict-config`                                                | Error on config fields this version does not recognise               |
-| `--enable / --disable <FEATURE>`                                 | Equivalent to `-c features.<name>=true                               | false` |
+| `--enable / --disable <FEATURE>`                                 | Equivalent to `-c features.<name>=true\|false`                       |
 | `-i, --image <FILE>...`                                          | Attach image(s) to the initial prompt                                |
 
 **`-a/--ask-for-approval` no longer exists on `codex exec`** — it was removed between 0.137.0 and 0.145.0, and passing it is a hard error. Headless exec now runs `approval_policy=Never` unconditionally (observed in a debug-log capture), which is what Boss wanted anyway. See [D-1](#deltas-that-change-the-design).
@@ -299,7 +299,6 @@ statusMessage = "Description"
 
 Handlers may also live in a per-layer `hooks.json`; both in one layer loads both with a warning. Project-local hooks load only when the `.codex/` layer is trusted; user-level hooks are independent of project trust.
 
-<a id="oq-1-do-codex-hooks-fire-under-codex-exec"></a>
 **Hooks fire on 0.145.0 — and did not on 0.137.0.** On the older version no hook fired in nine configurations (`hooks.json` at `$CODEX_HOME`; `hooks.json` at `<project>/.codex/`; TOML `[[hooks.PreToolUse]]` CamelCase; TOML `[[hooks.pre_tool_use]]` snake_case; `matcher = "*"`, `matcher = ".*"`, and none; `command` as a shell string and as a bare executable path; with and without `--dangerously-bypass-hook-trust`). On 0.145.0 the **first** of those configurations — CamelCase TOML, `matcher = ".*"`, with the trust-bypass flag — fires `SessionStart`, `PreToolUse`, and `Stop` reliably, and a deny decision blocks the command before it executes. Payloads and evidence are in [D-2](#deltas-that-change-the-design).
 
 **The trust gate is the operative constraint, and it fails open.** Hooks run only if trusted. Trust comes from either `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash` record (`HookStateToml` _(binary)_; `--strict-config` accepts the key, so it is real). Without trust, the hook is **skipped in complete silence** — the command runs, and there is no warning, no stream event, and no log line. Separately, a hook whose command does not exist also produces **no diagnostic**: the 0.137.0 control (`command = "/definitely/not/a/real/binary-xyz"`) reproduces exactly on 0.145.0, completing the turn as if nothing were configured.
@@ -328,20 +327,22 @@ Every Boss workspace contains a `.claude/` directory (gitignored by the engine, 
 
 Classification per the brief: **(a)** implementable against the current trait, **(b)** needs a trait signature change, **(c)** needs new engine machinery, **(d)** genuinely absent.
 
-| #    | Capability              | What Codex offers natively                     | Class   | Verdict                                    |
-| ---- | ----------------------- | ---------------------------------------------- | ------- | ------------------------------------------ |
-| G-1  | `Spawn`                 | `codex exec` + flags                           | **(b)** | Signature is Claude-shaped                 |
-| G-2  | `WorkspaceProvisioning` | `AGENTS.md`, `CODEX_HOME`, trust registry      | **(a)** | Fits; needs `CODEX_HOME` lifecycle         |
-| G-3  | `PermissionPolicy`      | 3 sandbox modes, 4 approval policies           | **(b)** | Trait is a file path; Codex needs argv+env |
-| G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)** | Blocked only by T3326                      |
-| G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)** | **Transport is not abstracted** — top gap  |
-| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(d)** | Degrade; relocate guardrails               |
-| G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)** | Native, but no trait method                |
-| G-8  | `StructuredOutput`      | `--output-schema`, `--output-last-message`     | **(b)** | Better than Claude's; no trait method      |
-| G-9  | `TranscriptAccess`      | rollout JSONL, Codex line schema               | **(b)** | Trait method exists but is dead code       |
-| G-10 | `ControlVerbs`          | process signals; `codex exec resume`           | **(b)** | Trait has one method, never called         |
-| G-11 | `ToolProvisioning`      | MCP, plugins, skills                           | **(a)** | Unused in v1, as designed                  |
-| G-12 | `PromptComposition`     | `AGENTS.md` + preamble                         | **(b)** | Shared body asserts Claude mechanics       |
+| #    | Capability              | What Codex offers natively                     | Class    | Verdict                                    |
+| ---- | ----------------------- | ---------------------------------------------- | -------- | ------------------------------------------ |
+| G-1  | `Spawn`                 | `codex exec` + flags                           | **(b)**  | Signature is Claude-shaped                 |
+| G-2  | `WorkspaceProvisioning` | `AGENTS.md`, `CODEX_HOME`, trust registry      | **(a)**  | Fits; needs `CODEX_HOME` lifecycle         |
+| G-3  | `PermissionPolicy`      | 3 sandbox modes, `writable_roots`, `.rules`    | **(b)**  | Trait is a file path; Codex needs argv+env |
+| G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)**  | Blocked only by T3326                      |
+| G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)**  | **Transport is not abstracted** — top gap  |
+| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(d)**† | Degrade; relocate guardrails               |
+| G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)**  | Native, but no trait method                |
+| G-8  | `StructuredOutput`      | `--output-schema`, `--output-last-message`     | **(b)**  | Better than Claude's; no trait method      |
+| G-9  | `TranscriptAccess`      | rollout JSONL, Codex line schema               | **(b)**  | Trait method exists but is dead code       |
+| G-10 | `ControlVerbs`          | process signals; `codex exec resume`           | **(b)**  | Trait has one method, never called         |
+| G-11 | `ToolProvisioning`      | MCP, plugins, skills                           | **(a)**  | Unused in v1, as designed                  |
+| G-12 | `PromptComposition`     | `AGENTS.md` + preamble                         | **(b)**  | Shared body asserts Claude mechanics       |
+
+† **G-6 is (d) _by choice_, not by absence.** Codex's `PreToolUse` exists and works on 0.145.0 — the four-way legend has no code for "available but not declarable". Boss declines to declare the capability because the mechanism fails open and silently, so it is not one Boss can promise to enforce. See [G-6](#g-6-tooluseinterception).
 
 ### G-1 `Spawn`
 
@@ -367,7 +368,7 @@ One gap: the trait gives no hook for **teardown**. A per-run `CODEX_HOME` accumu
 
 `ClaudeDriver::write_permission_config` is still `unimplemented!()` (`engine/driver/src/claude.rs:477-480`); the real logic remains in `engine/core/src/worker_setup.rs` emitting Claude permission grammar. T1479 moves it.
 
-The problem for Codex is the **signature**: `async fn write_permission_config(&self, dest_dir: &Path) -> anyhow::Result<PathBuf>` (`engine/driver/src/lib.rs:573`) hardcodes the assumption that a permission policy _is a file whose path is passed to the CLI_. For Codex the policy is `--sandbox <mode>`, `--ask-for-approval <policy>`, `[sandbox_workspace_write] writable_roots`, and `CODEX_HOME` — argv and config, not a single file path.
+The problem for Codex is the **signature**: `async fn write_permission_config(&self, dest_dir: &Path) -> anyhow::Result<PathBuf>` (`engine/driver/src/lib.rs:573`) hardcodes the assumption that a permission policy _is a file whose path is passed to the CLI_. For Codex the policy is `--sandbox <mode>`, `--ignore-rules` / `--strict-config`, `[sandbox_workspace_write] writable_roots`, and `CODEX_HOME` — argv and config, not a single file path. (`-a/--ask-for-approval` used to belong on that list; it was removed from `codex exec` between 0.137.0 and 0.145.0 — see [D-1](#deltas-that-change-the-design) — which does not weaken the point, since what remains is still argv plus config plus a directory.)
 
 **Fix:** the method should take Boss's _abstract_ policy (autonomous-honour-denies / reviewer-read-only / structural deny set) and return an opaque `PermissionArtifacts { config_files: Vec<PathBuf>, extra_args: Vec<String>, env: Vec<(String,String)> }`. **T1479 as currently scoped is insufficient** — it extracts Claude's logic behind a signature Codex cannot satisfy, which would force a second refactor.
 
@@ -621,11 +622,12 @@ Design _for_, do not design _now_. Three seams, with attachment points:
 <a id="oq-3-what-is-the-codex-rules-execpolicy-format"></a>
 **OQ-3 — What is the Codex `.rules` execpolicy format?** On 0.145.0 `--ignore-rules` is a **documented** `codex exec` flag (_"Do not load user or project execpolicy `.rules` files"_) rather than the binary-string inference it was on 0.137.0, which raises confidence that the system is real and reachable. It might restore some per-command deny fidelity natively, reducing reliance on `PATH` shims. Still unexamined — I did not want to design against a surface I had not run.
 
-**OQ-6 — Is `codex exec review` a better substrate for Boss's review kind than a plain read-only exec run?** New in this pass ([D-3](#delta-that-changes-a-tasks-scope)). It is purpose-built, takes `--base` / `--commit` / `--uncommitted`, and has a dedicated `codex-auto-review` model. It may also impose its own output shape that does not match Boss's `ReviewResult`. Unexamined; folded into [T-25](#t-25-codex-eligibility-for-review-and-conflict-resolution-kinds).
-
 **OQ-4 — Rollout disk growth.** `~/.codex` on this host holds 279 active + 241 archived rollouts at ~865 MB. Per-worker `CODEX_HOME` multiplies this across workspaces. `--ephemeral` avoids it entirely but would forfeit `TranscriptAccess`. Needs a retention policy; not a v1 blocker.
 
 **OQ-5 — `codex exec` is one turn per process.** Claude's probe/nudge injects into a live session; Codex requires `codex exec resume`, a new process. I believe this is tractable ([T-17](#t-17-controlverbs-on-the-trait-plus-codex-probenudge-via-exec-resume-a-7)) but it is the least-validated part of this design — I did not spike resume-based probing, and pane lifecycle across a process restart is exactly where surprises live.
+
+<a id="oq-6-codex-exec-review"></a>
+**OQ-6 — Is `codex exec review` a better substrate for Boss's review kind than a plain read-only exec run?** New in this pass ([D-3](#delta-that-changes-a-tasks-scope)). It is purpose-built, takes `--base` / `--commit` / `--uncommitted`, and has a dedicated `codex-auto-review` model. It may also impose its own output shape that does not match Boss's `ReviewResult`. Unexamined; folded into [T-25](#t-25-codex-eligibility-for-review-and-conflict-resolution-kinds).
 
 **Risk — the `PATH`-shim relocation is a change to the Claude path.** It touches live guardrails on the driver that runs everything today. It is a net improvement (it closes the subshell-evasion hole) but it is not risk-free, and it lands before any Codex value is visible. I think this ordering is correct and non-negotiable — shipping Codex first means shipping it unguarded — but it is worth a human agreeing before [T-02](#t-02-relocate-command-guardrails-to-path-shims-claude-path) starts.
 
@@ -638,7 +640,7 @@ Discrete, filed-work-item-sized. Boss work items **cannot** be created from this
 | #    | Proposed name                                                                        | Effort    | Amends / new                                                                      | Brief                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ---- | ------------------------------------------------------------------------------------ | --------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A-1  | `ProgressObservation`: abstract the ingress transport, not just normalisation        | `large`   | **Amends T3328** (materially widens it)                                           | T3328 as scoped only stops the `.expect()` panic at `worker_setup.rs:530-532`, leaving a hookless driver with no progress signal at all. `ProgressObservationWiring` must become an enum over transports — `HookCallback(wiring)` for Claude, `StdoutJsonl` for Codex — with an engine-side stdout reader feeding the same normaliser and activity machine. `normalize_progress_event` needs no signature change; `events_socket.rs:248`'s hardcoded `ClaudeDriver` does. Without this, no Codex worker reports progress or completes. |
-| A-2  | `PermissionPolicy`: return permission _artifacts_, not a single file path            | `medium`  | **Amends T1479**                                                                  | `write_permission_config(&self, dest_dir) -> Result<PathBuf>` (`lib.rs:573`) hardcodes "a permission policy is one file whose path is passed to the CLI". Codex's policy is `--sandbox`, `--ask-for-approval`, `[sandbox_workspace_write]`, and `CODEX_HOME` — argv plus config. Return `PermissionArtifacts { config_files, extra_args, env }`. Landing T1479 against the current signature guarantees a second refactor.                                                                                                             |
+| A-2  | `PermissionPolicy`: return permission _artifacts_, not a single file path            | `medium`  | **Amends T1479**                                                                  | `write_permission_config(&self, dest_dir) -> Result<PathBuf>` (`lib.rs:573`) hardcodes "a permission policy is one file whose path is passed to the CLI". Codex's policy is `--sandbox`, `--ignore-rules` / `--strict-config`, `[sandbox_workspace_write]`, and `CODEX_HOME` — argv plus config. Return `PermissionArtifacts { config_files, extra_args, env }`. Landing T1479 against the current signature guarantees a second refactor.                                                                                             |
 | A-3  | `Spawn`: replace Claude-shaped parameters with a `SpawnRequest`/`SpawnPlan` pair     | `medium`  | **New**                                                                           | `spawn_invocation` (`lib.rs:553-560`) takes `settings_path`, `non_opus_auto_mode`, `permission_mode_override` — all Claude concepts — and returns a `String` the engine wraps with a hardcoded `unset ANTHROPIC_API_KEY` (`pane_spawn.rs:382`). Codex needs an exported `CODEX_HOME`. Take an opaque request struct; return `SpawnPlan { env, command }` so env mutation is driver-supplied.                                                                                                                                           |
 | A-4  | `TurnBoundary` trait method — decouple completion from `WorkerEvent::Stop`           | `medium`  | **Amends T3325** (re-scopes; drops the synthesizer from the critical path)        | T3325 pairs a trait method with an engine synthesizer. Codex needs only the method: `turn.completed` is native and maps directly to `WorkerEvent::Stop`, so `completion/stop.rs:12,168` stops being hardwired to a Claude hook. The synthesizer remains worth building for a driver with neither hooks nor turn events, but it should not gate Codex. Re-scope T3325 to the trait method; split the synthesizer out.                                                                                                                   |
 | A-5  | `StructuredOutput` trait method + driver-supplied PR-URL extraction                  | `medium`  | **Amends T1476** (adds PR-URL; T1476's own scope is sufficient as far as it goes) | `StructuredOutput` (`lib.rs:43`) has no trait method. More urgently, PR-URL capture is derived from `PostToolUse` hook events (`pr_url_capture.rs:1-6`) and is out of T1476's scope — under Codex it breaks completely, and the PR URL is the acceptance criterion for nearly every work item. Codex's `command_execution` items carry `aggregated_output`, so the same regex works against the stream. Make extraction driver-supplied. Also surface `--output-schema`, which is a stronger contract than the env-var file.           |
@@ -922,7 +924,7 @@ Phase 2: enable the document-producing kinds via `KindRequirements` once the str
 
 ### T-25 Codex eligibility for review and conflict-resolution kinds
 
-Phase 3: verify `--sandbox read-only` is a genuine reviewer-read-only equivalent (including that the worker demonstrably cannot write), and that structured `ReviewResult` output round-trips. **Additionally evaluate `codex exec review`** — a native non-interactive review mode found in the 0.145.0 pass, with `--base` / `--commit` / `--uncommitted` and a dedicated `codex-auto-review` model ([D-3](#delta-that-changes-a-tasks-scope), [OQ-6](#risks--open-questions)). It may fit Boss's review kind better than a general exec run, or may impose an output shape that does not match `ReviewResult`; decide between the two rather than defaulting to the general path.
+Phase 3: verify `--sandbox read-only` is a genuine reviewer-read-only equivalent (including that the worker demonstrably cannot write), and that structured `ReviewResult` output round-trips. **Additionally evaluate `codex exec review`** — a native non-interactive review mode found in the 0.145.0 pass, with `--base` / `--commit` / `--uncommitted` and a dedicated `codex-auto-review` model ([D-3](#delta-that-changes-a-tasks-scope), [OQ-6](#oq-6-codex-exec-review)). It may fit Boss's review kind better than a general exec run, or may impose an output shape that does not match `ReviewResult`; decide between the two rather than defaulting to the general path.
 
 - **Effort:** `medium`
 - **Depends on:** T-24

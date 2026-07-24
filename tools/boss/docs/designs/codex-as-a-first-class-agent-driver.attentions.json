@@ -6,19 +6,19 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Codex's --json event stream carries no schema version, and 0.145.0 is already out while 0.137.0 is what was tested. How should agent-CLI versions be managed?",
+    "prompt": "Codex's --json event stream carries no schema version, and re-running this analysis across 0.137.0 -> 0.145.0 found the drift is real rather than hypothetical: a removed flag that would have made the design's prescribed launch command fail outright, an added `usage` field, a changed item-ID base, a second meaning for `error` items, four new TurnItem variants, and a new hook event -- none of them announced on the wire, across eight minor versions. How should agent-CLI versions be managed?",
     "choices": [
-      "Pin the tested Codex version; gate upgrades on the T-22 conformance harness",
+      "Pin the tested Codex version, add --strict-config for the config half, and gate upgrades on the conformance harness",
       "Track latest; rely on the conformance harness to catch breakage after the fact",
       "Pin both Codex and Claude Code versions under one policy",
       "Defer the decision until after Phase 1 acceptance (T-23)"
     ],
-    "anchor": "risks--open-questions"
+    "anchor": "oq-2"
   },
   {
     "question_type": "yes_no",
-    "prompt": "Should the Codex hook activation spike (T-01) be treated as a hard gate before Phase 2 (design/investigation kinds), rather than as informational? The v1 design deliberately assumes hooks do NOT work under `codex exec`, so a negative result changes nothing — but a positive result would let ToolUseInterception be declared and make PATH shims defence-in-depth rather than the sole guardrail carrier.",
-    "anchor": "oq-1-do-codex-hooks-fire-under-codex-exec"
+    "prompt": "Should the Codex hook trust-provisioning spike (T-01) be treated as a hard gate before Phase 2 (design/investigation kinds), rather than as informational? Hooks demonstrably DO fire under `codex exec` on 0.145.0 and a PreToolUse deny genuinely blocks a command pre-execution -- but that alone does not let ToolUseInterception be declared, because an untrusted hook (and a hook whose command is missing) is skipped in complete silence. T-01 is what settles whether Boss can provision `trusted_hash` deterministically and observe a hook that did not run; only then could the capability be declared and hooks become defence-in-depth alongside the PATH shims.",
+    "anchor": "oq-1-hook-trust-provisioning"
   },
   {
     "question_type": "yes_no",
