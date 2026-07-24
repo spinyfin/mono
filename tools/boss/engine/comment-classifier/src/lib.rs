@@ -16,7 +16,7 @@
 //! billing env var, JSON-only prompt, `serde_json` parse of the reply) —
 //! this is a classification call, not a doc-rewrite call, so it has no need
 //! for length/diff sanity checks. Transport goes through the shared
-//! [`crate::claude_client`] pipeline like every other Claude call in the
+//! [`boss_claude_client`] pipeline like every other Claude call in the
 //! engine.
 
 use std::time::Duration;
@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use boss_protocol::{CommentAnchor, CommentThreadEntry, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION};
 
-use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
+use boss_claude_client::{self as claude_client, CallConfig, Message, MessagesRequest};
 
 const CLASSIFIER_API_KEY_ENV: &str = "BOSS_INTENT_CLASSIFIER_API_KEY";
 
