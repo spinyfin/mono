@@ -39,7 +39,8 @@ echo "[boss-release] agent: $(uname -a)"
 #
 # Fetched via the REST endpoint (`gh api repos/.../releases`), NOT
 # `gh release list` — that command queries GraphQL under the hood, which
-# shares a rate-limit budget with unrelated pollers on this token (see T3192).
+# shares a rate-limit budget with unrelated GitHub-status pollers running on
+# this same personal token, which can exhaust the graphql budget.
 # GraphQL exhaustion was confirmed as the trigger for build 8383's collision
 # (boss-v1.0.328 recomputed and re-tagged ~4 min after it was already
 # published): a degraded/truncated GraphQL response under-reported the true
@@ -231,7 +232,21 @@ done < <(git ls-remote --tags origin 'refs/tags/boss-v1.0.*' 2>/dev/null \
   | sed -E 's#.*refs/tags/##')
 
 if (( GIT_MAX_N > MAX_N )); then
-  die "Release-list snapshot reports the highest boss-v1.0.* release as N=${MAX_N}, but 'git ls-remote --tags origin' (independent of the GitHub releases API) shows a tag up to boss-v1.0.${GIT_MAX_N}. The release list is degraded or incomplete — refusing to compute a version number from it, since doing so would recompute and collide with an already-published tag. Investigate GitHub API health (rate limits, outages) and retry."
+  # Two distinct root causes land here and need different remedies:
+  #   1. A prior run pushed the boss-v1.0.${GIT_MAX_N} tag but died (e.g.
+  #      SIGKILL) before `gh release create` ran — the tag exists with no
+  #      matching release. Retrying won't help; the stale tag must be deleted.
+  #   2. The release-list snapshot itself is genuinely degraded/truncated
+  #      (the original build 8383 failure mode) even though a release for
+  #      that tag does exist. Retrying may help once the API recovers.
+  # Distinguish them with a direct, single-tag lookup (not the paginated
+  # list) before deciding which message to surface.
+  LEAKED_TAG="boss-v1.0.${GIT_MAX_N}"
+  if gh api "repos/spinyfin/mono/releases/tags/${LEAKED_TAG}" >/dev/null 2>&1; then
+    die "Release-list snapshot reports the highest boss-v1.0.* release as N=${MAX_N}, but 'git ls-remote --tags origin' (independent of the GitHub releases API) shows a tag up to ${LEAKED_TAG}, and a release for ${LEAKED_TAG} does exist via a direct lookup. The paginated release-list snapshot is degraded or incomplete — refusing to compute a version number from it, since doing so would recompute and collide with an already-published tag. Investigate GitHub API health (rate limits, outages) and retry."
+  else
+    die "'git ls-remote --tags origin' shows tag ${LEAKED_TAG}, but no GitHub release exists for it (checked directly, not just the paginated list) and the release-list snapshot's highest release is only N=${MAX_N}. This looks like a leaked tag from a prior run that pushed the tag but died before creating the release — retrying will not clear this. The remedy is to delete the stale tag (e.g. 'git push origin :refs/tags/${LEAKED_TAG}') and rerun."
+  fi
 fi
 
 NEXT_N=$(( MAX_N + 1 ))
