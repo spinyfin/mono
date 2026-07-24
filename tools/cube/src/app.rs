@@ -1067,6 +1067,48 @@ fn run_workspace(
                 store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
                 workspace.head_commit = Some(head_commit);
 
+                // Positive recovery check. `--allow-dirty` says "hand me this
+                // workspace without resetting it"; it does NOT establish that
+                // there is still anything in it to recover. A workspace that
+                // was already reset (by a release before the preservation
+                // guard existed, by `--force-reset`, or by pool GC) is handed
+                // over just as happily — and a caller that assumes recovery
+                // succeeded because the lease succeeded will silently start
+                // from an empty tree.
+                //
+                // So probe and report. `dirty_verified: false` is the signal
+                // that cube could NOT recover the work and the caller must
+                // fall back to its own artifact (the Boss engine's recovery
+                // patch). No fetch here: an extra network round trip on the
+                // recovery path is not worth it, and the verdict only turns on
+                // the remote view when `@` is non-empty — in which case there
+                // is demonstrably a working copy to hand back either way.
+                let recovery_probe = read_head_status(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repo_record.main_branch,
+                );
+                let (dirty_verified, dirty_probe_error) = match &recovery_probe {
+                    Ok(status) => (!status.is_reusable(), None),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: cube could not probe {} for recoverable state: {e}; \
+                             reporting dirty_verified=false so the caller falls back rather than \
+                             assuming a recovery that may not have happened",
+                            workspace.workspace_id,
+                        );
+                        (false, Some(e.to_string()))
+                    }
+                };
+                if !dirty_verified {
+                    eprintln!(
+                        "cube: reclaimed {} with --allow-dirty but its working copy holds no \
+                         unrecovered work (dirty_verified=false); nothing was recovered in place.",
+                        workspace.workspace_id,
+                    );
+                }
+
                 audit!(
                     database_path,
                     "lease.acquired_dirty",
@@ -1076,6 +1118,10 @@ fn run_workspace(
                     holder = holder,
                     task = task,
                     head_commit = workspace.head_commit,
+                    dirty_verified = dirty_verified,
+                    dirty_head_change_id = recovery_probe.as_ref().ok().map(|s| s.head_change_id()),
+                    dirty_unpushed_commits = recovery_probe.as_ref().ok().map(|s| s.unpushed_summary()),
+                    dirty_probe_error = dirty_probe_error.as_deref(),
                 );
 
                 let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
@@ -1106,6 +1152,20 @@ fn run_workspace(
                             "workspace_id": pref,
                             "allow_dirty": true,
                             "reset_skipped": true,
+                            // Whether the workspace still held unrecovered work
+                            // at reclaim time. See the probe above: `false`
+                            // means cube recovered nothing and the caller must
+                            // fall back to its own recovery artifact.
+                            "dirty_verified": dirty_verified,
+                            "dirty_head_change_id": recovery_probe
+                                .as_ref()
+                                .ok()
+                                .map(|s| s.head_change_id().to_string()),
+                            "dirty_unpushed_commits": recovery_probe
+                                .as_ref()
+                                .ok()
+                                .map(|s| s.unpushed_summary()),
+                            "dirty_probe_error": dirty_probe_error,
                         })],
                     }),
                 );
@@ -1772,6 +1832,7 @@ fn run_workspace(
             repo,
             reason,
             keep_dirty,
+            force_reset,
         } => {
             let lease = resolve_release_lease(&mut store, workspace, lease, repo)?;
             let workspace = store
@@ -1811,6 +1872,9 @@ fn run_workspace(
             // timed-out reset degrades to "release the lease anyway, mark the
             // workspace dirty" instead of blocking the release.
             let mut reset_error: Option<CubeError> = None;
+            // Set when the release-time reuse guard refused the destructive
+            // reset because `@` still holds work that exists on no remote.
+            let mut preserved: Option<PreservedWorkingCopy> = None;
             if !keep_dirty {
                 let repo_record = store
                     .get_repo(&workspace.repo)?
@@ -1822,13 +1886,14 @@ fn run_workspace(
                 // lock). Best-effort: if the lease is already gone the reset
                 // and release below surface it as LeaseNotFound as before.
                 let _ = store.heartbeat_lease(&lease, Some(current_epoch_s()? + DEFAULT_LEASE_TTL_SECS));
-                match reset_workspace(
+                match reset_workspace_on_release(
                     runner,
                     database_path,
                     &workspace.workspace_path,
                     &repo_record.main_branch,
+                    force_reset,
                 ) {
-                    Ok(()) => {
+                    Ok(ReleaseResetOutcome::Reset) => {
                         // Opportunistically forget consumed boss/exec_* bookmarks.
                         // The fetch above already updated main, so do_fetch = false.
                         // Best-effort: log a warning but never block the release.
@@ -1849,6 +1914,16 @@ fn run_workspace(
                             }
                         }
                     }
+                    Ok(ReleaseResetOutcome::PreservedUnpushedWork(kept)) => {
+                        eprintln!(
+                            "cube: release of {} preserved the working copy: `@` ({}) holds work that \
+                             exists on no remote. The workspace is freed but left dirty so the work \
+                             stays reachable; re-lease it with `--prefer {} --allow-dirty` to resume, \
+                             or release with `--force-reset` once you know the tree is disposable.",
+                            workspace.workspace_id, kept.head_change_id, workspace.workspace_id,
+                        );
+                        preserved = Some(kept);
+                    }
                     Err(e) => {
                         eprintln!(
                             "warning: workspace reset on release of {} failed: {e}; releasing the \
@@ -1863,14 +1938,26 @@ fn run_workspace(
 
             // Take the lock only for the registry state transition.
             let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
+            // A preserved working copy is the reason the workspace is being
+            // freed dirty; record it in `last_release_reason` (overriding the
+            // caller's annotation only when the caller gave none) so
+            // `cube workspace list` explains the dirty row.
+            let effective_reason = reason.clone().or_else(|| {
+                preserved
+                    .as_ref()
+                    .map(|_| PRESERVED_UNPUSHED_RELEASE_REASON.to_string())
+            });
             let released = store
-                .release_workspace(&lease, reason.as_deref())?
+                .release_workspace(&lease, effective_reason.as_deref())?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
-            if reset_error.is_some() {
-                // The freed workspace is in an unknown post-reset state. Flag it
-                // dirty (release_workspace cleared health to NULL) so the lease
-                // health-check skips it and pool GC resets it, rather than
-                // handing out an un-reset tree.
+            if reset_error.is_some() || preserved.is_some() {
+                // Either the freed workspace is in an unknown post-reset state,
+                // or the guard deliberately left the prior holder's work in the
+                // tree. Both must be flagged dirty (release_workspace cleared
+                // health to NULL) so the lease health-check skips the workspace
+                // rather than handing out an un-reset tree — and, for the
+                // preserved case, so a fresh worker never lands on top of work
+                // that is only in that tree.
                 let _ = store.update_workspace_health(&released.repo, &released.workspace_id, WorkspaceHealth::Dirty);
             }
             drop(_lock);
@@ -1881,14 +1968,23 @@ fn run_workspace(
                 repo = released.repo,
                 workspace_id = released.workspace_id,
                 lease_id = lease,
-                reason = reason,
+                reason = effective_reason,
                 keep_dirty = keep_dirty,
+                force_reset = force_reset,
+                preserved_unpushed = preserved.is_some(),
+                preserved_head_change_id = preserved.as_ref().map(|p| p.head_change_id.as_str()),
+                preserved_unpushed_commits = preserved.as_ref().map(|p| p.unpushed_summary.as_str()),
                 reset_failed = reset_error.is_some(),
                 reset_error = reset_error.as_ref().map(|e| e.to_string()),
             );
 
             let message = if keep_dirty {
                 format!("Released {} (kept dirty).", released.workspace_id)
+            } else if preserved.is_some() {
+                format!(
+                    "Released {} (working copy preserved: unpushed work).",
+                    released.workspace_id
+                )
             } else if reset_error.is_some() {
                 format!("Released {} (reset failed; marked dirty).", released.workspace_id)
             } else {
@@ -1899,6 +1995,9 @@ fn run_workspace(
                 json!({
                     "workspace": released,
                     "reset_failed": reset_error.is_some(),
+                    "preserved_unpushed_work": preserved.is_some(),
+                    "preserved_head_change_id": preserved.as_ref().map(|p| p.head_change_id.clone()),
+                    "preserved_unpushed_commits": preserved.as_ref().map(|p| p.unpushed_summary.clone()),
                 }),
             )
         }
@@ -5206,6 +5305,114 @@ fn reset_workspace_guarded(
         }
     }
 
+    reset_workspace_after_fetch(runner, database_path, workspace_path, main_branch, prior_expired)
+}
+
+/// `last_release_reason` recorded when the release-time reuse guard preserves
+/// a working copy and the caller supplied no reason of its own.
+const PRESERVED_UNPUSHED_RELEASE_REASON: &str = "unpushed_work_preserved";
+
+/// What [`reset_workspace_on_release`] did to the working copy.
+#[derive(Debug)]
+enum ReleaseResetOutcome {
+    /// The workspace was fetched and reset to `<main>@<upstream>`.
+    Reset,
+    /// The destructive reset was skipped: `@` holds non-empty work that
+    /// exists on no remote, so resetting would be the only thing standing
+    /// between that work and oblivion.
+    PreservedUnpushedWork(PreservedWorkingCopy),
+}
+
+/// Details of a working copy the release guard declined to reset, carried
+/// through to the audit entry and the JSON payload so an operator can find
+/// the preserved work without re-probing jj.
+#[derive(Debug)]
+struct PreservedWorkingCopy {
+    head_change_id: String,
+    /// `change:commit` pairs for the commits that exist on no remote.
+    unpushed_summary: String,
+}
+
+/// Reset a workspace as part of releasing its lease — but never at the cost
+/// of work that exists nowhere else.
+///
+/// ## Why the guard is on by default rather than caller opt-in
+///
+/// `cube workspace release` used to reset unconditionally unless the caller
+/// passed `--keep-dirty`. The Boss engine has more than a dozen release call
+/// sites (normal completion, conflict watch, terminal-work sweep, host
+/// reconcile, speculative conflict, …) and exactly one of them needs to be
+/// the "the worker crashed, keep the tree" one. Getting that classification
+/// right at every site, forever, is not a property any codebase has; the one
+/// site that got it wrong (`cube_commands.rs`, which issues a bare
+/// `workspace release --lease <id>`) is why in-flight work was destroyed on
+/// every engine restart.
+///
+/// So the safe behaviour is the default and the destructive behaviour is the
+/// opt-in (`--force-reset`). Cube is the component that can actually *see*
+/// whether the tree holds unpushed work, so cube is where the decision
+/// belongs — the caller does not have to know which kind of release it is
+/// performing.
+///
+/// The predicate is [`crate::reuse_guard`]'s, unchanged and already load
+/// bearing for TTL-expiry reclaim: `@` is non-empty AND is reachable from no
+/// remote bookmark. A worker that finished and pushed its branch fails that
+/// test (its work is on the remote) and is reset as before, so the steady
+/// state of the pool is unaffected.
+fn reset_workspace_on_release(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+    force_reset: bool,
+) -> Result<ReleaseResetOutcome> {
+    audit_jj_op(database_path, workspace_path, "git", &["fetch"], None);
+    run_jj_network(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
+    )?;
+
+    if !force_reset {
+        // The fetch above is what makes this verdict trustworthy: the probe
+        // asks "is this work on any remote?", and a stale remote view would
+        // call already-pushed work unpushed and preserve the pool into
+        // uselessness.
+        let head_status = read_head_status(runner, database_path, workspace_path, main_branch)?;
+        if !head_status.is_reusable() {
+            audit!(
+                database_path,
+                "workspace.release_reset_preserved_dirty",
+                workspace_path = workspace_path.display().to_string(),
+                main_branch = main_branch,
+                head_change_id = head_status.head_change_id(),
+                head_is_empty = head_status.head_is_empty(),
+                head_parent_bookmarks = head_status.head_parent_bookmarks(),
+                parent_is_main = head_status.parent_is_main(),
+                unpushed_commits = head_status.unpushed_summary(),
+            );
+            return Ok(ReleaseResetOutcome::PreservedUnpushedWork(PreservedWorkingCopy {
+                head_change_id: head_status.head_change_id().to_string(),
+                unpushed_summary: head_status.unpushed_summary(),
+            }));
+        }
+    }
+
+    reset_workspace_after_fetch(runner, database_path, workspace_path, main_branch, None)?;
+    Ok(ReleaseResetOutcome::Reset)
+}
+
+/// The destructive half of a workspace reset, factored out so the
+/// TTL-expiry path ([`reset_workspace_guarded`]) and the release path
+/// ([`reset_workspace_on_release`]) can each apply their own guard between
+/// the fetch and the `jj new`. Assumes `jj git fetch` has already run.
+fn reset_workspace_after_fetch(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+    prior_expired: Option<&crate::store::ExpiredLease>,
+) -> Result<()> {
     // Detect the real upstream remote by URL so both the fast-forward and the
     // `jj new` target the current GitHub HEAD. For source-pool workspaces this
     // resolves the `github` remote; for direct-GitHub clones it returns
@@ -6764,17 +6971,17 @@ mod tests {
     use crate::cli::{Cli, Command};
     use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
     use crate::lock::RepoLock;
-    use crate::metadata::WorkspaceState;
+    use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
     use crate::reuse_guard;
     use crate::store::{Store, WorkspaceListFilter};
 
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY,
-        RebaseOpts, RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
-        gc_aged_unhealthy_workspaces, is_retryable_network_error, is_stdin_path, rebase_workspace_branch,
-        render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
-        run_checkleft_gate_impl, run_jj_push, run_with_context, run_with_dependencies, upsert_managed_exclude,
-        workspace_goto, workspace_push,
+        PRESERVED_UNPUSHED_RELEASE_REASON, RebaseOpts, RepoEnsureDefaults, Result, current_epoch_s,
+        ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_retryable_network_error, is_stdin_path,
+        rebase_workspace_branch, render_boss_infra_exclude_block, repo_lock_path, resolve_body_file,
+        resolve_checkleft_bin, run_checkleft_gate, run_checkleft_gate_impl, run_jj_push, run_with_context,
+        run_with_dependencies, upsert_managed_exclude, workspace_goto, workspace_push,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -9395,7 +9602,7 @@ mod tests {
         // --allow-dirty must claim the preferred workspace as-is and run
         // NO health check, NO `jj git fetch`, and NO `jj new main` — the
         // dirty tree is handed to the new lease-holder intact. The only jj
-        // call is the head-commit read.
+        // calls are the head-commit read and the read-only recovery probe.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
@@ -9431,12 +9638,18 @@ mod tests {
                 .unwrap();
         }
 
-        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
-            dirty_path.clone(),
-            "jj",
-            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
-            "dead789",
-        )]);
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                dirty_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "dead789",
+            ),
+            // The recovery probe: `@` is non-empty and on no bookmark, so the
+            // unpushed probe runs and confirms there IS work to recover.
+            head_status_command(&dirty_path, &head_status_output("strandedwip", false, "", "", "")),
+            unpushed_probe_command(&dirty_path, "strandedwip\tfeed0001\n"),
+        ]);
 
         let result = run_with_dependencies(
             Cli::parse_from([
@@ -9467,12 +9680,80 @@ mod tests {
         assert_eq!(hc.len(), 1);
         assert_eq!(hc[0]["allow_dirty"], true);
         assert_eq!(hc[0]["reset_skipped"], true);
+        // P1: cube reports that it really did hand back unrecovered work.
+        assert_eq!(hc[0]["dirty_verified"], true);
+        assert_eq!(hc[0]["dirty_head_change_id"], "strandedwip");
+        assert_eq!(hc[0]["dirty_unpushed_commits"], "strandedwip:feed0001");
 
         // The row is now leased to this holder.
         use crate::store::Store;
         let store = Store::open_at(&database_path).unwrap();
         let ws = store.get_workspace_by_path(&dirty_path).unwrap().unwrap();
         assert_eq!(ws.state, crate::metadata::WorkspaceState::Leased);
+    }
+
+    /// P1: `--allow-dirty` succeeding is NOT proof that anything was
+    /// recovered. A workspace that was already reset back to an empty `@` on
+    /// main is handed over just as happily — and cube must say so, because a
+    /// caller that assumes recovery from lease success starts from an empty
+    /// tree and silently loses the work it was trying to save.
+    #[test]
+    fn workspace_lease_allow_dirty_reports_dirty_verified_false_when_nothing_to_recover() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-005");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+        {
+            use crate::metadata::WorkspaceCandidate;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-005".to_string(),
+                        workspace_path: ws_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "beef0001",
+            ),
+            // Empty `@` on main: the fast path settles it, no unpushed probe.
+            head_status_command(&ws_path, &head_status_output("cleanhead", true, "main", "main", "main")),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "recover stranded work",
+                "--prefer",
+                "mono-agent-005",
+                "--allow-dirty",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        // The lease still succeeds — cube's job is to hand over the named
+        // workspace, not to decide the caller's recovery strategy — but the
+        // report is unambiguous that nothing was recovered in place.
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc[0]["allow_dirty"], true);
+        assert_eq!(hc[0]["dirty_verified"], false);
     }
 
     #[test]
@@ -9941,6 +10222,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&ws_path),
             ExpectedCommand::ok(
                 ws_path.clone(),
                 "jj",
@@ -10084,6 +10366,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -10155,6 +10438,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -10277,6 +10561,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -10394,6 +10679,220 @@ mod tests {
         assert_eq!(result.payload["workspace"]["last_release_reason"], "crash");
         assert!(result.message.contains("kept dirty"));
         release_runner.assert_exhausted();
+    }
+
+    // ── release-time dirty preservation (P0) ───────────────────────────────
+    //
+    // A plain `cube workspace release --lease <id>` — the exact invocation
+    // the Boss engine issues from `cube_commands.rs` — must NOT destroy a
+    // working copy that holds work existing on no remote. Before this guard,
+    // every engine restart reset those trees and the in-flight work was gone.
+
+    /// Lease `mono-agent-001` and return its lease id, leaving the registry
+    /// in the "leased, workspace on disk" state the release tests need.
+    fn lease_agent_001_for_release_test(workspace_path: &std::path::Path, database_path: &std::path::Path) -> String {
+        let lease_runner = lease_runner_for(workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+        lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string()
+    }
+
+    /// Read back the single registry row for `mono-agent-001`.
+    fn agent_001_record(database_path: &std::path::Path) -> WorkspaceRecord {
+        Store::open_at(database_path)
+            .expect("store")
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                workspace_id: Some("mono-agent-001"),
+                ..Default::default()
+            })
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("workspace row")
+    }
+
+    /// A bare release whose `@` is non-empty and on no remote keeps the
+    /// working copy: no `jj new`, workspace freed but flagged dirty, and the
+    /// preservation is reported on the payload and the message. This is the
+    /// P0 behaviour the engine depends on.
+    #[test]
+    fn workspace_release_preserves_working_copy_holding_unpushed_work() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
+        seed_mono_repo(&workspace_root, &database_path);
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_id = lease_agent_001_for_release_test(&workspace_path, &database_path);
+
+        // fetch, then the two guard probes — and nothing else. The absence of
+        // `jj new main@origin` from these expectations is the assertion that
+        // matters: FakeRunner rejects any command it was not given.
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            head_status_command(&workspace_path, &head_status_output("wipchange", false, "", "", "")),
+            unpushed_probe_command(&workspace_path, "wipchange\tdeadbeef\n"),
+        ]);
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+
+        assert_eq!(result.payload["preserved_unpushed_work"], true);
+        assert_eq!(result.payload["preserved_head_change_id"], "wipchange");
+        assert_eq!(result.payload["preserved_unpushed_commits"], "wipchange:deadbeef");
+        assert_eq!(result.payload["workspace"]["state"], "free");
+        assert!(
+            result.message.contains("working copy preserved"),
+            "message should say the tree was kept: {}",
+            result.message
+        );
+
+        // Freed but marked dirty, so the lease health check skips it and no
+        // fresh worker lands on top of the preserved work.
+        let record = agent_001_record(&database_path);
+        assert_eq!(record.state, WorkspaceState::Free);
+        assert_eq!(record.health_status, Some(WorkspaceHealth::Dirty));
+        // With no caller-supplied --reason, the preservation itself is the
+        // reason, so `cube workspace list` explains the dirty row.
+        assert_eq!(
+            record.last_release_reason.as_deref(),
+            Some(PRESERVED_UNPUSHED_RELEASE_REASON)
+        );
+    }
+
+    /// The steady state is untouched: a worker that pushed its work leaves an
+    /// empty `@` on main, the guard says "reusable", and the release resets
+    /// exactly as it always did.
+    #[test]
+    fn workspace_release_still_resets_when_working_copy_is_reusable() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
+        seed_mono_repo(&workspace_root, &database_path);
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_id = lease_agent_001_for_release_test(&workspace_path, &database_path);
+
+        let release_runner = release_runner_for(&workspace_path);
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+
+        assert_eq!(result.payload["preserved_unpushed_work"], false);
+        assert_eq!(result.payload["workspace"]["state"], "free");
+        assert_eq!(
+            agent_001_record(&database_path).health_status,
+            None,
+            "a reset workspace must not be flagged dirty"
+        );
+    }
+
+    /// `--force-reset` is the deliberate opt-out: the guard probe is skipped
+    /// entirely and the destructive reset runs regardless of the tree.
+    #[test]
+    fn workspace_release_force_reset_overrides_the_preservation_guard() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
+        seed_mono_repo(&workspace_root, &database_path);
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_id = lease_agent_001_for_release_test(&workspace_path, &database_path);
+
+        // No head-status probe at all: --force-reset skips it, so the
+        // expectations are the plain fetch+reset sequence.
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+            gc_noop_command(&workspace_path),
+            gc_pr_remote_noop_command(&workspace_path),
+        ]);
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id, "--force-reset"]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+        assert_eq!(result.payload["preserved_unpushed_work"], false);
+        assert!(result.message.starts_with("Released mono-agent-001."));
+    }
+
+    /// A caller-supplied `--reason` wins over the synthetic preservation
+    /// reason, so an operator's crash annotation is not overwritten.
+    #[test]
+    fn workspace_release_preservation_does_not_clobber_caller_reason() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
+        seed_mono_repo(&workspace_root, &database_path);
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_id = lease_agent_001_for_release_test(&workspace_path, &database_path);
+
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            head_status_command(&workspace_path, &head_status_output("wip2", false, "", "", "")),
+            unpushed_probe_command(&workspace_path, "wip2\tcafe1234\n"),
+        ]);
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "release",
+                "--lease",
+                &lease_id,
+                "--reason",
+                "engine-restart",
+            ]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+        assert_eq!(result.payload["preserved_unpushed_work"], true);
+        assert_eq!(result.payload["workspace"]["last_release_reason"], "engine-restart");
+    }
+
+    /// `--keep-dirty` and `--force-reset` are mutually exclusive: they ask for
+    /// opposite things, and silently letting one win would be exactly the
+    /// class of ambiguity this change exists to remove.
+    #[test]
+    fn workspace_release_rejects_keep_dirty_with_force_reset() {
+        let parsed = Cli::try_parse_from([
+            "cube",
+            "workspace",
+            "release",
+            "mono-agent-001",
+            "--keep-dirty",
+            "--force-reset",
+        ]);
+        assert!(parsed.is_err(), "--keep-dirty and --force-reset must conflict");
     }
 
     #[test]
@@ -11727,10 +12226,23 @@ mod tests {
         )
     }
 
-    /// Standard release runner: fetch, reset, then gc-noop (exec + pr sweeps).
+    /// The release-time reuse-guard probe that says "this working copy is
+    /// safe to reset": an empty `@` sitting on `main`, which
+    /// `needs_unpushed_probe` settles without a second jj call. Every
+    /// release expectation needs this between `jj git fetch` and the reset.
+    fn release_guard_reusable_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+        head_status_command(
+            workspace_path,
+            &head_status_output("releaseok", true, "main", "main", "main"),
+        )
+    }
+
+    /// Standard release runner: fetch, reuse-guard probe, reset, then gc-noop
+    /// (exec + pr sweeps).
     fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner {
         FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(workspace_path),
             ExpectedCommand::ok(
                 workspace_path.to_path_buf(),
                 "jj",
@@ -11872,6 +12384,7 @@ mod tests {
         // Release runner returns a consumed bookmark from the gc log query.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -12363,6 +12876,7 @@ mod tests {
         // Release runner: gc finds a closed pr/42 bookmark and forgets it.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -12450,6 +12964,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -12536,6 +13051,7 @@ mod tests {
         // Release runner: gc finds pr/7 but state is OPEN — no forget call.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -12622,6 +13138,7 @@ mod tests {
         // Release runner: remote list fails → pr sweep skipped, no extra commands.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -12970,6 +13487,7 @@ steps:
         // Release so we can re-lease cleanly.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -13120,6 +13638,7 @@ steps:
         };
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            release_guard_reusable_command(&workspace_path),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
