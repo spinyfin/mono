@@ -3256,6 +3256,32 @@ fn workspace_push(
         ));
     }
 
+    // `jj git push` refuses to push a commit with an empty description. This
+    // command lands whatever is already resolved in the working copy without
+    // an intervening `jj describe` — the deterministic-resolver rung
+    // (`attempt_rung0` in conflict_ladder.rs) edits conflicted files directly
+    // via the resolver registry and never describes `@` itself, so without
+    // this check its resolution reaches here undescribed and the push below
+    // is rejected outright. Stamp a deterministic description only when `@`
+    // doesn't already have one, so a description a human or an earlier step
+    // already set is left untouched.
+    let description = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(&cwd, "jj", &["log", "-r", "@", "--no-graph", "-T", "description"]),
+    )?;
+    if description.trim().is_empty() {
+        let message = match pr {
+            Some(n) => format!("Resolve merge conflict on PR #{n} ({boss_branch})"),
+            None => format!("Resolve merge conflict on {boss_branch}"),
+        };
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(&cwd, "jj", &["describe", "-r", "@", "-m", &message]),
+        )?;
+    }
+
     // Advance the branch bookmark to @. A prior rebase already legitimately
     // moved it off its previous remote position, so --allow-backwards is
     // expected here, not a footgun.
@@ -16409,6 +16435,18 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "description"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["describe", "-r", "@", "-m", "Resolve merge conflict on boss/exec_abc"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
                 &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
                 "",
             ),
@@ -16466,6 +16504,24 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "description"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "describe",
+                    "-r",
+                    "@",
+                    "-m",
+                    "Resolve merge conflict on PR #9 (boss/exec_pr9)",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
                 &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
                 "",
             ),
@@ -16497,6 +16553,138 @@ steps:
         let result = run_push(&runner, None, Some(9)).expect("push via --pr");
         runner.assert_exhausted();
         assert_eq!(result.payload["branch"], branch);
+    }
+
+    // Regression coverage: `jj git push` refuses a commit with no
+    // description. `@` reaches `cube workspace push` undescribed when the
+    // conflict-ladder's rung-0 deterministic resolvers edited files directly
+    // without ever calling `jj describe` — see `attempt_rung0` in
+    // `conflict_ladder.rs`. This test pins that a blank description is
+    // detected and stamped with a deterministic message before the bookmark
+    // is advanced and pushed.
+    #[test]
+    fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let branch = "boss/exec_undescribed";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                "CLEAN",
+            ),
+            // Blank description (only whitespace) — must still trigger `jj describe`.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "description"],
+                "  \n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "describe",
+                    "-r",
+                    "@",
+                    "-m",
+                    "Resolve merge conflict on boss/exec_undescribed",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", branch, "--remote", "github"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+                "beef\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_undescribed",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "beef\n",
+            ),
+        ]);
+
+        let result = run_push(&runner, Some(branch), None).expect("push describes then pushes");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["pushed"], true);
+    }
+
+    // Sibling of the test above: an already-described `@` (e.g. a human or
+    // an earlier step already set one) must be left untouched — no
+    // `jj describe` call at all.
+    #[test]
+    fn workspace_push_leaves_an_existing_description_untouched() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let branch = "boss/exec_described";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                "CLEAN",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "description"],
+                "an existing commit message\n",
+            ),
+            // No `describe` call expected here.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", branch, "-r", "@", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", branch, "--remote", "github"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+                "d00d\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_described",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "d00d\n",
+            ),
+        ]);
+
+        let result = run_push(&runner, Some(branch), None).expect("push with existing description");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["pushed"], true);
     }
 
     #[test]
@@ -16533,6 +16721,18 @@ steps:
                 "jj",
                 &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
                 "CLEAN",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "description"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["describe", "-r", "@", "-m", "Resolve merge conflict on boss/exec_pf2"],
+                "",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
