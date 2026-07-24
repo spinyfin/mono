@@ -45,6 +45,7 @@ members = [
   "tools/boss/log-files",
   "tools/boss/protocol",
   "tools/boss/engine/ssh-transport",
+  "tools/boss/engine/timer-wheel",
   "tools/boss/engine/transcript-tail",
   "tools/boss/engine/transient-error",
   "tools/boss/engine/utils",

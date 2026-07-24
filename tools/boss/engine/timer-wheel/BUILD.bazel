@@ -4,24 +4,27 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "event-bus",
+    name = "timer-wheel",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_event_bus",
+    crate_name = "boss_timer_wheel",
     crate_root = "src/lib.rs",
     edition = "2024",
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/timer-wheel:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/event-bus",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "event-bus_test",
+    name = "timer-wheel_test",
     size = "small",
-    crate = ":event-bus",
+    crate = ":timer-wheel",
     edition = "2024",
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/engine/event-bus",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
