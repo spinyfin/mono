@@ -19,6 +19,7 @@ members = [
   "tools/boss/engine/conflict-diagnosis",
   "tools/boss/engine/deterministic-resolvers",
   "tools/boss/engine/dispatch-events",
+  "tools/boss/engine/event-bus",
   "tools/boss/engine/core",
   "tools/boss/engine/day-rotated-log",
   "tools/boss/engine/design-doc-fetcher",
