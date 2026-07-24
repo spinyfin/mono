@@ -81,6 +81,33 @@ pub struct CheckConfig {
     /// position (backward-compat). Replaced (not unioned) on upsert, consistent with how
     /// the rest of a check entry is overridden by a child `CHECKS` file.
     pub exclude_patterns: Vec<String>,
+    /// What this check's scheduling is keyed on. See [`CheckScope`].
+    pub scope: CheckScope,
+}
+
+/// What a configured check's scheduling is keyed on.
+///
+/// `Files` (the default) is today's behavior: the check is scheduled once per
+/// distinct configuration and runs against whichever changed files matched it.
+///
+/// `Changeset` is for checks that have no file to point at — they inspect the
+/// changeset as a whole (the PR description, the commit message) rather than
+/// any one file. Such a check is scheduled exactly once per invocation,
+/// regardless of the changed-file set (including an empty one), instead of
+/// being tied to file resolution. See `Runner::schedule_changeset_scope_runs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckScope {
+    #[default]
+    Files,
+    Changeset,
+}
+
+fn parse_check_scope(raw: &str) -> Result<CheckScope> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "files" => Ok(CheckScope::Files),
+        "changeset" => Ok(CheckScope::Changeset),
+        _ => bail!("expected one of `files` or `changeset`"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +456,45 @@ impl ConfigResolver {
                     continue;
                 }
             };
+            let scope_explicit = check.scope.is_some();
+            let scope = match check.scope.as_deref() {
+                Some(raw) => match parse_check_scope(raw) {
+                    Ok(scope) => scope,
+                    Err(err) => {
+                        resolved.push_diagnostic(config_check_diagnostic(
+                            configured_id.clone(),
+                            config_relative_path.clone(),
+                            format!("invalid `scope` for check `{configured_id}`: {err}"),
+                        ));
+                        continue;
+                    }
+                },
+                // No `scope` key: an ancestor CHECKS file (typically the repo root, the
+                // only place `scope = changeset` is honoured) may already have resolved
+                // this id to `Changeset`. Inherit that rather than silently defaulting to
+                // `Files` — otherwise a subdirectory override that only tweaks e.g.
+                // `policy` flips the check to files scope for that subtree, and it ends
+                // up scheduled twice (once as changeset at the root, once as files here).
+                None => resolved
+                    .get(&configured_id)
+                    .map(|existing| existing.scope)
+                    .unwrap_or_default(),
+            };
+            // Only an *explicit* `scope = changeset` in a subdirectory is rejected — it
+            // can never be honoured there. An inherited `Changeset` scope (no `scope` key
+            // in this file) is expected and must fall through to the upsert below so the
+            // override still merges into the single root-scheduled changeset check.
+            if scope_explicit && scope == CheckScope::Changeset && !check_config_dir.as_os_str().is_empty() {
+                resolved.push_diagnostic(config_check_diagnostic(
+                    configured_id.clone(),
+                    config_relative_path.clone(),
+                    format!(
+                        "`scope = changeset` is only honoured in the repo-root CHECKS file; check `{configured_id}` declared in {} will never be scheduled",
+                        config_relative_path.display()
+                    ),
+                ));
+                continue;
+            }
             resolved.upsert(CheckConfig {
                 check: check_name,
                 id: configured_id,
@@ -440,6 +506,7 @@ impl ConfigResolver {
                 policy,
                 config: check.config,
                 exclude_patterns,
+                scope,
             });
         }
     }
@@ -509,6 +576,9 @@ struct ParsedCheckConfig {
     /// also read for backward compatibility and merged with this field.
     #[serde(default, alias = "exclude_files", alias = "exclude_globs")]
     exclude: Option<Vec<String>>,
+    /// `files` (default) or `changeset`. See [`CheckScope`].
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1127,6 +1197,15 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
         } else {
             extract_legacy_config_excludes(&check.config, Path::new(""))
         };
+        let scope = match check.scope.as_deref() {
+            Some(raw) => parse_check_scope(raw).with_context(|| {
+                format!(
+                    "invalid `scope` for check `{configured_id}` in {}",
+                    external_checks_file.source_label
+                )
+            })?,
+            None => CheckScope::default(),
+        };
         resolved.upsert(CheckConfig {
             check: check_name,
             id: configured_id,
@@ -1138,6 +1217,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             policy,
             config: check.config.clone(),
             exclude_patterns,
+            scope,
         });
     }
 
