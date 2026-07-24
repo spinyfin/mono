@@ -676,16 +676,9 @@ struct ServerState {
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
     /// The engine's in-process typed topic bus (`tools/boss/engine/
-    /// event-bus`), generalizing the bespoke `Notify`-based "kick"
-    /// primitives into typed `publish`/`subscribe` topics. The merge
-    /// poller subscribes to the `PrReconcileRequested{pr_url}` topic here
-    /// as the keyed companion to the broad `pr_reconciler_kick` sweep —
-    /// replacing the old `PrReconcilerTargetedKick` `Notify`+`Vec<String>`
-    /// queue. No producer publishes onto that topic yet (a future caller —
-    /// push-event relay, adaptive per-PR timer — see
-    /// `tools/boss/docs/investigations/
-    /// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9); wiring
-    /// the first one is a separate follow-up task.
+    /// event-bus`). The merge poller subscribes to the
+    /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
+    /// the broad `pr_reconciler_kick` sweep.
     #[builder(default = Arc::new(EventBus::new()))]
     event_bus: Arc<EventBus>,
     /// Kick signal for the automation scheduler loop. Notified by any

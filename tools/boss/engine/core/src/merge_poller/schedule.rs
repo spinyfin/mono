@@ -223,16 +223,10 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
 /// result in repeated GitHub API calls.
 ///
 /// `pr_reconcile_requests` is the keyed companion to the broad `kick`:
-/// a [`boss_event_bus::Subscription`] to the [`Event::PrReconcileRequested`]
-/// topic, replacing the bespoke `PrReconcilerTargetedKick`
-/// `Notify`+`Vec<String>` queue this loop used before the event bus
-/// existed. Same quiesce window as the broad kick, but each received
-/// event reconciles just its named PR via [`reconcile_one`] rather than
-/// triggering a full sweep. No producer publishes onto this topic yet —
-/// wiring the first one (push-event relay, adaptive per-PR timer — see
-/// `tools/boss/docs/investigations/
-/// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9 items
-/// 3–4) is a separate follow-up task.
+/// a subscription to the [`Event::PrReconcileRequested`] topic. Same
+/// quiesce window as the broad kick, but each received event reconciles
+/// just its named PR via [`reconcile_one`] rather than triggering a full
+/// sweep.
 ///
 /// The Trunk merge-queue observer
 /// ([`crate::trunk_queue_poller::TrunkQueueProbe`]) rides this same loop
@@ -262,6 +256,7 @@ pub fn spawn_loop(
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
+        let mut pr_requests_closed = false;
         let mut trunk_probe = crate::trunk_queue_poller::TrunkQueueProbe::new();
         let mut spec_schedule = crate::speculative_conflict::SpeculativeCheckSchedule::default();
         let mut stacking_schedule = crate::stacked_pr_structuring::StackingSchedule::default();
@@ -465,7 +460,7 @@ pub fn spawn_loop(
                         );
                         // continue listening; periodic sleep arm will eventually fire
                     }
-                    event = pr_reconcile_requests.recv() => {
+                    event = pr_reconcile_requests.recv(), if !pr_requests_closed => {
                         match event {
                             Some(Event::PrReconcileRequested { pr_url }) => {
                                 let since_last = last_run_at.elapsed();
@@ -514,6 +509,7 @@ pub fn spawn_loop(
                                 );
                             }
                             None => {
+                                pr_requests_closed = true;
                                 tracing::warn!(
                                     "merge poller: pr_reconcile_requests subscription closed \
                                      (event bus dropped) — keyed PR reconcile requests will no \
