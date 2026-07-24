@@ -88,8 +88,9 @@ pub enum PreemptOutcome {
     /// pool slot is free and its work is safe to requeue.
     Released,
     /// The victim had no live pane to reap — it is mid-spawn, and its
-    /// lease is deliberately still held (T981: releasing it now would
-    /// hand cube a workspace the in-flight spawn is about to occupy).
+    /// lease is deliberately still held (the mid-spawn-cancel lease-hold
+    /// case: releasing it now would hand cube a workspace the in-flight
+    /// spawn is about to occupy).
     /// The caller MUST abandon the preemption: do not cancel, do not
     /// requeue. The in-flight run releases the lease itself once its
     /// spawn settles.
@@ -113,7 +114,7 @@ pub enum PreemptOutcome {
 /// locks — the #975/#1006 leak class), releases the pool slot, and
 /// releases the cube lease. Reusing it — rather than open-coding a
 /// teardown here — is what keeps preemption's process-tree reap and its
-/// mid-spawn (T981) refusal correct by construction.
+/// mid-spawn-cancel lease-hold refusal correct by construction.
 #[async_trait]
 pub trait AutomationPreemptor: Send + Sync {
     async fn preempt_worker(&self, execution_id: &str) -> PreemptOutcome;
@@ -292,8 +293,9 @@ const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// `work_attention_items.kind` filed when a `ready` execution has been
 /// repeatedly deferred behind the SAME `chain_serialized` live sibling for
-/// at least [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`] — the 2026-07-09 T251
-/// incident (`task_18c07e0a815e6bd0_1de`): the dispatcher re-evaluated and
+/// at least [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`] — the 2026-07-09
+/// chain-serialization re-defer stall incident (`task_18c07e0a815e6bd0_1de`):
+/// the dispatcher re-evaluated and
 /// re-deferred every ~10s for ~20 minutes with zero durable, user-visible
 /// signal, so a human only noticed by grepping `engine-trace.jsonl`. Filed
 /// once per stall (idempotent via [`WorkDb::upsert_work_item_attention`])
@@ -304,8 +306,9 @@ pub const CHAIN_SERIALIZED_STALL_ATTENTION_KIND: &str = "chain_serialized_stall"
 
 /// How long a `ready` execution may sit deferred behind the same live chain
 /// sibling before [`CHAIN_SERIALIZED_STALL_ATTENTION_KIND`] fires. Set
-/// comfortably below the ~20-minute silent stall observed in the T251
-/// incident so a human is alerted well before that point going forward.
+/// comfortably below the ~20-minute silent stall observed in the
+/// chain-serialization re-defer stall incident so a human is alerted well
+/// before that point going forward.
 pub const CHAIN_SERIALIZED_STALL_THRESHOLD_SECS: i64 = 900;
 
 /// Short `repo#N` reference for a canonical GitHub PR URL, for embedding in
@@ -576,8 +579,9 @@ pub trait CubeClient: Send + Sync {
     /// bookmark on a clean result, so the real PR branch is never mutated.
     /// Used for the speculative/throwaway rebase the merge poller's
     /// prediction sweep runs against in-review PRs to observe whether they
-    /// would conflict against current `main` (Layer 4 / T10 of the
-    /// merge-conflict-reduction design). Same default-Err pattern as
+    /// would conflict against current `main` (the conflict-against-main
+    /// result-gate layer of the merge-conflict-reduction design). Same
+    /// default-Err pattern as
     /// `rebase_workspace` — only [`CommandCubeClient`] implements it for
     /// real.
     async fn rebase_workspace_no_push(&self, workspace_path: &Path, pr: u64) -> Result<RebaseOutcome> {
@@ -600,9 +604,9 @@ pub trait CubeClient: Send + Sync {
         let _ = (workspace_path, pr);
         Err(anyhow!("push_resolution is not supported by this CubeClient"))
     }
-    /// T9 (T2562) result-gate: verify a resolution already pushed to PR
-    /// `pr`'s branch against the both-parents deletion tripwire
-    /// (incident-002 P2, `merge_parent_deletion::compute_merged_parent_deletions`).
+    /// The conflict-against-main result-gate layer: verify a resolution
+    /// already pushed to PR `pr`'s branch against the both-parents deletion
+    /// tripwire (`merge_parent_deletion::compute_merged_parent_deletions`).
     /// Returns the tripwire's rendered finding lines — empty means clean.
     /// Used by the merge-conflict escalation ladder's mechanical rungs (0
     /// and 1, `conflict_ladder.rs`) to vet an auto-retiring resolution the
@@ -862,8 +866,9 @@ impl CubeClient for CommandCubeClient {
         // Same command as `rebase_workspace` plus `--no-push`: a clean
         // rebase never advances/pushes the boss bookmark, so the real PR
         // branch is untouched. Used for the speculative/throwaway rebase
-        // (Layer 4 / T10) — the caller only wants to observe whether the PR
-        // would conflict against current `main`.
+        // (the conflict-against-main result-gate layer) — the caller only
+        // wants to observe whether the PR would conflict against current
+        // `main`.
         let payload = self
             .run_json_in_dir(
                 workspace_path,
