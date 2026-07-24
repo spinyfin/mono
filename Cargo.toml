@@ -60,6 +60,7 @@ members = [
   "tools/checkleft/checks/rust/giant-structs",
   "tools/checkleft/checks/rust/giant-structs-common",
   "tools/checkleft/checks/rust/giant-structs-create",
+  "tools/checkleft/checks/text/forbidden-pattern",
   "tools/checkleft/preinstalled-bundle",
   "tools/checkleft_package",
   "tools/cube",
