@@ -335,7 +335,7 @@ async fn retire_skipped_when_product_opt_out_flag_disabled() {
 /// no active (pending/running) remediation attempt — because the prior
 /// attempt was already terminal (failed, abandoned) — it must emit
 /// `CiFailureCleared` so the UI can clear its stale `ci failing` badge
-/// without incorrectly setting the `ci auto-fixed` badge. (T606 fix)
+/// without incorrectly setting the `ci auto-fixed` badge.
 #[tokio::test]
 async fn retire_without_active_attempt_emits_ci_failure_cleared() {
     let dir = tempdir().unwrap();

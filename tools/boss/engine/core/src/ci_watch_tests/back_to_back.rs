@@ -1,8 +1,8 @@
 use super::helpers::*;
 
-// ----- Back-to-back dequeue regression (T628 / PR #718 06:51Z miss) -----
+// ----- Back-to-back dequeue regression (PR #718 06:51Z miss) -----
 
-/// Reproducer for T628: a PR that was dequeued, manually re-queued,
+/// Reproducer: a PR that was dequeued, manually re-queued,
 /// and dequeued again must end up with a parked revision for the second
 /// dequeue's SHA — without requiring the first dequeue's worker to have
 /// completed.

@@ -1,12 +1,12 @@
 use super::helpers::*;
 
-// ----- Merge-queue rebounce detection (T605 regression, PR #690) -----
+// ----- Merge-queue rebounce detection (PR #690) -----
 
 /// A PR whose head-branch CI is all green but that was removed from
 /// the merge queue with `reason=FAILED_CHECKS` must flip its owning
 /// chore to `blocked: ci_failure` and park a `ci_remediation` execution.
 ///
-/// This is the basic reproducer for the T604 missed-detection: the
+/// This is the basic reproducer for the missed-detection: the
 /// engine must act on the `RemovedFromMergeQueueEvent` timeline signal,
 /// not on the per-PR `statusCheckRollup` (which stays SUCCESS after a
 /// dequeue).
@@ -31,7 +31,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
     .await;
     assert!(flipped, "rebounce detection must flip chore to ci_failure");
 
-    // T2381/PR#1861 fix: in the in_review model (mirrors on_ci_failure_detected
+    // PR#1861 fix: in the in_review model (mirrors on_ci_failure_detected
     // and on_conflict_detected) a spawned revision immediately unblocks the
     // parent back to `in_review`; `blocked: ci_failure` is transient. Before
     // this fix the parent stayed `blocked: ci_failure` forever, invisible to
@@ -139,7 +139,7 @@ async fn rebounce_stores_failing_checks_from_failures_slice() {
     );
 }
 
-/// THE REGRESSION (T604 / PR #690 04:44Z miss): a clean head-branch CI
+/// THE REGRESSION (PR #690 04:44Z miss): a clean head-branch CI
 /// probe must NOT clear a `merge_queue_rebounce` block.
 ///
 /// Before the fix, `on_ci_resolved` treated "head-branch CI is green" as
