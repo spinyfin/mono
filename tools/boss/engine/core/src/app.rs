@@ -6,13 +6,11 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use boss_event_bus::EventBus;
+use boss_event_bus::{EventBus, EventKind, TopicFilter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex, Notify, oneshot};
-
-use boss_event_bus::{EventBus, EventKind, TopicFilter};
 
 use crate::audit_effort;
 use crate::cli::Cli;
@@ -428,7 +426,9 @@ struct ServerState {
     /// In-process typed event bus (design:
     /// `tools/boss/docs/designs/engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`).
     /// The events-socket accept loop publishes the hook-observable
-    /// transitions onto it; no subscribers are wired up yet.
+    /// transitions onto it. The merge poller subscribes to the
+    /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
+    /// the broad `pr_reconciler_kick` sweep.
     #[builder(default = Arc::new(EventBus::new()))]
     event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,
@@ -675,12 +675,6 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
-    /// The engine's in-process typed topic bus (`tools/boss/engine/
-    /// event-bus`). The merge poller subscribes to the
-    /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
-    /// the broad `pr_reconciler_kick` sweep.
-    #[builder(default = Arc::new(EventBus::new()))]
-    event_bus: Arc<EventBus>,
     /// Kick signal for the automation scheduler loop. Notified by any
     /// automation mutation handler (create, update, enable, disable,
     /// delete) so the scheduler recomputes its min-next-fire sleep
