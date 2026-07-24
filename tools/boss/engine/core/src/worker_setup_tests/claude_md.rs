@@ -131,12 +131,12 @@ fn claude_md_warns_against_force_tracking_dot_claude() {
     assert!(rendered.contains("force") || rendered.contains("track"));
 }
 
-/// Authoring-side guardrail against reimplementing existing infrastructure
-/// (P1690 incident: a sixth hand-rolled Anthropic Messages API client landed
-/// unflagged). Standard workers must be told to search for an existing
+/// Authoring-side guardrail against reimplementing existing infrastructure.
+/// A prior incident saw a sixth hand-rolled Anthropic Messages API client
+/// land unflagged. Standard workers must be told to search for an existing
 /// implementation before building a cross-cutting capability, and that a
-/// genuinely-necessary duplication needs an explicit, operator-visible
-/// justification in the PR description.
+/// genuinely-necessary duplication needs an explicit justification recorded
+/// in the PR description.
 #[test]
 fn claude_md_has_reuse_before_you_build_guardrail() {
     let input = sample_input();

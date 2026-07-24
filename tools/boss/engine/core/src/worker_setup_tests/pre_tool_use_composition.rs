@@ -101,8 +101,8 @@ fn chore_implementation_has_pr_redirect_guard_but_no_revision_guard() {
 }
 
 /// Design and investigation workers are also `WorkerKind::Standard` and must
-/// carry the PR redirect guard. The original root cause (T686) was a DESIGN
-/// worker's prelude diverging from chore/task preludes — pin that cross-prelude
+/// carry the PR redirect guard. The original root cause was a design worker's
+/// prelude diverging from the chore/task preludes — pin that cross-prelude
 /// invariant here so future drift is caught immediately.
 #[test]
 fn design_and_investigation_workers_carry_pr_redirect_guard() {
