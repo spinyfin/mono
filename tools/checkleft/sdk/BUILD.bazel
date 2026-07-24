@@ -18,6 +18,7 @@ rust_library(
         "//tools/checkleft/checks/md/link-integrity:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs-create:__pkg__",
+        "//tools/checkleft/checks/text/forbidden-pattern:__pkg__",
         "//tools/checkleft/preinstalled-bundle:__pkg__",
         "//tools/checkleft/sdk/examples:__subpackages__",
     ],

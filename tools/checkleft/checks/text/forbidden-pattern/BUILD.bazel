@@ -1,0 +1,42 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The text/forbidden-pattern check logic as an ordinary rlib. It is linked
+# (together with the other preinstalled checks) into the single multiplexed
+# Component Model component built by //tools/checkleft/preinstalled-bundle.
+# Building as an rlib lets the shared wasm runtime baseline
+# (std/alloc/SDK/wit-bindgen/serde) be deduped across all checks inside one
+# component.
+rust_library(
+    name = "text_forbidden_pattern_check",
+    srcs = ["src/lib.rs"],
+    crate_name = "checkleft_text_forbidden_pattern",
+    edition = "2024",
+    proc_macro_deps = [
+        "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
+    ] + all_crate_deps(proc_macro = True),
+    visibility = ["//tools/checkleft/preinstalled-bundle:__pkg__"],
+    deps = [
+        "//tools/checkleft/sdk:checkleft_check_sdk",
+        "@@rules_rust++crate+mono_crates__regex-1.12.4//:regex",
+    ] + all_crate_deps(normal = True),
+)
+
+# Unit tests for the check logic compiled natively.
+rust_test(
+    name = "text_forbidden_pattern_check_test",
+    size = "small",
+    crate = ":text_forbidden_pattern_check",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/checkleft/sdk:checkleft_check_sdk",
+        "@@rules_rust++crate+mono_crates__regex-1.12.4//:regex",
+        "@@rules_rust++crate+mono_crates__tempfile-3.27.0//:tempfile",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -182,6 +182,7 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             "md/link-integrity",
             "rust/giant-structs",
             "rust/giant-structs-create",
+            "text/forbidden-pattern",
         ],
         kind: BundledCheckDefKind::Component {
             bytes: checkleft_preinstalled_wasm_bundle::WASM,

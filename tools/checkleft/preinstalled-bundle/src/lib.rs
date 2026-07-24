@@ -43,4 +43,5 @@ export_checks!(
     checkleft_md_link_integrity::md_link_integrity_check,
     checkleft_rust_giant_structs_use_builder::giant_structs_check,
     checkleft_rust_giant_structs_create::giant_structs_create_check,
+    checkleft_text_forbidden_pattern::forbidden_pattern_check,
 );
