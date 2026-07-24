@@ -66,7 +66,7 @@ pub enum RunWaitState {
     /// the just-spawned pane; the coordinator must release the cube
     /// lease the cancel path deliberately left held and skip the normal
     /// completion recording (the row is already terminal). See
-    /// [`PaneSpawnRunner::run_execution`] and the T981 mid-spawn-cancel
+    /// [`PaneSpawnRunner::run_execution`] and the mid-spawn-cancel
     /// collision this closes.
     CancelledDuringSpawn,
     /// A `pr_review` reviewer pane was successfully spawned. The pane is

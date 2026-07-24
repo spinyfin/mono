@@ -237,14 +237,18 @@ fn recovery_block_injected_when_prior_branch_provided() {
     );
 }
 
-// ── STARTUP RECOVERY: recovered working state (P3) ────────────────────
+// ── STARTUP RECOVERY: recovered working state ──────────────────────────
 //
 // The old block talked only about a *pushed branch* and told the worker
 // to fall back to `jj new main@origin` — which moves `@` off any
 // recovered uncommitted state. These tests pin the fix.
 
-fn apply_report(paths: &[&str], insertions: usize, deletions: usize) -> crate::recovery_apply::ApplyReport {
-    crate::recovery_apply::ApplyReport {
+fn apply_report(
+    paths: &[&str],
+    insertions: usize,
+    deletions: usize,
+) -> boss_engine_recovery::recovery_apply::ApplyReport {
+    boss_engine_recovery::recovery_apply::ApplyReport {
         paths: paths.iter().map(|p| (*p).to_owned()).collect(),
         insertions,
         deletions,
@@ -271,10 +275,10 @@ fn recovery_block_never_tells_the_worker_to_unconditionally_reset() {
 /// it, and tell the worker to look before it leaps.
 #[test]
 fn recovery_block_reports_in_place_recovery() {
-    let report = crate::recovery_apply::RecoveryReport {
+    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
         for_execution_id: "exec_new".to_owned(),
         from_execution_id: "exec_dead".to_owned(),
-        source: crate::recovery_apply::RecoverySource::CubeInPlace,
+        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
         applied: None,
         patch_error: None,
     };
@@ -295,10 +299,10 @@ fn recovery_block_reports_in_place_recovery() {
 /// that only uncommitted edits came across.
 #[test]
 fn recovery_block_reports_patch_recovery_in_human_terms() {
-    let report = crate::recovery_apply::RecoveryReport {
+    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
         for_execution_id: "exec_new".to_owned(),
         from_execution_id: "exec_dead".to_owned(),
-        source: crate::recovery_apply::RecoverySource::Patch,
+        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
         applied: Some(apply_report(&["tools/cube/src/app.rs", "docs/x.md"], 120, 14)),
         patch_error: None,
     };
@@ -318,10 +322,10 @@ fn recovery_block_reports_patch_recovery_in_human_terms() {
 /// Silence would leave it believing it was resuming.
 #[test]
 fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
-    let report = crate::recovery_apply::RecoveryReport {
+    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
         for_execution_id: "exec_new".to_owned(),
         from_execution_id: "exec_dead".to_owned(),
-        source: crate::recovery_apply::RecoverySource::Patch,
+        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
         applied: None,
         patch_error: Some("error: patch does not apply".to_owned()),
     };
@@ -344,10 +348,10 @@ fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
 fn recovery_block_keeps_the_prior_branch_instructions() {
     for report in [
         None,
-        Some(crate::recovery_apply::RecoveryReport {
+        Some(boss_engine_recovery::recovery_apply::RecoveryReport {
             for_execution_id: "e".to_owned(),
             from_execution_id: "d".to_owned(),
-            source: crate::recovery_apply::RecoverySource::CubeInPlace,
+            source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
             applied: None,
             patch_error: None,
         }),
@@ -507,7 +511,7 @@ fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
 
 #[test]
 fn no_op_directive_present_for_fresh_chore_without_pr() {
-    // T1868: a fresh chore_implementation worker (no existing PR) must
+    // A fresh chore_implementation worker (no existing PR) must
     // be told the sanctioned way to terminate when the work is already
     // done — emit NO_CHANGES_NEEDED — instead of only "stop and explain".
     let prompt = compose_execution_prompt(
@@ -651,7 +655,7 @@ fn task_bound_pr_url_returns_none_when_description_has_only_issue_url() {
 
 #[test]
 fn task_bound_pr_url_ignores_pr_url_in_description() {
-    // Regression for T683 / exec_18b341df81251750_4: a chore imported
+    // Regression for exec_18b341df81251750_4: a chore imported
     // from an issue whose body *mentions* a PR URL (e.g. as a repro
     // example) must NOT cause a RESUME EXISTING PR block. The structured
     // `pr_url` field is the only authoritative source.
@@ -677,7 +681,7 @@ fn task_bound_pr_url_ignores_pr_url_in_description() {
 
 #[test]
 fn resume_directive_absent_when_pr_url_is_null() {
-    // Regression for T683: a chore with pr_url=null and a description
+    // Regression: a chore with pr_url=null and a description
     // mentioning a PR must not generate a RESUME EXISTING PR block.
     let chore = match chore_without_pr() {
         WorkItem::Chore(mut task) => {
@@ -1107,7 +1111,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
         prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
         "base revision directive must still be present:\n{prompt}",
     );
-    // P1 (incident-002): the preservation rule must be present so a
+    // incident-002: the preservation rule must be present so a
     // resolution never silently deletes functionality a merged parent
     // added.
     assert!(
@@ -1122,7 +1126,7 @@ fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
         prompt.contains("design-doc citation"),
         "preservation rule must require a design-doc citation for any removal:\n{prompt}",
     );
-    // P4 (incident-002): the post-resolution comment must be
+    // incident-002: the post-resolution comment must be
     // removal-forward and must not fabricate a review history.
     assert!(
         prompt.contains("⚠️ Removed"),
@@ -1524,7 +1528,7 @@ fn revision_directive_without_provenance_has_no_fragment() {
 
 #[test]
 fn revision_directive_requires_pr_title_update() {
-    // Issue #843 (motivating incident T132 / PR #713): the revision worker
+    // Issue #843 (motivating incident PR #713): the revision worker
     // correctly fixed the code but left the original PR title and body
     // arguing the now-overturned conclusion. The directive must instruct
     // the worker to update BOTH the title and the description to match the
@@ -1561,8 +1565,7 @@ fn revision_directive_requires_pr_title_update() {
 }
 
 // -----------------------------------------------------------------------
-// `[deferred-scope]` marker directive (Flunge T254, root-caused to
-// T222/PR #765)
+// `[deferred-scope]` marker directive (root-caused to PR #765)
 // -----------------------------------------------------------------------
 
 #[test]

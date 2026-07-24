@@ -458,8 +458,8 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Provisional spawn: the `SpawnWorkerPane` ack timed out, so the
         // app may or may not have hosted the pane. We deliberately do NOT
         // treat this as a failure (which would release the lease under a
-        // possibly-live pane and duplicate-dispatch the work item — the
-        // T267 incident). The execution stays tracked in `waiting_human`
+        // possibly-live pane and duplicate-dispatch the work item — a
+        // prior incident). The execution stays tracked in `waiting_human`
         // with the slot registered; the spawn-ack sweep confirms liveness
         // (a hook/pid arrives) or reaps on total silence past the grace
         // window. Surface it loudly so the provisional state is visible in
@@ -497,7 +497,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             );
         }
 
-        // Mid-spawn cancel reconciliation (T981). A cancel / force-stop
+        // Mid-spawn cancel reconciliation. A cancel / force-stop
         // can land while we were awaiting the `SpawnWorkerPane`
         // round-trip: it marks the execution row `cancelled` but, with
         // no pid yet materialized, cannot reap the worker and
@@ -1193,7 +1193,7 @@ mod pane_spawn_tests {
         assert_eq!(spawn.prompt_addendum, None);
     }
 
-    /// Regression for T1647: `PaneSpawnRunner::run_execution` must return
+    /// Regression: `PaneSpawnRunner::run_execution` must return
     /// `ReviewerPaneAlive` (not `WaitingHuman`) for `PrReview` executions so
     /// the execution stays in `running` while the reviewer pane is alive.
     ///
@@ -1500,7 +1500,7 @@ mod pane_spawn_tests {
         );
     }
 
-    /// T981 regression — the mid-spawn cancel reconciliation. When the
+    /// Regression — the mid-spawn cancel reconciliation. When the
     /// execution row is cancelled while the `SpawnWorkerPane` round-trip
     /// is in flight, `run_execution` must, on return, (i) reap the
     /// just-spawned pane (the pid is now known, so the reap is no longer

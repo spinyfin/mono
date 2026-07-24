@@ -66,7 +66,7 @@ pub(super) struct ExecutionPromptParams<'a> {
 /// ## What it says now
 ///
 /// When the engine recovered state into this workspace it drops a marker
-/// (`.boss/recovery-report.json`, see [`crate::recovery_apply`]); `report` is
+/// (`.boss/recovery-report.json`, see [`boss_engine_recovery::recovery_apply`]); `report` is
 /// that marker, already filtered to this execution. The block then states, in
 /// order:
 ///
@@ -86,9 +86,9 @@ pub(super) struct ExecutionPromptParams<'a> {
 fn startup_recovery_block(
     prior_branch: &str,
     expected_branch_new: &str,
-    report: Option<&crate::recovery_apply::RecoveryReport>,
+    report: Option<&boss_engine_recovery::recovery_apply::RecoveryReport>,
 ) -> String {
-    use crate::recovery_apply::RecoverySource;
+    use boss_engine_recovery::recovery_apply::RecoverySource;
 
     let mut block = String::from("## STARTUP RECOVERY\n\n");
     block.push_str(
@@ -296,7 +296,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         prompt.push_str(&startup_recovery_block(
             prior_branch,
             &expected_branch_new,
-            crate::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id).as_ref(),
+            boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id).as_ref(),
         ));
     }
 
@@ -494,17 +494,17 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         prompt.push_str(&worker_escalation_protocol_directive(
             worker_signal_proposals_seam_enabled,
         ));
-        // Flunge T254 (root-caused to T222/PR #765): teach chore/task workers
-        // the `[deferred-scope]` marker so a deliberate scope narrowing is
-        // recorded, not just claimed in prose ("filed as a followup") that
-        // nothing actually tracks.
+        // Teach chore/task workers the `[deferred-scope]` marker so a
+        // deliberate scope narrowing is recorded, not just claimed in prose
+        // ("filed as a followup") that nothing actually tracks (root cause:
+        // PR #765).
         if matches!(
             execution.kind,
             ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
         ) {
             prompt.push_str(&deferred_scope_directive());
         }
-        // T1868: give a fresh-PR chore/task implementation worker a SANCTIONED
+        // Give a fresh-PR chore/task implementation worker a SANCTIONED
         // way to terminate as "the work was already done". Without it, a worker
         // that correctly finds an empty diff stops and explains — and the
         // engine's Stop-boundary handler then nudges it to "produce a PR"
@@ -896,12 +896,12 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
         .to_string()
 }
 
-/// `[deferred-scope]` marker protocol directive (Flunge T254, root-caused to
-/// T222/PR #765). A worker that deliberately narrows its own scope —
-/// delivers part of the brief and consciously defers a piece of it, rather
-/// than merely running out of turns — had no sanctioned way to record that
-/// decision: task completion is binary (PR merged => done) and nothing
-/// reconciles delivered scope against the brief. The T222 worker wired part
+/// `[deferred-scope]` marker protocol directive (root-caused to PR #765).
+/// A worker that deliberately narrows its own scope — delivers part of the
+/// brief and consciously defers a piece of it, rather than merely running
+/// out of turns — had no sanctioned way to record that decision: task
+/// completion is binary (PR merged => done) and nothing reconciles
+/// delivered scope against the brief. The PR #765 worker wired part
 /// of a feature, deferred the rest because it needed new data plumbing, and
 /// wrote "I've filed it as a followup" in the PR body — workers cannot file
 /// anything, so the remainder silently died until an operator noticed weeks
@@ -944,7 +944,7 @@ pub(crate) fn deferred_scope_directive() -> String {
         .to_string()
 }
 
-/// Sanctioned no-op completion directive (T1868). A `chore_implementation`
+/// Sanctioned no-op completion directive. A `chore_implementation`
 /// / `task_implementation` worker sometimes investigates and finds the work
 /// is *already done* — the change is already on `main`, so `jj diff -r @` is
 /// empty and there is nothing to commit/push/open a PR for. That is a
@@ -1098,7 +1098,7 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
     out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same file (e.g. a compact-view task and a detail-view task that both edit the same component/container). If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
     out.push_str("  - include items that are deferred or explicitly out of scope as their own entries (tagged `Scope: deferred (future / not a v1 blocker)`, see above) rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected. Do not drop the entry just because it is deferred; the scope tag is what lets it stay visible without being auto-started.\n");
-    out.push_str("  - This section is what P783's auto-populate will consume to materialise dependent tasks with edges, so completeness matters.\n");
+    out.push_str("  - This section is what the design doc's auto-populate step will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str(&design_questions_manifest_block());
     out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
     out
@@ -1449,7 +1449,7 @@ fn compose_revision_directive(
          directory at the root — only `.jj/`). Pass `--repo {repo_slug}` on every \
          `gh` command: `gh pr view`, `gh pr checks`, `gh pr diff`, `gh api`, etc.\n"
     ));
-    // Issue #804: revision chores (T30–T34 on PR #250) were the worst
+    // Issue #804: revision chores on PR #250 were the worst
     // offenders for pushing red code. Apply the pre-push build gate when
     // the workspace is a Bazel workspace. Conflict-resolution revisions
     // get the merge-correctness variant (build before push; tests run in

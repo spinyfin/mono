@@ -91,7 +91,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         })
         .ok()?;
 
-    // incident-002 P3: deterministically scan the worker's *narrative*
+    // incident-002: deterministically scan the worker's *narrative*
     // surfaces (PR body, commit messages, PR comments) for supersession /
     // obsolescence language. When present, the reviewer is required to verify
     // a design-doc citation for each flagged claim. The diff itself is
@@ -135,7 +135,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         last_reviewed_sha: None,
         supersession_flags,
         // Filled in by the caller (the spawn path computes the merge-parent
-        // deletion tripwire for conflict-resolution reviews — incident-002 P2).
+        // deletion tripwire for conflict-resolution reviews — incident-002).
         merged_parent_deletions: Vec::new(),
         boss_construct_refs,
     })
@@ -349,7 +349,7 @@ pub(crate) async fn compose_worker_spawn(
     // directly. If the automation vanished mid-flight, fall back to the
     // generic prompt so the worker at least has workspace context.
     //
-    // P992 task 6: a `pr_review` execution renders the reviewer prompt
+    // Likewise, a `pr_review` execution renders the reviewer prompt
     // instead of the ordinary implementer prompt. Its `work_item_id` is
     // the producing task id, so we read the task to get the PR context.
     // If the task or its pr_url cannot be resolved, fall back to the

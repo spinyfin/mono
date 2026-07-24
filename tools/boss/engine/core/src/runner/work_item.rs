@@ -65,7 +65,7 @@ pub(crate) fn work_item_pr_url(work_item: &WorkItem) -> Option<&str> {
 /// pattern-matching a PR URL out of `task.description` (mono#742).
 /// That fallback was removed because it fires on any description that
 /// *mentions* a PR in passing (e.g. an issue-imported chore whose body
-/// cites a repro session's PR as an example — incident T683 /
+/// cites a repro session's PR as an example — see execution
 /// exec_18b341df81251750_4). A misfire sends the worker to a foreign
 /// repo's PR, which is strictly worse than a duplicate-PR restart.
 /// The reconciler path (`reconciler_attach_pr_url`) is responsible for
