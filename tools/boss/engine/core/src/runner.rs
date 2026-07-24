@@ -2439,6 +2439,7 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("    - a one-paragraph **scope** description.\n");
     out.push_str("    - an **effort hint**: one of `trivial | small | medium | large`.\n");
     out.push_str("    - **explicit dependencies** — which other entries in this list gate this one (use the task names; \"none\" if it can start immediately).\n");
+    out.push_str("    - a **scope tag** — exactly one of `Scope: in-scope` or `Scope: deferred (future / not a v1 blocker)`. Use this exact `Scope:` line (own line, this literal wording) on every entry — downstream scheduling keys off it verbatim, so free prose like \"this is a stretch goal\" instead of the tag will not be recognised. Tag an entry `deferred` when it is explicitly out of scope for v1, a stretch goal, or something you are deliberately not proposing for immediate implementation; follow the tag with a short inline reason (e.g. `Scope: deferred (future / not a v1 blocker) — needs the batch API landing in phase 2`).\n");
     out.push_str("  - **size each entry to one reviewable PR by one worker in one session.** This is the granularity scheduling materialises into tasks, so pre-split the work here — an oversize entry forces the scheduler to reject and re-plan it:\n");
     out.push_str("    - keep each entry single-subsystem and single-PR. Scope that spans several subsystems (engine + cli + protocol + app + …) is several entries with dependency edges, not one.\n");
     out.push_str("    - multi-phase scope (\"parse (i)… and (ii)… and emit… and validate…\") is several entries — list each phase separately with explicit dependencies, never one entry that does it all.\n");
@@ -2447,7 +2448,7 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("    - if an entry needs a paragraph to describe, it is probably several tasks — split it.\n");
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
     out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same file (e.g. a compact-view task and a detail-view task that both edit the same component/container). If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
-    out.push_str("  - include items that are deferred or explicitly out of scope, marked as `future / not a v1 blocker` rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected.\n");
+    out.push_str("  - include items that are deferred or explicitly out of scope as their own entries (tagged `Scope: deferred (future / not a v1 blocker)`, see above) rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected. Do not drop the entry just because it is deferred; the scope tag is what lets it stay visible without being auto-started.\n");
     out.push_str("  - This section is what P783's auto-populate will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str(&design_questions_manifest_block());
     out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
@@ -5945,6 +5946,25 @@ mod compose_prompt_tests {
             prompt.contains("exec_\u{2026}"),
             "baked-in identifier rule must be present when flag is on:\n{prompt}",
         );
+    }
+
+    /// The design directive must require the `Scope:` tag on every breakdown
+    /// entry — this is the structured marker the Planner's system prompt
+    /// (`tools/boss/engine/core/src/planner.rs`) keys off to park deferred
+    /// items instead of proposing them as ordinary startable work.
+    #[test]
+    fn design_directive_requires_the_scope_tag() {
+        let directive = compose_design_directive(None);
+        assert!(directive.contains("Scope: in-scope"), "{directive}");
+        assert!(
+            directive.contains("Scope: deferred (future / not a v1 blocker)"),
+            "{directive}"
+        );
+        assert!(
+            directive.contains("downstream scheduling keys off it verbatim"),
+            "{directive}"
+        );
+        assert!(directive.contains("rather than silently omitting them"), "{directive}");
     }
 }
 

@@ -704,6 +704,36 @@ Do NOT propose:\n\
 names are listed in the user message).\n\
 - More than the task cap stated in the user message.\n\
 \n\
+## scope tiers — in-scope vs deferred\n\
+\n\
+A breakdown entry may carry a `Scope:` tag (exactly `Scope: in-scope` or \
+`Scope: deferred (future / not a v1 blocker)`) put there by the design \
+directive. Older docs written before this convention existed will instead \
+say so in prose — phrases like \"future / not a v1 blocker\", \"out of \
+scope\", \"deferred\", \"stretch goal\", or \"not for v1\" attached to an \
+item. Treat either signal the same way.\n\
+\n\
+- **Never silently drop a deferred item.** It still becomes a task — \
+omitting it forces the coordinator to guess what you considered and \
+rejected.\n\
+- **Mark it, don't dispatch it.** Prefix the task's `name` with the literal \
+`[deferred] ` (e.g. `[deferred] Add bulk-export endpoint`), and end its \
+`description` with a line reading exactly `[deferred] future / not a v1 \
+blocker — parked; requires an explicit operator decision before it starts.` \
+followed by the doc's own reason for deferring it, if one is given. This \
+keeps the item visible in the project's task list without implying it is \
+ready to dispatch — it is a signal to the operator, since every task the \
+Planner proposes is staged (`autostart = false`) for human review \
+regardless of scope tier.\n\
+- **Do not gate in-scope work on a deferred task.** Never add a `edges` \
+entry whose `prerequisite` is a `[deferred]`-prefixed task — deferred work \
+is explicitly not being built now, so nothing in-scope should wait on it. A \
+deferred task may still depend on an in-scope one (e.g. it builds on a \
+shared root), which is a normal `dependent` edge.\n\
+- Classify a deferred task's `kind` and `effort` exactly as you would any \
+other task — the deferral is a scheduling signal, not a different shape of \
+work.\n\
+\n\
 ## task sizing contract — one reviewable PR per task\n\
 \n\
 Every task you propose must be single-subsystem, single-PR, and completable \
@@ -1015,6 +1045,21 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("Embedded fan-out is its own dependent task"));
         assert!(SYSTEM_PROMPT.contains("INVESTIGATION task"));
         assert!(SYSTEM_PROMPT.contains("re-prompted to decompose"));
+    }
+
+    /// The Planner must not mint fully-startable tasks for design-doc items
+    /// the design directive tags `Scope: deferred (future / not a v1
+    /// blocker)` — it must still emit them (never silently drop), but mark
+    /// them `[deferred]` rather than proposing them as ordinary in-scope
+    /// work, and never let an in-scope task depend on one.
+    #[test]
+    fn system_prompt_encodes_scope_tier_handling() {
+        assert!(SYSTEM_PROMPT.contains("Scope: in-scope"));
+        assert!(SYSTEM_PROMPT.contains("Scope: deferred (future / not a v1 blocker)"));
+        assert!(SYSTEM_PROMPT.contains("Never silently drop a deferred item"));
+        assert!(SYSTEM_PROMPT.contains("[deferred] "));
+        assert!(SYSTEM_PROMPT.contains("Do not gate in-scope work on a deferred task"));
+        assert!(SYSTEM_PROMPT.contains("stretch goal"));
     }
 
     fn response_from(value: Value) -> MessagesResponse {
