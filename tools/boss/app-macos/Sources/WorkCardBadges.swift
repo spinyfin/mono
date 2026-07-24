@@ -269,8 +269,8 @@ struct MergeQueueDetail: Equatable {
     /// `live_entry_detail_json`). Disambiguates `state`'s vocabulary, since
     /// GitHub and Trunk use different (and overlapping-looking) strings.
     var source: String?
-    /// Trunk's queue-level state (`"RUNNING"`, `"PAUSED"`, `"DRAINING"`,
-    /// `"SWITCHING_MODES"`), distinct from this entry's own `state`. `nil`
+    /// Trunk's queue-level state (`"running"`, `"paused"`, `"draining"`,
+    /// `"switching_modes"`), distinct from this entry's own `state`. `nil`
     /// for a GitHub-native entry, which has no equivalent concept.
     var queueState: String?
 
@@ -355,14 +355,14 @@ struct MergeQueueDetail: Equatable {
 
     /// "Trunk queue paused/draining" banner text for the Merging section
     /// header (`ChatViewModel.mergingSection`). `nil` while the queue is
-    /// `RUNNING` (the healthy default), for a non-Trunk entry, or when
+    /// `running` (the healthy default), for a non-Trunk entry, or when
     /// Trunk didn't report a queue state.
     var queueStateBanner: String? {
-        guard isTrunk, let queueState, queueState != "RUNNING" else { return nil }
+        guard isTrunk, let queueState, queueState != "running" else { return nil }
         switch queueState {
-        case "PAUSED": return "Trunk queue paused"
-        case "DRAINING": return "Trunk queue draining"
-        case "SWITCHING_MODES": return "Trunk queue switching modes"
+        case "paused": return "Trunk queue paused"
+        case "draining": return "Trunk queue draining"
+        case "switching_modes": return "Trunk queue switching modes"
         default: return "Trunk queue \(queueState.lowercased())"
         }
     }

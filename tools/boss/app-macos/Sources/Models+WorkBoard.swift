@@ -262,7 +262,7 @@ struct WorkBoardSection: Identifiable {
     /// "Trunk queue paused/draining" banner shown in the section header
     /// (`ChatViewModel.mergingSection`'s `MergeQueueDetail.queueStateBanner`
     /// rollup). `nil` for every section except "Merging" while a tracked
-    /// Trunk queue is non-`RUNNING`.
+    /// Trunk queue is non-`running`.
     var queueBannerText: String? = nil
 }
 
