@@ -5,7 +5,7 @@
 //! (project P783) §1 "Trigger & idempotency" and the architecture overview.
 //! This module is task 7 of that design: the orchestrator that wires the
 //! sibling components — the idempotency ledger ([`crate::work::planner_runs`]),
-//! the live doc fetch ([`crate::doc_fetcher`]), the Planner
+//! the live doc fetch ([`boss_design_doc_fetcher`]), the Planner
 //! ([`crate::planner`]), the validation layer ([`boss_engine_planner_validation`]),
 //! and the Materializer ([`crate::materializer`]) — into one fail-safe pass:
 //!
@@ -58,10 +58,10 @@ use boss_protocol::{
 };
 
 use crate::coordinator::ExecutionPublisher;
-use crate::doc_fetcher::{DocFetchOutcome, fetch_design_doc};
 use crate::materializer::Materializer;
 use crate::planner::{DecompositionAudit, PLANNER_MODEL, Planner, PlannerOutcome};
 use crate::work::{ClaimPlannerRunInput, PlannerRunPatch, WorkDb};
+use boss_design_doc_fetcher::{DocFetchOutcome, fetch_design_doc};
 use boss_engine_planner_validation::{ValidationResult, validate};
 
 /// Default hard cap on how many tasks one populate may create (design

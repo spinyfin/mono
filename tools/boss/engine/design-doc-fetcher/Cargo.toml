@@ -1,0 +1,11 @@
+[package]
+name = "boss-design-doc-fetcher"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-github = { path = "../../github" }
+git-utils = { path = "../../../../lib/rust/git_utils" }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }

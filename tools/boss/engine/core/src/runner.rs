@@ -2654,9 +2654,9 @@ async fn compose_answer_agent_prompt(work_db: &WorkDb, execution: &WorkExecution
     };
 
     let doc_content = match parse_pr_doc_artifact_id(&comment.artifact_id) {
-        Some((repo, branch, path)) => match crate::doc_fetcher::fetch_design_doc(&repo, &path, &branch).await {
-            crate::doc_fetcher::DocFetchOutcome::Content(text) => Some((path, text)),
-            crate::doc_fetcher::DocFetchOutcome::DocMissing => {
+        Some((repo, branch, path)) => match boss_design_doc_fetcher::fetch_design_doc(&repo, &path, &branch).await {
+            boss_design_doc_fetcher::DocFetchOutcome::Content(text) => Some((path, text)),
+            boss_design_doc_fetcher::DocFetchOutcome::DocMissing => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     comment_id = %comment_id,
@@ -2666,7 +2666,7 @@ async fn compose_answer_agent_prompt(work_db: &WorkDb, execution: &WorkExecution
                 );
                 None
             }
-            crate::doc_fetcher::DocFetchOutcome::FetchFailed { reason } => {
+            boss_design_doc_fetcher::DocFetchOutcome::FetchFailed { reason } => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     comment_id = %comment_id,

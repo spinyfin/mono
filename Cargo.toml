@@ -20,6 +20,7 @@ members = [
   "tools/boss/engine/dispatch-events",
   "tools/boss/engine/core",
   "tools/boss/engine/day-rotated-log",
+  "tools/boss/engine/design-doc-fetcher",
   "tools/boss/engine/design-docs",
   "tools/boss/engine/driver",
   "tools/boss/engine/effort",

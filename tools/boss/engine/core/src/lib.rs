@@ -39,7 +39,6 @@ pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_metrics;
 pub(crate) mod dispatch_spillover;
 pub mod dispatch_stall_escalation;
-pub mod doc_fetcher;
 pub use boss_editorial as editorial;
 pub use boss_engine_driver as driver;
 pub mod dispatch_reader;
