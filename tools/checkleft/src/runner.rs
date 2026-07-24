@@ -11,7 +11,7 @@ use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count
 
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
-use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
+use crate::config::{CheckConfig, CheckConfigOrigin, CheckScope, ConfigDiagnostic, ConfigResolver};
 use crate::exclusion::ExclusionStatus;
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::{
@@ -76,6 +76,61 @@ impl EffectiveCheckPolicy {
 struct ScheduledRuns {
     runs: Vec<ScheduledCheckRun>,
     diagnostics: Vec<CheckResult>,
+}
+
+/// Dedup key for a scheduled check run: (check id, check definition name,
+/// implementation fingerprint, config fingerprint, policy fingerprint, exclude
+/// fingerprint). Two changed files that resolve to identical values here share
+/// one run.
+type RunGroupKey = (String, String, String, String, String, String);
+
+/// Dedup key for config diagnostics: (check_id, path, line, column, message, remediation).
+type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, String);
+
+/// Build the [`RunGroupKey`] for `check` under `policy` and the given effective
+/// exclude patterns (global ∪ per-check, already normalized to repo-root-relative
+/// coords by the caller).
+fn run_group_key(
+    check: &CheckConfig,
+    policy: &EffectiveCheckPolicy,
+    effective_exclude_patterns: &[String],
+) -> RunGroupKey {
+    let config_fingerprint = toml::to_string(&check.config).unwrap_or_default();
+    let implementation_fingerprint = check
+        .implementation
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let exclude_fingerprint = effective_exclude_patterns.join("\n");
+    (
+        check.id.clone(),
+        check.check.clone(),
+        implementation_fingerprint,
+        config_fingerprint,
+        policy.fingerprint(),
+        exclude_fingerprint,
+    )
+}
+
+/// Fold `diagnostics` into `grouped_diagnostics`, deduping on [`DiagnosticGroupKey`].
+fn collect_diagnostics<'a>(
+    diagnostics: impl Iterator<Item = &'a ConfigDiagnostic>,
+    grouped_diagnostics: &mut BTreeMap<DiagnosticGroupKey, CheckResult>,
+) {
+    for diagnostic in diagnostics {
+        let remediation = diagnostic.remediation.clone().unwrap_or_default();
+        let key = (
+            diagnostic.check_id.clone(),
+            diagnostic.location.path.clone(),
+            diagnostic.location.line,
+            diagnostic.location.column,
+            diagnostic.message.clone(),
+            remediation,
+        );
+        grouped_diagnostics
+            .entry(key)
+            .or_insert_with(|| config_diagnostic_result(diagnostic));
+    }
 }
 
 /// The remediation bullet injected for every fixable finding, advertising the
@@ -1022,11 +1077,32 @@ impl Runner {
                 continue;
             }
             for check in resolved.enabled() {
+                if check.scope == CheckScope::Changeset {
+                    // Listed via the root-resolved pass below, not per changed file.
+                    continue;
+                }
                 if let ScheduledExecution::Invalid { message, .. } = self.resolve_scheduled_execution(check) {
                     resolution_errors.insert(check.id.clone(), message);
                 }
                 checks.insert(check.id.clone());
             }
+        }
+
+        // `scope = changeset` checks run once per invocation regardless of the
+        // changed-file set (see `schedule_changeset_scope_runs`), so list them
+        // from the root-resolved configuration rather than any changed file.
+        let root_resolved = self.resolver.resolve_for_file(Path::new(""))?;
+        for diagnostic in root_resolved.diagnostics() {
+            config_diagnostics.insert(format_config_diagnostic(diagnostic));
+        }
+        for check in root_resolved.enabled() {
+            if check.scope != CheckScope::Changeset {
+                continue;
+            }
+            if let ScheduledExecution::Invalid { message, .. } = self.resolve_scheduled_execution(check) {
+                resolution_errors.insert(check.id.clone(), message);
+            }
+            checks.insert(check.id.clone());
         }
 
         if !resolution_errors.is_empty() {
@@ -1048,11 +1124,7 @@ impl Runner {
 
     fn schedule_runs(&self, changeset: &ChangeSet) -> Result<ScheduledRuns> {
         info!(changed_files = changeset.changed_files.len(), "scheduling checks");
-        let mut grouped_runs: BTreeMap<(String, String, String, String, String, String), ScheduledCheckRun> =
-            BTreeMap::new();
-        // Dedup key for config diagnostics:
-        // (check_id, path, line, column, message, remediation).
-        type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, String);
+        let mut grouped_runs: BTreeMap<RunGroupKey, ScheduledCheckRun> = BTreeMap::new();
         let mut grouped_diagnostics: BTreeMap<DiagnosticGroupKey, CheckResult> = BTreeMap::new();
 
         for changed_file in &changeset.changed_files {
@@ -1062,32 +1134,17 @@ impl Runner {
             info!(path = %changed_file.path.display(), "evaluating changed file");
 
             let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
-            for diagnostic in resolved.diagnostics() {
-                let remediation = diagnostic.remediation.clone().unwrap_or_default();
-                let key = (
-                    diagnostic.check_id.clone(),
-                    diagnostic.location.path.clone(),
-                    diagnostic.location.line,
-                    diagnostic.location.column,
-                    diagnostic.message.clone(),
-                    remediation,
-                );
-                grouped_diagnostics
-                    .entry(key)
-                    .or_insert_with(|| config_diagnostic_result(diagnostic));
-            }
+            collect_diagnostics(resolved.diagnostics(), &mut grouped_diagnostics);
             if should_skip_file(changed_file, &resolved) {
                 continue;
             }
             for check in resolved.enabled() {
+                if check.scope == CheckScope::Changeset {
+                    // Scheduled once per run by `schedule_changeset_scope_runs`
+                    // below, independent of any particular changed file.
+                    continue;
+                }
                 let policy = self.resolve_effective_policy(check);
-                let config_fingerprint = toml::to_string(&check.config).unwrap_or_default();
-                let implementation_fingerprint = check
-                    .implementation
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default();
-                let policy_fingerprint = policy.fingerprint();
                 // The effective exclude set (global ∪ per-check) can differ between two
                 // files that resolve to the same check id (a subdirectory `CHECKS` may
                 // add a global exclude). Fold it into the grouping key so files with a
@@ -1099,49 +1156,10 @@ impl Runner {
                     .chain(check.exclude_patterns.iter())
                     .cloned()
                     .collect();
-                let exclude_fingerprint = effective_exclude_patterns.join("\n");
-                let key = (
-                    check.id.clone(),
-                    check.check.clone(),
-                    implementation_fingerprint,
-                    config_fingerprint,
-                    policy_fingerprint,
-                    exclude_fingerprint,
-                );
+                let key = run_group_key(check, &policy, &effective_exclude_patterns);
 
                 let entry = grouped_runs.entry(key).or_insert_with(|| {
-                    let execution = self.resolve_scheduled_execution(check);
-                    let mut effective_policy = policy;
-                    if let ScheduledExecution::ExternalResolved { package } = &execution
-                        && let ExternalCheckPackageImplementation::Declarative(d) = &package.implementation
-                        && d.invocations.iter().any(|inv| inv.transform.uses_dynamic_severity())
-                    {
-                        effective_policy.preserve_finding_severity = true;
-                    }
-                    // An invalid exclude glob fails matcher construction; fall back to a
-                    // no-op matcher (excludes nothing) so a malformed pattern never
-                    // crashes the whole run — config validation surfaces it elsewhere.
-                    let exclusion_matcher = ExclusionMatcher::new(&effective_exclude_patterns).unwrap_or_else(|err| {
-                        tracing::warn!(check_id = %check.id, error = %err, "invalid exclude glob; treating as no exclusions");
-                        ExclusionMatcher::default()
-                    });
-                    ScheduledCheckRun {
-                        configured_check_id: check.id.clone(),
-                        source_path: check.source_path.clone(),
-                        execution,
-                        policy: effective_policy,
-                        config: check.config.clone(),
-                        changeset: ChangeSet {
-                            changed_files: Vec::new(),
-                            file_line_deltas: HashMap::new(),
-                            file_diffs: HashMap::new(),
-                            commit_description: changeset.commit_description.clone(),
-                            pr_description: changeset.pr_description.clone(),
-                            change_id: changeset.change_id.clone(),
-                            repository: changeset.repository.clone(),
-                        },
-                        exclusion_matcher,
-                    }
+                    self.build_scheduled_check_run(check, policy, &effective_exclude_patterns, changeset)
                 });
 
                 let already_present = entry
@@ -1171,10 +1189,102 @@ impl Runner {
             }
         }
 
+        self.schedule_changeset_scope_runs(changeset, &mut grouped_runs, &mut grouped_diagnostics)?;
+
         Ok(ScheduledRuns {
             runs: grouped_runs.into_values().collect(),
             diagnostics: grouped_diagnostics.into_values().collect(),
         })
+    }
+
+    /// Schedule every `scope = changeset` check exactly once per invocation,
+    /// independent of the changed-file set (including an empty one).
+    ///
+    /// These checks inspect the changeset as a whole (the PR description, the
+    /// commit message) rather than any one file, so tying their scheduling to
+    /// file resolution — as the per-file loop above does for `scope = files`
+    /// checks — would mean they silently don't run whenever every changed file
+    /// is excluded or skipped, or don't run at all in a changeset with no file
+    /// changes.
+    ///
+    /// A changeset-scope check has no changed file to key directory-scoped
+    /// config resolution on, so it is resolved once against the repo-root
+    /// configuration: its declaration must live in a `CHECKS` file that is the
+    /// repo root or an ancestor external config, not a subdirectory override.
+    fn schedule_changeset_scope_runs(
+        &self,
+        changeset: &ChangeSet,
+        grouped_runs: &mut BTreeMap<RunGroupKey, ScheduledCheckRun>,
+        grouped_diagnostics: &mut BTreeMap<DiagnosticGroupKey, CheckResult>,
+    ) -> Result<()> {
+        let resolved = self.resolver.resolve_for_file(Path::new(""))?;
+        collect_diagnostics(resolved.diagnostics(), grouped_diagnostics);
+
+        for check in resolved.enabled() {
+            if check.scope != CheckScope::Changeset {
+                continue;
+            }
+            let policy = self.resolve_effective_policy(check);
+            let effective_exclude_patterns: Vec<String> = resolved
+                .global_exclude_patterns()
+                .iter()
+                .chain(check.exclude_patterns.iter())
+                .cloned()
+                .collect();
+            let key = run_group_key(check, &policy, &effective_exclude_patterns);
+
+            grouped_runs.entry(key).or_insert_with(|| {
+                self.build_scheduled_check_run(check, policy, &effective_exclude_patterns, changeset)
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Build a fresh [`ScheduledCheckRun`] for `check`, seeded with an empty
+    /// changed-file set. The per-file scheduling loop appends matched files
+    /// after this returns; `schedule_changeset_scope_runs` leaves the set empty,
+    /// since a changeset-scope check runs against the changeset's descriptions
+    /// rather than any file.
+    fn build_scheduled_check_run(
+        &self,
+        check: &CheckConfig,
+        policy: EffectiveCheckPolicy,
+        effective_exclude_patterns: &[String],
+        changeset: &ChangeSet,
+    ) -> ScheduledCheckRun {
+        let execution = self.resolve_scheduled_execution(check);
+        let mut effective_policy = policy;
+        if let ScheduledExecution::ExternalResolved { package } = &execution
+            && let ExternalCheckPackageImplementation::Declarative(d) = &package.implementation
+            && d.invocations.iter().any(|inv| inv.transform.uses_dynamic_severity())
+        {
+            effective_policy.preserve_finding_severity = true;
+        }
+        // An invalid exclude glob fails matcher construction; fall back to a
+        // no-op matcher (excludes nothing) so a malformed pattern never
+        // crashes the whole run — config validation surfaces it elsewhere.
+        let exclusion_matcher = ExclusionMatcher::new(effective_exclude_patterns).unwrap_or_else(|err| {
+            tracing::warn!(check_id = %check.id, error = %err, "invalid exclude glob; treating as no exclusions");
+            ExclusionMatcher::default()
+        });
+        ScheduledCheckRun {
+            configured_check_id: check.id.clone(),
+            source_path: check.source_path.clone(),
+            execution,
+            policy: effective_policy,
+            config: check.config.clone(),
+            changeset: ChangeSet {
+                changed_files: Vec::new(),
+                file_line_deltas: HashMap::new(),
+                file_diffs: HashMap::new(),
+                commit_description: changeset.commit_description.clone(),
+                pr_description: changeset.pr_description.clone(),
+                change_id: changeset.change_id.clone(),
+                repository: changeset.repository.clone(),
+            },
+            exclusion_matcher,
+        }
     }
 
     fn resolve_effective_policy(&self, check: &CheckConfig) -> EffectiveCheckPolicy {

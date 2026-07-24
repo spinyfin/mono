@@ -91,12 +91,29 @@ Supported keys:
 - `enabled` (optional, default `true`): disable with `false`.
 - `config` (optional table): check-specific configuration.
 - `policy` (optional table): framework-managed severity/bypass controls.
+- `scope` (optional `files|changeset`, default `files`): what the check's scheduling is keyed on. See [Changeset-scope checks](#changeset-scope-checks).
 
 `policy` keys:
 
 - `severity` (optional `error|warning|info`): overrides finding severity for the check instance.
 - `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
+
+## Changeset-scope checks
+
+Most checks look at individual files: `scope: files` (the default) schedules a check once per distinct configuration and runs it only against the changed files that resolved to it.
+
+A check with `scope: changeset` has no file to point at — it inspects the changeset as a whole, for example the PR description or the commit message. Set `scope: changeset` on such a check and it is scheduled exactly once per invocation, regardless of the changed-file set (including a changeset with no file changes, or one where every changed file is excluded):
+
+```yaml
+checks:
+  - id: boss/no-boss-isms
+    scope: changeset
+```
+
+Because there is no changed file to key directory-scoped config resolution on, a `scope: changeset` check must be declared in a `CHECKS` file that is the repo root (or an ancestor `external_checks_url` config) — a subdirectory `CHECKS.yaml` override is not consulted for these checks.
+
+A `scope: changeset` check that finds something has no file to attach the finding to, so it should emit a **locationless finding** (`location: None` / no `location` field). Locationless findings are preserved by the framework — they still fail the build, still print in the terminal and `--format=json` output, and their check id and message are appended beneath the counts line in the GitHub check-run summary. They are the only shape available for a non-file subject: unlike a synthetic path (e.g. `<pr-description>`), a real file path is what every other output surface (SARIF, inline check-run annotations, GHA workflow commands) requires, so a synthetic one would be silently dropped before reaching any of them.
 
 ## Excluding files from checks
 

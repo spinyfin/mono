@@ -7,7 +7,7 @@ use tempfile::tempdir;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::Severity;
 
-use super::{ConfigResolver, StaleExclusionMode};
+use super::{CheckScope, ConfigResolver, StaleExclusionMode};
 
 mod yaml;
 
@@ -95,6 +95,58 @@ id = "rust/giant-structs"
             .any(|diagnostic| diagnostic.message.contains("stale_exclusion_severity")),
         "expected a diagnostic about the invalid severity, got {diagnostics:?}"
     );
+}
+
+#[test]
+fn scope_defaults_to_files() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let check = checks.get("rust/giant-structs").expect("check present");
+    assert_eq!(check.scope, CheckScope::Files);
+}
+
+#[test]
+fn scope_changeset_is_parsed() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\nscope = \"changeset\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let check = checks.get("boss/no-boss-isms").expect("check present");
+    assert_eq!(check.scope, CheckScope::Changeset);
+}
+
+#[test]
+fn invalid_scope_produces_diagnostic() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nscope = \"directory\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("scope")),
+        "expected a diagnostic about the invalid scope, got {diagnostics:?}"
+    );
+    // The malformed check is skipped, not upserted with a bogus scope.
+    assert!(checks.get("rust/giant-structs").is_none());
 }
 
 #[test]

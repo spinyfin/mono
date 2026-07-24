@@ -1294,6 +1294,7 @@ include!("tests_policy.rs");
 include!("tests_external.rs");
 include!("tests_fix_multipass.rs");
 include!("tests_fix_suggested.rs");
+include!("tests_changeset_scope.rs");
 
 // ── change-scope finding filter ─────────────────────────────────────────────────
 

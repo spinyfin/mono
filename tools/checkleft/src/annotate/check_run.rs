@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::annotate::{Annotation, AnnotationLevel, annotation_from_finding};
+use crate::annotate::{Annotation, AnnotationLevel, annotation_from_finding, cap_with_log};
 use crate::output::{CheckResult, Severity};
 
 /// Maximum annotations GitHub accepts in a single check-run create/update request.
@@ -106,11 +106,17 @@ pub fn output_title(counts: FindingCounts) -> String {
 }
 
 /// Human-readable summary body, broken down by severity.
-pub fn output_summary(counts: FindingCounts) -> String {
+///
+/// A finding with no file location (e.g. a `scope = changeset` check flagging
+/// the PR description) never becomes a SARIF result or an inline annotation —
+/// both require a path — so `output.summary` is its only channel into the
+/// GitHub UI. Appends one bullet per locationless finding beneath the counts
+/// line, per the locationless-rendering investigation's recommendation.
+pub fn output_summary(counts: FindingCounts, results: &[CheckResult]) -> String {
     if counts.total() == 0 {
         return "checkleft found no findings.".to_owned();
     }
-    format!(
+    let mut summary = format!(
         "checkleft found {total} {findings}: {e} {errors}, {w} {warnings}, {n} {notices}.",
         total = counts.total(),
         findings = if counts.total() == 1 { "finding" } else { "findings" },
@@ -120,7 +126,33 @@ pub fn output_summary(counts: FindingCounts) -> String {
         warnings = if counts.warnings == 1 { "warning" } else { "warnings" },
         n = counts.notices,
         notices = if counts.notices == 1 { "notice" } else { "notices" },
-    )
+    );
+    let locationless = locationless_summary_lines(results);
+    if !locationless.is_empty() {
+        summary.push_str("\n\n");
+        summary.push_str(&locationless.join("\n"));
+    }
+    summary
+}
+
+/// Maximum locationless findings listed in the check-run summary body. Findings
+/// beyond this are dropped with a log warning (via `cap_with_log`), never silently.
+const LOCATIONLESS_SUMMARY_CAP: usize = 50;
+
+/// Render every locationless finding across `results` as a Markdown bullet
+/// (`` - `check_id`: message ``), capped at [`LOCATIONLESS_SUMMARY_CAP`].
+fn locationless_summary_lines(results: &[CheckResult]) -> Vec<String> {
+    let lines: Vec<String> = results
+        .iter()
+        .flat_map(|result| {
+            result
+                .findings
+                .iter()
+                .filter(|finding| finding.location.is_none())
+                .map(move |finding| format!("- `{}`: {}", result.check_id, finding.message))
+        })
+        .collect();
+    cap_with_log(lines, LOCATIONLESS_SUMMARY_CAP, "check-run summary")
 }
 
 /// One annotation in a check-run `output.annotations` array.
@@ -230,7 +262,7 @@ pub async fn post_check_run(
 
     let counts = count_findings(results);
     let title = output_title(counts);
-    let summary = output_summary(counts);
+    let summary = output_summary(counts, results);
     let conclusion = conclusion_for(results);
     let annotations = collect_annotations(results);
 
@@ -456,15 +488,63 @@ mod tests {
             }),
             "5 findings"
         );
-        assert_eq!(output_summary(FindingCounts::default()), "checkleft found no findings.");
         assert_eq!(
-            output_summary(FindingCounts {
-                errors: 1,
-                warnings: 2,
-                notices: 0
-            }),
+            output_summary(FindingCounts::default(), &[]),
+            "checkleft found no findings."
+        );
+        assert_eq!(
+            output_summary(
+                FindingCounts {
+                    errors: 1,
+                    warnings: 2,
+                    notices: 0
+                },
+                &[]
+            ),
             "checkleft found 3 findings: 1 error, 2 warnings, 0 notices."
         );
+    }
+
+    #[test]
+    fn summary_lists_locationless_findings_beneath_counts() {
+        let results = vec![result(
+            "boss/no-boss-isms",
+            vec![
+                finding(Severity::Error, "located", "src/lib.rs", Some(1), None),
+                finding_no_location(Severity::Error, "PR description leaks a work-item id"),
+            ],
+        )];
+        let counts = count_findings(&results);
+        let summary = output_summary(counts, &results);
+        assert_eq!(
+            summary,
+            "checkleft found 2 findings: 2 errors, 0 warnings, 0 notices.\n\n\
+             - `boss/no-boss-isms`: PR description leaks a work-item id"
+        );
+    }
+
+    #[test]
+    fn summary_omits_locationless_section_when_none_present() {
+        let results = vec![result(
+            "lint/rust",
+            vec![finding(Severity::Warning, "w", "a.rs", Some(1), None)],
+        )];
+        let counts = count_findings(&results);
+        assert_eq!(
+            output_summary(counts, &results),
+            "checkleft found 1 finding: 0 errors, 1 warning, 0 notices."
+        );
+    }
+
+    #[test]
+    fn summary_caps_locationless_findings_with_log() {
+        let findings: Vec<Finding> = (0..LOCATIONLESS_SUMMARY_CAP + 5)
+            .map(|i| finding_no_location(Severity::Error, &format!("finding {i}")))
+            .collect();
+        let results = vec![result("boss/no-boss-isms", findings)];
+        let counts = count_findings(&results);
+        let summary = output_summary(counts, &results);
+        assert_eq!(summary.matches("boss/no-boss-isms").count(), LOCATIONLESS_SUMMARY_CAP);
     }
 
     #[test]
