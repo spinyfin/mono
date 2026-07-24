@@ -608,7 +608,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/getQueue"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "state": "RUNNING",
+                "state": "running",
                 "branch": "main",
                 "enqueuedPullRequests": [],
             })))
@@ -668,7 +668,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/getQueue"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "state": "RUNNING",
+                "state": "running",
                 "branch": "main",
                 "enqueuedPullRequests": [],
             })))

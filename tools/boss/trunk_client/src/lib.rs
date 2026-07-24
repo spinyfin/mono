@@ -26,6 +26,7 @@ pub use client::{CallConfig, RetryPolicy, TRUNK_API_BASE_URL, TrunkClient};
 pub use error::TrunkError;
 pub use models::{
     GetQueueRequest, ListPullRequestsRequest, ListPullRequestsResponse, SubmitPullRequestRequest, TrunkPrLookup,
-    TrunkPrRef, TrunkPrState, TrunkPriority, TrunkPullRequest, TrunkQueue, TrunkQueueState, TrunkRepoRef,
+    TrunkPrRef, TrunkPrState, TrunkPriority, TrunkPullRequest, TrunkQueue, TrunkQueueState, TrunkReadiness,
+    TrunkRepoRef,
 };
 pub use secret::{SecretString, StaticTokenProvider, TrunkTokenProvider};

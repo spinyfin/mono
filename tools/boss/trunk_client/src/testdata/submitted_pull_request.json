@@ -1,7 +1,12 @@
 {
   "id": "entry_123",
   "state": "testing",
-  "readiness": "ready",
+  "readiness": {
+    "hasImpactedTargets": false,
+    "requiresImpactedTargets": false,
+    "doesBaseBranchMatch": true,
+    "gitHubMergeability": "mergeable"
+  },
   "stateChangedAt": "2026-07-19T10:00:00Z",
   "priorityValue": 0,
   "priorityName": "default",
