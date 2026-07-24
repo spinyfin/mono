@@ -3,7 +3,7 @@
 //! Uses `gh api` rather than a direct HTTP call so that credentials are
 //! handled by the `gh` CLI installation (same pattern as the rest of Boss).
 
-use crate::gh_runner::gh_output;
+use crate::gh_runner::{gh_output, parse_http_status_from_stderr};
 
 /// Build the endpoint and full `gh api` argv for a raw-content GET against
 /// the Contents API: `repos/{owner}/{repo}/contents/{path}` with `ref=` in
@@ -51,7 +51,8 @@ pub async fn fetch_repo_file(owner: &str, repo: &str, path: &str, ref_name: &str
 /// - `Ok(Some(body))` — the request succeeded; the decoded stdout is the file
 ///   content at that ref.
 /// - `Ok(None)` — the file does not exist at that ref (HTTP 404). Detected via
-///   gh's stderr containing `"Not Found"` or `"404"`.
+///   the shared [`parse_http_status_from_stderr`] primitive (an `HTTP 404` in
+///   gh's stderr), or gh's stderr containing the text `"Not Found"`.
 /// - `Err(_)` — any other non-zero exit (transport failure, rate limit, auth
 ///   error, …). The error message is the trimmed stderr.
 ///
@@ -61,7 +62,7 @@ fn classify_contents_response(status_success: bool, stdout: &[u8], stderr: &str)
     if status_success {
         return Ok(Some(String::from_utf8_lossy(stdout).into_owned()));
     }
-    if stderr.contains("Not Found") || stderr.contains("404") {
+    if parse_http_status_from_stderr(stderr) == Some(404) || stderr.contains("Not Found") {
         return Ok(None);
     }
     anyhow::bail!("{}", stderr.trim())
