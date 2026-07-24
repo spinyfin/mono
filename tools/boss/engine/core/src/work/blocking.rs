@@ -2031,7 +2031,7 @@ impl WorkDb {
 // The bulk of `effective_ci_budget`, `set_ci_attempt_budget`,
 // `ci_attempts_used`, `active_blocked_signals`, and the `rearm_*` signal
 // contracts are already covered end-to-end by the sibling external suite
-// (`work/tests/t05.rs`, `work/tests/t16.rs`) — including cases this module
+// (`work/tests/ci_remediation_tests.rs`, `work/tests/t16.rs`) — including cases this module
 // does not exercise, like `active_blocked_signals`'s `created_at`/`reason`
 // ordering and the `deleted_at` guard on the attempts-used writers. This
 // module is intentionally narrow: it holds only the unknown-work-item

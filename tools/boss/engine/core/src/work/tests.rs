@@ -604,7 +604,15 @@ mod t01;
 mod t02;
 mod t03;
 mod t04;
-mod t05;
+// t05 was split by functionality into the descriptively-named sibling
+// modules below (project design-doc/audit, resolve_repo, effort/model,
+// schema migrations, short_id allocator, work-item writes, CI remediation).
+mod ci_remediation_tests;
+mod design_doc_audit_tests;
+mod effort_model_tests;
+mod resolve_repo_tests;
+mod schema_migration_tests;
+mod short_id_alloc_tests;
 mod t06;
 mod t07;
 mod t08;
@@ -631,3 +639,4 @@ mod t28;
 mod t29;
 mod t30;
 mod t31;
+mod work_item_write_tests;
