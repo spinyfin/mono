@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_protocol::{
     EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus,
 };
@@ -1636,6 +1637,24 @@ pub struct ExecutionCoordinator {
     /// fresh `ready` executions stranded with no scheduler running.
     #[builder(default)]
     scheduling_pending: AtomicBool,
+    /// Engine event bus. `kick()` publishes `Event::DispatchReady` onto it
+    /// when [`Self::enable_dispatch_ready_bus`] is on; otherwise it goes
+    /// unused. Defaults to a fresh, subscriber-less bus so every existing
+    /// constructor and test needs no changes — publishing to a bus with no
+    /// subscribers is simply a no-op fan-out.
+    #[builder(default = Arc::new(EventBus::new()))]
+    event_bus: Arc<EventBus>,
+    /// Kill-switch for routing `kick()` through [`Self::event_bus`] instead
+    /// of latching `scheduling_pending`/`scheduling_active` directly. OFF by
+    /// default — see [`crate::config::DEFAULT_ENABLE_DISPATCH_READY_BUS`].
+    /// Seeded once at construction from `WorkConfig::enable_dispatch_ready_bus`
+    /// via [`Self::set_enable_dispatch_ready_bus`] (a boot-time setting, not a
+    /// live-toggle — unlike `dispatch_paused`, nothing flips this after
+    /// startup); `app.rs` also gates [`Self::spawn_dispatch_ready_subscriber`]
+    /// on this same flag so a bus-routed `kick()` always has a live
+    /// subscriber whenever it's on.
+    #[builder(default)]
+    enable_dispatch_ready_bus: bool,
     /// Repo origin URLs the cold-pool probe has already inspected in
     /// this engine's lifetime. The probe runs once per URL on the
     /// first successful `ensure_repo` for that URL; subsequent
@@ -1816,6 +1835,8 @@ impl ExecutionCoordinator {
             dispatch_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)),
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
+            event_bus: Arc::new(EventBus::new()),
+            enable_dispatch_ready_bus: false,
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
             merge_order_stagger_secs: 0,
@@ -1985,6 +2006,46 @@ impl ExecutionCoordinator {
     /// never panic.
     pub fn set_metrics(&mut self, metrics: Arc<Registry>) {
         self.metrics = metrics;
+    }
+
+    /// Seed the `kick()`-routes-through-the-bus kill-switch. `app.rs` calls
+    /// this once at construction with `cfg.work.enable_dispatch_ready_bus`
+    /// (default off). A boot-time setting, not a live toggle: nothing flips
+    /// this after the coordinator is wrapped in its `Arc`. See
+    /// [`Self::enable_dispatch_ready_bus`] and
+    /// [`Self::spawn_dispatch_ready_subscriber`].
+    pub fn set_enable_dispatch_ready_bus(&mut self, enabled: bool) {
+        self.enable_dispatch_ready_bus = enabled;
+    }
+
+    /// Wire the engine-wide event bus into this coordinator. Per the design
+    /// doc ("One engine process, one bus" —
+    /// `engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`),
+    /// there must be exactly one `EventBus` per engine process so every
+    /// producer and subscriber — this coordinator's `kick()`/
+    /// `spawn_dispatch_ready_subscriber`, and any future producer wired
+    /// through `crate::event_publish::commit_and_publish` — reaches the same
+    /// fan-out. `app.rs` calls this once at construction with the single
+    /// `Arc<EventBus>` it also hands to `ServerState`. Left unset, the
+    /// coordinator keeps its private `EventBus::new()` default, which is
+    /// correct for tests and any caller that never wires a shared bus but
+    /// would silently strand events from a second producer in production.
+    pub fn set_event_bus(&mut self, bus: Arc<EventBus>) {
+        self.event_bus = bus;
+    }
+
+    /// The coordinator's `EventBus`, per the design doc's "one engine
+    /// process, one bus" invariant. A future producer living outside the
+    /// coordinator (e.g. a `crate::event_publish::commit_and_publish` call
+    /// site in another module) reaches the same bus `kick()` and
+    /// `spawn_dispatch_ready_subscriber` use through
+    /// `server_state.execution_coordinator.event_bus()`, rather than
+    /// constructing an unreachable bus of its own. `serve_with_merge_probe`
+    /// also uses this to log the subscriber count once the dispatch-ready
+    /// subscriber has attached, as a boot-time sanity check that the
+    /// injected bus in [`Self::set_event_bus`] is actually the one wired up.
+    pub(crate) fn event_bus(&self) -> &Arc<EventBus> {
+        &self.event_bus
     }
 
     /// Wire the engine's live per-slot worker registry so the dispatch
@@ -2174,7 +2235,36 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Wake the scheduler. Every call site that just enqueued a `ready`
+    /// execution — a kanban drag, a reconciler sweep, the heartbeat, an
+    /// automation dispatch, … — calls this.
+    ///
+    /// Routes through [`Self::event_bus`] as `Event::DispatchReady` when
+    /// [`Self::enable_dispatch_ready_bus`] is on; otherwise calls
+    /// [`Self::note_dispatch_ready`] directly, exactly as this function did
+    /// before the bus existed. The flag is the rollback switch: flip it off
+    /// and every call site is back on the direct path with no other change,
+    /// no redeploy of anything but config.
     pub fn kick(self: &Arc<Self>) {
+        if self.enable_dispatch_ready_bus {
+            tracing::debug!("scheduler_kick outcome=bus_publish — routing through DispatchReady");
+            self.event_bus.publish(Event::DispatchReady);
+            return;
+        }
+        self.note_dispatch_ready();
+    }
+
+    /// The double-latch wakeup itself, extracted from [`Self::kick`] so both
+    /// `kick()`'s direct (flag-off) path and
+    /// [`Self::spawn_dispatch_ready_subscriber`]'s bus-driven (flag-on) path
+    /// share one implementation. Latching `scheduling_pending` before
+    /// contending on `scheduling_active` is what closes the kick/drain TOCTOU
+    /// fixed in PR #345 — see `run_scheduler` for the full
+    /// account of the three race classes this pattern handles, and
+    /// `kick_during_active_scheduler_latches_pending_wakeup` /
+    /// `dispatch_ready_event_during_active_scheduler_latches_pending_wakeup`
+    /// for the pinning regression tests on each path.
+    fn note_dispatch_ready(self: &Arc<Self>) {
         // Order matters: `scheduling_pending` must be written BEFORE we
         // contend on `scheduling_active`. If we lose the swap race
         // (another scheduler is already running) the alive scheduler
@@ -2195,6 +2285,59 @@ impl ExecutionCoordinator {
         });
     }
 
+    /// Subscribe to `Event::DispatchReady` and re-enter the double-latch
+    /// (via [`Self::note_dispatch_ready`]) on every event, so a `kick()`
+    /// that [`Self::enable_dispatch_ready_bus`] routed onto the bus still
+    /// reaches the scheduler. Returns `None` — spawning nothing — when the
+    /// flag is off, so an installation that never opts in never pays for a
+    /// subscriber loop.
+    ///
+    /// Supervised: a panic inside the subscriber loop is logged and the
+    /// loop restarted (with a fresh subscription) rather than silently
+    /// dying and leaving `kick()` publishing into a bus nobody reads. Even
+    /// so, the bus is best-effort and this is not the sole path to
+    /// dispatch — [`Self::spawn_scheduler_heartbeat`] keeps re-kicking on
+    /// its own interval regardless of this flag, so a dropped
+    /// `DispatchReady` (a full mailbox, a mid-restart gap) self-heals
+    /// within one heartbeat rather than stranding a `ready` row forever.
+    pub fn spawn_dispatch_ready_subscriber(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.enable_dispatch_ready_bus {
+            return None;
+        }
+        let coordinator = Arc::clone(self);
+        Some(boss_event_bus::spawn_supervised(
+            "coordinator_dispatch_ready",
+            move || {
+                let coordinator = Arc::clone(&coordinator);
+                async move {
+                    let mut subscription = coordinator
+                        .event_bus
+                        .subscribe(TopicFilter::kind(EventKind::DispatchReady));
+                    // Reconcile pass: catch up on anything a dropped event (or a
+                    // gap while a prior attempt was restarting after a panic)
+                    // might have missed, exactly like every other bus subscriber
+                    // reconciles on start — see `spawn_supervised`'s contract.
+                    coordinator.note_dispatch_ready();
+                    while subscription.recv().await.is_some() {
+                        coordinator.note_dispatch_ready();
+                    }
+                    // `recv()` only returns `None` once the bus itself is
+                    // dropped; `spawn_supervised` treats that as a clean,
+                    // deliberate exit and does NOT restart this loop. The
+                    // coordinator owns the bus for its own lifetime, so this
+                    // is currently unreachable — but `warn!` here rather than
+                    // falling out silently, so a future change that makes it
+                    // reachable is observable instead of quietly ending
+                    // dispatch-ready subscription forever.
+                    tracing::warn!(
+                        "dispatch_ready subscriber: event bus dropped, subscription ended; \
+                         no more DispatchReady events will be delivered via the bus",
+                    );
+                }
+            },
+        ))
+    }
+
     /// Spawn a background task that periodically wakes the scheduler and
     /// surfaces a warning when a `ready` execution has been sitting in
     /// the queue for longer than one heartbeat interval.
@@ -2212,11 +2355,14 @@ impl ExecutionCoordinator {
     /// The heartbeat is a second line of defence, not a replacement for
     /// either mechanism:
     ///
-    /// * It calls [`kick`] regardless of the in-memory active flag, so
-    ///   any kick that was lost to a race the existing latching can't
-    ///   cover is re-issued within one interval. The scheduler still
-    ///   serializes drains through `scheduling_active`, so two
-    ///   schedulers can never run concurrently.
+    /// * It calls [`Self::note_dispatch_ready`] directly — NOT [`kick`] —
+    ///   regardless of the in-memory active flag or
+    ///   [`Self::enable_dispatch_ready_bus`], so this is the one wakeup path
+    ///   that never depends on the event bus having a live subscriber. Any
+    ///   kick that was lost to a race the existing latching can't cover, or
+    ///   a `DispatchReady` the bus dropped, is re-issued within one
+    ///   interval. The scheduler still serializes drains through
+    ///   `scheduling_active`, so two schedulers can never run concurrently.
     /// * When the heartbeat actually observes a stranded `ready` row
     ///   (anything older than the interval), it logs a `warn!` line
     ///   carrying the execution id so an operator sees the failure on
@@ -2253,7 +2399,13 @@ impl ExecutionCoordinator {
                          may have dropped a wakeup; re-kicking now",
                     );
                 }
-                coordinator.kick();
+                // NOT `kick()`: when `enable_dispatch_ready_bus` is on,
+                // `kick()` only publishes to the event bus and returns —
+                // routing the heartbeat through it would make the bus the
+                // sole path to `run_scheduler`, defeating the entire point
+                // of a bus-independent backstop. Call the double-latch
+                // directly so this wakeup always reaches the scheduler.
+                coordinator.note_dispatch_ready();
                 tokio::time::sleep(interval).await;
             }
         })
@@ -2385,7 +2537,7 @@ impl ExecutionCoordinator {
         // "guard drops" — kicks landing in that window noop'd against
         // `scheduling_active=true` and the new `ready` row sat
         // forever with no scheduler running to pick it up. That is
-        // the symptom motivating this fix (see `task_18ae9d21044843b8_44`).
+        // the symptom motivating this fix (see PR #345).
         loop {
             self.scheduling_pending.store(false, Ordering::Release);
             let drain_started_at = std::time::Instant::now();
@@ -7306,6 +7458,7 @@ mod tests {
         worker_page_label,
     };
     use crate::spawn_flow::StartWorkerError;
+    use boss_event_bus::{Event, EventKind, TopicFilter};
     use boss_protocol::{EngineToAppError, ExecutionStatus};
 
     /// Reproduces the live incident (flunge T449, PR brianduff/flunge#906,
@@ -12225,7 +12378,7 @@ mod tests {
         );
     }
 
-    /// Regression for `task_18ae9d21044843b8_44` — `bossctl work start`
+    /// Regression for PR #345 — `bossctl work start`
     /// returned `status: ready` but no scheduler ever ran, leaving the
     /// row stranded. Root cause was a TOCTOU between the scheduler's
     /// last `list_ready_executions()` call and dropping its
@@ -12316,6 +12469,162 @@ mod tests {
         coordinator.kick();
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+    }
+
+    /// Bus-routed sibling of [`kick_during_active_scheduler_latches_pending_wakeup`]
+    /// — same TOCTOU contract, exercised across `Event::DispatchReady` instead
+    /// of a direct `kick()` call. This is the gate for
+    /// `WorkConfig::enable_dispatch_ready_bus`: turning the flag on must not
+    /// weaken the kick/drain TOCTOU fix from PR #345, it must merely change
+    /// *how* the wakeup reaches the double latch.
+    ///
+    /// With the flag on, `kick()` no longer latches `scheduling_pending`
+    /// itself — it publishes and returns. This test pins both halves of that
+    /// split: (1) a bus-routed `kick()` publishes `Event::DispatchReady`
+    /// without touching `scheduling_pending`, and (2) delivering that event
+    /// to `note_dispatch_ready` (exactly what
+    /// [`ExecutionCoordinator::spawn_dispatch_ready_subscriber`]'s loop does
+    /// per received event) while `scheduling_active` is already `true` still
+    /// latches `scheduling_pending`, so the alive scheduler re-enters its
+    /// drain loop instead of exiting on stale state.
+    #[tokio::test]
+    async fn dispatch_ready_event_during_active_scheduler_latches_pending_wakeup() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coordinator =
+            ExecutionCoordinator::new(db, WorkerPool::new(1), cube, Arc::new(FakeExecutionRunner::default()));
+        coordinator.set_enable_dispatch_ready_bus(true);
+        let coordinator = Arc::new(coordinator);
+
+        // Subscribe by hand rather than via `spawn_dispatch_ready_subscriber`
+        // — that method's own reconcile-on-start pass would race the
+        // `scheduling_active`/`scheduling_pending` state this test hand-sets
+        // below. This is the same filter that method installs.
+        let mut subscription = coordinator
+            .event_bus
+            .subscribe(TopicFilter::kind(EventKind::DispatchReady));
+
+        // Simulate "another scheduler is already running".
+        coordinator.scheduling_active.store(true, Ordering::Release);
+        coordinator.scheduling_pending.store(false, Ordering::Release);
+
+        coordinator.kick();
+        assert!(
+            !coordinator.scheduling_pending.load(Ordering::Acquire),
+            "a bus-routed kick() must not latch scheduling_pending directly — only the \
+             subscriber's reaction to the event may, otherwise the flag changes nothing \
+             observable and there is nothing to roll back",
+        );
+
+        let event = subscription
+            .recv()
+            .await
+            .expect("bus-routed kick() must publish DispatchReady");
+        assert_eq!(event, Event::DispatchReady);
+
+        // The subscriber's reaction to the event it just received.
+        coordinator.note_dispatch_ready();
+
+        assert!(
+            coordinator.scheduling_pending.load(Ordering::Acquire),
+            "a DispatchReady event delivered while scheduling_active is true must still latch \
+             scheduling_pending so the alive scheduler re-enters its drain loop instead of \
+             exiting on stale state — same TOCTOU contract as \
+             kick_during_active_scheduler_latches_pending_wakeup, now proven on the bus-routed path",
+        );
+    }
+
+    /// `spawn_dispatch_ready_subscriber` must spawn nothing when
+    /// `enable_dispatch_ready_bus` is off (the default) — an installation
+    /// that never opts in never pays for a subscriber loop, and `kick()`'s
+    /// direct path remains the sole trigger.
+    #[tokio::test]
+    async fn spawn_dispatch_ready_subscriber_is_noop_when_flag_off() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db,
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+
+        assert!(
+            coordinator.spawn_dispatch_ready_subscriber().is_none(),
+            "the bus flag defaults off, so no subscriber task should be spawned",
+        );
+    }
+
+    /// End-to-end gate for the flag-on wakeup path: unlike
+    /// [`dispatch_ready_event_during_active_scheduler_latches_pending_wakeup`]
+    /// (which subscribes by hand and calls `note_dispatch_ready` itself) and
+    /// [`spawn_dispatch_ready_subscriber_is_noop_when_flag_off`] (which never
+    /// turns the flag on), this test runs the real
+    /// `spawn_dispatch_ready_subscriber` loop with the flag on and proves
+    /// `kick()` reaches `note_dispatch_ready` through `kick -> Event::DispatchReady
+    /// on the bus -> the subscriber's loop` with no hand-call anywhere. An
+    /// inverted flag check, a wrong `TopicFilter`, or a loop that never calls
+    /// `note_dispatch_ready` would each hang this test until the bounded
+    /// `tokio::time::timeout` fires.
+    #[tokio::test]
+    async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coordinator =
+            ExecutionCoordinator::new(db, WorkerPool::new(1), cube, Arc::new(FakeExecutionRunner::default()));
+        coordinator.set_enable_dispatch_ready_bus(true);
+        let coordinator = Arc::new(coordinator);
+
+        // Pre-set `scheduling_active` before the subscriber spawns, so its
+        // reconcile-on-start `note_dispatch_ready()` call (see
+        // `spawn_dispatch_ready_subscriber`'s doc) finds a scheduler already
+        // "active" and only latches `scheduling_pending`, rather than racing
+        // a real `run_scheduler` task to completion on an empty queue.
+        coordinator.scheduling_active.store(true, Ordering::Release);
+        coordinator.scheduling_pending.store(false, Ordering::Release);
+
+        let handle = coordinator
+            .spawn_dispatch_ready_subscriber()
+            .expect("enable_dispatch_ready_bus is on, so a subscriber task must spawn");
+
+        // Wait for the reconcile-on-start pass to latch pending, then reset
+        // it to model an in-flight drain that has already observed and
+        // cleared the wakeup — exactly the state the real, later kick()
+        // below must re-latch.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coordinator.scheduling_pending.load(Ordering::Acquire) {
+                    break;
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("subscriber's reconcile-on-start pass must latch scheduling_pending");
+        coordinator.scheduling_pending.store(false, Ordering::Release);
+
+        // The real path under test — no hand-call to note_dispatch_ready.
+        coordinator.kick();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coordinator.scheduling_pending.load(Ordering::Acquire) {
+                    break;
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect(
+            "kick() with enable_dispatch_ready_bus on must reach note_dispatch_ready through \
+             the real subscriber loop (kick -> bus -> subscriber -> note_dispatch_ready) \
+             within a bounded timeout",
+        );
+
+        handle.abort();
     }
 
     /// Regression for the 2026-05-12 "`@` got re-pointed mid-flight"

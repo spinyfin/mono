@@ -1464,6 +1464,24 @@ pub async fn serve_with_merge_probe(
         .execution_coordinator
         .spawn_scheduler_heartbeat(Duration::from_secs(15));
 
+    // DispatchReady bus subscriber — no-op (returns `None`, spawns nothing)
+    // unless `BOSS_ENABLE_DISPATCH_READY_BUS` is on. When it is, this is
+    // what re-enters the kick/drain double-latch for a `kick()` that routed
+    // through the bus instead of latching directly; the heartbeat above
+    // stays the backstop either way. See
+    // `ExecutionCoordinator::spawn_dispatch_ready_subscriber`.
+    let _dispatch_ready_subscriber_handle = server_state.execution_coordinator.spawn_dispatch_ready_subscriber();
+    if _dispatch_ready_subscriber_handle.is_some() {
+        // Boot-time sanity check that the bus injected via `set_event_bus`
+        // in `app.rs` is the same one the subscriber just attached to —
+        // `server_state.execution_coordinator.event_bus()` is the seam a
+        // future producer outside the coordinator reaches this bus through.
+        tracing::debug!(
+            subscriber_count = server_state.execution_coordinator.event_bus().subscriber_count(),
+            "dispatch_ready bus subscriber attached",
+        );
+    }
+
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
     // without progressing. Read-only against the per-execution
