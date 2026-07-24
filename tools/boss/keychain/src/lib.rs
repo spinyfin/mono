@@ -419,4 +419,91 @@ mod tests {
         store.set_raw("new").unwrap();
         assert_eq!(store.get_raw().unwrap().as_deref(), Some("new"));
     }
+
+    /// Behavior tests for the real filesystem-backed `FileBackend`, the macOS
+    /// dev-build fallback. These construct `FileBackend { path }` directly
+    /// against a tempdir and exercise the public `KeystoreBackend` interface,
+    /// asserting only on observable behavior (round-trips, `None`/idempotent
+    /// results) and observable filesystem state (file contents, 0600
+    /// permissions, created parent dirs).
+    #[cfg(target_os = "macos")]
+    mod file_backend {
+        use crate::KeystoreBackend;
+        use crate::macos_backends::FileBackend;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        fn backend_at(dir: &TempDir, rel: &str) -> FileBackend {
+            FileBackend {
+                path: dir.path().join(rel),
+            }
+        }
+
+        #[test]
+        fn set_then_get_round_trips_value() {
+            let dir = TempDir::new().unwrap();
+            let backend = backend_at(&dir, "secret");
+
+            backend.set_raw("secret_abc").unwrap();
+            assert_eq!(backend.get_raw().unwrap().as_deref(), Some("secret_abc"));
+        }
+
+        #[test]
+        fn get_on_missing_path_returns_none() {
+            let dir = TempDir::new().unwrap();
+            let backend = backend_at(&dir, "does_not_exist");
+
+            // NotFound is mapped to Ok(None), not surfaced as an error.
+            assert!(backend.get_raw().unwrap().is_none());
+        }
+
+        #[test]
+        fn delete_on_missing_file_is_idempotent() {
+            let dir = TempDir::new().unwrap();
+            let backend = backend_at(&dir, "does_not_exist");
+
+            // Deleting a secret that was never written must succeed.
+            backend.delete_raw().unwrap();
+            // ...and stay a no-op on a second call.
+            backend.delete_raw().unwrap();
+        }
+
+        #[test]
+        fn set_creates_missing_parent_directories() {
+            let dir = TempDir::new().unwrap();
+            // Parent dirs `nested/deeper/` do not exist yet.
+            let backend = backend_at(&dir, "nested/deeper/secret");
+            assert!(!backend.path.parent().unwrap().exists());
+
+            backend.set_raw("secret_abc").unwrap();
+
+            assert!(backend.path.exists());
+            assert_eq!(backend.get_raw().unwrap().as_deref(), Some("secret_abc"));
+        }
+
+        #[test]
+        fn set_writes_file_with_0600_permissions() {
+            let dir = TempDir::new().unwrap();
+            let backend = backend_at(&dir, "secret");
+
+            backend.set_raw("secret_abc").unwrap();
+
+            let mode = std::fs::metadata(&backend.path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "expected owner-only rw, got {:o}", mode & 0o777);
+        }
+
+        #[test]
+        fn set_truncates_existing_longer_value() {
+            let dir = TempDir::new().unwrap();
+            let backend = backend_at(&dir, "secret");
+
+            backend.set_raw("a_much_longer_previous_value").unwrap();
+            backend.set_raw("short").unwrap();
+
+            // No trailing bytes from the longer prior write survive.
+            assert_eq!(backend.get_raw().unwrap().as_deref(), Some("short"));
+            let len = std::fs::metadata(&backend.path).unwrap().len();
+            assert_eq!(len, "short".len() as u64);
+        }
+    }
 }

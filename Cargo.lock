@@ -634,6 +634,7 @@ dependencies = [
  "keyring",
  "security-framework 3.7.0",
  "security-framework-sys",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
