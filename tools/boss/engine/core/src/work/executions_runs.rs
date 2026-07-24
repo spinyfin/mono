@@ -1956,10 +1956,13 @@ mod event_bus_tests {
     #[tokio::test]
     async fn cancel_execution_does_not_publish_on_error() {
         // Cancelling an already-terminal execution bails before ever
-        // touching the DB, so the rolled-back-transaction guarantee
-        // ("no publish without a commit") is moot here — but the same
-        // no-publish-on-failure expectation should hold: a failed call
-        // must not leave a stray event on the bus.
+        // touching the DB, so this test covers only the reject-before-any-write
+        // path: a failed call must not leave a stray event on the bus. It does
+        // NOT exercise "a staged event is dropped when the enclosing
+        // transaction rolls back after staging" for a real `work/` producer —
+        // that guarantee is covered generically (against a synthetic
+        // producer) by `event_publish.rs`'s own `drops_events_when_commit_fails`
+        // / `drops_events_when_commit_never_runs` tests.
         let (_dir, db) = open_db();
         let execution = ready_execution(&db);
         db.mark_execution_orphaned(&execution.id, "reap").unwrap();

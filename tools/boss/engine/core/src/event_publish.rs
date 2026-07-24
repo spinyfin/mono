@@ -28,7 +28,9 @@
 //! post-commit `DependencyPrereqsSatisfied` event here for other bus
 //! subscribers rather than publish in-txn itself.
 //!
-//! This module is pure plumbing: no transition publishes onto it yet.
+//! Execution-terminal transitions in `work/` stage through
+//! `stage_execution_terminal` and commit via [`commit_and_publish`];
+//! host-disable transitions publish directly (no enclosing transaction).
 
 use boss_event_bus::{Event, EventBus};
 
@@ -61,7 +63,7 @@ impl PendingEvents {
     /// [`commit_and_publish`] — its single `Connection::execute` write
     /// already auto-committed, so there's nothing left to gate the
     /// publish on; the caller publishes each event immediately instead.
-    pub fn drain(self) -> Vec<Event> {
+    pub fn into_events(self) -> Vec<Event> {
         self.0
     }
 }

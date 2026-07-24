@@ -1236,20 +1236,24 @@ impl WorkDb {
         let conn = self.connect()?;
         let existing = query_execution(&conn, execution_id)?;
         let now = now_string();
-        conn.execute(
-            "UPDATE work_executions
-             SET status = 'abandoned',
-                 finished_at = COALESCE(finished_at, ?2)
-             WHERE id = ?1",
-            rusqlite::params![execution_id, now],
-        )?;
+        let updated = match &existing {
+            Some(existing) if !existing.status.is_terminal() => conn.execute(
+                "UPDATE work_executions
+                 SET status = 'abandoned',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE id = ?1",
+                rusqlite::params![execution_id, now],
+            )?,
+            _ => 0,
+        };
         // Canonical terminalization trace — see
         // `WorkDb::mark_execution_orphaned` in executions_runs.rs. The
         // double-spawn guard abandoning a redundant duplicate is exactly
         // the secondary-incident shape (a cross-kind duplicate execution
         // that got abandoned and shadowed the real one), so this site must
         // be attributable from the trace alone too.
-        if let Some(existing) = existing {
+        if updated > 0 {
+            let existing = existing.expect("updated > 0 implies existing was Some and non-terminal");
             tracing::warn!(
                 execution_id = %execution_id,
                 work_item_id = %existing.work_item_id,
@@ -1513,5 +1517,35 @@ mod event_bus_tests {
                 pool_claim: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn mark_execution_redundant_does_not_republish_on_already_terminal() {
+        // A second `mark_execution_redundant` call on an already-`abandoned`
+        // execution must be a no-op: no re-write of the row, no second
+        // `ExecutionTerminal` publish.
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        let execution = create_ready_chore_execution(&db, chore.id);
+
+        db.mark_execution_redundant(&execution.id).unwrap();
+
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.mark_execution_redundant(&execution.id).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no second ExecutionTerminal should be published for an already-terminal execution");
     }
 }

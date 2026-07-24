@@ -84,7 +84,7 @@ pub(crate) fn publish_execution_terminal(
 ) -> Result<()> {
     let mut pending = PendingEvents::new();
     stage_execution_terminal(&mut pending, conn, execution_id, task_id)?;
-    for event in pending.drain() {
+    for event in pending.into_events() {
         bus.publish(event);
     }
     Ok(())
