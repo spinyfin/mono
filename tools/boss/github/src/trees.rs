@@ -22,7 +22,7 @@
 //! must distinguish (missing auth, rate limit, missing repo, offline)
 //! need four different remedies.
 
-use crate::gh_runner::gh_output;
+use crate::gh_runner::{gh_output, parse_http_status_from_stderr};
 
 /// One blob in a repo's tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +103,7 @@ fn classify_failure(stderr: &str) -> TreeApiError {
         TreeApiErrorKind::RateLimited
     } else if lower.contains("http 401") || lower.contains("http 403") || lower.contains("bad credentials") {
         TreeApiErrorKind::NotAuthorized
-    } else if lower.contains("http 404") || lower.contains("not found") {
+    } else if parse_http_status_from_stderr(&message) == Some(404) || lower.contains("not found") {
         TreeApiErrorKind::NotFound
     } else {
         TreeApiErrorKind::Unreachable

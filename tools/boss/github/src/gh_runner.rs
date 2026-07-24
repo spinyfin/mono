@@ -204,7 +204,11 @@ pub async fn pr_in_merge_queue(pr_url: &str) -> bool {
 pub struct CommandGhRunner;
 
 /// Scan `gh`'s stderr for an HTTP status code pattern like "(HTTP 404)" or "HTTP 404".
-fn parse_http_status_from_stderr(stderr: &str) -> Option<u16> {
+///
+/// The canonical status-detection primitive for the crate: `contents` and
+/// `trees` reuse it for their 404 branches rather than re-deriving the
+/// pattern with ad-hoc `contains("404")` / `contains("http 404")` checks.
+pub(crate) fn parse_http_status_from_stderr(stderr: &str) -> Option<u16> {
     let lower = stderr.to_lowercase();
     if let Some(pos) = lower.find("http ") {
         let after = &stderr[pos + 5..];
