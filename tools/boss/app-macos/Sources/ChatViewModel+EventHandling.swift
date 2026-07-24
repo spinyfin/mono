@@ -593,11 +593,9 @@ extension ChatViewModel {
         pendingWorkTreeRefetchTasks[productID] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 150_000_000)
             guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.pendingWorkTreeRefetchTasks.removeValue(forKey: productID)
-                self.engine.sendGetWorkTree(productId: productID, flow: flow)
-            }
+            guard let self else { return }
+            self.pendingWorkTreeRefetchTasks.removeValue(forKey: productID)
+            self.engine.sendGetWorkTree(productId: productID, flow: flow)
         }
     }
 
