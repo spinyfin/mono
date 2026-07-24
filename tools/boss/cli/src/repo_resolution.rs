@@ -15,7 +15,7 @@ use std::io::{self, Write};
 
 use boss_client::BossClient;
 use boss_protocol::{FrontendEvent, FrontendRequest, Product, Task};
-use git_utils::repo_slug::short_name_for;
+use git_utils::repo_slug::{parse_github_slug, short_name_for};
 
 use crate::CliError;
 
@@ -301,7 +301,7 @@ fn aliases_for(url: &str) -> Vec<String> {
         }
     };
     push(url.to_owned());
-    if let Some(slug) = owner_repo_for(url) {
+    if let Some(slug) = parse_github_slug(url) {
         push(slug);
     }
     let short = short_name_for(url).to_owned();
@@ -311,37 +311,6 @@ fn aliases_for(url: &str) -> Vec<String> {
         push(dashless);
     }
     out
-}
-
-/// `owner/repo` for a GitHub-shaped URL. Defensive — returns `None`
-/// when the URL doesn't carry two trailing path components.
-fn owner_repo_for(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let trimmed = trimmed.trim_end_matches(".git");
-    // For `git@host:owner/repo.git` the path lives after `:`; for
-    // `https://host/owner/repo` it lives after the third `/`. The
-    // common shape after the first prefix-strip is `…/owner/repo`,
-    // so take the last two non-empty path components.
-    let after_scheme = trimmed
-        .split_once("://")
-        .map(|x| x.1)
-        .unwrap_or(trimmed)
-        .trim_start_matches('/');
-    let body = after_scheme.splitn(2, ':').last().unwrap_or(after_scheme);
-    // `body` is now e.g. `github.com/foo/bar` or `foo/bar`.
-    let parts: Vec<&str> = body.split('/').filter(|seg| !seg.is_empty()).collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let repo = parts[parts.len() - 1];
-    let owner = parts[parts.len() - 2];
-    // Guard against the `github.com/foo` (1-component) case where the
-    // split picked up the host; require the owner to look like a path
-    // segment, not a host.
-    if owner.contains('.') {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -443,14 +412,23 @@ mod tests {
 
     #[test]
     fn owner_repo_handles_ssh_and_https() {
-        assert_eq!(owner_repo_for("git@github.com:foo/bar.git").as_deref(), Some("foo/bar"));
+        // `aliases_for` now derives the owner/repo slug from the canonical
+        // `git_utils::repo_slug::parse_github_slug`; pin its behavior at
+        // this call boundary for the SSH/HTTPS shapes we feed it.
         assert_eq!(
-            owner_repo_for("https://github.com/foo/bar.git").as_deref(),
+            parse_github_slug("git@github.com:foo/bar.git").as_deref(),
             Some("foo/bar")
         );
-        assert_eq!(owner_repo_for("https://github.com/foo/bar").as_deref(), Some("foo/bar"));
+        assert_eq!(
+            parse_github_slug("https://github.com/foo/bar.git").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            parse_github_slug("https://github.com/foo/bar").as_deref(),
+            Some("foo/bar")
+        );
         // Not enough path components.
-        assert_eq!(owner_repo_for("https://github.com/foo").as_deref(), None);
+        assert_eq!(parse_github_slug("https://github.com/foo").as_deref(), None);
     }
 
     #[test]
