@@ -251,6 +251,16 @@ final class ChatViewModel: ObservableObject {
     /// so the banner doesn't flash on a transient reconnect.
     @Published var engineAnthropicApiKeyPresent: Bool = true
 
+    /// Whether a Trunk org API token is currently configured (env override
+    /// or Keychain), sourced from `trunk_status` — on Settings-pane appear,
+    /// after a `TrunkSetToken` save, and on product-settings appear so the
+    /// merge-mechanism control can warn when Trunk queue has no token.
+    /// `nil` until the engine has answered at least once this session.
+    @Published var trunkTokenConfigured: Bool?
+    /// `"env"` / `"keychain"` when `trunkTokenConfigured` is `true`, mirrors
+    /// `TrunkStatus.source`.
+    @Published var trunkTokenSource: String?
+
     /// Engine metrics snapshot — every registered counter and gauge —
     /// sourced from `metrics_list_live` on Metrics pane open and
     /// refreshed by the pane's 5-second polling timer. Empty until the
@@ -289,10 +299,9 @@ final class ChatViewModel: ObservableObject {
     /// a spinner without losing the previously-loaded listing underneath.
     @Published var designDocsLoadingProductIDs: Set<String> = []
     /// Fetched document bodies keyed by their full `(repo, path, ref)`
-    /// triple. Keyed by the full triple rather than a single "current
-    /// document" slot, so a fetch that lands after the selection has
-    /// moved on updates its own entry instead of overwriting what is
-    /// on screen.
+    /// triple. Keyed by the triple rather than held in a single
+    /// "current document" slot so a slow fetch landing after the
+    /// operator clicked elsewhere cannot overwrite the visible document.
     @Published var designDocContentByRef: [DesignDocRef: DesignDocContent] = [:]
     /// The document the Designs tab reader pane is showing, if any.
     @Published var selectedDesignDocRef: DesignDocRef?
@@ -1524,6 +1533,22 @@ final class ChatViewModel: ObservableObject {
 
     func unsetProductExternalTracker(productId: String) {
         engine.sendUnsetProductExternalTracker(productId: productId)
+    }
+
+    /// Set a product's merge mechanism (`"direct"` or `"trunk_queue"`) —
+    /// how an approved merge on this product's PRs is executed.
+    func setProductMergeMechanism(productId: String, mechanism: String) {
+        engine.sendSetProductMergeMechanism(productId: productId, mechanism: mechanism)
+    }
+
+    /// Store the org-level Trunk API token (Settings pane's "Trunk" tab).
+    func setTrunkToken(_ token: String) {
+        engine.sendTrunkSetToken(token: token)
+    }
+
+    /// Re-query whether a Trunk API token is currently configured.
+    func refreshTrunkStatus() {
+        engine.sendTrunkStatus()
     }
 
     func deleteSelectedWorkItem() {

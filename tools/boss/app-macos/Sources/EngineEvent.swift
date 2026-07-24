@@ -122,6 +122,11 @@ enum EngineEvent {
     /// pane warning. Introduced after #699 where a missing API key
     /// silently broke summarization with no UI affordance.
     case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
+    /// Reply to `trunk_set_token` / `trunk_status` — whether a Trunk org
+    /// API token is configured (env override or Keychain), and where it
+    /// came from. Drives the Settings pane's Trunk token control and the
+    /// per-product merge-mechanism token-required warning.
+    case trunkStatus(configured: Bool, source: String?, note: String?)
     /// Engine's live pool-size configuration, pushed immediately after
     /// `app_session_registered` so `WorkersWorkspaceModel` can configure
     /// its slot ranges before any `SpawnWorkerPane` request arrives.

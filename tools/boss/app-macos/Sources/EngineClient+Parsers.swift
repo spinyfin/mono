@@ -146,7 +146,8 @@ extension EngineClient {
             externalTrackerConfig: externalTrackerConfigString,
             workerBranchPrefix: payload["worker_branch_prefix"] as? String,
             editorialRules: editorialRules,
-            docsRepo: payload["docs_repo"] as? String
+            docsRepo: payload["docs_repo"] as? String,
+            mergeMechanism: payload["merge_mechanism"] as? String
         )
     }
 

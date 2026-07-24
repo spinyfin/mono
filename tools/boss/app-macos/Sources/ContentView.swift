@@ -399,6 +399,11 @@ struct ContentView: View {
                     if case .product(let product) = request.item {
                         model.unsetProductExternalTracker(productId: product.id)
                     }
+                },
+                onSetMergeMechanism: { mechanism in
+                    if case .product(let product) = request.item {
+                        model.setProductMergeMechanism(productId: product.id, mechanism: mechanism)
+                    }
                 }
             )
             // Re-inject the model so the nested GitHubAccountSection (inside
@@ -4604,11 +4609,14 @@ private struct ProductFormSection<Content: View>: View {
 }
 
 private struct WorkEditSheet: View {
+    @EnvironmentObject private var model: ChatViewModel
+
     let request: WorkEditRequest
     let onCancel: () -> Void
     let onSave: (String, String, String, String, String, String, String, String, String) -> Void
     let onSetTracker: ((String, String, String, Int, Bool) -> Void)?
     let onUnsetTracker: (() -> Void)?
+    let onSetMergeMechanism: ((String) -> Void)?
 
     @State private var name: String
     @State private var description: String
@@ -4629,18 +4637,25 @@ private struct WorkEditSheet: View {
     // True if the product had a tracker bound when the sheet opened.
     private let initialTrackerBound: Bool
 
+    // Merge mechanism state (product only). `"direct"` or `"trunk_queue"`;
+    // mirrors `Product.merge_mechanism` with `nil` resolved to `"direct"`.
+    @State private var mergeMechanism: String
+    private let initialMergeMechanism: String
+
     init(
         request: WorkEditRequest,
         onCancel: @escaping () -> Void,
         onSave: @escaping (String, String, String, String, String, String, String, String, String) -> Void,
         onSetTracker: ((String, String, String, Int, Bool) -> Void)? = nil,
-        onUnsetTracker: (() -> Void)? = nil
+        onUnsetTracker: (() -> Void)? = nil,
+        onSetMergeMechanism: ((String) -> Void)? = nil
     ) {
         self.request = request
         self.onCancel = onCancel
         self.onSave = onSave
         self.onSetTracker = onSetTracker
         self.onUnsetTracker = onUnsetTracker
+        self.onSetMergeMechanism = onSetMergeMechanism
 
         switch request.item {
         case .product(let product):
@@ -4653,6 +4668,9 @@ private struct WorkEditSheet: View {
             _prURL = State(initialValue: "")
             _workerBranchPrefix = State(initialValue: product.workerBranchPrefix ?? "")
             _docsRepo = State(initialValue: product.docsRepo ?? "")
+            let resolvedMergeMechanism = product.mergeMechanism ?? "direct"
+            _mergeMechanism = State(initialValue: resolvedMergeMechanism)
+            initialMergeMechanism = resolvedMergeMechanism
 
             if let kind = product.externalTrackerKind,
                let configJSON = product.externalTrackerConfig,
@@ -4696,6 +4714,8 @@ private struct WorkEditSheet: View {
             _trackerProjectNumber = State(initialValue: "")
             _trackerReverseClose = State(initialValue: false)
             initialTrackerBound = false
+            _mergeMechanism = State(initialValue: "direct")
+            initialMergeMechanism = "direct"
         case .task(let task), .chore(let task):
             _name = State(initialValue: task.name)
             _description = State(initialValue: task.description)
@@ -4712,12 +4732,17 @@ private struct WorkEditSheet: View {
             _trackerProjectNumber = State(initialValue: "")
             _trackerReverseClose = State(initialValue: false)
             initialTrackerBound = false
+            _mergeMechanism = State(initialValue: "direct")
+            initialMergeMechanism = "direct"
         }
     }
 
     var body: some View {
         if case .product = request.item {
             productBody
+                .onAppear {
+                    model.refreshTrunkStatus()
+                }
         } else {
             sharedBody
         }
@@ -4790,6 +4815,45 @@ private struct WorkEditSheet: View {
                     }
                 }
 
+                ProductFormSection("Merge Mechanism") {
+                    LabeledContent("On approval, merge via") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Picker("Merge mechanism", selection: $mergeMechanism) {
+                                Text("Direct merge").tag("direct")
+                                Text("Trunk merge queue").tag("trunk_queue")
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 320, alignment: .leading)
+                            Text(
+                                "Direct merges an approved PR immediately (gh pr merge --auto --squash). " +
+                                "Trunk merge queue submits it to the product's Trunk queue instead."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                            if mergeMechanism == "trunk_queue" && model.trunkTokenConfigured == false {
+                                HStack(alignment: .top, spacing: 6) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("No Trunk API token is configured — merges on this product will fail until one is set.")
+                                            .font(.caption)
+                                            .foregroundStyle(.orange)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        SettingsLink {
+                                            Text("Open Settings…")
+                                                .font(.caption)
+                                        }
+                                    }
+                                }
+                                .padding(.top, 2)
+                            }
+                        }
+                    }
+                }
+
                 ProductFormSection("External Tracker") {
                     LabeledContent("Kind") {
                         Picker("Kind", selection: $trackerKind) {
@@ -4851,6 +4915,9 @@ private struct WorkEditSheet: View {
                     if trackerFormValid,
                        let num = Int(trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)) {
                         onSetTracker?(trackerKind, trackerOrg, trackerRepo, num, trackerReverseClose)
+                    }
+                    if mergeMechanism != initialMergeMechanism {
+                        onSetMergeMechanism?(mergeMechanism)
                     }
                 }
                 .keyboardShortcut(.defaultAction)

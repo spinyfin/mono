@@ -573,6 +573,11 @@ final class EngineClient: @unchecked Sendable {
                 let rawIssues = report["issues"] as? [[String: Any]] ?? []
                 let issues = rawIssues.compactMap(parseEngineHealthIssue)
                 emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
+            case "trunk_status":
+                let configured = (payload["configured"] as? NSNumber)?.boolValue ?? false
+                let source = payload["source"] as? String
+                let note = payload["note"] as? String
+                emit(.trunkStatus(configured: configured, source: source, note: note))
             case "settings_list":
                 let raw = payload["settings"] as? [[String: Any]] ?? []
                 let settings = raw.compactMap(parseEngineSetting)
