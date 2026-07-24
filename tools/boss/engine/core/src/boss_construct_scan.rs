@@ -155,10 +155,54 @@ pub fn hit_lines(hits: &[BossConstructHit]) -> Vec<String> {
 // prompt that interpolates it); the deterministic scan that produces the
 // hit lines stays here. See `boss_pr_review::render_boss_construct_sweep_block`.
 
+/// Pull the `pattern` value out of the `boss-work-item-id` entry in
+/// `tools/boss/CHECKS.yaml`'s `boss-ism/pr-text-leakage` check, without
+/// pulling in a YAML parser dependency for one field. The pattern is written
+/// there as a single-quoted YAML scalar (no escape processing beyond `''`),
+/// so slicing between the first pair of single quotes after the anchor
+/// recovers the literal pattern text.
+#[cfg(test)]
+fn extract_boss_work_item_id_pattern_from_checks_yaml(yaml: &str) -> &str {
+    let anchor_pos = yaml
+        .find("name: boss-work-item-id")
+        .expect("tools/boss/CHECKS.yaml must contain a `boss-work-item-id` pattern entry");
+    let after_anchor = &yaml[anchor_pos..];
+    let pattern_key_pos = after_anchor
+        .find("pattern:")
+        .expect("`boss-work-item-id` entry in tools/boss/CHECKS.yaml must have a `pattern` field");
+    let after_key = after_anchor[pattern_key_pos + "pattern:".len()..].trim_start();
+    assert!(
+        after_key.starts_with('\''),
+        "`boss-work-item-id` pattern value must be a single-quoted YAML scalar, got: {after_key}"
+    );
+    let value = &after_key[1..];
+    let closing_quote = value
+        .find('\'')
+        .expect("`boss-work-item-id` pattern value must be closed by a single quote");
+    &value[..closing_quote]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use boss_pr_review::render_boss_construct_sweep_block;
+
+    /// Byte-identity self-test: `tools/boss/CHECKS.yaml` configures the
+    /// `boss-ism/pr-text-leakage` checkleft check with a `boss-work-item-id`
+    /// pattern that is meant to be exactly `BOSS_ID_RE`'s source, so that
+    /// checkleft's deterministic PR-text scan and this engine's deterministic
+    /// diff/narrative scan never drift apart on what counts as a bare Boss
+    /// work-item id. If someone edits one without the other, this fails.
+    #[test]
+    fn boss_ism_checks_yaml_id_pattern_matches_boss_id_re_source() {
+        let checks_yaml = include_str!(env!("BOSS_CHECKS_YAML"));
+        let configured_pattern = extract_boss_work_item_id_pattern_from_checks_yaml(checks_yaml);
+        assert_eq!(
+            configured_pattern,
+            BOSS_ID_RE.as_str(),
+            "tools/boss/CHECKS.yaml's `boss-work-item-id` pattern must stay byte-identical to BOSS_ID_RE's source"
+        );
+    }
 
     #[test]
     fn scans_added_diff_lines_and_resolves_file_line() {
