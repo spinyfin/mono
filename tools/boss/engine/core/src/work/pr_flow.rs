@@ -615,6 +615,112 @@ impl WorkDb {
         Ok(rows_changed > 0)
     }
 
+    /// Return terminated/abandoned executions whose engine-supplied branch
+    /// may have been pushed with no PR ever bound — the candidate set for
+    /// [`crate::abandoned_branch_pr_sweep`].
+    ///
+    /// Unlike [`Self::list_recently_terminal_executions_pending_pr_detection`]
+    /// this does **not** gate on `t.status = 'active'`. That gate is exactly
+    /// the gap behind the 2026-07-24 GitHub PR-creation-outage incident: a
+    /// terminated worker's execution can leave the task in `todo` (auto-demote
+    /// / churn-guard / plain fallback), not just `active`, and an
+    /// `active`-only query then treats it as indistinguishable from work
+    /// that never started. This detects the state directly off the
+    /// execution row — terminal, workspace-backed (a pane actually spawned
+    /// and could have pushed), no `pr_url` bound anywhere — independent of
+    /// whatever kanban status the task fell back to.
+    ///
+    /// `grace_secs` excludes executions that finished too recently: a
+    /// worker that just terminated may not have reached PR creation yet, and
+    /// the normal on-Stop / merge-poller paths are still the first line of
+    /// detection. `max_lookback_secs` bounds the scan on the old end — this
+    /// sweep runs frequently and retries indefinitely (see that module), so
+    /// once a row is older than the lookback it has already been through
+    /// many passes; the bound exists to keep the query cheap as the table
+    /// grows, not to give up on any specific row (a still-unresolved row
+    /// this old already has an open attention item from an earlier pass).
+    ///
+    /// Excludes `cancelled` executions (explicit human/engine cancel — no
+    /// business auto-recovering a PR for abandoned-on-purpose work) and
+    /// `t.status IN ('done', 'archived', 'cancelled')` (an explicit close
+    /// decision the auto-heal path must never overwrite). `workspace_path
+    /// IS NOT NULL` mirrors the late-PR query: the absence of a workspace
+    /// path means the execution never reached pane-spawn and therefore never
+    /// pushed anything.
+    pub fn list_abandoned_pushed_branch_candidates(
+        &self,
+        grace_secs: i64,
+        max_lookback_secs: i64,
+    ) -> Result<Vec<LatePrCandidate>> {
+        let conn = self.connect()?;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let grace_cutoff = (now - grace_secs).to_string();
+        let lookback_cutoff = (now - max_lookback_secs).to_string();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status IN ('orphaned', 'abandoned', 'failed', 'completed')
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND (we.pr_url IS NULL OR we.pr_url = '')
+               AND we.finished_at IS NOT NULL
+               AND CAST(we.finished_at AS INTEGER) <= ?1
+               AND CAST(we.finished_at AS INTEGER) >= ?2
+               AND t.deleted_at IS NULL
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
+               AND t.status NOT IN ('done', 'archived', 'cancelled')
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+             ORDER BY we.finished_at ASC, we.id ASC",
+        ))?;
+        let rows = stmt.query_map(params![grace_cutoff, lookback_cutoff], |row| {
+            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
+            Ok(LatePrCandidate {
+                execution_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                repo_remote_url: row.get(2)?,
+                branch_naming,
+                worker_branch_prefix: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Bind a PR to a task from a terminal execution regardless of the
+    /// task's current kanban status, so long as it isn't already closed.
+    ///
+    /// Like [`Self::bind_pr_to_active_task_from_terminal_execution`] but
+    /// relaxes the `status = 'active'` gate to `status NOT IN ('done',
+    /// 'archived', 'cancelled')` — [`crate::abandoned_branch_pr_sweep`]
+    /// detects state directly off the execution row and must be able to
+    /// recover a work item regardless of whether it fell back to `todo`,
+    /// stayed `active`, or is sitting `blocked`. Refuses only an explicit
+    /// close decision (`done`/`archived`/`cancelled`), which the auto-heal
+    /// path must never overwrite.
+    ///
+    /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
+    /// already closed or already carried a `pr_url` (idempotent for
+    /// concurrent sweeps).
+    pub fn bind_pr_to_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 pr_url            = ?2,
+                 updated_at        = ?3,
+                 last_status_actor = 'engine',
+                 blocked_reason    = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status NOT IN ('done', 'archived', 'cancelled')
+               AND (pr_url IS NULL OR pr_url = '')",
+            params![work_item_id, pr_url, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
     /// Move the chore or project_task identified by `work_item_id`
     /// from `in_review` to `done`, recording `pr_url` (no-op if it
     /// was already set to the same value). Returns the updated task

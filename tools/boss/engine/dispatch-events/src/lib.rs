@@ -505,6 +505,16 @@ pub enum Stage {
     /// knows it must start over.
     WorkspaceRecovery,
     AutomationPreempted,
+    /// [`crate::abandoned_branch_pr_sweep`] found a terminated execution
+    /// whose engine-supplied branch was pushed to the remote with no PR
+    /// ever opened for it. `outcome=ok` with `details.action="bound"`
+    /// means a PR already existed and was bound to the work item;
+    /// `details.action="created"` means the sweep opened the PR itself.
+    /// `outcome=error` means an auto-create attempt failed (transient or
+    /// permanent — `details.transient` distinguishes them); `outcome=skipped`
+    /// means the branch has nothing to open a PR for (never pushed, or no
+    /// commits ahead of the default branch).
+    AbandonedBranchPrRecovery,
 }
 
 impl Stage {
@@ -553,6 +563,7 @@ impl Stage {
             Stage::DispatchResumed => "dispatch_resumed",
             Stage::AutomationPreempted => "automation_preempted",
             Stage::WorkspaceRecovery => "workspace_recovery",
+            Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",
         }
     }
 }
