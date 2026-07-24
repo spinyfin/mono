@@ -13,10 +13,12 @@
 mod bus;
 mod event;
 mod filter;
+mod supervisor;
 
 pub use bus::{EventBus, Subscription};
 pub use event::{Event, EventKind};
 pub use filter::TopicFilter;
+pub use supervisor::spawn_supervised;
 
 #[cfg(test)]
 mod tests;
