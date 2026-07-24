@@ -278,7 +278,44 @@ mod tests {
     use super::*;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
+
+    /// A socket filename that is unique across every test invocation in this
+    /// process, not just across the (already-unique) `TempDir` it lives in.
+    /// Belt-and-suspenders for the two tests below that rebind at the same
+    /// path twice within one test: extra entropy costs nothing and rules out
+    /// any path-level ambiguity beyond what `TempDir` alone provides.
+    fn unique_socket_path(dir: &TempDir) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.path().join(format!(
+            "events-{}-{:?}-{n}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    /// Poll `path_has_a_live_listener` until it reports false. Dropping a
+    /// `UnixListener` closes its fd synchronously, but that only guarantees
+    /// *this process* sees the fd gone — it makes no promise about how
+    /// quickly the kernel finishes tearing down the listening socket's
+    /// internal state such that a fresh `connect()` reliably observes it as
+    /// gone too. A production restart never exercises that narrow window
+    /// (the old process is long dead before a new one binds); this test's
+    /// drop-then-immediately-rebind in the same process is what makes the
+    /// window observable. Waiting here tests the real invariant — the old
+    /// listener eventually goes away — without asserting a zero-latency
+    /// guarantee the kernel doesn't make.
+    async fn wait_for_teardown(path: &Path) {
+        for _ in 0..200 {
+            if !path_has_a_live_listener(path) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("listener at {} did not tear down within 2s", path.display());
+    }
 
     #[tokio::test]
     async fn bind_creates_socket_with_mode_0600() {
@@ -346,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn rebind_after_stale_file_listens() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
+        let path = unique_socket_path(&dir);
 
         // Round 1: bind, then drop the listener. The on-disk socket
         // file persists (close(2) doesn't unlink AF_UNIX paths).
@@ -354,6 +391,10 @@ mod tests {
             let _listener = bind_events_socket(&path).unwrap();
         }
         assert!(path.exists(), "stale socket file should remain after drop");
+        // Give the kernel a moment to finish tearing down the dropped
+        // listener's socket state before probing it again — see
+        // `wait_for_teardown`'s doc comment.
+        wait_for_teardown(&path).await;
 
         // Round 2: rebind. Must unlink + listen successfully.
         let _listener = bind_events_socket(&path).unwrap();
@@ -374,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_steal_a_live_listener() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
+        let path = unique_socket_path(&dir);
 
         // Round 1: a real listener stays alive on `path` for the whole test.
         let _live_listener = bind_events_socket(&path).unwrap();
