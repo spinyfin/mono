@@ -401,6 +401,21 @@ extension EngineClient {
         sendLine(["type": "git_hub_auth_status"])
     }
 
+    /// Store the Trunk org API token (never logged, persisted to the OS
+    /// Keychain by the engine). Replies with `trunk_status` reflecting the
+    /// newly stored token.
+    func sendTrunkSetToken(token: String) {
+        sendLine([
+            "type": "trunk_set_token",
+            "token": token,
+        ])
+    }
+
+    /// Request whether a Trunk org API token is currently configured.
+    func sendTrunkStatus() {
+        sendLine(["type": "trunk_status"])
+    }
+
     func sendCreateProduct(name: String, description: String, repoRemoteURL: String) {
         sendLine([
             "type": "create_product",
@@ -507,6 +522,17 @@ extension EngineClient {
             "type": "set_product_external_tracker",
             "product_id": productId,
             "unset": true,
+        ])
+    }
+
+    /// Set a product's merge mechanism. `mechanism` must be `"direct"` or
+    /// `"trunk_queue"` — the engine validates against `MergeMechanism::parse`
+    /// and rejects anything else.
+    func sendSetProductMergeMechanism(productId: String, mechanism: String) {
+        sendLine([
+            "type": "set_product_merge_mechanism",
+            "product_id": productId,
+            "mechanism": mechanism,
         ])
     }
 

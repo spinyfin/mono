@@ -29,6 +29,10 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Feature Flags", systemImage: "flag")
                 }
+            TrunkSettingsPane()
+                .tabItem {
+                    Label("Trunk", systemImage: "arrow.triangle.merge")
+                }
             UpdateSettingsView(model: updateModel)
                 .tabItem {
                     Label("Updates", systemImage: "arrow.down.circle")

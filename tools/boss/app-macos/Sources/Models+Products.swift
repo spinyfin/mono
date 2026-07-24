@@ -33,6 +33,11 @@ struct WorkProduct: Identifiable, Hashable {
     /// to the user-level `BOSS_USER_DOCS_REPO` default.
     /// Mirrors `Product.docs_repo`.
     var docsRepo: String? = nil
+    /// How an approved merge on this product's PRs is executed: `"direct"`
+    /// (`gh pr merge --auto --squash`) or `"trunk_queue"` (submit to
+    /// Trunk's merge queue). `nil` → `"direct"`. Mirrors
+    /// `Product.merge_mechanism`.
+    var mergeMechanism: String? = nil
 }
 
 /// Swift mirror of `boss_protocol::WorkItemExternalRef`. Stable upstream
