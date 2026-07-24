@@ -77,7 +77,7 @@ impl ExecutionCoordinator {
         let mut hold_slot_busy = false;
 
         match run_outcome {
-            // Mid-spawn cancel (T981): the worker was cancelled while it
+            // Mid-spawn cancel: the worker was cancelled while it
             // was still spawning. The runner has already reaped the
             // just-spawned pane; our job is to release the cube lease the
             // cancel path deliberately left held (so a still-occupied

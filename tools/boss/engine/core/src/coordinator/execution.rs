@@ -337,7 +337,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        // Per-PR single-writer guard (T1577 / T1815 incident). The
+        // Per-PR single-writer guard (guards against the two-concurrent-writers-to-one-PR incident). The
         // double-spawn guard above only sees executions on this exact
         // work_item; it cannot see a *sibling* execution that targets the
         // SAME PR. A revision (conflict-resolution, ci-fix, review-findings,
@@ -1688,7 +1688,8 @@ impl ExecutionCoordinator {
 
     /// Persist a successful recovery: drop the marker the worker's prompt
     /// reads, emit the dispatch event, and retire the patch so a later
-    /// restart does not replay it over the work it already restored (P4).
+    /// restart does not replay it over the work it already restored (case: a
+    /// restart racing a just-completed recovery).
     async fn record_recovery(
         &self,
         execution: &WorkExecution,
@@ -1915,7 +1916,7 @@ impl ExecutionCoordinator {
         // lives only in the named workspace, so landing elsewhere is
         // meaningless and must surface an error rather than silently
         // dispatching to a clean workspace.
-        // P5 — a resume that loses the workspace race is not automatically
+        // Case: a resume that loses the workspace race is not automatically
         // doomed. The hard pin exists because the uncommitted work lived ONLY
         // in that workspace; once the engine has captured a recovery patch
         // for the dead execution, that premise is false and the work is

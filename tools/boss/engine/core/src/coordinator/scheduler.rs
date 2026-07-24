@@ -252,7 +252,8 @@ impl ExecutionCoordinator {
     /// `status IN ('running', 'waiting_human')` is a *paper* liveness
     /// signal — a row can sit `waiting_human` forever after its worker died
     /// without a `Stop` hook (the 2026-06-14 incident this exact gap
-    /// re-created for chain-serialization: T251 / `exec_18af40745c552070_26`,
+    /// re-created for chain-serialization — the chain-serialization re-defer
+    /// stall incident, `exec_18af40745c552070_26`,
     /// a 56-day-old `waiting_human` zombie with no live pane, wedged every
     /// subsequent execution on its PR/chain behind `chain_serialized` in a
     /// ~10s dispatcher loop until a human noticed and ran `bossctl agents
@@ -278,8 +279,8 @@ impl ExecutionCoordinator {
     /// underlying `member_ids` walk is chain-root-first
     /// ([`crate::work::dispatch::WorkDb::live_executions_elsewhere_in_chain`]),
     /// so trusting only the first live sibling lets a root `pr_review` mask
-    /// a live descendant *writer* — reintroducing the exact two-writer
-    /// T1577/T1815 hazard this guard exists to prevent.
+    /// a live descendant *writer* — reintroducing the exact
+    /// two-concurrent-writers-to-one-PR hazard this guard exists to prevent.
     async fn live_chain_siblings(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         const MAX_RECONCILE_ATTEMPTS: u8 = 4;
         for _ in 0..MAX_RECONCILE_ATTEMPTS {
@@ -330,11 +331,11 @@ impl ExecutionCoordinator {
     /// `pr_review` sibling never blocks a merge-conflict-fix revision
     /// (`DispatchClass::MergeConflictRevision`).
     ///
-    /// Rationale (the 2026-07-10 T270/T258 priority-inversion incident): a
+    /// Rationale (the 2026-07-10 priority-inversion incident): a
     /// `pr_review` execution is strictly read-only — never writes, commits,
     /// or pushes (enforced by the reviewer CLAUDE.md, its tool denylist, and
     /// its prompt mandate; see `crate::pr_review` module docs) — so it
-    /// cannot participate in the writer-vs-writer T1577/T1815 hazard this
+    /// cannot participate in the writer-vs-writer two-concurrent-writers-to-one-PR hazard this
     /// guard exists to prevent (two *writers* rebasing/rewriting each
     /// other's commits on the shared jj backing store). Meanwhile a pending
     /// merge-conflict fix is urgent and, once it lands, immediately
@@ -353,7 +354,7 @@ impl ExecutionCoordinator {
     /// `pr_review` on the chain root could mask a live *writer* further down
     /// the chain (a descendant conflict-fix revision) — bypassing would then
     /// co-dispatch a second writer alongside that still-live one, the exact
-    /// two-writer T1577/T1815 hazard this guard exists to prevent. So the
+    /// two-writer hazard (the two-concurrent-writers-to-one-PR incident) this guard exists to prevent. So the
     /// bypass only fires when EVERY live sibling is a review; if even one is
     /// a non-review (writer), this fails closed to `Blocked`.
     ///
@@ -400,7 +401,7 @@ impl ExecutionCoordinator {
     /// `dispatch_wait_reason` (and rendered verbatim on the kanban card)
     /// for a `ChainHold::Blocked` outcome. Names the concrete blocking
     /// task and PR instead of the opaque engine-internal "sibling"
-    /// vocabulary — see the T2469 incident (mono#1901) where the card read
+    /// vocabulary — see the opaque-sibling-wording incident (mono#1901) where the card read
     /// "Waiting — blocked behind a live PR sibling" with no way to tell
     /// what a "sibling" was, which task was blocking, or which PR was
     /// involved. When more than one sibling is queued, names the count and
@@ -453,8 +454,8 @@ impl ExecutionCoordinator {
     /// After `execution` has sat `ready` and chain-serialized for at least
     /// [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`], file a durable
     /// [`CHAIN_SERIALIZED_STALL_ATTENTION_KIND`] attention on its work item
-    /// so a human notices without grepping `engine-trace.jsonl` — the T251
-    /// incident sat in this exact state, re-deferred every ~10s, for ~20
+    /// so a human notices without grepping `engine-trace.jsonl` — the
+    /// chain-serialization re-defer stall incident sat in this exact state, re-deferred every ~10s, for ~20
     /// silent minutes before a human found it by hand.
     ///
     /// Uses `execution.created_at` as the "stuck since" clock: a `ready`
@@ -832,7 +833,7 @@ impl ExecutionCoordinator {
                 "spawn_attempt status=ready -> picked_up"
             );
 
-            // Per-PR single-writer guard (T1577 / T1815 incident): defer this
+            // Per-PR single-writer guard (guards against the two-concurrent-writers-to-one-PR incident): defer this
             // execution if ANOTHER work item on the same PR/revision chain is
             // already live. Checked BEFORE claiming a worker so a serialized
             // row never burns a slot or pollutes its dispatch timeline. The
@@ -842,10 +843,11 @@ impl ExecutionCoordinator {
             // for the `force_dispatch` path. Goes through `resolve_chain_hold`
             // (not the raw `WorkDb` query) so a `waiting_human` sibling whose
             // worker pane is actually dead doesn't wedge this row forever —
-            // see `live_chain_siblings`'s docs for the T251 incident this
+            // see `live_chain_siblings`'s docs for the chain-serialization
+            // re-defer stall incident this
             // closes — and so a merge-conflict-fix revision never waits
             // behind a read-only review (see `resolve_chain_hold`'s docs for
-            // the T270/T258 priority-inversion incident this closes).
+            // the 2026-07-10 priority-inversion incident this closes).
             match self.resolve_chain_hold(&execution).await {
                 Ok(ChainHold::Blocked {
                     sibling,
@@ -879,8 +881,8 @@ impl ExecutionCoordinator {
                         )
                         .await;
                     // Operator-facing wait reason: names the concrete blocking
-                    // task/PR instead of the opaque "PR sibling" wording (T2469
-                    // incident — the card read "blocked behind a live PR
+                    // task/PR instead of the opaque "PR sibling" wording (the
+                    // opaque-sibling-wording incident — the card read "blocked behind a live PR
                     // sibling" with no way to tell what a sibling was or which
                     // task/PR was involved). `dispatch_events`/tracing above
                     // keep the terse `event_reason` code for stats grouping;
@@ -1316,7 +1318,7 @@ impl ExecutionCoordinator {
         match self.automation_preemptor.preempt_worker(&victim.execution_id).await {
             PreemptOutcome::Released => {}
             PreemptOutcome::MidSpawn => {
-                // T981: the victim is still spawning and its lease is
+                // Mid-spawn cancel: the victim is still spawning and its lease is
                 // deliberately held. Nothing was torn down and nothing was
                 // requeued — abandon cleanly.
                 tracing::info!(
@@ -1426,7 +1428,7 @@ impl ExecutionCoordinator {
     /// `request_execution`'s live-execution guard see the item as free.
     ///
     /// The two requeue shapes mirror the ones the slot-busy path
-    /// established (T2685 / #2030):
+    /// established for the slot-busy requeue fix (#2030):
     ///
     /// - `automation_triage` binds to an `automations.id` and has no
     ///   `tasks` row, so it needs its own fresh triage execution and its

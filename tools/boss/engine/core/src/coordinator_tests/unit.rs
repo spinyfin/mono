@@ -6,7 +6,7 @@
 
 use super::helpers::*;
 
-/// Reproduces the live incident (flunge T449, PR brianduff/flunge#906,
+/// Reproduces the live incident (flunge, PR brianduff/flunge#906,
 /// 2026-07-16): rung 1's `conflicted_files` come straight from `jj
 /// resolve --list`, whose entries carry a trailing conflict-type
 /// descriptor glued onto the path (e.g. `"MODULE.bazel.lock    2-sided

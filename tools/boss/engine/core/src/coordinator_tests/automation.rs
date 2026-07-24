@@ -108,7 +108,7 @@ async fn automation_produced_task_routes_to_automation_pool() {
 /// that is strictly greater than `MAX_WORKER_POOL_SIZE` — i.e. it
 /// must land in the automation-pool slot range (Kira/Dax/Bashir),
 /// not the regular-pool range (Riker … O'Brien). This is the pane-
-/// spawn correctness regression test for the T1104 incident where
+/// spawn correctness regression test for the slot-decoding incident where
 /// `auto-worker-1` was decoded as slot 1 (Riker) instead of slot
 /// 9 (Kira).
 #[tokio::test]
@@ -182,7 +182,7 @@ async fn automation_dispatch_worker_id_maps_to_automation_pool_slot() {
     assert!(
         slot as usize > MAX_WORKER_POOL_SIZE,
         "automation slot_id {slot} must be > {MAX_WORKER_POOL_SIZE} (the regular-pool ceiling); \
-             got slot {slot} — automation pane would land on a regular-pool pane (T1104 regression)"
+             got slot {slot} — automation pane would land on a regular-pool pane (slot-decoding regression)"
     );
 }
 

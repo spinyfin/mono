@@ -352,7 +352,7 @@ async fn schedule_execution_rejects_gated_ready_execution() {
     );
 }
 
-/// Per-PR single-writer guard (T1577 / T1815 incident). When an
+/// Per-PR single-writer guard (guards against the two-concurrent-writers-to-one-PR incident). When an
 /// implementation execution on the chain root is live, dispatching a
 /// conflict-resolution revision (a DIFFERENT work item that targets the
 /// SAME PR via the chain) must be DEFERRED — not co-dispatched onto the
@@ -473,7 +473,7 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
 /// The chore_18c0da77bef326b0_840 fix: a live `pr_review` sibling is
 /// strictly read-only, so it must NOT chain-serialize a merge-conflict-
 /// fix revision behind it — the priority inversion where the fix waited
-/// the full length of a review run (T270/T258, 2026-07-10). Unlike
+/// the full length of a review run (2026-07-10). Unlike
 /// [`schedule_execution_defers_revision_behind_live_chain_sibling`]
 /// (whose live sibling is a writer and must still block), this revision
 /// must dispatch immediately even though the review is still live.
@@ -559,7 +559,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_merge_conflict_revi
 /// `resolve_chain_hold`/`live_chain_siblings` fix, the root-first single-
 /// sibling walk would have returned only the review, bypassed, and
 /// co-dispatched a second writer alongside the still-live descendant
-/// writer — the exact T1577/T1815 two-writer hazard this guard exists to
+/// writer — the exact two-concurrent-writers-to-one-PR hazard this guard exists to
 /// prevent.
 #[tokio::test]
 async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_descendant_writer() {
@@ -839,7 +839,7 @@ async fn drain_records_review_held_wait_reason_distinct_from_writer_held() {
 /// The `chain_serialized` (writer-held, not review-held) wait reason
 /// persisted into `dispatch_wait_reason` must name the concrete
 /// blocking task (`T<short_id>` + name) and PR — not the opaque
-/// "PR sibling" wording the T2469 incident (mono#1901) reported, which
+/// "PR sibling" wording the opaque-sibling-wording incident (mono#1901) reported, which
 /// gave an operator no way to tell what a "sibling" was, which task
 /// was blocking, or which PR was involved.
 #[tokio::test]
@@ -1253,7 +1253,7 @@ async fn chain_serialized_backstop_emits_terminal_host_selected_error() {
     );
 }
 
-/// T251 incident (2026-07-09, `exec_18af40745c552070_26`): the chain
+/// Chain-serialization re-defer stall incident (2026-07-09, `exec_18af40745c552070_26`): the chain
 /// single-writer guard must not treat a `waiting_human` chain sibling as
 /// live forever when its worker pane is actually dead (workspace
 /// directory gone, no `Stop` hook). The auto-dispatcher's pre-claim
@@ -1368,7 +1368,7 @@ async fn chain_serialized_pre_claim_reconciles_lost_workspace_zombie_and_dispatc
     );
 }
 
-/// Part (c) of the T251 fix: once a `ready` execution has sat
+/// Part (c) of the chain-serialization re-defer stall fix: once a `ready` execution has sat
 /// chain-serialized behind a genuinely live sibling for longer than
 /// [`CHAIN_SERIALIZED_STALL_THRESHOLD_SECS`], a durable, user-visible
 /// `chain_serialized_stall` attention must be raised on its work item —
@@ -1422,7 +1422,7 @@ async fn chain_serialized_stall_raises_durable_attention_after_threshold() {
         .unwrap();
 
     // Backdate `created_at` well past the stall threshold — simulates the
-    // T251 incident's ~20 minutes of silent re-defers without a real sleep.
+    // chain-serialization re-defer stall incident's ~20 minutes of silent re-defers without a real sleep.
     {
         let conn = db.connect().unwrap();
         let stale_created_at =
@@ -1564,7 +1564,7 @@ async fn gating_prereqs_guard_emits_terminal_host_selected_error() {
     );
 }
 
-/// 2026-07-03 incident (exec_18be836b10baae8_35 / T2154): a merge-conflict
+/// 2026-07-03 incident (exec_18be836b10baae8_35): a merge-conflict
 /// revision can sit `ready` behind worker-pool contention while the
 /// periodic merge-poller sweep (`conflict_watch::on_resolved`) notices the
 /// bound PR is mergeable again and independently retires the linked
@@ -1706,7 +1706,7 @@ async fn merge_conflict_already_resolved_guard_short_circuits_dispatch() {
     }
 }
 
-/// Occupancy-guard livelock regression (T1769). When cube keeps handing
+/// Occupancy-guard livelock regression. When cube keeps handing
 /// back the same occupied workspace, the engine must exclude it on the
 /// next lease call and land on a different free workspace.
 ///

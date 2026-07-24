@@ -281,7 +281,7 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     }
 }
 
-/// T267 regression (outcome 3): a slow `SpawnWorkerPane` ack that
+/// Slow-ack provisional-spawn regression (outcome 3): a slow `SpawnWorkerPane` ack that
 /// nonetheless spawned the pane must NOT be treated as a spawn
 /// failure. The real `PaneSpawnRunner` now converts the ack timeout
 /// into a PROVISIONAL spawn (waiting_human + slot retained); the fake
@@ -521,7 +521,7 @@ async fn pane_spawn_failure_for_pr_review_does_not_demote_work_item() {
     );
 }
 
-/// The automation-dispatch consistency fix (T410 field incident,
+/// The automation-dispatch consistency fix (the engine/app slot-occupancy-disagreement incident,
 /// 2026-07-15): a `SlotBusy` app rejection means the engine and the
 /// app disagree about a slot's occupancy — it is an engine-side
 /// infrastructure issue, not a genuine dispatch failure of the task
@@ -817,7 +817,7 @@ async fn automation_triage_execution_advances_past_worker_claimed_to_lease() {
     );
 }
 
-/// Regression for the regular-pool dispatch stall (T1849): a
+/// Regression for the regular-pool dispatch stall: a
 /// `revision_implementation` execution (main pool) must drive PAST
 /// `worker_claimed` — through host selection and the cube repo-ensure
 /// handoff — to `cube_workspace_lease_attempted`, exactly like the

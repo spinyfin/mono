@@ -283,13 +283,13 @@ pub(super) struct FakeExecutionRunner {
     /// fills this in — tests that want to assert on the
     /// dispatcher's effort/model surfacing set it explicitly.
     pub(super) spawn_config: Option<crate::effort::SpawnConfig>,
-    /// When `true`, simulate the T981 mid-spawn cancel: cancel the
+    /// When `true`, simulate a mid-spawn cancel: cancel the
     /// execution row (via `work_db`, mirroring the real cancel path
     /// that ran while the spawn was in flight) and report
     /// `RunWaitState::CancelledDuringSpawn`. The coordinator must
     /// then release the deferred lease and skip completion recording.
     pub(super) cancelled_during_spawn: bool,
-    /// When `true`, simulate the T267 provisional spawn: the real
+    /// When `true`, simulate a slow-ack provisional spawn: the real
     /// `PaneSpawnRunner` converts a `SpawnWorkerPane` ack timeout into
     /// a provisional (unverified) spawn — the pane may be live, so the
     /// run is tracked in `waiting_human` with its slot retained and the

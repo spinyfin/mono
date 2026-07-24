@@ -890,7 +890,7 @@ async fn pool_exhaustion_does_not_ghost_activate_chores() {
     assert_eq!(coordinator.worker_pool().idle_count().await, 0);
 }
 
-/// Root-cause regression (T2130, 2026-07-01): pool exhaustion is a
+/// Root-cause regression (2026-07-01): pool exhaustion is a
 /// transient capacity wait, not a failure. A chore that repeatedly loses
 /// the pool-claim race (`worker_claimed/skipped reason=pool_exhausted`,
 /// cycle after cycle across drain passes) must stay untouched — no

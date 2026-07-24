@@ -134,7 +134,7 @@ async fn recovery_prefers_cube_in_place_and_does_not_replay_the_patch() {
         std::fs::read_to_string(ws.join("hello.txt")).unwrap(),
         "recovered work\n"
     );
-    // P4: consumed, so a later restart does not replay it.
+    // The recovery patch is consumed, so a later restart does not replay it.
     assert!(!patch.exists());
     assert!(recovery_dir.join(format!("{dead_id}.patch.applied")).exists());
 
@@ -689,7 +689,7 @@ async fn change_creation_failure_marks_execution_failed_and_releases_workspace()
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 }
 
-/// T981 regression — the coordinator's mid-spawn cancel handling.
+/// Mid-spawn cancel regression — the coordinator's mid-spawn cancel handling.
 /// When the runner reports `CancelledDuringSpawn` (it reaped the
 /// just-spawned pane), the coordinator must release the cube lease
 /// the cancel path deliberately left held, and must NOT drive the
