@@ -43,6 +43,7 @@ rust_library(
         "//tools/boss/engine/automation-dedup",
         "//tools/boss/engine/automation-schedule",
         "//tools/boss/engine/ci-log-reader",
+        "//tools/boss/engine/comment-classifier",
         "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/design-doc-fetcher",

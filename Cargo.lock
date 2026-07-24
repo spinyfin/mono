@@ -392,6 +392,7 @@ dependencies = [
  "boss-editorial",
  "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
+ "boss-engine-comment-classifier",
  "boss-engine-day-rotated-log",
  "boss-engine-design-docs",
  "boss-engine-driver",
@@ -450,6 +451,18 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+]
+
+[[package]]
+name = "boss-engine-comment-classifier"
+version = "0.1.0"
+dependencies = [
+ "boss-claude-client",
+ "boss-engine-utils",
+ "boss-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
