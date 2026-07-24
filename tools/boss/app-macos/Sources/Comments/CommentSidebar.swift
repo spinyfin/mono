@@ -9,6 +9,9 @@ import Textual
 /// Dismiss button is at the top-right of each card.
 struct CommentSidebar: View {
     @ObservedObject var layer: CommentLayer
+    /// Collapses the sidebar back to the rail. `nil` hides the collapse control
+    /// (e.g. hosting tests that render the sidebar in isolation).
+    var onCollapse: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,6 +60,15 @@ struct CommentSidebar: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                if let onCollapse {
+                    Button(action: onCollapse) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Collapse comments")
+                    .accessibilityIdentifier("comment-sidebar-collapse")
+                }
             }
             // Soft-dismiss "show resolved" toggle (P529 Phase 2). Only meaningful
             // on an engine-backed viewer, where resolved comments are retained.

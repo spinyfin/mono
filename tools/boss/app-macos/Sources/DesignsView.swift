@@ -423,22 +423,47 @@ private struct DesignsStatusView: View {
 
 // MARK: - Reader pane
 
-/// Renders one document fetched from GitHub.
+/// Renders one document fetched from GitHub, inside the Designs tab's detail
+/// pane.
 ///
-/// `content` is `nil` while the engine's fetch is in flight; the pane
-/// shows a spinner rather than a blank page so a slow read is legible
-/// as "loading" and not as "empty document".
+/// The loaded document routes through the shared [[MarkdownDocumentChrome]] so it
+/// looks identical to the standalone window viewers (black background, ⌘F find,
+/// rich header). Comments are disabled here (`commentsEnabled: false`): this
+/// reader is embedded in the main application window and has no document identity
+/// to persist comments against, so the comment layer's window-scoped NSEvent
+/// monitors must not be installed. `content` is `nil` while the engine's fetch is
+/// in flight; the pane shows a spinner rather than a blank page so a slow read is
+/// legible as "loading" and not as "empty document".
 private struct DesignDocReaderView: View {
     let ref: DesignDocRef
     let ownerRepo: String?
     let content: DesignDocContent?
 
     var body: some View {
+        switch content {
+        case .loaded(let markdown):
+            MarkdownDocumentChrome(
+                title: ref.fileName,
+                subtitle: "\(ref.path) @ \(shortSHA(ref.gitRef))",
+                webURL: githubURL?.absoluteString,
+                source: markdown,
+                commentsEnabled: false
+            )
+        default:
+            statusScaffold
+        }
+    }
+
+    /// Header + loading/failed status, in a plain scroll container. Used for the
+    /// transient non-document states, which never carry markdown to render
+    /// through the chrome.
+    @ViewBuilder
+    private var statusScaffold: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 header
                 Divider()
-                body(for: content)
+                statusBody(for: content)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
@@ -456,7 +481,7 @@ private struct DesignDocReaderView: View {
             Spacer()
             if let githubURL {
                 Link(destination: githubURL) {
-                    Label("GitHub", systemImage: "arrow.up.forward.square")
+                    Label("Open on GitHub", systemImage: "arrow.up.right.square")
                         .font(.caption)
                 }
                 .help(githubURL.absoluteString)
@@ -471,16 +496,8 @@ private struct DesignDocReaderView: View {
     }
 
     @ViewBuilder
-    private func body(for content: DesignDocContent?) -> some View {
+    private func statusBody(for content: DesignDocContent?) -> some View {
         switch content {
-        case .none:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Loading from GitHub…")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
         case .failed(let reason):
             VStack(alignment: .leading, spacing: 8) {
                 Label("Couldn't read this document", systemImage: "exclamationmark.triangle")
@@ -493,11 +510,14 @@ private struct DesignDocReaderView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        case .loaded(let markdown):
-            StructuredText(markdown: markdown)
-                .bossMarkdown()
-                .textual.textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        default:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading from GitHub…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -533,15 +553,15 @@ struct MarkdownViewerContent: Codable, Hashable {
     }
 }
 
-/// Stand-alone scrolling viewer for long task / chore descriptions.
-/// Rendered inside the `"markdown-viewer"` WindowGroup scene. The
-/// chrome matches [[DesignDocReaderView]] so the "Read full description"
-/// affordance lands in a layout that visually mirrors the Designs file
-/// viewer.
+/// Stand-alone scrolling viewer for long task / chore descriptions and fetched
+/// design docs. Rendered inside the `"markdown-viewer"` WindowGroup scene and,
+/// via [[AsyncMarkdownViewerView]], the `"async-markdown-viewer"` singleton.
 ///
-/// The view is split into an outer wrapper that applies `.withComments()` and
-/// an inner `MarkdownViewerContent` that reads the comment-environment values
-/// injected by `WithCommentsModifier` and feeds them to `HighlightingMarkdownParser`.
+/// A thin adapter over the shared [[MarkdownDocumentChrome]]: this string-backed
+/// surface passes a bare title (no repo chip / path / GitHub link) and forwards
+/// the comment artifact and timing anchors. The chrome supplies the black
+/// background, ⌘F find, comment layer, and render core so this viewer looks
+/// identical to the disk-backed File ▸ Open renderer.
 struct MarkdownViewerView: View {
     let title: String
     let source: String
@@ -558,191 +578,12 @@ struct MarkdownViewerView: View {
     var artifact: CommentArtifactRef? = nil
 
     var body: some View {
-        MarkdownViewerScrollContent(
+        MarkdownDocumentChrome(
             title: title,
             source: source,
+            artifact: artifact,
             projectShortID: projectShortID,
             clickStartTime: clickStartTime
-        )
-        .withComments(artifact: artifact, source: source)
-    }
-}
-
-/// Preference key used to detect when `StructuredText` has been laid out
-/// for the first time, signalling that Textual has completed parsing.
-private struct StructuredTextHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
-
-/// Inner content view that reads comment state from the environment and uses
-/// HighlightingMarkdownParser to paint persistent yellow highlights on commented spans.
-private struct MarkdownViewerScrollContent: View {
-    let title: String
-    let source: String
-    let projectShortID: String
-    /// Click→first-paint anchor passed in from `MarkdownViewerView`. When
-    /// non-nil and layout completes, we additionally emit `phase=interactive`
-    /// so the unified log carries a single end-to-end number alongside the
-    /// per-stage spans.
-    let clickStartTime: Date?
-
-    @Environment(\.commentedAnchors) private var commentedAnchors
-    @Environment(\.commentFlashAnchor) private var commentFlashAnchor
-    @Environment(\.suppressTypeToComment) private var suppressTypeToComment
-    @State private var parseStartTime: Date? = nil
-    @State private var parseLogged = false
-    /// Monotonically-increasing counter bumped whenever the highlight state
-    /// changes. Used as the `.id()` for `StructuredText` to force a fresh
-    /// parse when comments are added/removed or the flash text changes.
-    /// A counter avoids hash collisions that can occur with XOR-combined
-    /// hashValues and guarantees identity changes on every highlight update.
-    @State private var parseVersion: Int = 0
-
-    /// ⌘F find-in-document state, scoped to this viewer window's lifetime —
-    /// see `MarkdownFindState` for why closing the bar doesn't clear `query`.
-    @StateObject private var findState = MarkdownFindState()
-    /// Stable across re-renders via `@State` (a plain stored `let`/`var`
-    /// would be reinitialized — losing the captured `NSScrollView` — every
-    /// time SwiftUI reconstructs this view struct).
-    @State private var scrollController = MarkdownScrollController()
-    @FocusState private var findFieldFocused: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if findState.isActive {
-                MarkdownFindBar(state: findState, isFocused: $findFieldFocused, onClose: closeFindBar)
-                Divider()
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(title)
-                        .font(.title3.weight(.semibold))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Divider()
-                    StructuredText(source, parser: markdownParser)
-                        .bossMarkdown()
-                        .textual.textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        // Force StructuredText recreation when highlight state changes so the
-                        // new HighlightingMarkdownParser instance is used to re-parse the source.
-                        // StructuredText only re-parses on markup changes; the id() change is the
-                        // trigger that ensures highlight updates are reflected immediately.
-                        // A monotonic counter is used instead of a hashValue-based key to avoid
-                        // hash collisions and guarantee a new identity on every comment/search update.
-                        .id(parseVersion)
-                        .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
-                        .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear.preference(
-                                    key: StructuredTextHeightKey.self,
-                                    value: geo.size.height
-                                )
-                            }
-                        )
-                }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 20)
-                .frame(maxWidth: 720)
-                .frame(maxWidth: .infinity)
-                .background(MarkdownScrollViewCapture(controller: scrollController))
-            }
-            .textSelection(.enabled)
-        }
-        .onAppear {
-            parseStartTime = Date()
-            parseLogged = false
-            findState.updateSource(source, baseURL: nil)
-        }
-        .onChange(of: source) { _, newSource in
-            findState.updateSource(newSource, baseURL: nil)
-        }
-        .onChange(of: findState.navigationNonce) { _, _ in
-            parseVersion &+= 1
-            guard findState.isActive, let range = findState.currentMatchRange else { return }
-            scrollController.scrollToFraction(Double(range.lowerBound) / Double(max(findState.plainTextLength, 1)))
-        }
-        .onPreferenceChange(StructuredTextHeightKey.self) { height in
-            guard !parseLogged, height > 0, let start = parseStartTime,
-                  !projectShortID.isEmpty else { return }
-            let ms = Int(Date().timeIntervalSince(start) * 1000)
-            let bytes = source.utf8.count
-            designDocTimingLog.info("phase=parse project=\(projectShortID, privacy: .public) duration_ms=\(ms, privacy: .public) bytes=\(bytes, privacy: .public)")
-            if let clickStart = clickStartTime {
-                let totalMs = Int(Date().timeIntervalSince(clickStart) * 1000)
-                designDocTimingLog.info("phase=interactive project=\(projectShortID, privacy: .public) duration_ms=\(totalMs, privacy: .public)")
-            }
-            DispatchQueue.main.async {
-                parseLogged = true
-                parseStartTime = nil
-            }
-        }
-        // Hidden buttons for the standard macOS find shortcuts. ⌘⇧K (Add
-        // Comment) is the nearest neighboring shortcut (WithCommentsModifier)
-        // and doesn't collide with ⌘F/⌘G/⇧⌘G. Next/Previous are disabled
-        // (rather than absent) while there's nothing to navigate, so the
-        // keystroke falls through instead of being silently swallowed.
-        .background {
-            Group {
-                Button("") { openFindBar() }
-                    .keyboardShortcut("f", modifiers: .command)
-                Button("") { findState.selectNext() }
-                    .keyboardShortcut("g", modifiers: .command)
-                    .disabled(!findState.isActive || findState.matches.isEmpty)
-                Button("") { findState.selectPrevious() }
-                    .keyboardShortcut("g", modifiers: [.command, .shift])
-                    .disabled(!findState.isActive || findState.matches.isEmpty)
-            }
-            .frame(width: 0, height: 0)
-            .hidden()
-        }
-    }
-
-    /// Bumps `parseVersion` (forcing `StructuredText` to remount with a
-    /// fresh `HighlightingMarkdownParser`) while preserving the scroll
-    /// position across the remount. AppKit resets a `NSScrollView`'s
-    /// document offset to the top when its document view's content is torn
-    /// down and rebuilt, which is exactly what SwiftUI does under the hood
-    /// for an `.id()` change — so a comment add/remove/flash would
-    /// otherwise silently scroll the reader back to the top of the
-    /// document. The offset is captured before the remount and reapplied
-    /// on the next run loop turn, once the new content has been laid out.
-    private func bumpParseVersionPreservingScroll() {
-        let offset = scrollController.currentOffset()
-        parseVersion &+= 1
-        guard let offset else { return }
-        DispatchQueue.main.async {
-            scrollController.restoreOffset(offset)
-        }
-    }
-
-    private func openFindBar() {
-        findState.open()
-        findFieldFocused = true
-    }
-
-    private func closeFindBar() {
-        findState.close()
-        findFieldFocused = false
-        suppressTypeToComment.wrappedValue = false
-    }
-
-    private var markdownParser: any MarkupParser {
-        let base: any MarkupParser
-        if commentedAnchors.isEmpty && commentFlashAnchor == nil {
-            base = AttributedStringMarkdownParser.markdown()
-        } else {
-            base = HighlightingMarkdownParser(
-                highlightedAnchors: commentedAnchors,
-                flashingAnchor: commentFlashAnchor
-            )
-        }
-        guard findState.isActive, !findState.matches.isEmpty else { return base }
-        return SearchHighlightingMarkdownParser(
-            inner: base,
-            matches: findState.matches,
-            currentMatchIndex: findState.currentIndex
         )
     }
 }
@@ -814,7 +655,7 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     var renderContentID: UUID? = nil
     /// Wall-clock time `openProjectDesignDoc` first dispatched the
     /// rawContentURL path for this click. Read by
-    /// `MarkdownViewerScrollContent` to emit a single
+    /// `MarkdownDocumentChrome` to emit a single
     /// `phase=interactive` line covering the full click→first-paint
     /// budget. Each click overwrites it, and the inner content's
     /// `parseLogged` flag guards against double-emission on a single
@@ -875,7 +716,7 @@ struct AsyncMarkdownViewerView: View {
                         vm.renderStartTime = nil
                         vm.pendingRenderProjectShortID = nil
                     }
-                    // clickStartTime is consumed by MarkdownViewerScrollContent's
+                    // clickStartTime is consumed by MarkdownDocumentChrome's
                     // layout-complete handler. It is not cleared here on purpose —
                     // SwiftUI may rebuild AsyncMarkdownViewerView before layout
                     // completes, and the next click re-stamps it.

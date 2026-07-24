@@ -1057,29 +1057,48 @@ struct WithCommentsModifier: ViewModifier {
 
     @Environment(\.commentBackend) private var commentBackend
     @StateObject private var layer = CommentLayer()
+    /// Whether the full comment sidebar is shown. Collapsed by default: an
+    /// engine-backed doc with no comments no longer opens onto a wide empty
+    /// sidebar. It auto-expands when the doc gains comments (a fresh add, or an
+    /// engine-backed doc whose existing comments load) and can be toggled by hand
+    /// via the collapsed rail's expand button / the sidebar's collapse button.
+    ///
+    /// Note the trap this avoids: keying visibility off `!layer.comments.isEmpty`
+    /// alone would make a doc whose comments are all *resolved* (filtered out of
+    /// `comments` unless `showResolved`) collapse and take the "Show resolved"
+    /// toggle with it, leaving resolved comments unreachable. The rail's expand
+    /// button is always present on engine-backed docs, so the full sidebar — and
+    /// with it that toggle — is always one click away.
+    @State private var sidebarExpanded = false
 
     func body(content: Content) -> some View {
         let commentedAnchors = layer.comments.filter(\.isHighlightable).map(\.anchor)
         let flashingAnchor = layer.flashingAnchor
-        let showSidebar = !layer.comments.isEmpty || layer.isEngineBacked
 
         HStack(spacing: 0) {
             content
                 .environment(\.commentedAnchors, commentedAnchors)
                 .environment(\.commentFlashAnchor, flashingAnchor)
 
-            if showSidebar {
-                Divider()
-                CommentSidebar(layer: layer)
+            Divider()
+            if sidebarExpanded {
+                CommentSidebar(layer: layer, onCollapse: { sidebarExpanded = false })
                     .frame(width: 280)
+            } else {
+                CollapsedCommentRail(
+                    commentCount: layer.comments.count,
+                    isEngineBacked: layer.isEngineBacked,
+                    onExpand: { sidebarExpanded = true },
+                    onAddComment: { layer.requestNewComment() }
+                )
             }
         }
-        .overlay(alignment: .topTrailing) {
-            if !showSidebar {
-                addCommentButton
-                    .padding(.trailing, 16)
-                    .padding(.top, 20)
-            }
+        // Auto-expand the first time the doc has comments to show — a just-added
+        // comment, or an engine-backed doc's existing comments arriving. A
+        // manual collapse afterwards sticks (no empty→non-empty transition to
+        // re-trigger it) until comments next go from none to some.
+        .onChange(of: layer.comments.isEmpty) { _, isEmpty in
+            if !isEmpty { sidebarExpanded = true }
         }
         // Hidden button for ⌘⇧K shortcut (⌘⇧M is already the Metrics panel shortcut).
         .background {
@@ -1109,17 +1128,77 @@ struct WithCommentsModifier: ViewModifier {
             layer.unbindFromEngine()
         }
     }
+}
 
-    private var addCommentButton: some View {
-        Button {
-            layer.requestNewComment()
-        } label: {
-            Label("Add Comment", systemImage: "bubble.left.and.text.bubble.right")
-                .font(.callout)
+/// The collapsed state of the comment affordance: a slim vertical rail on the
+/// right edge of a markdown viewer. Replaces the earlier floating "Add Comment"
+/// overlay with an explicit, always-present expand affordance, so the full
+/// sidebar (and its "Show resolved" toggle) is always reachable — including on a
+/// doc whose comments are all resolved and therefore absent from `commentCount`.
+struct CollapsedCommentRail: View {
+    /// Number of currently-listed (unresolved, unless `showResolved`) comments,
+    /// shown as a badge on the expand button when non-zero.
+    let commentCount: Int
+    /// Whether the layer persists through the engine. When true the expand
+    /// button is always offered (resolved comments may exist even when
+    /// `commentCount` is 0); when false it is offered only once in-memory
+    /// comments exist.
+    let isEngineBacked: Bool
+    let onExpand: () -> Void
+    let onAddComment: () -> Void
+
+    /// Whether to offer the expand button. Engine-backed docs always offer it —
+    /// resolved comments (absent from `commentCount`) may still be reachable only
+    /// by expanding to the "Show resolved" toggle. In-memory docs offer it only
+    /// once there is at least one comment to reveal. Pure so the
+    /// resolved-reachability guarantee is unit-testable.
+    static func shouldOfferExpand(commentCount: Int, isEngineBacked: Bool) -> Bool {
+        isEngineBacked || commentCount > 0
+    }
+
+    private var showExpandButton: Bool {
+        Self.shouldOfferExpand(commentCount: commentCount, isEngineBacked: isEngineBacked)
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Button(action: onAddComment) {
+                Image(systemName: "bubble.left.and.text.bubble.right")
+                    .font(.callout)
+            }
+            .buttonStyle(.plain)
+            .help("Select text, then click or press ⌘⇧K to add a comment")
+            .accessibilityIdentifier("comment-rail-add")
+
+            if showExpandButton {
+                Button(action: onExpand) {
+                    Image(systemName: "text.bubble")
+                        .font(.callout)
+                        .overlay(alignment: .topTrailing) {
+                            if commentCount > 0 {
+                                Text("\(commentCount)")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 3)
+                                    .padding(.vertical, 1)
+                                    .background(Capsule().fill(Color.accentColor))
+                                    .offset(x: 8, y: -8)
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+                .help("Show comments")
+                .accessibilityIdentifier("comment-rail-expand")
+            }
+
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .help("Select text, then click or press ⌘⇧K to add a comment")
+        .padding(.horizontal, 8)
+        .padding(.top, 20)
+        .frame(width: 36)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
