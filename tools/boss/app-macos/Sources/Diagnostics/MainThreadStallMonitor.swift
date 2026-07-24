@@ -72,6 +72,13 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         self.log = log
     }
 
+    /// The app's own executable image name (e.g. "Boss"), used to tell a
+    /// genuine app-code hang from a backtrace that's landed back in the
+    /// idle event loop. `nil` (e.g. under `swift test`, with no app
+    /// bundle) disables the app-frame check, so idle-leaf stacks are
+    /// still filtered on symbol alone.
+    private static let appImageName: String? = Bundle.main.executableURL?.lastPathComponent
+
     /// Begin monitoring. Must be called on the main thread (it captures
     /// the main thread's Mach port via `mach_thread_self()`). Idempotent.
     func start() {
@@ -160,7 +167,21 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         state.withLock { $0.recordedBeat = snap.beat }
 
         let addresses = MainThreadBacktrace.capture(thread: mainThreadPort, maxFrames: config.maxFrames)
-        let frames = MainThreadBacktrace.symbolicate(addresses)
+        let symbolicated = MainThreadBacktrace.symbolicate(addresses)
+
+        // The capture above can land after the main thread has already
+        // unwound back to its idle wait (poll granularity, or the whole
+        // process having been CPU-starved/backgrounded rather than the
+        // main thread itself blocked). That backtrace has no app frame
+        // on it at all — it isn't a real hang, so don't log it as one.
+        // `recordedBeat` above is still updated, so a persistently idle
+        // stack doesn't get re-captured every tick.
+        guard !MainThreadBacktrace.isIdleEventLoopStack(symbolicated, appImage: Self.appImageName) else {
+            ongoingRecordId = nil
+            return
+        }
+
+        let frames = MainThreadBacktrace.format(symbolicated)
         let record = StallRecord(
             tsEpochMs: Int64(Date().timeIntervalSince1970 * 1000),
             durationMs: durationMs,

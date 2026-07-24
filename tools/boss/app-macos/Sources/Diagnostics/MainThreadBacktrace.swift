@@ -27,20 +27,27 @@ enum MainThreadBacktrace {
         return Array(UnsafeBufferPointer(start: buffer, count: count))
     }
 
-    /// Resolve each address to `image  0x…  symbol + offset` via
-    /// `dladdr`. Allocates, so call only after the target thread has
-    /// been resumed.
-    static func symbolicate(_ addresses: [UInt]) -> [String] {
+    /// One resolved frame: the image it belongs to and its symbol,
+    /// ahead of text formatting. Kept structured (rather than the
+    /// rendered `String`) so callers can reason about *which* image a
+    /// frame came from — e.g. [[MainThreadStallMonitor]] uses this to
+    /// tell a genuine app-code hang from a backtrace that's landed back
+    /// in the idle event loop.
+    struct SymbolicatedFrame: Equatable {
+        let index: Int
+        let image: String
+        let address: UInt
+        let symbol: String
+        let offset: UInt
+    }
+
+    /// Resolve each address to its owning image/symbol via `dladdr`.
+    /// Allocates, so call only after the target thread has been resumed.
+    static func symbolicate(_ addresses: [UInt]) -> [SymbolicatedFrame] {
         addresses.enumerated().map { idx, addr in
             var info = Dl_info()
             guard dladdr(UnsafeRawPointer(bitPattern: addr), &info) != 0 else {
-                return formatFrame(
-                    index: idx,
-                    image: "???",
-                    address: addr,
-                    symbol: hex(addr),
-                    offset: 0
-                )
+                return SymbolicatedFrame(index: idx, image: "???", address: addr, symbol: hex(addr), offset: 0)
             }
             let image = info.dli_fname
                 .flatMap { String(validatingCString: $0) }
@@ -49,14 +56,47 @@ enum MainThreadBacktrace {
                 .flatMap { String(validatingCString: $0) } ?? hex(addr)
             let symAddr = UInt(bitPattern: info.dli_saddr)
             let offset = (symAddr != 0 && addr >= symAddr) ? addr - symAddr : 0
-            return formatFrame(
-                index: idx,
-                image: image,
-                address: addr,
-                symbol: symbol,
-                offset: offset
-            )
+            return SymbolicatedFrame(index: idx, image: image, address: addr, symbol: symbol, offset: offset)
         }
+    }
+
+    /// Render resolved frames in the column layout `Thread.callStackSymbols` uses.
+    static func format(_ frames: [SymbolicatedFrame]) -> [String] {
+        frames.map {
+            formatFrame(index: $0.index, image: $0.image, address: $0.address, symbol: $0.symbol, offset: $0.offset)
+        }
+    }
+
+    /// Leaf symbols the main thread parks on while idling in the run
+    /// loop waiting for the next event/message — i.e. *not* blocked.
+    static let idleEventLoopLeafSymbols: Set<String> = [
+        "mach_msg",
+        "mach_msg_trap",
+        "mach_msg2",
+        "mach_msg2_trap",
+        "_mach_msg2_trap",
+        "_nextEventMatchingMask",
+    ]
+
+    /// True when the captured stack shows the main thread parked in the
+    /// idle event loop rather than genuinely blocked: the leaf frame is
+    /// one of [[idleEventLoopLeafSymbols]] (or an `NSApplication`
+    /// next-event wait) and no frame belongs to `appImage`.
+    ///
+    /// This is the case the watchdog can misfire on: it detects a late
+    /// heartbeat and captures a backtrace, but by the time the capture
+    /// actually runs (poll granularity, or the whole process having been
+    /// CPU-starved/backgrounded rather than the main thread being
+    /// blocked) the main thread has already unwound back to idle. The
+    /// resulting "stall" has no app code on it at all, which is the
+    /// tell that it isn't one.
+    static func isIdleEventLoopStack(_ frames: [SymbolicatedFrame], appImage: String?) -> Bool {
+        guard let leaf = frames.first else { return false }
+        let leafIsIdle = idleEventLoopLeafSymbols.contains(leaf.symbol)
+            || leaf.symbol.contains("nextEventMatchingMask")
+        guard leafIsIdle else { return false }
+        guard let appImage, !appImage.isEmpty else { return true }
+        return !frames.contains { $0.image == appImage }
     }
 
     /// One frame rendered in the column layout `Thread.callStackSymbols`
