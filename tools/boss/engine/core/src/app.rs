@@ -889,8 +889,6 @@ impl ServerState {
         let metrics_for_coordinator = metrics_registry.clone();
         let pr_reconciler_kick = Arc::new(Notify::new());
         let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
-        let event_bus = Arc::new(boss_event_bus::EventBus::new());
-        let event_bus_for_state = event_bus.clone();
         let shutdown_trigger = Arc::new(Notify::new());
         let shutdown_trigger_for_state = shutdown_trigger.clone();
         let control_token_for_state = control_token.clone();
@@ -1107,7 +1105,6 @@ impl ServerState {
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
                 .pr_reconciler_kick(pr_reconciler_kick_for_state)
-                .event_bus(event_bus_for_state)
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)

@@ -76,6 +76,7 @@ impl EventKind {
             EventKind::PrReconcileRequested => "pr_reconcile_requested",
             EventKind::DispatchReady => "dispatch_ready",
             EventKind::Timer => "timer",
+            EventKind::AutomationMutation => "automation_mutation",
         }
     }
 }
@@ -119,6 +120,7 @@ impl Event {
             Event::PrReconcileRequested { pr_url } => pr_url.clone(),
             Event::DispatchReady => String::new(),
             Event::Timer { deadline_id } => deadline_id.clone(),
+            Event::AutomationMutation => String::new(),
         }
     }
 }
