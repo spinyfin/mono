@@ -377,6 +377,36 @@ final class UpdateModelTests: XCTestCase {
         XCTAssertEqual(count, 1, "automatic mode should download/stage exactly once")
     }
 
+    func testDownloadProgressPlumbsIntoDownloadStateWhileDownloading() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        let gate = ProgressGate()
+        let stager = UpdateStager { update, onProgress in
+            onProgress(.determinate(0.4))
+            await gate.waitForRelease()
+            return update.version
+        }
+        let model = makeModel(result: .availableMock, stager: stager)
+
+        await model.checkNow()
+
+        // The progress callback lands on the main actor asynchronously; poll
+        // briefly for it rather than assuming it has landed by the time
+        // `checkNow()` returns.
+        var sawProgress = false
+        for _ in 0..<50 {
+            if case .downloading(_, .determinate(let fraction)) = model.downloadState, fraction == 0.4 {
+                sawProgress = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(sawProgress, "download progress must reach downloadState before staging completes")
+
+        await gate.release()
+        await model.awaitStagingForTesting()
+        XCTAssertEqual(model.downloadState, .readyToInstall(version: Self.mockVersion))
+    }
+
     func testNotifyModeDoesNotAutoStage() async throws {
         // Default mode is .notify.
         let recorder = StagedRecorder()
@@ -640,6 +670,27 @@ private extension UpdateCheckResult {
 actor FetchCounter {
     private(set) var value: Int = 0
     func increment() { value += 1 }
+}
+
+// MARK: - Progress-test synchronization gate
+
+/// Lets a fake ``UpdateStager`` suspend mid-stage so a test can observe an
+/// intermediate ``UpdateDownloadState/downloading(version:progress:)`` value
+/// before staging completes.
+actor ProgressGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func waitForRelease() async {
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 // MARK: - Recording stager

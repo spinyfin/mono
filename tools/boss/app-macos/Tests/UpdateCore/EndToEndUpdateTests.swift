@@ -443,7 +443,7 @@ extension EndToEndUpdateTests {
         return AssetDownloader { _, onProgress in
             let file = root.appendingPathComponent("dl-\(UUID().uuidString).zip")
             _ = FileManager.default.createFile(atPath: file.path, contents: Data(count: bytes))
-            onProgress(1.0)
+            onProgress(.determinate(1.0))
             return file
         }
     }

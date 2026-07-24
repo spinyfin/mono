@@ -73,32 +73,142 @@ enum DownloadOutcome: Equatable, Sendable {
     case failed(reason: String)
 }
 
+// MARK: - Download progress
+
+/// A single progress sample reported during an asset download. Public because it
+/// appears in ``UpdateDownloadState/downloading(version:progress:)``, which the
+/// app layer switches on directly.
+public enum DownloadProgress: Equatable, Sendable {
+    /// Fractional progress in `0...1`, known because the server reported a
+    /// `Content-Length` for the response.
+    case determinate(Double)
+    /// The server did not report a content length, so fractional progress can't
+    /// be computed; the UI should fall back to an indeterminate spinner.
+    case indeterminate
+}
+
+/// Coalesces raw `URLSessionDownloadDelegate` byte counts into whole-percent
+/// `DownloadProgress` samples, so the UI updates smoothly instead of on every
+/// `didWriteData` callback (which can fire many times per second). Pure and
+/// stateful-but-synchronous, so it's unit-testable without any networking.
+struct DownloadProgressCoalescer: Sendable {
+    private enum State: Equatable { case unset, indeterminate, percent(Int) }
+    private var state: State = .unset
+
+    /// Returns the `DownloadProgress` to report for this sample, or `nil` if it
+    /// should be suppressed because nothing visible has changed since the last
+    /// emission.
+    mutating func sample(totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) -> DownloadProgress? {
+        guard totalBytesExpectedToWrite > 0 else {
+            guard state != .indeterminate else { return nil }
+            state = .indeterminate
+            return .indeterminate
+        }
+        let percent = Int((Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100).rounded())
+        guard state != .percent(percent) else { return nil }
+        state = .percent(percent)
+        return .determinate(Double(percent) / 100)
+    }
+}
+
 // MARK: - Injectable asset downloader
 
 /// Downloads a remote asset to a local file. Injectable so tests run without a
 /// network. The `.live` implementation uses `URLSession`.
 struct AssetDownloader: Sendable {
-    /// Download `url`, reporting fractional progress (`0...1`). Returns the local
-    /// file URL of the completed download. The returned file is owned by the
-    /// caller (`UpdateDownloader` moves it into the staging directory).
-    let download: @Sendable (_ url: URL, _ onProgress: @Sendable @escaping (Double) -> Void) async throws -> URL
+    /// Download `url`, reporting coalesced progress via `onProgress`. Returns the
+    /// local file URL of the completed download. The returned file is owned by
+    /// the caller (`UpdateDownloader` moves it into the staging directory).
+    let download: @Sendable (_ url: URL, _ onProgress: @Sendable @escaping (DownloadProgress) -> Void) async throws -> URL
 
-    /// Foreground `URLSession` download to a temp file.
+    /// Foreground `URLSession` download to a temp file, reporting real byte-level
+    /// progress from `URLSessionDownloadDelegate`.
     ///
-    /// The async `download(from:)` writes to a URLSession-managed temporary
-    /// location that may be reclaimed once this closure returns, so we move it to
-    /// a temp file we own before handing it back. A background-configured session
-    /// (survives app suspension, resumable) can be slotted in here later without
-    /// touching `UpdateDownloader` — that lifecycle concern belongs to the app
-    /// layer (T2), not this leaf module.
+    /// Uses a dedicated delegate-backed session rather than the `download(from:)`
+    /// async convenience API because that API gives no access to
+    /// `didWriteData` callbacks — there is no other way to observe transfer
+    /// progress. A background-configured session (survives app suspension,
+    /// resumable) can be slotted in here later without touching
+    /// `UpdateDownloader` — that lifecycle concern belongs to the app layer (T2),
+    /// not this leaf module.
     static let live = AssetDownloader { url, onProgress in
-        let (tempURL, _) = try await URLSession.shared.download(from: url)
+        try await DownloadTaskRunner.run(url: url, onProgress: onProgress)
+    }
+}
+
+/// Runs a single `URLSessionDownloadTask` to completion, reporting coalesced
+/// byte-level progress via `onProgress`. The download moves to a temp file we
+/// own before returning, since the delegate-provided location is reclaimed by
+/// `URLSession` once `urlSession(_:downloadTask:didFinishDownloadingTo:)` returns.
+///
+/// Task cancellation (e.g. a newer version superseding this download) cancels
+/// the underlying `URLSessionDownloadTask` so the transfer actually stops
+/// rather than continuing to completion in the background.
+private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let onProgress: @Sendable (DownloadProgress) -> Void
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<URL, Error>?
+    private var coalescer = DownloadProgressCoalescer()
+
+    private init(onProgress: @escaping @Sendable (DownloadProgress) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    static func run(url: URL, onProgress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
+        let delegate = DownloadTaskRunner(onProgress: onProgress)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let task = session.downloadTask(with: url)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                delegate.lock.lock()
+                delegate.continuation = continuation
+                delegate.lock.unlock()
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func finish(_ result: Result<URL, Error>) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        switch result {
+        case .success(let url): pending?.resume(returning: url)
+        case .failure(let error): pending?.resume(throwing: error)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession, downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64
+    ) {
+        lock.lock()
+        let sample = coalescer.sample(
+            totalBytesWritten: totalBytesWritten, totalBytesExpectedToWrite: totalBytesExpectedToWrite)
+        lock.unlock()
+        guard let sample else { return }
+        onProgress(sample)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         let stable = FileManager.default.temporaryDirectory
             .appendingPathComponent("boss-update-\(UUID().uuidString).zip")
-        try? FileManager.default.removeItem(at: stable)
-        try FileManager.default.moveItem(at: tempURL, to: stable)
-        onProgress(1.0)
-        return stable
+        do {
+            try? FileManager.default.removeItem(at: stable)
+            try FileManager.default.moveItem(at: location, to: stable)
+            onProgress(.determinate(1.0))
+            finish(.success(stable))
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let error else { return }
+        finish(.failure(error))
     }
 }
 
@@ -304,7 +414,7 @@ actor UpdateDownloader {
     func download(
         _ update: AvailableUpdate,
         etag: String? = nil,
-        onProgress: @Sendable @escaping (Double) -> Void = { _ in }
+        onProgress: @Sendable @escaping (DownloadProgress) -> Void = { _ in }
     ) async -> DownloadOutcome {
         let version = update.version
         let versionStr = version.description
