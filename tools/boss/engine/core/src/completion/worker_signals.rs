@@ -194,9 +194,14 @@ impl WorkerCompletionHandler {
 
     /// Shared fallback-hit recorder every proposal-backed seam uses: bumps
     /// `counter` and logs a WARN carrying the seam name, the signal/marker
-    /// kind, and the marker line that triggered the legacy path. Each seam's
-    /// `record_*_fallback_hit` supplies only its own counter handle and kind
-    /// label (see [`Self::record_worker_signal_fallback_hit`] and
+    /// kind, and `detail` — a channel-neutral description of what triggered
+    /// the legacy path. For the marker-based seams (worker-signal,
+    /// deferred-scope) this is the marker line itself; for the follow-ups
+    /// seam, which has no single marker line, it names which legacy source
+    /// fired (`"reconcile_task_followups"` / `"attentions_followups_backstop"`
+    /// — see [`Self::record_followup_fallback_hit`]). Each seam's
+    /// `record_*_fallback_hit` supplies only its own counter handle, kind
+    /// label, and detail (see [`Self::record_worker_signal_fallback_hit`] and
     /// [`Self::record_deferred_scope_fallback_hit`]).
     pub(super) fn record_proposal_fallback_hit(
         &self,
@@ -204,7 +209,7 @@ impl WorkerCompletionHandler {
         counter: &'static crate::metrics::CounterHandle,
         seam: &str,
         kind: &str,
-        marker_line: &str,
+        detail: &str,
     ) {
         counter.inc(&self.metrics);
         tracing::warn!(
@@ -212,8 +217,8 @@ impl WorkerCompletionHandler {
             work_item_id = %execution.work_item_id,
             seam,
             kind,
-            marker_line,
-            "no worker_proposals row found for this execution/kind; legacy marker parser fired \
+            detail,
+            "no worker_proposals row found for this execution/kind; legacy detection path fired \
              instead of the proposal path",
         );
     }
@@ -495,6 +500,31 @@ impl WorkerCompletionHandler {
             );
         }
         true
+    }
+
+    /// Count one legacy-chain hit for the follow-ups seam and log a WARN.
+    /// Called once per genuinely new follow-up the legacy chain recorded
+    /// (i.e. once per member `crate::completion::pr_transition`'s followups
+    /// block actually inserted, not once per call — a `followup_task`
+    /// proposal already covering that member's `proposed_name` is filtered
+    /// out for free by [`crate::work::WorkDb::reconcile_attentions`]'s
+    /// content dedup before this is reached) — mirrors
+    /// [`Self::record_worker_signal_fallback_hit`] /
+    /// [`Self::record_deferred_scope_fallback_hit`]'s discipline of not
+    /// re-incrementing on every subsequent terminal Stop of the same
+    /// cumulative transcript. `source` names which legacy path fired
+    /// (`"reconcile_task_followups"` for the structured-output-artifact /
+    /// `FOLLOWUPS:` sentinel chain, or `"attentions_followups_backstop"` for
+    /// the LLM pass) since, unlike a single marker line, there is no one
+    /// line to log for a whole reconciled batch.
+    pub(super) fn record_followup_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str) {
+        self.record_proposal_fallback_hit(
+            execution,
+            &FOLLOWUP_FALLBACK_HIT,
+            "followup_proposals_seam",
+            "followup_task",
+            source,
+        );
     }
 
     /// Consume this execution's staged `proposal_channel_error` (if any —

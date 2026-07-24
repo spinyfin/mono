@@ -16,7 +16,12 @@
 //!   group. A `FOLLOWUPS:` sentinel + fenced JSON array in the transcript tail
 //!   is kept as a **transitional fallback** (covering remote workers, whose
 //!   artifact is written on the remote host, and any artifact-write failure)
-//!   and can be removed once the artifact path is proven.
+//!   and can be removed once the artifact path is proven. Both of these are
+//!   themselves demoted to a counted fallback ahead of a `followup_task`
+//!   worker-proposal row when `followup_proposals_seam` is on — see
+//!   [`reconcile_task_followups`]'s own doc and
+//!   `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`
+//!   (implementation task 10).
 //!
 //! Both paths are content-idempotent: re-detecting the same PR or
 //! re-emitting the same block never appends duplicate members (the dedup
@@ -321,6 +326,19 @@ fn parse_owner_repo_from_pr_url(pr_url: &str) -> Option<(String, String)> {
 /// never mask the surrounding PR transition, and the producing worker's
 /// terminal act is opening its PR, so re-prompting here is structurally
 /// wrong. All failures are logged and swallowed.
+///
+/// Design implementation task 10
+/// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md`): when
+/// `followup_proposals_seam` is on, the caller
+/// (`completion::pr_transition::finalize_pr_transition`) checks for an
+/// existing `followup_task` proposal on the execution *before* calling this
+/// function at all, and skips the call entirely when one exists —
+/// `boss propose followup-task` already upserted the member into the
+/// `followup` attention group synchronously at submission time
+/// (`crate::work::proposal_apply::stage_followup_task_in_transaction`), so
+/// this artifact/sentinel scrape only ever runs as a counted fallback now.
+/// This function itself is unaware of the flag; it always does the same
+/// artifact-then-sentinel read it always has.
 pub async fn reconcile_task_followups(
     work_db: &WorkDb,
     work_item_id: &str,

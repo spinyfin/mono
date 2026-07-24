@@ -154,6 +154,21 @@ crate::register_counter!(
     "detect_and_record_deferred_scope fell back to the legacy [deferred-scope] marker parser \
      because no worker_proposals row existed for the execution (deferred_scope_proposals_seam on).",
 );
+// Worker-proposal seam: fallback-hit counter for `reconcile_task_followups`'s
+// legacy structured-output-artifact / `FOLLOWUPS:` sentinel scrape and the
+// `attentions_followups_backstop` LLM pass (design implementation task 10),
+// incremented only when `followup_proposals_seam` is on and no
+// `worker_proposals` row of kind `followup_task` existed for the execution
+// — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*`/`DEFERRED_SCOPE_FALLBACK_HIT`
+// above. Same remote-worker caveat applies (see the comment on those
+// counters).
+crate::register_counter!(
+    FOLLOWUP_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.followup_task",
+    "reconcile_task_followups fell back to the legacy structured-output-artifact / FOLLOWUPS: \
+     sentinel scrape (or the attentions_followups_backstop LLM pass) because no worker_proposals \
+     row of kind followup_task existed for the execution (followup_proposals_seam on).",
+);
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
@@ -166,6 +181,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
+    registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row

@@ -18,7 +18,7 @@ use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{ExecutionKind, ExecutionStatus, WorkItemBinding};
 
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
-use super::worker_spawn::{ComposedWorkerSpawn, compose_worker_spawn};
+use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
@@ -287,6 +287,11 @@ impl ExecutionRunner for PaneSpawnRunner {
         // deferred-scope seam migration must move together.
         let deferred_scope_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("deferred_scope_proposals_seam");
+        // Mirrors `worker_signal_proposals_seam_enabled` above — see
+        // `followups_emission_block`'s doc for why both halves of the
+        // follow-ups seam migration must move together.
+        let followup_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("followup_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -297,12 +302,13 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            (
+            WorkerSpawnOpts {
                 editorial_enabled,
-                self.cfg.work.max_review_embed_diff_lines,
+                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
                 worker_signal_proposals_seam_enabled,
                 deferred_scope_proposals_seam_enabled,
-            ),
+                followup_proposals_seam_enabled,
+            },
         )
         .await?;
 

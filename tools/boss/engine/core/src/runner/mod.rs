@@ -33,7 +33,7 @@ pub use pane_spawn::PaneSpawnRunner;
 pub(crate) use pane_spawn::{install_boss_event_to_stable_bin, resolve_boss_event_binary};
 pub(crate) use prompt::bazel_prepush_gate_text;
 pub(crate) use work_item::{task_bound_pr_url, work_item_name, work_item_task_kind};
-pub(crate) use worker_spawn::{ComposedWorkerSpawn, compose_worker_spawn};
+pub(crate) use worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {

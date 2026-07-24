@@ -23,6 +23,23 @@ pub(crate) struct ComposedWorkerSpawn {
     pub spawn_config: SpawnConfig,
 }
 
+/// Editorial + worker-proposal-seam knobs [`compose_worker_spawn`] threads
+/// into prompt composition, bundled into one named struct (rather than
+/// positional bools) so call sites state what they are setting. Each
+/// `*_proposals_seam_enabled` field mirrors a feature flag of the same name
+/// gating one seam of the worker-proposal-API migration; see
+/// [`super::prompt::ExecutionPromptParams`]'s matching fields for what each
+/// one does to the rendered prompt. All fields default OFF, matching every
+/// flag's registry default.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WorkerSpawnOpts {
+    pub(crate) editorial_enabled: bool,
+    pub(crate) max_embed_diff_lines: u64,
+    pub(crate) worker_signal_proposals_seam_enabled: bool,
+    pub(crate) deferred_scope_proposals_seam_enabled: bool,
+    pub(crate) followup_proposals_seam_enabled: bool,
+}
+
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
 ///
 /// Calls `gh pr view <pr_url> --json baseRefOid,headRefOid,files` and returns
@@ -194,17 +211,19 @@ pub(crate) async fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
-    // (editorial_enabled, max_embed_diff_lines, worker_signal_proposals_seam_enabled,
-    // deferred_scope_proposals_seam_enabled) — bundled to keep the parameter count
-    // under clippy::too_many_arguments.
-    editorial_opts: (bool, u64, bool, bool),
+    // Bundled (rather than five positional bools) to keep the parameter
+    // count under clippy::too_many_arguments AND so call sites name what
+    // they set instead of relying on positional order — a transposed pair
+    // of seam flags here would compile silently and mis-gate a prompt.
+    editorial_opts: WorkerSpawnOpts,
 ) -> anyhow::Result<ComposedWorkerSpawn> {
-    let (
+    let WorkerSpawnOpts {
         editorial_enabled,
         max_embed_diff_lines,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
-    ) = editorial_opts;
+        followup_proposals_seam_enabled,
+    } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -578,6 +597,7 @@ pub(crate) async fn compose_worker_spawn(
                 .editorial_enabled(editorial_enabled)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                 .merge_order_preservation(&merge_order_preservation)
                 .build(),
         )
@@ -731,7 +751,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            WorkerSpawnOpts::default(),
         )
         .await
         .unwrap();
@@ -767,7 +787,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            WorkerSpawnOpts::default(),
         )
         .await
         .unwrap();
@@ -806,7 +826,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            WorkerSpawnOpts::default(),
         )
         .await
         .unwrap();
@@ -845,7 +865,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            WorkerSpawnOpts::default(),
         )
         .await
         .unwrap();
