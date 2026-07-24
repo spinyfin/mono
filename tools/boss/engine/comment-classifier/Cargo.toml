@@ -1,0 +1,13 @@
+[package]
+name = "boss-comment-classifier"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-claude-client = { path = "../../claude_client" }
+boss-engine-utils = { path = "../utils" }
+boss-protocol = { path = "../../protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
