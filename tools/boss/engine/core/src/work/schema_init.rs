@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -614,8 +614,12 @@ impl WorkDb {
         // label — this sibling column is where prose goes instead of
         // being crammed (and truncated) into the label.
         migrate_tasks_blocked_detail_column(conn)?;
+        // `automation_runs.first_attempted_at`: the first-attempt timestamp
+        // the scheduler's retry deadline is measured from, distinct from
+        // `started_at` which the retry upsert rewrites on every attempt.
+        migrate_automation_runs_first_attempted_at_column(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '27')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -706,7 +710,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "27");
+        assert_eq!(schema_version, "28");
 
         let boothby_passes_exists: bool = conn
             .query_row(

@@ -139,6 +139,16 @@ pub struct AutomationRun {
     pub scheduled_for: String,
 
     pub started_at: String,
+    /// UTC epoch seconds (as a string) of the *first* dispatch attempt
+    /// against this occurrence. Unlike `started_at` — rewritten by the
+    /// retry upsert on every attempt, so it reflects only the most recent
+    /// one — this is set once on insert and never rewritten, so the
+    /// scheduler's retry deadline can be measured from the true first
+    /// attempt rather than from the occurrence's scheduled time. `None` for
+    /// rows written before this column existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_attempted_at: Option<String>,
+
     /// Human-readable reason for `skipped` or failure detail for
     /// `failed_*` outcomes. `None` for `produced_task` /
     /// `suppressed_at_limit`.

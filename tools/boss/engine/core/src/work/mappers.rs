@@ -870,7 +870,8 @@ pub(crate) fn map_automation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::A
 
 /// Map a row from the canonical `automation_runs` SELECT column order:
 /// 0 id, 1 automation_id, 2 scheduled_for, 3 started_at, 4 finished_at,
-/// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail
+/// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail,
+/// 9 first_attempted_at
 pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protocol::AutomationRun> {
     Ok(boss_protocol::AutomationRun {
         id: row.get(0)?,
@@ -882,6 +883,7 @@ pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protoco
         outcome: row.get(6)?,
         produced_task_id: row.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()),
         detail: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+        first_attempted_at: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
         repeat_count: 1,
     })
 }

@@ -130,9 +130,14 @@ pub const AUTOMATION_RETRY_INTERVAL_SECS: i64 = 60;
 /// 20 — had its occurrence quietly relabelled and dropped while the run row
 /// still read `failed_will_retry`, promising a retry that would never come.
 ///
-/// The effective deadline is `max(catch_up_window, this)`, so an automation
-/// configured with a long custom catch-up window never gets a *shorter* retry
-/// budget than its own tolerance for lateness.
+/// The effective deadline is `max(catch_up_window, this)`, measured from the
+/// occurrence's *first* dispatch attempt (`automation_runs.first_attempted_at`)
+/// — not from the occurrence's scheduled time. Measuring from the scheduled
+/// time instead would let a late first attempt eat into the budget (worse,
+/// the longer the custom window, the less budget would be left), which is
+/// exactly backwards: an automation configured with a long custom catch-up
+/// window never gets a *shorter* retry budget than its own tolerance for
+/// lateness.
 pub const AUTOMATION_RETRY_HOLD_MAX_SECS: i64 = 3600;
 
 /// How soon to re-run a pass after a pass-level error (e.g. the due-automation
@@ -179,7 +184,8 @@ pub trait TriageDispatcher: Send + Sync {
     async fn dispatch_triage(&self, automation: &Automation, scheduled_for_epoch: i64) -> TriageDispatch;
 }
 
-/// Task-5 placeholder dispatcher, superseded in production by
+/// Non-dispatching fallback used when no real triage dispatcher is wired,
+/// superseded in production by
 /// [`crate::automation_triage::EngineTriageDispatcher`]. Every fire reports a
 /// transient failure, so the occurrence is *held* (recorded
 /// `failed_will_retry`, schedule not advanced) rather than silently dropped —
@@ -554,6 +560,21 @@ async fn evaluate_one(
         )?;
         pass.skipped_stale += 1;
         pass.note_advance(now, Some(advance_to));
+
+        // The collapse above may have walked `most_recent` straight past an
+        // earlier occurrence still held for retry (no pass ran between the
+        // hold and this one). That row's `automation_run_for_occurrence`
+        // lookup above was for the *new* `most_recent`, so it was never
+        // consulted and would otherwise be stranded at `failed_will_retry`
+        // forever. Finalise it honestly now that we know it will never be
+        // retried.
+        let stranded = work_db.finalize_stale_retry_holds_before(
+            &automation.id,
+            most_recent,
+            now,
+            &format!("occurrence was superseded by a later catch-up collapse to {most_recent}"),
+        )?;
+        pass.gave_up += stranded;
         return Ok(());
     }
 
@@ -573,8 +594,24 @@ async fn evaluate_one(
         }
 
         // 6. A held occurrence, mid-retry.
+        //
+        //    The deadline is measured from the *first* attempt, not from the
+        //    occurrence's scheduled time: `staleness` above already includes
+        //    however late that first attempt landed, so comparing it directly
+        //    against `retry_deadline` would silently eat into the retry
+        //    budget whenever the first attempt was itself late inside a long
+        //    custom catch-up window — the longer the window, the shorter the
+        //    budget, inverting the guarantee below. Measuring from
+        //    `first_attempted_at` keeps the retry budget exactly
+        //    `retry_deadline` regardless of how late the first attempt was.
+        let first_attempt = run
+            .first_attempted_at
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(most_recent);
+        let attempt_staleness = now - first_attempt;
         let retry_deadline = catch_up_window.max(AUTOMATION_RETRY_HOLD_MAX_SECS);
-        if staleness > retry_deadline {
+        if attempt_staleness > retry_deadline {
             let Some(advance_to) = following else {
                 tracing::warn!(
                     automation_id = %automation.id,
@@ -593,8 +630,8 @@ async fn evaluate_one(
                     .outcome(AUTOMATION_OUTCOME_FAILED_GAVE_UP)
                     .finished_at(now)
                     .detail(format!(
-                        "gave up after retrying for {staleness}s (> retry deadline {retry_deadline}s); \
-                         last failure: {}",
+                        "gave up after retrying for {attempt_staleness}s since the first attempt \
+                         (> retry deadline {retry_deadline}s); last failure: {}",
                         run.detail.as_deref().unwrap_or("unknown")
                     ))
                     .next_due_at(advance_to)
@@ -956,10 +993,12 @@ mod tests {
         db.initialize_automation_next_due_at(&automation.id, occ).unwrap();
 
         let dispatcher = FakeDispatcher::transient();
+        // First attempt at occ + 5 — the retry deadline is measured from
+        // *this*, not from `occ` itself.
         run_one_pass(&db, occ + 5, &dispatcher).await;
         let calls_after_first = dispatcher.call_count();
 
-        let pass = run_one_pass(&db, occ + AUTOMATION_RETRY_HOLD_MAX_SECS + 1, &dispatcher).await;
+        let pass = run_one_pass(&db, occ + 5 + AUTOMATION_RETRY_HOLD_MAX_SECS + 1, &dispatcher).await;
 
         assert_eq!(pass.gave_up, 1, "{pass:?}");
         assert_eq!(
@@ -1018,6 +1057,99 @@ mod tests {
         let pass = run_one_pass(&db, occ + AUTOMATION_RETRY_HOLD_MAX_SECS + 60, &dispatcher).await;
         assert_eq!(pass.gave_up, 0, "{pass:?}");
         assert_eq!(pass.held_transient, 1, "still retrying inside the custom window");
+    }
+
+    /// The retry deadline is measured from the *first* dispatch attempt, not
+    /// from the occurrence's scheduled time — even when that first attempt
+    /// itself lands very late inside a long custom catch-up window.
+    ///
+    /// Before this was fixed, `retry_deadline` was compared against
+    /// `now - most_recent` (staleness since the occurrence), so a first
+    /// attempt landing near the end of a long window left almost no retry
+    /// budget: with a 7200s window, a first attempt at `occ + 7100` would
+    /// have given up after just ~101s, inverting the documented guarantee
+    /// that a longer custom window never yields a *shorter* retry budget.
+    #[tokio::test]
+    async fn custom_catch_up_window_late_first_attempt_still_gets_the_full_retry_budget() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let long_window = 7200;
+        let automation = db
+            .create_automation(
+                CreateAutomationInput::builder()
+                    .product_id(product.clone())
+                    .name("long-window-late-first-attempt")
+                    .trigger(AutomationTrigger::Schedule {
+                        cron: "0 14 * * *".to_owned(),
+                        timezone: "UTC".to_owned(),
+                    })
+                    .standing_instruction("x")
+                    .catch_up_window_secs(long_window)
+                    .build(),
+            )
+            .unwrap();
+        let occ = utc_epoch(2026, 5, 28, 14, 0);
+        db.initialize_automation_next_due_at(&automation.id, occ).unwrap();
+
+        let dispatcher = FakeDispatcher::transient();
+        // First attempt lands at occ + 7100 — inside the window (so not
+        // "stale"), but only 100s before it elapses.
+        let first_attempt_at = occ + 7100;
+        let first = run_one_pass(&db, first_attempt_at, &dispatcher).await;
+        assert_eq!(first.held_transient, 1, "{first:?}");
+        assert_eq!(first.skipped_stale, 0, "still inside the catch-up window");
+
+        // Just past the *occurrence's* staleness deadline (occ + 7200), but
+        // only ~101s after the first attempt — well inside the retry budget
+        // when measured correctly.
+        let pass = run_one_pass(&db, first_attempt_at + 101, &dispatcher).await;
+        assert_eq!(
+            pass.gave_up, 0,
+            "a late first attempt must not shrink the retry budget: {pass:?}"
+        );
+        assert_eq!(pass.held_transient, 1, "still retrying: {pass:?}");
+
+        // The occurrence is only abandoned once the budget measured from the
+        // first attempt — not the occurrence — actually elapses.
+        let gave_up = run_one_pass(&db, first_attempt_at + long_window + 1, &dispatcher).await;
+        assert_eq!(gave_up.gave_up, 1, "{gave_up:?}");
+    }
+
+    /// A held retry that predates a catch-up collapse the scheduler walks
+    /// past is finalised as `failed_gave_up` rather than left stranded at
+    /// `failed_will_retry` with a NULL `finished_at` forever.
+    ///
+    /// Reproduces: hold an occurrence at T1, then skip straight to evaluating
+    /// T2 (as if no pass ran in between) once T2 is itself stale — the
+    /// catch-up collapse advances `most_recent` to T2 without ever
+    /// re-consulting the T1 row.
+    #[tokio::test]
+    async fn stranded_held_row_is_finalized_when_collapse_walks_past_it() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_daily_automation(&db, &product);
+        let t1 = utc_epoch(2026, 5, 28, 14, 0);
+        let t2 = utc_epoch(2026, 5, 29, 14, 0);
+        db.initialize_automation_next_due_at(&automation.id, t1).unwrap();
+
+        let dispatcher = FakeDispatcher::transient();
+        let held = run_one_pass(&db, t1 + 5, &dispatcher).await;
+        assert_eq!(held.held_transient, 1, "{held:?}");
+
+        // Jump straight to well past T2 with no pass in between — the
+        // catch-up collapse walks `most_recent` from T1 to T2 (both now
+        // stale) in one tick.
+        let pass = run_one_pass(&db, t2 + 20 * 60, &dispatcher).await;
+        assert_eq!(pass.skipped_stale, 1, "{pass:?}");
+        assert_eq!(pass.gave_up, 1, "the stranded T1 hold must be finalized: {pass:?}");
+
+        let runs = db.list_automation_runs(&automation.id).unwrap();
+        let t1_run = runs
+            .iter()
+            .find(|r| r.scheduled_for.parse::<i64>().unwrap() == t1)
+            .expect("T1 run must still exist");
+        assert_eq!(t1_run.outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
+        assert!(t1_run.finished_at.is_some(), "T1 must reach a terminal state");
     }
 
     /// A gated dispatch (the global pause) writes no run row, advances nothing,

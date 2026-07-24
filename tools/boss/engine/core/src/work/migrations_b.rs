@@ -2184,3 +2184,24 @@ pub(crate) fn migrate_worker_proposals_table(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Add `automation_runs.first_attempted_at`: the epoch (UTC seconds, as a
+/// string) of the *first* dispatch attempt against this occurrence, set once
+/// on insert and never rewritten by the retry upsert (unlike `started_at`,
+/// which the upsert rewrites on every attempt so it reflects the most recent
+/// one). `NULL` for every row written before this column existed.
+///
+/// Exists because the scheduler's retry deadline was being measured from the
+/// occurrence's scheduled time rather than from the first attempt against it:
+/// a long custom `catch_up_window_secs` could then produce a *shorter* retry
+/// budget than the documented guarantee, since a first attempt landing late
+/// inside that window left almost no time before the collapsed deadline hit.
+/// Measuring from `first_attempted_at` instead makes the retry budget exactly
+/// the advertised `max(catch_up_window, AUTOMATION_RETRY_HOLD_MAX_SECS)`,
+/// regardless of how late the first attempt happened to land.
+pub(crate) fn migrate_automation_runs_first_attempted_at_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "automation_runs", "first_attempted_at")? {
+        conn.execute("ALTER TABLE automation_runs ADD COLUMN first_attempted_at TEXT", [])?;
+    }
+    Ok(())
+}

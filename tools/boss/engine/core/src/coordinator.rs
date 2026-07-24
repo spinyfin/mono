@@ -264,8 +264,21 @@ const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Backoff delays between successive pre-start retry attempts. Element N
 /// is the sleep before attempt N+2 (the first retry, the second retry, …).
-/// Three entries → up to 3 retries (4 total attempts) before a pre-start
-/// failure surfaces to the operator.
+/// Three entries → up to 3 retries (4 total attempts), ~65s total budget,
+/// before a pre-start failure surfaces to the operator.
+///
+/// This is a genuinely different seam from
+/// [`crate::automation_scheduler::AUTOMATION_RETRY_HOLD_MAX_SECS`] (~3600s
+/// budget), not a duplicate: this one is keyed on
+/// `work_executions.pre_start_failure_count` / `dispatch_not_before` and
+/// requires an execution row to already exist, whereas the scheduler's
+/// budget covers the case where `dispatch_triage` itself couldn't create
+/// one. The ~55x difference is deliberate — a blocker discovered before an
+/// execution row exists (e.g. cube lease/git-remote failures ahead of the
+/// automation firing at all) gets the much longer scheduler-side budget
+/// because there is nothing else watching that occurrence in the meantime,
+/// while a failure after the row exists gets this shorter budget since a
+/// human already has a concrete execution to look at.
 const PRE_START_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(45)];
 
