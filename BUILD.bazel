@@ -4,3 +4,14 @@ exports_files([
     "Cargo.lock",
     "Cargo.toml",
 ])
+
+# Exported narrowly so `engine/core`'s self-test can embed the root
+# `CHECKS.yaml` via `compile_data`, to assert the `boss-ism/pr-text-leakage`
+# check's boss-work-item-id pattern stays in sync with `BOSS_ID_RE` — see
+# `boss_construct_scan.rs`. The check lives in the root CHECKS.yaml (not
+# `tools/boss/CHECKS.yaml`) because `scope: changeset` is only honoured
+# there.
+exports_files(
+    ["CHECKS.yaml"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)

@@ -155,10 +155,118 @@ pub fn hit_lines(hits: &[BossConstructHit]) -> Vec<String> {
 // prompt that interpolates it); the deterministic scan that produces the
 // hit lines stays here. See `boss_pr_review::render_boss_construct_sweep_block`.
 
+/// Pull the `pattern` value out of the named entry (e.g. `boss-work-item-id`)
+/// in the root `CHECKS.yaml`'s `boss-ism/pr-text-leakage` check, without
+/// pulling in a YAML parser dependency for one field. Handles both the
+/// single-quoted scalar form (no escape processing beyond `''`, used by
+/// `boss-work-item-id`) and the double-quoted form with `\\`/`\"` escapes
+/// (used by the other patterns), returning the literal regex source in
+/// either case.
+#[cfg(test)]
+fn extract_pattern_from_checks_yaml_by_name(yaml: &str, name: &str) -> String {
+    let anchor = format!("name: {name}");
+    let anchor_pos = yaml
+        .find(&anchor)
+        .unwrap_or_else(|| panic!("root CHECKS.yaml must contain a `{name}` pattern entry"));
+    let after_anchor = &yaml[anchor_pos..];
+    let pattern_key_pos = after_anchor
+        .find("pattern:")
+        .unwrap_or_else(|| panic!("`{name}` entry in root CHECKS.yaml must have a `pattern` field"));
+    let after_key = after_anchor[pattern_key_pos + "pattern:".len()..].trim_start();
+    let quote = after_key
+        .chars()
+        .next()
+        .unwrap_or_else(|| panic!("`{name}` pattern value is empty"));
+    assert!(
+        quote == '\'' || quote == '"',
+        "`{name}` pattern value must be a quoted YAML scalar, got: {after_key}"
+    );
+    let value = &after_key[1..];
+    let closing_quote = value
+        .find(quote)
+        .unwrap_or_else(|| panic!("`{name}` pattern value must be closed by a matching quote"));
+    let raw = &value[..closing_quote];
+    if quote == '\'' {
+        raw.to_string()
+    } else {
+        raw.replace("\\\\", "\\").replace("\\\"", "\"")
+    }
+}
+
+#[cfg(test)]
+fn extract_boss_work_item_id_pattern_from_checks_yaml(yaml: &str) -> String {
+    extract_pattern_from_checks_yaml_by_name(yaml, "boss-work-item-id")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use boss_pr_review::render_boss_construct_sweep_block;
+
+    /// Byte-identity self-test: the root `CHECKS.yaml` configures the
+    /// `boss-ism/pr-text-leakage` checkleft check with a `boss-work-item-id`
+    /// pattern that is meant to be exactly `BOSS_ID_RE`'s source, so that
+    /// checkleft's deterministic PR-text scan and this engine's deterministic
+    /// diff/narrative scan never drift apart on what counts as a bare Boss
+    /// work-item id. If someone edits one without the other, this fails.
+    #[test]
+    fn boss_ism_checks_yaml_id_pattern_matches_boss_id_re_source() {
+        let checks_yaml = include_str!(env!("BOSS_CHECKS_YAML"));
+        let configured_pattern = extract_boss_work_item_id_pattern_from_checks_yaml(checks_yaml);
+        assert_eq!(
+            configured_pattern,
+            BOSS_ID_RE.as_str(),
+            "root CHECKS.yaml's `boss-work-item-id` pattern must stay byte-identical to BOSS_ID_RE's source"
+        );
+    }
+
+    /// Every `boss-ism/pr-text-leakage` pattern in the root `CHECKS.yaml`
+    /// must compile as a regex, and must actually match/not-match the
+    /// leakage phrase it targets. `compile_patterns` in checkleft's
+    /// `text/forbidden-pattern` check bails out on the *first* invalid
+    /// regex in the list and disables the whole check silently (a single
+    /// finding, no scan) — a typo in any one YAML-escaped pattern here would
+    /// otherwise go unnoticed until a PR happened to schedule the check.
+    #[test]
+    fn boss_ism_checks_yaml_patterns_all_compile_and_match_as_expected() {
+        let checks_yaml = include_str!(env!("BOSS_CHECKS_YAML"));
+        let cases: &[(&str, &str, &str)] = &[
+            ("boss-work-item-id", "see T339 for context", "T5Config is unrelated"),
+            (
+                "boss-operator-reference",
+                "the operator asked for this",
+                "operator precedence rules",
+            ),
+            (
+                "boss-brief-reference",
+                "per the brief this changes X",
+                "briefly summarized below",
+            ),
+            (
+                "boss-chore-reference",
+                "this chore updates the config",
+                "the household chore list",
+            ),
+            (
+                "boss-revision-cycle-reference",
+                "another revision cycle happened",
+                "revision history is preserved",
+            ),
+        ];
+        for (name, should_match, should_not_match) in cases {
+            let pattern = extract_pattern_from_checks_yaml_by_name(checks_yaml, name);
+            let re = Regex::new(&pattern)
+                .unwrap_or_else(|err| panic!("`{name}` pattern `{pattern}` must compile as a regex: {err}"));
+            assert!(
+                re.is_match(should_match),
+                "`{name}` pattern `{pattern}` must match {should_match:?}"
+            );
+            assert!(
+                !re.is_match(should_not_match),
+                "`{name}` pattern `{pattern}` must not match {should_not_match:?}"
+            );
+        }
+    }
 
     #[test]
     fn scans_added_diff_lines_and_resolves_file_line() {

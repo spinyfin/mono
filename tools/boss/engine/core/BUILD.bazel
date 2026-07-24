@@ -19,6 +19,9 @@ rust_library(
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
         "//tools/boss/installer:build_info_rs",
+        # Read by boss_construct_scan.rs's self-test to assert the CHECKS.yaml
+        # boss-ism pattern stays byte-identical to BOSS_ID_RE.
+        "//:CHECKS.yaml",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
@@ -29,6 +32,12 @@ rust_library(
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
         # them to absolute filesystem paths before invoking rustc.
         "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
+        # Absolute path to the root CHECKS.yaml, read by
+        # boss_construct_scan.rs's self-test via include_str!(env!(...)). A
+        # plain relative include_str! can't cross this package boundary: the
+        # source file's compile-time path is rooted under bazel-out, not the
+        # real source tree, so `../../../CHECKS.yaml` doesn't resolve there.
+        "BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)",
     },
     visibility = [
         "//tools/boss/bossctl:__pkg__",

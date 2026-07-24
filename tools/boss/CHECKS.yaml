@@ -20,7 +20,7 @@ checks:
         - cli/src/main.rs
       # Grandfathered struct violations, scanned-but-exempt. The file is still parsed, so a
       # NEW giant struct added alongside any of these is flagged (this is how the
-      # `CreateAttentionInput` miss — see T819 — is now caught). TODO: convert each to
+      # `CreateAttentionInput` miss — see T<n> — is now caught). TODO: convert each to
       # `#[derive(bon::Builder)]` and delete its entry.
       #
       # Entry forms:
@@ -31,7 +31,7 @@ checks:
       #                                    (tools/boss/). Exempts that struct only in that exact
       #                                    file, so a same-named struct in another file is still
       #                                    flagged. This is the form used by entries migrated off
-      #                                    `exclude_globs` (T828/T829): it exempts exactly the
+      #                                    `exclude_globs` (T<n>/T<n>): it exempts exactly the
       #                                    known-existing violation and nothing more.
       exclude_structs:
         # Migrated off exclude_globs (qualified per-file form). Each line is the exact giant
