@@ -747,6 +747,113 @@ mod tests {
     }
 
     #[test]
+    fn seed_counter_overwrites_value_and_timestamp_when_registered() {
+        // Rehydration seeds a registered counter with the persisted
+        // total + timestamp so a restart doesn't lose accumulated
+        // history. It reports success and the values are observable
+        // through the snapshot.
+        let registry = Registry::new();
+        registry.register_counter(&TEST_COUNTER_A);
+        TEST_COUNTER_A.inc_by(&registry, 3);
+
+        let seeded = registry.seed_counter("test.counter_a", 500, 123_456);
+        assert!(seeded, "seeding a registered counter returns true");
+
+        let snap = registry.counter_snapshot_one("test.counter_a").unwrap();
+        assert_eq!(snap.value, 500, "seed overwrites the live value");
+        assert_eq!(snap.updated_at_ms, 123_456, "seed overwrites the timestamp");
+        assert!(!snap.stale, "a seeded registered counter is not stale");
+    }
+
+    #[test]
+    fn seed_counter_is_noop_and_returns_false_when_absent() {
+        let registry = Registry::new();
+        let seeded = registry.seed_counter("test.counter_a", 42, 999);
+        assert!(!seeded, "seeding an unregistered counter returns false");
+        assert!(
+            registry.counter_snapshot_one("test.counter_a").is_none(),
+            "seeding an absent name must not create the counter",
+        );
+    }
+
+    #[test]
+    fn seed_gauge_overwrites_value_and_timestamp_when_registered() {
+        let registry = Registry::new();
+        registry.register_gauge(&TEST_GAUGE_A);
+        TEST_GAUGE_A.set(&registry, 7);
+
+        let seeded = registry.seed_gauge("test.gauge_a", -250, 654_321);
+        assert!(seeded, "seeding a registered gauge returns true");
+
+        let snap = registry.gauge_snapshot_one("test.gauge_a").unwrap();
+        assert_eq!(snap.value, -250, "seed overwrites the live value");
+        assert_eq!(snap.observed_at_ms, 654_321, "seed overwrites the timestamp");
+        assert!(!snap.stale, "a seeded registered gauge is not stale");
+    }
+
+    #[test]
+    fn seed_gauge_is_noop_and_returns_false_when_absent() {
+        let registry = Registry::new();
+        let seeded = registry.seed_gauge("test.gauge_a", 42, 999);
+        assert!(!seeded, "seeding an unregistered gauge returns false");
+        assert!(
+            registry.gauge_snapshot_one("test.gauge_a").is_none(),
+            "seeding an absent name must not create the gauge",
+        );
+    }
+
+    #[test]
+    fn insert_stale_gauge_surfaces_in_snapshots() {
+        // Mirrors `stale_row_is_adopted_on_registration`'s counter
+        // coverage: a rehydrated row with no live handle shows up in
+        // both the aggregate and single-name snapshots, flagged stale.
+        let registry = Registry::new();
+        registry.insert_stale_gauge("test.gauge_a", "legacy gauge description", -13, 200);
+
+        let snaps = registry.gauge_snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].name, "test.gauge_a");
+        assert_eq!(snaps[0].value, -13);
+        assert_eq!(snaps[0].observed_at_ms, 200);
+        assert_eq!(snaps[0].description, "legacy gauge description");
+        assert!(snaps[0].stale, "an inserted stale gauge is flagged stale");
+
+        let one = registry.gauge_snapshot_one("test.gauge_a").unwrap();
+        assert_eq!(one.value, -13);
+        assert!(one.stale);
+    }
+
+    #[test]
+    fn stale_gauge_row_is_adopted_on_registration() {
+        // Parallel to the counter `stale_row_is_adopted_on_registration`:
+        // registering a handle over a stale gauge keeps the persisted
+        // value + timestamp, adopts the binary's description, and
+        // clears the stale flag.
+        let registry = Registry::new();
+        registry.insert_stale_gauge("test.gauge_a", "legacy gauge description", 88, 300);
+        let snap_before = registry.gauge_snapshot_one("test.gauge_a").unwrap();
+        assert!(snap_before.stale);
+        assert_eq!(snap_before.description, "legacy gauge description");
+
+        registry.register_gauge(&TEST_GAUGE_A);
+        let snap_after = registry.gauge_snapshot_one("test.gauge_a").unwrap();
+        assert!(!snap_after.stale, "adopted gauge row should clear stale flag");
+        assert_eq!(snap_after.value, 88, "adopted gauge row must preserve value");
+        assert_eq!(
+            snap_after.observed_at_ms, 300,
+            "adopted gauge row must preserve timestamp"
+        );
+        assert_eq!(
+            snap_after.description, "Phase 1 unit-test gauge A.",
+            "adopted gauge row should pick up the current binary's description",
+        );
+
+        // An adopted (no-longer-stale) gauge is writable again.
+        TEST_GAUGE_A.set(&registry, 5);
+        assert_eq!(registry.gauge_value("test.gauge_a"), Some(5));
+    }
+
+    #[test]
     fn reset_all_zeros_every_counter_and_gauge() {
         let registry = Registry::new();
         registry.register_counter(&TEST_COUNTER_A);
