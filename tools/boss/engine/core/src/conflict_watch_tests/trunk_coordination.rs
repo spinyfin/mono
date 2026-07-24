@@ -127,6 +127,58 @@ async fn conflict_detection_that_declines_ownership_does_not_strand_the_trunk_in
     );
 }
 
+/// Regression guard for the second, narrower "manually moved" path: the
+/// parent was flipped away from `in_review` directly to a terminal status
+/// (not `blocked: merge_conflict`) by a human, so `mark_chore_blocked_merge_conflict`'s
+/// `status = 'in_review'` WHERE guard misses AND `rearm_blocked_merge_conflict_signal`
+/// finds `is_blocked == false` — the "row not blocked:merge_conflict
+/// (manually moved); skipping" branch. `on_conflict_detected` declines
+/// ownership here too (no `conflict_resolutions` row is created), so the
+/// Trunk intent's sentinel must NOT be set — the same failure mode covered
+/// above for the foreign-bucket-owned path, but reached below the
+/// `mark_chore_blocked_merge_conflict` match instead of above it.
+#[tokio::test]
+async fn conflict_detection_on_a_manually_moved_row_does_not_strand_the_trunk_intent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/9005";
+    let (product, chore) = make_in_review(&db, "C-trunk-manually-moved", pr);
+    seed_trunk_intent(&db, &chore, pr, 9005);
+    db.update_work_item(
+        &chore,
+        WorkItemPatch {
+            status: Some("done".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let took_over = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(
+        !took_over,
+        "conflict_watch must not flip a row a human already moved away from in_review"
+    );
+    assert!(
+        db.active_conflict_resolution_for_work_item(&chore).unwrap().is_none(),
+        "no conflict-resolution attempt should have been created"
+    );
+
+    let intent = db.get_active_trunk_merge_intent(&chore).unwrap().expect("still active");
+    assert_eq!(
+        intent.last_trunk_state, None,
+        "a slot conflict_watch never took ownership of must not carry the superseded sentinel",
+    );
+}
+
 #[tokio::test]
 async fn conflict_resolution_clears_a_superseded_intent_for_resubmit() {
     let dir = tempdir().unwrap();
