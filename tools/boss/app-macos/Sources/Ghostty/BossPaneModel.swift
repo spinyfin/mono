@@ -62,7 +62,7 @@ final class BossPaneModel: ObservableObject {
         // Claude Code shows "Auth conflict: Using ANTHROPIC_API_KEY
         // instead of Anthropic Console key."
         // --permission-mode auto is required so the coordinator session
-        // runs unattended (same policy as worker spawns from T465).
+        // runs unattended, matching the policy used for worker spawns.
         logger.info("Boss-session claude invocation: \(invocation, privacy: .public)")
         let env = Self.bossSessionEnv()
         let launchSpec = TerminalLaunchSpec(
@@ -274,14 +274,14 @@ func writeBossSettingsLocalJson(to path: URL) {
 
     var permissions = root["permissions"] as? [String: Any] ?? [:]
     permissions["allow"] = mergedRules(
-        existing: permissions["allow"] as? [String],
+        existing: existingStringArray(permissions["allow"], field: "permissions.allow"),
         required: bossBaselinePermissionsAllow
     )
     root["permissions"] = permissions
 
     var autoMode = root["autoMode"] as? [String: Any] ?? [:]
     autoMode["allow"] = mergedRules(
-        existing: autoMode["allow"] as? [String],
+        existing: existingStringArray(autoMode["allow"], field: "autoMode.allow"),
         // $defaults is force-included even if an existing autoMode.allow omits it,
         // so the built-in classifier rules are always inherited on top of these
         // extra entries rather than replaced by them.
@@ -306,6 +306,18 @@ private enum ExistingSettingsJson {
     case absent
     case malformed
     case parsed([String: Any])
+}
+
+/// Extracts an existing `[String]` allow-array value, logging (rather than silently
+/// dropping) any present-but-wrong-shape value so the loss is visible instead of a
+/// silent clobber by the required rules in `mergedRules`.
+func existingStringArray(_ value: Any?, field: String) -> [String]? {
+    guard let value else { return nil }
+    guard let strings = value as? [String] else {
+        logger.error("Boss session settings.local.json has \(field, privacy: .public) with an unexpected shape; existing entries were not preserved")
+        return nil
+    }
+    return strings
 }
 
 private func existingJsonObject(at path: URL) -> ExistingSettingsJson {

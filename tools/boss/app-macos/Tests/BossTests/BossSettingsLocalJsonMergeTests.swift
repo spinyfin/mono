@@ -92,4 +92,28 @@ final class BossSettingsLocalJsonMergeTests: XCTestCase {
         let merged = mergedRules(existing: ["z-first", "a-second"], required: ["a-second", "new-rule"])
         XCTAssertEqual(merged, ["z-first", "a-second", "new-rule"])
     }
+
+    func testWrongShapedExistingAllowArrayFallsBackToRequiredRulesOnly() throws {
+        try withScratchSettingsPath { path in
+            let handWritten: [String: Any] = [
+                "permissions": ["allow": ["Bash(my-hand-added-rule *)", 1]],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: handWritten, options: [.sortedKeys])
+            try data.write(to: path)
+
+            writeBossSettingsLocalJson(to: path)
+
+            let root = readJson(at: path)
+            let permissionsAllow = (root["permissions"] as? [String: Any])?["allow"] as? [String] ?? []
+            XCTAssertFalse(permissionsAllow.contains("Bash(my-hand-added-rule *)"))
+            XCTAssertTrue(permissionsAllow.contains("Bash(boss *)"))
+        }
+    }
+
+    func testExistingStringArrayReturnsNilAndLogsForWrongShape() {
+        XCTAssertNil(existingStringArray(nil, field: "test.field"))
+        XCTAssertEqual(existingStringArray(["a", "b"], field: "test.field"), ["a", "b"])
+        XCTAssertNil(existingStringArray(["a", 1], field: "test.field"))
+        XCTAssertNil(existingStringArray("not-an-array", field: "test.field"))
+    }
 }
