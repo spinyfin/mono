@@ -1029,7 +1029,18 @@ struct ContentView: View {
         let frontierIDs = model.depFrontierHighlightIDs
         let revisionIDs = model.revisionHighlightIDs
         let selectedRevisionParentID = model.selectedRevisionParentID
-        VStack(alignment: .leading, spacing: 10) {
+        // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
+        // the default (ungrouped) board layout each column is a single section,
+        // so this was the actual eagerly-built list of every card in the
+        // column regardless of scroll position. Combined with the whole-model
+        // `@Published` invalidation that hover badges trigger (any card's
+        // `onDepBadgeHover`/`onRevisionBadgeHover` re-renders every card in
+        // every column), a plain `VStack` here meant hovering one badge while
+        // scrolling re-evaluated and re-hit-tested every card on the board,
+        // not just the visible ones. `LazyVStack` + `ScrollViewReader` +
+        // `.id(task.id)` below is the supported combo for reveal-scroll, so
+        // this doesn't change that behavior.
+        LazyVStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
                 let isRevealed = highlightID == task.id

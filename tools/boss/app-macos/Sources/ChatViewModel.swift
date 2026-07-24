@@ -2138,6 +2138,19 @@ final class ChatViewModel: ObservableObject {
     /// full graph walk per event.
     var cachedDependencyPrereqs: [String: [WorkDependencyRow]]?
     var cachedGatingPrereqs: [String: [WorkDependencyRow]]?
+    /// Backing storage for `inReviewRevisions(forParentTaskID:)` /
+    /// `doneRevisions(forParentTaskID:)` (ChatViewModel+BoardHelpers). `nil`
+    /// means "invalidated — rebuild on next read". Before this cache
+    /// existed, both accessors re-scanned every project's tasks and every
+    /// product's revisions on EVERY call, and the kanban calls both once
+    /// per visible card on every render. Hover-highlight state
+    /// (`revisionHighlightIDs` et al) lives on this `@Published` view model,
+    /// so a single badge hover during a scroll re-renders the whole board
+    /// and re-ran that O(total tasks) scan per card — a measured
+    /// main-thread hot leaf during hover-while-scroll jank. Rebuilt lazily,
+    /// same pattern as `cachedGatingPrereqs`.
+    var cachedInReviewRevisionsByParentID: [String: [WorkTask]]?
+    var cachedDoneRevisionsByParentID: [String: [WorkTask]]?
 
     func invalidateWorkCache() {
         cachedVisibleItems = nil
@@ -2147,6 +2160,8 @@ final class ChatViewModel: ObservableObject {
         taskIndexByID = nil
         cachedDependencyPrereqs = nil
         cachedGatingPrereqs = nil
+        cachedInReviewRevisionsByParentID = nil
+        cachedDoneRevisionsByParentID = nil
     }
 
     /// Inline drag-refusal banner shown next to the source card when a
