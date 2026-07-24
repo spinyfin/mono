@@ -15,7 +15,7 @@
 //! marker protocol: a worker that deliberately delivers less than the brief
 //! asks emits one `[deferred-scope]` line per deferred item on its Stop
 //! boundary (see
-//! [`crate::runner::deferred_scope_directive`] for the prompt text taught to
+//! [`crate::runner::prompt::deferred_scope_directive`] for the prompt text taught to
 //! workers). [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
 //! detects it at the same Stop-boundary surface `[effort-escalation]`/
 //! `[blocked]` travel on, appends a durable audit line to the work item's

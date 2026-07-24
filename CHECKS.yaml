@@ -40,7 +40,6 @@ checks:
         - "**/*.pb.rs"
         # Files currently over the 3000-line limit — TODO: split each below 3000
         - tools/boss/engine/core/src/coordinator.rs
-        - tools/boss/engine/core/src/runner.rs
         - tools/cube/src/app.rs
         - tools/boss/app-macos/Sources/ContentView.swift
     policy:
