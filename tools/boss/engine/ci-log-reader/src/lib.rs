@@ -273,17 +273,33 @@ impl CiLogReader for UnparseableCoordinatesReader {
 /// misleading "unknown provider" error. Other providers ignore
 /// `target_url`; callers that don't have one may pass `""`.
 pub fn reader_for(provider: CiProvider, target_url: &str) -> Box<dyn CiLogReader> {
+    reader_for_with_binaries(provider, target_url, "bk", "gh")
+}
+
+/// Same dispatch as [`reader_for`], but with the `bk`/`gh` binary paths
+/// overridable. Lets tests point the constructed reader at a fake script
+/// instead of the real CLI, so assertions about *which reader type got
+/// built and with what coordinates* don't depend on whether `bk`/`gh`
+/// happen to be installed or authenticated on the host running the test.
+fn reader_for_with_binaries(
+    provider: CiProvider,
+    target_url: &str,
+    bk_binary: &str,
+    gh_binary: &str,
+) -> Box<dyn CiLogReader> {
     match provider {
         CiProvider::Buildkite => match (
             parse_buildkite_pipeline_slug(target_url),
             parse_buildkite_build_id(target_url),
         ) {
-            (Some(pipeline_slug), Some(build_number)) => Box::new(BuildkiteLogReader::new(pipeline_slug, build_number)),
+            (Some(pipeline_slug), Some(build_number)) => {
+                Box::new(BuildkiteLogReader::with_binary(bk_binary, pipeline_slug, build_number))
+            }
             _ => Box::new(UnparseableCoordinatesReader::new(format!(
                 "could not parse pipeline slug and build number from target_url {target_url:?}"
             ))),
         },
-        CiProvider::GithubActions => Box::new(GithubActionsLogReader::new()),
+        CiProvider::GithubActions => Box::new(GithubActionsLogReader::with_binary(gh_binary)),
         CiProvider::Other => Box::new(UnknownProviderReader),
     }
 }
@@ -900,36 +916,78 @@ exit 2
 
     #[tokio::test]
     async fn reader_for_buildkite_with_canonical_url_builds_working_reader() {
-        let r = reader_for(
+        // Confirms the canonical URL resolves to a real `BuildkiteLogReader`
+        // wired with the right coordinates (not the `UnparseableCoordinatesReader`
+        // fallback) by routing through a fake `bk` binary and inspecting the
+        // coordinates it actually received. This must not shell out to the
+        // real `bk` CLI: whether that spawn succeeds, fails to spawn, or
+        // fails with an auth/config error depends entirely on host state
+        // (installed vs. absent, configured vs. not), none of which this
+        // test is about.
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("bk");
+        let script = r#"#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "log" ]; then
+    echo "coordinates: pipeline=$4 build=$6 job=$7"
+    exit 0
+fi
+echo "unhandled args: $@" 1>&2
+exit 2
+"#;
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let r = reader_for_with_binaries(
             CiProvider::Buildkite,
             "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
+            script_path.to_str().unwrap(),
+            "gh",
         );
-        // Confirms the canonical URL actually resolves to a `BuildkiteLogReader`
-        // wired with the right coordinates, not just "doesn't error here" —
-        // an unset binary would fail to spawn, proving the coordinates parsed.
-        let err = r.read_log_full("j").await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("failed to spawn"),
-            "expected a real BuildkiteLogReader (spawn `bk`), got: {err:#}"
-        );
+        let log = r
+            .read_log_full("j")
+            .await
+            .expect("expected a real BuildkiteLogReader to spawn the fake `bk` successfully");
+        assert_eq!(log.trim(), "coordinates: pipeline=mypipeline build=1329 job=j");
     }
 
     #[tokio::test]
     async fn reader_for_github_actions_ignores_target_url() {
-        let r = reader_for(CiProvider::GithubActions, "not a url at all");
         // GithubActionsLogReader doesn't need target_url; confirm dispatch
         // still builds a working (non-fallback) reader regardless of its
-        // shape. We can't assert *how* the real `gh` invocation fails —
-        // that depends on whether the test host has `gh` installed and
-        // authenticated (spawn failure vs. an auth error) — so instead we
-        // assert the error carries the real command's args, which only a
-        // genuine `GithubActionsLogReader` attempt produces; the
-        // `UnknownProviderReader` fallback's message never mentions them.
-        let err = r.read_log_full("j").await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("run view --log-failed --job j"),
-            "expected a real GithubActionsLogReader (spawn `gh`), got: {err:#}"
+        // shape. Routed through a fake `gh` binary (rather than the real
+        // CLI) so the assertion doesn't depend on whether the test host has
+        // `gh` installed/authenticated, and instead directly checks the
+        // constructed reader actually invokes `gh` with the expected args —
+        // the `UnknownProviderReader` fallback would never spawn anything.
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("gh");
+        let script = "#!/bin/sh\necho \"invoked: $@\"\nexit 0\n";
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let r = reader_for_with_binaries(
+            CiProvider::GithubActions,
+            "not a url at all",
+            "bk",
+            script_path.to_str().unwrap(),
         );
+        let log = r
+            .read_log_full("j")
+            .await
+            .expect("expected a real GithubActionsLogReader to spawn the fake `gh` successfully");
+        assert_eq!(log.trim(), "invoked: run view --log-failed --job j");
     }
 
     // ---------- integration: fake bk / fake gh ------------------------------
