@@ -203,14 +203,34 @@ mod tests {
         f.into_temp_path()
     }
 
+    /// Resolve, retrying if the kernel transiently reports ETXTBSY.
+    ///
+    /// Even after the write fd is closed (see `make_fake_gh`), Linux can briefly
+    /// refuse to exec a just-written file with "Text file busy" under heavy parallel
+    /// test load (e.g. sandboxed CI runners) before the kernel fully releases it.
+    /// Retrying a few times rides out that window without weakening the assertion:
+    /// the resolve is still required to succeed, just not necessarily on the first try.
+    async fn resolve_retrying_etxtbsy(
+        resolver: &(impl TrackerCredentialResolver + ?Sized),
+    ) -> Result<TrackerCredential, TrackerCredentialError> {
+        for attempt in 0..5 {
+            match resolver.resolve("github", &serde_json::Value::Null).await {
+                Err(TrackerCredentialError::AuthFailed { detail, .. })
+                    if attempt < 4 && detail.contains("Text file busy") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("loop always returns by the last attempt")
+    }
+
     #[tokio::test]
     async fn resolves_ambient_credential_when_gh_auth_succeeds() {
         let fake = make_fake_gh("exit 0");
         let resolver = GhAuthStatusResolver::with_gh_binary(&*fake);
-        let cred = resolver
-            .resolve("github", &serde_json::Value::Null)
-            .await
-            .expect("should succeed");
+        let cred = resolve_retrying_etxtbsy(&resolver).await.expect("should succeed");
         assert_eq!(cred.token, "");
     }
 
@@ -280,10 +300,7 @@ mod tests {
         let store = KeychainTokenStore::with_backend(FakeStore::empty());
         let fallback = GhAuthStatusResolver::with_gh_binary(&*fake_gh);
         let resolver = KeychainOAuthResolver::with_fallback(store, fallback);
-        let cred = resolver
-            .resolve("github", &serde_json::Value::Null)
-            .await
-            .expect("should succeed");
+        let cred = resolve_retrying_etxtbsy(&resolver).await.expect("should succeed");
         assert_eq!(cred.token, ""); // ambient credential
     }
 
