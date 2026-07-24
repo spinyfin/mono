@@ -16555,7 +16555,7 @@ steps:
         assert_eq!(result.payload["branch"], branch);
     }
 
-    // Regression coverage for T2840: `jj git push` refuses a commit with no
+    // Regression coverage: `jj git push` refuses a commit with no
     // description. `@` reaches `cube workspace push` undescribed when the
     // conflict-ladder's rung-0 deterministic resolvers edited files directly
     // without ever calling `jj describe` — see `attempt_rung0` in

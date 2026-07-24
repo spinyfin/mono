@@ -212,7 +212,7 @@ pub(crate) enum LadderOutcome {
     /// variant so a caller logging the canonical routing verdict (see
     /// [`log_routing_verdict`]) reports the real cause instead of a generic
     /// stand-in — conflating distinct causes under one static message was
-    /// exactly the T2840 verdict-mislabel bug this field exists to prevent.
+    /// exactly the verdict-mislabel bug this field exists to prevent.
     FellThrough {
         residual_conflict_files: Option<usize>,
         reason: &'static str,
@@ -622,7 +622,7 @@ async fn run_rung1_in_lease(
         // operationally, or a resolved-but-unpushed result) into one static
         // "did not resolve every residual file" message previously
         // misdiagnosed a resolved-but-push-rejected result as an unresolved
-        // one (T2840).
+        // one.
         match rung0_outcome {
             LadderOutcome::FellThrough { reason, .. } => reason,
             other => return other,
