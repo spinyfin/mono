@@ -25,7 +25,7 @@ log "[boss-release] releasing"
 echo "[boss-release] agent: $(uname -a)"
 
 # ── list all boss-v* releases (single authoritative snapshot) ────────────────
-# A single `gh release list` call, retried on transient failure, backs every
+# A single release-list call, retried on transient failure, backs every
 # decision below (LAST_TAG, the idempotency guard, change-detection, and the
 # next-version computation). Two independent queries used to run minutes
 # apart in this script; a `|| true` on the first swallowed any `gh` failure
@@ -36,16 +36,25 @@ echo "[boss-release] agent: $(uname -a)"
 # fail loudly if `gh` can't be trusted, and reuse the result everywhere so the
 # view of "what releases exist" cannot go stale or disagree with itself
 # mid-script.
+#
+# Fetched via the REST endpoint (`gh api repos/.../releases`), NOT
+# `gh release list` — that command queries GraphQL under the hood, which
+# shares a rate-limit budget with unrelated pollers on this token (see T3192).
+# GraphQL exhaustion was confirmed as the trigger for build 8383's collision
+# (boss-v1.0.328 recomputed and re-tagged ~4 min after it was already
+# published): a degraded/truncated GraphQL response under-reported the true
+# max tag. REST releases live on the separate `core` rate-limit budget, so
+# exhausting `graphql` here can no longer corrupt version numbering.
 BUILDKITE_SOURCE="${BUILDKITE_SOURCE:-}"
 
 _gh_release_list_json() {
   local out attempt
   for attempt in 1 2 3; do
-    if out=$(gh release list --repo spinyfin/mono --limit 200 --json tagName 2>&1); then
+    if out=$(gh api repos/spinyfin/mono/releases --paginate -X GET -F per_page=100 2>&1); then
       printf '%s' "${out}"
       return 0
     fi
-    echo "[boss-release] gh release list attempt ${attempt}/3 failed: ${out}" >&2
+    echo "[boss-release] release list attempt ${attempt}/3 failed: ${out}" >&2
     sleep $((attempt * 5))
   done
   return 1
@@ -53,11 +62,11 @@ _gh_release_list_json() {
 
 log "[boss-release] listing existing boss-v* releases"
 RELEASE_LIST_JSON=$(_gh_release_list_json) || die \
-  "Unable to list existing releases via 'gh release list' after 3 attempts. Refusing to proceed: treating this as \"no prior release\" would risk publishing a misleading \"Initial Boss release.\" placeholder, or recomputing the next version number, when releases may already exist. Investigate gh/GitHub API health and retry."
+  "Unable to list existing releases via the GitHub releases API after 3 attempts. Refusing to proceed: treating this as \"no prior release\" would risk publishing a misleading \"Initial Boss release.\" placeholder, or recomputing the next version number, when releases may already exist. Investigate GitHub API health and retry."
 
 log "[boss-release] resolving last boss-v* release tag"
 LAST_TAG=$(echo "${RELEASE_LIST_JSON}" \
-  | jq -r '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName // empty')
+  | jq -r '[.[] | select(.tag_name | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tag_name // empty')
 
 LAST_SHA=""
 if [[ -n "${LAST_TAG}" ]]; then
@@ -188,10 +197,10 @@ git fetch --tags origin 2>/dev/null || true
 
 log "[boss-release] computing next version"
 # Reuse the single RELEASE_LIST_JSON snapshot from above instead of issuing a
-# second `gh release list` call — two separate calls run seconds to minutes
+# second release-list call — two separate calls run seconds to minutes
 # apart could observe different states (a release created in between) and
 # silently disagree about the last tag vs. the max existing tag.
-EXISTING_TAGS=$(echo "${RELEASE_LIST_JSON}" | jq -r '.[].tagName')
+EXISTING_TAGS=$(echo "${RELEASE_LIST_JSON}" | jq -r '.[].tag_name')
 
 MAX_N=-1
 while IFS= read -r tag; do
@@ -200,6 +209,30 @@ while IFS= read -r tag; do
     if (( n > MAX_N )); then MAX_N="${n}"; fi
   fi
 done <<< "${EXISTING_TAGS}"
+
+# ── degraded-list cross-check ─────────────────────────────────────────────────
+# The release-list snapshot above is API data (REST now, previously GraphQL)
+# and can under-report the true max on a degraded/rate-limited response
+# without failing outright (build 8383: a truncated snapshot silently missed
+# boss-v1.0.328, so this block recomputed 328 again and collided with its own
+# prior tag). Cross-check against `git ls-remote --tags`, which talks the git
+# smart-HTTP protocol directly to the remote and shares no budget with either
+# GitHub API. If git sees a higher boss-v1.0.* tag than the release list
+# reported, the list is untrustworthy — fail loudly (matching the existing
+# fail-closed behavior for an outright `gh` failure above) instead of silently
+# computing an already-published version number.
+GIT_MAX_N=-1
+while IFS= read -r tag; do
+  if [[ "${tag}" =~ ^boss-v1\.0\.([0-9]+)$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    if (( n > GIT_MAX_N )); then GIT_MAX_N="${n}"; fi
+  fi
+done < <(git ls-remote --tags origin 'refs/tags/boss-v1.0.*' 2>/dev/null \
+  | sed -E 's#.*refs/tags/##')
+
+if (( GIT_MAX_N > MAX_N )); then
+  die "Release-list snapshot reports the highest boss-v1.0.* release as N=${MAX_N}, but 'git ls-remote --tags origin' (independent of the GitHub releases API) shows a tag up to boss-v1.0.${GIT_MAX_N}. The release list is degraded or incomplete — refusing to compute a version number from it, since doing so would recompute and collide with an already-published tag. Investigate GitHub API health (rate limits, outages) and retry."
+fi
 
 NEXT_N=$(( MAX_N + 1 ))
 VERSION="boss-v1.0.${NEXT_N}"
@@ -220,12 +253,33 @@ _cleanup() {
   [[ -n "${NOTES_FILE}" ]] && rm -f "${NOTES_FILE}"
   if [[ "${TAG_PUSHED}" == "1" && "${RELEASE_CREATED}" == "0" ]]; then
     echo "[boss-release] release not completed — deleting leaked remote tag ${VERSION}" >&2
-    git push origin ":refs/tags/${VERSION}" 2>/dev/null || true
+    git push origin ":refs/tags/${VERSION}" 2>/dev/null \
+      || echo "[boss-release] WARNING: failed to delete leaked tag ${VERSION} — manual cleanup needed: git push origin :refs/tags/${VERSION}" >&2
     git tag -d "${VERSION}" 2>/dev/null || true
   fi
   [[ -n "${WORK_DIR}" ]] && rm -rf "${WORK_DIR}"
 }
 trap '_cleanup' EXIT
+
+# ── tag-collision guard ────────────────────────────────────────────────────────
+# Re-fetch immediately before tagging to close the race window between the
+# release-list snapshot above and now (mirrors checkleft-release.sh). If
+# ${VERSION} already exists on the remote — the exact build-8383 failure mode,
+# where a degraded list snapshot recomputed an already-published number — this
+# is EITHER a redundant duplicate run on a commit that's already released
+# (idempotent no-op: exit 0, nothing left to do) OR a genuinely stale/wrong
+# computation (die loudly with an actionable message instead of the raw
+# `fatal: tag already exists` that used to hard-abort here).
+git fetch origin "refs/tags/${VERSION}:refs/tags/${VERSION}" 2>/dev/null || true
+if git rev-parse -q --verify "refs/tags/${VERSION}" &>/dev/null; then
+  EXISTING_TAG_SHA=$(git rev-list -n 1 "${VERSION}" 2>/dev/null || true)
+  HEAD_SHA_FOR_TAG=$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")
+  if [[ -n "${EXISTING_TAG_SHA}" && "${EXISTING_TAG_SHA}" == "${HEAD_SHA_FOR_TAG}" ]]; then
+    echo "release step skipped: ${VERSION} already exists and points at HEAD (${HEAD_SHA_FOR_TAG:0:12}) — this run is a redundant duplicate of an already-published release; nothing to do"
+    exit 0
+  fi
+  die "Computed tag ${VERSION} already exists on remote (at commit ${EXISTING_TAG_SHA:-unknown}), but HEAD is ${HEAD_SHA_FOR_TAG:-unknown}. The version resolver produced a stale or already-published result — most likely a degraded release-list snapshot under-reported the true max. Re-run the pipeline to retry with a fresh snapshot; do NOT force-push over the existing tag."
+fi
 
 log "[boss-release] creating and pushing release tag ${VERSION} (before build)"
 git tag "${VERSION}" HEAD
