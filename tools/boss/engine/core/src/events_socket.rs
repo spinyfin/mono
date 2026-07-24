@@ -13,6 +13,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
@@ -252,6 +253,54 @@ pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, 
         transcript_path,
         event,
     })
+}
+
+/// Publish the two event-bus transitions this hook-ingress path can
+/// observe directly, per the event-bus design doc's taxonomy
+/// (`tools/boss/docs/designs/engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`).
+/// No subscribers are wired up yet — this only stages the publishers so a
+/// later PR can land `stranded_answering_sweep` / `transient_recovery` as
+/// thin subscribers without touching this ingress path again.
+///
+/// Events are hints, not commands: a subscriber always re-reads
+/// authoritative DB state before acting (e.g. whether this run's
+/// execution is actually a live `answer_agent` with a pending question),
+/// so publishing on a run this ingress can't fully classify is harmless
+/// — the eventual subscriber's own check no-ops on a false positive.
+///
+/// - [`Event::TransientErrorIdle`]: published on a `Stop` hook whose
+///   transcript's last meaningful entry is a trailing Claude API error —
+///   the same ground truth [`crate::transient_recovery`]'s sweep already
+///   trusts, just checked immediately instead of waiting for the next
+///   60s pass.
+/// - [`Event::AnswerAgentDied`]: published on `SessionEnd`, the only
+///   hook that fires when a worker's session terminates. This does not
+///   cover a hard pane kill (no hook fires at all in that case) — that
+///   case has no in-process event and stays reliant on
+///   `stranded_answering_sweep`'s DB-driven backstop, unchanged.
+pub async fn publish_hook_derived_events(bus: &EventBus, incoming: &IncomingHookEvent) {
+    let Some(execution_id) = incoming.run_id.clone() else {
+        return;
+    };
+    match &incoming.event {
+        WorkerEvent::Stop { .. } => {
+            let Some(transcript_path) = incoming.transcript_path.as_deref() else {
+                return;
+            };
+            let lines = crate::transient_recovery::read_transcript_tail(
+                transcript_path,
+                crate::transient_recovery::TRANSCRIPT_TAIL_MAX_BYTES,
+            )
+            .await;
+            if crate::transient_error::extract_worker_error(&lines).is_some() {
+                bus.publish(Event::TransientErrorIdle { execution_id });
+            }
+        }
+        WorkerEvent::SessionEnd { .. } => {
+            bus.publish(Event::AnswerAgentDied { execution_id });
+        }
+        _ => {}
+    }
 }
 
 /// Pull `_boss_run_id` out of the raw hook payload if the shim
@@ -690,5 +739,130 @@ mod tests {
         // Release the client.
         close_tx.send(()).ok();
         client.join().unwrap();
+    }
+
+    // ─── publish_hook_derived_events ───────────────────────────────────
+
+    fn incoming_stop(run_id: &str, transcript_path: Option<&str>) -> IncomingHookEvent {
+        IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run_id.to_owned()),
+            transcript_path: transcript_path.map(str::to_owned),
+            event: WorkerEvent::Stop {
+                session_id: "s".to_owned(),
+                stop_hook_active: false,
+                stop_reason: boss_protocol::StopReason::Completed,
+            },
+        }
+    }
+
+    fn write_transcript(dir: &TempDir, name: &str, lines: &[&str]) -> String {
+        use std::io::Write;
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    const NORMAL_LINE: &str =
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#;
+    const API_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: The socket connection was closed unexpectedly."}]}}"#;
+
+    #[tokio::test]
+    async fn stop_with_trailing_api_error_publishes_transient_error_idle() {
+        let dir = TempDir::new().unwrap();
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, API_ERROR_LINE]);
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        publish_hook_derived_events(&bus, &incoming_stop("exec-1", Some(&transcript))).await;
+
+        let event = sub.recv().await.expect("event published");
+        assert_eq!(
+            event,
+            Event::TransientErrorIdle {
+                execution_id: "exec-1".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_no_trailing_error_publishes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE]);
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        publish_hook_derived_events(&bus, &incoming_stop("exec-1", Some(&transcript))).await;
+
+        // Publish an unrelated event so the assertion below can distinguish
+        // "nothing published" from "recv would hang forever".
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(
+            event,
+            Event::DispatchReady,
+            "no TransientErrorIdle should have been published"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_no_transcript_path_publishes_nothing() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        publish_hook_derived_events(&bus, &incoming_stop("exec-1", None)).await;
+
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(event, Event::DispatchReady);
+    }
+
+    #[tokio::test]
+    async fn session_end_publishes_answer_agent_died() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+        let incoming = IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some("exec-2".to_owned()),
+            transcript_path: None,
+            event: WorkerEvent::SessionEnd {
+                session_id: "s".to_owned(),
+                reason: "exit".to_owned(),
+            },
+        };
+
+        publish_hook_derived_events(&bus, &incoming).await;
+
+        let event = sub.recv().await.expect("event published");
+        assert_eq!(
+            event,
+            Event::AnswerAgentDied {
+                execution_id: "exec-2".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_run_id_publishes_nothing() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+        let incoming = IncomingHookEvent {
+            peer_pid: None,
+            run_id: None,
+            transcript_path: None,
+            event: WorkerEvent::SessionEnd {
+                session_id: "s".to_owned(),
+                reason: "exit".to_owned(),
+            },
+        };
+
+        publish_hook_derived_events(&bus, &incoming).await;
+
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(event, Event::DispatchReady);
     }
 }

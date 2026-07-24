@@ -2003,6 +2003,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 incoming.run_id.as_deref(),
                                 &incoming.event,
                             );
+                            crate::events_socket::publish_hook_derived_events(&server_state.event_bus, &incoming).await;
                             dispatch_live_worker_state(&server_state, &incoming).await;
                             // Editorial PreToolUse audit: evaluate every
                             // `gh pr|issue` Bash invocation against the
