@@ -2328,6 +2328,7 @@ fn run_workspace(
                 repo.as_deref(),
                 workspace.as_deref(),
                 dry_run,
+                None,
             );
 
             let promoted = report.promoted_to_clean.len();
@@ -4652,10 +4653,24 @@ fn gc_collect_closed_pr_bookmarks(
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
-/// exists — used to decide whether a completed-but-partial pass should be
-/// retried after POOL_GC_BACKLOG_RETRY_SECS instead of waiting a full day.
-/// Mirrors the eligibility logic in `gc_aged_unhealthy_workspaces` without
-/// doing any of the (potentially slow) reset work.
+/// exists that `gc_aged_unhealthy_workspaces` can actually reset — used to
+/// decide whether a completed-but-partial pass should be retried after
+/// POOL_GC_BACKLOG_RETRY_SECS instead of waiting a full day.
+///
+/// Deliberately excludes `Quarantined` workspaces even though
+/// `gc_aged_unhealthy_workspaces` also considers them: quarantine is only
+/// ever lifted against evidence from a live reuse probe (an unpushed-work
+/// check), and a quarantined workspace whose `@` genuinely still holds
+/// unpushed work stays quarantined forever — its `unhealthy_since` never
+/// advances, so counting it here would pin the retry interval at
+/// POOL_GC_BACKLOG_RETRY_SECS permanently instead of settling back to
+/// AUTO_GC_INTERVAL_SECS once the resettable (Dirty/Conflicted) backlog is
+/// actually drained. Dirty/Conflicted workspaces have no such refusal path —
+/// `gc_aged_unhealthy_workspaces` resets them unconditionally once aged past
+/// the threshold — so they are a reliable "will make progress next pass"
+/// signal. Running the live probe here to distinguish resettable from stuck
+/// quarantined workspaces would defeat the point of this being a cheap,
+/// read-only check (see `gc_aged_unhealthy_workspaces`'s quarantine probe).
 fn pool_gc_has_aged_unhealthy_backlog(store: &Store, now_epoch_s: i64) -> Result<bool> {
     let max_age_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
     let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
@@ -4666,16 +4681,13 @@ fn pool_gc_has_aged_unhealthy_backlog(store: &Store, now_epoch_s: i64) -> Result
         }
         let is_unhealthy = matches!(
             record.health_status,
-            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
+            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
         );
         if !is_unhealthy {
             return false;
         }
-        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
-        let unhealthy_since = match (record.unhealthy_since_epoch_s, is_quarantined) {
-            (Some(since), _) => since,
-            (None, true) => 0,
-            (None, false) => return false,
+        let Some(unhealthy_since) = record.unhealthy_since_epoch_s else {
+            return false;
         };
         unhealthy_since <= threshold_epoch_s
     }))
@@ -4745,22 +4757,12 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, deadline: I
     };
     let runner = RealCommandRunner;
 
-    // Reconcile stale health cache: re-check dirty/conflicted workspaces
-    // against their on-disk state and promote any that have recovered to
-    // clean. This runs before the aged-unhealthy reset so the aged-unhealthy
-    // pass only fires on workspaces that are genuinely still dirty on disk.
-    let health_report = reconcile_free_workspace_health(&runner, &store, database_path.as_deref(), None, None, false);
-    if !health_report.promoted_to_clean.is_empty() {
-        eprintln!(
-            "cube: auto gc: promoted {} workspace(s) from dirty/conflicted to clean",
-            health_report.promoted_to_clean.len(),
-        );
-    }
-
-    // Run the aged-unhealthy recycler before the bookmark loop so it is never
-    // blocked by a slow or hanging per-workspace fetch in the loop below, and
-    // so it gets first claim on the time budget — it is the part that
-    // actually reclaims disk space from stuck-dirty workspaces.
+    // Run the aged-unhealthy recycler first so it genuinely gets first claim
+    // on the time budget — it is the part that actually reclaims disk space
+    // from stuck-dirty workspaces, and it must not be starved by the
+    // reconcile pass below (which only refreshes cached health labels, a
+    // less time-critical repair). It is bounded by `deadline` itself, so a
+    // large backlog cannot consume more than its share.
     let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
@@ -4775,7 +4777,35 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, deadline: I
     }
 
     if Instant::now() >= deadline {
-        eprintln!("cube: auto gc: time budget exhausted after aged-unhealthy pass, deferring log/bookmark gc");
+        eprintln!(
+            "cube: auto gc: time budget exhausted after aged-unhealthy pass, deferring reconcile/log/bookmark gc"
+        );
+        return;
+    }
+
+    // Reconcile stale health cache: re-check dirty/conflicted workspaces
+    // against their on-disk state and promote any that have recovered to
+    // clean. Runs after the aged-unhealthy pass (which already reset whatever
+    // it could) and is itself bounded by the same deadline so it cannot eat
+    // into the remaining budget meant for the log/bookmark sweep below.
+    let health_report = reconcile_free_workspace_health(
+        &runner,
+        &store,
+        database_path.as_deref(),
+        None,
+        None,
+        false,
+        Some(deadline),
+    );
+    if !health_report.promoted_to_clean.is_empty() {
+        eprintln!(
+            "cube: auto gc: promoted {} workspace(s) from dirty/conflicted to clean",
+            health_report.promoted_to_clean.len(),
+        );
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!("cube: auto gc: time budget exhausted after reconcile pass, deferring log/bookmark gc");
         return;
     }
 
@@ -6601,13 +6631,16 @@ struct ReconcileHealthReport {
 ///
 /// Called from:
 /// - `run_pool_gc_background` (synchronously, on `cube workspace lease`,
-///   throttled to roughly daily — see `maybe_trigger_pool_gc`)
-/// - `WorkspaceCommand::Reconcile` (explicit operator command)
+///   throttled to roughly daily — see `maybe_trigger_pool_gc`), bounded by
+///   `deadline` so it cannot itself stall lease dispatch
+/// - `WorkspaceCommand::Reconcile` (explicit operator command, no deadline)
 /// - Indirectly: `cube workspace lease` also lazily promotes stale-dirty
 ///   workspaces when it finds them clean during the health-check phase.
 ///
 /// When `dry_run` is true the DB is not modified but the report reflects what
-/// would change.
+/// would change. When `deadline` is `Some` and it has passed, the pass stops
+/// before checking the next candidate and reports what it got to so far —
+/// remaining candidates are picked up on the next pass.
 fn reconcile_free_workspace_health(
     runner: &dyn CommandRunner,
     store: &Store,
@@ -6615,6 +6648,7 @@ fn reconcile_free_workspace_health(
     repo_filter: Option<&str>,
     workspace_filter: Option<&str>,
     dry_run: bool,
+    deadline: Option<Instant>,
 ) -> ReconcileHealthReport {
     let all = match store.list_workspaces_filtered(&WorkspaceListFilter {
         repo: repo_filter,
@@ -6642,6 +6676,10 @@ fn reconcile_free_workspace_health(
     let mut report = ReconcileHealthReport::default();
 
     for record in candidates {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            eprintln!("cube: health reconcile: time budget exhausted, deferring remaining candidates to next pass");
+            break;
+        }
         let prior_health = record
             .health_status
             .map(|h| h.as_str())
@@ -7083,9 +7121,10 @@ mod tests {
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY,
         PRESERVED_UNPUSHED_RELEASE_REASON, RebaseOpts, RepoEnsureDefaults, Result, current_epoch_s,
         ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_retryable_network_error, is_stdin_path,
-        rebase_workspace_branch, render_boss_infra_exclude_block, repo_lock_path, resolve_body_file,
-        resolve_checkleft_bin, run_checkleft_gate, run_checkleft_gate_impl, run_jj_push, run_with_context,
-        run_with_dependencies, upsert_managed_exclude, workspace_goto, workspace_push,
+        maybe_trigger_pool_gc, pool_gc_has_aged_unhealthy_backlog, rebase_workspace_branch,
+        render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
+        run_checkleft_gate_impl, run_jj_push, run_with_context, run_with_dependencies, upsert_managed_exclude,
+        workspace_goto, workspace_push,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -13468,6 +13507,84 @@ mod tests {
             "last_pool_gc_started_at should have advanced past stuck value"
         );
         assert!(now - ts < 10, "last_pool_gc_started_at should be near now");
+    }
+
+    #[test]
+    fn pool_gc_backlog_retriggers_before_24h_elapsed() {
+        // When an aged-unhealthy workspace is still sitting in the pool,
+        // pool_gc_has_aged_unhealthy_backlog reports a backlog, so
+        // maybe_trigger_pool_gc must retry after POOL_GC_BACKLOG_RETRY_SECS
+        // (5 min) rather than waiting the full AUTO_GC_INTERVAL_SECS (24h).
+        let (tempdir, database_path) = with_database_path();
+        let (mut store, _ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+            .expect("mark dirty");
+
+        // Backdate unhealthy_since well past the 5-day default threshold so
+        // this workspace counts as aged-unhealthy backlog.
+        let six_days_ago = current_epoch_s().unwrap() - (6 * 86_400);
+        store
+            .set_workspace_unhealthy_since("mono", "mono-agent-001", six_days_ago)
+            .expect("set unhealthy_since");
+
+        // Last pass completed 10 minutes ago: past POOL_GC_BACKLOG_RETRY_SECS
+        // (5 min) but nowhere near AUTO_GC_INTERVAL_SECS (24h).
+        let now = current_epoch_s().unwrap();
+        let ten_min_ago = now - (10 * 60);
+        store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, ten_min_ago).unwrap();
+
+        assert!(
+            pool_gc_has_aged_unhealthy_backlog(&store, now).unwrap(),
+            "an aged dirty workspace should be reported as backlog"
+        );
+
+        maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+
+        let started_ts = store
+            .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
+            .unwrap()
+            .expect("pass should have been (re)triggered because of the backlog");
+        assert_eq!(
+            started_ts, now,
+            "backlog should force a retry despite being < 24h since last pass"
+        );
+        let completed_ts = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY).unwrap().unwrap();
+        assert_eq!(
+            completed_ts, now,
+            "the synchronous pass should stamp completion at `now`"
+        );
+    }
+
+    #[test]
+    fn pool_gc_skips_before_24h_when_no_backlog() {
+        // With no aged-unhealthy workspace in the pool, the throttle must fall
+        // back to the full AUTO_GC_INTERVAL_SECS (24h) — a pass that completed
+        // only 10 minutes ago should NOT be retriggered.
+        let (tempdir, database_path) = with_database_path();
+        let (mut store, _ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        let now = current_epoch_s().unwrap();
+        let ten_min_ago = now - (10 * 60);
+        store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, ten_min_ago).unwrap();
+
+        assert!(
+            !pool_gc_has_aged_unhealthy_backlog(&store, now).unwrap(),
+            "a pool with no unhealthy workspaces should report no backlog"
+        );
+
+        maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("trigger gc");
+
+        assert!(
+            store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap().is_none(),
+            "pass should not be retriggered within 24h when there is no backlog"
+        );
+        let completed_ts = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY).unwrap().unwrap();
+        assert_eq!(
+            completed_ts, ten_min_ago,
+            "last_pool_gc_at should be untouched when the pass is skipped"
+        );
     }
 
     #[test]
