@@ -254,6 +254,12 @@ extension ChatViewModel {
                 var tasks = tasksByProjectID[projectID] ?? []
                 tasks.append(updatedTask)
                 tasksByProjectID[projectID] = tasks.sorted(by: taskSort)
+                // Keep the tracked set authoritative: applyWorkTree only
+                // evicts buckets it knows about, so a project that gains its
+                // first task here (previously untracked/empty) must be
+                // recorded or the next full apply will leave this bucket
+                // un-evicted and duplicate the task onto itself.
+                trackedProjectIDsByProductID[productID, default: []].insert(projectID)
             } else if updatedTask.kind == "revision" {
                 revisions.append(updatedTask)
                 productLevelRevisionsByProductID[productID] = revisions.sorted(by: taskSort)
