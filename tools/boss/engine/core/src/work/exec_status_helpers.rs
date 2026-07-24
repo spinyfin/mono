@@ -87,6 +87,34 @@ pub(crate) fn task_accepts_execution(task: &Task) -> bool {
     true
 }
 
+/// True when `work_item_id` is a task flagged `deferred = 1` (future /
+/// not-yet-in-scope). Deferred items are still auto-unblocked and remain
+/// schedulable, but the engine must never mint a `ready` execution for
+/// them on any automatic path — `reconcile_work_item_execution` and
+/// `reconcile_revision_execution` consult this and skip the mint until a
+/// human explicitly approves the item (which clears the flag). Projects
+/// (`proj_…`) never carry the column, so this is always `false` for them.
+///
+/// Reads the column directly rather than mapping a full `Task`: gating
+/// must stay correct on every code path regardless of which mapper (and
+/// therefore which SELECT column set) produced a caller's in-memory Task.
+/// It is deliberately NOT wired into [`task_accepts_execution`] — the
+/// dependency auto-unblock cascade bypasses that gate and calls the
+/// reconcile helpers directly, so the check belongs at the mint point.
+pub(crate) fn work_item_is_deferred(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    if !work_item_id.starts_with("task_") {
+        return Ok(false);
+    }
+    let deferred: Option<i64> = conn
+        .query_row(
+            "SELECT deferred FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(deferred.unwrap_or(0) != 0)
+}
+
 pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
     match classify_id(work_item_id)? {
         ItemKind::Product => query_product(conn, work_item_id)?

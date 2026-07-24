@@ -74,6 +74,14 @@ struct WorkTask: Identifiable, Hashable {
     /// leaving them in Backlog. Defaults to `false` when absent from the
     /// wire so legacy rows without the field stay in Backlog (unchanged).
     var autostart: Bool = false
+    /// Durable "future scope" classification. When `true`, this item was
+    /// filed as deferred / not-yet-in-scope: the engine still auto-unblocks
+    /// it and keeps it visible/schedulable, but never auto-dispatches it
+    /// until a human explicitly approves it. Distinct from `autostart` (a
+    /// one-shot dispatch-timing pause) and from the transient
+    /// `deferred_scope` attention marker. Rendered as a muted "Future"
+    /// badge on the card. Defaults to `false` when absent from the wire.
+    var deferred: Bool = false
     /// Aggregate required-CI state at last merge-poller probe. One of:
     /// `"in_progress"`, `"success"`, `"fail"`, `"unknown"`. `nil` until the
     /// first probe completes. Only rendered when `status == "in_review"` and

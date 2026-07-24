@@ -492,6 +492,22 @@ pub(crate) fn reconcile_work_item_execution(
     } else {
         desired_status
     };
+    // Deferred/future-scope items are auto-unblocked and left schedulable,
+    // but never auto-dispatched: skip minting or promoting any execution
+    // until a human explicitly approves the item (which clears `deferred`).
+    // The dependency auto-unblock cascade calls this function directly, so
+    // gating here — rather than in `task_accepts_execution`, which the
+    // cascade bypasses — is what suppresses execution on every automatic
+    // path (normal reconcile, cascade, project chain) without touching
+    // `dep_helpers.rs`. The unblock (row → `todo`) itself is never
+    // suppressed; only the mint is.
+    if work_item_is_deferred(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is deferred/future-scope — suppressing execution mint until explicit approval",
+        );
+        return Ok(());
+    }
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
             if execution.kind == kind && execution.status.can_reconcile() && execution.status != effective_status {
@@ -730,6 +746,20 @@ pub(crate) fn reconcile_revision_execution(
         ExecutionStatus::Ready
     };
 
+    // Same future-scope suppression as `reconcile_work_item_execution`: a
+    // deferred revision is left settled/unblocked but never auto-dispatched
+    // until a human approves it (clearing `deferred`). Placed after the
+    // chain-root-done archival and spawning-attempt-retired settle logic
+    // above so those still run — only the ready/waiting_dependency mint is
+    // skipped.
+    if work_item_is_deferred(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is deferred/future-scope — suppressing execution mint until explicit approval",
+        );
+        return Ok(());
+    }
+
     match query_latest_execution_for_work_item(conn, &task.id)? {
         Some(existing)
             if existing.kind == ExecutionKind::RevisionImplementation
@@ -952,6 +982,23 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // there is nothing here to bypass. If the fresh attempt fails again,
         // the next sweep pass re-files the attention.
         resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+
+        // Explicit dispatch is the human-approval signal for a deferred
+        // (future-scope) item: clear the classification so the reconciler
+        // and dependency cascade will mint `ready` executions for it again.
+        // Mirrors `autostart`'s single-shot clear on start — deliberately
+        // starting an item means it is no longer future scope. Guarded on
+        // `deferred = 1` so it is a no-op for ordinary items.
+        let approved = conn.execute(
+            "UPDATE tasks SET deferred = 0 WHERE id = ?1 AND deferred = 1 AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+        if approved > 0 {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                "RequestExecution: approved deferred/future-scope item — cleared `deferred` on explicit start",
+            );
+        }
     }
 
     // Multi-repo Q5: route through the single resolver so the

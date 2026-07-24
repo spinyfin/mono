@@ -141,6 +141,7 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     let ordinal = next_task_ordinal(conn, &input.project_id)?;
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+    let deferred_value: i64 = if input.deferred { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
@@ -150,9 +151,9 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, deferred)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, deferred_value],
     )?;
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
@@ -201,6 +202,7 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     let now = now_string();
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+    let deferred_value: i64 = if input.deferred { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let kind_str = input.kind_override.as_ref().map(|k| k.as_str()).unwrap_or("chore");
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, kind_str);
@@ -211,9 +213,9 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, origin_task_short_id, origin_pr_number)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, input.origin_task_short_id, input.origin_pr_number],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, origin_task_short_id, origin_pr_number, deferred)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value],
     )?;
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
@@ -244,6 +246,7 @@ pub(crate) fn insert_investigation_in_tx(
     let now = now_string();
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+    let deferred_value: i64 = if input.deferred { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "investigation");
     let repo_remote_url = input.repo_remote_url.filter(|s| !s.is_empty());
@@ -252,12 +255,12 @@ pub(crate) fn insert_investigation_in_tx(
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id)
-         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, deferred)
+         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             id, input.product_id, input.project_id, input.name, description, now,
             autostart_value, priority, created_via, repo_remote_url,
-            effort_level, model_override, driver, short_id
+            effort_level, model_override, driver, short_id, deferred_value
         ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing investigation after insert: {id}"))

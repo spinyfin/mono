@@ -1383,6 +1383,30 @@ fn bulk_create_item_rejects_unknown_fields() {
 }
 
 #[test]
+fn bulk_create_item_deserializes_deferred_and_defaults_absent_to_none() {
+    let with_deferred: BulkCreateItem =
+        serde_json::from_str(r#"{ "name": "future work", "description": "d", "deferred": true }"#).unwrap();
+    assert_eq!(with_deferred.deferred, Some(true));
+
+    // Absent → None (the create path treats None as `false`).
+    let without: BulkCreateItem = serde_json::from_str(r#"{ "name": "n", "description": "d" }"#).unwrap();
+    assert_eq!(without.deferred, None);
+}
+
+#[test]
+fn task_update_parses_deferred_flag() {
+    // `--deferred false` is the operator-approval form; it must parse into
+    // the shared TaskUpdateArgs.
+    let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--deferred", "false"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Update(args),
+        } => assert_eq!(args.deferred, Some(false)),
+        _ => panic!("expected task update command"),
+    }
+}
+
+#[test]
 fn parses_project_set_design_doc_with_path() {
     let cli = Cli::parse_from([
         "boss",

@@ -4,6 +4,42 @@
 
 use super::*;
 
+/// Drop the `deferred` column (simulating a pre-classification DB) and
+/// re-open: `migrate_tasks_deferred`'s ALTER TABLE path must re-add it and
+/// leave existing rows at the `0` (not-future-scope) default, so an upgrade
+/// never spuriously parks live work.
+#[test]
+fn migration_re_adds_deferred_column_defaulting_to_zero() {
+    // disk_db_path required: drops a column and re-opens the DB to trigger migration.
+    let (_dir, path) = disk_db_path("deferred-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let chore = create_test_chore(&db, product.id.clone(), "Legacy chore");
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("ALTER TABLE tasks DROP COLUMN deferred", []).unwrap();
+        assert!(!table_has_column(&conn, "tasks", "deferred").unwrap());
+    }
+    drop(db);
+
+    // Re-open re-runs the migrations.
+    let db = WorkDb::open(path.clone()).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "deferred").unwrap());
+        let deferred: i64 = conn
+            .query_row("SELECT deferred FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            deferred, 0,
+            "an existing row must default to not-deferred after the migration"
+        );
+    }
+}
+
 /// Drop the effort/model columns (simulating a pre-PR-370 DB)
 /// and re-open: the migration's ALTER TABLE path must re-add
 /// them and leave existing rows with NULL on each new column.

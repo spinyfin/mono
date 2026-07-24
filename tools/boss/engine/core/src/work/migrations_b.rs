@@ -12,6 +12,20 @@ pub(crate) fn migrate_tasks_autostart(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the `deferred` column to `tasks` for older databases. A deferred
+/// (future-scope) work item is auto-unblocked and made schedulable like
+/// any other, but the engine never mints a `ready` execution for it on an
+/// automatic path — it runs only after explicit human approval (see
+/// [`crate::work::exec_status_helpers::work_item_is_deferred`] and
+/// `reconcile_work_item_execution`). Older rows default to 0 so the
+/// historical "not future scope" behaviour is preserved across the upgrade.
+pub(crate) fn migrate_tasks_deferred(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "deferred")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN deferred INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    Ok(())
+}
+
 /// Add `last_status_actor` to `tasks` and `projects` so the engine
 /// can distinguish a status it set itself (`'engine'`) from one a
 /// human typed at the CLI / kanban (`'human'`). The dependencies

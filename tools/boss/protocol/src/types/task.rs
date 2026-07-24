@@ -110,6 +110,14 @@ pub struct CreateChoreInput {
     #[builder(default = true)]
     pub autostart: bool,
 
+    /// See [`Task::deferred`]. When `true`, the chore is filed as
+    /// future/not-yet-in-scope: the engine parks it (no auto-minted
+    /// `ready` execution on any path) until a human explicitly approves
+    /// it. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
+
     /// See [`CreateTaskInput::force_duplicate`].
     #[serde(default)]
     #[builder(default)]
@@ -190,6 +198,11 @@ pub struct CreateInvestigationInput {
     #[builder(default = true)]
     pub autostart: bool,
 
+    /// See [`Task::deferred`]. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
+
     #[serde(default)]
     #[builder(default)]
     pub force_duplicate: bool,
@@ -256,6 +269,11 @@ pub struct CreateTaskInput {
     #[serde(default = "default_true")]
     #[builder(default = true)]
     pub autostart: bool,
+
+    /// See [`Task::deferred`]. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
 
     /// Bypass the recent-duplicate guard. When `true`, the engine skips
     /// the 60-second same-name/same-product duplicate check and inserts
@@ -421,6 +439,29 @@ pub struct Task {
     #[serde(default = "default_true")]
     #[builder(default = true)]
     pub autostart: bool,
+
+    /// Durable classification marking this work item as **deferred /
+    /// future scope** — filed now but explicitly not yet in scope to run.
+    ///
+    /// Distinct from [`autostart`](Self::autostart) (a one-shot
+    /// dispatch-*timing* pause) and from `status` (lifecycle position): a
+    /// deferred item is still auto-unblocked and made schedulable by the
+    /// dependency cascade — it reaches `todo` and stays visible on the
+    /// board — but the engine never *mints a `ready` execution* for it on
+    /// any automatic path (normal reconcile, dependency auto-unblock, or
+    /// automation retry). It becomes eligible only when a human explicitly
+    /// approves it: an explicit `RequestExecution` (`bossctl work start` /
+    /// a kanban drag-to-Doing) clears this flag as the approval, mirroring
+    /// `autostart`'s single-shot clear, and `boss task update --deferred
+    /// false` clears it directly. Existing rows from before this column
+    /// was introduced default to `false`.
+    ///
+    /// Not to be confused with the transient `deferred_scope` *attention*
+    /// item (the AI `[deferred-scope]` marker) — that is per-execution
+    /// telemetry; this is a durable per-row property.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
 
     /// Every active block reason currently in flight on this work
     /// item — the multi-signal companion to the scalar

@@ -560,6 +560,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         created_at: ts.to_owned(),
         updated_at: ts.to_owned(),
         autostart: true,
+        deferred: false,
         last_status_actor: "human".to_owned(),
         priority: "medium".to_owned(),
         created_via: "cli".to_owned(),
@@ -639,4 +640,5 @@ mod t28;
 mod t29;
 mod t30;
 mod t31;
+mod t32;
 mod work_item_write_tests;

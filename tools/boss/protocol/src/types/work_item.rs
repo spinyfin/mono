@@ -117,6 +117,13 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
 
+    /// Flip the `deferred` (future-scope) classification. `None` → leave
+    /// unchanged. `Some(false)` approves the item (pulls it into scope so
+    /// it can be dispatched); `Some(true)` re-defers it. See
+    /// [`crate::Task::deferred`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<bool>,
+
     /// Set or clear the `blocked_reason` field. `None` → leave unchanged.
     /// `Some("")` → clear (write NULL). Any non-empty string is stored verbatim
     /// (e.g. `"merge_conflict"`, `"ci_failure"`). Manual escape hatch for
