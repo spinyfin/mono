@@ -206,9 +206,11 @@ extension ChatViewModel {
         case .engineHealthResult(let apiKeyPresent, let issues):
             engineAnthropicApiKeyPresent = apiKeyPresent
             engineHealthIssues = issues
-        case .trunkStatus(let configured, let source, _):
+        case .trunkStatus(let configured, let source, let queueCheck, let note):
             trunkTokenConfigured = configured
             trunkTokenSource = source
+            trunkTokenQueueCheck = queueCheck
+            trunkTokenNote = note
         case .enginePoolConfig(let workerSlots, let automationSlots, let reviewSlots, let coordinatorModel):
             panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots, coordinatorModel)
         case .settingsList(let settings):

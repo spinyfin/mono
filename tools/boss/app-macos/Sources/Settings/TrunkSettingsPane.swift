@@ -38,6 +38,16 @@ struct TrunkSettingsPane: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+                if let validityLabel {
+                    HStack(spacing: 6) {
+                        Image(systemName: validityIcon)
+                            .foregroundStyle(validityColor)
+                        Text(validityLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 8) {
                     SecureField("Trunk org API token", text: $tokenDraft)
                         .textFieldStyle(.roundedBorder)
@@ -91,6 +101,34 @@ struct TrunkSettingsPane: View {
         case nil:
             return "Checking…"
         }
+    }
+
+    /// Live `getQueue` smoke-check outcome, shown under the presence/source
+    /// status when available. `nil` (label omitted) when the token isn't
+    /// configured yet, since presence is already covered by `statusLabel`.
+    private var validityLabel: String? {
+        guard chatModel.trunkTokenConfigured == true else { return nil }
+        if let queueCheck = chatModel.trunkTokenQueueCheck {
+            return queueCheck.ok ? "Queue check: \(queueCheck.detail)" : "Queue check failed: \(queueCheck.detail)"
+        }
+        if let note = chatModel.trunkTokenNote {
+            return note
+        }
+        return nil
+    }
+
+    private var validityIcon: String {
+        if let queueCheck = chatModel.trunkTokenQueueCheck {
+            return queueCheck.ok ? "checkmark.circle.fill" : "xmark.circle.fill"
+        }
+        return "info.circle"
+    }
+
+    private var validityColor: Color {
+        if let queueCheck = chatModel.trunkTokenQueueCheck {
+            return queueCheck.ok ? .green : .red
+        }
+        return .secondary
     }
 
     private func saveToken() {

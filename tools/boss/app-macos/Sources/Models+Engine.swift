@@ -120,6 +120,16 @@ struct EngineHealthIssue: Identifiable, Hashable {
     let body: String
 }
 
+/// Live `getQueue` smoke-check outcome against a `trunk_queue`-mechanism
+/// product's queue, decoded from a `trunk_status` response's `queue_check`.
+/// Mirrors `boss_protocol::TrunkQueueCheckDto` one-for-one. `nil` when no
+/// token is configured, or when there is no `trunk_queue`-mechanism product
+/// yet to probe against.
+struct TrunkQueueCheck: Hashable {
+    let ok: Bool
+    let detail: String
+}
+
 /// One registered host, decoded from a `hosts_list` / `host_result` /
 /// `host_updated` response. Mirrors `boss_protocol::HostSnapshot`.
 struct EngineHost: Identifiable, Hashable {

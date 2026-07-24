@@ -260,6 +260,13 @@ final class ChatViewModel: ObservableObject {
     /// `"env"` / `"keychain"` when `trunkTokenConfigured` is `true`, mirrors
     /// `TrunkStatus.source`.
     @Published var trunkTokenSource: String?
+    /// Live `getQueue` smoke-check outcome, mirrors `TrunkStatus.queueCheck`.
+    /// `nil` when no token is configured, or when there is no
+    /// `trunk_queue`-mechanism product yet to probe — see `trunkTokenNote`.
+    @Published var trunkTokenQueueCheck: TrunkQueueCheck?
+    /// Explains why `trunkTokenQueueCheck` is `nil`, mirrors
+    /// `TrunkStatus.note`.
+    @Published var trunkTokenNote: String?
 
     /// Engine metrics snapshot — every registered counter and gauge —
     /// sourced from `metrics_list_live` on Metrics pane open and

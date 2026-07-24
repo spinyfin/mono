@@ -125,8 +125,11 @@ enum EngineEvent {
     /// Reply to `trunk_set_token` / `trunk_status` — whether a Trunk org
     /// API token is configured (env override or Keychain), and where it
     /// came from. Drives the Settings pane's Trunk token control and the
-    /// per-product merge-mechanism token-required warning.
-    case trunkStatus(configured: Bool, source: String?, note: String?)
+    /// per-product merge-mechanism token-required warning. `queueCheck` is
+    /// the live `getQueue` smoke-check outcome (`nil` when no token is
+    /// configured, or when there is no `trunk_queue`-mechanism product yet
+    /// to probe); `note` explains which when `queueCheck` is `nil`.
+    case trunkStatus(configured: Bool, source: String?, queueCheck: TrunkQueueCheck?, note: String?)
     /// Engine's live pool-size configuration, pushed immediately after
     /// `app_session_registered` so `WorkersWorkspaceModel` can configure
     /// its slot ranges before any `SpawnWorkerPane` request arrives.

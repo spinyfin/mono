@@ -543,6 +543,16 @@ extension EngineClient {
         return EngineHealthIssue(kind: kind, severity: severity, title: title, body: body)
     }
 
+    func parseTrunkQueueCheck(_ payload: [String: Any]) -> TrunkQueueCheck? {
+        guard
+            let ok = (payload["ok"] as? NSNumber)?.boolValue,
+            let detail = payload["detail"] as? String
+        else {
+            return nil
+        }
+        return TrunkQueueCheck(ok: ok, detail: detail)
+    }
+
     func parseEngineHost(_ payload: [String: Any]) -> EngineHost? {
         guard
             let hostId = payload["id"] as? String,

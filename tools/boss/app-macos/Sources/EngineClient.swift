@@ -576,8 +576,9 @@ final class EngineClient: @unchecked Sendable {
             case "trunk_status":
                 let configured = (payload["configured"] as? NSNumber)?.boolValue ?? false
                 let source = payload["source"] as? String
+                let queueCheck = (payload["queue_check"] as? [String: Any]).flatMap(parseTrunkQueueCheck)
                 let note = payload["note"] as? String
-                emit(.trunkStatus(configured: configured, source: source, note: note))
+                emit(.trunkStatus(configured: configured, source: source, queueCheck: queueCheck, note: note))
             case "settings_list":
                 let raw = payload["settings"] as? [[String: Any]] ?? []
                 let settings = raw.compactMap(parseEngineSetting)
