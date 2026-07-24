@@ -899,8 +899,12 @@ pub(crate) async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) 
 }
 
 /// Shared handler for `boss task show <id>` and `boss chore show <id>`.
-/// Routes any leaf work item id through the same path; the JSON key
-/// and human-mode label match the actual kind of the returned item.
+/// Routes any leaf work item id through the same path. The JSON row
+/// is *not* wrapped under a dynamic `task`/`chore` key — its fields
+/// (including `kind`, from the `Task` struct itself) sit at the top
+/// level alongside `dependencies`/`executions`/`attention_items`/
+/// `attention_groups`, so `.status` resolves the same way regardless
+/// of which kind the resolved item turned out to be.
 ///
 /// `chore_only`: when `true` (called from `boss chore show`), resolving
 /// a friendly short id to a non-chore task-table row produces a
@@ -940,30 +944,43 @@ pub(crate) async fn run_show_leaf(
     let runtime = get_task_runtime(client, &item.id).await?;
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
-    let task_json = task_json_with_runtime(&item, &runtime)?;
-    print_entity(
-        ctx,
-        &serde_json::json!({
-            label: task_json,
-            "dependencies": detail,
-            "executions": executions,
-            "attention_items": attention_items,
-            "attention_groups": attention_groups,
-        }),
-        || {
-            print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
-            print_attention_items_section(&attention_items);
-            print_attention_groups_section(&attention_groups);
-            print_runtime_section(&runtime);
-            print_dependency_section(&detail);
-            print_executions_section(&executions);
-        },
-    )
+    let mut task_json = task_json_with_runtime(&item, &runtime)?;
+    // These keys share a namespace with `Task`'s own serialized fields, so a
+    // future `Task` field named `dependencies`/`executions`/`attention_items`/
+    // `attention_groups` would be silently overwritten by the insert below.
+    if let serde_json::Value::Object(map) = &mut task_json {
+        map.insert(
+            "dependencies".to_owned(),
+            serde_json::to_value(&detail).map_err(CliError::internal)?,
+        );
+        map.insert(
+            "executions".to_owned(),
+            serde_json::to_value(&executions).map_err(CliError::internal)?,
+        );
+        map.insert(
+            "attention_items".to_owned(),
+            serde_json::to_value(&attention_items).map_err(CliError::internal)?,
+        );
+        map.insert(
+            "attention_groups".to_owned(),
+            serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
+        );
+    } else {
+        return Err(CliError::internal(anyhow::anyhow!("task JSON was not an object")));
+    }
+    print_entity(ctx, &task_json, || {
+        print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
+        print_attention_items_section(&attention_items);
+        print_attention_groups_section(&attention_groups);
+        print_runtime_section(&runtime);
+        print_dependency_section(&detail);
+        print_executions_section(&executions);
+    })
 }
 
 /// Serialise `item` and splice the runtime's `current_execution_id`
 /// / `current_run_id` onto the resulting JSON object so a downstream
-/// `jq .task.current_execution_id` resolves to the engine's view of
+/// `jq .current_execution_id` resolves to the engine's view of
 /// the dispatched execution. Both fields land as `null` when no
 /// execution / run exists yet — the coordinator wants the keys
 /// present so it can distinguish "engine returned null" from "this

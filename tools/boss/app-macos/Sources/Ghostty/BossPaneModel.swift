@@ -546,7 +546,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     Escalation is a post-dispatch event: the worker has already finished before the marker fires, so a second write is safe. Use the fetch-then-update recipe:
 
     ```sh
-    EXISTING=$(boss task show <row-id> --json | jq -r '.task.description // ""')
+    EXISTING=$(boss task show <row-id> --json | jq -r '.description // ""')
     AUDIT='[effort-escalation] original=`small` new=`large` matched-markers=`…` reason="…"'
     boss task update <row-id> --description "$EXISTING
 
@@ -614,14 +614,14 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ## CLI shape gotchas
 
-    ### 1. `boss <verb> --json` returns a wrapped object
+    ### 1. `boss <verb> --json` returns a wrapped object — except `show`
 
-    - `boss chore show --json` → `{chore: {...}, dependencies: [...]}`
-    - `boss project show --json` → `{project: {...}, dependencies: [...], design_doc: {...}}`
-    - `boss chore list --json` → `{chores: [...]}`
-    - `boss task list --json` → `{tasks: [...]}`
+    - `boss chore show --json` / `boss task show --json` → flat row object: the row's own fields (`id`, `short_id`, `status`, `description`, …) alongside `dependencies`, `executions`, `attention_items`, and `attention_groups` at the top level. No `chore`/`task` wrapper — project fields directly.
+    - `boss project show --json` → `{project: {...}, dependencies: [...], design_doc: {...}}` (still wrapped)
+    - `boss chore list --json` → `{chores: [...]}` (still wrapped)
+    - `boss task list --json` → `{tasks: [...]}` (still wrapped)
 
-    Check `jq 'keys'` before projecting fields. Projecting `{id, short_id, name}` on the top level silently returns `null` when the wrapper is forgotten.
+    Check `jq 'keys'` before projecting fields on `project show` or any `list` verb. Projecting `{id, short_id, name}` on the top level silently returns `null` when that wrapper is forgotten. `show` for `chore`/`task` is the exception — it is already flat, so project directly.
 
     ### 2. `boss <kind> create` succeeded if you saw the header line
 

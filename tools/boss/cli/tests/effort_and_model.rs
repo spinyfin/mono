@@ -65,8 +65,8 @@ async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result
     assert_eq!(created["chore"]["model_override"].as_str(), Some("claude-opus-4-7"),);
 
     let shown = run_boss(engine.socket_str(), &["chore", "show", &chore_id])?;
-    assert_eq!(shown["chore"]["effort_level"].as_str(), Some("large"));
-    assert_eq!(shown["chore"]["model_override"].as_str(), Some("claude-opus-4-7"),);
+    assert_eq!(shown["effort_level"].as_str(), Some("large"));
+    assert_eq!(shown["model_override"].as_str(), Some("claude-opus-4-7"),);
     Ok(())
 }
 
