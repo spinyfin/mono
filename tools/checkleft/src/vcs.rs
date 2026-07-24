@@ -205,17 +205,18 @@ impl Vcs {
     }
 
     pub fn remote_repo_slug(&self) -> Option<String> {
-        match self.kind {
-            VcsKind::Git => {
-                let output = run_command(&self.root, "git", &["remote", "get-url", "origin"]).ok()?;
-                parse_repo_slug_from_remote_url(output.trim())
-            }
-            VcsKind::Jujutsu => {
-                let output = run_command(&self.root, "jj", &["git", "remote", "list"]).ok()?;
-                let url = parse_jj_remote_list_url(&output, "origin")?;
-                parse_repo_slug_from_remote_url(&url)
-            }
+        let slug = match self.kind {
+            VcsKind::Git => run_command(&self.root, "git", &["remote", "get-url", "origin"])
+                .ok()
+                .and_then(|output| parse_repo_slug_from_remote_url(output.trim())),
+            VcsKind::Jujutsu => run_command(&self.root, "jj", &["git", "remote", "list"])
+                .ok()
+                .and_then(|output| resolve_jj_repo_slug_from_remote_list(&output, "origin")),
+        };
+        if slug.is_none() {
+            info!(kind = ?self.kind, "could not resolve a github repo slug from any configured remote");
         }
+        slug
     }
 
     /// Return the name of the current branch/bookmark, if determinable.
@@ -622,6 +623,33 @@ fn parse_jj_remote_list_url(output: &str, remote_name: &str) -> Option<String> {
     })
 }
 
+/// Resolve a GitHub repo slug from `jj git remote list` output, preferring
+/// `preferred_remote` (normally `"origin"`) but falling back to the first
+/// remote (in list order) whose URL yields a slug.
+///
+/// Cube's shared-store pool can contain workspaces provisioned before the
+/// github-remote fix, where `origin` points at a local mirror
+/// (`/local/mirror`-style path) and the real GitHub upstream lives under a
+/// separately-named remote (see
+/// `tools/cube/src/app/reset.rs::detect_upstream_tracking_remote`, which
+/// applies the same origin-first-then-scan strategy). Those are exactly the
+/// workspaces this jj path exists to support, so a strict origin-only lookup
+/// would keep failing silently in them.
+fn resolve_jj_repo_slug_from_remote_list(output: &str, preferred_remote: &str) -> Option<String> {
+    if let Some(slug) =
+        parse_jj_remote_list_url(output, preferred_remote).and_then(|url| parse_repo_slug_from_remote_url(&url))
+    {
+        return Some(slug);
+    }
+
+    output.lines().find_map(|line| {
+        let mut parts = line.splitn(2, ' ');
+        let _name = parts.next()?;
+        let url = parts.next()?.trim();
+        parse_repo_slug_from_remote_url(url)
+    })
+}
+
 fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
     let remote_url = remote_url.trim();
     let repo_path = if let Some(stripped) = remote_url.strip_prefix("git@github.com:") {
@@ -654,7 +682,7 @@ mod tests {
     use super::{
         normalize_non_empty, parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary,
         parse_jj_remote_list_url, parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
-        try_expand_brace_notation,
+        resolve_jj_repo_slug_from_remote_list, try_expand_brace_notation,
     };
 
     #[test]
@@ -847,6 +875,51 @@ R docs/old.md => docs/new.md
         );
     }
 
+    #[test]
+    fn resolve_jj_repo_slug_from_remote_list_prefers_origin() {
+        assert_eq!(
+            resolve_jj_repo_slug_from_remote_list(
+                "origin git@github.com:example/flunge.git\nupstream https://github.com/other/flunge.git\n",
+                "origin",
+            ),
+            Some("example/flunge".to_owned())
+        );
+    }
+
+    /// Reproduces the cube pool shape from `detect_upstream_tracking_remote`:
+    /// `origin` is a local mirror path and the real GitHub upstream lives
+    /// under a separately-named remote. Must not silently resolve to `None`.
+    #[test]
+    fn resolve_jj_repo_slug_from_remote_list_falls_back_when_origin_is_not_github() {
+        assert_eq!(
+            resolve_jj_repo_slug_from_remote_list(
+                "origin /local/mirror/mono\ngithub git@github.com:example/flunge.git\n",
+                "origin",
+            ),
+            Some("example/flunge".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_jj_repo_slug_from_remote_list_falls_back_when_origin_is_absent() {
+        assert_eq!(
+            resolve_jj_repo_slug_from_remote_list("upstream git@github.com:example/flunge.git\n", "origin"),
+            Some("example/flunge".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_jj_repo_slug_from_remote_list_returns_none_when_no_remote_yields_a_slug() {
+        assert_eq!(
+            resolve_jj_repo_slug_from_remote_list(
+                "origin /local/mirror/mono\nupstream https://gitlab.com/example/flunge.git\n",
+                "origin",
+            ),
+            None
+        );
+        assert_eq!(resolve_jj_repo_slug_from_remote_list("", "origin"), None);
+    }
+
     /// Whether `jj` is on PATH. The jj-specific tests below are skipped (not
     /// failed) when it isn't, so the suite stays green in sandboxes that don't
     /// provision the jj binary — same convention as
@@ -949,6 +1022,36 @@ R docs/old.md => docs/new.md
         assert!(
             !temp.path().join(".git").exists(),
             "test setup must produce a non-colocated jj repo (no .git at root)"
+        );
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        assert_eq!(vcs.kind(), super::VcsKind::Jujutsu);
+        assert_eq!(vcs.remote_repo_slug(), Some("example/flunge".to_owned()));
+    }
+
+    /// Reproduces a pre-github-remote-fix cube pool workspace end-to-end
+    /// through the real jj CLI: `origin` is a local mirror path and the
+    /// GitHub upstream is a separately-named remote. `remote_repo_slug()`
+    /// must still resolve it instead of returning `None`.
+    #[test]
+    fn remote_repo_slug_falls_back_to_non_origin_github_remote() {
+        use tempfile::tempdir;
+
+        if !jj_available() {
+            eprintln!("skipping remote_repo_slug_falls_back_to_non_origin_github_remote: `jj` is not on PATH");
+            return;
+        }
+
+        let mirror = tempdir().expect("create local mirror dir");
+        let temp = tempdir().expect("create temp dir");
+        run_jj(temp.path(), &["git", "init"]);
+        run_jj(
+            temp.path(),
+            &["git", "remote", "add", "origin", &mirror.path().display().to_string()],
+        );
+        run_jj(
+            temp.path(),
+            &["git", "remote", "add", "github", "git@github.com:example/flunge.git"],
         );
 
         let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
