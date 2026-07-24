@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::boothby::BoothbyActInput;
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse, HostedPaneEntry};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
@@ -243,6 +244,21 @@ pub enum FrontendRequest {
         product_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_days: Option<u32>,
+    },
+
+    /// Perform one Boothby catalogue verb against one target — the
+    /// single choke point for every Boothby mutation. Applies the
+    /// blast-radius caps, the live-work / human-touch / lease guards,
+    /// two-pass confirmation for irreversible verbs, and fingerprint
+    /// refusal, then journals the effect to `boothby_actions`.
+    ///
+    /// A refusal is a normal reply, not an error: the outcome enum
+    /// distinguishes "ask again next pass" from "stop asking this
+    /// pass" from "never ask again". Replies with
+    /// [`FrontendEvent::BoothbyActed`].
+    BoothbyAct {
+        #[serde(flatten)]
+        input: BoothbyActInput,
     },
 
     /// Cancel a queued or running execution. Marks the execution row

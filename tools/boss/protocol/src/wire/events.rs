@@ -769,6 +769,15 @@ pub enum FrontendEvent {
         level: String,
         elapsed_seconds: i64,
     },
+    /// Response to [`FrontendRequest::BoothbyAct`]. Carries the
+    /// executor's verdict — executed, or the specific rail that
+    /// refused it. A refusal rides here rather than in
+    /// [`FrontendEvent::WorkError`] because it is an ordinary,
+    /// expected answer that Boothby must be able to tell apart from
+    /// a transient failure worth retrying.
+    BoothbyActed {
+        outcome: crate::BoothbyActOutcome,
+    },
     /// Response to [`FrontendRequest::AuditProductEffort`]. Carries
     /// the per-marker under-classification analysis for one
     /// product. Read-only snapshot; the engine recomputes from

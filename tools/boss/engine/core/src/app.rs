@@ -38,9 +38,10 @@ use crate::protocol::{
 };
 use crate::repo_slug;
 use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
-    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
-    SetRunTranscriptPathOutcome, THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, BoothbyActOutcome,
+    DuplicateTaskError, ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput,
+    ReviseDocOutcome, SetRunTranscriptPathOutcome, THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb,
+    WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -50,6 +51,7 @@ mod agent_launch_guard;
 mod app_session;
 mod attentions;
 mod automations;
+mod boothby;
 mod broadcasts;
 mod ci_remediation;
 mod comments;
@@ -461,6 +463,13 @@ struct ServerState {
     /// keystroke-speed product switch. See
     /// [`boss_engine_design_docs`] for why the cache cannot go stale.
     design_docs: Arc<boss_engine_design_docs::DesignDocsService>,
+    /// The single choke point for every Boothby mutation — caps,
+    /// guards, two-pass confirmation, fingerprint refusal, journal.
+    /// Lives here rather than on a pass because its two-pass gate has
+    /// to outlive any one pass: that is the whole mechanism by which
+    /// an irreversible verb proves itself across two of them. See
+    /// [`crate::boothby`].
+    boothby_executor: Arc<crate::boothby::BoothbyExecutor>,
     /// Primary-path `execution_id → pr_url` staging cache. Populated
     /// by [`dispatch_live_worker_state`] from `PostToolUse` Bash
     /// hooks that surface a `gh pr create` (or `view` / `edit`)
@@ -1077,6 +1086,16 @@ impl ServerState {
                 )))
                 .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
                 .design_docs(Arc::new(boss_engine_design_docs::DesignDocsService::new()))
+                // Default policy = `propose` mode: nothing Boothby asks for
+                // mutates anything until an operator turns it up. The
+                // scheduler (breakdown task 3) replaces this with the
+                // settings-derived policy once `boothby.*` keys exist; the
+                // verb handlers (tasks 8/9) register their effects. Until
+                // both land this executor refuses every call, which is the
+                // intended shipping-dark state.
+                .boothby_executor(Arc::new(crate::boothby::BoothbyExecutor::new(
+                    crate::boothby::BoothbyPolicy::default(),
+                )))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
@@ -1668,6 +1687,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::AddHostTag { .. } => hosts::handle_add_host_tag(ctx, r).await,
             r @ FrontendRequest::AnswerAttention { .. } => attentions::handle_answer_attention(ctx, r).await,
             r @ FrontendRequest::AuditProductEffort { .. } => effort::handle_audit_product_effort(ctx, r).await,
+            r @ FrontendRequest::BoothbyAct { .. } => boothby::handle_boothby_act(ctx, r).await,
             r @ FrontendRequest::CancelExecution { .. } => executions::handle_cancel_execution(ctx, r).await,
             r @ FrontendRequest::ClassifyCiRemediation { .. } => {
                 ci_remediation::handle_classify_ci_remediation(ctx, r).await
