@@ -49,6 +49,7 @@ pub mod editorial_hook;
 pub use boss_engine_effort as effort;
 pub mod engine_control;
 pub mod envelope_watch;
+pub mod event_publish;
 pub mod events_socket;
 pub mod execution_liveness;
 pub mod execution_retention_sweep;
