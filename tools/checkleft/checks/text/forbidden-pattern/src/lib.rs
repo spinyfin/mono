@@ -36,7 +36,9 @@
 //! `pattern` is a Rust `regex` syntax expression evaluated per line, `message`
 //! is the finding text shown to the author, and `severity` is an optional
 //! per-pattern override (`"error"`, `"warning"`, or `"info"`; defaults to
-//! `"error"`).
+//! `"error"`; any other value is a config error). Because matching is done
+//! per line, a pattern containing a literal newline can never match and is
+//! rejected as a config error.
 
 use checkleft_check_sdk::{ChangeKind, CheckInput, Finding, Severity, check};
 use regex::Regex;
@@ -110,10 +112,13 @@ pub fn forbidden_pattern_check(input: CheckInput) -> Vec<Finding> {
             for pattern in &patterns {
                 for m in pattern.regex.find_iter(line) {
                     let column = (line[..m.start()].chars().count() + 1) as u32;
-                    let mut finding = Finding::error(pattern.message.clone())
-                        .at_column(file.path.clone(), line_number, column)
-                        .with_remediation(format!("matched forbidden pattern `{}`", pattern.name));
-                    finding.severity = pattern.severity;
+                    let finding = match pattern.severity {
+                        Severity::Error => Finding::error(pattern.message.clone()),
+                        Severity::Warning => Finding::warning(pattern.message.clone()),
+                        Severity::Info => Finding::info(pattern.message.clone()),
+                    }
+                    .at_column(file.path.clone(), line_number, column)
+                    .with_remediation(format!("matched forbidden pattern `{}`", pattern.name));
                     findings.push(finding);
                 }
             }
@@ -136,25 +141,34 @@ fn compile_patterns(patterns: &[PatternConfig]) -> Result<Vec<CompiledPattern>, 
         if pattern.pattern.trim().is_empty() {
             return Err(format!("`{field_prefix}.pattern` must not be empty"));
         }
+        if pattern.pattern.contains('\n') {
+            return Err(format!(
+                "`{field_prefix}.pattern` is evaluated per line and must not span newlines"
+            ));
+        }
 
         let regex = Regex::new(&pattern.pattern)
             .map_err(|e| format!("invalid regex `{}` in `{field_prefix}.pattern`: {e}", pattern.pattern))?;
 
+        let severity =
+            parse_severity(pattern.severity.as_deref()).map_err(|e| format!("`{field_prefix}.severity` {e}"))?;
+
         compiled.push(CompiledPattern {
             name: pattern.name.clone(),
             message: pattern.message.clone(),
-            severity: parse_severity(pattern.severity.as_deref()),
+            severity,
             regex,
         });
     }
     Ok(compiled)
 }
 
-fn parse_severity(s: Option<&str>) -> Severity {
+fn parse_severity(s: Option<&str>) -> Result<Severity, String> {
     match s.map(|v| v.to_ascii_lowercase()).as_deref() {
-        Some("warning") | Some("warn") => Severity::Warning,
-        Some("info") => Severity::Info,
-        _ => Severity::Error,
+        None | Some("error") => Ok(Severity::Error),
+        Some("warning") | Some("warn") => Ok(Severity::Warning),
+        Some("info") => Ok(Severity::Info),
+        Some(other) => Err(format!("must be one of `error`, `warning`, `info`; got `{other}`")),
     }
 }
 
@@ -189,7 +203,7 @@ mod tests {
     #[test]
     fn flags_matching_line_in_changed_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_temp_file(dir.path(), "notes.md", "see task T3124 for context\n");
+        let path = write_temp_file(dir.path(), "notes.md", "see task ZZ3124 for context\n");
 
         let findings = forbidden_pattern_check(make_input(
             vec![ChangedFile {
@@ -197,7 +211,7 @@ mod tests {
                 kind: ChangeKind::Modified,
                 old_path: None,
             }],
-            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bT\\d{4,}\\b","message":"Internal work-item ids must not leak."}]}"#,
+            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"Internal work-item ids must not leak."}]}"#,
         ));
 
         assert_eq!(findings.len(), 1);
@@ -220,7 +234,7 @@ mod tests {
                 kind: ChangeKind::Modified,
                 old_path: None,
             }],
-            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bT\\d{4,}\\b","message":"Internal work-item ids must not leak."}]}"#,
+            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"Internal work-item ids must not leak."}]}"#,
         ));
 
         assert!(findings.is_empty());
@@ -234,7 +248,7 @@ mod tests {
                 kind: ChangeKind::Deleted,
                 old_path: None,
             }],
-            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bT\\d{4,}\\b","message":"nope"}]}"#,
+            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
         ));
 
         assert!(findings.is_empty());
@@ -243,7 +257,7 @@ mod tests {
     #[test]
     fn emits_one_finding_per_match_per_pattern() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_temp_file(dir.path(), "notes.md", "T1111 and T2222 leaked in one line\n");
+        let path = write_temp_file(dir.path(), "notes.md", "ZZ1111 and ZZ2222 leaked in one line\n");
 
         let findings = forbidden_pattern_check(make_input(
             vec![ChangedFile {
@@ -251,7 +265,7 @@ mod tests {
                 kind: ChangeKind::Added,
                 old_path: None,
             }],
-            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bT\\d{4,}\\b","message":"nope"}]}"#,
+            r#"{"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
         ));
 
         assert_eq!(findings.len(), 2);
@@ -320,7 +334,7 @@ mod tests {
     fn severity_parsing_is_case_insensitive() {
         for severity_str in &["Warning", "WARNING", "warn", "WARN"] {
             let dir = tempfile::tempdir().unwrap();
-            let path = write_temp_file(dir.path(), "notes.md", "T9999 leaked\n");
+            let path = write_temp_file(dir.path(), "notes.md", "ZZ9999 leaked\n");
 
             let findings = forbidden_pattern_check(make_input(
                 vec![ChangedFile {
@@ -329,12 +343,33 @@ mod tests {
                     old_path: None,
                 }],
                 &format!(
-                    r#"{{"patterns":[{{"name":"work-item-id","pattern":"\\bT\\d{{4,}}\\b","message":"nope","severity":"{}"}}]}}"#,
+                    r#"{{"patterns":[{{"name":"work-item-id","pattern":"\\bZZ\\d{{4,}}\\b","message":"nope","severity":"{}"}}]}}"#,
                     severity_str
                 ),
             ));
             assert_eq!(findings.len(), 1, "severity={}", severity_str);
             assert_eq!(findings[0].severity, Severity::Warning, "severity={}", severity_str);
         }
+    }
+
+    #[test]
+    fn rejects_unknown_severity() {
+        let findings = forbidden_pattern_check(make_input(
+            vec![],
+            r#"{"patterns":[{"name":"foo","pattern":"bar","message":"baz","severity":"critical"}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("severity"));
+        assert!(findings[0].message.contains("critical"));
+    }
+
+    #[test]
+    fn rejects_pattern_spanning_newline() {
+        let findings = forbidden_pattern_check(make_input(
+            vec![],
+            r#"{"patterns":[{"name":"foo","pattern":"foo\nbar","message":"baz"}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("newline"));
     }
 }
