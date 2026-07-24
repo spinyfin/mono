@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use boss_event_bus::{EventBus, EventKind, TopicFilter};
+use boss_timer_wheel::TimerWheel;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
@@ -809,6 +810,26 @@ struct ServerState {
     /// SIGTERM-style shutdown signal and exits the same graceful path
     /// when either fires.
     shutdown_trigger: Arc<Notify>,
+    /// The single shared in-process `EventBus` the event-bus design doc
+    /// calls for (§Approach). `EventBus::new` spawns no background task, so
+    /// this is constructible outside a live Tokio runtime and can live on
+    /// `ServerState` from construction — every producer
+    /// (`event_publish::commit_and_publish`) and consumer (currently only
+    /// the envelope-watch timer subscriber; automation cron is the design
+    /// doc's next planned consumer, task 13) shares this exact instance
+    /// instead of each standing up a private bus nothing else can reach.
+    #[builder(default)]
+    envelope_event_bus: Arc<EventBus>,
+    /// The shared timer-wheel feeding `envelope_event_bus`'s `Timer` topic.
+    /// Unlike `EventBus::new`, `TimerWheel::spawn` spawns its background
+    /// delivery task, which requires a live Tokio runtime — many unit tests
+    /// construct `ServerState` outside one. So this starts empty and `serve`
+    /// initializes it (via `get_or_init`) once the runtime is confirmed
+    /// live, right before spawning the first consumer that needs it. Tests
+    /// that never call `serve` never touch this and so never spawn the
+    /// wheel's background task.
+    #[builder(default)]
+    envelope_timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
 }
 
 impl ServerState {
