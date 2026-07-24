@@ -1661,5 +1661,5 @@ fn heal_single_settings_json(settings_path: &Path, new_boss_event_path: &Path) -
 }
 
 #[cfg(test)]
-#[path = "worker_setup_tests.rs"]
+#[path = "worker_setup_tests/mod.rs"]
 mod tests;
