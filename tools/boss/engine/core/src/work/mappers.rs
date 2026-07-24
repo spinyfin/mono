@@ -898,3 +898,102 @@ pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protoco
         repeat_count: 1,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal local `FromStr` type used to drive both the Ok and Err
+    // paths of `parse_text_column` without depending on any production
+    // enum's parse rules. It accepts `"tag:<x>"` and rejects everything
+    // else, so a single helper exercises both branches deterministically.
+    #[derive(Debug, PartialEq)]
+    struct Tag(String);
+
+    #[derive(Debug)]
+    struct TagParseError(String);
+
+    impl std::fmt::Display for TagParseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "not a tag: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for TagParseError {}
+
+    impl std::str::FromStr for Tag {
+        type Err = TagParseError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s.strip_prefix("tag:") {
+                Some(rest) if !rest.is_empty() => Ok(Tag(rest.to_owned())),
+                _ => Err(TagParseError(s.to_owned())),
+            }
+        }
+    }
+
+    #[test]
+    fn deserialize_json_or_default_returns_default_on_null() {
+        // NULL column (None) yields T::default().
+        let v: Vec<String> = deserialize_json_or_default(None);
+        assert_eq!(v, Vec::<String>::new());
+    }
+
+    #[test]
+    fn deserialize_json_or_default_returns_default_on_malformed_json() {
+        // Undeserializable text falls back to T::default() rather than
+        // surfacing a parse error.
+        let v: Vec<String> = deserialize_json_or_default(Some("{ not valid json"));
+        assert_eq!(v, Vec::<String>::new());
+
+        // Well-formed JSON of the wrong shape (an object where a list is
+        // expected) also falls through to the default.
+        let v: Vec<String> = deserialize_json_or_default(Some(r#"{"a":1}"#));
+        assert_eq!(v, Vec::<String>::new());
+    }
+
+    #[test]
+    fn deserialize_json_or_default_parses_valid_json() {
+        let v: Vec<String> = deserialize_json_or_default(Some(r#"["a","b"]"#));
+        assert_eq!(v, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn deserialize_json_or_default_value_null_on_missing_or_invalid() {
+        // The doc comment pins that `serde_json::Value::default()` is
+        // `Value::Null`, so a `Value` call site degrades NULL / invalid
+        // input to `Value::Null` (the behavior the old
+        // `unwrap_or(Value::Null)` sites relied on).
+        let null_from_none: serde_json::Value = deserialize_json_or_default(None);
+        assert_eq!(null_from_none, serde_json::Value::Null);
+
+        let null_from_invalid: serde_json::Value = deserialize_json_or_default(Some("{ not json"));
+        assert_eq!(null_from_invalid, serde_json::Value::Null);
+
+        // Valid JSON still parses through to the real value.
+        let parsed: serde_json::Value = deserialize_json_or_default(Some(r#"{"k":42}"#));
+        assert_eq!(parsed, serde_json::json!({"k": 42}));
+    }
+
+    #[test]
+    fn parse_text_column_parses_valid_input() {
+        let parsed: Tag = parse_text_column(3, "tag:alpha").unwrap();
+        assert_eq!(parsed, Tag("alpha".to_owned()));
+    }
+
+    #[test]
+    fn parse_text_column_surfaces_from_sql_conversion_failure() {
+        let err = parse_text_column::<Tag>(7, "not-a-tag").unwrap_err();
+        // The contract is that a parse failure becomes a
+        // `FromSqlConversionFailure` keyed to the caller-supplied column
+        // index and `Type::Text`. Assert those survive; the boxed source
+        // error is an internal detail we don't pin.
+        match err {
+            rusqlite::Error::FromSqlConversionFailure(col, ty, _) => {
+                assert_eq!(col, 7);
+                assert_eq!(ty, rusqlite::types::Type::Text);
+            }
+            other => panic!("expected FromSqlConversionFailure, got {other:?}"),
+        }
+    }
+}
