@@ -1,6 +1,4 @@
 //! engine (trunk / ci / attempts / conflicts) command handlers
-//!
-//! Extracted from the former monolithic `main.rs` (mechanical split; behavior unchanged).
 
 use crate::*;
 

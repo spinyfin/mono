@@ -1,6 +1,4 @@
 //! RPC data-access helpers, resolvers, and selectors
-//!
-//! Extracted from the former monolithic `main.rs` (mechanical split; behavior unchanged).
 
 use crate::*;
 

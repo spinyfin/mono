@@ -1,6 +1,4 @@
 //! table / detail rendering, formatting, lint, and local commands
-//!
-//! Extracted from the former monolithic `main.rs` (mechanical split; behavior unchanged).
 
 use crate::*;
 

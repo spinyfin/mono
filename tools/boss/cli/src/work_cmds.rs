@@ -1,6 +1,4 @@
 //! product / project / task / chore / comment / github command handlers
-//!
-//! Extracted from the former monolithic `main.rs` (mechanical split; behavior unchanged).
 
 use crate::*;
 

@@ -1,4 +1,4 @@
-//! Unit tests extracted from the former monolithic `main.rs`.
+//! Unit tests for the boss CLI.
 
 use clap::Parser;
 
