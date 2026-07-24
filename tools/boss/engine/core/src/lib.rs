@@ -1,5 +1,6 @@
 pub use boss_transcript_markdown as transcript_markdown;
 
+pub mod abandoned_branch_pr_sweep;
 pub mod answer_agent;
 pub mod app;
 pub mod attentions_detector;
