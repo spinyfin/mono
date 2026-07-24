@@ -8,7 +8,7 @@
 use super::*;
 
 use boss_protocol::{
-    COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, THREAD_ENTRY_KIND_NUDGE,
+    COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, INTENT_REVISION, THREAD_ENTRY_KIND_NUDGE,
     THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
 };
 
@@ -110,14 +110,9 @@ fn spawn_comment_classifier(
                     // Buckets 1&3 (P2b): nudge the operator toward a revision
                     // immediately on classification, before `[Revise]` is
                     // even clicked (design § "Buckets 1 & 3 — unified").
-                    if matches!(result.intent.as_str(), INTENT_DIRECTIVE | INTENT_LARGER_CHANGE)
-                        && let Err(err) = work_db.create_nudge_thread_entry(&comment_id, NUDGE_BODY)
-                    {
-                        tracing::warn!(
-                            comment_id = %comment_id,
-                            err = %err,
-                            "comment intent classifier: failed to post nudge thread entry",
-                        );
+                    // Scope-gated — see `post_nudge_once`.
+                    if result.intent.as_str() == INTENT_REVISION {
+                        post_nudge_once(&work_db, &artifact_kind, &artifact_id, &comment_id);
                     }
 
                     publish_comment_invalidation(
@@ -131,8 +126,8 @@ fn spawn_comment_classifier(
                     .await;
 
                     // Bucket 2 (P3b): a `question`-classified comment spawns the
-                    // read-only answer agent. Buckets 1&3 (directive/larger_change)
-                    // are a later phase — the comment just stays `active` for now.
+                    // read-only answer agent. Buckets 1&3 (`revision`) are a
+                    // later phase — the comment just stays `active` for now.
                     if classified.intent.as_deref() == Some(INTENT_QUESTION) {
                         spawn_answer_agent(&server_state, &work_db, &session_id, &request_id, &classified).await;
                     }
@@ -743,7 +738,7 @@ fn spawn_followup_classifier(
                 // the answer agent runs again with the accumulated thread.
                 respawn_answer_agent_for_followup(&server_state, &work_db, &session_id, &request_id, &comment).await;
             }
-            INTENT_DIRECTIVE | INTENT_LARGER_CHANGE => {
+            INTENT_REVISION => {
                 // The bucket-1&3 bridge: `awaiting_followup → active`, so
                 // the next `[Revise]` batch picks this comment up. The
                 // thread's answer-agent reply is carried into that batch's
@@ -759,13 +754,7 @@ fn spawn_followup_classifier(
                     );
                     return;
                 }
-                if let Err(err) = work_db.create_nudge_thread_entry(&comment.id, NUDGE_BODY) {
-                    tracing::warn!(
-                        comment_id = %comment.id,
-                        err = %err,
-                        "follow-up classifier: failed to post the bridged nudge thread entry",
-                    );
-                }
+                post_nudge_once(&work_db, &comment.artifact_kind, &comment.artifact_id, &comment.id);
                 publish_comment_invalidation(
                     &server_state,
                     &session_id,
@@ -889,7 +878,7 @@ pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest)
     }
 }
 
-/// Batch-address every unaddressed `directive`/`larger_change` comment on a
+/// Batch-address every unaddressed `revision` comment on a
 /// design/investigation-owned `pr_doc` artifact — the `[Revise]`-banner
 /// action. App-or-Boss tier — replaces the retired magic-wand dispatch path.
 /// Design: `tools/boss/docs/designs/comment-triggered-document-revisions.md`
@@ -1068,9 +1057,9 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 ///
 /// | before | new intent | what happens |
 /// |---|---|---|
-/// | `answering` | `directive`/`larger_change` | stand the live run down (`superseded`) and cancel + release its execution *before* the override write, then `→ active`, post the nudge |
-/// | `answered`/`awaiting_followup` | `directive`/`larger_change` | `→ active`, post the nudge |
-/// | `active` | `directive`/`larger_change` | post the nudge (no status change needed) |
+/// | `answering` | `revision` | stand the live run down (`superseded`) and cancel + release its execution *before* the override write, then `→ active`, post the nudge |
+/// | `answered`/`awaiting_followup` | `revision` | `→ active`, post the nudge |
+/// | `active` | `revision` | post the nudge (no status change needed) |
 /// | `active` | `question` | spawn the answer agent → `answering` |
 /// | any | same track as before | no-op beyond the label |
 /// | `in_revision` | anything | label only — see below |
@@ -1123,7 +1112,7 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
     // `running` run, complete it `replied`, and feed the retracted question's
     // answer into the revise directive. Standing it down first means the
     // reply can only win this race if it genuinely beat the reclassification.
-    if status_before == COMMENT_STATUS_ANSWERING && matches!(intent.as_str(), INTENT_DIRECTIVE | INTENT_LARGER_CHANGE) {
+    if status_before == COMMENT_STATUS_ANSWERING && intent.as_str() == INTENT_REVISION {
         stand_down_answer_agent(&server_state, &work_db, &comment_id).await;
     }
 
@@ -1168,8 +1157,8 @@ async fn rehome_reclassified_comment(
         // A claimed comment stays claimed (see the table above): no nudge,
         // because the chip already reads `in_revision` and a nudge would make
         // it read `reopened` once the batch reconciles.
-        Some(INTENT_DIRECTIVE | INTENT_LARGER_CHANGE) if comment.status == COMMENT_STATUS_ACTIVE => {
-            post_nudge_once(work_db, &comment.id);
+        Some(INTENT_REVISION) if comment.status == COMMENT_STATUS_ACTIVE => {
+            post_nudge_once(work_db, &comment.artifact_kind, &comment.artifact_id, &comment.id);
         }
         // The `active` guard is load-bearing: `transition_comment_to_answering`
         // only accepts that source status, and re-affirming `question` on a
@@ -1271,7 +1260,26 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
 /// reclassified back and forth, and because the classifier or the follow-up
 /// bridge may already have posted one; a second identical entry would just
 /// duplicate the banner text in the thread.
-fn post_nudge_once(work_db: &Arc<WorkDb>, comment_id: &str) {
+///
+/// Scope-gated on [`WorkDb::resolve_doc_owner`] — the same gate
+/// `comments_banner_state` and `CommentsReviseDoc` use to decide whether a
+/// `[Revise]` affordance can ever appear for this artifact. The classifier
+/// runs on every artifact kind, so without this gate a comment on an
+/// out-of-scope artifact (e.g. `artifact_kind = 'work_item'`) would be
+/// nudged toward a `[Revise]` button that can never appear.
+fn post_nudge_once(work_db: &Arc<WorkDb>, artifact_kind: &str, artifact_id: &str, comment_id: &str) {
+    match work_db.resolve_doc_owner(artifact_kind, artifact_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                comment_id,
+                err = %err,
+                "comment nudge: failed to resolve the doc owner; skipping the nudge rather than risking a dead-end",
+            );
+            return;
+        }
+    }
     match work_db.list_comment_thread_entries(comment_id) {
         Ok(entries) if entries.iter().any(|e| e.entry_kind == THREAD_ENTRY_KIND_NUDGE) => return,
         Ok(_) => {}
@@ -1483,6 +1491,12 @@ mod tests {
     /// `answer_agent` execution — the state `handle_comments_post_answer`
     /// expects to resolve a reply against. Returns `(comment_id,
     /// execution_id)`.
+    ///
+    /// Wires an investigation task's doc pointer at the artifact's
+    /// `(repo, branch, path)` so `resolve_doc_owner` matches it — the same
+    /// scope gate `post_nudge_once` checks before posting the bucket-1&3
+    /// nudge (see `set_intent_from_a_live_answering_run_rehomes_stands_down_and_nudges`,
+    /// which asserts the nudge is posted on rehome).
     fn seed_answering_comment(work_db: &Arc<WorkDb>) -> (String, String) {
         let product = work_db
             .create_product(
@@ -1490,6 +1504,22 @@ mod tests {
                     .name("Boss")
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .build(),
+            )
+            .unwrap();
+        let investigation = work_db
+            .create_investigation(
+                boss_protocol::CreateInvestigationInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Investigate the thing")
+                    .build(),
+            )
+            .unwrap();
+        work_db
+            .set_task_doc_pointer(
+                &investigation.id,
+                Some("git@github.com:spinyfin/mono.git"),
+                Some("main"),
+                Some("docs/design.md"),
             )
             .unwrap();
         let comment = work_db
@@ -1955,13 +1985,13 @@ mod tests {
         let (comment_id, execution_id) = seed_answering_comment(&work_db);
         let artifact_id = work_db.get_comment(&comment_id).unwrap().unwrap().artifact_id;
 
-        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_LARGER_CHANGE).await;
+        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_REVISION).await;
 
         // 1. The comment re-homes IMMEDIATELY — not deferred to the run's
         //    termination, which is the operator-visible bug.
         let comment = work_db.get_comment(&comment_id).unwrap().unwrap();
         assert_eq!(comment.status, COMMENT_STATUS_ACTIVE);
-        assert_eq!(comment.intent.as_deref(), Some(INTENT_LARGER_CHANGE));
+        assert_eq!(comment.intent.as_deref(), Some(INTENT_REVISION));
 
         // 2. It counts as unresolved and is a `[Revise]` candidate right now.
         assert_eq!(
@@ -2003,13 +2033,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_intent_on_an_out_of_scope_artifact_does_not_nudge() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        // `artifact_kind = "work_item"` never resolves via `resolve_doc_owner`
+        // (it only matches `pr_doc`), so a `[Revise]` affordance can never
+        // appear for this comment. Reclassifying it to `revision` must not
+        // post a nudge pointing at that nonexistent button.
+        let comment = work_db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id: "t1".into(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "work_item".into(),
+                author: "human".into(),
+                body: "What does this mean?".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
+
+        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
+
+        let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some(INTENT_REVISION));
+
+        let entries = work_db.list_comment_thread_entries(&comment.id).unwrap();
+        assert!(
+            entries.iter().all(|e| e.entry_kind != THREAD_ENTRY_KIND_NUDGE),
+            "an out-of-scope artifact must never get a nudge toward a nonexistent [Revise] button, got {entries:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn a_late_reply_from_a_stood_down_run_does_not_resurrect_answering() {
         let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let (comment_id, execution_id) = seed_answering_comment(&work_db);
 
-        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_DIRECTIVE).await;
+        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_REVISION).await;
         let _ = sink.next().await; // drain the reclassification's own reply
 
         // The stood-down agent's process was still alive and posts anyway.
@@ -2046,9 +2114,7 @@ mod tests {
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
-        work_db
-            .override_comment_intent(&comment.id, INTENT_LARGER_CHANGE)
-            .unwrap();
+        work_db.override_comment_intent(&comment.id, INTENT_REVISION).unwrap();
 
         set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_QUESTION).await;
 
@@ -2095,9 +2161,7 @@ mod tests {
             )
             .unwrap();
 
-        work_db
-            .override_comment_intent(&comment.id, INTENT_LARGER_CHANGE)
-            .unwrap();
+        work_db.override_comment_intent(&comment.id, INTENT_REVISION).unwrap();
 
         set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_QUESTION).await;
 
@@ -2138,8 +2202,8 @@ mod tests {
         let sink = make_session_sink();
         let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
 
-        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_DIRECTIVE).await;
-        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_LARGER_CHANGE).await;
+        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
+        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
 
         let nudges = work_db
             .list_comment_thread_entries(&comment.id)
@@ -2156,7 +2220,7 @@ mod tests {
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
-        work_db.override_comment_intent(&comment.id, INTENT_DIRECTIVE).unwrap();
+        work_db.override_comment_intent(&comment.id, INTENT_REVISION).unwrap();
         {
             let conn = work_db.connect().unwrap();
             conn.execute(

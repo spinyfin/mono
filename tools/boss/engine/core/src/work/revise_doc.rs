@@ -1,8 +1,8 @@
-//! `CommentsReviseDoc` — batch-address every unaddressed `directive`/
-//! `larger_change` comment on a design/investigation-owned `pr_doc`
+//! `CommentsReviseDoc` — batch-address every unaddressed `revision`-classified
+//! comment on a design/investigation-owned `pr_doc`
 //! artifact (the unified buckets 1 & 3 path). Design:
 //! `tools/boss/docs/designs/comment-triggered-document-revisions.md`
-//! §"Buckets 1 & 3 — unified (directive / larger change)".
+//! §"Buckets 1 & 3 — unified (revision)".
 
 use super::*;
 
@@ -120,7 +120,7 @@ impl WorkDb {
                         artifact_id = %input.artifact_id,
                         task_id = %task_id,
                         excluded = excluded_comment_ids.len(),
-                        "revise_doc: batch excluded comments badged directive/larger_change whose status disqualified them",
+                        "revise_doc: batch excluded comments badged revision whose status disqualified them",
                     );
                 }
                 Ok(ReviseDocOutcome::Created {
@@ -406,9 +406,9 @@ mod tests {
         .unwrap();
 
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
         let c2 = make_comment(&db, &artifact_id, "beta");
-        db.set_comment_intent(&c2.id, "larger_change", 0.9).unwrap();
+        db.set_comment_intent(&c2.id, "revision", 0.9).unwrap();
         // A question-intent comment must never be swept into the batch.
         let c3 = make_comment(&db, &artifact_id, "gamma");
         db.set_comment_intent(&c3.id, "question", 0.9).unwrap();
@@ -476,11 +476,11 @@ mod tests {
         assert_eq!(state.doc_kind, Some(TaskKind::Design));
 
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
         let c2 = make_comment(&db, &artifact_id, "beta");
         db.set_comment_intent(&c2.id, "question", 0.9).unwrap();
 
-        // One directive comment: revisable, and the question-intent one
+        // One revision comment: revisable, and the question-intent one
         // must not count toward `unresolved_count`.
         let state = db.comments_banner_state("pr_doc", &artifact_id).unwrap();
         assert!(state.revisable);
@@ -519,7 +519,7 @@ mod tests {
         .unwrap();
 
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -542,7 +542,7 @@ mod tests {
         let db = mem_db();
         let (_design, artifact_id) = seed_design_owned_artifact(&db);
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -574,7 +574,7 @@ mod tests {
         )
         .unwrap();
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let first = db
             .revise_doc(
@@ -588,7 +588,7 @@ mod tests {
         assert!(matches!(first, ReviseDocOutcome::Created { .. }));
 
         // Nothing new landed since; a second click finds no active
-        // directive/larger_change comments left and is a no-op.
+        // revision comments left and is a no-op.
         let second = db
             .revise_doc(
                 ReviseDocInput::builder()
@@ -615,9 +615,9 @@ mod tests {
         )
         .unwrap();
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
         let c2 = make_comment(&db, &artifact_id, "beta");
-        db.set_comment_intent(&c2.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c2.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -659,7 +659,7 @@ mod tests {
         .unwrap();
 
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         // ...but the live checker reports the PR merged, so the gate
         // refuses at click time and this must fall through to a chore
@@ -686,7 +686,7 @@ mod tests {
         let db = mem_db();
         let (_design, artifact_id) = seed_design_owned_artifact(&db);
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         // Exercise `claim_revisable_comments` directly with a candidate
         // list captured while the comment was still `active` (as
@@ -717,7 +717,7 @@ mod tests {
         let db = mem_db();
         let (_design, artifact_id) = seed_design_owned_artifact(&db);
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         // Exercise `claim_revisable_comments` directly with a candidate
         // list captured (as `revise_doc` would) while the comment was
@@ -748,7 +748,7 @@ mod tests {
         let (_design, artifact_id) = seed_design_owned_artifact(&db);
         // No PR on the owner yet -> decision table picks the chore vehicle.
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -791,7 +791,7 @@ mod tests {
         )
         .unwrap();
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -843,7 +843,7 @@ mod tests {
         )
         .unwrap();
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -905,7 +905,7 @@ mod tests {
         )
         .unwrap();
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -955,7 +955,7 @@ mod tests {
         let db = mem_db();
         let (_design, artifact_id) = seed_design_owned_artifact(&db);
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -995,7 +995,7 @@ mod tests {
         )
         .unwrap();
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -1033,7 +1033,7 @@ mod tests {
         let db = mem_db();
         let (_design, artifact_id) = seed_design_owned_artifact(&db);
         let c1 = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -1108,13 +1108,13 @@ mod tests {
             None,
         )
         .unwrap();
-        db.reclassify_comment_intent(&c1.id, "directive", 0.85).unwrap();
+        db.reclassify_comment_intent(&c1.id, "revision", 0.85).unwrap();
         db.transition_comment_awaiting_followup_to_active(&c1.id).unwrap();
 
         // An ordinary directive comment with no bucket-2 history alongside
         // it — its directive text must not gain any bridge context.
         let c2 = make_comment(&db, &artifact_id, "beta");
-        db.set_comment_intent(&c2.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c2.id, "revision", 0.9).unwrap();
 
         let outcome = db
             .revise_doc(
@@ -1157,7 +1157,7 @@ mod tests {
         .unwrap();
 
         // A comment auto-classified `question`, answered by the answer
-        // agent, then manually reclassified to `larger_change` by the user
+        // agent, then manually reclassified to `revision` by the user
         // via the sidebar intent badge — the exact repro from T2265's
         // design doc (PR spinyfin/mono#1791): the answer agent has already
         // finished (status = 'answered'), so there is no bucket-2 bridge in
@@ -1182,16 +1182,16 @@ mod tests {
         let answered = db.transition_comment_to_answered(&c1.id).unwrap();
         assert_eq!(answered.status, "answered");
 
-        // The user reclassifies to `larger_change` — before the fix, this
+        // The user reclassifies to `revision` — before the fix, this
         // left the comment stuck at status='answered', invisible to
         // `[Revise]`.
-        let overridden = db.override_comment_intent(&c1.id, "larger_change").unwrap();
+        let overridden = db.override_comment_intent(&c1.id, "revision").unwrap();
         assert_eq!(overridden.status, "active");
 
-        // An ordinary larger_change comment alongside it, to mirror the
-        // repro's "four other larger_change comments" batch.
+        // An ordinary revision comment alongside it, to mirror the
+        // repro's "four other larger-change comments" batch.
         let c2 = make_comment(&db, &artifact_id, "beta");
-        db.set_comment_intent(&c2.id, "larger_change", 0.9).unwrap();
+        db.set_comment_intent(&c2.id, "revision", 0.9).unwrap();
 
         // The banner must count the reclassified comment before dispatch.
         let banner = db.comments_banner_state("pr_doc", &artifact_id).unwrap();
@@ -1256,13 +1256,13 @@ mod tests {
         let artifact_id = seed_open_pr_design_artifact(&db);
 
         let addressable = make_comment(&db, &artifact_id, "alpha");
-        db.set_comment_intent(&addressable.id, "larger_change", 0.9).unwrap();
-        // Badged `larger_change` in the sidebar, but its anchor is gone — so
+        db.set_comment_intent(&addressable.id, "revision", 0.9).unwrap();
+        // Badged `revision` in the sidebar, but its anchor is gone — so
         // the batch cannot address it. An orphaned comment is still badged
-        // `larger_change` in the sidebar, so dropping it silently is
+        // `revision` in the sidebar, so dropping it silently is
         // indistinguishable from addressing it.
         let orphaned = make_comment(&db, &artifact_id, "beta");
-        db.set_comment_intent(&orphaned.id, "larger_change", 0.9).unwrap();
+        db.set_comment_intent(&orphaned.id, "revision", 0.9).unwrap();
         db.set_comment_status(&orphaned.id, "orphaned", Some("engine")).unwrap();
 
         let outcome = db
@@ -1313,7 +1313,7 @@ mod tests {
             Some("reclassified"),
         )
         .unwrap();
-        let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        let overridden = db.override_comment_intent(&comment.id, "revision").unwrap();
         assert_eq!(overridden.status, "active");
 
         let outcome = db

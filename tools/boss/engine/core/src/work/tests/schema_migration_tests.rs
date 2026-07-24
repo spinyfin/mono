@@ -376,3 +376,106 @@ fn migration_normalises_empty_effort_level_to_null() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Comment intent taxonomy collapse: existing rows carrying the classifier's
+/// retired `directive`/`larger_change` values must be re-homed onto the
+/// single `revision` value on the next DB open, so they keep matching
+/// `revisable_comment_predicate` (`intent = 'revision'`) instead of silently
+/// falling out of the `[Revise]` candidate pool. A `question` row is an
+/// untouched control.
+#[test]
+fn migration_collapses_directive_and_larger_change_intent_to_revision() {
+    let (_dir, path) = disk_db_path("collapse-directive-larger-change-intent");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let directive_comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "a comment".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    let larger_change_comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "beta".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "another comment".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    let question_comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "gamma".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "a question".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&question_comment.id, "question", 0.9).unwrap();
+
+    // Bypass `set_comment_intent`'s validation (which now rejects these
+    // retired values) to simulate legacy rows written before the collapse.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_comments SET intent = 'directive', intent_classified_at = '1' WHERE id = ?1",
+            [&directive_comment.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_comments SET intent = 'larger_change', intent_classified_at = '1' WHERE id = ?1",
+            [&larger_change_comment.id],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    // Re-opening runs the migration which collapses both retired values.
+    let db = WorkDb::open(path.clone()).unwrap();
+    assert_eq!(
+        db.get_comment(&directive_comment.id)
+            .unwrap()
+            .unwrap()
+            .intent
+            .as_deref(),
+        Some("revision"),
+        "a legacy 'directive' row must be re-homed onto 'revision'",
+    );
+    assert_eq!(
+        db.get_comment(&larger_change_comment.id)
+            .unwrap()
+            .unwrap()
+            .intent
+            .as_deref(),
+        Some("revision"),
+        "a legacy 'larger_change' row must be re-homed onto 'revision'",
+    );
+    assert_eq!(
+        db.get_comment(&question_comment.id).unwrap().unwrap().intent.as_deref(),
+        Some("question"),
+        "a 'question' row must be left untouched by the collapse migration",
+    );
+
+    let _ = std::fs::remove_file(path);
+}

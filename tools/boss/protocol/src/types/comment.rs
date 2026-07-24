@@ -54,7 +54,7 @@ pub const COMMENT_STATUS_RESOLVED: &str = "resolved";
 pub const COMMENT_STATUS_ORPHANED: &str = "orphaned";
 pub const COMMENT_STATUS_DISMISSED: &str = "dismissed";
 /// Phase 2 (buckets 1&3, `comment-triggered-document-revisions.md`): a
-/// `directive`/`larger_change` comment addressed by a `CommentsReviseDoc`
+/// `revision`-classified comment addressed by a `CommentsReviseDoc`
 /// batch. `revise_task_id` is set for the duration of this status.
 /// Transitions `active` → `in_revision` on the guarded batch UPDATE;
 /// `in_revision` → `resolved` (task done) or `active` (task
@@ -70,14 +70,14 @@ pub const COMMENT_STATUS_ANSWERING: &str = "answering";
 /// Bucket-2 track (P3b): the answer agent posted its reply (or the run ended
 /// without one). Awaits an operator follow-up (phase 3c reclassifies it back
 /// into `answering` for another question, or into `active` for a
-/// directive/larger-change bridge into the revision path).
+/// revision bridge into the revision path).
 pub const COMMENT_STATUS_ANSWERED: &str = "answered";
 /// Bucket-2 track (P3c): an operator has posted an `entry_kind =
 /// 'operator_followup'` reply on an `answered` comment; the reply is being
 /// (re)classified. Exits back to [`COMMENT_STATUS_ANSWERING`] if the
 /// follow-up reclassifies as `question` (the answer agent runs again with
 /// the accumulated thread as context), or to [`COMMENT_STATUS_ACTIVE`] if it
-/// reclassifies as `directive`/`larger_change` (the bucket-1&3 bridge — the
+/// reclassifies as `revision` (the bucket-1&3 bridge — the
 /// comment re-enters the `[Revise]` candidate pool with the bucket-2
 /// thread's context carried into the eventual directive).
 pub const COMMENT_STATUS_AWAITING_FOLLOWUP: &str = "awaiting_followup";
@@ -89,13 +89,17 @@ pub const RESOLVED_WITH_FUZZY: &str = "fuzzy";
 pub const RESOLVED_WITH_ORPHAN: &str = "orphan";
 
 /// Comment intent-classification values (`work_comments.intent`). A
-/// `directive`/`larger_change` classification routes to the revision/
-/// update-task path; `question` routes to the read-only answer agent. Both
-/// routing paths are later phases — see
+/// `revision` classification routes to the revision/update-task path;
+/// `question` routes to the read-only answer agent. Both routing paths are
+/// later phases — see
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
-pub const INTENT_DIRECTIVE: &str = "directive";
+///
+/// Intent is a binary routing decision: nothing downstream — the
+/// `[Revise]` batch predicate, the nudge trigger, the answered/active
+/// transitions, manual override — distinguishes a small edit from a
+/// substantive one, so both are `revision`.
+pub const INTENT_REVISION: &str = "revision";
 pub const INTENT_QUESTION: &str = "question";
-pub const INTENT_LARGER_CHANGE: &str = "larger_change";
 
 pub fn default_comment_status() -> String {
     COMMENT_STATUS_ACTIVE.to_owned()
@@ -432,9 +436,9 @@ pub struct WorkComment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_actor: Option<String>,
 
-    /// `directive` | `question` | `larger_change` — the async classifier's
-    /// output. `NULL` while classification is in flight; this doubles as
-    /// the transient `classifying` state (no separate `status` value).
+    /// `revision` | `question` — the async classifier's output. `NULL`
+    /// while classification is in flight; this doubles as the transient
+    /// `classifying` state (no separate `status` value).
     /// Comment-intent-classification design § "The classifier".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,

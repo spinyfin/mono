@@ -1837,6 +1837,21 @@ pub(crate) fn migrate_work_comments_revise_task_id_column(conn: &Connection) -> 
     Ok(())
 }
 
+/// One-time data migration: re-homes rows still carrying the retired
+/// `directive` / `larger_change` intent values onto the single
+/// `INTENT_REVISION` ("revision") value, so they keep matching
+/// `revisable_comment_predicate` (`intent = 'revision'`) rather than
+/// silently falling out of the `[Revise]` candidate pool. Data-only, no
+/// schema change. Idempotent: only rows still carrying one of the two
+/// retired values are touched, so a second run affects zero rows.
+pub(crate) fn migrate_collapse_directive_larger_change_intent(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE work_comments SET intent = 'revision' WHERE intent IN ('directive', 'larger_change')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// One-time data migration (Phase 2 task 2e, magic-wand removal, of
 /// `comment-triggered-document-revisions.md`): retires every `work_comments`
 /// row left in `status = 'dispatched'` by the now-deleted magic-wand

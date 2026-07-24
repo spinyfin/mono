@@ -78,7 +78,7 @@ impl WorkDb {
     }
 
     /// Post an `entry_kind='nudge'` thread entry on `comment_id`. Called
-    /// immediately on `directive`/`larger_change` classification (design §
+    /// immediately on `revision` classification (design §
     /// "Buckets 1 & 3 — unified"); `revise_task_id` starts `NULL` and is
     /// filled in later, once a `[Revise]` batch actually claims the comment.
     pub fn create_nudge_thread_entry(&self, comment_id: &str, body: &str) -> Result<CommentThreadEntry> {

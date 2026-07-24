@@ -30,7 +30,7 @@ protocol CommentBackend: AnyObject {
     /// Post an operator follow-up reply in a bucket-2 comment's thread.
     func postFollowup(commentId: String, body: String)
     /// The `[Revise]`-banner action: batch-address every unaddressed
-    /// directive/larger_change comment on the artifact.
+    /// `revision` comment on the artifact.
     func reviseDoc(artifactKind: String, artifactId: String)
 }
 

@@ -44,7 +44,7 @@
 //! distinguishing `error_kind`, post the apology thread entry so the thread
 //! isn't silently stuck, then `transition_comment_to_answered`, which is
 //! intent-aware and lands a comment already reclassified to
-//! `directive`/`larger_change` on `active` instead. This sweep is a
+//! `revision` on `active` instead. This sweep is a
 //! *substitute for a Stop that never came*, not a second, divergent recovery
 //! policy — except when the answer already landed (the run went `replied` or
 //! `superseded` but the comment's transition didn't follow), in which case
@@ -274,7 +274,7 @@ fn recover(work_db: &WorkDb, comment: &WorkComment) -> bool {
 mod tests {
     use super::*;
     use boss_protocol::{
-        ANSWER_AGENT_RUN_STATUS_FAILED, CommentAnchor, CreateCommentInput, INTENT_LARGER_CHANGE, INTENT_QUESTION,
+        ANSWER_AGENT_RUN_STATUS_FAILED, CommentAnchor, CreateCommentInput, INTENT_QUESTION, INTENT_REVISION,
         THREAD_ENTRY_KIND_ANSWER,
     };
     use std::path::PathBuf;
@@ -337,8 +337,7 @@ mod tests {
         let comment_id = seed_answering(&db, INTENT_QUESTION);
         // Reclassified mid-flight by something that didn't re-home the status
         // (the engine-side follow-up reclassifier), then stranded.
-        db.reclassify_comment_intent(&comment_id, INTENT_LARGER_CHANGE, 0.8)
-            .unwrap();
+        db.reclassify_comment_intent(&comment_id, INTENT_REVISION, 0.8).unwrap();
         let mut seen = HashSet::new();
 
         run_one_pass(&db, &mut seen).await;
