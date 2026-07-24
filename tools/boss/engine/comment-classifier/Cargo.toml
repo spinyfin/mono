@@ -1,5 +1,5 @@
 [package]
-name = "boss-comment-classifier"
+name = "boss-engine-comment-classifier"
 version.workspace = true
 edition.workspace = true
 workspace = "../../../.."
