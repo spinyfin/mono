@@ -397,7 +397,8 @@ impl WorkDb {
 
         let mut stmt = conn.prepare(
             "SELECT id, automation_id, scheduled_for, started_at, finished_at,
-                    triage_execution_id, outcome, produced_task_id, detail
+                    triage_execution_id, outcome, produced_task_id, detail,
+                    first_attempted_at
                FROM automation_runs
               WHERE automation_id = ?1
               ORDER BY scheduled_for DESC, started_at DESC
@@ -591,7 +592,8 @@ impl WorkDb {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, automation_id, scheduled_for, started_at, finished_at,
-                    triage_execution_id, outcome, produced_task_id, detail
+                    triage_execution_id, outcome, produced_task_id, detail,
+                    first_attempted_at
                FROM automation_runs
               WHERE automation_id = ?1 AND scheduled_for = ?2",
             params![automation_id, scheduled_for_epoch.to_string()],
@@ -599,6 +601,72 @@ impl WorkDb {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Finalise any non-terminal held retries (`failed_will_retry`, never
+    /// dispatched) for `automation_id` whose occurrence is strictly older
+    /// than `collapsed_to` — the occurrence the catch-up collapse just
+    /// walked past.
+    ///
+    /// The stale-catch-up skip (step 4) only ever looks up and advances past
+    /// `most_recent`, the *collapsed* latest occurrence at or before now. If
+    /// no pass ran between an earlier hold and the next occurrence, the
+    /// collapse jumps `most_recent` straight past the held row without ever
+    /// re-evaluating it: `automation_run_for_occurrence` for the new
+    /// `most_recent` returns `None`, so the held row is never looked at again
+    /// and is left at `failed_will_retry` with a NULL `finished_at`
+    /// forever — reading "Failed (retrying)" for an occurrence that will
+    /// never actually be retried. Called right after a stale-catch-up skip so
+    /// every such row is finalised honestly as `failed_gave_up` instead.
+    pub fn finalize_stale_retry_holds_before(
+        &self,
+        automation_id: &str,
+        collapsed_to_epoch: i64,
+        now_epoch: i64,
+        detail_suffix: &str,
+    ) -> Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let stranded: Vec<(String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, detail FROM automation_runs
+                  WHERE automation_id = ?1 AND outcome = ?2 AND finished_at IS NULL
+                    AND triage_execution_id IS NULL
+                    AND CAST(scheduled_for AS INTEGER) < ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    automation_id,
+                    boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                    collapsed_to_epoch
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let finalized = stranded.len();
+        for (id, detail) in stranded {
+            let new_detail = format!(
+                "gave up: {detail_suffix}; last failure: {}",
+                detail.as_deref().unwrap_or("unknown")
+            );
+            tx.execute(
+                "UPDATE automation_runs
+                    SET outcome = ?2, finished_at = ?3, detail = ?4
+                  WHERE id = ?1",
+                params![
+                    id,
+                    boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                    now_epoch.to_string(),
+                    new_detail
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(finalized)
     }
 
     /// Record one scheduler decision and advance the automation's
@@ -656,8 +724,9 @@ impl WorkDb {
                 tx.execute(
                     "INSERT INTO automation_runs
                          (id, automation_id, scheduled_for, started_at, finished_at,
-                          triage_execution_id, outcome, produced_task_id, detail)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                          triage_execution_id, outcome, produced_task_id, detail,
+                          first_attempted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         run_id,
                         record.automation_id,
@@ -668,6 +737,7 @@ impl WorkDb {
                         record.outcome,
                         record.produced_task_id,
                         record.detail,
+                        started_at,
                     ],
                 )?;
             }
@@ -795,7 +865,8 @@ impl WorkDb {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT id, automation_id, scheduled_for, started_at, finished_at,
-                    triage_execution_id, outcome, produced_task_id, detail
+                    triage_execution_id, outcome, produced_task_id, detail,
+                    first_attempted_at
                FROM automation_runs
               WHERE triage_execution_id = ?1
               ORDER BY scheduled_for DESC, started_at DESC
