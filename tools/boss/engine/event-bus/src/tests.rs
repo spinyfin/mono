@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{Event, EventBus, EventKind, Registry, TopicFilter};
 
@@ -91,18 +92,11 @@ async fn topic_filter_with_multiple_kinds_matches_any() {
     );
 }
 
-#[tokio::test]
-async fn full_mailbox_drops_event_instead_of_blocking() {
-    let bus = EventBus::new();
-    let mut sub = bus.subscribe_with_capacity(TopicFilter::kind(EventKind::DispatchReady), 1);
-
-    // Mailbox capacity is 1: the first publish fills it, the second is
-    // dropped rather than blocking the publisher.
-    bus.publish(Event::DispatchReady);
-    bus.publish(Event::DispatchReady);
-
-    assert_eq!(sub.recv().await, Some(Event::DispatchReady));
-}
+// `full_mailbox_drops_event_instead_of_blocking` (which used to publish
+// two identical events into a capacity-1 mailbox) is removed: under the
+// always-coalesce behaviour those two events coalesce rather than drop,
+// so the case is now covered by `full_mailbox_drops_distinct_key_event_and_counts_it`
+// below, which uses two distinct keys and also asserts the drop counter.
 
 #[tokio::test]
 async fn full_mailbox_coalesces_same_key_event_instead_of_dropping() {
@@ -208,6 +202,81 @@ async fn coalescing_keeps_up_under_a_pressure_burst() {
 }
 
 #[tokio::test]
+async fn pending_index_rebases_correctly_after_a_pop_with_multiple_keys_resident() {
+    // Exercises `Mailbox::pop_front_locked`'s index bookkeeping with more
+    // than one event resident at once -- a wrong-index bug here would
+    // otherwise slip through every other test, none of which has more
+    // than one key in the mailbox simultaneously.
+    let registry = Arc::new(Registry::new());
+    let bus = EventBus::with_metrics(registry.clone());
+    let mut sub = bus.subscribe_with_capacity(TopicFilter::kind(EventKind::TaskTerminal), 3);
+
+    // Fill all three slots: A, B, C (in that order).
+    bus.publish(Event::TaskTerminal {
+        task_id: "A".to_string(),
+        project_id: "p_A1".to_string(),
+    });
+    bus.publish(Event::TaskTerminal {
+        task_id: "B".to_string(),
+        project_id: "p_B1".to_string(),
+    });
+    bus.publish(Event::TaskTerminal {
+        task_id: "C".to_string(),
+        project_id: "p_C1".to_string(),
+    });
+
+    // Drain A, freeing its slot and shifting B and C's front-relative
+    // positions down by one.
+    assert_eq!(
+        sub.recv().await,
+        Some(Event::TaskTerminal {
+            task_id: "A".to_string(),
+            project_id: "p_A1".to_string(),
+        })
+    );
+
+    // A fresh event for A gets a brand-new slot (queued behind B and C);
+    // a newer event for C coalesces into C's shifted slot in place.
+    bus.publish(Event::TaskTerminal {
+        task_id: "A".to_string(),
+        project_id: "p_A2".to_string(),
+    });
+    bus.publish(Event::TaskTerminal {
+        task_id: "C".to_string(),
+        project_id: "p_C2".to_string(),
+    });
+
+    assert_eq!(
+        sub.recv().await,
+        Some(Event::TaskTerminal {
+            task_id: "B".to_string(),
+            project_id: "p_B1".to_string(),
+        })
+    );
+    assert_eq!(
+        sub.recv().await,
+        Some(Event::TaskTerminal {
+            task_id: "C".to_string(),
+            project_id: "p_C2".to_string(),
+        }),
+        "C's slot must hold the newer coalesced event"
+    );
+    assert_eq!(
+        sub.recv().await,
+        Some(Event::TaskTerminal {
+            task_id: "A".to_string(),
+            project_id: "p_A2".to_string(),
+        }),
+        "A must have gotten a fresh slot after its first event was drained"
+    );
+    assert_eq!(
+        registry.counter_value("bus_events_dropped_total.task_terminal"),
+        None,
+        "every event here either queued into a free slot or coalesced -- nothing was dropped"
+    );
+}
+
+#[tokio::test]
 async fn drop_counter_is_independent_per_topic() {
     let registry = Arc::new(Registry::new());
     let bus = EventBus::with_metrics(registry.clone());
@@ -247,13 +316,61 @@ async fn without_metrics_dropped_events_do_not_panic() {
     // tests and any caller that doesn't care about metrics shouldn't be
     // forced to wire one up.
     let bus = EventBus::new();
-    let mut sub = bus.subscribe_with_capacity(TopicFilter::kind(EventKind::DispatchReady), 0);
+    let mut sub = bus.subscribe_with_capacity(TopicFilter::kind(EventKind::TaskTerminal), 1);
 
-    bus.publish(Event::DispatchReady);
+    // Capacity 1, filled with task_1's pending event. task_2 is a
+    // distinct key with no pending slot to coalesce into, so it is
+    // dropped -- without a registry wired up, that must not panic.
+    bus.publish(Event::TaskTerminal {
+        task_id: "task_1".to_string(),
+        project_id: "proj_1".to_string(),
+    });
+    bus.publish(Event::TaskTerminal {
+        task_id: "task_2".to_string(),
+        project_id: "proj_2".to_string(),
+    });
 
-    // Capacity 0: nothing was ever queued.
     drop(bus);
+    assert_eq!(
+        sub.recv().await,
+        Some(Event::TaskTerminal {
+            task_id: "task_1".to_string(),
+            project_id: "proj_1".to_string(),
+        })
+    );
     assert_eq!(sub.recv().await, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recv_parked_before_drop_still_wakes_up_with_none() {
+    // Unlike `subscription_recv_returns_none_after_bus_dropped_and_drained`
+    // (which drops the bus before `recv` is ever polled), this spawns
+    // `recv` on its own worker thread and gives it real wall-clock time
+    // to register with `Notify` and genuinely park -- queue empty, bus
+    // not yet closed -- before the bus is dropped from the main task.
+    // `Mailbox::close` must still wake it, or this hangs and the test
+    // times out. Note this cannot deterministically hit the specific
+    // lock-release-then-register interleaving that made the lost-wakeup
+    // bug possible -- that window is far too narrow for a wall-clock
+    // sleep to land in reliably -- so it does not by itself prove that
+    // bug fixed; `Mailbox::close`'s use of `notify_one` (which stores a
+    // permit even for a not-yet-registered waiter, unlike
+    // `notify_waiters`) is what closes that window.
+    let bus = EventBus::new();
+    let mut sub = bus.subscribe(TopicFilter::kind(EventKind::DispatchReady));
+
+    let recv_task = tokio::spawn(async move { sub.recv().await });
+
+    // Give the spawned task a real chance to run past its empty-queue
+    // check and start awaiting `notified()` before we drop the bus.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(bus);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), recv_task)
+        .await
+        .expect("recv() must wake up after the bus is dropped, not hang forever")
+        .expect("recv task must not panic");
+    assert_eq!(result, None);
 }
 
 #[tokio::test]
