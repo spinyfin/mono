@@ -428,7 +428,8 @@ struct ServerState {
     /// The events-socket accept loop publishes the hook-observable
     /// transitions onto it. The merge poller subscribes to the
     /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
-    /// the broad `pr_reconciler_kick` sweep.
+    /// the broad `pr_reconciler_kick` sweep; `orphan_sweep::spawn_event_subscriber`
+    /// is another subscriber, wired in `app::server::serve`.
     #[builder(default = Arc::new(EventBus::new()))]
     event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,

@@ -1308,6 +1308,18 @@ pub async fn serve_with_merge_probe(
         Duration::from_secs(60),
     );
 
+    // Event-driven fast path for the same reconciler: on `ExecutionTerminal`
+    // redispatch the terminated execution's work item immediately if it is
+    // now orphaned, instead of waiting up to 60s for the sweep above. The
+    // periodic sweep stays as the unconditional backstop for whatever the
+    // best-effort bus drops.
+    let _orphan_sweep_event_handle = crate::orphan_sweep::spawn_event_subscriber(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        server_state.event_bus.clone(),
+    );
+
     // Periodic dispatch-failure recovery reconciler: the pre-spawn
     // sibling of the orphan-active sweep above. Re-enqueues work items
     // the engine bounced to Backlog after a pre-spawn dispatch failure

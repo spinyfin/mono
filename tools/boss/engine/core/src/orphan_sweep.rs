@@ -9,7 +9,13 @@
 //! `bossctl work start <id>`.
 //!
 //! The sweep runs every 60 seconds and fires once immediately on
-//! engine boot (same startup-sweep pattern as the merge poller). Each
+//! engine boot (same startup-sweep pattern as the merge poller). It is
+//! also event-driven: [`spawn_event_subscriber`] subscribes to
+//! [`Event::ExecutionTerminal`] and re-evaluates just the terminated
+//! execution's work item immediately, so an orphan left behind by a
+//! worker crash is usually redispatched within milliseconds instead of
+//! waiting out the interval. The periodic sweep is kept unconditionally
+//! as the backstop for whatever the best-effort bus drops. Each
 //! pass:
 //!
 //! 1. Checks whether the worker pool has at least one idle slot; if
@@ -40,6 +46,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput};
 
 use crate::coordinator::ExecutionCoordinator;
@@ -107,8 +114,52 @@ pub fn spawn_loop(
     )
 }
 
-/// Run a single orphan-active sweep pass. Returns a summary of what
-/// happened; callers may log it.
+/// Subscribe to [`Event::ExecutionTerminal`] and redispatch the
+/// terminated execution's work item immediately if it is now orphaned
+/// (`active`, no live execution). This is the event-driven fast path
+/// alongside [`spawn_loop`]'s 60s backstop — not a replacement for it:
+/// delivery on the bus is best-effort (see `boss_event_bus::EventBus`),
+/// so the periodic sweep still catches whatever a dropped or missed
+/// event leaves behind.
+///
+/// Follows the subscriber crash-recovery contract documented on
+/// [`boss_event_bus::spawn_supervised`]: every attempt — the first, and
+/// each restart after a panic — runs a full [`run_one_pass`] before
+/// settling into its event loop, so a subscriber crash never leaves an
+/// orphan stranded until the next scheduled sweep tick.
+pub fn spawn_event_subscriber(
+    work_db: Arc<WorkDb>,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: Arc<dyn DispatchEventSink>,
+    event_bus: Arc<EventBus>,
+) -> tokio::task::JoinHandle<()> {
+    boss_event_bus::spawn_supervised("orphan_sweep_event", move || {
+        let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let event_bus = Arc::clone(&event_bus);
+        async move {
+            run_one_pass(work_db.as_ref(), Arc::clone(&coordinator), dispatch_events.as_ref()).await;
+
+            let mut subscription = event_bus.subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
+            while let Some(event) = subscription.recv().await {
+                let Event::ExecutionTerminal { task_id, .. } = event else {
+                    continue;
+                };
+                run_one_pass_for_item(
+                    work_db.as_ref(),
+                    Arc::clone(&coordinator),
+                    dispatch_events.as_ref(),
+                    &task_id,
+                )
+                .await;
+            }
+        }
+    })
+}
+
+/// Run a single orphan-active sweep pass over every candidate in the
+/// database. Returns a summary of what happened; callers may log it.
 ///
 /// Takes `coordinator` as `Arc` because kicking the scheduler
 /// requires `Arc<ExecutionCoordinator>` — the kick path spawns a
@@ -117,6 +168,43 @@ pub async fn run_one_pass(
     work_db: &WorkDb,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+) -> OrphanSweepOutcome {
+    run_one_pass_filtered(work_db, coordinator, dispatch_events, None).await
+}
+
+/// Event-driven counterpart of [`run_one_pass`]: re-evaluates only
+/// `work_item_id` instead of scanning every candidate in the database.
+/// Called from [`spawn_event_subscriber`] when an
+/// [`Event::ExecutionTerminal`] names this work item, so a post-crash
+/// orphan is usually redispatched within milliseconds of the terminal
+/// transition rather than waiting out the periodic sweep's interval.
+///
+/// Re-reads `work_item_id`'s candidacy from the DB rather than trusting
+/// the event payload — events are hints, not commands (see the
+/// event-bus design doc), so this is exactly as safe as a periodic pass
+/// that happens to observe the same row. Idempotent with the periodic
+/// sweep and with itself: a `work_item_id` that has already been
+/// redispatched (or is no longer a candidate) simply is not present in
+/// [`WorkDb::list_orphan_active_candidates`]'s result and this is a
+/// no-op.
+pub async fn run_one_pass_for_item(
+    work_db: &WorkDb,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    work_item_id: &str,
+) -> OrphanSweepOutcome {
+    run_one_pass_filtered(work_db, coordinator, dispatch_events, Some(work_item_id)).await
+}
+
+/// Shared implementation behind [`run_one_pass`] and
+/// [`run_one_pass_for_item`]. `only_work_item_id` restricts the pass to
+/// a single candidate when set; `None` scans every candidate (the
+/// periodic-sweep behavior).
+async fn run_one_pass_filtered(
+    work_db: &WorkDb,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    only_work_item_id: Option<&str>,
 ) -> OrphanSweepOutcome {
     let mut outcome = OrphanSweepOutcome::default();
 
@@ -144,6 +232,10 @@ pub async fn run_one_pass(
             tracing::warn!(?err, "orphan sweep: failed to list candidates; skipping pass");
             return outcome;
         }
+    };
+    let candidates = match only_work_item_id {
+        Some(id) => candidates.into_iter().filter(|c| c == id).collect(),
+        None => candidates,
     };
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -707,5 +799,150 @@ mod tests {
                 .any(|e| e.id == execution.id && e.status == ExecutionStatus::Running),
             "running pr_review execution must survive the sweep even when not in any pool"
         );
+    }
+
+    // ── event-driven path (run_one_pass_for_item / spawn_event_subscriber) ──
+
+    /// `run_one_pass_for_item` redispatches the named orphan, same as a full
+    /// `run_one_pass` would, when it is a genuine candidate.
+    #[tokio::test]
+    async fn run_one_pass_for_item_redispatches_matching_orphan() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass_for_item(db.as_ref(), coordinator.clone(), sink.as_ref(), &work_item_id).await;
+
+        assert_eq!(outcome.redispatched, 1);
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions.iter().any(|e| e.status == ExecutionStatus::Ready),
+            "expected a ready execution after the event-driven redispatch"
+        );
+    }
+
+    /// `run_one_pass_for_item` never acts on a work item other than the one
+    /// named — an `ExecutionTerminal` event for a different task must not
+    /// cause an unrelated orphan to be touched.
+    #[tokio::test]
+    async fn run_one_pass_for_item_ignores_other_work_items() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass_for_item(db.as_ref(), coordinator.clone(), sink.as_ref(), "task_unrelated").await;
+
+        assert_eq!(outcome.redispatched, 0);
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions.is_empty(),
+            "the named-but-unrelated work item must be left untouched"
+        );
+    }
+
+    /// Idempotency: once the periodic sweep (`run_one_pass`) has already
+    /// redispatched an orphan, a subsequent event-driven pass
+    /// (`run_one_pass_for_item`) for the same work item — e.g. the
+    /// `ExecutionTerminal` event racing the sweep that already reconciled
+    /// it — must be a no-op rather than double-dispatching.
+    #[tokio::test]
+    async fn event_driven_pass_is_idempotent_with_periodic_sweep() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let first = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        assert_eq!(
+            first.redispatched, 1,
+            "periodic sweep should redispatch the orphan once"
+        );
+
+        let second = run_one_pass_for_item(db.as_ref(), coordinator.clone(), sink.as_ref(), &work_item_id).await;
+        assert_eq!(
+            second.redispatched, 0,
+            "event-driven pass for the same work item must be a no-op once already redispatched"
+        );
+
+        let ready_count = db
+            .list_executions(Some(&work_item_id))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.status == ExecutionStatus::Ready)
+            .count();
+        assert_eq!(ready_count, 1, "exactly one ready execution, not a duplicate");
+    }
+
+    /// End-to-end: `spawn_event_subscriber` actually redispatches an
+    /// orphan when an `ExecutionTerminal` event is published on the bus.
+    /// The subscriber's initial full reconcile pass is deliberately
+    /// starved of an idle worker slot (the pool's one slot is pre-claimed)
+    /// so it observes `no_worker_skipped` and does nothing — isolating the
+    /// assertion to the event-driven path rather than the startup
+    /// reconcile that every subscriber also runs.
+    #[tokio::test]
+    async fn spawn_event_subscriber_redispatches_on_execution_terminal() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let dummy_worker_id = coordinator
+            .worker_pool()
+            .claim_worker("dummy-exec-id", None)
+            .await
+            .expect("test pool must have a slot to claim");
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let bus = Arc::new(EventBus::new());
+
+        let _handle = spawn_event_subscriber(db.clone(), coordinator.clone(), sink.clone(), bus.clone());
+
+        // Let the subscriber's initial full-reconcile pass run and observe
+        // no idle worker before we free the slot below.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            db.list_executions(Some(&work_item_id)).unwrap().is_empty(),
+            "startup reconcile must not have redispatched while the pool was fully claimed"
+        );
+
+        coordinator.worker_pool().release_worker(&dummy_worker_id, None).await;
+
+        bus.publish(Event::ExecutionTerminal {
+            execution_id: "dummy-exec-id".to_owned(),
+            task_id: work_item_id.clone(),
+            host_id: "local".to_owned(),
+            pool_claim: None,
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let executions = db.list_executions(Some(&work_item_id)).unwrap();
+                if executions.iter().any(|e| e.status == ExecutionStatus::Ready) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("event-driven redispatch did not happen before the timeout");
     }
 }
