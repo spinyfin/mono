@@ -79,24 +79,51 @@ impl WorkDb {
     /// Most recently created `design_postmortem` task for `project_id`
     /// (deleted or not), or `None` if the project has never had one.
     ///
-    /// Used by `project_postmortem_sweep` both as the dedup gate (skip
-    /// scheduling while the returned task is live and still open) and as
-    /// the timestamp cutoff for "implementation work completed since the
-    /// last postmortem" (a wave of zero net work must not spawn another
-    /// one). Deliberately includes soft-deleted rows: excluding them would
-    /// let deleting an unwanted postmortem erase its "already reviewed up
-    /// to here" boundary, re-arming the trigger and causing the sweep to
-    /// immediately re-backfill the very history the deletion was meant to
-    /// dismiss — the caller (`project_postmortem_sweep::evaluate_project`)
-    /// is responsible for treating a deleted row as not gating (only a
-    /// live, non-terminal postmortem blocks scheduling) while still using
-    /// it as a cutoff anchor.
+    /// Used by `project_postmortem_sweep` solely as the timestamp cutoff for
+    /// "implementation work completed since the last postmortem" (a wave of
+    /// zero net work must not spawn another one). For the dedup gate itself
+    /// (skip scheduling while a postmortem is still open), use
+    /// [`Self::last_live_design_postmortem_for_project`] instead — mixing
+    /// the two concerns into one row let a newer *deleted* postmortem mask
+    /// an older *live, still-open* one and defeat the gate. Deliberately
+    /// includes soft-deleted rows: excluding them would let deleting an
+    /// unwanted postmortem erase its "already reviewed up to here" boundary,
+    /// re-arming the trigger and causing the sweep to immediately re-
+    /// backfill the very history the deletion was meant to dismiss.
     pub fn last_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
         let conn = self.connect()?;
         let id: Option<String> = conn
             .query_row(
                 "SELECT id FROM tasks
                  WHERE project_id = ?1 AND kind = 'design_postmortem'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => query_task(&conn, &id),
+            None => Ok(None),
+        }
+    }
+
+    /// Most recently created *live* (non-deleted) `design_postmortem` task
+    /// for `project_id`, or `None` if there isn't one.
+    ///
+    /// This is `project_postmortem_sweep`'s dedup gate: a live, non-terminal
+    /// postmortem blocks scheduling a duplicate; a soft-deleted one never
+    /// does. Sibling to [`Self::last_design_postmortem_for_project`], which
+    /// answers a different question (the cutoff anchor, which must keep
+    /// considering tombstones, see its doc comment) and must not be reused
+    /// for this purpose: a newer deleted row from that query would mask an
+    /// older, still-live, still-open one and defeat the gate.
+    pub fn last_live_design_postmortem_for_project(&self, project_id: &str) -> Result<Option<Task>> {
+        let conn = self.connect()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE project_id = ?1 AND kind = 'design_postmortem' AND deleted_at IS NULL
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1",
                 params![project_id],
@@ -124,8 +151,8 @@ impl WorkDb {
     /// `effort_level` is stamped explicitly to `Medium` rather than left
     /// `NULL` — see incident postmortem-archived-fanout-2026-07-20: an
     /// unclassified engine-created row silently falls through to
-    /// `resolve_spawn_config`'s untagged-row fallback with no operator
-    /// visibility into why. That fallback is `engine_default = "opus"` at
+    /// `resolve_spawn_config`'s untagged-row fallback with no visibility
+    /// into why. That fallback is `engine_default = "opus"` at
     /// HEAD (never Fable — see `claude.rs`'s `ModelMenu` doc comment), but
     /// an explicit level makes the choice visible on the row itself
     /// (`boss task show`) and stops it drifting with whatever the fallback
