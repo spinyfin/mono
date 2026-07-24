@@ -99,6 +99,7 @@ pub mod pr_review_recovery;
 pub mod pr_url_capture;
 pub mod project_postmortem_sweep;
 pub(crate) mod prompt_fragments;
+pub mod proposal_channel_error;
 pub mod proposal_expiry_sweep;
 pub mod protocol;
 pub(crate) mod reconcile_audit;

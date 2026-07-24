@@ -31,7 +31,8 @@ use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
     FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry,
-    ROSTER, RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkspacePoolEntry,
+    ProposalKind, ProposalState, ROSTER, RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal,
+    WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -634,6 +635,40 @@ enum WorkAction {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Inspect the `worker_proposals` ledger.
+    Proposals {
+        #[command(subcommand)]
+        action: ProposalsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProposalsAction {
+    /// List `worker_proposals` rows, newest first, optionally filtered.
+    /// Shows the full ledger — including `rejected`/`expired` history —
+    /// per the design's §"UI visibility and provenance": the ledger is
+    /// CLI-inspectable even though it gets no app-side UI surface. Reads
+    /// `state.db` directly (same resolution as `metrics`/`hosts`), so it
+    /// works even when the engine is wedged.
+    List {
+        /// Restrict to proposals filed against this execution.
+        #[arg(long)]
+        execution_id: Option<String>,
+        /// Restrict to proposals filed against this work item (across all
+        /// its executions).
+        #[arg(long)]
+        work_item_id: Option<String>,
+        /// Restrict to one proposal kind (e.g. `followup_task`, `blocked`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Restrict to one disposition (`proposed`, `applied`, `rejected`,
+        /// `superseded`, `expired`).
+        #[arg(long)]
+        state: Option<String>,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -912,6 +947,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 state_root,
             },
         } => work_executions(cli.json, state_root, &work_item_id),
+        Command::Work {
+            action:
+                WorkAction::Proposals {
+                    action:
+                        ProposalsAction::List {
+                            execution_id,
+                            work_item_id,
+                            kind,
+                            state,
+                            state_root,
+                        },
+                },
+        } => work_proposals_list(cli.json, state_root, execution_id, work_item_id, kind, state),
         Command::Workspace {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
@@ -1947,6 +1995,74 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
         }
     }
     Ok(())
+}
+
+/// `bossctl work proposals list` — the `worker_proposals` ledger,
+/// optionally filtered by execution/work-item/kind/state. Opens `state.db`
+/// directly via [`resolve_db_path`] (same resolution `metrics`/`hosts`/
+/// `work executions` use), so it works even when the engine is wedged.
+///
+/// Per the design's §"UI visibility and provenance", proposals get no
+/// app-side listing surface — this CLI verb is the full ledger, including
+/// `rejected`/`expired` history, which is why `state` is left unfiltered
+/// by default rather than defaulting to `proposed` only.
+fn work_proposals_list(
+    json: bool,
+    state_root: Option<PathBuf>,
+    execution_id: Option<String>,
+    work_item_id: Option<String>,
+    kind: Option<String>,
+    state: Option<String>,
+) -> Result<()> {
+    let kind = kind
+        .map(|k| k.parse::<ProposalKind>())
+        .transpose()
+        .map_err(|err| anyhow::anyhow!(err))
+        .context("parsing --kind")?;
+    let state = state
+        .map(|s| s.parse::<ProposalState>())
+        .transpose()
+        .map_err(|err| anyhow::anyhow!(err))
+        .context("parsing --state")?;
+
+    let db = open_state_db(state_root)?;
+    let proposals = db
+        .list_worker_proposals(execution_id.as_deref(), work_item_id.as_deref(), kind, state)
+        .context("listing worker proposals")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "proposals": proposals,
+            })
+        );
+    } else if proposals.is_empty() {
+        println!("no proposals match the given filters");
+    } else {
+        for proposal in &proposals {
+            print_proposal_row(proposal);
+        }
+    }
+    Ok(())
+}
+
+fn print_proposal_row(proposal: &WorkerProposal) {
+    let work_item = proposal.work_item_id.as_deref().unwrap_or("-");
+    println!(
+        "{}  [{}]  kind={}  execution={}  work_item={}  created={}",
+        proposal.id, proposal.state, proposal.kind, proposal.execution_id, work_item, proposal.created_at,
+    );
+    if let Some(applied_ref) = &proposal.applied_ref {
+        println!("  applied_ref: {applied_ref}");
+    }
+    if let Some(decision_reason) = &proposal.decision_reason {
+        let decided_by = proposal
+            .decided_by
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  decision ({decided_by}): {decision_reason}");
+    }
 }
 
 fn print_execution_history_row(exec: &WorkExecution, host: &str) {

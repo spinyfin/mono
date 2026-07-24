@@ -322,6 +322,32 @@ pub(super) async fn dispatch_live_worker_state(
                         }
                     }
                 }
+
+                // proposal_channel_error detection: a `boss propose <kind>`
+                // Bash invocation that failed. Staged in-memory against the
+                // execution id; `on_stop` files an attention and increments
+                // `worker_proposals.channel_error`. See
+                // `crate::proposal_channel_error`.
+                if crate::proposal_channel_error::is_boss_propose_submit_command(tool_input)
+                    && let Some(error_text) = crate::proposal_channel_error::extract_channel_error(tool_response)
+                {
+                    let command = tool_input
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("boss propose")
+                        .to_owned();
+                    if server_state
+                        .staged_proposal_channel_errors
+                        .record_if_unset(run_id, &command, &error_text)
+                    {
+                        tracing::warn!(
+                            execution_id = run_id,
+                            command = %command,
+                            error_text = %error_text,
+                            "proposal_channel_error: staged a failed `boss propose` submission",
+                        );
+                    }
+                }
             }
         }
         _ => {}

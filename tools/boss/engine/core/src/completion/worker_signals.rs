@@ -379,6 +379,71 @@ impl WorkerCompletionHandler {
         }
     }
 
+    /// Consume this execution's staged `proposal_channel_error` (if any —
+    /// see [`crate::proposal_channel_error`]), file an attention for it, and
+    /// increment `worker_proposals.channel_error`. Design §"Failure
+    /// semantics: degrade loudly": "the completion path records
+    /// `proposal_channel_error` on the run outcome and files an
+    /// engine-side attention, so the degradation is recorded, not inferred
+    /// from prose." Best-effort: filing failures are logged and swallowed,
+    /// never block completion.
+    pub(super) async fn detect_and_file_proposal_channel_error(&self, execution: &crate::work::WorkExecution) {
+        let Some(staged) = self.staged_proposal_channel_errors.take(&execution.id) else {
+            return;
+        };
+        crate::proposal_channel_error::PROPOSAL_CHANNEL_ERROR.inc(&self.metrics);
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            command = %staged.command,
+            error_text = %staged.error_text,
+            "proposal_channel_error: worker's `boss propose` submission failed this Stop-boundary window",
+        );
+
+        let body = format!(
+            "Worker's `boss propose` submission failed during this run.\n\n\
+             - execution: `{execution_id}`\n\
+             - work item: `{work_item_id}`\n\n\
+             Command:\n\n```\n{command}\n```\n\n\
+             Error:\n\n```\n{error_text}\n```\n\n\
+             This is the proposal API's degrade-loudly path: the failure is recorded here rather \
+             than being silently lost or inferred from prose. If the worker's transcript claims to \
+             have proposed something (a followup, an escalation, a blocker) around this point, treat \
+             that claim as unconfirmed and check `bossctl work proposals list --execution-id \
+             {execution_id}` for what actually landed.",
+            execution_id = execution.id,
+            work_item_id = execution.work_item_id,
+            command = staged.command,
+            error_text = staged.error_text,
+        );
+
+        match self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: crate::proposal_channel_error::PROPOSAL_CHANNEL_ERROR_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Worker's proposal submission failed".to_owned(),
+            body_markdown: body,
+            resolved_at: None,
+        }) {
+            Ok(item) => {
+                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                    let product_id = work_item.product_id().to_string();
+                    self.publisher
+                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
+                        .await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "proposal_channel_error: failed to file attention item (non-fatal)",
+                );
+            }
+        }
+    }
+
     /// `Some(reason)` when `execution` has at least one *unresolved*
     /// (`status != "resolved"`) worker-escalation/blocker attention item —
     /// the condition [`Self::nudge_or_park`] uses to suppress the

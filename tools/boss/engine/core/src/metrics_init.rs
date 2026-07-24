@@ -45,6 +45,11 @@ pub fn init_all(registry: &Registry) {
     // Trunk merge-queue poller: probe/lookup volume, state writes, intent
     // retirements, and attention items.
     crate::trunk_queue_poller::init(registry);
+    // Worker-proposal API: SubmitProposal counters (submissions by kind,
+    // validation failures, rate-limit hits).
+    crate::app::proposals::register_metrics(registry);
+    // Worker-proposal API: proposal_channel_error detection counter.
+    crate::proposal_channel_error::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -174,12 +179,31 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // Worker-proposal API: SubmitProposal counters.
+        for expected in [
+            "worker_proposals.submitted.attention",
+            "worker_proposals.submitted.effort_escalation",
+            "worker_proposals.submitted.blocked",
+            "worker_proposals.submitted.deferred_scope",
+            "worker_proposals.submitted.followup_task",
+            "worker_proposals.submitted.automation_outcome",
+            "worker_proposals.submitted.pr_created",
+            "worker_proposals.validation_failed",
+            "worker_proposals.rate_limited",
+            "worker_proposals.channel_error",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         assert_eq!(
             names.len(),
-            60,
+            70,
             "expected 4 pr_url_capture + 2 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 10 merge_poller + 18 external_tracker + 2 speculative_conflict + \
-             1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller counters"
+             1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
+             9 worker_proposals submit + 1 worker_proposals channel_error counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
