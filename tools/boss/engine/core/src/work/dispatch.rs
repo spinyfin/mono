@@ -1152,6 +1152,22 @@ impl WorkDb {
         Ok(Some(not_before))
     }
 
+    /// Every work item in the same revision chain as `work_item_id`,
+    /// chain-root first, INCLUDING `work_item_id` itself and tombstoned
+    /// members (see [`chain_member_ids_on`] for the tombstone rationale).
+    ///
+    /// Exposed for the in-flight dispatch registry
+    /// ([`crate::dispatch_inflight`]), which must answer "is this chain
+    /// already being dispatched" against reservations held in memory rather
+    /// than rows in `work_executions`. Dispatch liveness is only visible in
+    /// the DB once `start_execution_run_on_host` commits, so the registry —
+    /// not this table — is the source of truth for the window between a
+    /// drain pass deciding to dispatch and the run actually starting.
+    pub fn chain_member_ids(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        chain_member_ids_on(&conn, work_item_id)
+    }
+
     /// Return EVERY live (`running` / `waiting_human`) execution belonging to
     /// ANY *other* work item in the same revision chain as `work_item_id` —
     /// not just the first one encountered. See
@@ -1169,17 +1185,7 @@ impl WorkDb {
     /// exists to prevent).
     pub fn live_executions_elsewhere_in_chain(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let root_id = chain_root(&conn, work_item_id)?;
-        let mut member_ids = Vec::with_capacity(4);
-        member_ids.push(root_id.clone());
-        // Tombstone-inclusive: `block_pending_revisions_on_parent_close`
-        // archives *and* tombstones a WIP revision in the same transaction
-        // that the merge poller detects the merge, but its execution isn't
-        // force-released until the poller's next step. A tombstone-filtered
-        // walk could miss that still-live execution during this window and
-        // let a second worker start on the same PR branch (the T1577/T1815
-        // hazard this guard exists to prevent).
-        member_ids.extend(collect_chain_revision_ids_including_deleted(&conn, &root_id)?);
+        let member_ids = chain_member_ids_on(&conn, work_item_id)?;
         let mut live_executions = Vec::new();
         for member_id in &member_ids {
             if member_id == work_item_id {
@@ -1422,4 +1428,21 @@ impl WorkDb {
             .optional()?;
         Ok(terminal_owner.map(|_| current_lease_id.to_owned()))
     }
+}
+
+/// Walk `work_item_id`'s revision chain and return every member id,
+/// chain-root first, including `work_item_id` itself.
+///
+/// Tombstone-inclusive: `block_pending_revisions_on_parent_close` archives
+/// *and* tombstones a WIP revision in the same transaction that the merge
+/// poller detects the merge, but its execution isn't force-released until the
+/// poller's next step. A tombstone-filtered walk could miss that still-live
+/// execution during this window and let a second worker start on the same PR
+/// branch (the T1577/T1815 hazard the chain guard exists to prevent).
+fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
+    let root_id = chain_root(conn, work_item_id)?;
+    let mut member_ids = Vec::with_capacity(4);
+    member_ids.push(root_id.clone());
+    member_ids.extend(collect_chain_revision_ids_including_deleted(conn, &root_id)?);
+    Ok(member_ids)
 }
