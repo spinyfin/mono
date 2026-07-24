@@ -471,11 +471,12 @@ impl WorkerCompletionHandler {
         // artifact is written on the remote host and not readable here, and
         // any local artifact-write failure.
         //
-        // `last_parse_error` captures the serde error from the last failed
-        // parse attempt across both channels so it can be included verbatim
-        // in the reviewer re-prompt, giving the reviewer the specific field +
-        // type message rather than a generic "write valid JSON" instruction.
-        let mut last_parse_error: Option<String> = None;
+        // `parse_error` captures the serde error from the artifact if it was
+        // present-but-invalid, else from the driver fallback's most-preferred
+        // failing candidate, so the reviewer re-prompt names the specific
+        // field + type mismatch rather than a generic "write valid JSON"
+        // instruction.
+        let mut parse_error: Option<String> = None;
 
         let from_artifact = match crate::structured_output::read(
             &self.structured_output_dir,
@@ -494,7 +495,7 @@ impl WorkerCompletionHandler {
                         "pr_review finalize: structured-output artifact present but did not \
                          validate as ReviewResult; trying the driver's transcript fallback",
                     );
-                    last_parse_error = Some(err_str);
+                    parse_error = Some(err_str);
                     None
                 }
             },
@@ -517,8 +518,8 @@ impl WorkerCompletionHandler {
                             "pr_review finalize: transcript JSON block present but did not \
                              validate as ReviewResult",
                         );
-                        if last_parse_error.is_none() {
-                            last_parse_error = err;
+                        if parse_error.is_none() {
+                            parse_error = err;
                         }
                     }
                     result
@@ -558,7 +559,7 @@ impl WorkerCompletionHandler {
                     // Include the specific serde error in the probe when we have one so
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
-                    let probe = if let Some(ref parse_err) = last_parse_error {
+                    let probe = if let Some(ref parse_err) = parse_error {
                         format!(
                             "Your review did not produce a valid ReviewResult. The JSON was \
                              present but failed to parse:\n\n  {parse_err}\n\n\

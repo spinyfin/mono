@@ -63,6 +63,19 @@ pub fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
     Some(&path[..end])
 }
 
+/// Extract `"owner/repo"` from a GitHub PR URL, tolerating a decorated tail
+/// the same way [`pr_number_from_url`] does: a further path segment
+/// (`/files`), a query (`?tab=…`), or a fragment (`#issuecomment-…`) after
+/// the PR number is ignored. The host, owner, repo, and `pull` segments are
+/// still validated strictly. Use this over [`repo_from_pr_url`] when the URL
+/// may come from prose or an artifact rather than a canonical API response.
+pub fn repo_from_pr_url_lenient(pr_url: &str) -> Option<&str> {
+    let (owner, repo, _) = split_pr_url(pr_url)?;
+    let path = pr_url.strip_prefix("https://github.com/")?;
+    let end = owner.len() + 1 + repo.len();
+    Some(&path[..end])
+}
+
 /// Extract the PR number from a GitHub PR URL of the form
 /// `https://github.com/<owner>/<repo>/pull/<N>`.
 ///
@@ -169,6 +182,32 @@ mod tests {
         );
         assert_eq!(repo_from_pr_url("https://example.com/owner/repo/pull/1"), None);
         assert_eq!(repo_from_pr_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn repo_from_pr_url_lenient_tolerates_decorated_tail() {
+        assert_eq!(
+            repo_from_pr_url_lenient("https://github.com/spinyfin/mono/pull/568/files"),
+            Some("spinyfin/mono"),
+        );
+        assert_eq!(
+            repo_from_pr_url_lenient("https://github.com/spinyfin/mono/pull/568?tab=diff"),
+            Some("spinyfin/mono"),
+        );
+        assert_eq!(
+            repo_from_pr_url_lenient("https://github.com/spinyfin/mono/pull/568#issuecomment-1"),
+            Some("spinyfin/mono"),
+        );
+    }
+
+    #[test]
+    fn repo_from_pr_url_lenient_matches_strict_on_canonical_urls() {
+        assert_eq!(
+            repo_from_pr_url_lenient("https://github.com/spinyfin/mono/pull/568"),
+            Some("spinyfin/mono"),
+        );
+        assert_eq!(repo_from_pr_url_lenient("https://example.com/owner/repo/pull/1"), None);
+        assert_eq!(repo_from_pr_url_lenient("not-a-url"), None);
     }
 
     #[test]

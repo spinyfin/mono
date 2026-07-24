@@ -980,7 +980,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
 
         let marker_lines: Vec<&str> = preamble
             .lines()
@@ -994,18 +994,24 @@ mod tests {
              example, and one generic-skip-marker example, found: {marker_lines:?}",
         );
 
+        let parse = |line: &str| {
+            let dir = std::env::temp_dir().join(format!("boss-triage-rt-{}-{}", std::process::id(), line.len()));
+            let decision = resolve_triage_decision(&crate::driver::ClaudeDriver, &dir, "exec_rt", Some(line));
+            let _ = std::fs::remove_dir_all(&dir);
+            decision
+        };
         assert_eq!(
-            parse_triage_decision(marker_lines[0]),
+            parse(marker_lines[0]),
             TriageDecision::ProducedTask("T42".to_owned()),
             "the preamble's own task-marker example must parse as the validator expects",
         );
         assert_eq!(
-            parse_triage_decision(marker_lines[1]),
+            parse(marker_lines[1]),
             TriageDecision::Skip("duplicate of Txxxx".to_owned()),
             "the preamble's own duplicate-skip-marker example must parse as the validator expects",
         );
         assert_eq!(
-            parse_triage_decision(marker_lines[2]),
+            parse(marker_lines[2]),
             TriageDecision::Skip("<one-line reason>".to_owned()),
             "the preamble's own generic-skip-marker example must parse as the validator expects",
         );

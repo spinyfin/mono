@@ -33,16 +33,10 @@
 //! hot path; the reconstruction path is the cold path.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use boss_engine_gh_invocation::{GhNoun, classify};
 use boss_engine_structured_output::pr_url::find_first_pr_url;
-use regex::Regex;
-
-/// Captures the `owner/repo` slug from a PR URL.
-static PR_URL_SLUG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/\d+").expect("PR URL slug regex compiles")
-});
 
 /// Well-known placeholder owner/repo slugs used in tests and documentation
 /// (compared case-insensitively). These are rejected as a belt-and-suspenders
@@ -71,10 +65,8 @@ pub fn parse_product_slug(repo_remote_url: &str) -> Option<String> {
 ///    `product_repo_remote_url`. A worker operating on the product's
 ///    cube workspace can only legitimately emit a PR URL for that repo.
 pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<(), String> {
-    let pr_slug = PR_URL_SLUG_RE
-        .captures(pr_url)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_lowercase())
+    let pr_slug = boss_github::pr_url::repo_from_pr_url_lenient(pr_url)
+        .map(|slug| slug.to_lowercase())
         .ok_or_else(|| format!("URL does not contain a recognisable owner/repo slug: {pr_url}"))?;
 
     if PLACEHOLDER_SLUGS.iter().any(|p| pr_slug == *p) {
