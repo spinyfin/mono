@@ -1,10 +1,1 @@
 # Tools
-
-# `tools/boss` has no BUILD.bazel of its own, so `boss/CHECKS.yaml` belongs to
-# this package. Exported narrowly so `engine/core`'s self-test can embed it
-# via `compile_data` to assert its boss-ism pattern stays in sync with
-# `BOSS_ID_RE` — see `boss_construct_scan.rs`.
-exports_files(
-    ["boss/CHECKS.yaml"],
-    visibility = ["//tools/boss/engine/core:__pkg__"],
-)

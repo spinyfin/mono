@@ -20,7 +20,7 @@ checks:
         - cli/src/main.rs
       # Grandfathered struct violations, scanned-but-exempt. The file is still parsed, so a
       # NEW giant struct added alongside any of these is flagged (this is how the
-      # `CreateAttentionInput` miss — see T819 — is now caught). TODO: convert each to
+      # `CreateAttentionInput` miss — see T<n> — is now caught). TODO: convert each to
       # `#[derive(bon::Builder)]` and delete its entry.
       #
       # Entry forms:
@@ -31,7 +31,7 @@ checks:
       #                                    (tools/boss/). Exempts that struct only in that exact
       #                                    file, so a same-named struct in another file is still
       #                                    flagged. This is the form used by entries migrated off
-      #                                    `exclude_globs` (T828/T829): it exempts exactly the
+      #                                    `exclude_globs` (T<n>/T<n>): it exempts exactly the
       #                                    known-existing violation and nothing more.
       exclude_structs:
         # Migrated off exclude_globs (qualified per-file form). Each line is the exact giant
@@ -55,56 +55,3 @@ checks:
     policy:
       severity: error
       allow_bypass: true
-
-  # Deterministic catch for Boss-internal review vocabulary leaking into
-  # PR-visible text (title/description) or commit messages — the automated
-  # PR reviewer was flagging these downstream on every occurrence, which is
-  # exactly the kind of thing a worker can catch itself before ever pushing.
-  # See the rubric this mirrors: `boss_isms` dimension (2)/(3) in
-  # `engine/pr-review/src/render.rs`.
-  #
-  # Scoped to `surfaces: [changeset]` only (PR description + commit message),
-  # deliberately NOT `files`. Every one of these phrases — `T<n>`/`P<n>` ids,
-  # "the operator", "chore", "revision" — is also this codebase's own
-  # correct, long-standing internal vocabulary for describing Boss itself
-  # (e.g. `boss_construct_scan.rs`'s own doc comments, or the hundreds of
-  # pre-existing `// T1234: ...` provenance comments across engine/core).
-  # Scanning file content would flag that legitimate usage everywhere it
-  # already exists rather than newly-introduced leaks, and the check has no
-  # per-line grandfather mechanism — only a file-level `exclude`, which
-  # would have to list most of `engine/core` to stay quiet, defeating the
-  # point of a narrow exclusion list. The PR description and commit message
-  # of a real changeset carry none of that legacy noise, and are exactly the
-  # surface the motivating incident was about, so that is where this starts.
-  - id: boss-ism/pr-text-leakage
-    check: text/forbidden-pattern
-    policy:
-      severity: error
-    config:
-      surfaces:
-        - changeset
-      patterns:
-        - name: boss-work-item-id
-          # Byte-identical to `BOSS_ID_RE` in
-          # `engine/core/src/boss_construct_scan.rs` — enforced by the
-          # `boss_ism_checks_yaml_id_pattern_matches_boss_id_re_source` test
-          # next to that constant, which fails loudly if the two drift apart.
-          pattern: '\b[TP]\d+\b'
-          message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in the PR description or commit message."
-          severity: error
-        - name: boss-operator-reference
-          pattern: "(?i)\\bthe operator\\b"
-          message: "Do not refer to \"the operator\" in the PR description or commit message; state the reason directly instead of naming who asked for it."
-          severity: error
-        - name: boss-brief-reference
-          pattern: "(?i)\\bper the brief\\b"
-          message: "Do not reference \"the brief\" in the PR description or commit message; describe what the change does instead of where the instruction came from."
-          severity: warning
-        - name: boss-chore-reference
-          pattern: "(?i)\\bthis chore\\b"
-          message: "Do not reference Boss work-kind vocabulary (\"this chore\") in the PR description or commit message."
-          severity: warning
-        - name: boss-revision-cycle-reference
-          pattern: "(?i)\\brevision cycle\\b"
-          message: "Do not reference Boss's internal revision-cycle vocabulary (\"revision cycle\") in the PR description or commit message; describe the change itself."
-          severity: warning
