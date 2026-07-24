@@ -15,29 +15,37 @@ impl WorkerCompletionHandler {
     /// marker protocol and finalise both its `automation_runs` row and the
     /// execution itself.
     ///
-    /// The worker was told to end its final message with exactly one of
-    /// `automation: task <id>` or `automation: skip — <reason>`. Steps:
-    /// 1. read the final assistant message and parse the decision;
-    /// 2. for a `task` marker, verify the id resolves to a task carrying this
-    ///    automation's provenance — so a misbehaving agent can't pass off an
-    ///    unrelated task as its own output;
+    /// The worker was told to write its decision to the engine-owned
+    /// structured-output artifact and to end its final message with the
+    /// matching `automation: task <id>` / `automation: skip — <reason>`
+    /// marker. Steps:
+    /// 1. resolve the decision — artifact first, the driver's marker-line
+    ///    producer as fallback (see
+    ///    [`crate::automation_triage::resolve_triage_decision`]);
+    /// 2. for a `task` decision, verify the id resolves to a task carrying
+    ///    this automation's provenance — so a misbehaving agent can't pass off
+    ///    an unrelated task as its own output;
     /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
-    ///    `failed_will_retry` for a missing / ambiguous / unverifiable marker);
+    ///    `failed_will_retry` for a missing / ambiguous / unverifiable
+    ///    decision);
     /// 4. finalise the execution (`completed`) and release pane + workspace.
     pub(super) async fn finalize_automation_triage(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let automation_id = execution.work_item_id.clone();
+        // The transcript state is still read (and kept) because the
+        // no-decision detail below distinguishes "ran but reported nothing"
+        // from "produced no transcript at all" — but it is only the *fallback*
+        // channel for the decision itself.
         let transcript = self.read_final_triage_message(&execution.id).await;
-        let decision = match &transcript {
-            TriageTranscript::FinalMessage(text) => parse_triage_decision(text),
-            // No path / unreadable / no assistant prose all mean we have no
-            // message to scan for a marker — treat as NoDecision, but the
-            // specific transcript state is folded into the detail below so the
-            // run history distinguishes "ran but emitted no marker" from
-            // "produced no transcript at all".
-            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => {
-                TriageDecision::NoDecision
-            }
+        let final_message = match &transcript {
+            TriageTranscript::FinalMessage(text) => Some(text.as_str()),
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
         };
+        let decision = crate::automation_triage::resolve_triage_decision(
+            &crate::driver::ClaudeDriver,
+            &self.structured_output_dir,
+            &execution.id,
+            final_message,
+        );
 
         let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) = match &decision {
             TriageDecision::ProducedTask(marker_id) => {
@@ -219,6 +227,11 @@ impl WorkerCompletionHandler {
                 "failed to finalise automation_runs row for triage execution",
             ),
         }
+
+        // The decision has been consumed and recorded; reap the artifact so a
+        // re-fired automation reusing this execution id can never read a stale
+        // one.
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
 
         // Finalise the execution + release pane and cube workspace, mirroring
         // the PR-completion finalizer's release order. Capture the lease id
@@ -466,7 +479,11 @@ impl WorkerCompletionHandler {
         // type message rather than a generic "write valid JSON" instruction.
         let mut last_parse_error: Option<String> = None;
 
-        let from_artifact = match crate::structured_output::read(&self.structured_output_dir, &execution.id) {
+        let from_artifact = match crate::structured_output::read(
+            &self.structured_output_dir,
+            &execution.id,
+            crate::structured_output::StructuredOutputKind::ReviewResult,
+        ) {
             None => None,
             Some(raw) => match crate::pr_review::ReviewResult::from_json(&raw) {
                 Ok(result) => Some(result),
@@ -477,7 +494,7 @@ impl WorkerCompletionHandler {
                         producing_task_id,
                         error = %err_str,
                         "pr_review finalize: structured-output artifact present but did not \
-                         validate as ReviewResult; trying the transcript fallback",
+                         validate as ReviewResult; trying the driver's transcript fallback",
                     );
                     last_parse_error = Some(err_str);
                     None
@@ -489,7 +506,11 @@ impl WorkerCompletionHandler {
             None => match self.read_final_triage_message(&execution.id).await.into_message() {
                 None => None,
                 Some(text) => {
-                    let (result, err) = crate::pr_review::extract_review_result_verbose(&text);
+                    let candidates = crate::driver::ClaudeDriver.structured_output_fallback(
+                        crate::structured_output::StructuredOutputKind::ReviewResult,
+                        &text,
+                    );
+                    let (result, err) = crate::pr_review::review_result_from_candidates(&candidates);
                     if let Some(ref e) = err {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -531,7 +552,11 @@ impl WorkerCompletionHandler {
                     return StopOutcome::ReviewPassAwaitingResult;
                 }
                 NudgeDecision::Proceed { count } => {
-                    let output_path = crate::structured_output::path_in(&self.structured_output_dir, &execution.id);
+                    let output_path = crate::structured_output::path_for(
+                        &self.structured_output_dir,
+                        &execution.id,
+                        crate::structured_output::StructuredOutputKind::ReviewResult,
+                    );
                     // Include the specific serde error in the probe when we have one so
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
@@ -581,7 +606,7 @@ impl WorkerCompletionHandler {
 
         // We are going to finalise now (we have a result, or we gave up after
         // re-prompting). Reap the engine-owned artifact either way.
-        crate::structured_output::clear(&self.structured_output_dir, &execution.id);
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
 
         // Extract head_sha before review_result is (potentially)
         // consumed by the revision path below. Used to update last_reviewed_sha.

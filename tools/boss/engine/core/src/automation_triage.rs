@@ -1,5 +1,5 @@
-//! Automation triage execution: preamble rendering, decision-marker
-//! parsing, and the real [`TriageDispatcher`] (Maint task 6).
+//! Automation triage execution: preamble rendering, decision resolution, and
+//! the real [`TriageDispatcher`] (Maint task 6).
 //!
 //! The scheduler (Maint task 5) decides *when* an automation fires and calls
 //! [`crate::automation_scheduler::TriageDispatcher::dispatch_triage`] through
@@ -13,9 +13,21 @@
 //! - **Spawn:** the runner renders [`render_triage_preamble`] instead of the
 //!   ordinary work-item prompt (the worker is a *triage* agent, not an
 //!   implementer).
-//! - **Stop:** the completion handler parses the worker's final message with
-//!   [`parse_triage_decision`] and finalises the matching `automation_runs`
+//! - **Stop:** the completion handler resolves the agent's decision with
+//!   [`resolve_triage_decision`] and finalises the matching `automation_runs`
 //!   row, rather than running PR detection.
+//!
+//! ## How the decision reaches the engine
+//!
+//! **Primary:** the agent writes its decision to the engine-owned
+//! structured-output artifact
+//! ([`StructuredOutputKind::TriageDecision`]) — a plain file, no transcript
+//! format involved, so any agent driver can satisfy it.
+//!
+//! **Fallback:** the driver recovers it from the worker's prose. For the
+//! Claude driver that is the historical marker protocol
+//! (`automation: task <id>` / `automation: skip — <reason>`), which now lives
+//! in `boss_engine_driver::claude::structured_output` rather than here.
 //!
 //! ## The marker protocol (design Risk #3) — and why it is not the primary signal
 //!
@@ -44,12 +56,15 @@
 //! --automation` (see [`crate::work::WorkDb::create_automation_task`])
 //! remains the backstop against a misbehaving agent fanning out.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use boss_protocol::{Automation, Task};
 
 use crate::automation_scheduler::{TriageDispatch, TriageDispatcher};
+use crate::driver::AgentDriver;
+use crate::structured_output::{StructuredOutputKind, TriageOutcome};
 use crate::work::WorkDb;
 
 /// How far back the "recently merged" half of the layer-0 context block
@@ -189,10 +204,35 @@ pub enum TriageDecision {
     /// `automation: skip — <reason>` — the agent decided nothing actionable
     /// exists right now. An explicit, agent-authored no-op.
     Skip(String),
-    /// No marker at all — the worker errored, was reaped, or simply never
-    /// reached a decision. Treated as a transient/ambiguous failure (the run
-    /// is left `failed_will_retry`), never as a skip.
+    /// No decision at all — the worker errored, was reaped, or simply never
+    /// reached one. Treated as a transient/ambiguous failure (the run is left
+    /// `failed_will_retry`), never as a skip.
     NoDecision,
+}
+
+impl TriageDecision {
+    /// Interpret a decision delivered over the structured-output contract.
+    ///
+    /// Both channels produce this same wire form — the artifact the agent
+    /// wrote, and the Claude driver's marker-line fallback producer — so this
+    /// is the single point where a triage payload becomes a decision.
+    ///
+    /// Returns `None` for a malformed payload (an unrecognised `decision`, or
+    /// a `task` decision with no id): the caller then treats the channel as
+    /// having produced nothing, exactly as it does for an absent artifact,
+    /// rather than recording a bogus outcome against the automation run.
+    pub fn from_outcome(outcome: &TriageOutcome) -> Option<Self> {
+        match outcome.decision.as_str() {
+            TriageOutcome::DECISION_TASK => {
+                let id = outcome.task_id.as_deref().unwrap_or_default().trim();
+                (!id.is_empty()).then(|| Self::ProducedTask(id.to_owned()))
+            }
+            TriageOutcome::DECISION_SKIP => Some(Self::Skip(
+                outcome.reason.as_deref().unwrap_or_default().trim().to_owned(),
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// Compose the per-automation triage preamble (design §"Phase 1 — Triage").
@@ -217,11 +257,18 @@ pub enum TriageDecision {
 /// list is what lets the agent make the right call on its own — and, when
 /// it does, skip with a citation instead of burning a worker on a
 /// duplicate that then has to be closed by hand.
+///
+/// `decision_artifact_path` is the engine-owned file the agent writes its
+/// decision to — the primary channel
+/// ([`StructuredOutputKind::TriageDecision`]). The marker line stays in the
+/// prompt as the driver's fallback, so an agent that writes only one of the
+/// two is still understood.
 pub fn render_triage_preamble(
     automation: &Automation,
     product_name: &str,
     siblings: &[crate::work::AutomationSiblingTask],
     context: &TriageContext,
+    decision_artifact_path: &str,
 ) -> String {
     let a_id = automation
         .short_id
@@ -245,9 +292,16 @@ You are explicitly allowed to conclude that nothing appropriate \
 exists — that is a normal, expected outcome on most runs.\n\n\
 {already_tracked}\
 {context_block}\
-## You MUST end this run with exactly one decision marker\n\n\
-Your final message must end with **exactly one** of these two lines, and nothing \
-after it:\n\n\
+## You MUST report exactly one decision\n\n\
+Report it **both ways**, and make them agree:\n\n\
+1. **Write it to `{decision_artifact_path}`** with the `Write` tool — one JSON \
+object, either `{{\"decision\": \"task\", \"task_id\": \"T42\"}}` or \
+`{{\"decision\": \"skip\", \"reason\": \"<one line>\"}}`. That path is outside \
+the repo, so it never pollutes anything, and it is the channel the engine reads \
+first.\n\
+2. **End your final message with the matching marker line** (below), and nothing \
+after it. This is the fallback the engine uses if the file is missing.\n\n\
+The two lines your final message may end with:\n\n\
 - **If there is work to do** — create exactly **one** task, then emit:\n\n\
   ```\n  {create_cmd}\n  ```\n\n\
   **Declare every file you expect the task to touch** with one `--target-file <path>` \
@@ -482,81 +536,61 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
     )
 }
 
-/// Parse the triage agent's final assistant message into a [`TriageDecision`].
+/// Resolve the decision a triage agent reached, file first.
 ///
-/// Scans every line for a decision marker (`automation: task <id>` /
-/// `automation: skip — <reason>`) and resolves to the **last** one found:
+/// Two channels, in order:
 ///
-/// - one or more markers → the last marker, in line order,
-/// - zero markers → [`TriageDecision::NoDecision`].
+/// 1. **Primary — the structured-output artifact.** The agent wrote a
+///    [`TriageOutcome`] to the path its prompt named. Driver-agnostic: no
+///    transcript format, no final-message convention.
+/// 2. **Fallback — the driver's producer.** `driver` recovers the same wire
+///    form from `final_message` (for Claude, the `automation:` marker line).
 ///
-/// The caller (`read_final_triage_message`) joins every assistant turn in the
-/// transcript before handing it here, because the real decision marker can
-/// land in a turn after the `boss task create` tool call. That join means a
-/// marker-shaped line the agent narrated earlier — quoting the format while
-/// explaining what it's about to do, or an "already tracked" preamble
-/// example — can appear before the actual decision. Taking the last marker
-/// rather than requiring exactly one avoids reading that kind of narration
-/// as ambiguity: the agent's real, final decision is always the one closest
-/// to the end of its transcript. A single turn that itself contains two
-/// contradictory markers is vanishingly rare next to the narration case, and
-/// still resolves deterministically (last wins) rather than falling back to
-/// the no-marker retry path.
-///
-/// Matching is lenient on case and on the skip separator (em-dash `—`, hyphen
-/// `-`, or colon `:` all accepted) but strict on the `automation:` prefix and
-/// on the `task` / `skip` keyword having a word boundary, so prose that merely
-/// *mentions* the protocol does not trip it.
-pub fn parse_triage_decision(final_message: &str) -> TriageDecision {
-    final_message
-        .lines()
-        .rev()
-        .find_map(parse_marker_line)
+/// A present-but-malformed payload on either channel is logged and treated as
+/// "this channel produced nothing", so a garbled artifact falls through to the
+/// prose rather than recording a bogus outcome. When neither channel yields a
+/// decision the result is [`TriageDecision::NoDecision`] and the caller's
+/// existing recovery path (look for an open task this automation created)
+/// takes over.
+pub fn resolve_triage_decision(
+    driver: &dyn AgentDriver,
+    structured_output_dir: &Path,
+    execution_id: &str,
+    final_message: Option<&str>,
+) -> TriageDecision {
+    let kind = StructuredOutputKind::TriageDecision;
+    match crate::structured_output::read_json::<TriageOutcome>(structured_output_dir, execution_id, kind) {
+        Ok(Some(outcome)) => match TriageDecision::from_outcome(&outcome) {
+            Some(decision) => return decision,
+            None => tracing::warn!(
+                execution_id,
+                decision = %outcome.decision,
+                "triage: decision artifact present but not a recognised outcome; \
+                 falling back to the driver's producer",
+            ),
+        },
+        Ok(None) => {}
+        Err(err) => tracing::warn!(
+            execution_id,
+            error = %err,
+            "triage: decision artifact present but did not validate; \
+             falling back to the driver's producer",
+        ),
+    }
+
+    let Some(text) = final_message else {
+        return TriageDecision::NoDecision;
+    };
+    driver
+        .structured_output_fallback(kind, text)
+        .iter()
+        .find_map(|candidate| {
+            serde_json::from_str::<TriageOutcome>(&candidate.payload)
+                .ok()
+                .as_ref()
+                .and_then(TriageDecision::from_outcome)
+        })
         .unwrap_or(TriageDecision::NoDecision)
-}
-
-/// Parse a single line into a marker, or `None` if it is not one. A `task`
-/// marker with an empty id is rejected (returns `None`) — an explicit skip
-/// with an empty reason is still a valid `Skip`.
-fn parse_marker_line(line: &str) -> Option<TriageDecision> {
-    let after_prefix = strip_ci_prefix(line.trim(), "automation:")?.trim_start();
-
-    if let Some(rest) = strip_keyword(after_prefix, "task") {
-        let id = rest.trim();
-        if id.is_empty() {
-            return None;
-        }
-        return Some(TriageDecision::ProducedTask(id.to_owned()));
-    }
-    if let Some(rest) = strip_keyword(after_prefix, "skip") {
-        let reason = rest
-            .trim_start_matches(|c: char| c.is_whitespace() || c == '—' || c == '-' || c == ':')
-            .trim();
-        return Some(TriageDecision::Skip(reason.to_owned()));
-    }
-    None
-}
-
-/// Case-insensitively strip `prefix` from the start of `s`, returning the
-/// remainder. ASCII-only prefixes keep the byte/char-boundary slice safe.
-fn strip_ci_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let (sb, pb) = (s.as_bytes(), prefix.as_bytes());
-    if sb.len() >= pb.len() && sb[..pb.len()].eq_ignore_ascii_case(pb) {
-        Some(&s[pb.len()..])
-    } else {
-        None
-    }
-}
-
-/// Like [`strip_ci_prefix`] but requires a trailing word boundary so `task`
-/// matches `task T1` but not `taskforce`.
-fn strip_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
-    let rest = strip_ci_prefix(s, keyword)?;
-    if rest.is_empty() || rest.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
-        Some(rest)
-    } else {
-        None
-    }
 }
 
 /// The real [`TriageDispatcher`]: creates an `automation_triage` execution and
@@ -653,118 +687,102 @@ impl TriageDispatcher for EngineTriageDispatcher {
 mod tests {
     use super::*;
 
+    /// Stand-in for the engine-owned decision artifact path in preamble tests.
+    const ARTIFACT_PATH: &str = "/tmp/boss-worker-output/exec_1.triage.json";
+
+    /// Resolve a decision from worker prose alone, with no artifact present —
+    /// i.e. exercising the Claude driver's marker-line fallback producer
+    /// through the same entry point the completion handler uses.
+    fn decision_from(text: &str) -> TriageDecision {
+        let empty = std::env::temp_dir().join(format!("boss-triage-no-artifact-{}", std::process::id()));
+        resolve_triage_decision(&crate::driver::ClaudeDriver, &empty, "exec_absent", Some(text))
+    }
+
+    /// Scratch structured-output dir seeded with `contents` as this
+    /// execution's triage artifact.
+    fn artifact_dir(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("boss-triage-artifact-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            crate::structured_output::path_for(&dir, "exec_1", StructuredOutputKind::TriageDecision),
+            contents,
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
-    fn parses_a_clean_task_marker() {
-        let msg = "Found a clear win.\n\nautomation: task T42\n";
+    fn artifact_is_the_primary_channel_and_beats_the_marker() {
+        // Artifact and marker disagree: the file wins.
+        let dir = artifact_dir("primary", r#"{"decision":"task","task_id":"T42"}"#);
+        let decision = resolve_triage_decision(
+            &crate::driver::ClaudeDriver,
+            &dir,
+            "exec_1",
+            Some("automation: skip — nothing to do"),
+        );
+        assert_eq!(decision, TriageDecision::ProducedTask("T42".to_owned()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_skip_carries_its_reason() {
+        let dir = artifact_dir("skip", r#"{"decision":"skip","reason":"no clippy warnings today"}"#);
         assert_eq!(
-            parse_triage_decision(msg),
-            TriageDecision::ProducedTask("T42".to_owned())
+            resolve_triage_decision(&crate::driver::ClaudeDriver, &dir, "exec_1", None),
+            TriageDecision::Skip("no clippy warnings today".to_owned()),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_artifact_falls_back_to_the_driver_producer() {
+        for bad in [r#"{not json}"#, r#"{"decision":"maybe"}"#, r#"{"decision":"task"}"#] {
+            let dir = artifact_dir("malformed", bad);
+            assert_eq!(
+                resolve_triage_decision(
+                    &crate::driver::ClaudeDriver,
+                    &dir,
+                    "exec_1",
+                    Some("automation: task T7"),
+                ),
+                TriageDecision::ProducedTask("T7".to_owned()),
+                "a {bad} artifact must not shadow a usable marker",
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn no_artifact_and_no_message_is_no_decision() {
+        let dir = std::env::temp_dir().join(format!("boss-triage-empty-{}", std::process::id()));
+        assert_eq!(
+            resolve_triage_decision(&crate::driver::ClaudeDriver, &dir, "exec_absent", None),
+            TriageDecision::NoDecision,
         );
     }
 
     #[test]
-    fn parses_canonical_task_id() {
-        assert_eq!(
-            parse_triage_decision("automation: task task_018abc"),
-            TriageDecision::ProducedTask("task_018abc".to_owned())
+    fn triage_preamble_names_the_decision_artifact_and_keeps_the_marker() {
+        let preamble = render_triage_preamble(
+            &dedup_automation(),
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
         );
-    }
-
-    #[test]
-    fn parses_skip_with_em_dash() {
-        assert_eq!(
-            parse_triage_decision("automation: skip — no clippy warnings today"),
-            TriageDecision::Skip("no clippy warnings today".to_owned())
+        assert!(
+            preamble.contains(ARTIFACT_PATH),
+            "preamble must name the artifact path the engine reads first"
         );
-    }
-
-    #[test]
-    fn parses_skip_with_hyphen_or_colon() {
-        assert_eq!(
-            parse_triage_decision("automation: skip - nothing to do"),
-            TriageDecision::Skip("nothing to do".to_owned())
+        assert!(
+            preamble.contains(r#"{"decision": "task", "task_id": "T42"}"#),
+            "preamble must show the artifact's wire form"
         );
-        assert_eq!(
-            parse_triage_decision("automation: skip: already clean"),
-            TriageDecision::Skip("already clean".to_owned())
-        );
-    }
-
-    #[test]
-    fn case_insensitive_prefix() {
-        assert_eq!(
-            parse_triage_decision("Automation: Task T7"),
-            TriageDecision::ProducedTask("T7".to_owned())
-        );
-    }
-
-    #[test]
-    fn zero_markers_is_no_decision() {
-        assert_eq!(
-            parse_triage_decision("I looked around but did not finish."),
-            TriageDecision::NoDecision
-        );
-    }
-
-    /// A multi-turn transcript can carry a narrated marker example ahead of
-    /// the agent's real, final decision — `read_final_triage_message` joins
-    /// every assistant turn, so this is the realistic shape, not a
-    /// same-turn contradiction. The last marker wins.
-    #[test]
-    fn two_markers_resolves_to_the_last_one() {
-        let msg = "automation: task T1\nautomation: skip — changed my mind";
-        assert_eq!(
-            parse_triage_decision(msg),
-            TriageDecision::Skip("changed my mind".to_owned())
-        );
-    }
-
-    /// The "Already tracked" preamble example line
-    /// (`automation: skip — already tracked as T<n>`) is itself
-    /// marker-shaped; if the agent quotes it while narrating and then emits
-    /// its real decision afterward, the real decision must still win.
-    #[test]
-    fn narrated_marker_example_does_not_shadow_the_real_decision() {
-        let msg = "automation: skip — already tracked as T<n>\n\
-                   automation: task T9";
-        assert_eq!(
-            parse_triage_decision(msg),
-            TriageDecision::ProducedTask("T9".to_owned())
-        );
-    }
-
-    #[test]
-    fn prose_mentioning_protocol_does_not_match() {
-        // A word like "taskforce" must not be read as a `task` marker, and a
-        // sentence describing the protocol without the exact prefix is inert.
-        assert_eq!(
-            parse_triage_decision("automation: taskforce assembled"),
-            TriageDecision::NoDecision
-        );
-        assert_eq!(
-            parse_triage_decision("I will emit automation markers when done."),
-            TriageDecision::NoDecision
-        );
-    }
-
-    #[test]
-    fn empty_task_id_is_not_a_marker() {
-        assert_eq!(parse_triage_decision("automation: task   "), TriageDecision::NoDecision);
-    }
-
-    #[test]
-    fn skip_with_empty_reason_is_still_a_skip() {
-        assert_eq!(
-            parse_triage_decision("automation: skip"),
-            TriageDecision::Skip(String::new())
-        );
-    }
-
-    #[test]
-    fn leading_and_trailing_whitespace_on_marker_line_tolerated() {
-        assert_eq!(
-            parse_triage_decision("   automation: task T9   "),
-            TriageDecision::ProducedTask("T9".to_owned())
+        assert!(
+            preamble.contains("automation: task T42"),
+            "the marker fallback must survive alongside the file contract"
         );
     }
 
@@ -869,7 +887,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
         let lower = preamble.to_lowercase();
         // Decide-then-stop.
         assert!(
@@ -917,7 +935,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
         // Must explicitly name the Agent tool and explain the hang risk.
         assert!(
             preamble.contains("Agent"),
@@ -1008,7 +1026,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
         assert!(preamble.contains("triage"));
         assert!(preamble.contains("A3"));
         assert!(preamble.contains("My Product"));
@@ -1039,7 +1057,7 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
         assert!(
             preamble.contains("--target-file"),
             "preamble must include --target-file on the create command example",
@@ -1105,7 +1123,7 @@ mod tests {
         // The bug manifested when the post-tool turn was MISSING from the
         // transcript (timing race). Simulate that by taking only the first turn:
         let only_pre_tool = &all_text[..1];
-        let pre_tool_decision = parse_triage_decision(&only_pre_tool[0]);
+        let pre_tool_decision = decision_from(&only_pre_tool[0]);
         assert_eq!(
             pre_tool_decision,
             TriageDecision::NoDecision,
@@ -1114,7 +1132,7 @@ mod tests {
 
         // The NEW code: join all turns and parse the combined text.
         let combined = all_text.join("\n");
-        let decision = parse_triage_decision(&combined);
+        let decision = decision_from(&combined);
         assert_eq!(
             decision,
             TriageDecision::ProducedTask("T1330".to_owned()),
@@ -1160,7 +1178,13 @@ mod tests {
                 Some("https://github.com/spinyfin/mono/pull/9001"),
             ),
         ];
-        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings, &TriageContext::default());
+        let preamble = render_triage_preamble(
+            &dedup_automation(),
+            "My Product",
+            &siblings,
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+        );
 
         assert!(preamble.contains("Already tracked"), "section heading missing");
         assert!(preamble.contains("T101"), "must cite each sibling by friendly id");
@@ -1190,7 +1214,13 @@ mod tests {
     #[test]
     fn preamble_still_permits_distinct_findings() {
         let siblings = [sibling(101, "Split engine/core/src/app.rs", "active", None)];
-        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &siblings, &TriageContext::default());
+        let preamble = render_triage_preamble(
+            &dedup_automation(),
+            "My Product",
+            &siblings,
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+        );
         assert!(
             preamble.contains("Genuinely different target"),
             "must tell the agent that a different file/crate is still fileable",
@@ -1205,7 +1235,13 @@ mod tests {
     /// read as licence to file, which is the opposite of the intent.
     #[test]
     fn preamble_omits_the_section_when_nothing_is_tracked() {
-        let preamble = render_triage_preamble(&dedup_automation(), "My Product", &[], &TriageContext::default());
+        let preamble = render_triage_preamble(
+            &dedup_automation(),
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+        );
         assert!(
             !preamble.contains("Already tracked"),
             "an empty sibling list must render no section",

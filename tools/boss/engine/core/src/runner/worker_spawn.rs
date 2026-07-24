@@ -8,6 +8,7 @@ use boss_engine_gh_invocation::gh_output;
 
 use crate::coordinator::pool_model_override_for_worker_id;
 use crate::effort::{SpawnConfig, resolve_spawn_config};
+use crate::structured_output::StructuredOutputKind;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::ExecutionKind;
 
@@ -420,7 +421,13 @@ pub(crate) async fn compose_worker_spawn(
                     .list_recently_completed_automation_tasks_for_product(&automation.product_id, since_epoch)
                     .unwrap_or_default();
                 let triage_context = crate::automation_triage::TriageContext::from_rows(open_tasks, merged_tasks);
-                crate::automation_triage::render_triage_preamble(&automation, &product_name, &siblings, &triage_context)
+                crate::automation_triage::render_triage_preamble(
+                    &automation,
+                    &product_name,
+                    &siblings,
+                    &triage_context,
+                    &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision),
+                )
             }
             other => {
                 tracing::warn!(
@@ -569,7 +576,7 @@ pub(crate) async fn compose_worker_spawn(
                 task_name,
                 task_description,
                 pr_url,
-                &crate::structured_output::default_path_string(&execution.id),
+                &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
                 scope,
                 pr_review_context.as_ref(),
                 &reviewer_repo_slug,

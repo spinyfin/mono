@@ -53,12 +53,13 @@ use boss_protocol::{
 };
 
 use crate::attentions_detector;
-use crate::automation_triage::{TriageDecision, parse_triage_decision};
+use crate::automation_triage::TriageDecision;
 use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
 use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
+use crate::driver::AgentDriver;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };
@@ -89,14 +90,28 @@ mod remediation;
 mod stop;
 mod worker_signals;
 
-// Phase-3 counter handles for the PR URL capture paths. The primary path
-// fires when the PostToolUse staging cache already holds the URL; the
-// reconstruction path fires when the cold-path `detect_pr` fallback is
-// invoked instead.
+// Counter handles for the PR URL capture channels, in the order they are
+// consulted: the worker's structured-output artifact (the driver-agnostic file
+// contract), the PostToolUse staging cache, the driver's final-message
+// producer, and finally the cold-path `detect_pr` reconstruction. The
+// `primary_path` counter covers every URL that arrived via the staging cache,
+// whichever channel filled it.
 crate::register_counter!(
     PR_URL_CAPTURE_PRIMARY_HIT,
     "pr_url_capture.primary_path.hit",
     "on_stop / recheck_for_pr found a staged PR URL and skipped the detector.",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_ARTIFACT_HIT,
+    "pr_url_capture.artifact.hit",
+    "the worker's structured-output PR-URL artifact supplied the URL (file contract, \
+     driver-agnostic).",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_DRIVER_FALLBACK_HIT,
+    "pr_url_capture.driver_fallback.hit",
+    "the driver's final-message producer supplied the PR URL (artifact and hook stream \
+     both empty).",
 );
 crate::register_counter!(
     PR_URL_CAPTURE_RECONSTRUCTION_HIT,
@@ -175,6 +190,8 @@ crate::register_counter!(
 /// surface at boot rather than at the first counter increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_ARTIFACT_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_DRIVER_FALLBACK_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
     registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);

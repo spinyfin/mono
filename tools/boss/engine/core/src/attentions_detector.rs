@@ -39,6 +39,8 @@ use serde::Deserialize;
 
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
 use crate::design_detector;
+use crate::driver::AgentDriver;
+use crate::structured_output::StructuredOutputKind;
 use crate::work::WorkDb;
 
 // ── Backstop: Anthropic API constants ────────────────────────────────────────
@@ -363,7 +365,7 @@ pub async fn reconcile_task_followups(
                 }
             };
             let assistant_text = extract_assistant_text(&jsonl);
-            parse_followups_block(&assistant_text)
+            followups_from_driver_fallback(&assistant_text, execution_id)
         }
     };
     if entries.is_empty() {
@@ -464,7 +466,7 @@ fn build_followup_input(entry: &FollowupEntry, work_item_id: &str, execution_id:
 /// transcript — the worker deliberately recorded none).
 fn read_followups_artifact(structured_output_dir: Option<&Path>, execution_id: &str) -> Option<Vec<FollowupEntry>> {
     let dir = structured_output_dir?;
-    let raw = crate::structured_output::read(dir, execution_id)?;
+    let raw = crate::structured_output::read(dir, execution_id, StructuredOutputKind::Followups)?;
     match serde_json::from_str::<Vec<FollowupEntry>>(&raw) {
         Ok(entries) => Some(entries),
         Err(err) => {
@@ -472,7 +474,7 @@ fn read_followups_artifact(structured_output_dir: Option<&Path>, execution_id: &
                 execution_id,
                 ?err,
                 "attentions detector: followups artifact present but is not a valid \
-                 FollowupEntry JSON array; falling back to transcript sentinel"
+                 FollowupEntry JSON array; falling back to the driver's transcript producer"
             );
             None
         }
@@ -494,25 +496,32 @@ fn extract_assistant_text(jsonl: &str) -> String {
         .join("\n")
 }
 
-/// Parse the `FOLLOWUPS:` block out of assistant text: locate the last
-/// `FOLLOWUPS:` sentinel and the first balanced JSON array after it (fenced
-/// or not, via the shared [`boss_engine_utils::json_extract::find_first_balanced_array`]).
-/// Returns an empty `Vec` when no parseable block is present.
-fn parse_followups_block(text: &str) -> Vec<FollowupEntry> {
-    let Some(idx) = text.rfind("FOLLOWUPS:") else {
-        return Vec::new();
-    };
-    let tail = &text[idx..];
-    let Some(array) = boss_engine_utils::json_extract::find_first_balanced_array(tail) else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<Vec<FollowupEntry>>(array) {
-        Ok(entries) => entries,
-        Err(err) => {
-            tracing::warn!(?err, "attentions detector: FOLLOWUPS block is not a valid JSON array");
-            Vec::new()
-        }
-    }
+/// Recover followups from worker prose via the driver's fallback producer —
+/// for the Claude driver, the `FOLLOWUPS:` sentinel plus the JSON array after
+/// it (see `boss_engine_driver::claude::structured_output`).
+///
+/// Returns an empty `Vec` when the driver offers nothing, or when what it
+/// offers does not validate: followups are optional and best effort, so a bad
+/// payload must never block the PR transition.
+fn followups_from_driver_fallback(text: &str, execution_id: &str) -> Vec<FollowupEntry> {
+    crate::driver::ClaudeDriver
+        .structured_output_fallback(StructuredOutputKind::Followups, text)
+        .iter()
+        .find_map(
+            |candidate| match serde_json::from_str::<Vec<FollowupEntry>>(&candidate.payload) {
+                Ok(entries) => Some(entries),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "attentions detector: FOLLOWUPS block present but is not a valid \
+                     FollowupEntry JSON array; ignoring"
+                    );
+                    None
+                }
+            },
+        )
+        .unwrap_or_default()
 }
 
 // ── Backstop: Questions extraction ───────────────────────────────────────────
@@ -814,7 +823,10 @@ pub async fn extract_followups_backstop(
     };
 
     let response_text = response.first_text().unwrap_or_default();
-    let entries = parse_followups_block(response_text);
+    // The backstop asks a Claude model for the same `FOLLOWUPS:` block shape a
+    // Claude worker emits, so the Claude driver's producer is the right parser
+    // for its answer too.
+    let entries = followups_from_driver_fallback(response_text, execution_id);
     if entries.is_empty() {
         return None;
     }
@@ -951,35 +963,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_followups_block_handles_fenced_json() {
+    fn followups_fallback_handles_fenced_json() {
         let text = "Some summary.\n\nFOLLOWUPS:\n```json\n[\n  {\"proposed_name\": \"Wire retries\", \"proposed_description\": \"add backoff\", \"proposed_effort\": \"small\"}\n]\n```\n";
-        let entries = parse_followups_block(text);
+        let entries = followups_from_driver_fallback(text, "e1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].proposed_name, "Wire retries");
         assert_eq!(entries[0].proposed_effort.as_deref(), Some("small"));
     }
 
     #[test]
-    fn parse_followups_block_handles_unfenced_array() {
+    fn followups_fallback_handles_unfenced_array() {
         let text = "FOLLOWUPS: [{\"proposed_name\": \"X\", \"proposed_description\": \"y\"}]";
-        let entries = parse_followups_block(text);
+        let entries = followups_from_driver_fallback(text, "e1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].proposed_name, "X");
     }
 
     #[test]
-    fn parse_followups_block_uses_last_sentinel() {
+    fn followups_fallback_uses_last_sentinel() {
         // An earlier mention (e.g. echoing instructions) is ignored in favour
         // of the final, real block.
         let text = "I will emit FOLLOWUPS: later.\n\nFOLLOWUPS:\n[{\"proposed_name\": \"Real\", \"proposed_description\": \"d\"}]";
-        let entries = parse_followups_block(text);
+        let entries = followups_from_driver_fallback(text, "e1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].proposed_name, "Real");
     }
 
     #[test]
-    fn parse_followups_block_empty_without_sentinel() {
-        assert!(parse_followups_block("no block here [1,2,3]").is_empty());
+    fn followups_fallback_empty_without_sentinel() {
+        assert!(followups_from_driver_fallback("no block here [1,2,3]", "e1").is_empty());
     }
 
     #[test]
@@ -993,7 +1005,7 @@ mod tests {
 
         // Valid FollowupEntry array → Some.
         std::fs::write(
-            crate::structured_output::path_in(&dir, "e1"),
+            crate::structured_output::path_for(&dir, "e1", StructuredOutputKind::Followups),
             r#"[{"proposed_name":"Wire retries","proposed_description":"add backoff"}]"#,
         )
         .unwrap();
@@ -1003,11 +1015,19 @@ mod tests {
 
         // Explicit empty array → Some(empty) (deliberately "no followups",
         // distinct from absent — the caller must not fall back to transcript).
-        std::fs::write(crate::structured_output::path_in(&dir, "e3"), "[]").unwrap();
+        std::fs::write(
+            crate::structured_output::path_for(&dir, "e3", StructuredOutputKind::Followups),
+            "[]",
+        )
+        .unwrap();
         assert_eq!(read_followups_artifact(Some(&dir), "e3").map(|v| v.len()), Some(0));
 
         // Malformed → None (caller falls back to the transcript sentinel).
-        std::fs::write(crate::structured_output::path_in(&dir, "e2"), "{not json}").unwrap();
+        std::fs::write(
+            crate::structured_output::path_for(&dir, "e2", StructuredOutputKind::Followups),
+            "{not json}",
+        )
+        .unwrap();
         assert!(read_followups_artifact(Some(&dir), "e2").is_none());
 
         // No dir provided → None.

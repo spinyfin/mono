@@ -527,6 +527,135 @@ async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
     );
 }
 
+/// File-based StructuredOutput contract: a worker that wrote its PR URL to the
+/// engine-owned artifact is finalised from that file alone — no hook-stream
+/// capture, no cold-path detector. This is the driver-agnostic primary
+/// channel; a backend with no `PostToolUse` hooks reaches `in_review` on it.
+#[tokio::test]
+async fn on_stop_uses_pr_url_artifact_when_the_hook_stream_captured_nothing() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    // A wrong detector URL makes any fall-through to the cold path visible.
+    let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+
+    let out_dir = tempdir().unwrap();
+    std::fs::write(
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &execution_id,
+            crate::structured_output::StructuredOutputKind::PrUrl,
+        ),
+        r#"{"pr_url": "https://github.com/spinyfin/mono/pull/458"}"#,
+    )
+    .unwrap();
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler
+        .with_structured_output_dir(out_dir.path().to_path_buf())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
+            if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+        "expected ReviewerEnqueued with the artifact's URL, got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "the artifact must short-circuit the cold-path detector, exactly as a staged hook URL does",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(
+            t.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/458"),
+            "the chore must bind to the artifact's URL, not the detector's",
+        ),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// A PR URL in the artifact that belongs to a different repository is dropped
+/// by the same product-repo gate the hook-capture path applies — the file
+/// channel is primary, not privileged.
+#[tokio::test]
+async fn pr_url_artifact_for_a_foreign_repo_is_rejected() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+
+    let out_dir = tempdir().unwrap();
+    std::fs::write(
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &execution_id,
+            crate::structured_output::StructuredOutputKind::PrUrl,
+        ),
+        r#"{"pr_url": "https://github.com/someone/else/pull/1"}"#,
+    )
+    .unwrap();
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_structured_output_dir(out_dir.path().to_path_buf());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a foreign-repo URL must never bind the work item; got {outcome:?}",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(t.pr_url.as_deref(), None, "no PR URL may be stamped"),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Fallback tier: no artifact and no hook capture, but the worker followed the
+/// Claude driver's "print the PR URL on its own line" convention. The driver's
+/// producer recovers it, and the engine finalises without the cold-path
+/// reconstruction.
+#[tokio::test]
+async fn on_stop_recovers_pr_url_from_the_driver_final_message_producer() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done. Tests pass.\n\nhttps://github.com/spinyfin/mono/pull/458",
+    );
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+        &execution_id,
+        &BranchNaming::BossExecPrefix,
+        None,
+    )));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
+            if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+        "expected ReviewerEnqueued with the URL from the final message, got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "the driver's producer must be consulted before the cold-path detector",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/458"),),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn on_stop_uses_staged_pr_url_and_skips_detector() {
     // Primary path: the worker ran `gh pr create` mid-run, the

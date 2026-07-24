@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use boss_engine_structured_output::StructuredOutputKind;
+use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
 use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_event};
 use boss_ssh_transport::shell_quote;
@@ -16,6 +18,8 @@ use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
     ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
 };
+
+pub mod structured_output;
 
 // ---------------------------------------------------------------------------
 // Claude model / effort menu (design §1.4 / §Mix-and-match)
@@ -621,6 +625,10 @@ impl AgentDriver for ClaudeDriver {
             ErrorClass::Permanent => WorkerErrorClass::Permanent,
             ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
         }
+    }
+
+    fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate> {
+        structured_output::fallback_candidates(kind, text)
     }
 }
 

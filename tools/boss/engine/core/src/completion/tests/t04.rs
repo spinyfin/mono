@@ -612,7 +612,11 @@ async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
     let probes = probe_queuer.snapshot();
     assert_eq!(probes.len(), 1, "exactly one probe must be queued");
     assert_eq!(probes[0].0, pr_review_exec_id, "probe keyed to the reviewer exec");
-    let expected_path = crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id);
+    let expected_path = crate::structured_output::path_for(
+        out_dir.path(),
+        &pr_review_exec_id,
+        crate::structured_output::StructuredOutputKind::ReviewResult,
+    );
     assert!(
         probes[0].1.contains(&expected_path.display().to_string()),
         "probe must name the artifact path; got: {}",
@@ -682,7 +686,11 @@ async fn pr_review_pass_reads_result_from_artifact_file() {
     let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
     let out_dir = tempdir().unwrap();
     std::fs::write(
-        crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &pr_review_exec_id,
+            crate::structured_output::StructuredOutputKind::ReviewResult,
+        ),
         &json,
     )
     .unwrap();
@@ -707,7 +715,12 @@ async fn pr_review_pass_reads_result_from_artifact_file() {
 
     // The artifact must be reaped after a successful read.
     assert!(
-        !crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id).exists(),
+        !crate::structured_output::path_for(
+            out_dir.path(),
+            &pr_review_exec_id,
+            crate::structured_output::StructuredOutputKind::ReviewResult,
+        )
+        .exists(),
         "structured-output artifact must be deleted after the finalizer reads it",
     );
 }
@@ -826,7 +839,11 @@ async fn pr_review_pass_malformed_artifact_probe_includes_parse_error() {
     let (_dir, db, _product_id, _chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
     let out_dir = tempdir().unwrap();
     std::fs::write(
-        crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &pr_review_exec_id,
+            crate::structured_output::StructuredOutputKind::ReviewResult,
+        ),
         &malformed_json,
     )
     .unwrap();
@@ -1321,6 +1338,62 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 // where workers park in waiting_for_input emitting "nothing left to
 // do" and hold their pool slot indefinitely until manually reaped.
 // -----------------------------------------------------------
+
+/// A revision worker that *names* the chain-root PR — in its structured-output
+/// artifact or its final message — has not thereby proved it pushed. Both
+/// self-reported channels must be ignored for revisions, leaving the SHA-delta
+/// gate as the only evidence that moves a revision forward. Without this, a
+/// revision that did nothing but echo its parent's PR URL would finalise.
+#[tokio::test]
+async fn revision_self_reported_pr_url_does_not_substitute_for_push_evidence() {
+    use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1490";
+    let head = "abcdef1111111111111111111111111111111111";
+    let (_dir, db, _product_id, _revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+
+    // The revision writes the parent's URL to its PR-URL artifact and prints
+    // it in its final message, but the head SHA has not moved.
+    let out_dir = tempdir().unwrap();
+    std::fs::write(
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &execution_id,
+            crate::structured_output::StructuredOutputKind::PrUrl,
+        ),
+        format!(r#"{{"pr_url": "{parent_pr_url}"}}"#),
+    )
+    .unwrap();
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        &format!("Nothing left to change.\n\n{parent_pr_url}"),
+    );
+
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head.into())).await;
+    let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_structured_output_dir(out_dir.path().to_path_buf())
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        staged_pr_urls.get(&execution_id).is_none(),
+        "neither self-reported channel may stage a URL for a revision; got {:?} (outcome {outcome:?})",
+        staged_pr_urls.get(&execution_id),
+    );
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a self-reported URL must not drive a revision's PR transition; got {outcome:?}",
+    );
+}
 
 #[tokio::test]
 async fn on_stop_finalizes_satisfied_revision_when_pr_clean_and_sha_unchanged() {

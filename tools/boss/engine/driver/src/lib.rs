@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use boss_engine_structured_output::StructuredOutputKind;
+use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{EffortLevel, NormalizeError, TaskKind, WorkerEvent};
 
 /// A named capability Boss needs from an agent driver.
@@ -642,6 +644,28 @@ pub trait AgentDriver: Send + Sync {
     /// Classify a raw error string from the worker's output for
     /// transient-recovery decisions.
     fn classify_error(&self, raw_output: &str) -> WorkerErrorClass;
+
+    // ── StructuredOutput capability ─────────────────────────────────────────
+
+    /// Fallback producer for [`Capability::StructuredOutput`]: recover
+    /// `kind`'s payload from the worker's prose when the **primary** channel
+    /// — the driver-agnostic file contract in
+    /// [`boss_engine_structured_output`] — produced nothing.
+    ///
+    /// `text` is the worker's final assistant message (or, where the engine
+    /// has it, the joined assistant prose of the run); the driver's
+    /// final-message conventions are what it knows how to read. Returns
+    /// candidates most-preferred first, each carrying the payload in exactly
+    /// the wire form the file contract defines for `kind`, so the caller runs
+    /// one parser over both channels and keeps the first candidate that
+    /// validates.
+    ///
+    /// Returning an empty `Vec` is the honest answer for a driver — or a kind
+    /// — with no prose convention to scrape, and is what a driver that
+    /// relies on the file channel alone does for every kind. It is never an
+    /// error: an absent payload is a normal outcome the caller already
+    /// handles.
+    fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate>;
 }
 
 pub mod claude;
@@ -943,6 +967,9 @@ mod tests {
         }
         fn classify_error(&self, _: &str) -> WorkerErrorClass {
             unimplemented!()
+        }
+        fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
+            Vec::new()
         }
     }
 }

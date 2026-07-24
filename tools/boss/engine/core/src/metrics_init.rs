@@ -64,6 +64,8 @@ mod tests {
         // Phase 3: PR URL capture counters.
         for expected in [
             "pr_url_capture.primary_path.hit",
+            "pr_url_capture.artifact.hit",
+            "pr_url_capture.driver_fallback.hit",
             "pr_url_capture.reconstruction_path.hit",
             "pr_url_capture.reconstruction_path.failed",
             "pr_url_capture.recheck_staged.branch_mismatch",
@@ -199,8 +201,8 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            72,
-            "expected 4 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
+            74,
+            "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 10 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error counters"

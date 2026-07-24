@@ -202,7 +202,12 @@ pub async fn reconcile_postmortem_followups(
 /// fallback here, unlike the generic followups artifact reader.
 fn read_artifact(dir: Option<&Path>, execution_id: &str) -> Result<Vec<PostmortemFollowupEntry>, String> {
     let dir = dir.ok_or_else(|| "no structured-output directory configured on this engine".to_owned())?;
-    let raw = crate::structured_output::read(dir, execution_id).ok_or_else(|| {
+    let raw = crate::structured_output::read(
+        dir,
+        execution_id,
+        crate::structured_output::StructuredOutputKind::PostmortemFollowups,
+    )
+    .ok_or_else(|| {
         "no structured-output artifact was written — the postmortem worker must always write one, \
          an empty array `[]` if it found no uncompleted work"
             .to_owned()
@@ -215,6 +220,7 @@ fn read_artifact(dir: Option<&Path>, execution_id: &str) -> Result<Vec<Postmorte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structured_output::StructuredOutputKind::PostmortemFollowups as PostmortemKind;
     use crate::test_support::{create_test_product_named, open_db};
     use crate::work::CreateProjectInput;
 
@@ -264,7 +270,7 @@ mod tests {
         let (dir, db) = open_db();
         let (product_id, project_id, postmortem_id) = setup_postmortem(&db);
         let out_dir = dir.path().join("structured-output");
-        let path = crate::structured_output::prepare(&out_dir, "exec_bad").unwrap();
+        let path = crate::structured_output::prepare(&out_dir, "exec_bad", PostmortemKind).unwrap();
         std::fs::write(&path, "not json").unwrap();
 
         let outcome = reconcile_postmortem_followups(
@@ -286,7 +292,7 @@ mod tests {
         let (dir, db) = open_db();
         let (product_id, project_id, postmortem_id) = setup_postmortem(&db);
         let out_dir = dir.path().join("structured-output");
-        let path = crate::structured_output::prepare(&out_dir, "exec_empty").unwrap();
+        let path = crate::structured_output::prepare(&out_dir, "exec_empty", PostmortemKind).unwrap();
         std::fs::write(&path, "[]").unwrap();
 
         let outcome = reconcile_postmortem_followups(
@@ -311,7 +317,7 @@ mod tests {
         let (dir, db) = open_db();
         let (product_id, project_id, postmortem_id) = setup_postmortem(&db);
         let out_dir = dir.path().join("structured-output");
-        let path = crate::structured_output::prepare(&out_dir, "exec_hit").unwrap();
+        let path = crate::structured_output::prepare(&out_dir, "exec_hit", PostmortemKind).unwrap();
         std::fs::write(
             &path,
             r#"[{"name":"Wire the frontend field","description":"Backend shipped the field but no UI consumes it.","evidence":"PR #42 added the field; grep shows zero frontend references."}]"#,
@@ -352,7 +358,7 @@ mod tests {
         let (dir, db) = open_db();
         let (product_id, project_id, postmortem_id) = setup_postmortem(&db);
         let out_dir = dir.path().join("structured-output");
-        let path = crate::structured_output::prepare(&out_dir, "exec_hit").unwrap();
+        let path = crate::structured_output::prepare(&out_dir, "exec_hit", PostmortemKind).unwrap();
         std::fs::write(
             &path,
             r#"[{"name":"Follow up A","description":"desc","evidence":"evidence"}]"#,

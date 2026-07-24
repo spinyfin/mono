@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::ci_log_reader::{parse_buildkite_build_id, parse_buildkite_pipeline_slug};
 use crate::conflict_diagnosis::ConflictDiagnosis;
+use crate::structured_output::StructuredOutputKind;
 use crate::work::{
     CiRemediation, ConflictResolution, Project, WorkDb, WorkExecution, WorkItem, parse_pr_doc_artifact_id,
 };
@@ -242,6 +243,70 @@ fn startup_recovery_block(
     block
 }
 
+/// The structured-output payload this execution's prompt is built around —
+/// the one `$BOSS_STRUCTURED_OUTPUT` names.
+///
+/// Each execution kind designates at most one: a reviewer produces a
+/// `ReviewResult`, a triage agent a decision, a design-postmortem worker its
+/// required uncompleted-work manifest, an implementer its optional followups.
+/// The PR URL is deliberately *not* here — an implementer produces both, so it
+/// gets its own path and env var (see [`structured_output_env_vars`]).
+/// Returns `None` for kinds with no designated payload (answer agent, CI
+/// remediation, plain design tasks).
+pub(super) fn designated_output_kind(execution: &WorkExecution, work_item: &WorkItem) -> Option<StructuredOutputKind> {
+    match execution.kind {
+        ExecutionKind::PrReview => Some(StructuredOutputKind::ReviewResult),
+        ExecutionKind::AutomationTriage => Some(StructuredOutputKind::TriageDecision),
+        // A `design_postmortem` task reuses `ProjectDesign` for dispatch, so
+        // the payload is chosen by the task's own kind — matching the branch
+        // in `compose_execution_prompt` that renders its directive.
+        ExecutionKind::ProjectDesign => matches!(
+            work_item,
+            WorkItem::Task(t) | WorkItem::Chore(t) if t.kind == TaskKind::DesignPostmortem
+        )
+        .then_some(StructuredOutputKind::PostmortemFollowups),
+        // Kept in lockstep with the `followups_emission_block` condition in
+        // `compose_execution_prompt`: these are the kinds whose prompt carries
+        // the followups instruction.
+        ExecutionKind::TaskImplementation
+        | ExecutionKind::ChoreImplementation
+        | ExecutionKind::InvestigationImplementation
+        | ExecutionKind::RevisionImplementation => Some(StructuredOutputKind::Followups),
+        _ => None,
+    }
+}
+
+/// Worker env carrying the structured-output artifact paths: the designated
+/// payload's path as `$BOSS_STRUCTURED_OUTPUT` (when the kind has one) and the
+/// PR-URL artifact's path as `$BOSS_PR_URL_OUTPUT`.
+///
+/// The operative instruction is always the literal path embedded in the
+/// prompt — a model writes with the `Write` tool, not by expanding env vars —
+/// but exporting them keeps the convention self-documenting in the pane and
+/// lets a script resolve it.
+pub(super) fn structured_output_env_vars(
+    dir: &Path,
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+) -> Vec<(String, String)> {
+    let path_of = |kind| {
+        crate::structured_output::path_for(dir, &execution.id, kind)
+            .display()
+            .to_string()
+    };
+    let mut env = vec![(
+        crate::structured_output::PR_URL_OUTPUT_ENV.to_owned(),
+        path_of(StructuredOutputKind::PrUrl),
+    )];
+    if let Some(kind) = designated_output_kind(execution, work_item) {
+        env.push((
+            crate::structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
+            path_of(kind),
+        ));
+    }
+    env
+}
+
 pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     let ExecutionPromptParams {
         execution,
@@ -400,7 +465,10 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             if is_postmortem {
                 prompt.push_str(&compose_design_postmortem_directive(
                     parent_project,
-                    &crate::structured_output::default_path_string(&execution.id),
+                    &crate::structured_output::default_path_string(
+                        &execution.id,
+                        StructuredOutputKind::PostmortemFollowups,
+                    ),
                 ));
             } else {
                 prompt.push_str(&compose_design_directive(parent_project));
@@ -489,6 +557,13 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // changes: the worker pushes to the existing PR branch instead of
         // creating a new one. The engine's staged-URL detector captures
         // the URL from `gh pr view` output at the end of the run.
+        // PRIMARY channel for the PR URL: an engine-owned artifact file the
+        // worker writes (design: agent-driver abstraction §1.6 — file-based
+        // StructuredOutput). Driver-agnostic: no transcript convention, no
+        // hook stream, just a path. The final-message line below stays as the
+        // Claude driver's fallback producer, and the `PostToolUse` capture of
+        // `gh pr create` stdout remains as its hook-derived one.
+        let pr_url_artifact = crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
         if let Some(pr_url) = existing_pr_url {
             let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
                 .map(|n| n.to_string())
@@ -497,7 +572,8 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
                  - Push your commits to the existing PR branch with `cube pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
                  - Confirm the PR is updated with `gh pr view {pr_number}` (pass `-R owner/repo` since bare gh calls need it in a jj workspace — use `jj git remote` to find the slug, or check the PR URL above).\n\
-                 - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
+                 - As soon as cube prints the PR URL, record it: write `{{\"pr_url\": \"<the url>\"}}` with the `Write` tool to `{pr_url_artifact}` (also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
+                 - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         } else {
@@ -507,7 +583,8 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                  - Push your branch (`jj bookmark create {expected_branch} -r @`) and open a PR with `cube pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It is safe to retry: if a prior call already created the PR (e.g. your tool killed an earlier invocation on a timeout but the push had actually landed), it returns that PR's URL instead of erroring. Use `cube pr update --branch {expected_branch}` only when you have new commits to push onto an already-open PR.\n\
                  - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `cube pr create` or `cube pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
-                 - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
+                 - As soon as cube prints the PR URL, record it: write `{{\"pr_url\": \"<the url>\"}}` with the `Write` tool to `{pr_url_artifact}` (also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
+                 - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         }
@@ -563,7 +640,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             | ExecutionKind::RevisionImplementation
     ) {
         prompt.push_str(&followups_emission_block(
-            &crate::structured_output::default_path_string(&execution.id),
+            &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::Followups),
             followup_proposals_seam_enabled,
         ));
     }
