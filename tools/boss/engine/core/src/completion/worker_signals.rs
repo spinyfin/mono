@@ -530,6 +530,58 @@ impl WorkerCompletionHandler {
         true
     }
 
+    /// Whether `execution` already carries at least one `worker_proposals`
+    /// row of kind `followup_task` — the proposals-first check
+    /// [`crate::completion::pr_transition`]'s followups block uses to skip
+    /// the *entire* legacy read chain (the structured-output artifact, the
+    /// `FOLLOWUPS:` sentinel scrape, and the `attentions_followups_backstop`
+    /// LLM pass) for this execution (design implementation task 10,
+    /// following the recipe [`Self::execution_has_worker_signal_proposal`] /
+    /// [`Self::execution_has_deferred_scope_proposal`] established).
+    ///
+    /// Unlike those two callers, this check is kind-scoped only, not
+    /// content-matched against a specific detected item: `boss propose
+    /// followup-task` is "one call per follow-up, during the run" (design
+    /// §"CLI surface"), and [`crate::work::proposal_apply::stage_followup_task_in_transaction`]
+    /// already upserts each proposal's member into the originating task's
+    /// `followup` attention group synchronously at submission time — so any
+    /// followup_task proposal for this execution means the worker used the
+    /// new mechanism for its follow-ups, and re-scraping legacy sources
+    /// would only add redundant or conflicting members alongside what is
+    /// already staged.
+    ///
+    /// A storage error fails open (`false`, so the legacy chain still runs)
+    /// rather than silently dropping real follow-ups.
+    pub(super) fn execution_has_followup_task_proposal(&self, execution: &crate::work::WorkExecution) -> bool {
+        self.execution_has_matching_proposal(execution, ProposalKind::FollowupTask, "followup_proposals_seam", |_| {
+            true
+        })
+    }
+
+    /// Count one legacy-chain hit for the follow-ups seam and log a WARN.
+    /// Called only when `followup_proposals_seam` is on, no `followup_task`
+    /// proposal existed for the execution, and the legacy chain actually
+    /// recorded at least one genuinely new follow-up (either the
+    /// structured-output artifact / `FOLLOWUPS:` sentinel path or the
+    /// `attentions_followups_backstop` LLM pass) — mirrors
+    /// [`Self::record_worker_signal_fallback_hit`] /
+    /// [`Self::record_deferred_scope_fallback_hit`]'s discipline of not
+    /// re-incrementing on every subsequent terminal Stop of the same
+    /// cumulative transcript. `source` names which legacy path fired
+    /// (`"reconcile_task_followups"` for the structured-output-artifact /
+    /// `FOLLOWUPS:` sentinel chain, or `"attentions_followups_backstop"` for
+    /// the LLM pass) since, unlike a single marker line, there is no one
+    /// line to log for a whole reconciled batch.
+    pub(super) fn record_followup_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str) {
+        self.record_proposal_fallback_hit(
+            execution,
+            &FOLLOWUP_FALLBACK_HIT,
+            "followup_proposals_seam",
+            "followup_task",
+            source,
+        );
+    }
+
     /// Consume this execution's staged `proposal_channel_error` (if any —
     /// see [`crate::proposal_channel_error`]), file an attention for it, and
     /// increment `worker_proposals.channel_error`. Design §"Failure

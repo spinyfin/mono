@@ -372,9 +372,18 @@ impl WorkerCompletionHandler {
         }
 
         // Followups: any completing implementation worker may surface
-        // out-of-scope follow-on work. PRIMARY: the engine-owned
-        // structured-output artifact (a `FollowupEntry` JSON array). FALLBACK:
-        // a `FOLLOWUPS:` block scraped from the transcript tail. A no-op (no
+        // out-of-scope follow-on work. PRIMARY (design implementation task
+        // 10): a `followup_task` proposal — `boss propose followup-task`
+        // already upserted the member into the `followup` attention group
+        // synchronously at submission time
+        // (`crate::work::proposal_apply::stage_followup_task_in_transaction`),
+        // so when `followup_proposals_seam` is on and this execution carries
+        // at least one such proposal, the entire legacy read chain below is
+        // skipped. LEGACY (counted fallback when no proposal exists, or
+        // unconditionally when the seam is off): the engine-owned
+        // structured-output artifact (a `FollowupEntry` JSON array), falling
+        // back to a `FOLLOWUPS:` block scraped from the transcript tail, and
+        // finally the `attentions_followups_backstop` LLM pass. A no-op (no
         // artifact / no transcript / no block) when absent; idempotent across
         // re-runs via the store's content dedup.
         //
@@ -384,29 +393,48 @@ impl WorkerCompletionHandler {
         // find nothing (or, if reusing the same artifact path, fail to
         // parse it as `FollowupEntry` and log spurious noise).
         if !is_design_postmortem {
-            let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
-            let followups_result = attentions_detector::reconcile_task_followups(
-                &self.work_db,
-                &work_item_id,
-                execution_id,
-                Some(&self.structured_output_dir),
-                transcript_path.as_deref(),
-            )
-            .await;
-            if let Some((ref group, ref created)) = followups_result {
-                self.publish_attentions_created(group, created).await;
-            } else if self.feature_flags.is_enabled("attentions_followups_backstop") {
-                // Primary found no FOLLOWUPS: block; fall back to the supervisor
-                // extraction backstop (flagged `confidence_source = extracted`).
-                if let Some((group, created)) = attentions_detector::extract_followups_backstop(
+            let followup_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+                && self.feature_flags.is_enabled("followup_proposals_seam");
+            let has_followup_proposal =
+                followup_proposals_first && self.execution_has_followup_task_proposal(&completion.execution);
+            if has_followup_proposal {
+                tracing::debug!(
+                    execution_id,
+                    work_item_id = %work_item_id,
+                    "followup_proposals_seam: skipping legacy followups detection — a \
+                     followup_task proposal already exists for this execution",
+                );
+            } else {
+                let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
+                let followups_result = attentions_detector::reconcile_task_followups(
                     &self.work_db,
                     &work_item_id,
                     execution_id,
+                    Some(&self.structured_output_dir),
                     transcript_path.as_deref(),
                 )
-                .await
-                {
-                    self.publish_attentions_created(&group, &created).await;
+                .await;
+                if let Some((ref group, ref created)) = followups_result {
+                    if followup_proposals_first && !created.is_empty() {
+                        self.record_followup_fallback_hit(&completion.execution, "reconcile_task_followups");
+                    }
+                    self.publish_attentions_created(group, created).await;
+                } else if self.feature_flags.is_enabled("attentions_followups_backstop") {
+                    // Primary found no FOLLOWUPS: block; fall back to the supervisor
+                    // extraction backstop (flagged `confidence_source = extracted`).
+                    if let Some((group, created)) = attentions_detector::extract_followups_backstop(
+                        &self.work_db,
+                        &work_item_id,
+                        execution_id,
+                        transcript_path.as_deref(),
+                    )
+                    .await
+                    {
+                        if followup_proposals_first && !created.is_empty() {
+                            self.record_followup_fallback_hit(&completion.execution, "attentions_followups_backstop");
+                        }
+                        self.publish_attentions_created(&group, &created).await;
+                    }
                 }
             }
         }

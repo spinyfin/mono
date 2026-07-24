@@ -287,6 +287,11 @@ impl ExecutionRunner for PaneSpawnRunner {
         // deferred-scope seam migration must move together.
         let deferred_scope_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("deferred_scope_proposals_seam");
+        // Mirrors `worker_signal_proposals_seam_enabled` above — see
+        // `followups_emission_block`'s doc for why both halves of the
+        // follow-ups seam migration must move together.
+        let followup_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("followup_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -302,6 +307,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 self.cfg.work.max_review_embed_diff_lines,
                 worker_signal_proposals_seam_enabled,
                 deferred_scope_proposals_seam_enabled,
+                followup_proposals_seam_enabled,
             ),
         )
         .await?;

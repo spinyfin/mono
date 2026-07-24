@@ -1892,6 +1892,177 @@ async fn deferred_scope_proposals_first_flag_off_matches_pre_migration_behavior_
     );
 }
 
+// -----------------------------------------------------------
+// Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
+// implementation task 10): `followup_proposals_seam` makes the followups
+// block in `finalize_pr_transition` read proposals-first, skipping the
+// entire legacy structured-output-artifact / `FOLLOWUPS:` sentinel chain
+// (`attentions_detector::reconcile_task_followups`) whenever this
+// execution already carries a `followup_task` proposal. Mirrors the
+// `deferred_scope_proposals_seam` tests above, but through the
+// PR-detected `finalize_pr_transition` path (followups only reconcile at
+// PR completion) rather than a bare `on_stop`.
+// -----------------------------------------------------------
+
+#[tokio::test]
+async fn followup_proposals_first_flag_skips_legacy_detection_when_a_proposal_already_exists() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
+    // The worker already called `boss propose followup-task` — this
+    // unconditionally stages a member into the chore's `followup`
+    // attention group at submission time (task 6), independent of any
+    // seam flag.
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::FollowupTask,
+        payload_json: r#"{"proposed_name":"Add retry to the X client","proposed_description":"bounded retry with jitter","rationale":"observed flakes during this task"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    // The final message also carries a legacy FOLLOWUPS: block with a
+    // DIFFERENT follow-up — proposals-first must skip this entirely, not
+    // just dedup it away.
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Unrelated legacy followup\", \"proposed_description\": \"should never land\"}]\n```\n",
+    );
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("followup_proposals_seam", true).unwrap();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+
+    let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    handler.on_stop(&execution_id).await;
+
+    let groups = db
+        .list_attention_groups(&product_id, None, Some(&chore_id), Some("followup"), None)
+        .unwrap();
+    assert_eq!(groups.len(), 1, "expected exactly one followup group; got {groups:?}");
+    let members = db.list_attentions_for_group(&groups[0].id).unwrap();
+    assert_eq!(
+        members.len(),
+        1,
+        "the proposal's synchronous stage already put one member in the group; the legacy \
+         FOLLOWUPS: block must not add a second one; got {members:?}",
+    );
+    assert_eq!(members[0].proposed_name.as_deref(), Some("Add retry to the X client"));
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.followup_task"),
+        Some(0),
+        "no fallback hit expected — an existing followup_task proposal covered this execution",
+    );
+}
+
+#[tokio::test]
+async fn followup_proposals_first_flag_falls_back_to_legacy_detection_and_counts_the_hit() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
+    // No proposal was ever submitted for this execution — only the legacy
+    // FOLLOWUPS: block.
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Add retry to the X client\", \"proposed_description\": \"bounded retry with jitter\"}]\n```\n",
+    );
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("followup_proposals_seam", true).unwrap();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+
+    let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    handler.on_stop(&execution_id).await;
+
+    let groups = db
+        .list_attention_groups(&product_id, None, Some(&chore_id), Some("followup"), None)
+        .unwrap();
+    assert_eq!(groups.len(), 1, "expected exactly one followup group; got {groups:?}");
+    let members = db.list_attentions_for_group(&groups[0].id).unwrap();
+    assert_eq!(
+        members.len(),
+        1,
+        "no proposal existed, so the legacy FOLLOWUPS: block must still be reconciled; \
+         got {members:?}",
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.followup_task"),
+        Some(1),
+        "the legacy path fired, so the seam's fallback-hit counter must increment",
+    );
+}
+
+#[tokio::test]
+async fn followup_proposals_first_flag_off_matches_pre_migration_behavior_exactly() {
+    // Even with an existing followup_task proposal AND a legacy
+    // FOLLOWUPS: block both present, the flag defaulting off must
+    // reproduce the exact pre-seam behavior: the legacy chain always
+    // runs, no proposals-first skip, no fallback counting.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::FollowupTask,
+        payload_json: r#"{"proposed_name":"Add retry to the X client","proposed_description":"bounded retry with jitter","rationale":"observed flakes during this task"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Unrelated legacy followup\", \"proposed_description\": \"should still land\"}]\n```\n",
+    );
+
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_metrics(metrics.clone());
+
+    handler.on_stop(&execution_id).await;
+
+    let groups = db
+        .list_attention_groups(&product_id, None, Some(&chore_id), Some("followup"), None)
+        .unwrap();
+    assert_eq!(groups.len(), 1, "expected exactly one followup group; got {groups:?}");
+    let members = db.list_attentions_for_group(&groups[0].id).unwrap();
+    assert_eq!(
+        members.len(),
+        2,
+        "with the flag off, both the proposal's synchronous stage and the legacy FOLLOWUPS: \
+         block must land — the proposals-first skip must not apply; got {members:?}",
+    );
+    assert_eq!(
+        metrics.counter_value("worker_proposals.fallback_hit.followup_task"),
+        Some(0),
+        "with the flag off nothing is counted",
+    );
+}
+
 #[tokio::test]
 async fn blocked_worker_is_never_reaped_across_repeated_stops() {
     // The other half of the auto-remediation contract: a worker with a

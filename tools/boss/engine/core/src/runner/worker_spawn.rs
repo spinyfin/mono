@@ -195,15 +195,16 @@ pub(crate) async fn compose_worker_spawn(
     workspace_path: &Path,
     cube_change_id: Option<&str>,
     // (editorial_enabled, max_embed_diff_lines, worker_signal_proposals_seam_enabled,
-    // deferred_scope_proposals_seam_enabled) — bundled to keep the parameter count
-    // under clippy::too_many_arguments.
-    editorial_opts: (bool, u64, bool, bool),
+    // deferred_scope_proposals_seam_enabled, followup_proposals_seam_enabled) —
+    // bundled to keep the parameter count under clippy::too_many_arguments.
+    editorial_opts: (bool, u64, bool, bool, bool),
 ) -> anyhow::Result<ComposedWorkerSpawn> {
     let (
         editorial_enabled,
         max_embed_diff_lines,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
+        followup_proposals_seam_enabled,
     ) = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -578,6 +579,7 @@ pub(crate) async fn compose_worker_spawn(
                 .editorial_enabled(editorial_enabled)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                 .merge_order_preservation(&merge_order_preservation)
                 .build(),
         )
@@ -731,7 +733,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            (false, 0, false, false, false),
         )
         .await
         .unwrap();
@@ -767,7 +769,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            (false, 0, false, false, false),
         )
         .await
         .unwrap();
@@ -806,7 +808,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            (false, 0, false, false, false),
         )
         .await
         .unwrap();
@@ -845,7 +847,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            (false, 0, false, false),
+            (false, 0, false, false, false),
         )
         .await
         .unwrap();

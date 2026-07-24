@@ -288,6 +288,28 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "followup_proposals_seam",
+        description: "Read worker_proposals rows before falling back to the legacy structured-output-artifact / \
+             FOLLOWUPS: sentinel scrape and LLM extraction backstop in reconcile_task_followups (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, implementation task 10 — the \
+             follow-ups seam migration, following the recipe `worker_signal_proposals_seam`/ \
+             `deferred_scope_proposals_seam` established). When on, an execution that already carries at \
+             least one worker_proposals row of kind followup_task skips the legacy artifact/sentinel scrape \
+             and the attentions_followups_backstop LLM pass entirely for that execution — \
+             stage_followup_task_in_transaction already upserted each proposed follow-up into the \
+             originating task's `followup` attention group synchronously at submission time (task 6), so \
+             re-scraping legacy sources would only produce redundant or conflicting members. When no \
+             followup_task proposal exists, the legacy chain still runs exactly as before, and every time it \
+             records a genuinely new follow-up the worker_proposals.fallback_hit.followup_task counter \
+             increments and a WARN logs — the counter is this seam's explicit exit criterion for eventually \
+             deleting the sentinel scrape and LLM backstop. DEFAULT OFF: enable per operator once the \
+             proposal path is validated in staging. Kill switch: set false to restore the pre-migration \
+             artifact/sentinel-only detection exactly.",
+        category: "attentions",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_rpc_tier",
         description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
              worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
@@ -738,6 +760,30 @@ mod tests {
         let store2 = make_store(&tmp);
         store2.load().unwrap();
         assert!(store2.is_enabled("deferred_scope_proposals_seam"));
+    }
+
+    #[test]
+    fn followup_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("followup_proposals_seam"),
+            "followup_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "followup_proposals_seam")
+            .expect("followup_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "attentions");
+
+        store.set("followup_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("followup_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("followup_proposals_seam"));
     }
 
     #[test]

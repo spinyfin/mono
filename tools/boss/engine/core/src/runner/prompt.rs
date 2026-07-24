@@ -55,6 +55,20 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// restore today's behavior exactly, prompt included.
     #[builder(default)]
     deferred_scope_proposals_seam_enabled: bool,
+    /// Whether `followup_proposals_seam` is on — gates the worker-facing
+    /// prompt half of the follow-ups seam migration (design implementation
+    /// task 10): [`followups_emission_block`]. `false` (the flag's registry
+    /// default) reproduces the exact structured-output-artifact-primary /
+    /// `FOLLOWUPS:`-sentinel-fallback text; `true` teaches `boss propose
+    /// followup-task` instead. This is the OTHER half of the flag: the
+    /// engine's read path
+    /// (`crate::completion::WorkerCompletionHandler::execution_has_followup_task_proposal`,
+    /// consumed by `crate::completion::pr_transition`'s followups block) is
+    /// gated by the same flag name read directly from `FeatureFlagsStore`;
+    /// gating the prompt too is what makes "flag off" restore today's
+    /// behavior exactly, prompt included.
+    #[builder(default)]
+    followup_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -243,6 +257,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         editorial_enabled,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
+        followup_proposals_seam_enabled,
         merge_order_preservation,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
@@ -549,6 +564,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     ) {
         prompt.push_str(&followups_emission_block(
             &crate::structured_output::default_path_string(&execution.id),
+            followup_proposals_seam_enabled,
         ));
     }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
@@ -1265,33 +1281,87 @@ fn design_questions_manifest_block() -> String {
 }
 
 /// Followups emission instruction (design:
-/// `tools/boss/docs/designs/attentions.md`, "Creation pipeline"). Appended to
-/// the implementation-worker directive: a worker that notices concrete,
-/// out-of-scope follow-on work near task completion **writes** it as a JSON
-/// array to the engine-owned artifact at `output_path` (see
-/// [`crate::structured_output`]). The engine reads + schema-validates that
-/// file at completion and upserts a followup group keyed to this task; the
-/// human turns accepted entries into tasks with one gesture. A `FOLLOWUPS:`
-/// fenced-JSON sentinel in the final message is kept as a transitional
-/// fallback (and to keep remote workers working until the artifact is fetched
-/// cross-host).
-fn followups_emission_block(output_path: &str) -> String {
+/// `tools/boss/docs/designs/attentions.md`, "Creation pipeline";
+/// `worker-proposal-api-replace-fragile-worker-to-engine-seams.md`,
+/// implementation task 10). Appended to the implementation-worker directive:
+/// a worker that notices concrete, out-of-scope follow-on work near task
+/// completion surfaces it for the human.
+///
+/// `seam_enabled` mirrors the `followup_proposals_seam` feature flag — the
+/// same flag
+/// [`crate::completion::WorkerCompletionHandler::execution_has_followup_task_proposal`]
+/// reads for the engine's read path, threaded here so the two halves of the
+/// migration move together: a worker must never be taught a verb the engine
+/// won't yet read proposals-first for, and flipping the flag off must
+/// restore today's behavior exactly, prompt included.
+///
+/// `seam_enabled = false` reproduces the pre-migration directive verbatim:
+/// **write** a JSON array to the engine-owned artifact at `output_path` (see
+/// [`crate::structured_output`]) — the engine reads + schema-validates that
+/// file at completion and upserts a followup group keyed to this task — with
+/// a `FOLLOWUPS:` fenced-JSON sentinel in the final message kept as a
+/// transitional fallback (and to keep remote workers working until the
+/// artifact is fetched cross-host).
+///
+/// `seam_enabled = true` instructs `boss propose followup-task` instead: one
+/// call per follow-up, during the run, not batched into an end-of-run
+/// artifact. Submission is synchronous — a malformed call fails right away
+/// with a typed error the worker can fix and retry, unlike an artifact/
+/// sentinel the engine only reads long after the worker has moved on — and
+/// it upserts into the same `followup` attention group visible to the human
+/// immediately, not just at completion. Because `followup_task` proposals
+/// stay `Gated` (task creation always needs the human batch-accept gesture),
+/// the directive carries the same "proposed, not filed" phrasing discipline
+/// [`deferred_scope_directive`] teaches: a PR body may reference a proposal
+/// only as "proposed follow-up `prp_…`", never "filed as a followup" — the
+/// worker has no write path to an actual task, so that claim would be false
+/// regardless of which channel emitted it.
+fn followups_emission_block(output_path: &str, seam_enabled: bool) -> String {
+    if !seam_enabled {
+        let mut out = String::new();
+        out.push_str("\n## Optional: surface follow-on work as followups\n\n");
+        out.push_str(
+            "If, while completing this task, you noticed concrete follow-on work worth filing — a separate bug, a needed refactor, a missing test, a docs gap — that is OUT OF SCOPE for this PR, you may surface it for the human. This is OPTIONAL: only include genuine, actionable proposals, never invent work to fill it, and never list the change you just made.\n\n",
+        );
+        out.push_str(&format!(
+            "If (and only if) you have followups, **write** a JSON array of them with the `Write` tool to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`):\n\n`{output_path}`\n\nThis path is outside the repo/workspace, so the manifest never pollutes your PR. Each array element is an object:\n",
+        ));
+        out.push_str("- `proposed_name` (required): a short task title.\n");
+        out.push_str("- `proposed_description` (required): one paragraph of scope.\n");
+        out.push_str("- `proposed_effort` (optional): one of `trivial` | `small` | `medium` | `large` | `max`.\n");
+        out.push_str("- `proposed_work_kind` (optional): one of `task` | `chore` | `project` (defaults to `task`).\n");
+        out.push_str("- `rationale` (optional): why it is worth doing.\n\n");
+        out.push_str("File contents example:\n\n```json\n[{\"proposed_name\": \"Add retry/backoff to the X client\", \"proposed_description\": \"The X client fails hard on transient 5xx; add bounded retry with jitter.\", \"proposed_effort\": \"small\", \"proposed_work_kind\": \"task\", \"rationale\": \"Observed flakes during this task.\"}]\n```\n\n");
+        out.push_str("Do NOT write the file at all if you have no followups — an absent file means \"no followups\", which is the normal case. Writing it does not block this PR — it just files proposals for the human to review.\n\n");
+        out.push_str("As a fallback only (e.g. if the file write is unavailable), you may instead append — after your `## Open Questions` section — a line containing exactly `FOLLOWUPS:` immediately followed by a fenced ```json code block holding the same JSON array.\n");
+        return out;
+    }
     let mut out = String::new();
     out.push_str("\n## Optional: surface follow-on work as followups\n\n");
     out.push_str(
         "If, while completing this task, you noticed concrete follow-on work worth filing — a separate bug, a needed refactor, a missing test, a docs gap — that is OUT OF SCOPE for this PR, you may surface it for the human. This is OPTIONAL: only include genuine, actionable proposals, never invent work to fill it, and never list the change you just made.\n\n",
     );
+    out.push_str(
+        "If (and only if) you have followups, call `boss propose followup-task` once per follow-up, during the run:\n\n\
+         ```\n\
+         boss propose followup-task --name \"<short task title>\" --description \"<one paragraph of scope>\" --rationale \"<why it is worth doing>\"\n\
+         ```\n\n",
+    );
+    out.push_str("- `--name` (required): a short task title.\n");
+    out.push_str("- `--description` / `--description-file` (required, exactly one): one paragraph of scope. Prefer `--description-file` for anything with backticks, quotes, or multiple lines.\n");
+    out.push_str("- `--rationale` (required): why it is worth doing.\n");
+    out.push_str("- `--effort` (optional): one of `trivial` | `small` | `medium` | `large` | `max`.\n");
+    out.push_str("- `--work-kind` (optional): one of `task` | `chore` | `project` (defaults to `chore`).\n\n");
+    out.push_str("Example:\n\n```\nboss propose followup-task --name \"Add retry/backoff to the X client\" --description \"The X client fails hard on transient 5xx; add bounded retry with jitter.\" --effort small --work-kind task --rationale \"Observed flakes during this task.\"\n```\n\n");
+    out.push_str(
+        "Do NOT call this at all if you have no followups — never calling it means \"no followups\", which is the normal case. Calling it does not block this PR — it upserts into the originating task's followup group for the human to review; task creation still requires the human's own batch-accept gesture.\n\n",
+    );
     out.push_str(&format!(
-        "If (and only if) you have followups, **write** a JSON array of them with the `Write` tool to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`):\n\n`{output_path}`\n\nThis path is outside the repo/workspace, so the manifest never pollutes your PR. Each array element is an object:\n",
+        "As a fallback only (e.g. if `boss propose` is unreachable), you may instead **write** a JSON array to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`): `{output_path}`. Each array element is an object with `proposed_name` (required), `proposed_description` (required), `proposed_effort` (optional), `proposed_work_kind` (optional), and `rationale` (optional) — or append a `FOLLOWUPS:` sentinel plus fenced ```json array to your final message. Prefer `boss propose followup-task` — it validates synchronously and is visible to the human immediately, instead of waiting until this run completes.\n\n",
     ));
-    out.push_str("- `proposed_name` (required): a short task title.\n");
-    out.push_str("- `proposed_description` (required): one paragraph of scope.\n");
-    out.push_str("- `proposed_effort` (optional): one of `trivial` | `small` | `medium` | `large` | `max`.\n");
-    out.push_str("- `proposed_work_kind` (optional): one of `task` | `chore` | `project` (defaults to `task`).\n");
-    out.push_str("- `rationale` (optional): why it is worth doing.\n\n");
-    out.push_str("File contents example:\n\n```json\n[{\"proposed_name\": \"Add retry/backoff to the X client\", \"proposed_description\": \"The X client fails hard on transient 5xx; add bounded retry with jitter.\", \"proposed_effort\": \"small\", \"proposed_work_kind\": \"task\", \"rationale\": \"Observed flakes during this task.\"}]\n```\n\n");
-    out.push_str("Do NOT write the file at all if you have no followups — an absent file means \"no followups\", which is the normal case. Writing it does not block this PR — it just files proposals for the human to review.\n\n");
-    out.push_str("As a fallback only (e.g. if the file write is unavailable), you may instead append — after your `## Open Questions` section — a line containing exactly `FOLLOWUPS:` immediately followed by a fenced ```json code block holding the same JSON array.\n");
+    out.push_str(
+        "**Phrasing matters:** a `followup-task` proposal is submitted, not filed — task creation still needs a human's batch-accept gesture. If your PR body or summary references one, say \"proposed follow-up `prp_…`\" (the id the command prints on success), never \"filed as a followup\" or \"tracked separately\" — you have no ability to file or track anything directly, and that phrasing would be false.\n",
+    );
     out
 }
 

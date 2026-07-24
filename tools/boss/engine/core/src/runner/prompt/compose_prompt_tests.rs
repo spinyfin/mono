@@ -1692,6 +1692,64 @@ fn deferred_scope_directive_absent_for_answer_agent() {
     );
 }
 
+// -----------------------------------------------------------
+// Worker-proposal seam (worker-proposal-api-replace-fragile-worker-to-engine-seams.md,
+// implementation task 10): `followup_proposals_seam` teaches
+// `boss propose followup-task` instead of the legacy structured-output
+// artifact / `FOLLOWUPS:` sentinel. Mirrors the `deferred_scope_proposals_seam`
+// tests above.
+// -----------------------------------------------------------
+
+#[test]
+fn followups_block_teaches_legacy_artifact_and_sentinel_when_seam_is_off() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("\"proposed_name\""),
+        "seam off: the prompt must teach the legacy structured-output artifact shape:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("FOLLOWUPS:"),
+        "seam off: the prompt must keep the FOLLOWUPS: sentinel fallback:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("boss propose followup-task"),
+        "seam off: the prompt must not teach a verb the engine won't yet read proposals-first for:\n{prompt}",
+    );
+}
+
+#[test]
+fn followups_block_teaches_boss_propose_verb_when_seam_is_on() {
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&base_execution())
+            .work_item(&chore_without_pr())
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .followup_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("boss propose followup-task --name"),
+        "seam on: the prompt must teach the followup-task verb with a worked example:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("proposed follow-up `prp_"),
+        "seam on: the prompt must teach the \"proposed follow-up prp_…\" phrasing, never \
+         \"filed\":\n{prompt}",
+    );
+    assert!(
+        prompt.contains("never \"filed as a followup\""),
+        "seam on: the prompt must still forbid the false \"filed as a followup\" claim:\n{prompt}",
+    );
+}
+
 // -----------------------------------------------------------------------
 // editorial-rules block rendering (chore #5)
 // -----------------------------------------------------------------------
