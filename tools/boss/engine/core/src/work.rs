@@ -70,6 +70,45 @@ pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 /// cleared by the sweep that raised it.
 pub const DISPATCH_STAGE_STALLED_ATTENTION_KIND: &str = "dispatch_stage_stalled";
 
+/// Outcome of [`WorkDb::classify_dispatch_stall`] — whether a persistently
+/// stalled execution the escalation sweep detected should actually be
+/// escalated onto the work-item attention surface, and if not, why.
+///
+/// The sweep's detector ([`crate::dispatch_reader::persistently_stalled`])
+/// is a pure scan of the per-execution `dispatch.jsonl` mirrors with no
+/// view of the DB — deliberately, so it still works when the engine RPC is
+/// wedged. That blind spot is exactly why it over-reports: a mirror can
+/// outlive its execution row, describe an already-terminal execution, or
+/// belong to an execution whose `work_item_id` is not a product/project/task
+/// at all. An `automation_triage` execution carries the `automations.id`
+/// (an `auto_…` id) as its `work_item_id`
+/// (`WorkDb::create_automation_triage_execution`), and
+/// [`crate::work::WorkDb::file_dispatch_stage_stalled_attention`] cannot
+/// target that — `product_id_for_work_item` rejects the id with
+/// `unknown work item id format: auto_…`. Only [`Self::Escalate`] is safe to
+/// file; the other variants are the sweep's cue to skip (and count) the
+/// stall rather than hammer the trace with a per-item failure every 60s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StallEscalation {
+    /// The execution is live (non-terminal) and bound to a real work item.
+    /// Carries the row's authoritative `work_item_id` to file/refresh the
+    /// attention item against.
+    Escalate { work_item_id: String },
+    /// The execution's `work_item_id` is not a product/project/task — e.g.
+    /// an `automation_triage` execution whose id is an `auto_…` automation
+    /// id. Such executions have no kanban card to surface a stall on; their
+    /// stalls remain visible via the `stage_stalled` dispatch event and
+    /// `bossctl dispatch ghost-active --include-stalled`.
+    NotWorkItem,
+    /// The execution row is already terminal
+    /// (`completed`/`failed`/`abandoned`/`cancelled`/`orphaned`) — a dead
+    /// timeline whose mirror simply stopped, not a live stall.
+    Terminal,
+    /// No execution row exists for the mirror's id — retention-swept, or an
+    /// on-disk mirror that outlived its DB row. Nothing live to escalate.
+    Missing,
+}
+
 /// Attention-item `kind` raised when the engine stops auto-resuming a
 /// worker because its Claude API error is non-retryable (permanent or
 /// unrecognised). See [`crate::transient_recovery`].

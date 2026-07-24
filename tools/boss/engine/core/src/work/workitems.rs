@@ -296,6 +296,40 @@ impl WorkDb {
         self.upsert_external_tracker_attention(work_item_id, DISPATCH_STAGE_STALLED_ATTENTION_KIND, &title, &body)
     }
 
+    /// Decide whether a persistently-stalled execution the dispatch-stall
+    /// escalation sweep detected should be escalated onto the work-item
+    /// attention surface — the terminal/liveness/id-kind gate the file-scan
+    /// detector ([`crate::dispatch_reader::persistently_stalled`])
+    /// deliberately cannot apply (it is DB-free so it works when the engine
+    /// RPC is wedged). Consults the execution's authoritative `work_item_id`
+    /// and `status` from `work_executions` rather than trusting the mirror
+    /// line, and returns a [`StallEscalation`] the sweep tallies and acts on.
+    ///
+    /// Only [`StallEscalation::Escalate`] should be filed via
+    /// [`Self::file_dispatch_stage_stalled_attention`]. The other variants —
+    /// a terminal/dead timeline, a mirror with no surviving row, or an
+    /// automation-triage execution whose `auto_…` id has no kanban card —
+    /// are the classes that used to make the sweep re-file (and warn) every
+    /// pass forever. See [`StallEscalation`] for the full rationale.
+    pub fn classify_dispatch_stall(&self, execution_id: &str) -> Result<StallEscalation> {
+        let conn = self.connect()?;
+        let Some(execution) = query_execution(&conn, execution_id)? else {
+            return Ok(StallEscalation::Missing);
+        };
+        if execution.status.is_terminal() {
+            return Ok(StallEscalation::Terminal);
+        }
+        // `classify_id` accepts only product/project/task ids — the exact set
+        // `file_dispatch_stage_stalled_attention` can target. An automation
+        // (`auto_…`) or other non-work-item id falls through here.
+        if classify_id(&execution.work_item_id).is_err() {
+            return Ok(StallEscalation::NotWorkItem);
+        }
+        Ok(StallEscalation::Escalate {
+            work_item_id: execution.work_item_id,
+        })
+    }
+
     /// Mark every open `worker_escalation` / `worker_blocked` attention item
     /// for `execution_id` as resolved. Returns the count resolved (`0` when
     /// none were open — a normal, non-error case).
