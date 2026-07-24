@@ -171,6 +171,15 @@ struct TranscriptView: View {
                             isExpanded: expansionBinding(for: seg),
                             probe: renderProbe
                         )
+                        // `SegmentRowView` is `Equatable`: without `.equatable()`,
+                        // every re-render of `TranscriptView` (a scroll-position
+                        // flip, a jump, another row's disclosure toggling) rebuilds
+                        // and re-lays-out *every* row's `StructuredText`, which is
+                        // the `Textual.StructuredText.BlockVStackLayout` UI-stall
+                        // hot path for long transcripts. `.equatable()` lets
+                        // SwiftUI skip body evaluation (and the layout pass) for
+                        // rows whose segment/expansion state didn't change.
+                        .equatable()
                         .id(seg.seq)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
@@ -226,10 +235,20 @@ struct TranscriptView: View {
 
 /// One transcript segment. Collapsible segments wrap their body in a
 /// `DisclosureGroup`; everything else stacks the header above the body.
-struct SegmentRowView: View {
+///
+/// `Equatable` so `.equatable()` at the call site can skip re-evaluating
+/// (and re-laying-out) rows whose segment content and expansion state
+/// haven't changed — see the comment at the `ForEach` in `TranscriptView`.
+struct SegmentRowView: View, @MainActor Equatable {
     let seg: TranscriptSegmentVM
     @Binding var isExpanded: Bool
     var probe: TranscriptRenderProbe?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.seg == rhs.seg
+            && lhs.isExpanded == rhs.isExpanded
+            && lhs.probe === rhs.probe
+    }
 
     var body: some View {
         content
