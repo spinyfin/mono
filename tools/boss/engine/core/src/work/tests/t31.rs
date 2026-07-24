@@ -190,7 +190,14 @@ fn preamble_omits_context_block_when_nothing_in_flight() {
         .created_at("2026-01-01")
         .updated_at("2026-01-01")
         .build();
-    let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+    let preamble = render_triage_preamble(
+        &automation,
+        "My Product",
+        &[],
+        &TriageContext::default(),
+        ARTIFACT_PATH,
+        false,
+    );
     assert!(
         !preamble.contains("Recently filed / in-flight automation work"),
         "empty context must not render the block"

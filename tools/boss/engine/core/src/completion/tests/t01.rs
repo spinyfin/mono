@@ -456,6 +456,71 @@ async fn automation_outcome_proposals_first_uses_produced_task_proposal_ignoring
 }
 
 #[tokio::test]
+async fn automation_outcome_proposals_first_resolves_the_friendly_task_id_the_prompt_actually_teaches() {
+    // The rewritten preamble/CLAUDE.md teach `boss propose automation-outcome
+    // --produced-task T42` — the friendly `T<short_id>` form printed by
+    // `boss task create --automation` — never the internal primary id used
+    // in the fixture above. The applier must resolve that friendly id
+    // before its provenance check, exactly as `get_work_item_resolving_short_id`
+    // does on the legacy marker path (`completion.rs:2414`), or every
+    // produced-task run finalizes `failed_will_retry` against a live prompt.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());
+
+    let this_run_task = db
+        .create_automation_task(&automation_id, "found via this triage run", None, &[], &[])
+        .unwrap();
+
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &automation_id,
+        kind: ProposalKind::AutomationOutcome,
+        payload_json: &format!(
+            r#"{{"outcome":"produced_task","task_id":"T{}"}}"#,
+            this_run_task.short_id.expect("automation task must have a short_id")
+        ),
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+
+    let transcript_path = write_no_marker_transcript(workspace.path(), &execution_id);
+    db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let flags_dir = tempdir().unwrap();
+    let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        flags_dir.path().join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags.set("worker_proposals", true).unwrap();
+    flags.set("automation_outcome_proposals_seam", true).unwrap();
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_feature_flags(flags).with_metrics(metrics.clone());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => assert_eq!(outcome, AUTOMATION_OUTCOME_PRODUCED_TASK),
+        other => panic!("expected produced_task via the proposal path, got {other:?}"),
+    }
+
+    let run = db
+        .automation_run_for_triage_execution(&execution_id)
+        .unwrap()
+        .expect("automation run row should exist");
+    assert_eq!(run.outcome, AUTOMATION_OUTCOME_PRODUCED_TASK);
+    assert_eq!(
+        run.produced_task_id.as_deref(),
+        Some(this_run_task.id.as_str()),
+        "the resolved primary id must be recorded, not the friendly `T<n>` string the prompt taught",
+    );
+}
+
+#[tokio::test]
 async fn automation_outcome_proposals_first_uses_skip_proposal_over_a_conflicting_legacy_marker() {
     let workspace = tempdir().unwrap();
     let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());

@@ -32,6 +32,12 @@ impl PureRebaseGateOutcome {
     }
 }
 
+/// `(outcome, produced_task_id, detail)` — the triple both
+/// [`WorkerCompletionHandler::automation_outcome_from_proposal`] and
+/// [`WorkerCompletionHandler::legacy_automation_triage_decision`] produce for
+/// [`WorkerCompletionHandler::finalize_automation_triage`] to record.
+type AutomationTriageDecision = (&'static str, Option<String>, Option<String>);
+
 impl WorkerCompletionHandler {
     /// Common Fresh/Merged transition path shared by `on_stop_inner`
     /// and `recheck_for_pr`. Records the completion, releases the
@@ -81,10 +87,10 @@ impl WorkerCompletionHandler {
 
         let automation_outcome_proposals_first = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("automation_outcome_proposals_seam");
-        let from_proposal = if automation_outcome_proposals_first {
+        let (from_proposal, proposal_row_existed) = if automation_outcome_proposals_first {
             self.automation_outcome_from_proposal(&execution.id)
         } else {
-            None
+            (None, false)
         };
         let used_proposal = from_proposal.is_some();
 
@@ -101,7 +107,11 @@ impl WorkerCompletionHandler {
         ) {
             Ok(true) => {
                 if automation_outcome_proposals_first && !used_proposal {
-                    self.record_automation_outcome_fallback_hit(execution, detail.as_deref().unwrap_or(""));
+                    self.record_automation_outcome_fallback_hit(
+                        execution,
+                        detail.as_deref().unwrap_or(""),
+                        proposal_row_existed,
+                    );
                 }
             }
             Ok(false) => tracing::warn!(
@@ -135,12 +145,23 @@ impl WorkerCompletionHandler {
         // sweep re-finalize an already-finalized triage run later with a
         // misleading pane-died detail.
         let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
             Some(&format!("automation triage: {outcome}")),
         ) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // Stop-driven completion termination path: tear down any
+                // driver-owned state outside the workspace, captured before
+                // `complete_pane_parked_execution` nulls `workspace_path`.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
+            }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "automation triage finalise: execution already terminal; nothing to do",
@@ -188,11 +209,17 @@ impl WorkerCompletionHandler {
     /// translate its already-decided disposition into the
     /// `(outcome, produced_task_id, detail)` triple
     /// [`Self::finalize_automation_triage`] records — see that method's doc
-    /// for the design context. Returns `None` when no `automation_outcome`
-    /// proposal exists for this execution (the caller then runs the legacy
-    /// marker-parse + recovery-heuristic chain as a counted fallback), or
-    /// when the DB lookup itself errors (fail open to the legacy path rather
-    /// than silently dropping the finalization).
+    /// for the design context. Returns `(None, row_existed)` when no operative
+    /// `automation_outcome` proposal is available (the caller then runs the
+    /// legacy marker-parse + recovery-heuristic chain as a counted fallback).
+    /// `row_existed` distinguishes why: `false` when no `automation_outcome`
+    /// proposal row exists for this execution at all (or the DB lookup itself
+    /// errored — fail open to the legacy path rather than silently dropping
+    /// the finalization), `true` when a row exists but was left in an
+    /// unexpected state (`Proposed`/`Superseded`/`Expired`, each already
+    /// WARN-logged below) — [`Self::record_automation_outcome_fallback_hit`]
+    /// uses this so its own WARN doesn't contradict the more specific one
+    /// just logged.
     ///
     /// [`crate::work::WorkDb::list_worker_proposals_for_execution`] orders by
     /// `created_at DESC`, and task 6's applier
@@ -204,10 +231,7 @@ impl WorkerCompletionHandler {
     /// outcome mid-run (submits `boss propose automation-outcome` a second
     /// time) is therefore handled for free: the newest row wins, with no
     /// special-casing here.
-    fn automation_outcome_from_proposal(
-        &self,
-        execution_id: &str,
-    ) -> Option<(&'static str, Option<String>, Option<String>)> {
+    fn automation_outcome_from_proposal(&self, execution_id: &str) -> (Option<AutomationTriageDecision>, bool) {
         let proposals = match self
             .work_db
             .list_worker_proposals_for_execution(execution_id, ProposalKind::AutomationOutcome)
@@ -220,12 +244,14 @@ impl WorkerCompletionHandler {
                     "automation_outcome_proposals_seam: failed to look up proposals for this \
                      execution; falling back to the legacy marker parser",
                 );
-                return None;
+                return (None, false);
             }
         };
-        let latest = proposals.first()?;
+        let Some(latest) = proposals.first() else {
+            return (None, false);
+        };
 
-        match latest.state {
+        let resolved = match latest.state {
             ProposalState::Rejected => Some((
                 AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
                 None,
@@ -260,7 +286,8 @@ impl WorkerCompletionHandler {
             // time (see `crate::work::proposal_apply::apply_policy`), so the
             // newest row should never be `Proposed`/`Superseded` — but fail
             // safe rather than guess: treat as "no operative proposal" so the
-            // legacy path still runs as a counted fallback.
+            // legacy path still runs as a counted fallback. The row DOES
+            // exist here, so the fallback-hit WARN must say so.
             ProposalState::Proposed | ProposalState::Superseded => {
                 tracing::warn!(
                     execution_id,
@@ -269,7 +296,7 @@ impl WorkerCompletionHandler {
                     "automation_outcome_proposals_seam: newest automation_outcome proposal is \
                      unexpectedly not Applied/Rejected; falling back to the legacy marker parser",
                 );
-                None
+                return (None, true);
             }
             ProposalState::Expired => {
                 tracing::warn!(
@@ -279,9 +306,11 @@ impl WorkerCompletionHandler {
                      unexpectedly Expired (not an in-flight-only kind); falling back to the \
                      legacy marker parser",
                 );
-                None
+                return (None, true);
             }
-        }
+        };
+
+        (resolved, true)
     }
 
     /// The pre-migration marker-parse + recovery-heuristic chain, unchanged
@@ -302,7 +331,7 @@ impl WorkerCompletionHandler {
         &self,
         execution: &crate::work::WorkExecution,
         automation_id: &str,
-    ) -> (&'static str, Option<String>, Option<String>) {
+    ) -> AutomationTriageDecision {
         // The transcript state is still read (and kept) because the
         // no-decision detail below distinguishes "ran but reported nothing"
         // from "produced no transcript at all" — but it is only the *fallback*

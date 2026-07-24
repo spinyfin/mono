@@ -1183,7 +1183,14 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+        let preamble = render_triage_preamble(
+            &automation,
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            false,
+        );
         let lower = preamble.to_lowercase();
         // Decide-then-stop.
         assert!(
@@ -1231,7 +1238,14 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+        let preamble = render_triage_preamble(
+            &automation,
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            false,
+        );
         // Must explicitly name the Agent tool and explain the hang risk.
         assert!(
             preamble.contains("Agent"),
@@ -1276,7 +1290,14 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+        let preamble = render_triage_preamble(
+            &automation,
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            false,
+        );
 
         let marker_lines: Vec<&str> = preamble
             .lines()
@@ -1328,7 +1349,14 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, true);
+        let preamble = render_triage_preamble(
+            &automation,
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            true,
+        );
         assert!(
             preamble.contains("boss propose automation-outcome --produced-task T42"),
             "seam on: preamble must teach the produced-task verb with a worked example:\n{preamble}",
@@ -1364,7 +1392,14 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+        let preamble = render_triage_preamble(
+            &automation,
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            false,
+        );
         assert!(preamble.contains("triage"));
         assert!(preamble.contains("A3"));
         assert!(preamble.contains("My Product"));
@@ -1395,7 +1430,14 @@ mod tests {
             .created_at("2026-01-01")
             .updated_at("2026-01-01")
             .build();
-        let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH, false);
+        let preamble = render_triage_preamble(
+            &automation,
+            "My Product",
+            &[],
+            &TriageContext::default(),
+            ARTIFACT_PATH,
+            false,
+        );
         assert!(
             preamble.contains("--target-file"),
             "preamble must include --target-file on the create command example",

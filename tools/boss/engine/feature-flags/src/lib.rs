@@ -335,10 +335,10 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         description: "Read the automation_outcome worker_proposals row before falling back to the legacy \
              automation: task/skip marker parser, recover_skip_reason, and the \
              find_most_recent_open_task_for_automation open-task recovery heuristic in \
-             finalize_automation_triage (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md, \
-             implementation task 11 — the automation-triage-outcome seam migration, the worst-failing seam in \
-             the design's inventory: a measurement of 67 consecutive produced_task finalizations found none \
-             decided by a valid marker). When on, a triage execution that already carries an automation_outcome \
+             finalize_automation_triage (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md) — \
+             the worst-failing seam in that design's inventory: a measurement of 67 consecutive produced_task \
+             finalizations found none decided by a valid marker. When on, a triage execution that already carries \
+             an automation_outcome \
              proposal (submitted via `boss propose automation-outcome --produced-task <id>` or `--skip --reason \
              \"...\"`, run after the triage worker's direct, still-sanctioned `boss task create --automation` \
              call) is finalized straight from that proposal's already-decided disposition — task 6's applier \
@@ -350,7 +350,8 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              + recovery-heuristic chain still run exactly as before, and every time it does the \
              worker_proposals.fallback_hit.automation_outcome counter increments and a WARN logs — the counter \
              is this seam's explicit exit criterion for eventually deleting the marker parser and the recovery \
-             heuristics (T2945's diagnosis becomes moot once that deletion lands). DEFAULT OFF: enable per \
+             heuristics; once that deletion lands, finalization no longer depends on guessing which open task a \
+             run produced. DEFAULT OFF: enable per \
              operator once the proposal path is validated in staging. Kill switch: set false to restore the \
              pre-migration marker/recovery-only behavior exactly, prompt included.",
         category: "completion",

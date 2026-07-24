@@ -198,7 +198,7 @@ impl WorkerCompletionHandler {
             WorkerSignalKind::EffortEscalation => (&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION, "effort_escalation"),
             WorkerSignalKind::Blocked => (&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED, "blocked"),
         };
-        self.record_proposal_fallback_hit(
+        self.record_proposal_fallback_hit_no_row(
             execution,
             counter,
             "worker_signal_proposals_seam",
@@ -218,6 +218,15 @@ impl WorkerCompletionHandler {
     /// `record_*_fallback_hit` supplies only its own counter handle, kind
     /// label, and detail (see [`Self::record_worker_signal_fallback_hit`] and
     /// [`Self::record_deferred_scope_fallback_hit`]).
+    ///
+    /// `reason` is the human-readable statement of *why* the legacy path
+    /// fired, logged verbatim in the WARN — callers that only ever hit the
+    /// "no proposal row at all" case pass the fixed message below via
+    /// [`Self::record_proposal_fallback_hit_no_row`]; callers whose fallback
+    /// can also be reached with a row present but undecidable (e.g.
+    /// [`Self::record_automation_outcome_fallback_hit`]) pass a reason that
+    /// says so, so the WARN doesn't contradict a more specific WARN logged
+    /// moments earlier for the same event.
     pub(super) fn record_proposal_fallback_hit(
         &self,
         execution: &crate::work::WorkExecution,
@@ -225,6 +234,7 @@ impl WorkerCompletionHandler {
         seam: &str,
         kind: &str,
         detail: &str,
+        reason: &str,
     ) {
         counter.inc(&self.metrics);
         tracing::warn!(
@@ -233,8 +243,29 @@ impl WorkerCompletionHandler {
             seam,
             kind,
             detail,
-            "no worker_proposals row found for this execution/kind; legacy detection path fired \
-             instead of the proposal path",
+            reason,
+            "legacy detection path fired instead of the proposal path",
+        );
+    }
+
+    /// Convenience wrapper for the common case: no `worker_proposals` row
+    /// existed at all for this execution/kind, so the legacy path is the
+    /// only source of truth. See [`Self::record_proposal_fallback_hit`].
+    pub(super) fn record_proposal_fallback_hit_no_row(
+        &self,
+        execution: &crate::work::WorkExecution,
+        counter: &'static crate::metrics::CounterHandle,
+        seam: &str,
+        kind: &str,
+        detail: &str,
+    ) {
+        self.record_proposal_fallback_hit(
+            execution,
+            counter,
+            seam,
+            kind,
+            detail,
+            "no worker_proposals row found for this execution/kind",
         );
     }
 
@@ -421,7 +452,7 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         item: &crate::deferred_scope::DeferredScopeItem,
     ) {
-        self.record_proposal_fallback_hit(
+        self.record_proposal_fallback_hit_no_row(
             execution,
             &DEFERRED_SCOPE_FALLBACK_HIT,
             "deferred_scope_proposals_seam",
@@ -533,7 +564,7 @@ impl WorkerCompletionHandler {
     /// the LLM pass) since, unlike a single marker line, there is no one
     /// line to log for a whole reconciled batch.
     pub(super) fn record_followup_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str) {
-        self.record_proposal_fallback_hit(
+        self.record_proposal_fallback_hit_no_row(
             execution,
             &FOLLOWUP_FALLBACK_HIT,
             "followup_proposals_seam",
@@ -553,13 +584,37 @@ impl WorkerCompletionHandler {
     /// already-finalized execution. `detail` carries the same human-readable
     /// detail string the legacy path recorded onto the `automation_runs` row,
     /// so the WARN is diagnosable without a second lookup.
-    pub(super) fn record_automation_outcome_fallback_hit(&self, execution: &crate::work::WorkExecution, detail: &str) {
+    ///
+    /// `row_existed` distinguishes the two ways this fallback can be
+    /// reached: `false` when no `automation_outcome` proposal row existed at
+    /// all for the execution (the common case, same as every other seam's
+    /// fallback), `true` when a row *did* exist but
+    /// [`WorkerCompletionHandler::automation_outcome_from_proposal`] could not
+    /// use it — the `list_worker_proposals_for_execution` error path or an
+    /// unexpected `Proposed`/`Superseded`/`Expired` state — each of which
+    /// already logged its own specific WARN moments earlier. Passing the
+    /// right reason here keeps this WARN from asserting "no row found" on a
+    /// path where a row was in fact found, which made the two situations
+    /// impossible to tell apart in logs.
+    pub(super) fn record_automation_outcome_fallback_hit(
+        &self,
+        execution: &crate::work::WorkExecution,
+        detail: &str,
+        row_existed: bool,
+    ) {
+        let reason = if row_existed {
+            "an automation_outcome worker_proposals row existed but was not in a decidable state \
+             (see the preceding WARN for specifics); falling back to the legacy marker parser"
+        } else {
+            "no worker_proposals row found for this execution/kind"
+        };
         self.record_proposal_fallback_hit(
             execution,
             &AUTOMATION_OUTCOME_FALLBACK_HIT,
             "automation_outcome_proposals_seam",
             "automation_outcome",
             detail,
+            reason,
         );
     }
 
