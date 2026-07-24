@@ -1,0 +1,28 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Approve relocating Boss's command-level guardrails (checkleft push guard, revision-PR guard, direct-push blocks, editorial enforcement) from Claude PreToolUse hooks into PATH shims in BOSS_BIN_DIR, landing on the live Claude path BEFORE any Codex worker runs? This is the design's load-bearing decision: it makes guardrails driver-agnostic and closes a subshell-evasion hole, but it changes live guardrails on the driver that runs everything today, and it lands before any Codex value is visible.",
+    "anchor": "guardrail-integrity"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Codex's --json event stream carries no schema version, and 0.145.0 is already out while 0.137.0 is what was tested. How should agent-CLI versions be managed?",
+    "choices": [
+      "Pin the tested Codex version; gate upgrades on the T-22 conformance harness",
+      "Track latest; rely on the conformance harness to catch breakage after the fact",
+      "Pin both Codex and Claude Code versions under one policy",
+      "Defer the decision until after Phase 1 acceptance (T-23)"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should the Codex hook activation spike (T-01) be treated as a hard gate before Phase 2 (design/investigation kinds), rather than as informational? The v1 design deliberately assumes hooks do NOT work under `codex exec`, so a negative result changes nothing — but a positive result would let ToolUseInterception be declared and make PATH shims defence-in-depth rather than the sole guardrail carrier.",
+    "anchor": "oq-1-do-codex-hooks-fire-under-codex-exec"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Confirm that triage and answer-agent kinds stay refused for Codex indefinitely via KindRequirements? They are blocked on transcript-scraping contracts (parse_triage_decision, and UserPromptSubmit-based delivery confirmation), not on guardrails. Rewriting those contracts to be file-based would unblock them and would arguably make triage MORE reliable than it is on Claude today, but that is a separate project.",
+    "anchor": "which-work-item-kinds-are-codex-eligible"
+  }
+]
