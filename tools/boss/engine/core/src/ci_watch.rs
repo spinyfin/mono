@@ -2136,5 +2136,5 @@ pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, 
 }
 
 #[cfg(test)]
-#[path = "ci_watch_tests.rs"]
+#[path = "ci_watch_tests/mod.rs"]
 mod tests;
