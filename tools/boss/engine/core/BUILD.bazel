@@ -44,6 +44,7 @@ rust_library(
         "//tools/boss/engine/ci-log-reader",
         "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/day-rotated-log",
+        "//tools/boss/engine/design-doc-fetcher",
         "//tools/boss/engine/design-docs",
         "//tools/boss/engine/deterministic-resolvers",
         "//tools/boss/engine/dispatch-events",
@@ -188,6 +189,7 @@ rust_test(
     ),
     deps = [
         ":engine_lib",
+        "//tools/boss/engine/design-doc-fetcher",
         "//tools/boss/engine/planner-validation",
         "//tools/boss/protocol",
     ] + all_crate_deps(

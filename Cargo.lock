@@ -319,6 +319,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-design-doc-fetcher"
+version = "0.1.0"
+dependencies = [
+ "boss-github",
+ "git-utils",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-deterministic-resolvers"
 version = "0.1.0"
 dependencies = [

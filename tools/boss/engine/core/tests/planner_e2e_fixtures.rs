@@ -46,8 +46,8 @@ use boss_protocol::{
     ProposedEdge, ProposedTask, SetProjectDesignDocInput, TaskBrief, TaskKind,
 };
 
+use boss_design_doc_fetcher::DocFetchOutcome;
 use boss_engine::coordinator::NoopExecutionPublisher;
-use boss_engine::doc_fetcher::DocFetchOutcome;
 use boss_engine::materializer::Materializer;
 use boss_engine::planner::{DecompositionAudit, PLANNER_MODEL, PlannerOutcome, build_request_body, build_user_prompt};
 use boss_engine::populator::{DEFAULT_MAX_TASKS, PopulateContext, PopulateOutcome, Populator, PopulatorSteps};

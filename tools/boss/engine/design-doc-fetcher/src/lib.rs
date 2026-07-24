@@ -1,8 +1,8 @@
 //! Live design-doc fetcher.
 //!
 //! Wraps [`boss_github::contents::fetch_repo_file`] with Boss-specific
-//! retry logic and typed outcomes. Both this module and
-//! [`crate::attentions_detector`] share that single fetch implementation.
+//! retry logic and typed outcomes. Both this crate and the engine's
+//! `attentions_detector` share that single fetch implementation.
 //!
 //! This is an independent root component that feeds the Populator
 //! (task 7 of the auto-populate-project-tasks-on-design-pr-merge design).
