@@ -139,8 +139,8 @@ impl CiLogReader for BuildkiteLogReader {
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
         format!(
-            "bk job log --pipeline {} --build-number {} {job_id}",
-            self.pipeline_slug, self.build_number
+            "{} job log --pipeline {} --build-number {} {job_id}",
+            self.binary, self.pipeline_slug, self.build_number
         )
     }
 }
@@ -192,7 +192,7 @@ impl CiLogReader for GithubActionsLogReader {
     }
 
     fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
-        format!("gh run view --log-failed --job {job_id}")
+        format!("{} run view --log-failed --job {job_id}", self.binary)
     }
 }
 
@@ -273,17 +273,33 @@ impl CiLogReader for UnparseableCoordinatesReader {
 /// misleading "unknown provider" error. Other providers ignore
 /// `target_url`; callers that don't have one may pass `""`.
 pub fn reader_for(provider: CiProvider, target_url: &str) -> Box<dyn CiLogReader> {
+    reader_for_with_binaries(provider, target_url, "bk", "gh")
+}
+
+/// Same dispatch as [`reader_for`], but with the `bk`/`gh` binary paths
+/// overridable. Lets tests point the constructed reader at a fake script
+/// instead of the real CLI, so assertions about *which reader type got
+/// built and with what coordinates* don't depend on whether `bk`/`gh`
+/// happen to be installed or authenticated on the host running the test.
+fn reader_for_with_binaries(
+    provider: CiProvider,
+    target_url: &str,
+    bk_binary: &str,
+    gh_binary: &str,
+) -> Box<dyn CiLogReader> {
     match provider {
         CiProvider::Buildkite => match (
             parse_buildkite_pipeline_slug(target_url),
             parse_buildkite_build_id(target_url),
         ) {
-            (Some(pipeline_slug), Some(build_number)) => Box::new(BuildkiteLogReader::new(pipeline_slug, build_number)),
+            (Some(pipeline_slug), Some(build_number)) => {
+                Box::new(BuildkiteLogReader::with_binary(bk_binary, pipeline_slug, build_number))
+            }
             _ => Box::new(UnparseableCoordinatesReader::new(format!(
                 "could not parse pipeline slug and build number from target_url {target_url:?}"
             ))),
         },
-        CiProvider::GithubActions => Box::new(GithubActionsLogReader::new()),
+        CiProvider::GithubActions => Box::new(GithubActionsLogReader::with_binary(gh_binary)),
         CiProvider::Other => Box::new(UnknownProviderReader),
     }
 }
@@ -533,6 +549,19 @@ async fn run_capture(binary: &str, args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fake script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake script");
+        }
+        path
+    }
+
     // ---------- URL parsing -------------------------------------------------
 
     #[test]
@@ -709,9 +738,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_trunk_merge_eviction_build_uses_full_coordinates_via_fake_bk() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let script = r#"#!/bin/sh
 if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=1" ]; then
     cat <<'JSON'
@@ -722,14 +751,7 @@ fi
 echo "unhandled args: $@" 1>&2
 exit 2
 "#;
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", script);
 
         let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
             .await
@@ -745,9 +767,9 @@ exit 2
     /// this closes: a busy org can push the episode build past the first
     /// 100 org-wide failed/failing builds.
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_trunk_merge_eviction_build_falls_through_to_page_two() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let page_one_path = dir.path().join("page1.json");
         // Page 1: exactly 100 non-matching builds (a full page, so the
         // lookup must not stop here). Page 2: the actual match.
@@ -781,14 +803,7 @@ exit 2
 "#,
             page_one = page_one_path.display(),
         );
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", &script);
 
         let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
             .await
@@ -800,9 +815,9 @@ exit 2
     /// No match on any searched page degrades to `Ok(None)` rather than an
     /// error — the caller falls back to generic worker instructions.
     #[tokio::test]
+    #[cfg(unix)]
     async fn find_trunk_merge_eviction_build_returns_none_when_exhausted() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("bk");
         let script = r#"#!/bin/sh
 if [ "$1" = "api" ]; then
     echo "[]"
@@ -811,14 +826,7 @@ fi
 echo "unhandled args: $@" 1>&2
 exit 2
 "#;
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        let script_path = write_script(dir.path(), "bk", script);
 
         let found = find_trunk_merge_eviction_build(script_path.to_str().unwrap(), 1007)
             .await
@@ -898,38 +906,116 @@ exit 2
         );
     }
 
-    #[tokio::test]
-    async fn reader_for_buildkite_with_canonical_url_builds_working_reader() {
+    #[test]
+    fn reader_for_buildkite_default_binaries_wire_bk() {
+        // Host-independent coverage of the one-line delegation in
+        // `reader_for` (`reader_for_with_binaries(provider, target_url, "bk",
+        // "gh")`). `worker_cli_invocation_hint` reads `self.binary`, so a
+        // swap or typo of either literal now genuinely fails this test
+        // instead of only showing up in production. Uses the trait's own
+        // `worker_cli_invocation_hint` accessor rather than a spawn, so it's
+        // hermetic on all three host states.
         let r = reader_for(
             CiProvider::Buildkite,
             "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
         );
-        // Confirms the canonical URL actually resolves to a `BuildkiteLogReader`
-        // wired with the right coordinates, not just "doesn't error here" —
-        // an unset binary would fail to spawn, proving the coordinates parsed.
-        let err = r.read_log_full("j").await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("failed to spawn"),
-            "expected a real BuildkiteLogReader (spawn `bk`), got: {err:#}"
+        assert_eq!(
+            r.worker_cli_invocation_hint("j"),
+            "bk job log --pipeline mypipeline --build-number 1329 j"
+        );
+
+        // Pin the coupling itself: a fake binary name must show up verbatim
+        // in the hint, proving the hint isn't just a hardcoded "bk" literal.
+        let r = reader_for_with_binaries(
+            CiProvider::Buildkite,
+            "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
+            "FAKEBK",
+            "gh",
+        );
+        assert_eq!(
+            r.worker_cli_invocation_hint("j"),
+            "FAKEBK job log --pipeline mypipeline --build-number 1329 j"
+        );
+    }
+
+    #[test]
+    fn reader_for_github_actions_default_binaries_wire_gh() {
+        let r = reader_for(CiProvider::GithubActions, "x");
+        assert_eq!(r.worker_cli_invocation_hint("j"), "gh run view --log-failed --job j");
+
+        // Pin the coupling itself: a fake binary name must show up verbatim
+        // in the hint, proving the hint isn't just a hardcoded "gh" literal.
+        let r = reader_for_with_binaries(CiProvider::GithubActions, "x", "bk", "FAKEGH");
+        assert_eq!(
+            r.worker_cli_invocation_hint("j"),
+            "FAKEGH run view --log-failed --job j"
         );
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn reader_for_buildkite_with_canonical_url_builds_working_reader() {
+        // Confirms the canonical URL resolves to a real `BuildkiteLogReader`
+        // wired with the right coordinates (not the `UnparseableCoordinatesReader`
+        // fallback) by routing through a fake `bk` binary and inspecting the
+        // coordinates it actually received. This must not shell out to the
+        // real `bk` CLI: whether that spawn succeeds, fails to spawn, or
+        // fails with an auth/config error depends entirely on host state
+        // (installed vs. absent, configured vs. not), none of which this
+        // test is about.
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "log" ]; then
+    if [ "$3" != "--pipeline" ] || [ "$5" != "--build-number" ]; then
+        echo "missing --pipeline/--build-number flags: $@" 1>&2
+        exit 3
+    fi
+    echo "coordinates: pipeline=$4 build=$6 job=$7"
+    exit 0
+fi
+echo "unhandled args: $@" 1>&2
+exit 2
+"#;
+        let script_path = write_script(dir.path(), "bk", script);
+
+        let r = reader_for_with_binaries(
+            CiProvider::Buildkite,
+            "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid",
+            script_path.to_str().unwrap(),
+            "gh",
+        );
+        let log = r
+            .read_log_full("j")
+            .await
+            .expect("expected a real BuildkiteLogReader to spawn the fake `bk` successfully");
+        assert_eq!(log.trim(), "coordinates: pipeline=mypipeline build=1329 job=j");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn reader_for_github_actions_ignores_target_url() {
-        let r = reader_for(CiProvider::GithubActions, "not a url at all");
         // GithubActionsLogReader doesn't need target_url; confirm dispatch
         // still builds a working (non-fallback) reader regardless of its
-        // shape. We can't assert *how* the real `gh` invocation fails —
-        // that depends on whether the test host has `gh` installed and
-        // authenticated (spawn failure vs. an auth error) — so instead we
-        // assert the error carries the real command's args, which only a
-        // genuine `GithubActionsLogReader` attempt produces; the
-        // `UnknownProviderReader` fallback's message never mentions them.
-        let err = r.read_log_full("j").await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("run view --log-failed --job j"),
-            "expected a real GithubActionsLogReader (spawn `gh`), got: {err:#}"
+        // shape. Routed through a fake `gh` binary (rather than the real
+        // CLI) so the assertion doesn't depend on whether the test host has
+        // `gh` installed/authenticated, and instead directly checks the
+        // constructed reader actually invokes `gh` with the expected args —
+        // the `UnknownProviderReader` fallback would never spawn anything.
+        let dir = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho \"invoked: $@\"\nexit 0\n";
+        let script_path = write_script(dir.path(), "gh", script);
+
+        let r = reader_for_with_binaries(
+            CiProvider::GithubActions,
+            "not a url at all",
+            "bk",
+            script_path.to_str().unwrap(),
         );
+        let log = r
+            .read_log_full("j")
+            .await
+            .expect("expected a real GithubActionsLogReader to spawn the fake `gh` successfully");
+        assert_eq!(log.trim(), "invoked: run view --log-failed --job j");
     }
 
     // ---------- integration: fake bk / fake gh ------------------------------
@@ -943,17 +1029,6 @@ exit 2
     #[cfg(unix)]
     mod fake_cli_integration {
         use super::*;
-        use std::os::unix::fs::PermissionsExt;
-        use std::path::{Path, PathBuf};
-
-        fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-            let path = dir.join(name);
-            std::fs::write(&path, body).expect("write fake script");
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod fake script");
-            path
-        }
 
         // ---- Buildkite ----------------------------------------------------
 
