@@ -121,20 +121,136 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
-/// Inline Python decision hook that blocks all workers from launching Boss
-/// itself — the macOS app or its bundled engine. Always applied (matcher `Bash`,
-/// inspects the command string). Blocks `open -a Boss`, `open … Boss.app`,
-/// `Boss.app/Contents/MacOS/Boss`, the bundled engine binary, `bazel run` of the
-/// app-macos or engine targets, and `swift run`. Does NOT block `bazel test` or
-/// `bazel build`.
-const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
-    "python3 -c \"",
-    "import json,sys,re; ",
-    "inp=json.load(sys.stdin); ",
-    "cmd=inp.get('tool_input',{}).get('command',''); ",
-    r#"m=re.search(r'(\bopen\b[^\n]*(Boss\.app|-a\s+Boss\b|-b\s+dev\.spinyfin\.bossmacapp))|Boss\.app/Contents/MacOS/Boss|Boss\.app/Contents/Resources/bin/engine|((bazel|bazelisk)\s+run\b[^\n]*tools/boss/(app-macos|engine))|(\bswift\s+run\b)',cmd); "#,
-    "msg='Workers must not launch or run Boss itself. This command would start the Boss app or its bundled engine, which attaches to the operator live engine on /tmp/boss-engine.sock, collides with the running engine, and triggers OS permission prompts. Building and unit tests are fine (bazel build, bazel test); launching/running the app or engine is not. Runtime and UI verification are the coordinator job.'; ",
-    "print(json.dumps({'decision':'block','reason':msg}) if m else json.dumps({'decision':'approve'})); ",
+/// Inline Python decision hook that blocks workers from launching the Boss
+/// macOS app or a Boss engine. Always applied (matcher `Bash`).
+///
+/// **This is the advisory layer, not the control.** It fails in-session, with
+/// a message the worker can act on immediately, which the engine-side gate
+/// (`boss_engine::app::agent_launch_guard`) cannot do — by the time that gate
+/// fires the worker has already spent a build. But a text matcher only
+/// recognises spellings, and the previous revision of this guard was defeated
+/// twice in four hours by ordinary shell idiom: an engine invoked as
+/// `./bazel-bin/tools/boss/engine/core/engine` (no bundle shape in the path),
+/// and a bundle path assigned to a variable on one line with `open "$APP"` on
+/// the next (no single line carrying both). The binary-side gate is what
+/// actually holds; treat this as a fast, friendly first failure.
+///
+/// The matcher works on `shlex`-tokenised commands rather than raw text, so:
+///
+/// - Single-assignment shell variables are resolved before matching, which
+///   catches the `APP=…/Boss.app` + `open "$APP"` split.
+/// - Launcher prefixes (`nohup`, `env`, `sudo`, `exec`, `timeout <n>`, …) are
+///   skipped so they cannot hide the program being run.
+/// - A phrase inside a quoted argument (a commit message, a `--body`) is one
+///   token and never matches.
+///
+/// Blocked: any program whose basename is `Boss` or `engine`, any program path
+/// containing `Boss.app`, `open` of a Boss bundle / `-a Boss` / the bundle id,
+/// `bazel run` of an `app-macos` target, `bazel run` of an engine target
+/// without an isolating `--socket-path`, and `swift run`.
+///
+/// Allowed: `bazel build`, `bazel test`, unpacking or inspecting a bundle, and
+/// `bazel run //tools/boss/engine:engine -- --socket-path <non-production>`.
+pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
+    "python3 -c \"\n",
+    "import json,os,sys,re,shlex\n",
+    "inp=json.load(sys.stdin)\n",
+    "cmd=inp.get('tool_input',{}).get('command','')\n",
+    "DELIMS={'&&','||',';','|','&'}\n",
+    "WRAP={'nohup','env','sudo','exec','command','stdbuf','setsid','caffeinate','xargs'}\n",
+    "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
+    "PROD='/tmp/boss-engine.sock'\n",
+    // Resolve single-level shell variables. Assignments are collected as the
+    // token stream is walked, so a value defined earlier in the command is
+    // substituted into later tokens -- the `APP=...` / `open $APP` split.
+    "vars={}\n",
+    "def expand(t):\n",
+    "    for k,v in vars.items():\n",
+    "        t=t.replace('$'+'{'+k+'}',v).replace('$'+k,v)\n",
+    "    return t\n",
+    // A newline separates commands just as `;` does, and shlex discards it,
+    // so each line is tokenised on its own. `vars` carries across lines
+    // because a value is routinely defined on one line and used on the next.
+    "groups=[]\n",
+    "for line in cmd.split(chr(10)):\n",
+    "    try:\n",
+    "        toks=shlex.split(line,posix=True)\n",
+    "    except Exception:\n",
+    "        toks=line.split()\n",
+    "    resolved=[]\n",
+    "    for t in toks:\n",
+    "        m=ASSIGN.match(t)\n",
+    "        if m:\n",
+    "            vars[m.group(1)]=expand(m.group(2))\n",
+    "        resolved.append(expand(t))\n",
+    "    cur=[]\n",
+    "    for t in resolved:\n",
+    "        if t in DELIMS:\n",
+    "            if cur:\n",
+    "                groups.append(cur[:])\n",
+    "            cur=[]\n",
+    "        else:\n",
+    "            cur.append(t)\n",
+    "    if cur:\n",
+    "        groups.append(cur)\n",
+    "def socket_arg(g):\n",
+    "    for j,t in enumerate(g):\n",
+    "        if t=='--socket-path' and j+1<len(g):\n",
+    "            return g[j+1]\n",
+    "        if t.startswith('--socket-path='):\n",
+    "            return t.split('=',1)[1]\n",
+    "    return None\n",
+    "matched=None\n",
+    "for g in groups:\n",
+    "    i=0\n",
+    "    while i<len(g):\n",
+    "        b=os.path.basename(g[i])\n",
+    "        if ASSIGN.match(g[i]) or b in WRAP:\n",
+    "            i+=1\n",
+    "            continue\n",
+    "        if b=='timeout' and i+1<len(g):\n",
+    "            i+=2\n",
+    "            continue\n",
+    "        break\n",
+    "    rest=g[i:]\n",
+    "    if not rest:\n",
+    "        continue\n",
+    "    prog=rest[0]\n",
+    "    base=os.path.basename(prog)\n",
+    "    if base in ('Boss','engine','boss-engine') or 'Boss.app' in prog:\n",
+    "        matched=prog\n",
+    "        break\n",
+    "    if base=='open':\n",
+    "        joined=' '.join(rest)\n",
+    "        if 'Boss.app' in joined or 'dev.spinyfin.bossmacapp' in joined or re.search(r'(^| )-a +Boss( |$)',joined):\n",
+    "            matched=joined[:120]\n",
+    "            break\n",
+    "    if base in ('bazel','bazelisk') and len(rest)>1 and rest[1]=='run':\n",
+    "        joined=' '.join(rest)\n",
+    "        if 'tools/boss/app-macos' in joined:\n",
+    "            matched='bazel run of an app-macos target'\n",
+    "            break\n",
+    "        if 'tools/boss/engine' in joined:\n",
+    "            sp=socket_arg(rest)\n",
+    "            if sp is None or os.path.normpath(sp)==PROD or 'Library/Application Support/Boss' in sp:\n",
+    "                matched='bazel run of an engine target without an isolating --socket-path'\n",
+    "                break\n",
+    "    if base=='swift' and len(rest)>1 and rest[1]=='run':\n",
+    "        matched='swift run'\n",
+    "        break\n",
+    "if matched:\n",
+    "    msg=('Blocked: this would start Boss itself (matched: '+matched+'). Workers must not launch ",
+    "the Boss macOS app or an engine that can reach production state on this machine -- the app ",
+    "puts a window on the user screen while they are working, and it terminates the running engine ",
+    "and starts its own in its place. To exercise a real engine, start an isolated one: env -u ",
+    "BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-<id>.sock. ",
+    "Any --socket-path other than /tmp/boss-engine.sock derives its own db, events socket, pid file ",
+    "and control token; unsetting BOSS_EVENTS_SOCKET matters because every worker pane inherits one ",
+    "pointing at production. Building and testing are unaffected (bazel build, bazel test). GUI ",
+    "verification is not something a worker can do -- say so in the PR and leave it to a human.')\n",
+    "    print(json.dumps({'decision':'block','reason':msg}))\n",
+    "else:\n",
+    "    print(json.dumps({'decision':'approve'}))\n",
     "\""
 );
 
@@ -866,7 +982,7 @@ mod tests {
                     e["hooks"][0]["command"]
                         .as_str()
                         .unwrap_or("")
-                        .contains("Workers must not launch or run Boss itself")
+                        .contains("this would start Boss itself")
                 }),
                 "boss-launch guard must be present in every config",
             );

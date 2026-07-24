@@ -70,7 +70,9 @@ use crate::ssh_transport::shell_quote;
 // super::*;`) can run the Python scripts end-to-end and verify their behaviour.
 // Scoped to test builds: the constants are not needed at runtime in this module.
 #[cfg(test)]
-pub(crate) use crate::driver::claude::{PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
+pub(crate) use crate::driver::claude::{
+    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
+};
 
 /// The kind of worker being spawned, used to select the per-kind tool
 /// denylist. Kept in this module so the denylist rules and the kind
@@ -423,6 +425,32 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            Never read, write, or touch it. Ask the coordinator for\n\
            work-taxonomy context; do not query the DB yourself.\n\
            `bossctl` is coordinator-only.\n\
+         \n\
+         ## Running Boss itself\n\
+         \n\
+         Never launch the Boss macOS app, and never start an engine that can\n\
+         reach production state. This machine is someone's laptop: the app\n\
+         puts a window on their screen while they are working, and it\n\
+         terminates the engine they are using and starts its own in its\n\
+         place. That applies however the launch is spelled — `open`, the\n\
+         bundle executable, a copy you unpacked yourself, `bazel run` of an\n\
+         app-macos target.\n\
+         \n\
+         To exercise a real engine, start an isolated one:\n\
+         \n\
+         ```sh\n\
+         env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- \\\n\
+           --socket-path /tmp/boss-test-$(uuidgen).sock\n\
+         ```\n\
+         \n\
+         Any `--socket-path` other than `/tmp/boss-engine.sock` puts the\n\
+         engine in test-fixture mode, where the db, events socket, pid file\n\
+         and control token are all derived from that socket's path. Unset\n\
+         `BOSS_EVENTS_SOCKET` because your pane inherits one pointing at\n\
+         production. Point a client at the same `--socket-path` to drive it.\n\
+         \n\
+         `bazel build` and `bazel test` are unaffected. Verifying the GUI is\n\
+         not something you can do — say so in the PR and leave it to a human.\n\
          \n\
          ## Coordinator\n\
          \n\

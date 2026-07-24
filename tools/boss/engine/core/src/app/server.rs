@@ -74,9 +74,27 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
         None
     };
 
+    // Last checkpoint before `serve` opens the db, writes the control
+    // token, and binds the sockets: an agent-owned engine may not take
+    // over the user's production state. Every path is resolved by now,
+    // so the gate judges what this process would actually touch rather
+    // than how it was invoked.
+    let socket_path = std::path::PathBuf::from(socket_path);
+    super::agent_launch_guard::evaluate(
+        super::agent_launch_guard::ResolvedPaths {
+            socket_path: &socket_path,
+            events_socket: &events_socket_path,
+            db_path: &cfg.work.db_path,
+            pid_path: &pid_file_path,
+            token_path: control_token_path.as_deref(),
+        },
+        boss_log_files::default_state_root().as_deref(),
+        super::agent_launch_guard::classify_ownership(|key| std::env::var(key).ok(), std::env::current_exe().ok()),
+    )?;
+
     serve(
         cfg,
-        socket_path.into(),
+        socket_path,
         Some(pid_file_path),
         Some(events_socket_path),
         control_token_path,
