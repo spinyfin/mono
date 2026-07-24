@@ -122,6 +122,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let work_item_id2 = work_item_id.clone();
                 let pr_url2 = pr_url.clone();
                 let kick = server_state.pr_reconciler_kick.clone();
+                let event_bus = server_state.event_bus.clone();
                 let direct_merge_executor = server_state.direct_merge_executor.clone();
                 let work_db2 = work_db.clone();
                 let product_name = product.name.clone();
@@ -134,8 +135,16 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                             // Kick the PR reconciler so the kanban state
                             // reflects the new merge-queue / auto-merge
                             // state promptly without waiting for the next
-                            // periodic sweep.
+                            // periodic sweep. Publish the keyed
+                            // `PrReconcileRequested` event alongside the
+                            // broad kick so the merge poller can reconcile
+                            // just this PR instead of waiting on (or
+                            // triggering) a full sweep; the broad kick
+                            // stays wired as the backstop.
                             kick.notify_one();
+                            event_bus.publish(Event::PrReconcileRequested {
+                                pr_url: pr_url2.clone(),
+                            });
                             if action == merge_when_ready::MergeAction::Enqueued {
                                 // A successful `gh pr merge` enqueue into
                                 // GitHub's native merge queue is itself
@@ -1175,6 +1184,13 @@ mod trunk_queue_tests {
             .unwrap();
         let sink = make_session_sink();
 
+        // Subscribe before dispatching so the Direct-merge success path's
+        // `PrReconcileRequested` publish (added alongside the existing
+        // `pr_reconciler_kick` notify) has a live receiver to land in.
+        let mut pr_reconcile_requests = state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::PrReconcileRequested,
+        ));
+
         handle_merge_when_ready(
             dispatch_ctx(&state, &sink),
             FrontendRequest::MergeWhenReady {
@@ -1193,6 +1209,13 @@ mod trunk_queue_tests {
             ["https://github.com/brianduff/flunge/pull/990"],
             "a NULL-mechanism product must route through the Direct executor"
         );
+
+        match pr_reconcile_requests.recv().await {
+            Some(boss_event_bus::Event::PrReconcileRequested { pr_url }) => {
+                assert_eq!(pr_url, "https://github.com/brianduff/flunge/pull/990");
+            }
+            other => panic!("expected a PrReconcileRequested event for the merged PR, got {other:?}"),
+        }
 
         assert!(
             state
