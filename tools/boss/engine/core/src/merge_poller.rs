@@ -248,11 +248,22 @@ pub fn init(registry: &Registry) {
 static RATE_LIMIT_REMAINING: AtomicI64 = AtomicI64::new(i64::MAX);
 
 /// Requests reserved as headroom for every OTHER GitHub consumer sharing
-/// this token (ci_watch, conflict_watch, review flows, worker `gh` calls)
-/// — the poller starts stretching its own cadence once its visibility into
-/// `remaining` drops below this, instead of being the caller that finally
-/// trips the 403 for everyone.
-const RATE_LIMIT_LOW_WATER: i64 = 500;
+/// this token (ci_watch, conflict_watch, review flows, worker `gh` calls,
+/// and out-of-process users of the same personal token such as the
+/// `boss-release` job) — the poller starts stretching its own cadence once
+/// its visibility into `remaining` drops below this, instead of being the
+/// caller that finally trips the 403 for everyone.
+///
+/// Sized to exceed the cost of a single full sweep, not just one round
+/// trip: at ~47 open PRs and the trimmed [`PR_PROBE_FIELDS`] node counts a
+/// sweep spends on the order of tens of GraphQL points, and one drained
+/// batch can overshoot a narrow reserve between two `remaining` readings.
+/// A wide reserve means the poller has already stretched its cadence hard
+/// *before* it can strand a sibling — the `boss-release` `gh release list`
+/// exhaustion (personal token, GraphQL 5000/5000) this remediation targets
+/// was exactly that starvation. Reserving ~1500 of the hourly 5000 leaves
+/// the release job and ad-hoc `gh` a dependable slice.
+const RATE_LIMIT_LOW_WATER: i64 = 1500;
 
 /// Multiplier the poller applies to its base poll intervals once
 /// `remaining` GraphQL quota drops below `low_water`. Above the low-water
@@ -311,6 +322,42 @@ fn record_rate_limit(body: &serde_json::Value) {
             remaining,
             "merge poller: GitHub API quota recovered — resuming normal poll cadence",
         );
+    }
+}
+
+/// Proactively read GitHub's shared GraphQL quota and fold it into the
+/// process-wide budget before a full sweep, so the poller's cadence /
+/// throttle decisions reflect spend by EVERY consumer sharing this token —
+/// `ci_watch`, `conflict_watch`, worker `gh` calls, and out-of-process
+/// users of the same personal token like the `boss-release` job — not only
+/// the poller's own last batched probe.
+///
+/// The batched probe already folds `rateLimit { remaining }` into its
+/// response ([`build_batch_query`]), but that only refreshes the budget
+/// when the poller *itself* issues a query. Between two sweeps — and across
+/// the long Cold waits when little is moving — a sibling or the release job
+/// can drain the reserve invisibly, and the next sweep then fires its whole
+/// ~47-PR batch at full cadence on stale "healthy" state before its own
+/// response reveals the drain. Reading the live number up front closes that
+/// window: the sweep sees the true shared budget and stretches its cadence
+/// (via [`rate_limit_throttle_factor`]) before spending, and it also
+/// replaces the `i64::MAX` cold-start sentinel on the very first sweep so
+/// the poller is never blind-at-full-speed on boot.
+///
+/// Querying `rateLimit` is itself free — GitHub charges it 0 points and
+/// does not count it as a call — so this is a zero-quota refresh.
+/// Best-effort: a spawn failure, non-zero exit, or unparseable body leaves
+/// the budget unchanged (see [`record_rate_limit`]), exactly like a batched
+/// response that never carried the field.
+async fn refresh_rate_limit_budget() {
+    let Ok(output) = gh_output(&["api", "graphql", "-f", "query={ rateLimit { remaining } }"]).await else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        record_rate_limit(&body);
     }
 }
 
@@ -543,12 +590,18 @@ pub enum PollTier {
 impl PollTier {
     /// How long to wait before reconciling this PR again. Stretched by
     /// [`rate_limit_throttle_factor`] when the hourly GitHub quota is
-    /// running low, so hot PRs back off from their normal 15s cadence
+    /// running low, so hot PRs back off from their normal 40s cadence
     /// right alongside the full sweep instead of being the adaptive
     /// layer that keeps draining an already-low budget.
+    ///
+    /// Hot was 15s; at ~47 open PRs each hot cycle re-probes the whole set,
+    /// so a 15s cadence was a structural driver of the personal-token
+    /// GraphQL exhaustion. 40s still catches CI/merge-queue transitions
+    /// promptly (those settle over minutes, not seconds) while cutting the
+    /// hot re-probe rate by ~2.7x.
     pub fn interval(self) -> Duration {
         let base = match self {
-            PollTier::Hot => Duration::from_secs(15),
+            PollTier::Hot => Duration::from_secs(40),
             PollTier::Cold => Duration::from_secs(180),
         };
         let throttle = rate_limit_throttle_factor();
@@ -556,23 +609,30 @@ impl PollTier {
     }
 }
 
-/// Classify a probed PR's [`PollTier`] from its lifecycle state.
-fn poll_tier_for_probe(probe: &PrLifecycleProbe) -> PollTier {
+/// Classify a probed PR's [`PollTier`] from its lifecycle state, or `None`
+/// when the PR has reached a terminal state and should be dropped from the
+/// adaptive schedule entirely rather than re-probed.
+///
+/// A `Merged` / `ClosedUnmerged` PR has already been transitioned out of
+/// every candidate list by the sweep that observed it, so a further
+/// adaptive probe spends GraphQL quota to re-confirm a fact that can no
+/// longer change. Returning `None` lets [`PrPollSchedule::reschedule`] stop
+/// tracking it immediately (the periodic full sweep remains the backstop if
+/// anything ever needs re-discovery), so terminal PRs cost zero between
+/// sweeps instead of one trailing Cold probe apiece.
+fn poll_tier_for_probe(probe: &PrLifecycleProbe) -> Option<PollTier> {
     match &probe.state {
         PrLifecycleState::Open(open) => {
             if probe.in_merge_queue
                 || open.mergeability != OpenPrMergeability::Clean
                 || matches!(open.ci, OpenPrCiStatus::InFlight)
             {
-                PollTier::Hot
+                Some(PollTier::Hot)
             } else {
-                PollTier::Cold
+                Some(PollTier::Cold)
             }
         }
-        // Terminal states: the PR will drop out of every candidate list
-        // on the next full sweep regardless of tier, so `Cold` is a
-        // harmless placeholder rather than a real steady-state claim.
-        PrLifecycleState::Merged | PrLifecycleState::ClosedUnmerged => PollTier::Cold,
+        PrLifecycleState::Merged | PrLifecycleState::ClosedUnmerged => None,
     }
 }
 
@@ -748,13 +808,33 @@ impl MergeProbe for CommandMergeProbe {
 /// `pr_in_merge_queue` — because `mergeQueueEntry` isn't a `--json` field in
 /// all `gh` versions; here we just ask GraphQL for it inline, since we're
 /// already hand-building the query).
+///
+/// GraphQL bills by node count (~cost = nodes / 100), so the connection
+/// `first`/`last` caps here are the dominant per-PR lever on quota spend.
+/// They are deliberately tight rather than blanket `first: 100`:
+///
+/// - `labels(first: 30)` — boss's own label vocabulary (`blocked:*`,
+///   priority, opt-out flags) is a handful of names; 30 is comfortable
+///   headroom and only the label *set* is consumed ([`parse_probe_json`]).
+/// - `reviews(last: 20)` — the merge-gating decision is read from the
+///   authoritative `reviewDecision` field, not this array; the array only
+///   supplies the tooltip's reviewer login list ([`classify_review`]), for
+///   which the 20 most-recent reviews cover every realistic PR.
+/// - `contexts(first: 30)` — the CI rollup on the head commit. Required
+///   checks are few (this repo gates on three Buildkite contexts); 30 is
+///   several times the real fan-out while still cutting the worst-case
+///   node count by ~3x versus `first: 100`.
+///
+/// Together these cut a typical probe from ~300 requested nodes to ~80 —
+/// roughly a 3x GraphQL-cost reduction with no behavioural loss for any
+/// realistically-shaped PR.
 const PR_PROBE_FIELDS: &str = concat!(
     "state mergedAt closedAt mergeable mergeStateStatus baseRefOid headRefOid headRefName baseRefName ",
-    "labels(first: 100) { nodes { name } } ",
-    "reviewDecision reviews(last: 100) { nodes { author { login } state } } ",
+    "labels(first: 30) { nodes { name } } ",
+    "reviewDecision reviews(last: 20) { nodes { author { login } state } } ",
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
-    "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ",
+    "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",
     "__typename ... on CheckRun { name status conclusion detailsUrl } ",
     "... on StatusContext { context state targetUrl } } } } } } }",
 );
@@ -2418,7 +2498,7 @@ pub async fn reconcile_one(
     let tier = probe_results
         .get(pr_url)
         .and_then(|r| r.as_ref().ok())
-        .map(poll_tier_for_probe);
+        .and_then(poll_tier_for_probe);
     (outcome, tier)
 }
 
@@ -4327,6 +4407,12 @@ pub fn spawn_loop(
         let mut stacking_schedule = crate::stacked_pr_structuring::StackingSchedule::default();
         let stacking_fetcher = crate::stacked_pr_structuring::GhPrChangedFiles;
         loop {
+            // Refresh the shared-token budget from GitHub before probing so
+            // this sweep's cadence reflects spend by every consumer (siblings,
+            // the release job, ad-hoc `gh`) — not just the poller's own last
+            // batch — and so the first sweep on boot isn't blind at the
+            // `i64::MAX` sentinel. Free (0 GraphQL points) and best-effort.
+            refresh_rate_limit_budget().await;
             let outcome = run_one_pass(
                 work_db.as_ref(),
                 probe.as_ref(),
@@ -5159,10 +5245,11 @@ mod tests {
 
         let (outcome, tier) = reconcile_one(&db, probe.as_ref(), publisher.as_ref(), None, None, pr1).await;
         assert_eq!(outcome.merged, 1);
-        // Merged is a terminal state; the placeholder tier is `Cold` (see
-        // `poll_tier_for_probe`) but the important assertion is that a
-        // tier is returned at all — the PR was a live candidate.
-        assert_eq!(tier, Some(PollTier::Cold));
+        // Merged is a terminal state: the PR has just been transitioned out
+        // of every candidate list, so `poll_tier_for_probe` returns `None`
+        // and the caller drops it from the adaptive schedule instead of
+        // spending another probe to re-confirm a fact that can't change.
+        assert_eq!(tier, None);
 
         match db.get_work_item(&chore1).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
@@ -5203,7 +5290,9 @@ mod tests {
     /// [`poll_tier_for_probe`] classification (doc §9 item 3): CI in
     /// flight, a merge-queued PR, and an unresolved/conflicting
     /// mergeability all count as "actively changing" (`Hot`); a clean,
-    /// mergeable, non-queued PR is steady-state (`Cold`).
+    /// mergeable, non-queued PR is steady-state (`Cold`); a terminal
+    /// (merged/closed) PR yields `None` so it is dropped from the adaptive
+    /// schedule instead of re-probed.
     #[test]
     fn poll_tier_classifies_open_pr_signals() {
         let base = |state: PrLifecycleState, in_merge_queue: bool| PrLifecycleProbe {
@@ -5227,11 +5316,11 @@ mod tests {
 
         assert_eq!(
             poll_tier_for_probe(&base(PrLifecycleState::Open(OpenPrStatus::clean()), false)),
-            PollTier::Cold
+            Some(PollTier::Cold)
         );
         assert_eq!(
             poll_tier_for_probe(&base(PrLifecycleState::Open(OpenPrStatus::clean()), true)),
-            PollTier::Hot,
+            Some(PollTier::Hot),
             "merge-queued PRs must poll fast",
         );
         assert_eq!(
@@ -5242,12 +5331,12 @@ mod tests {
                 }),
                 false
             )),
-            PollTier::Hot,
+            Some(PollTier::Hot),
             "in-flight CI must poll fast",
         );
         assert_eq!(
             poll_tier_for_probe(&base(PrLifecycleState::Open(OpenPrStatus::conflict_only()), false)),
-            PollTier::Hot,
+            Some(PollTier::Hot),
             "conflicting mergeability must poll fast",
         );
         assert_eq!(
@@ -5255,16 +5344,18 @@ mod tests {
                 PrLifecycleState::Open(OpenPrStatus::unknown_mergeability()),
                 false
             )),
-            PollTier::Hot,
+            Some(PollTier::Hot),
             "unresolved mergeability must poll fast",
         );
         assert_eq!(
             poll_tier_for_probe(&base(PrLifecycleState::Merged, false)),
-            PollTier::Cold
+            None,
+            "merged PRs are terminal — drop them from the adaptive schedule",
         );
         assert_eq!(
             poll_tier_for_probe(&base(PrLifecycleState::ClosedUnmerged, false)),
-            PollTier::Cold
+            None,
+            "closed PRs are terminal — drop them from the adaptive schedule",
         );
     }
 
@@ -5283,9 +5374,9 @@ mod tests {
         // far in the future — while pr2 (never seen) gets a fresh Hot slot.
         schedule.seed_defaults(["pr1".to_owned(), "pr2".to_owned()], now);
 
-        // Only pr2's Hot (15 s) slot should be due at now + 20s; pr1's Cold
+        // Only pr2's Hot (40 s) slot should be due at now + 45s; pr1's Cold
         // (180 s) slot is not.
-        let due = schedule.drain_due(now + Duration::from_secs(20));
+        let due = schedule.drain_due(now + Duration::from_secs(45));
         assert_eq!(due, vec!["pr2".to_owned()]);
 
         // pr1 is still tracked (its Cold slot hasn't arrived yet).
