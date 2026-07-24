@@ -198,3 +198,92 @@ fn format_age_ms_reports_multiple_days() {
     // 3 days of age.
     assert_eq!(format_age_ms(1_000, 259_201_000), "(3d ago)");
 }
+
+#[test]
+fn pause_system_all_covers_every_registry_variant() {
+    // `PauseSystem::all()` drives the default scope of `bossctl
+    // pause`/`bossctl resume` with no arguments — pin that it always
+    // matches clap's enumeration of variants (the registry), not a
+    // hand-maintained list that could drift when a variant is added.
+    let all = PauseSystem::all();
+    assert_eq!(all, <PauseSystem as clap::ValueEnum>::value_variants());
+}
+
+#[test]
+fn pause_arg_targets_defaults_to_every_system_when_empty() {
+    assert_eq!(pause_arg_targets(&[]), PauseSystem::all());
+}
+
+#[test]
+fn pause_arg_targets_filters_out_the_state_sentinel() {
+    // `state` is handled before this function is ever called (it
+    // dispatches to `unified_state` instead), but the filter should
+    // still drop it defensively rather than mapping to a phantom system.
+    let targets = pause_arg_targets(&[PauseArg::Dispatch, PauseArg::State]);
+    assert_eq!(targets, vec![PauseSystem::Dispatch]);
+}
+
+#[test]
+fn pause_arg_targets_preserves_explicit_subset_and_order() {
+    let targets = pause_arg_targets(&[PauseArg::Automation]);
+    assert_eq!(targets, vec![PauseSystem::Automation]);
+}
+
+#[test]
+fn format_dispatch_set_line_matches_existing_dispatch_pause_text() {
+    let paused = DispatchPauseState {
+        paused: true,
+        paused_since_epoch_s: Some(123),
+        reviews_exempt: true,
+    };
+    assert_eq!(
+        format_dispatch_set_line(&paused),
+        "dispatch paused (since epoch 123) — PR reviews are exempt and keep dispatching"
+    );
+
+    let resumed = DispatchPauseState {
+        paused: false,
+        paused_since_epoch_s: None,
+        reviews_exempt: false,
+    };
+    assert_eq!(format_dispatch_set_line(&resumed), "dispatch resumed");
+}
+
+#[test]
+fn format_dispatch_set_line_flags_non_exempt_breaker_pause() {
+    let paused = DispatchPauseState {
+        paused: true,
+        paused_since_epoch_s: None,
+        reviews_exempt: false,
+    };
+    assert_eq!(
+        format_dispatch_set_line(&paused),
+        "dispatch paused — PR reviews are held too (spawn-capability breaker)"
+    );
+}
+
+#[test]
+fn format_automation_set_line_matches_existing_automation_pause_text() {
+    let paused = AutomationPauseState {
+        paused: true,
+        paused_since_epoch_s: Some(456),
+    };
+    assert_eq!(
+        format_automation_set_line(&paused),
+        "automation paused (since epoch 456) — new triage passes and automation-pool spawns are held; \
+         already-running automation workers finish normally"
+    );
+
+    let resumed = AutomationPauseState {
+        paused: false,
+        paused_since_epoch_s: None,
+    };
+    assert_eq!(format_automation_set_line(&resumed), "automation resumed");
+}
+
+#[test]
+fn format_state_summary_reports_paused_with_and_without_since() {
+    assert_eq!(format_state_summary(true, Some(789)), "paused (since epoch 789)");
+    assert_eq!(format_state_summary(true, None), "paused");
+    assert_eq!(format_state_summary(false, None), "running");
+}

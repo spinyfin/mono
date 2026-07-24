@@ -113,6 +113,33 @@ enum Command {
         #[command(subcommand)]
         action: LiveStatusAction,
     },
+    /// Pause one or more Boss systems in a single call. Defaults to every
+    /// pausable system when no SYSTEMS are given — `bossctl pause` alone
+    /// pauses everything the systems registry currently knows about, so
+    /// a future pausable subsystem joins the default set automatically
+    /// instead of requiring a hardcoded update here. This is a thin
+    /// wrapper over the same per-system pause logic `dispatch pause` /
+    /// `automation pause` already use — those verbs are unchanged and
+    /// remain the way to pause exactly one system.
+    Pause {
+        /// Systems to pause: `dispatch`, `automation`, or `state` (prints
+        /// pause status instead of pausing — equivalent to `bossctl
+        /// state`; cannot be combined with other systems). Omit to pause
+        /// every system.
+        systems: Vec<PauseArg>,
+    },
+    /// Resume one or more Boss systems in a single call. Defaults to
+    /// every pausable system when no SYSTEMS are given. Symmetric with
+    /// `pause` — see its help for the systems registry and the
+    /// relationship to `dispatch resume` / `automation resume`.
+    Resume {
+        /// Systems to resume. Omit to resume every system.
+        systems: Vec<PauseSystem>,
+    },
+    /// Show pause status for every system (dispatch, automation, ...) in
+    /// one view, including `paused_since` for whichever are paused.
+    /// Equivalent to `bossctl pause state`.
+    State,
     /// Inspect the dispatch-pipeline event stream (file-scan only —
     /// works when the engine is wedged).
     Dispatch {
@@ -294,6 +321,10 @@ enum DispatchAction {
     /// from recording a produced task — those keep queueing and drain once
     /// dispatch resumes. It never sets, clears, or implies `automation
     /// pause`/`resume`.
+    ///
+    /// Equivalent to `bossctl pause dispatch`. To also stop automation
+    /// (the scope operators usually want), use `bossctl pause` (defaults
+    /// to every system) or `bossctl pause dispatch automation`.
     Pause,
     /// Resume global dispatch. The engine immediately drains any executions
     /// that queued while paused and resumes normal dispatch. Idempotent —
@@ -356,6 +387,10 @@ enum AutomationAction {
     /// the first place — the tighter gate you want when the goal is
     /// curbing runaway automation-produced work items, not just throttling
     /// dispatch. It never sets, clears, or implies `dispatch pause`/`resume`.
+    ///
+    /// Equivalent to `bossctl pause automation`. To also stop dispatch,
+    /// use `bossctl pause` (defaults to every system) or `bossctl pause
+    /// dispatch automation`.
     Pause,
     /// Resume automation-originated activity. The engine immediately
     /// drains any automation-pool executions that queued while paused and
@@ -366,6 +401,49 @@ enum AutomationAction {
     /// Show the current automation-pause state (paused/running and, if
     /// paused, when it was paused).
     State,
+}
+
+/// The registry of pausable Boss systems. This is the single source of
+/// truth for what `bossctl pause`/`bossctl resume` with no arguments
+/// means ("every system") — it is a Rust enum rather than a hardcoded
+/// pair of dispatch/automation booleans specifically so that adding a
+/// variant here is the only change needed for a new subsystem (e.g. a
+/// per-poller pause) to join the default "pause everything" set; nothing
+/// else derives its own list.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseSystem {
+    /// Worker dispatch — see `bossctl dispatch pause`.
+    Dispatch,
+    /// Automation triage — see `bossctl automation pause`.
+    Automation,
+}
+
+impl PauseSystem {
+    /// Every system in the registry — the default scope of `bossctl
+    /// pause`/`bossctl resume` when no SYSTEMS are given.
+    fn all() -> Vec<PauseSystem> {
+        <PauseSystem as clap::ValueEnum>::value_variants().to_vec()
+    }
+}
+
+/// Positional value accepted by `bossctl pause`: any [`PauseSystem`],
+/// plus `state` as a discoverable alias for `bossctl state`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseArg {
+    Dispatch,
+    Automation,
+    /// Alias for `bossctl state` — show pause status instead of pausing.
+    State,
+}
+
+impl PauseArg {
+    fn as_system(self) -> Option<PauseSystem> {
+        match self {
+            PauseArg::Dispatch => Some(PauseSystem::Dispatch),
+            PauseArg::Automation => Some(PauseSystem::Automation),
+            PauseArg::State => None,
+        }
+    }
 }
 
 /// Output format for `bossctl agents transcript --format`.
@@ -866,6 +944,26 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     include_stalled,
                 },
         } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
+        Command::Pause { systems } => {
+            if systems.iter().any(|s| matches!(s, PauseArg::State)) {
+                if systems.len() > 1 {
+                    bail!("`bossctl pause state` does not take additional systems");
+                }
+                unified_state(&cli.socket_path, cli.json).await
+            } else {
+                let targets = pause_arg_targets(&systems);
+                set_paused_for_systems(&cli.socket_path, cli.json, &targets, true).await
+            }
+        }
+        Command::Resume { systems } => {
+            let targets = if systems.is_empty() {
+                PauseSystem::all()
+            } else {
+                systems
+            };
+            set_paused_for_systems(&cli.socket_path, cli.json, &targets, false).await
+        }
+        Command::State => unified_state(&cli.socket_path, cli.json).await,
         Command::Dispatch {
             action: DispatchAction::Pause,
         } => dispatch_set_paused(&cli.socket_path, cli.json, true).await,
@@ -1093,7 +1191,22 @@ fn dispatch_ghost_active(
     Ok(())
 }
 
-async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
+/// Current dispatch-pause state as returned by
+/// [`FrontendRequest::SetDispatchPaused`] / [`FrontendRequest::GetDispatchState`].
+struct DispatchPauseState {
+    paused: bool,
+    paused_since_epoch_s: Option<u64>,
+    reviews_exempt: bool,
+}
+
+/// Current automation-pause state as returned by
+/// [`FrontendRequest::SetAutomationPaused`] / [`FrontendRequest::GetAutomationState`].
+struct AutomationPauseState {
+    paused: bool,
+    paused_since_epoch_s: Option<u64>,
+}
+
+async fn set_dispatch_paused_raw(socket_path: &Option<String>, paused: bool) -> Result<DispatchPauseState> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::SetDispatchPaused { paused })
@@ -1101,34 +1214,14 @@ async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: b
         .context("sending SetDispatchPaused")?;
     match response {
         FrontendEvent::DispatchStateResult {
-            paused: new_paused,
+            paused,
             paused_since_epoch_s,
             reviews_exempt,
-        } => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "paused": new_paused,
-                        "paused_since_epoch_s": paused_since_epoch_s,
-                        "reviews_exempt": reviews_exempt,
-                    })
-                );
-            } else if new_paused {
-                let since_str = paused_since_epoch_s
-                    .map(|s| format!(" (since epoch {s})"))
-                    .unwrap_or_default();
-                let exempt_str = if reviews_exempt {
-                    " — PR reviews are exempt and keep dispatching"
-                } else {
-                    " — PR reviews are held too (spawn-capability breaker)"
-                };
-                println!("dispatch paused{since_str}{exempt_str}");
-            } else {
-                println!("dispatch resumed");
-            }
-            Ok(())
-        }
+        } => Ok(DispatchPauseState {
+            paused,
+            paused_since_epoch_s,
+            reviews_exempt,
+        }),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected SetDispatchPaused: {message}")
         }
@@ -1136,7 +1229,7 @@ async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: b
     }
 }
 
-async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+async fn get_dispatch_state_raw(socket_path: &Option<String>) -> Result<DispatchPauseState> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::GetDispatchState)
@@ -1147,34 +1240,11 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
             paused,
             paused_since_epoch_s,
             reviews_exempt,
-        } => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "paused": paused,
-                        "paused_since_epoch_s": paused_since_epoch_s,
-                        "reviews_exempt": reviews_exempt,
-                    })
-                );
-            } else if paused {
-                let since_str = paused_since_epoch_s
-                    .map(|s| format!("  paused_since: epoch {s}"))
-                    .unwrap_or_default();
-                println!("state: paused");
-                if !since_str.is_empty() {
-                    println!("{since_str}");
-                }
-                if reviews_exempt {
-                    println!("  reviews: exempt — PR-review executions keep dispatching");
-                } else {
-                    println!("  reviews: held — spawn-capability breaker pause");
-                }
-            } else {
-                println!("state: running");
-            }
-            Ok(())
-        }
+        } => Ok(DispatchPauseState {
+            paused,
+            paused_since_epoch_s,
+            reviews_exempt,
+        }),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected GetDispatchState: {message}")
         }
@@ -1182,7 +1252,7 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
     }
 }
 
-async fn automation_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
+async fn set_automation_paused_raw(socket_path: &Option<String>, paused: bool) -> Result<AutomationPauseState> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::SetAutomationPaused { paused })
@@ -1190,30 +1260,12 @@ async fn automation_set_paused(socket_path: &Option<String>, json: bool, paused:
         .context("sending SetAutomationPaused")?;
     match response {
         FrontendEvent::AutomationStateResult {
-            paused: new_paused,
+            paused,
             paused_since_epoch_s,
-        } => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "paused": new_paused,
-                        "paused_since_epoch_s": paused_since_epoch_s,
-                    })
-                );
-            } else if new_paused {
-                let since_str = paused_since_epoch_s
-                    .map(|s| format!(" (since epoch {s})"))
-                    .unwrap_or_default();
-                println!(
-                    "automation paused{since_str} — new triage passes and automation-pool spawns are held; \
-                     already-running automation workers finish normally"
-                );
-            } else {
-                println!("automation resumed");
-            }
-            Ok(())
-        }
+        } => Ok(AutomationPauseState {
+            paused,
+            paused_since_epoch_s,
+        }),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected SetAutomationPaused: {message}")
         }
@@ -1221,7 +1273,7 @@ async fn automation_set_paused(socket_path: &Option<String>, json: bool, paused:
     }
 }
 
-async fn automation_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+async fn get_automation_state_raw(socket_path: &Option<String>) -> Result<AutomationPauseState> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::GetAutomationState)
@@ -1231,33 +1283,263 @@ async fn automation_state(socket_path: &Option<String>, json: bool) -> Result<()
         FrontendEvent::AutomationStateResult {
             paused,
             paused_since_epoch_s,
-        } => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "paused": paused,
-                        "paused_since_epoch_s": paused_since_epoch_s,
-                    })
-                );
-            } else if paused {
-                let since_str = paused_since_epoch_s
-                    .map(|s| format!("  paused_since: epoch {s}"))
-                    .unwrap_or_default();
-                println!("state: paused");
-                if !since_str.is_empty() {
-                    println!("{since_str}");
-                }
-            } else {
-                println!("state: running");
-            }
-            Ok(())
-        }
+        } => Ok(AutomationPauseState {
+            paused,
+            paused_since_epoch_s,
+        }),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected GetAutomationState: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }
+}
+
+/// One-line summary printed by `dispatch pause`/`dispatch resume` and
+/// reused by the unified `bossctl pause`/`bossctl resume`.
+fn format_dispatch_set_line(state: &DispatchPauseState) -> String {
+    if state.paused {
+        let since_str = state
+            .paused_since_epoch_s
+            .map(|s| format!(" (since epoch {s})"))
+            .unwrap_or_default();
+        let exempt_str = if state.reviews_exempt {
+            " — PR reviews are exempt and keep dispatching"
+        } else {
+            " — PR reviews are held too (spawn-capability breaker)"
+        };
+        format!("dispatch paused{since_str}{exempt_str}")
+    } else {
+        "dispatch resumed".to_string()
+    }
+}
+
+/// One-line summary printed by `automation pause`/`automation resume` and
+/// reused by the unified `bossctl pause`/`bossctl resume`.
+fn format_automation_set_line(state: &AutomationPauseState) -> String {
+    if state.paused {
+        let since_str = state
+            .paused_since_epoch_s
+            .map(|s| format!(" (since epoch {s})"))
+            .unwrap_or_default();
+        format!(
+            "automation paused{since_str} — new triage passes and automation-pool spawns are held; \
+             already-running automation workers finish normally"
+        )
+    } else {
+        "automation resumed".to_string()
+    }
+}
+
+async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
+    let state = set_dispatch_paused_raw(socket_path, paused).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "paused": state.paused,
+                "paused_since_epoch_s": state.paused_since_epoch_s,
+                "reviews_exempt": state.reviews_exempt,
+            })
+        );
+    } else {
+        println!("{}", format_dispatch_set_line(&state));
+    }
+    Ok(())
+}
+
+async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let state = get_dispatch_state_raw(socket_path).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "paused": state.paused,
+                "paused_since_epoch_s": state.paused_since_epoch_s,
+                "reviews_exempt": state.reviews_exempt,
+            })
+        );
+    } else if state.paused {
+        let since_str = state
+            .paused_since_epoch_s
+            .map(|s| format!("  paused_since: epoch {s}"))
+            .unwrap_or_default();
+        println!("state: paused");
+        if !since_str.is_empty() {
+            println!("{since_str}");
+        }
+        if state.reviews_exempt {
+            println!("  reviews: exempt — PR-review executions keep dispatching");
+        } else {
+            println!("  reviews: held — spawn-capability breaker pause");
+        }
+    } else {
+        println!("state: running");
+    }
+    Ok(())
+}
+
+async fn automation_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
+    let state = set_automation_paused_raw(socket_path, paused).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "paused": state.paused,
+                "paused_since_epoch_s": state.paused_since_epoch_s,
+            })
+        );
+    } else {
+        println!("{}", format_automation_set_line(&state));
+    }
+    Ok(())
+}
+
+async fn automation_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let state = get_automation_state_raw(socket_path).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "paused": state.paused,
+                "paused_since_epoch_s": state.paused_since_epoch_s,
+            })
+        );
+    } else if state.paused {
+        let since_str = state
+            .paused_since_epoch_s
+            .map(|s| format!("  paused_since: epoch {s}"))
+            .unwrap_or_default();
+        println!("state: paused");
+        if !since_str.is_empty() {
+            println!("{since_str}");
+        }
+    } else {
+        println!("state: running");
+    }
+    Ok(())
+}
+
+/// Resolve `bossctl pause`'s positional [`PauseArg`]s to the
+/// [`PauseSystem`]s to act on — empty input means "every system"
+/// ([`PauseSystem::all`]). Callers must handle [`PauseArg::State`]
+/// (the `bossctl state` alias) before reaching here; it maps to no
+/// system.
+fn pause_arg_targets(systems: &[PauseArg]) -> Vec<PauseSystem> {
+    if systems.is_empty() {
+        PauseSystem::all()
+    } else {
+        systems.iter().filter_map(|s| s.as_system()).collect()
+    }
+}
+
+/// Pause or resume every system in `targets`, calling the same
+/// per-system RPCs `dispatch pause`/`automation pause` use, then print
+/// one line (or one JSON object) per system touched. Backs both
+/// `bossctl pause`/`bossctl resume` and their `[SYSTEMS]`-restricted
+/// forms.
+async fn set_paused_for_systems(
+    socket_path: &Option<String>,
+    json: bool,
+    targets: &[PauseSystem],
+    paused: bool,
+) -> Result<()> {
+    let mut dispatch_result = None;
+    let mut automation_result = None;
+    for system in targets {
+        match system {
+            PauseSystem::Dispatch => dispatch_result = Some(set_dispatch_paused_raw(socket_path, paused).await?),
+            PauseSystem::Automation => automation_result = Some(set_automation_paused_raw(socket_path, paused).await?),
+        }
+    }
+
+    if json {
+        let mut systems = serde_json::Map::new();
+        if let Some(d) = &dispatch_result {
+            systems.insert(
+                "dispatch".to_string(),
+                serde_json::json!({
+                    "paused": d.paused,
+                    "paused_since_epoch_s": d.paused_since_epoch_s,
+                    "reviews_exempt": d.reviews_exempt,
+                }),
+            );
+        }
+        if let Some(a) = &automation_result {
+            systems.insert(
+                "automation".to_string(),
+                serde_json::json!({
+                    "paused": a.paused,
+                    "paused_since_epoch_s": a.paused_since_epoch_s,
+                }),
+            );
+        }
+        println!("{}", serde_json::Value::Object(systems));
+    } else {
+        if let Some(d) = &dispatch_result {
+            println!("{}", format_dispatch_set_line(d));
+        }
+        if let Some(a) = &automation_result {
+            println!("{}", format_automation_set_line(a));
+        }
+    }
+    Ok(())
+}
+
+/// One-line status used by the unified `bossctl state` / `bossctl pause
+/// state` view — deliberately more compact than the detailed multi-line
+/// `dispatch state` / `automation state` output, since this view shows
+/// every system at once.
+fn format_state_summary(paused: bool, paused_since_epoch_s: Option<u64>) -> String {
+    if paused {
+        match paused_since_epoch_s {
+            Some(s) => format!("paused (since epoch {s})"),
+            None => "paused".to_string(),
+        }
+    } else {
+        "running".to_string()
+    }
+}
+
+/// Show pause status for every system in the registry in one view.
+/// Backs both `bossctl state` and `bossctl pause state`.
+async fn unified_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let dispatch = get_dispatch_state_raw(socket_path).await?;
+    let automation = get_automation_state_raw(socket_path).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dispatch": {
+                    "paused": dispatch.paused,
+                    "paused_since_epoch_s": dispatch.paused_since_epoch_s,
+                    "reviews_exempt": dispatch.reviews_exempt,
+                },
+                "automation": {
+                    "paused": automation.paused,
+                    "paused_since_epoch_s": automation.paused_since_epoch_s,
+                },
+            })
+        );
+    } else {
+        println!(
+            "dispatch:   {}",
+            format_state_summary(dispatch.paused, dispatch.paused_since_epoch_s)
+        );
+        if dispatch.paused {
+            let reviews = if dispatch.reviews_exempt {
+                "reviews: exempt — PR-review executions keep dispatching"
+            } else {
+                "reviews: held — spawn-capability breaker pause"
+            };
+            println!("            {reviews}");
+        }
+        println!(
+            "automation: {}",
+            format_state_summary(automation.paused, automation.paused_since_epoch_s)
+        );
+    }
+    Ok(())
 }
 
 /// Print recent dispatch pause/resume episodes with their full audit
