@@ -33,11 +33,21 @@
 //! the token path is now derived alongside `db_path` / `events_socket`
 //! / `pid_path` in `IsolationPaths` so an isolated fixture never
 //! computes the production path in the first place; [`write_token_file`]
-//! refuses to overwrite a token whose recorded pid is still alive, so
+//! refuses to overwrite a token whose socket is still answering, so
 //! even a misconfigured/future caller that *does* land on the
 //! production path can't clobber it; and [`ControlTokenGuard`] compares
 //! the full token (not just pid) before deleting, so it only ever
 //! removes the exact secret it minted.
+//!
+//! [`write_token_file`]'s refusal originally gated on the recorded
+//! pid's liveness alone. Pids recycle — very likely across a reboot —
+//! so an engine killed uncleanly left a token file that, once its pid
+//! got reassigned to some unrelated process, made every subsequent
+//! engine start read a "live" pid and fail hard with no recovery path.
+//! The token file already records `socket_path`, which nothing else can
+//! wear: a socket is either bound by a live listener or it isn't. The
+//! check now reconciles on that instead, treating the recorded pid as
+//! a diagnostic hint rather than the gate.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -112,30 +122,59 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
 }
 
+/// Is `existing`'s recorded engine still actually serving?
+///
+/// Reconciles on socket reachability rather than pid liveness: a pid is
+/// recyclable (very likely across a reboot), but a socket is either bound
+/// by a live listener or it isn't — nothing else can wear its address. The
+/// recorded pid is logged as a diagnostic hint only; it never gates the
+/// decision.
+fn existing_token_is_live(path: &Path, existing: &ControlTokenFile) -> bool {
+    let socket_live = crate::events_socket::path_has_a_live_listener(Path::new(&existing.socket_path));
+    if !socket_live && process_is_alive(existing.pid as libc::pid_t) {
+        tracing::warn!(
+            token_path = %path.display(),
+            recorded_pid = existing.pid,
+            socket_path = %existing.socket_path,
+            "reclaiming stale engine-control token: recorded pid is alive but its socket is dead \
+             (pid was very likely recycled since the previous engine exited)",
+        );
+    }
+    socket_live
+}
+
 /// Write the token file with mode 0600, creating parent directories
-/// as needed.
+/// as needed. The write itself is atomic (write-temp-then-rename): a
+/// crash or error between the reconciliation check and the write can
+/// never leave a truncated or partial token file behind.
 ///
-/// Refuses to clobber a token that is still owned by a live engine:
-/// if a file already exists at `path`, parses, and its recorded pid is
-/// still alive, this returns an error instead of overwriting it. This
-/// is the fix for the 2026-07 incident where a worker-launched fixture
-/// engine overwrote — and, on its own shutdown, then deleted — the
-/// production control token (issue: engine-control token writable and
-/// deletable by any worker-launched engine). Pid liveness is the same
-/// check `bind_events_socket`'s isolation guard should be doing for
-/// the events socket.
+/// Refuses to clobber a token that is still owned by a live engine: if a
+/// file already exists at `path`, parses, and its recorded `socket_path`
+/// still has a live listener, this returns an actionable error instead of
+/// overwriting it — the operator must stop that engine first, there is no
+/// path-file-only recovery when the other engine is genuinely still
+/// running. This is the fix for the 2026-07 incident where a
+/// worker-launched fixture engine overwrote — and, on its own shutdown,
+/// then deleted — the production control token (issue: engine-control
+/// token writable and deletable by any worker-launched engine).
 ///
-/// A prior file that fails to parse, or whose pid is no longer alive,
-/// is stale (e.g. left behind by a previous engine that crashed
-/// without cleanup) and is safely overwritten.
+/// A prior file that fails to parse, or whose socket is no longer
+/// answering, is stale (e.g. left behind by a previous engine that
+/// crashed without cleanup, or one whose pid was later recycled by an
+/// unrelated process) and is safely reclaimed — this is the recovery
+/// path: the common case of an uncleanly-killed engine no longer requires
+/// any operator intervention to start a fresh one.
 pub fn write_token_file(path: &Path, contents: &ControlTokenFile) -> Result<()> {
     if let Ok(existing_raw) = std::fs::read_to_string(path)
         && let Ok(existing) = serde_json::from_str::<ControlTokenFile>(&existing_raw)
-        && process_is_alive(existing.pid as libc::pid_t)
+        && existing_token_is_live(path, &existing)
     {
         anyhow::bail!(
-            "refusing to overwrite engine-control token at {}: still owned by live engine pid {}",
+            "refusing to overwrite engine-control token at {}: its socket {} still has a live listener \
+             (recorded pid {}). Another engine appears to be running at this path — stop it before \
+             starting a new one here.",
             path.display(),
+            existing.socket_path,
             existing.pid
         );
     }
@@ -149,16 +188,45 @@ pub fn write_token_file(path: &Path, contents: &ControlTokenFile) -> Result<()> 
 
     let serialized = serde_json::to_string(contents).context("failed to serialize control-token file")?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(TOKEN_FILE_MODE)
-        .open(path)
-        .with_context(|| format!("failed to open control-token file {}", path.display()))?;
-    file.write_all(serialized.as_bytes())
-        .with_context(|| format!("failed to write control-token file {}", path.display()))?;
+    let tmp_path = sibling_tmp_path(path);
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(TOKEN_FILE_MODE)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to open control-token temp file {}", tmp_path.display()))?;
+        file.write_all(serialized.as_bytes())
+            .with_context(|| format!("failed to write control-token temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync control-token temp file {}", tmp_path.display()))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to atomically install control-token file {} (from temp {})",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
     Ok(())
+}
+
+/// Sibling temp path used to stage an atomic write of `path`: same
+/// directory (so the final `rename` is same-filesystem and atomic),
+/// suffixed with this process's pid so concurrent writers never collide
+/// on the temp file itself.
+fn sibling_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    path.with_file_name(tmp_name)
 }
 
 /// RAII guard that removes the token file when dropped — both on
@@ -329,32 +397,35 @@ mod tests {
     /// Regression for the escalation half of the incident: a live engine's
     /// token must never be silently overwritten by another process that
     /// resolves the same path (e.g. a worker-launched fixture engine that,
-    /// due to an isolation bug, computed the production token path).
+    /// due to an isolation bug, computed the production token path). The
+    /// gate is the recorded socket actually having a live listener — a real
+    /// `UnixListener` bound for the duration of the test — not the pid.
     #[test]
-    fn write_token_file_refuses_to_overwrite_live_pid() {
+    fn write_token_file_refuses_to_overwrite_live_socket() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("engine-control.token");
-        let live_pid = std::process::id();
+        let socket_path = dir.path().join("prod.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
         let production = ControlTokenFile {
             token: "production-secret".into(),
-            socket_path: "/prod.sock".into(),
-            pid: live_pid,
+            socket_path: socket_path.display().to_string(),
+            pid: std::process::id(),
         };
         write_token_file(&path, &production).unwrap();
 
         let fixture = ControlTokenFile {
             token: "fixture-secret".into(),
-            socket_path: "/fixture.sock".into(),
-            pid: live_pid + 1,
+            socket_path: dir.path().join("fixture.sock").display().to_string(),
+            pid: std::process::id(),
         };
         let err = write_token_file(&path, &fixture).expect_err("must refuse to clobber a live engine's token");
-        assert!(err.to_string().contains("still owned by live engine"), "{err}");
+        assert!(err.to_string().contains("still has a live listener"), "{err}");
 
         // Production's token must be byte-for-byte unchanged.
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: ControlTokenFile = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.token, "production-secret");
-        assert_eq!(parsed.pid, live_pid);
     }
 
     /// The DoS half: a token file left behind by a process that is no
@@ -367,21 +438,106 @@ mod tests {
         let path = dir.path().join("engine-control.token");
         let stale = ControlTokenFile {
             token: "stale-secret".into(),
-            socket_path: "/stale.sock".into(),
+            socket_path: "/nonexistent/stale.sock".into(),
             pid: i32::MAX as u32,
         };
         write_token_file(&path, &stale).unwrap();
 
         let fresh = ControlTokenFile {
             token: "fresh-secret".into(),
-            socket_path: "/fresh.sock".into(),
+            socket_path: "/nonexistent/fresh.sock".into(),
             pid: std::process::id(),
         };
-        write_token_file(&path, &fresh).expect("a dead pid's token must be reclaimable");
+        write_token_file(&path, &fresh).expect("a dead socket's token must be reclaimable");
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: ControlTokenFile = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.token, "fresh-secret");
+    }
+
+    /// The pid-recycle regression this fix targets: the recorded pid
+    /// happens to be alive (recycled by an unrelated process across a
+    /// reboot, or simply this very test process) but its socket is dead —
+    /// the write must still succeed instead of hard-failing, because
+    /// liveness is decided by the socket, not the pid.
+    #[test]
+    fn write_token_file_reclaims_when_socket_is_dead_even_though_recorded_pid_is_alive() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("engine-control.token");
+        let stale = ControlTokenFile {
+            token: "stale-secret".into(),
+            socket_path: dir.path().join("dead.sock").display().to_string(),
+            // This test process's own pid: guaranteed alive, standing in for
+            // a recycled pid that now belongs to some unrelated live process.
+            pid: std::process::id(),
+        };
+        write_token_file(&path, &stale).unwrap();
+
+        let fresh = ControlTokenFile {
+            token: "fresh-secret".into(),
+            socket_path: dir.path().join("fresh.sock").display().to_string(),
+            pid: std::process::id(),
+        };
+        write_token_file(&path, &fresh)
+            .expect("a dead socket's token must be reclaimable even when the recorded pid is alive");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: ControlTokenFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.token, "fresh-secret");
+    }
+
+    /// Atomicity: if the temp-file write step fails partway (simulated here
+    /// by pre-occupying the exact temp path this pid would use with a
+    /// directory, so `OpenOptions::open` fails before any bytes are
+    /// written), the original file at `path` must be left completely
+    /// untouched — the old non-atomic read-check-then-truncate
+    /// implementation would have already truncated it by this point.
+    #[test]
+    fn write_token_file_leaves_original_intact_when_temp_write_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("engine-control.token");
+        let original = ControlTokenFile {
+            token: "original-secret".into(),
+            socket_path: dir.path().join("dead.sock").display().to_string(),
+            pid: i32::MAX as u32,
+        };
+        write_token_file(&path, &original).unwrap();
+
+        let tmp_path = sibling_tmp_path(&path);
+        std::fs::create_dir(&tmp_path).unwrap();
+
+        let fresh = ControlTokenFile {
+            token: "fresh-secret".into(),
+            socket_path: dir.path().join("fresh.sock").display().to_string(),
+            pid: std::process::id(),
+        };
+        write_token_file(&path, &fresh).expect_err("temp-file creation must fail while the temp path is a directory");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: ControlTokenFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.token, "original-secret",
+            "a failed write must not touch the original file"
+        );
+
+        std::fs::remove_dir(&tmp_path).unwrap();
+    }
+
+    /// No leftover temp file after a successful write.
+    #[test]
+    fn write_token_file_cleans_up_temp_file_on_success() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("engine-control.token");
+        let contents = ControlTokenFile {
+            token: "x".into(),
+            socket_path: "/nonexistent.sock".into(),
+            pid: 1,
+        };
+        write_token_file(&path, &contents).unwrap();
+
+        assert!(!sibling_tmp_path(&path).exists());
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "only the final token file should remain: {entries:?}");
     }
 
     /// An unparsable existing file (corrupt, or from a future schema) must
