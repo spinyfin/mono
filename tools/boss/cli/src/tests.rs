@@ -664,6 +664,25 @@ fn task_status_accepts_legacy_aliases_on_input() {
 }
 
 #[test]
+fn task_status_arg_accepts_cancelled() {
+    let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--status", "cancelled"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Update(args),
+        } => assert!(matches!(args.status, Some(TaskStatusArg::Cancelled))),
+        _ => panic!("expected task update command"),
+    }
+    let cli = Cli::parse_from(["boss", "task", "list", "--status", "cancelled"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::List(args),
+        } => assert!(matches!(args.status.as_slice(), [TaskStatusArg::Cancelled])),
+        _ => panic!("expected task list command"),
+    }
+    assert_eq!(TaskStatusArg::Cancelled.as_str(), "cancelled");
+}
+
+#[test]
 fn move_target_accepts_board_name_primary() {
     let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "backlog"]);
     match cli.command {

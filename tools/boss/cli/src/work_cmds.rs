@@ -1129,6 +1129,7 @@ pub(crate) async fn run_cancel_leaf(
     ctx: &RunContext,
     args: TaskIdArg,
 ) -> Result<(), CliError> {
+    let with_primary_id = args.with_primary_id;
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
     let patch = WorkItemPatch {
         status: Some("cancelled".to_owned()),
@@ -1137,7 +1138,7 @@ pub(crate) async fn run_cancel_leaf(
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {
-        print_task_details(&format!("Cancelled {label}"), &item, None, false);
+        print_task_details(&format!("Cancelled {label}"), &item, None, with_primary_id);
     })
 }
 

@@ -593,7 +593,7 @@ pub(crate) async fn run_create_revision(
             .build(),
     )
     .await?;
-    warn_if_chain_has_live_worker(client, &parent_id).await;
+    warn_if_chain_has_live_worker(client, &parent_id, &task.id).await;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
         if !ctx.quiet {
             println!("created revision T{}: {}", task.short_id.unwrap_or(0), description);
@@ -603,18 +603,25 @@ pub(crate) async fn run_create_revision(
 }
 
 /// Best-effort advisory printed after `create-revision` succeeds: if any
-/// execution anywhere in the parent's revision chain (the chain root itself
-/// or a sibling revision) is still `running`/`waiting_human`, a worker may
-/// still be actively landing commits on the shared PR branch. The engine
-/// already serializes dispatch for back-to-back revisions on the same PR
-/// (see coordinator dispatch gating), so this is visibility only — it does
-/// not block or delay the new revision.
+/// execution *elsewhere* in the parent's revision chain (the chain root
+/// itself or a sibling revision) is still `running`/`waiting_human`, a
+/// worker may still be actively landing commits on the shared PR branch.
+/// The engine already serializes dispatch for back-to-back revisions on the
+/// same PR (see coordinator dispatch gating), so this is visibility only —
+/// it does not block or delay the new revision.
+///
+/// `new_revision_id` is excluded from the liveness scan: `create_revision`
+/// reconciles the new revision's own execution inside the same transaction
+/// that inserts it, so when there is no chain tail to gate on, that
+/// execution is born `ready` and can already be `running` by the time this
+/// advisory's RPCs land — without the exclusion the advisory would tell the
+/// caller to watch out for the very revision they just created.
 ///
 /// Failures here (chain-root resolution or the executions lookup) are
 /// swallowed: this is a courtesy notice, not part of the create-revision
 /// contract, so a transient RPC hiccup must not fail an otherwise-successful
 /// creation.
-async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str) {
+async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str, new_revision_id: &str) {
     let Some(chain_root_id) = resolve_chain_root_id(client, parent_id).await else {
         return;
     };
@@ -623,7 +630,7 @@ async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str)
     };
     let live: Vec<String> = executions
         .iter()
-        .filter(|e| e.status.is_live())
+        .filter(|e| e.work_item_id != new_revision_id && e.status.is_live())
         .map(|e| format!("{} ({})", e.work_item_id, e.status.as_str()))
         .collect();
     if !live.is_empty() {
@@ -636,25 +643,33 @@ async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str)
     }
 }
 
-/// Walk `parent_task_id` links up from `task_id` to the chain root (the
-/// first ancestor with no `parent_task_id`), capped at 20 hops to mirror
-/// the engine's own chain-walk cap (`revision_helpers.rs`). Returns `None`
-/// on any lookup failure or unresolvable chain — callers treat this as
-/// "skip the advisory", not an error.
+/// Walk `parent_task_id` links up from `task_id` to the chain root — the
+/// first ancestor whose `kind` is not `revision`, or one with no
+/// `parent_task_id` — capped at 64 hops to mirror the engine's own
+/// chain-walk cap (`work/chain_helpers.rs::chain_root`). Returns `None`
+/// on any lookup failure for the starting id; a dangling hop mid-walk
+/// instead returns the last successfully-resolved id, matching the
+/// engine's broken-parent handling. Callers treat `None` as "skip the
+/// advisory", not an error.
 async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> Option<String> {
     let mut current = task_id.to_owned();
-    for _ in 0..20 {
-        let item = get_work_item(client, &current).await.ok()?;
-        let parent_task_id = match &item {
-            WorkItem::Task(t) | WorkItem::Chore(t) => t.parent_task_id.clone(),
-            _ => None,
+    for _ in 0..64 {
+        let Ok(item) = get_work_item(client, &current).await else {
+            return Some(current);
         };
+        let (kind, parent_task_id) = match &item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => (t.kind.clone(), t.parent_task_id.clone()),
+            _ => return Some(current),
+        };
+        if kind != boss_protocol::TaskKind::Revision {
+            return Some(current);
+        }
         match parent_task_id {
             Some(parent) => current = parent,
             None => return Some(current),
         }
     }
-    None
+    Some(current)
 }
 
 pub(crate) async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
