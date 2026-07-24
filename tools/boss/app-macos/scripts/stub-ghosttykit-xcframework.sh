@@ -27,6 +27,13 @@
 #   - Idempotent: a no-op if a framework (real or stub) is already present.
 #   - Never destructive: it never overwrites an existing GhosttyKit.xcframework,
 #     so a real bootstrapped framework is left untouched.
+#   - Self-healing for a dangling symlink: a dev-bootstrapped workspace makes
+#     ThirdParty/GhosttyKit.xcframework a symlink into the bazel repo cache. If
+#     that cache entry is later GC'd, the symlink dangles: `-f
+#     "${XCFW}/Info.plist"` reads false (so the idempotency guard doesn't
+#     early-exit) but `mkdir -p "${XCFW}/..."` can't traverse the dead symlink
+#     and fails with ENOENT. Detect that case and remove the stale symlink
+#     before re-stubbing, rather than mkdir'ing through it.
 #   - Safe off-macOS: on a host without the Apple toolchain (no `xcrun`, or not
 #     Darwin) it prints a notice and exits 0 rather than failing. A cube setup
 #     step that fails hard-fails the lease, and there is nothing this stub can
@@ -47,6 +54,11 @@ fi
 if [[ "$(uname -s)" != "Darwin" ]] || ! command -v xcrun >/dev/null 2>&1; then
   echo "[stub-ghosttykit] not a macOS host with an Apple toolchain (uname=$(uname -s), xcrun=$(command -v xcrun || echo none)); skipping stub"
   exit 0
+fi
+
+if [[ -L "${XCFW}" && ! -e "${XCFW}" ]]; then
+  echo "[stub-ghosttykit] removing dangling GhosttyKit.xcframework symlink at ${XCFW}"
+  rm -f "${XCFW}"
 fi
 
 echo "[stub-ghosttykit] creating GhosttyKit.xcframework stub for SPM describe at ${XCFW}"
