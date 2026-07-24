@@ -207,35 +207,21 @@ status is otherwise left unchanged for re-dispatch or manual review."
                     .any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND && i.status != "resolved")
             })
             .unwrap_or(false);
-        if !already_filed {
-            match self.work_db.create_attention_item(CreateAttentionItemInput {
-                execution_id: Some(execution.id.clone()),
-                work_item_id: None,
-                kind: NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
-                status: None,
-                title: "Worker parked: auto-nudge loop bounded".to_owned(),
-                body_markdown: reason.clone(),
-                resolved_at: None,
-            }) {
-                Ok(item) => {
-                    if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                        let product_id = work_item.product_id().to_string();
-                        self.publisher
-                            .publish_frontend_event_on_product(
-                                &product_id,
-                                FrontendEvent::AttentionItemCreated { item },
-                            )
-                            .await;
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "nudge breaker: failed to file attention item; parking without UI surface"
-                    );
-                }
-            }
+        if !already_filed
+            && let Err(err) = self
+                .file_execution_attention(
+                    execution,
+                    NUDGE_BREAKER_ATTENTION_KIND,
+                    "Worker parked: auto-nudge loop bounded",
+                    reason.clone(),
+                )
+                .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "nudge breaker: failed to file attention item; parking without UI surface"
+            );
         }
 
         self.publisher

@@ -86,33 +86,23 @@ impl WorkerCompletionHandler {
              fallback validated. The producing task is advancing to Review WITHOUT an automated \
              revision; review the PR by hand."
         );
-        // Scope to the execution (not the work item): the store rejects
-        // setting both, and execution-scoped mirrors the nudge-breaker
-        // attention so `list_attention_items(&execution.id)` surfaces it.
-        match self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: Some(execution.id.clone()),
-            work_item_id: None,
-            kind: REVIEW_RESULT_GIVEUP_ATTENTION_KIND.to_owned(),
-            status: None,
-            title: "Reviewer produced no valid ReviewResult".to_owned(),
-            body_markdown: body,
-            resolved_at: None,
-        }) {
-            Ok(item) => {
-                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item.product_id().to_string();
-                    self.publisher
-                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
-                        .await;
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "pr_review finalize: failed to file review-result give-up attention item",
-                );
-            }
+        // Execution-scoped (see `file_execution_attention`): mirrors the
+        // nudge-breaker attention so `list_attention_items(&execution.id)`
+        // surfaces it.
+        if let Err(err) = self
+            .file_execution_attention(
+                execution,
+                REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
+                "Reviewer produced no valid ReviewResult",
+                body,
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "pr_review finalize: failed to file review-result give-up attention item",
+            );
         }
     }
 }
