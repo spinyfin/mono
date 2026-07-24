@@ -193,15 +193,7 @@ The app already has a Merging lane: the collapsible `done-merging` section rende
 
 ### Misconfiguration detection and enforcement flag-day
 
-**The flip sequence for flunge** (operator-executed, after the engine path has merged N ≥ 1 successful queue-backed merges):
-
-1. Confirm `boss engine trunk status` is green and flunge's `merge_mechanism = trunk_queue` has been live through at least one full merge and one eviction-remediation cycle.
-2. In GitHub branch protection for `main` on `brianduff/flunge` (per Trunk's enforcement docs): restrict pushes to `main` to the Trunk GitHub app; **disable** "require branches to be up to date before merging" (the queue owns freshness — leaving it on double-serializes); exclude `trunk-temp/**` and `trunk-merge/**` from branch-protection rules so Trunk can manage its working branches.
-3. Verify: a manual `gh pr merge` on a throwaway PR now fails with a push-restriction error; a Boss merge-button merge succeeds through the queue.
-4. **Emergency-bypass runbook** (documented in the ops doc this task list produces): repo admin temporarily lifts the push restriction (or adds themselves to the allowlist) in branch-protection settings, merges the emergency change, restores the restriction, and — if Boss tracked that PR — expects the normal merged-observation path to reconcile it (it does: terminal detection is GitHub-side). Pausing the Trunk queue first (`PAUSED` via the web app) avoids racing the queue during the bypass.
-5. Rollback is symmetric: remove the push restriction and set `merge_mechanism` back to `direct`; nothing in the engine assumes enforcement.
-
-**Misconfiguration detection** (enforcement on, Boss wrong): if a product is still `direct` and enforcement is enabled, `gh pr merge` fails — the handler already surfaces `gh` stderr as `WorkError`, and a new pattern match on push-restriction/rule-violation errors upgrades it to an attention item that names the fix ("flunge appears to be queue-enforced; set merge_mechanism=trunk_queue"). Conversely `trunk_queue` without a working token is covered by the auth section. Both states fail loudly on first use; neither can silently merge around the queue.
+The enforcement flip sequence, misconfiguration detection, and emergency-bypass procedure are documented as a standalone runbook: [`tools/boss/docs/runbooks/trunk-enforcement.md`](../runbooks/trunk-enforcement.md).
 
 ## Risks / open questions
 
