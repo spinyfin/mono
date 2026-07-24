@@ -71,10 +71,11 @@ pub(crate) struct TaskListCriteria<'a> {
     #[builder(default)]
     pub(crate) ids: &'a [String],
     pub(crate) limit: Option<usize>,
-    /// When `false`, `archived` rows are hidden unless `statuses`
-    /// explicitly asks for them — mirrors the deleted/restore contract
-    /// (hidden by default, visible on request) rather than the
-    /// show-everything default other statuses get.
+    /// When `false`, `archived` and `cancelled` rows are hidden unless
+    /// `statuses` explicitly asks for them — mirrors the deleted/restore
+    /// contract (hidden by default, visible on request) rather than the
+    /// show-everything default other statuses get. Both terminal statuses
+    /// share this flag: neither should linger on the default board.
     #[builder(default)]
     pub(crate) include_archived: bool,
 }
@@ -90,10 +91,14 @@ pub(crate) fn apply_task_list_filters(
     let id_set: std::collections::HashSet<&str> = criteria.ids.iter().map(String::as_str).collect();
     let lc_term = criteria.match_term.map(str::to_lowercase);
     let show_archived = criteria.include_archived || allowed_statuses.contains(&"archived");
+    let show_cancelled = criteria.include_archived || allowed_statuses.contains(&"cancelled");
     items
         .into_iter()
         .filter(|task| {
             if !show_archived && task.status.as_str() == "archived" {
+                return false;
+            }
+            if !show_cancelled && task.status.as_str() == "cancelled" {
                 return false;
             }
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
