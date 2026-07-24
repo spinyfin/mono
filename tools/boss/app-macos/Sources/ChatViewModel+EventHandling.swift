@@ -131,7 +131,7 @@ extension ChatViewModel {
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
             if let productID = project(withID: projectId)?.productID {
-                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
+                scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
         case .workItemDeleted(let id):
             let deletedTask = task(withID: id)
@@ -139,7 +139,7 @@ extension ChatViewModel {
                 selectedWorkCardID = nil
             }
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
+                scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
         case .workError(let message):
             // Allow the user to retry any in-flight review terminal or
@@ -561,7 +561,7 @@ extension ChatViewModel {
     /// could have covered. Shared by the topic-matched and payload-matched
     /// arms of `.workInvalidated`, which want identical refreshes.
     private func refetchForInvalidation(productID: String) {
-        engine.sendGetWorkTree(productId: productID, flow: .invalidationRefetch)
+        scheduleWorkTreeRefetch(productID: productID, flow: .invalidationRefetch)
         engine.sendListAttentionItemsForWorkItem(workItemID: productID)
         engine.sendListAttentionGroups(productId: productID)
         engine.sendListDeferredScopeAttentions(productId: productID)
@@ -575,7 +575,29 @@ extension ChatViewModel {
         plannerActionInFlightProjectIDs.remove(projectID)
         engine.sendListPlannerRuns(projectId: projectID)
         if let productID = project(withID: projectID)?.productID {
-            engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
+            scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
+        }
+    }
+
+    /// Coalesce bursts of invalidation-style refetch triggers (repeated
+    /// `WorkInvalidated` pushes, bulk deletes/reorders, planner actions
+    /// touching many projects) into a single `GetWorkTree` request per
+    /// product, instead of one full-tree fetch — and one full,
+    /// synchronous `applyWorkTree` rebuild — per triggering event. A
+    /// later call for the same product within the debounce window
+    /// supersedes an earlier one rather than queuing a second request.
+    /// Not used for cold-start/product-switch/manual-refresh fetches,
+    /// which want to land immediately.
+    func scheduleWorkTreeRefetch(productID: String, flow: PopulationFlow) {
+        pendingWorkTreeRefetchTasks[productID]?.cancel()
+        pendingWorkTreeRefetchTasks[productID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.pendingWorkTreeRefetchTasks.removeValue(forKey: productID)
+                self.engine.sendGetWorkTree(productId: productID, flow: flow)
+            }
         }
     }
 

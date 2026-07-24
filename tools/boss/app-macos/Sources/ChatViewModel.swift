@@ -58,6 +58,21 @@ final class ChatViewModel: ObservableObject {
         didSet { invalidateWorkCache() }
     }
     @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
+    /// Project-bucket keys in [[tasksByProjectID]] currently populated for
+    /// each product, maintained incrementally by `applyWorkTree`. Lets a
+    /// work-tree refresh evict exactly the stale buckets it's about to
+    /// replace instead of scanning every product's buckets — without this,
+    /// `applyWorkTree` cost grew with the total tasks/chores across every
+    /// product ever viewed this session, not just the product being
+    /// refreshed (see `ChatViewModel+WorkItemEvents.applyWorkTree`).
+    var trackedProjectIDsByProductID: [String: Set<String>] = [:]
+    /// Debounce handles for [[scheduleWorkTreeRefetch]], keyed by product
+    /// id. A burst of invalidation-style events for the same product
+    /// (bulk deletes, reorders, planner actions) collapses into one
+    /// `GetWorkTree` request — and one full-tree apply — instead of one
+    /// per event; see the "refetch storm" evidence in
+    /// docs/investigations/task-population-latency-on-start-and-product-switch.md §10.2.
+    var pendingWorkTreeRefetchTasks: [String: Task<Void, Never>] = [:]
     /// Dependency edges keyed by product. Refreshed whenever the engine
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render

@@ -276,6 +276,14 @@ extension ChatViewModel {
         workItems(in: effectiveBoardColumn(for: task)).contains(where: { $0.id == task.id })
     }
 
+    /// Replace this product's slice of [[taskRuntimesByID]] with `runtimes`.
+    /// Removes only the keys actually being replaced instead of filtering
+    /// the whole dictionary — `taskRuntimesByID` accumulates every product
+    /// ever viewed this session, so a full-dictionary filter here cost
+    /// O(every product's items) on every single work-tree refresh, not
+    /// O(this product's items). This was the dominant unattributed cost in
+    /// the `apply` population-timing segment (see the ui-stall diagnostics
+    /// this fix responds to).
     func mergeTaskRuntimes(
         _ runtimes: [WorkTaskRuntime],
         for productID: String,
@@ -283,7 +291,10 @@ extension ChatViewModel {
         chores: [WorkTask]
     ) {
         let productItemIDs = Set(tasks.map(\.id) + chores.map(\.id))
-        taskRuntimesByID = taskRuntimesByID.filter { !productItemIDs.contains($0.key) }
+        let freshRuntimeIDs = Set(runtimes.map(\.workItemID))
+        for id in productItemIDs where !freshRuntimeIDs.contains(id) {
+            taskRuntimesByID.removeValue(forKey: id)
+        }
         for runtime in runtimes {
             taskRuntimesByID[runtime.workItemID] = runtime
         }

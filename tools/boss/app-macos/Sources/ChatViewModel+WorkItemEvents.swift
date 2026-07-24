@@ -30,11 +30,20 @@ extension ChatViewModel {
         }
         projectsByProductID[product.id] = projects.sorted(by: projectSort)
         let popBucketStartNanos = PopulationTiming.now()
-        tasksByProjectID = tasksByProjectID.filter { _, existingTasks in
-            existingTasks.first?.productID != product.id
+        // Evict exactly this product's previous buckets (tracked
+        // incrementally in [[trackedProjectIDsByProductID]]) instead of
+        // filtering the whole dictionary — `tasksByProjectID` accumulates
+        // every product ever viewed this session, so the naive
+        // `tasksByProjectID.filter { ... }` scan cost O(every product's
+        // tasks) on every single refresh, not O(this product's tasks).
+        if let staleProjectIDs = trackedProjectIDsByProductID[product.id] {
+            for projectID in staleProjectIDs {
+                tasksByProjectID.removeValue(forKey: projectID)
+            }
         }
         var productLevelRevisions: [WorkTask] = []
         var productLevelTasks: [WorkTask] = []
+        var freshProjectIDs: Set<String> = []
         for task in tasks {
             guard let projectID = task.projectID else {
                 // Product-level rows (`project_id IS NULL`) have no project
@@ -53,11 +62,14 @@ extension ChatViewModel {
                 continue
             }
             tasksByProjectID[projectID, default: []].append(task)
+            freshProjectIDs.insert(projectID)
         }
+        trackedProjectIDsByProductID[product.id] = freshProjectIDs
         let popBucketEndNanos = PopulationTiming.now()
-        for (projectID, projectTasks) in tasksByProjectID where
-            projectTasks.first?.productID == product.id {
-            tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
+        for projectID in freshProjectIDs {
+            if let projectTasks = tasksByProjectID[projectID] {
+                tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
+            }
         }
         choresByProductID[product.id] = chores.sorted(by: taskSort)
         productLevelRevisionsByProductID[product.id] = productLevelRevisions.sorted(by: taskSort)
