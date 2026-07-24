@@ -61,16 +61,27 @@ extension ChatViewModel {
 
 
     /// `kind == "revision"` tasks for parentID with status `"in_review"`.
+    /// O(1) per card — reads the cache built by `rebuildRevisionCache()`,
+    /// which groups every project- and product-level revision by parent id
+    /// and status in a single pass. Called once per visible card on every
+    /// kanban render, so this used to be an O(total tasks) scan per card;
+    /// see `cachedInReviewRevisionsByParentID`.
     func inReviewRevisions(forParentTaskID parentID: String) -> [WorkTask] {
-        revisions(forParentTaskID: parentID, status: "in_review", includeChoresAndProductTasks: false)
+        if cachedInReviewRevisionsByParentID == nil { rebuildRevisionCache() }
+        return cachedInReviewRevisionsByParentID?[parentID] ?? []
     }
 
-    /// `kind == "revision"` tasks for parentID with status `"done"`.
+    /// `kind == "revision"` tasks for parentID with status `"done"`. O(1)
+    /// per card; see `inReviewRevisions(forParentTaskID:)`.
     func doneRevisions(forParentTaskID parentID: String) -> [WorkTask] {
-        revisions(forParentTaskID: parentID, status: "done", includeChoresAndProductTasks: false)
+        if cachedDoneRevisionsByParentID == nil { rebuildRevisionCache() }
+        return cachedDoneRevisionsByParentID?[parentID] ?? []
     }
 
-    /// `kind == "revision"` tasks for parentID regardless of status.
+    /// `kind == "revision"` tasks for parentID regardless of status. Used
+    /// only by the transcript viewer's one-shot chain lookup (not a
+    /// per-render hot path), so it keeps the direct scan rather than
+    /// growing the cache to cover the chore/product-task buckets too.
     func allRevisions(forParentTaskID parentID: String) -> [WorkTask] {
         revisions(forParentTaskID: parentID, status: nil, includeChoresAndProductTasks: true)
     }
@@ -107,6 +118,42 @@ extension ChatViewModel {
             }
         }
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+    }
+
+    /// Groups every project- and product-level revision task by parent id
+    /// for the two statuses the kanban card footer actually renders
+    /// (`in_review`, `done`), in one O(total revisions) pass. Populates
+    /// `cachedInReviewRevisionsByParentID` / `cachedDoneRevisionsByParentID`.
+    /// Mirrors `rebuildPrereqCache` in ChatViewModel+Dependencies.swift —
+    /// same buckets as the `revisions(...)` scan above with
+    /// `includeChoresAndProductTasks: false` (chores/product-level tasks
+    /// aren't revision parents, so they're excluded here too).
+    private func rebuildRevisionCache() {
+        var inReview: [String: [WorkTask]] = [:]
+        var done: [String: [WorkTask]] = [:]
+        func collect(_ tasks: [WorkTask]) {
+            for task in tasks {
+                guard task.kind == "revision", let parentID = task.parentTaskId else { continue }
+                switch task.status {
+                case "in_review":
+                    inReview[parentID, default: []].append(task)
+                case "done":
+                    done[parentID, default: []].append(task)
+                default:
+                    break
+                }
+            }
+        }
+        for tasks in tasksByProjectID.values { collect(tasks) }
+        for revisions in productLevelRevisionsByProductID.values { collect(revisions) }
+        for key in inReview.keys {
+            inReview[key]?.sort { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+        }
+        for key in done.keys {
+            done[key]?.sort { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+        }
+        cachedInReviewRevisionsByParentID = inReview
+        cachedDoneRevisionsByParentID = done
     }
 
     // MARK: Project / chore counts
