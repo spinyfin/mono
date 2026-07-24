@@ -31,12 +31,8 @@ pub async fn run(cli: Cli) -> Result<()> {
 ///
 /// A pure function of its arguments — no env reads, no I/O — pulled out of
 /// `run_server` so the wiring that connects [`IsolationPaths`] to a real
-/// engine start is directly unit-testable. Before this extraction, deleting
-/// the `ensure_isolated()` call (or the events-socket stamp `run` applies to
-/// `WorkConfig`) still left the whole test suite green: the derivation and
-/// the gate had unit coverage as pure functions, but nothing exercised the
-/// code that actually calls them on a real start — precisely the asymmetry
-/// this module's isolation doc criticises about the old `isolation_guard.rs`.
+/// start is unit-testable — deleting the `ensure_isolated` call below must
+/// fail a test, not just the derivation's own tests.
 ///
 /// `pid_env_override` and `token_env_override` are the callers' env-sourced
 /// fallbacks (`$BOSS_PID_PATH`, `crate::engine_control::default_token_path()`)
@@ -297,6 +293,23 @@ pub async fn serve(
     .await
 }
 
+/// What `WorkConfig::events_socket_path` should be after this `serve` call,
+/// given the path the config already carries and the path (if any) this call
+/// is about to bind.
+///
+/// `bound` is authoritative whenever it is `Some`: this call *is* the
+/// binding, so if `existing` names a different path, keeping `existing` would
+/// silently hand every downstream resolver (`bound_events_socket_path`) a
+/// path nobody is listening on. `bound: None` just means this particular
+/// `serve` call didn't bind a socket (e.g. an in-process test) — that is not
+/// evidence `existing` was wrong, so it passes through unchanged.
+fn stamped_events_socket_path(existing: Option<&Path>, bound: Option<&Path>) -> Option<std::path::PathBuf> {
+    match bound {
+        Some(bound) => Some(bound.to_path_buf()),
+        None => existing.map(|p| p.to_path_buf()),
+    }
+}
+
 /// Same as [`serve`], but accepts an optional `MergeProbe` override, plumbed
 /// straight through to [`ServerState`]. Production callers (and most tests)
 /// go through `serve` and get the real `CommandMergeProbe`; tests that need
@@ -316,23 +329,42 @@ pub async fn serve_with_merge_probe(
     // The socket this call is about to bind is the one every worker's
     // `settings.json` must name. Stamp it onto the config so downstream
     // resolvers read the binding instead of re-deriving it from the
-    // environment. In production `run` already set this and the fill-in is a
-    // no-op; it matters for in-process callers that pass an explicit socket
-    // path alongside a config built without one.
-    //
-    // Fill-in only: never overwrite a path the config already carries with
-    // `None`. `events_socket_path: None` here just means "this particular
-    // `serve` call didn't bind one" (e.g. an in-process test) — it is not
-    // evidence that the config's own path was wrong, and erasing it would
-    // silently hand every downstream resolver (`bound_events_socket_path`)
-    // back to re-reading `$BOSS_EVENTS_SOCKET`.
-    let cfg = if cfg.work.events_socket_path.is_none() && events_socket_path.is_some() {
+    // environment. In production `run` already set this and the overwrite is
+    // a no-op; it matters for in-process callers that pass an explicit socket
+    // path alongside a config built without one. See
+    // [`stamped_events_socket_path`] for the merge rule.
+    let stamped = stamped_events_socket_path(cfg.work.events_socket_path.as_deref(), events_socket_path.as_deref());
+    let cfg = if stamped.as_deref() != cfg.work.events_socket_path.as_deref() {
         let mut work = cfg.work.clone();
-        work.events_socket_path = events_socket_path.clone();
+        work.events_socket_path = stamped;
         Arc::new(cfg.with_work(work))
     } else {
         cfg
     };
+
+    // Refuse to proceed at all if a live process already holds the events
+    // socket path — before the control-token file, the frontend socket, or
+    // the pid file are touched. `bind_events_socket` probes again immediately
+    // before it unlinks (belt-and-suspenders for callers that reach it some
+    // other way), but by then the token/frontend-socket/pid-file writes below
+    // would already have clobbered a live engine's state on refusal, which is
+    // worse than not probing at all.
+    if let Some(path) = &events_socket_path
+        && crate::events_socket::path_has_a_live_listener(path)
+    {
+        let owner = std::os::unix::net::UnixStream::connect(path)
+            .ok()
+            .and_then(|stream| {
+                stream.set_nonblocking(true).ok()?;
+                tokio::net::UnixStream::from_std(stream).ok()
+            })
+            .and_then(|stream| peer_pid(&stream).ok());
+        return Err(anyhow::anyhow!(
+            "refusing to start: a live process ({}) is already listening on the events socket {}",
+            owner.map(|p| p.to_string()).unwrap_or_else(|| "unknown pid".to_owned()),
+            path.display()
+        ));
+    }
 
     let (control_token, _control_token_guard) = match control_token_path {
         Some(path) => {
@@ -362,6 +394,25 @@ pub async fn serve_with_merge_probe(
         None,
         None,
     )?;
+
+    // A socket file with a live process behind it must never be unlinked;
+    // only a crashed engine's leftover is safe to rebind. Same probe as the
+    // events socket below — the frontend socket is what the macOS app and
+    // `bossctl` connect to, so stealing it is at least as damaging.
+    if crate::events_socket::path_has_a_live_listener(&socket_path) {
+        let owner = std::os::unix::net::UnixStream::connect(&socket_path)
+            .ok()
+            .and_then(|stream| {
+                stream.set_nonblocking(true).ok()?;
+                tokio::net::UnixStream::from_std(stream).ok()
+            })
+            .and_then(|stream| peer_pid(&stream).ok());
+        return Err(anyhow::anyhow!(
+            "refusing to start: a live process ({}) is already listening on the frontend socket {}",
+            owner.map(|p| p.to_string()).unwrap_or_else(|| "unknown pid".to_owned()),
+            socket_path.display()
+        ));
+    }
 
     // Always attempt to unlink any existing file at the path before
     // binding. `path.exists()` lies for dangling symlinks and races
@@ -1971,10 +2022,9 @@ mod resolve_engine_paths_tests {
 
     /// If the config's events socket resolves onto production — e.g. the
     /// stamp `run` applies to `WorkConfig` was skipped or bypassed — the
-    /// wiring this function performs (not just the pure `derive_from`/
-    /// `ensure_isolated` functions in isolation.rs) must refuse the start.
-    /// This pins the call site the PR's own module doc criticised the old
-    /// `isolation_guard.rs` for never exercising.
+    /// wiring this function performs must refuse the start. Covers the call
+    /// site, not just the pure `derive_from`/`ensure_isolated` functions in
+    /// isolation.rs: deleting the gate call must fail here.
     #[test]
     fn config_resolving_onto_production_is_refused_by_the_real_wiring() {
         let prod = production();
@@ -2017,5 +2067,44 @@ mod resolve_engine_paths_tests {
 
         let err = resolve_engine_paths(&isolation, &cfg, None, None).expect_err("no bound events socket must error");
         assert!(format!("{err}").contains("HOME must be set"));
+    }
+}
+
+#[cfg(test)]
+mod stamped_events_socket_path_tests {
+    use std::path::PathBuf;
+
+    use super::stamped_events_socket_path;
+
+    #[test]
+    fn none_config_and_some_bind_fills_in() {
+        let bound = PathBuf::from("/tmp/bound.events.sock");
+        assert_eq!(stamped_events_socket_path(None, Some(&bound)), Some(bound));
+    }
+
+    #[test]
+    fn some_config_and_some_different_bind_yields_the_bound_path() {
+        let existing = PathBuf::from("/tmp/stale.events.sock");
+        let bound = PathBuf::from("/tmp/bound.events.sock");
+        assert_eq!(
+            stamped_events_socket_path(Some(&existing), Some(&bound)),
+            Some(bound),
+            "the socket actually bound must win over a stale config value"
+        );
+    }
+
+    #[test]
+    fn some_config_and_none_bind_leaves_config_unchanged() {
+        let existing = PathBuf::from("/tmp/existing.events.sock");
+        assert_eq!(
+            stamped_events_socket_path(Some(&existing), None),
+            Some(existing),
+            "no binding happened this call, so the config's own value must not be erased"
+        );
+    }
+
+    #[test]
+    fn none_config_and_none_bind_stays_none() {
+        assert_eq!(stamped_events_socket_path(None, None), None);
     }
 }

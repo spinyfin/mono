@@ -18,10 +18,11 @@ pub const EVENTS_SOCKET_ENV: &str = "BOSS_EVENTS_SOCKET";
 pub const PID_PATH_ENV: &str = "BOSS_ENGINE_PID_PATH";
 
 /// Default value for [`WorkConfig::max_review_cycles`]. Matches the
-/// "~3 cycles at worst" mental model from P992 design §7.
+/// "~3 cycles at worst" mental model from the review-cycle-cap design, §7.
 pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
 
-/// Default threshold for the no-op / trivial-diff skip gate (P992 design §8).
+/// Default threshold for the no-op / trivial-diff skip gate (review-cycle-cap
+/// design, §8).
 /// Zero means "skip only when the effective diff is literally empty (0 changed
 /// lines)"; operators can raise this to also skip small cosmetic-only pushes.
 pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
@@ -64,7 +65,7 @@ pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
 /// to be a benign cause — display sleep + App Nap throttling the app's
 /// MainActor, making spawn acks 24-87s late — and latched the entire
 /// fleet's dispatch, reviews included, for ~40 minutes until a human
-/// manually resumed it. That incident (T2761) drove the flag to default off
+/// manually resumed it. That incident drove the flag to default off
 /// between PR #2041 and this change, via `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`
 /// opt-in only. Two fixes have since landed: the App Nap opt-out (display
 /// sleep no longer degrades spawn acks) and the enabled-mode half-open
@@ -137,7 +138,7 @@ pub struct WorkConfig {
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances the task to human Review
     /// directly. Configured via `BOSS_MAX_REVIEW_CYCLES`; defaults to
-    /// [`DEFAULT_MAX_REVIEW_CYCLES`] (3). P992 design §7.
+    /// [`DEFAULT_MAX_REVIEW_CYCLES`] (3). Review-cycle-cap design, §7.
     #[builder(default = DEFAULT_MAX_REVIEW_CYCLES)]
     pub max_review_cycles: usize,
     /// Minimum number of changed lines (additions + deletions) required to
@@ -147,7 +148,7 @@ pub struct WorkConfig {
     /// skip only when the diff is completely empty; operators can raise it to
     /// also skip small cosmetic pushes. Configured via
     /// `BOSS_MIN_REVIEW_CHANGED_LINES`; defaults to
-    /// [`DEFAULT_MIN_REVIEW_CHANGED_LINES`] (0). P992 design §8.
+    /// [`DEFAULT_MIN_REVIEW_CHANGED_LINES`] (0). Review-cycle-cap design, §8.
     #[builder(default = DEFAULT_MIN_REVIEW_CHANGED_LINES)]
     pub min_review_changed_lines: u64,
     /// Maximum diff size (lines) at which the engine pre-embeds the full

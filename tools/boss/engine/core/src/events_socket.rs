@@ -146,7 +146,7 @@ pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
 /// assume stale" so a transient permission hiccup doesn't newly block
 /// startup — the existing `remove_file` error handling right after this call
 /// still surfaces a real problem.
-fn path_has_a_live_listener(path: &Path) -> bool {
+pub(crate) fn path_has_a_live_listener(path: &Path) -> bool {
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_stream) => true,
         Err(_) => false,
@@ -369,11 +369,8 @@ mod tests {
     }
 
     /// The counterpart to `rebind_after_stale_file_listens`: a socket file
-    /// with a LIVE process behind it must be refused, not stolen. This is
-    /// the finding this probe closes — `bind_events_socket` previously
-    /// unlinked unconditionally on the assumption every file it found was
-    /// stale, which is exactly what let a fixture rebind a live production
-    /// socket when the layers above this one missed the collision.
+    /// with a live process behind it must never be unlinked; only a crashed
+    /// engine's leftover is safe to rebind.
     #[tokio::test]
     async fn refuses_to_steal_a_live_listener() {
         let dir = TempDir::new().unwrap();

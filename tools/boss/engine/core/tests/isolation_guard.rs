@@ -510,3 +510,165 @@ async fn fixture_cannot_overwrite_or_delete_live_production_token() -> Result<()
     prod_join.abort();
     Ok(())
 }
+
+/// A live process holding the frontend socket must be refused, not stolen —
+/// the frontend socket is what the macOS app and `bossctl` connect to, so
+/// stealing it is at least as damaging as stealing the events socket.
+#[tokio::test]
+async fn refuses_to_steal_a_live_frontend_socket() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let shared_socket = temp.path().join("shared.sock");
+
+    // "Live" engine: owns the frontend socket for real, stays running.
+    let live_db = temp.path().join("live.db");
+    let live_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(live_db)
+        .build();
+    let live_cfg = Arc::new(RuntimeConfig::from_parts(live_work, None));
+    let live_sock_c = shared_socket.clone();
+    let live_join = tokio::spawn(async move { serve(live_cfg, live_sock_c, None, None, None, None).await });
+    if !wait_for_socket(shared_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        live_join.abort();
+        return Err(anyhow!("live engine never bound socket"));
+    }
+    let before_ino = std::fs::metadata(&shared_socket)?.ino();
+
+    // Second engine attempts to bind the SAME frontend socket path (an
+    // isolation bug, or a second engine that resolved the same path).
+    let second_socket = shared_socket.clone();
+    let second_db = temp.path().join("second.db");
+    let second_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(second_db)
+        .build();
+    let second_cfg = Arc::new(RuntimeConfig::from_parts(second_work, None));
+    let second_result = serve(second_cfg, second_socket, None, None, None, None).await;
+
+    let err = second_result.expect_err("must not steal a live listener's frontend socket");
+    assert!(format!("{err:#}").contains("live process"), "unexpected error: {err:#}");
+
+    // The live engine's socket file must be untouched — same inode, still
+    // reachable — not unlinked-and-recreated by the refused steal attempt.
+    let after_ino = std::fs::metadata(&shared_socket)?.ino();
+    assert_eq!(
+        after_ino, before_ino,
+        "live engine's frontend socket must be the same inode, not recreated"
+    );
+    assert!(
+        wait_for_socket(shared_socket.to_str().unwrap(), Duration::from_secs(1)).await,
+        "live engine's frontend socket must remain reachable after the refused steal attempt"
+    );
+
+    live_join.abort();
+    Ok(())
+}
+
+/// Regression test for the ordering bug: when the events socket has a live
+/// listener, `serve()` must refuse BEFORE writing the control-token file,
+/// unlinking/rebinding the frontend socket, or writing the pid file — not
+/// after, which would leave the live engine's frontend socket unlinked and
+/// its token/pid files deleted by the refusing process's own guards on
+/// unwind.
+#[tokio::test]
+async fn events_socket_collision_is_refused_before_any_destructive_write() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+
+    // "Live" engine: owns the events socket, plus its own frontend socket,
+    // pid file, and control-token file, and stays running throughout.
+    let live_socket = temp.path().join("live.sock");
+    let live_events = temp.path().join("shared-events.sock");
+    let live_pid = temp.path().join("live.pid");
+    let live_token = temp.path().join("live.control-token");
+    let live_db = temp.path().join("live.db");
+    let live_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(live_db)
+        .build();
+    let live_cfg = Arc::new(RuntimeConfig::from_parts(live_work, None));
+    let live_sock_c = live_socket.clone();
+    let live_pid_c = live_pid.clone();
+    let live_events_c = live_events.clone();
+    let live_token_c = live_token.clone();
+    let live_join = tokio::spawn(async move {
+        serve(
+            live_cfg,
+            live_sock_c,
+            Some(live_pid_c),
+            Some(live_events_c),
+            Some(live_token_c),
+            None,
+        )
+        .await
+    });
+    if !wait_for_socket(live_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        live_join.abort();
+        return Err(anyhow!("live engine never bound socket"));
+    }
+
+    let frontend_ino_before = std::fs::metadata(&live_socket)?.ino();
+    let token_before = std::fs::read_to_string(&live_token)?;
+    let pid_before = std::fs::read_to_string(&live_pid)?;
+
+    // Second engine: distinct frontend socket, pid, and token paths, but the
+    // SAME events socket the live engine already holds — mirrors the
+    // orphaned-engine restart path, where a new engine reuses the events
+    // socket of an engine still alive but no longer tracked by pid.
+    let second_socket = temp.path().join("second.sock");
+    let second_pid = temp.path().join("second.pid");
+    let second_token = temp.path().join("second.control-token");
+    let second_db = temp.path().join("second.db");
+    let second_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(second_db)
+        .build();
+    let second_cfg = Arc::new(RuntimeConfig::from_parts(second_work, None));
+    let second_result = serve(
+        second_cfg,
+        second_socket.clone(),
+        Some(second_pid.clone()),
+        Some(live_events.clone()),
+        Some(second_token.clone()),
+        None,
+    )
+    .await;
+
+    let err = second_result.expect_err("must refuse to start when the events socket is already live");
+    assert!(format!("{err:#}").contains("live process"), "unexpected error: {err:#}");
+
+    // None of the second engine's own files were left behind: the refusal
+    // happened before any of them were created.
+    assert!(
+        !second_socket.exists(),
+        "refused start must not have bound its own frontend socket"
+    );
+    assert!(!second_pid.exists(), "refused start must not have written a pid file");
+    assert!(
+        !second_token.exists(),
+        "refused start must not have written a control-token file"
+    );
+
+    // The live engine's own files are untouched.
+    let frontend_ino_after = std::fs::metadata(&live_socket)?.ino();
+    assert_eq!(
+        frontend_ino_after, frontend_ino_before,
+        "live engine's frontend socket must be the same inode, not clobbered by the refused second start"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&live_token)?,
+        token_before,
+        "live engine's control-token file must be unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&live_pid)?,
+        pid_before,
+        "live engine's pid file must be unchanged"
+    );
+    assert!(
+        wait_for_socket(live_socket.to_str().unwrap(), Duration::from_secs(1)).await,
+        "live engine's frontend socket must remain reachable throughout"
+    );
+
+    live_join.abort();
+    Ok(())
+}

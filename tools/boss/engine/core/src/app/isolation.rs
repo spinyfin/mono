@@ -405,6 +405,16 @@ fn same_path(a: &Path, b: Option<&Path>) -> bool {
 /// process's own production model. See [`EnginePaths::production`]'s doc for
 /// what this still cannot catch (production relocated by env var to a path
 /// that doesn't have this shape at all).
+///
+/// This has no reference to `$HOME`, so it is a *structural* check only: a
+/// deliberately-chosen private path that happens to reproduce production's
+/// `.../Library/Application Support/Boss/<filename>` layout under a different
+/// root (e.g. a sandbox at `/Users/dev/sandboxes/alpha/Library/Application
+/// Support/Boss/events.sock`) is treated as inherited environment and
+/// isolated away rather than honored. That is the safe direction — isolate
+/// rather than risk a collision — but it means such a path is never treated
+/// as an intentional override; name the file or the containing directory
+/// differently to opt out.
 fn is_production_shaped(path: &Path, filename: &str) -> bool {
     if path.file_name().and_then(|n| n.to_str()) != Some(filename) {
         return false;
@@ -632,6 +642,31 @@ mod tests {
             &EnginePaths::default(), // models HOME unset: every field None
         );
         assert_eq!(paths.derived.db.as_deref(), Some(Path::new("/tmp/boss-test-abc123.db")),);
+    }
+
+    /// A *private* path that happens to reproduce production's layout under a
+    /// different root (e.g. a developer's sandbox mirroring `Library/
+    /// Application Support/Boss`) is still classified as inherited
+    /// environment and isolated away — `is_production_shaped` has no
+    /// reference to `$HOME`, so it cannot distinguish "this is the real
+    /// production tree under someone else's home" from "this is a private
+    /// path that happens to end the same way". This is a deliberate,
+    /// pinned choice (isolate rather than risk a collision), not an
+    /// accident: a developer who wants their private path honored must name
+    /// the file or the containing directory differently.
+    #[test]
+    fn private_path_reproducing_production_shape_is_still_isolated_away() {
+        let paths = derive(IsolationOverrides {
+            events_socket: Some(PathBuf::from(
+                "/Users/dev/sandboxes/alpha/Library/Application Support/Boss/events.sock",
+            )),
+            ..IsolationOverrides::default()
+        });
+        assert_eq!(
+            paths.derived.events_socket.as_deref(),
+            Some(Path::new("/tmp/boss-test-abc123.events.sock")),
+            "a private path with production's shape is treated as inherited env, not honored intent"
+        );
     }
 
     /// The gate must fail closed, not open, when it cannot resolve
