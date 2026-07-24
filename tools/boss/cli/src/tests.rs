@@ -1397,7 +1397,7 @@ fn bulk_create_item_deserializes_deferred_and_defaults_absent_to_none() {
 fn task_update_parses_deferred_flag() {
     // `--deferred false` is the operator-approval form; it must parse into
     // the shared TaskUpdateArgs.
-    let cli = Cli::parse_from(["boss", "task", "update", "T1", "--deferred", "false"]);
+    let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--deferred", "false"]);
     match cli.command {
         Commands::Task {
             command: TaskCommand::Update(args),

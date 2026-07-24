@@ -232,6 +232,56 @@ fn marking_queued_item_deferred_abandons_its_pending_execution() {
     );
 }
 
+/// The primary non-start approval affordance: `boss task update --deferred
+/// false` clears the classification directly (no `RequestExecution`), and a
+/// subsequent reconcile then mints a `ready` execution for the now-ordinary
+/// autostart item.
+#[test]
+fn clearing_deferred_via_update_then_reconcile_dispatches() {
+    let db = WorkDb::open(temp_db_path("deferred-update-approve")).unwrap();
+    let product = create_test_product_named(&db, "Boss-deferred-update-approve");
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("future work")
+                .deferred(true)
+                .build(),
+        )
+        .unwrap();
+
+    // Sanity: auto-reconcile leaves it parked while still deferred.
+    db.reconcile_product_executions(&product.id).unwrap();
+    assert!(!has_ready(&db, &chore.id), "deferred item is parked before approval");
+
+    // Approve via `--deferred false` (the update path), not RequestExecution.
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        deferred_flag(&db, &chore.id),
+        0,
+        "`--deferred false` clears the deferred column directly",
+    );
+    assert!(
+        !has_ready(&db, &chore.id),
+        "the update itself does not mint an execution — only reconcile does",
+    );
+
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    assert!(
+        has_ready(&db, &chore.id),
+        "reconcile mints a ready execution for the now-approved autostart item",
+    );
+}
+
 /// The same suppression on the revision branch: a deferred revision whose
 /// chain root has an open PR is not auto-dispatched by
 /// `reconcile_revision_execution`.
