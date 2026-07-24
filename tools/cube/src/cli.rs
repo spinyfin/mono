@@ -181,7 +181,7 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         lease: String,
         /// Override the new TTL in seconds. Defaults to the standard
-        /// 1800s window from now.
+        /// 24h window from now.
         #[arg(long)]
         ttl_seconds: Option<u64>,
     },

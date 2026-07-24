@@ -30,10 +30,27 @@ use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 
 type Result<T> = std::result::Result<T, CubeError>;
 
-/// Default lease TTL: 30 minutes from acquisition. The Boss-engine
-/// integration sketch in R4 of v2-design-risks.md heartbeats every
-/// few minutes against this window.
-const DEFAULT_LEASE_TTL_SECS: i64 = 1800;
+/// Default lease TTL: 24 hours from acquisition.
+///
+/// Was 30 minutes until the 2026-07-23 crash-and-restart incident: a worker's
+/// lease that had never been heartbeated (e.g. the holder died before its
+/// first heartbeat pass, or the engine itself was down) expired on cube's own
+/// clock, and a fresh dispatch grabbed the now-`free` workspace out from under
+/// a resume-in-place execution trying to reclaim the same one — a race lost
+/// by seconds. The workspace still held the prior holder's uncommitted work,
+/// which then sat unused while the resumed execution rebuilt it from scratch.
+///
+/// Workspaces are cheap and provisioned on demand (no fixed pool); in-flight
+/// work is not. A long default TTL means a dead-but-unreaped holder keeps its
+/// claim — rather than an eager fresh dispatch being able to grab the
+/// workspace via ordinary TTL expiry before a resume ever gets a chance —
+/// while genuinely dead leases are still reclaimed promptly through paths
+/// that do not depend on this TTL at all: `cube workspace force-release`
+/// (admin/engine-initiated, bypasses TTL entirely) and the Boss engine's own
+/// heartbeat-failure-streak + confirm-dead auto-reap (also calls
+/// force-release directly, see `cube_lease_heartbeat.rs`). This TTL is only
+/// the last-resort backstop for leases nothing else is watching.
+const DEFAULT_LEASE_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// `last_release_reason` recorded when the dirty-reclaim guard in
 /// `reset_workspace_guarded` refuses a destructive reset and the workspace
@@ -11614,7 +11631,7 @@ mod tests {
         // heartbeat handler uses it as the new base.
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        // Heartbeat with the default TTL (1800s) — since current_epoch_s
+        // Heartbeat with the default TTL — since current_epoch_s
         // moved forward by >1s since the lease, the new expiry must be
         // strictly greater than the initial one.
         let beat_result = run_with_dependencies(
