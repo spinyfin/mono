@@ -422,6 +422,7 @@ dependencies = [
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-engine-worker-policy",
+ "boss-event-bus",
  "boss-feature-flags",
  "boss-github",
  "boss-github-tracker",
