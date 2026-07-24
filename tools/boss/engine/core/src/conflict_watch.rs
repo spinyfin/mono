@@ -675,6 +675,7 @@ pub async fn on_conflict_detected(
                     }
                     conflict_ladder::LadderOutcome::FellThrough {
                         residual_conflict_files,
+                        ..
                     } => {
                         use_small_agent_profile = conflict_ladder::rung2_eligible(residual_conflict_files);
                     }
