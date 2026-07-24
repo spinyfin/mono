@@ -1,6 +1,6 @@
 //! Worker Stop-boundary deferred-scope marker detection.
 //!
-//! Root cause (T222/PR #765, recovered weeks later as Flunge T254): a worker
+//! Root cause (PR #765, recovered weeks later): a worker
 //! legitimately narrowed its task's scope mid-execution — it wired part of
 //! the brief and deferred the rest because it needed new data plumbing, not
 //! just wiring. The only record of the deferred remainder was a prose
@@ -15,7 +15,7 @@
 //! marker protocol: a worker that deliberately delivers less than the brief
 //! asks emits one `[deferred-scope]` line per deferred item on its Stop
 //! boundary (see
-//! [`crate::runner::deferred_scope_directive`] for the prompt text taught to
+//! [`crate::runner::prompt::deferred_scope_directive`] for the prompt text taught to
 //! workers). [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
 //! detects it at the same Stop-boundary surface `[effort-escalation]`/
 //! `[blocked]` travel on, appends a durable audit line to the work item's
