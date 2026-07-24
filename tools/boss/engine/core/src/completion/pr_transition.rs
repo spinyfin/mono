@@ -205,6 +205,8 @@ impl WorkerCompletionHandler {
         // count so a later unrelated nudge cycle starts clean.
         self.nudge_breaker.forget(execution_id);
         self.build_wait_tracker.forget(execution_id);
+        self.background_children_tracker.forget(execution_id);
+        self.hold_registry.release(execution_id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {

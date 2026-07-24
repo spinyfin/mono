@@ -1955,6 +1955,184 @@ async fn build_wait_horizon_expiry_falls_back_to_normal_nudge() {
 }
 
 // -----------------------------------------------------------
+// Background-children suppression (observed live 2026-07-17). A worker
+// whose Stop-boundary process tree still has live descendant processes — a backgrounded
+// subagent spawned via the harness Agent tool that has not yet
+// reported back — must not be nudged: the worker's turn genuinely
+// ended, but it is waiting, not stalled.
+// -----------------------------------------------------------
+
+/// Reports a fixed descendant count for every execution, regardless of
+/// id — enough to exercise `nudge_or_park`'s suppression branch without
+/// a real process tree.
+struct FixedDescendantProbe(usize);
+impl crate::background_children::BackgroundActivityProbe for FixedDescendantProbe {
+    fn live_descendant_count(&self, _execution_id: &str) -> usize {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn background_children_suppress_nudge_across_repeated_stops() {
+    // Same shape as `build_wait_narration_suppresses_nudge_across_repeated_stops`:
+    // fire more Stops than the (lowered) breaker cap would tolerate for
+    // an ordinary unproductive nudge — if background-children
+    // suppression did not short-circuit before the breaker, this would
+    // trip `park_for_unproductive_nudges` and discard the worker's
+    // in-progress session while its subagent is still running.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness {
+        handler,
+        cube,
+        pane,
+        probes,
+        ..
+    } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_max_unproductive_nudges(2)
+        .with_background_activity_probe(Arc::new(FixedDescendantProbe(2)));
+
+    for _ in 0..5 {
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(
+                outcome,
+                StopOutcome::BackgroundChildrenPending {
+                    descendant_count: 2,
+                    ..
+                }
+            ),
+            "every Stop while live descendants remain must be BackgroundChildrenPending; got {outcome:?}",
+        );
+    }
+
+    assert!(
+        probes.snapshot().is_empty(),
+        "a worker waiting on live background children must never be nudged; got {:?}",
+        probes.snapshot(),
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "a healthy worker with live background children must never have its lease released",
+    );
+    assert!(
+        pane.calls.lock().await.is_empty(),
+        "a healthy worker with live background children must never have its pane torn down",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::WaitingHuman,
+        "a healthy worker with live background children must stay live, not be finalized",
+    );
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+        "background-children suppression must not masquerade as a breaker trip",
+    );
+}
+
+#[tokio::test]
+async fn background_children_horizon_expiry_falls_back_to_normal_nudge() {
+    // Requirement: genuine wedge detection must keep working — a
+    // subagent that never exits does not suppress forever. A
+    // `0`-second horizon means the very first sighting is already past
+    // budget, deterministically exercising the fallback.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_background_activity_probe(Arc::new(FixedDescendantProbe(1)))
+        .with_background_children_horizon_secs(0);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingInput),
+        "an expired background-children horizon must fall back to the normal produce-a-PR nudge; got {outcome:?}",
+    );
+    let queued = probes.snapshot();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the normal nudge must fire once the horizon has elapsed"
+    );
+    assert_eq!(queued[0].1, PROBE_NO_PR);
+}
+
+// -----------------------------------------------------------
+// Operator hold (`bossctl agents hold`). An explicit hold must skip the
+// idle-park flow entirely — no nudge, no breaker consultation, no park
+// — until released.
+// -----------------------------------------------------------
+
+#[tokio::test]
+async fn operator_hold_suppresses_nudge_and_never_touches_breaker() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness {
+        handler,
+        cube,
+        pane,
+        probes,
+        ..
+    } = TestHarness::new(db.clone(), detector);
+    let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
+    hold_registry.hold(&execution_id, Some("debugging by hand".to_owned()), 0);
+    let handler = handler
+        .with_max_unproductive_nudges(2)
+        .with_hold_registry(hold_registry);
+
+    for _ in 0..5 {
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::Held { .. }),
+            "every Stop on a held execution must be Held; got {outcome:?}",
+        );
+    }
+
+    assert!(probes.snapshot().is_empty(), "a held execution must never be nudged");
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "a held execution's lease must never be released",
+    );
+    assert!(
+        pane.calls.lock().await.is_empty(),
+        "a held execution's pane must never be torn down",
+    );
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+        "a hold must not masquerade as a breaker trip",
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_hold_resumes_normal_nudging() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
+    hold_registry.hold(&execution_id, None, 0);
+    let handler = handler.with_hold_registry(hold_registry.clone());
+
+    let held_outcome = handler.on_stop(&execution_id).await;
+    assert!(matches!(held_outcome, StopOutcome::Held { .. }), "got {held_outcome:?}");
+
+    hold_registry.release(&execution_id);
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingInput),
+        "releasing the hold must resume the normal produce-a-PR nudge; got {outcome:?}",
+    );
+    assert_eq!(probes.snapshot().len(), 1);
+}
+
+// -----------------------------------------------------------
 // revision_implementation stop-boundary fix (T-this).
 //
 // A `revision_implementation` execution must NEVER be told to

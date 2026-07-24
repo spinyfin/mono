@@ -181,6 +181,14 @@ pub struct LiveWorkerState {
     pub work_item_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    /// True while an operator has placed an explicit hold on this run via
+    /// `bossctl agents hold` — exempting it from the idle-park and
+    /// auto-reap sweeps until released or the run ends. Surfaced so
+    /// `bossctl agents list`/`status` can show held workers distinctly
+    /// from a normal `idle` row. `#[serde(default)]` keeps decode
+    /// tolerant of payloads from older engines that omit the key.
+    #[serde(default)]
+    pub held: bool,
 }
 
 impl LiveWorkerState {
@@ -217,6 +225,7 @@ impl LiveWorkerState {
             work_item_id,
             work_item_name,
             execution_id,
+            held: false,
         }
     }
 }
@@ -270,6 +279,21 @@ mod tests {
         assert!(state.live_status.is_none());
         assert!(state.live_status_at.is_none());
         assert!(state.recovery_status.is_none());
+        assert!(!state.held);
+    }
+
+    #[test]
+    fn held_defaults_false_when_key_is_absent_from_json() {
+        // Decode tolerance for payloads from older engines that predate
+        // the `held` field.
+        let json = r#"{
+            "slot_id": 1, "name": "Riker", "run_id": "run-1", "model": "opus",
+            "shell_pid": 0, "last_event_at": null, "current_tool": null,
+            "last_tool_ended_at": null, "activity": "idle",
+            "live_status": null, "live_status_at": null
+        }"#;
+        let parsed: LiveWorkerState = serde_json::from_str(json).unwrap();
+        assert!(!parsed.held);
     }
 
     #[test]
@@ -318,6 +342,7 @@ mod tests {
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
             execution_id: Some("run-7".into()),
+            held: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -366,6 +391,7 @@ mod tests {
             work_item_id: None,
             work_item_name: None,
             execution_id: None,
+            held: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();

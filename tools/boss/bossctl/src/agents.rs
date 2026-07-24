@@ -536,6 +536,86 @@ pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent:
     }
 }
 
+/// Place an explicit hold on the worker referenced by `agent`, exempting
+/// it from the idle-park and auto-reap sweeps until released (`agents
+/// release-hold`) or the run ends.
+pub(crate) async fn agents_hold(
+    socket_path: &Option<String>,
+    json: bool,
+    agent: String,
+    reason: Option<String>,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
+    let response = client
+        .send_request(&FrontendRequest::HoldRun {
+            run_id: run_id.clone(),
+            reason,
+        })
+        .await
+        .context("sending HoldRun")?;
+    match response {
+        FrontendEvent::RunHeld {
+            run_id: returned,
+            reason,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "held",
+                        "run_id": returned,
+                        "reason": reason,
+                    })
+                );
+            } else {
+                match reason {
+                    Some(reason) => println!("held run {returned} ({reason})"),
+                    None => println!("held run {returned}"),
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected hold: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+/// Release a hold previously placed by `agents hold` on the worker
+/// referenced by `agent`.
+pub(crate) async fn agents_release_hold(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
+    let response = client
+        .send_request(&FrontendRequest::ReleaseHoldRun { run_id: run_id.clone() })
+        .await
+        .context("sending ReleaseHoldRun")?;
+    match response {
+        FrontendEvent::RunHoldReleased { run_id: returned } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "hold_released",
+                        "run_id": returned,
+                    })
+                );
+            } else {
+                println!("released hold on run {returned}");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected release-hold: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
 pub(crate) async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -1042,6 +1122,9 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     println!("  model:         {}", state.model);
     println!("  activity:      {}", state.activity.as_str());
     println!("  shell_pid:     {}", state.shell_pid);
+    if state.held {
+        println!("  held:          true (exempt from idle-park/auto-reap sweeps)");
+    }
     if let Some(recovery) = &state.recovery_status {
         println!("  recovery:      {recovery}");
     }
@@ -1085,6 +1168,9 @@ fn print_live_state_short(state: &LiveWorkerState) {
     // `activity=idle`, indistinguishable from a normally-finished turn.
     if let Some(recovery) = &state.recovery_status {
         print!("  recovery=\"{recovery}\"");
+    }
+    if state.held {
+        print!("  held=true");
     }
     println!();
 }

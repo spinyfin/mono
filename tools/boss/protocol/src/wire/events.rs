@@ -299,6 +299,20 @@ pub enum FrontendEvent {
     RunStopped {
         run_id: String,
     },
+    /// Engine acknowledges a [`FrontendRequest::HoldRun`] — the run is
+    /// now exempt from the idle-park and auto-reap sweeps. `reason`
+    /// echoes back whatever the caller supplied, if any.
+    RunHeld {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Engine acknowledges a [`FrontendRequest::ReleaseHoldRun`] — the
+    /// idle-park/auto-reap sweeps' normal behavior is restored for the
+    /// run.
+    RunHoldReleased {
+        run_id: String,
+    },
     /// Engine acknowledges a focus request — the worker pane has
     /// been raised in the macOS app. Carries the resolved `slot_id`
     /// so the caller (e.g. `bossctl agents focus`) can confirm which

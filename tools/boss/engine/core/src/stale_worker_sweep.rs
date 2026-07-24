@@ -62,6 +62,7 @@ use boss_protocol::WorkerActivity;
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::hold_registry::HoldRegistry;
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::work::WorkDb;
 
@@ -115,6 +116,9 @@ pub struct StaleWorkerSweepOutcome {
     /// execution's own `started_at` — a mis-attributed event from a
     /// recycled slot (the false-positive cancel guard, defect 1).
     pub pre_start_event_skipped: usize,
+    /// Slots skipped because an operator placed an explicit hold on the
+    /// execution via `bossctl agents hold` (see [`crate::hold_registry`]).
+    pub held_skipped: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
@@ -128,29 +132,50 @@ impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
             fresh_skipped = self.fresh_skipped,
             tool_in_flight_skipped = self.tool_in_flight_skipped,
             grace_skipped = self.grace_skipped,
+            held_skipped = self.held_skipped,
             "stale-worker sweep: pass complete",
         );
     }
+}
+
+/// Shared-ownership collaborators [`spawn_loop`] clones into each pass.
+/// Bundled into one struct (rather than six positional `Arc` parameters)
+/// to keep `spawn_loop` under clippy's argument-count lint once the
+/// operator-hold registry joined the sweep's dependencies.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct StaleWorkerSweepDeps {
+    pub work_db: Arc<WorkDb>,
+    pub live_states: Arc<LiveWorkerStateRegistry>,
+    pub coordinator: Arc<ExecutionCoordinator>,
+    pub dispatch_events: Arc<dyn DispatchEventSink>,
+    pub reaper: Arc<dyn StaleWorkerReaper>,
+    pub hold_registry: Arc<HoldRegistry>,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so a worker that wedged before the engine
 /// restarted is recovered at boot without waiting for the first interval.
 pub fn spawn_loop(
-    work_db: Arc<WorkDb>,
-    live_states: Arc<LiveWorkerStateRegistry>,
-    coordinator: Arc<ExecutionCoordinator>,
-    dispatch_events: Arc<dyn DispatchEventSink>,
-    reaper: Arc<dyn StaleWorkerReaper>,
+    deps: StaleWorkerSweepDeps,
     interval: Duration,
     stale_threshold_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
+    let StaleWorkerSweepDeps {
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        reaper,
+        hold_registry,
+    } = deps;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
         let dispatch_events = Arc::clone(&dispatch_events);
         let reaper = Arc::clone(&reaper);
+        let hold_registry = Arc::clone(&hold_registry);
         async move {
             run_one_pass(
                 work_db.as_ref(),
@@ -158,6 +183,7 @@ pub fn spawn_loop(
                 coordinator.clone(),
                 dispatch_events.as_ref(),
                 reaper.as_ref(),
+                hold_registry.as_ref(),
                 stale_threshold_secs,
             )
             .await
@@ -177,6 +203,7 @@ pub async fn run_one_pass(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     reaper: &dyn StaleWorkerReaper,
+    hold_registry: &HoldRegistry,
     stale_threshold_secs: i64,
 ) -> StaleWorkerSweepOutcome {
     let mut outcome = StaleWorkerSweepOutcome::default();
@@ -191,6 +218,16 @@ pub async fn run_one_pass(
     let stale_cutoff = iso8601_utc(now_epoch_secs - stale_threshold_secs);
 
     for state in snapshot {
+        // Operator hold (`bossctl agents hold`): checked before every
+        // other guard so a held run is never reaped regardless of how
+        // stale-looking it is — see `crate::hold_registry`'s "sweeps must
+        // respect it" contract. Manual `bossctl agents stop`/`reap` still
+        // work on a held run; only this automated sweep is exempted.
+        if hold_registry.is_held(&state.run_id) {
+            outcome.held_skipped += 1;
+            continue;
+        }
+
         // Only `working` slots are candidates. `Spawning` is still
         // coming up (no event history expected); `Idle` and
         // `WaitingForInput` are handled by the completion and
@@ -533,6 +570,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -597,6 +635,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             NEVER_STALE,
         )
         .await;
@@ -632,6 +671,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -669,6 +709,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -703,6 +744,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -760,6 +802,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -816,6 +859,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -833,5 +877,53 @@ mod tests {
                 .contains(&execution_id),
             "slot must be released after the reap",
         );
+    }
+
+    /// A stale-looking `working` slot whose execution an operator has
+    /// explicitly held (`bossctl agents hold`) is never reaped, even past
+    /// the threshold — the auto-reap sweep must respect a hold.
+    #[tokio::test]
+    async fn held_worker_is_not_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        drive_to_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let hold_registry = HoldRegistry::new();
+        hold_registry.hold(&execution_id, Some("debugging by hand".to_owned()), 0);
+
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &hold_registry,
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 0, "a held worker must never be reaped");
+        assert_eq!(outcome.held_skipped, 1);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "a held worker's slot must remain claimed",
+        );
+        assert!(reaper.reaped().is_empty(), "no process reap may fire for a held worker");
     }
 }

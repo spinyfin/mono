@@ -37,6 +37,10 @@ impl WorkerCompletionHandler {
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
             build_wait_tracker: Arc::new(BuildWaitTracker::new()),
             build_wait_horizon_secs: DEFAULT_BUILD_WAIT_HORIZON_SECS,
+            background_activity_probe: Arc::new(crate::background_children::NoopBackgroundActivityProbe),
+            background_children_tracker: Arc::new(BuildWaitTracker::new()),
+            background_children_horizon_secs: crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS,
+            hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
             enable_revision_triggered_reviews: false,
@@ -90,6 +94,43 @@ impl WorkerCompletionHandler {
     /// nudge/park flow deterministically; production uses the default.
     pub fn with_build_wait_horizon_secs(mut self, horizon_secs: i64) -> Self {
         self.build_wait_horizon_secs = horizon_secs;
+        self
+    }
+
+    /// Wire the real [`crate::background_children::BackgroundActivityProbe`]
+    /// into this handler. `app.rs` wires in
+    /// [`crate::background_children::RegistryBackgroundActivityProbe`]; tests
+    /// inject a fixed-count stub to exercise the suppression path
+    /// deterministically without a real process tree.
+    pub fn with_background_activity_probe(
+        mut self,
+        probe: Arc<dyn crate::background_children::BackgroundActivityProbe>,
+    ) -> Self {
+        self.background_activity_probe = probe;
+        self
+    }
+
+    /// Wire an externally-owned background-children tracker into this
+    /// handler. Tests use it to share / inspect tracker state.
+    pub fn with_background_children_tracker(mut self, tracker: Arc<BuildWaitTracker>) -> Self {
+        self.background_children_tracker = tracker;
+        self
+    }
+
+    /// Override the background-children suppression horizon. Tests set this
+    /// low (or to `0`) to exercise the post-expiry fallback to the normal
+    /// nudge/park flow deterministically; production uses the default.
+    pub fn with_background_children_horizon_secs(mut self, horizon_secs: i64) -> Self {
+        self.background_children_horizon_secs = horizon_secs;
+        self
+    }
+
+    /// Wire an externally-owned [`crate::hold_registry::HoldRegistry`] into
+    /// this handler. `app.rs` shares one instance between this handler,
+    /// the RPC handlers that set/clear holds, and
+    /// [`crate::stale_worker_sweep::run_one_pass`].
+    pub fn with_hold_registry(mut self, registry: Arc<crate::hold_registry::HoldRegistry>) -> Self {
+        self.hold_registry = registry;
         self
     }
 

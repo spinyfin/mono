@@ -838,6 +838,24 @@ pub enum FrontendRequest {
     /// reflecting the latest known state.
     GitHubAuthStatus,
 
+    /// Boss-tier RPC: place an explicit operator hold on the live run
+    /// `run_id`, exempting it from the idle-park
+    /// ([`crate::LiveWorkerState`]'s owning
+    /// `WorkerCompletionHandler::nudge_or_park`) and auto-reap
+    /// (`stale_worker_sweep`) sweeps until released
+    /// ([`Self::ReleaseHoldRun`]) or the run ends. `reason` is an
+    /// optional free-text note surfaced on `agents list`/`agents status`.
+    /// Does NOT protect the run from a direct `bossctl agents stop` /
+    /// `agents reap` — those break-glass verbs still work on a held run.
+    /// Used by `bossctl agents hold`. Replies with
+    /// [`FrontendEvent::RunHeld`], or `WorkError` if `run_id` is not a
+    /// live run.
+    HoldRun {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Boss-tier RPC: interrupt the worker pane hosting `run_id` —
     /// equivalent to the human pressing Esc inside that pane.
     /// Resolves `run_id → slot_id` and forwards an
@@ -1480,6 +1498,15 @@ pub enum FrontendRequest {
     /// immediately reflects accurate `capability_present` state.
     RegisterCapabilities {
         capability_ids: Vec<String>,
+    },
+
+    /// Boss-tier RPC: release a previously-placed [`Self::HoldRun`] hold
+    /// on `run_id`, restoring the idle-park/auto-reap sweeps' normal
+    /// behavior for it. Idempotent — releasing a run with no hold in
+    /// place still replies `RunHoldReleased`. Used by `bossctl agents
+    /// release-hold`. Replies with [`FrontendEvent::RunHoldReleased`].
+    ReleaseHoldRun {
+        run_id: String,
     },
 
     /// Release a project's staged auto-populate batch (design

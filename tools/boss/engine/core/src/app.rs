@@ -428,6 +428,13 @@ struct ServerState {
     /// `ListWorkerLiveStates` and pushed on the
     /// `worker.live_states` topic whenever any slot changes.
     live_worker_states: Arc<LiveWorkerStateRegistry>,
+    /// Operator-placed holds (`bossctl agents hold`/`release-hold`) that
+    /// exempt a live run from the idle-park and auto-reap sweeps. Shared
+    /// with the completion handler (idle-park) and the stale-worker sweep
+    /// (auto-reap) so both consult the same holds. See
+    /// [`crate::hold_registry`].
+    #[builder(default)]
+    hold_registry: Arc<crate::hold_registry::HoldRegistry>,
     /// Cross-work-item spawn-capability circuit breaker. Fed by both the
     /// `ReportWorkerSpawnFailed` NACK handler and the periodic
     /// [`crate::spawn_ack_sweep`]; when too many DISTINCT work items fail to
@@ -944,6 +951,17 @@ impl ServerState {
         let merge_probe_for_state = ci_probe.clone();
         let direct_merge_executor_for_state: Arc<dyn merge_when_ready::DirectMergeExecutor> =
             direct_merge_executor_override.unwrap_or_else(|| Arc::new(merge_when_ready::CommandDirectMergeExecutor));
+
+        // Create the live per-slot worker registry and the operator-hold
+        // registry before the completion handler is built, so the
+        // completion handler (background-children probe, idle-park hold
+        // check), the coordinator's occupancy guard, and `ServerState` all
+        // share the SAME instances.
+        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
+        let live_worker_states_for_coordinator = live_worker_states.clone();
+        let live_worker_states_for_completion = live_worker_states.clone();
+        let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
+        let hold_registry_for_state = hold_registry.clone();
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -960,7 +978,11 @@ impl ServerState {
             .with_metrics(metrics_for_completion)
             .with_max_review_cycles(cfg.work.max_review_cycles)
             .with_min_review_changed_lines(cfg.work.min_review_changed_lines)
-            .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews),
+            .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews)
+            .with_background_activity_probe(Arc::new(
+                crate::background_children::RegistryBackgroundActivityProbe::new(live_worker_states_for_completion),
+            ))
+            .with_hold_registry(hold_registry),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -999,11 +1021,6 @@ impl ServerState {
         // reverse forward at the production engine.
         let provider_events_socket = crate::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
-        // Create the live per-slot worker registry up front so the
-        // coordinator's lease-time occupancy guard (defect 3) and
-        // ServerState share the SAME registry instance.
-        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
-        let live_worker_states_for_coordinator = live_worker_states.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -1067,6 +1084,7 @@ impl ServerState {
                 .topic_broker(topic_broker)
                 .worker_registry(WorkerRegistry::new())
                 .live_worker_states(live_worker_states)
+                .hold_registry(hold_registry_for_state)
                 .spawn_health(Arc::new(
                     crate::spawn_health::SpawnHealthTracker::new()
                         .with_breaker_enabled(cfg.work.enable_spawn_capability_breaker),
@@ -1748,6 +1766,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GitHubAuthDisconnect => github_auth::handle_git_hub_auth_disconnect(ctx, r).await,
             r @ FrontendRequest::GitHubAuthStart => github_auth::handle_git_hub_auth_start(ctx, r).await,
             r @ FrontendRequest::GitHubAuthStatus => github_auth::handle_git_hub_auth_status(ctx, r).await,
+            r @ FrontendRequest::HoldRun { .. } => executions::handle_hold_run(ctx, r).await,
             r @ FrontendRequest::InterruptWorkerPane { .. } => panes::handle_interrupt_worker_pane(ctx, r).await,
             r @ FrontendRequest::KickPrReconcilers => engine_meta::handle_kick_pr_reconcilers(ctx, r).await,
             r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
@@ -1833,6 +1852,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
             r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
             r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,
+            r @ FrontendRequest::ReleaseHoldRun { .. } => executions::handle_release_hold_run(ctx, r).await,
             r @ FrontendRequest::ReleaseProject { .. } => planner_ops::handle_release_project(ctx, r).await,
             r @ FrontendRequest::ReleaseReviewTerminal { .. } => review::handle_release_review_terminal(ctx, r).await,
             r @ FrontendRequest::RemoveDependency { .. } => dependencies::handle_remove_dependency(ctx, r).await,

@@ -685,6 +685,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "run_stopped",
         },
         TagCase {
+            label: "RunHeld",
+            event: FrontendEvent::RunHeld {
+                run_id: "run_1".into(),
+                reason: Some("investigating".into()),
+            },
+            expected_tag: "run_held",
+        },
+        TagCase {
+            label: "RunHoldReleased",
+            event: FrontendEvent::RunHoldReleased { run_id: "run_1".into() },
+            expected_tag: "run_hold_released",
+        },
+        TagCase {
             label: "WorkerPaneFocused",
             event: FrontendEvent::WorkerPaneFocused {
                 run_id: "run_1".into(),
@@ -1679,6 +1692,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProbeReplied { .. }
         | FrontendEvent::ProbeDeliveryEscalated { .. }
         | FrontendEvent::RunStopped { .. }
+        | FrontendEvent::RunHeld { .. }
+        | FrontendEvent::RunHoldReleased { .. }
         | FrontendEvent::WorkerPaneFocused { .. }
         | FrontendEvent::WorkerInputSent { .. }
         | FrontendEvent::WorkerPaneInterrupted { .. }
