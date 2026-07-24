@@ -32,7 +32,7 @@
 
 use std::time::Duration;
 
-use crate::merge_poller::{MergeProbe, OpenPrMergeability, PrLifecycleState};
+use crate::merge_poller::{MergeProbe, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState};
 
 /// How many extra probes to spend waiting out a `mergeable=UNKNOWN`
 /// before giving up and refusing the claim anyway. GitHub's async
@@ -44,6 +44,14 @@ pub const UNKNOWN_RETRY_ATTEMPTS: u32 = 2;
 /// Base delay between `UNKNOWN` re-probes; doubled on each retry. Only
 /// ever paid on the rare Stop of a conflict revision that pushed
 /// nothing, never on a hot path.
+///
+/// Worst case, a persistent `UNKNOWN` blocks the `on_stop` handler for
+/// `DEFAULT_UNKNOWN_RETRY_BACKOFF * (2^UNKNOWN_RETRY_ATTEMPTS - 1)` = 3s +
+/// 6s = 9s before returning [`ConflictClearance::Indeterminate`]. A
+/// caller that already holds a fresh probe result should pass it via
+/// [`verify_conflict_cleared_from`] rather than call [`verify_conflict_cleared`]
+/// blind — that skips the first (redundant) probe but not the sleeps
+/// past it.
 pub const DEFAULT_UNKNOWN_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
 /// What GitHub says about a merge-conflict revision's bound PR at the
@@ -83,17 +91,37 @@ pub async fn verify_conflict_cleared(
     pr_url: &str,
     unknown_backoff: Duration,
 ) -> ConflictClearance {
+    verify_conflict_cleared_from(probe, pr_url, unknown_backoff, None).await
+}
+
+/// Same contract as [`verify_conflict_cleared`], but lets the caller pass
+/// an already-fetched `initial` probe result to stand in for attempt 0 —
+/// skipping the redundant re-probe when the caller (e.g.
+/// `completion::try_retire_cleared_blocking_signal`) already probed this
+/// PR microseconds earlier and observed it was not yet `Clean`. Every
+/// subsequent `UNKNOWN` retry still probes for real.
+pub async fn verify_conflict_cleared_from(
+    probe: &dyn MergeProbe,
+    pr_url: &str,
+    unknown_backoff: Duration,
+    initial: Option<PrLifecycleProbe>,
+) -> ConflictClearance {
+    let mut initial = initial;
     let mut delay = unknown_backoff;
     for attempt in 0..=UNKNOWN_RETRY_ATTEMPTS {
-        let result = match probe.probe(pr_url).await {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::warn!(
-                    pr_url,
-                    ?err,
-                    "conflict stop gate: PR probe failed; cannot verify the conflict claim",
-                );
-                return ConflictClearance::Unavailable;
+        let result = if let Some(cached) = initial.take() {
+            cached
+        } else {
+            match probe.probe(pr_url).await {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        pr_url,
+                        ?err,
+                        "conflict stop gate: PR probe failed; cannot verify the conflict claim",
+                    );
+                    return ConflictClearance::Unavailable;
+                }
             }
         };
         let open = match result.state {
