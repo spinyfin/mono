@@ -11,13 +11,14 @@ use boss_protocol::{
     EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus,
 };
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
+use crate::dispatch_inflight::InflightDispatches;
 use crate::host_adapter::{HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider};
 use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
@@ -261,6 +262,27 @@ const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// fast (it's an idempotent record lookup), but the same hang class
 /// applies if cube wedges, so we time-bound it too.
 const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Ceiling on how many handed-off dispatches may run their slow tail
+/// (`cube repo ensure` → workspace lease → `goto` → `change create`)
+/// concurrently.
+///
+/// `drain_ready_queue` hands each claimed row off to its own task so one slow
+/// item can't head-of-line block the backlog behind it (the 2026-07-15 T2692
+/// incident: a resumed 40-minute backlog drained at ~1/minute against ample
+/// free slots, because every row waited out the row before it hitting a 30-60s
+/// cube timeout).
+///
+/// The real bound on concurrent dispatches is the worker pools: a row is only
+/// handed off *after* it claims a slot, so the three pools' combined hard caps
+/// already cap in-flight dispatches. This constant is deliberately derived from
+/// those caps rather than picked independently, so it is a backstop against
+/// unbounded task spawning (a future hand-off path that forgets to claim first)
+/// and NOT a pacing mechanism. Picking a smaller round number would make the
+/// semaphore bind during exactly the workload this change exists to fix —
+/// draining a large backlog into a fully free pool — quietly reintroducing the
+/// head-of-line blocking one permit-width at a time.
+const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE;
 
 /// Backoff delays between successive pre-start retry attempts. Element N
 /// is the sleep before attempt N+2 (the first retry, the second retry, …).
@@ -1570,6 +1592,22 @@ pub struct ExecutionCoordinator {
     /// scheduling starts.
     #[builder(default = Arc::new(NoopDispatchEventSink))]
     dispatch_events: Arc<dyn DispatchEventSink>,
+    /// Dispatches handed off by `drain_ready_queue` that have not yet reached
+    /// `start_execution_run_on_host` (the point where the DB starts reporting
+    /// them `running`).
+    ///
+    /// The chain single-writer guard and the double-spawn guard both read
+    /// liveness from `work_executions.status`, which cannot see a dispatch
+    /// that is still resolving its lease. When the drain loop awaited each
+    /// dispatch inline, the DB was a complete picture by construction; with
+    /// concurrent hand-off it no longer is, and the guards union it with this
+    /// registry to stay correct. See [`crate::dispatch_inflight`].
+    #[builder(default)]
+    inflight_dispatches: InflightDispatches,
+    /// Permits bounding concurrent handed-off dispatch tails to
+    /// [`MAX_INFLIGHT_DISPATCHES`].
+    #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
+    dispatch_slots: Arc<Semaphore>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
@@ -1761,6 +1799,8 @@ impl ExecutionCoordinator {
             host_adapter_provider,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink),
+            inflight_dispatches: InflightDispatches::new(),
+            dispatch_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)),
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
@@ -2273,6 +2313,22 @@ impl ExecutionCoordinator {
                 status = execution.status,
             ));
         }
+        // `ready` is necessary but not sufficient: the auto-dispatcher may
+        // already have handed this row (or a duplicate of it) off, and it
+        // stays `ready` until its run starts. Force-dispatching over the top
+        // would claim a second slot and spawn a second worker for one work
+        // item.
+        //
+        // Claimed BEFORE the worker, and via the atomic `try_reserve` rather
+        // than a check-then-reserve pair: a concurrent `drain_ready_queue`
+        // could otherwise slip in during the `claim_worker_force` await, and
+        // both paths would believe they own the dispatch.
+        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution) else {
+            return Err(anyhow!(
+                "execution {execution_id} (or another execution for its work item) is already \
+                 being dispatched — cannot force-dispatch"
+            ));
+        };
         let preferred_workspace_id = execution.preferred_workspace_id.clone();
         let worker_id = self
             .worker_pool
@@ -2397,12 +2453,45 @@ impl ExecutionCoordinator {
     /// so trusting only the first live sibling lets a root `pr_review` mask
     /// a live descendant *writer* — reintroducing the exact two-writer
     /// T1577/T1815 hazard this guard exists to prevent.
-    async fn live_chain_siblings(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
+    ///
+    /// "Live" spans two sources, and needs both. `work_executions.status`
+    /// covers siblings whose run has started; [`Self::inflight_dispatches`]
+    /// covers siblings that `drain_ready_queue` has handed off but which have
+    /// not yet reached `start_execution_run_on_host`, so the DB still shows
+    /// them `ready`. Consulting only the DB was sound while the drain loop
+    /// awaited each dispatch inline — a sibling was always either finished or
+    /// `running` by the time the next row was examined — but concurrent
+    /// hand-off means two rows on one chain can both find a DB with no live
+    /// sibling and both dispatch. See [`crate::dispatch_inflight`].
+    ///
+    /// In-flight reservations are exempt from the zombie reconciliation
+    /// below: the engine created them moments ago in this process and holds
+    /// the guard, so they are live by construction — there is no pane or
+    /// workspace to probe yet.
+    async fn live_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let work_item_id = execution.work_item_id.as_str();
+        let inflight = self.inflight_chain_siblings(execution)?;
+        // Union DB-live siblings with in-flight ones, without double-counting
+        // a sibling that is momentarily both: a dispatch that has just
+        // committed `start_execution_run_on_host` is already `running` in the
+        // DB while its task still holds the reservation for the instant before
+        // the guard drops. `resolve_chain_hold` reports `siblings.len()` to the
+        // operator as "N revisions queued", so a duplicate would inflate the
+        // count on the kanban card.
+        let union_with_inflight = |mut db_siblings: Vec<WorkExecution>| {
+            let extra: Vec<WorkExecution> = inflight
+                .iter()
+                .filter(|i| !db_siblings.iter().any(|d| d.id == i.id))
+                .cloned()
+                .collect();
+            db_siblings.extend(extra);
+            db_siblings
+        };
         const MAX_RECONCILE_ATTEMPTS: u8 = 4;
         for _ in 0..MAX_RECONCILE_ATTEMPTS {
             let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
             if siblings.is_empty() {
-                return Ok(siblings);
+                return Ok(union_with_inflight(siblings));
             }
             let mut any_reconciled = false;
             for sibling in &siblings {
@@ -2432,14 +2521,38 @@ impl ExecutionCoordinator {
                 }
             }
             if !any_reconciled {
-                return Ok(siblings);
+                return Ok(union_with_inflight(siblings));
             }
         }
         // Exhausted retries without converging on a stable answer (e.g. a
         // pathological chain with many zombies reconciling one per pass).
         // Fail closed: treat whatever is there now as live rather than risk
         // co-dispatching two workers onto the same shared jj backing store.
-        self.work_db.live_executions_elsewhere_in_chain(work_item_id)
+        let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
+        Ok(union_with_inflight(siblings))
+    }
+
+    /// Dispatches currently handed off for OTHER work items in `execution`'s
+    /// revision chain.
+    ///
+    /// Propagates a chain-walk error to [`Self::live_chain_siblings`], whose
+    /// callers all fail OPEN — they log and dispatch without the defer rather
+    /// than wedge the queue on a DB error. That is the pre-existing policy for
+    /// the DB-backed chain query and this shares it; the widened blast radius
+    /// is one extra error source, mitigated by the early return below (no
+    /// query at all unless something is actually in flight).
+    ///
+    /// Skips the chain-membership query entirely when nothing is in flight,
+    /// which is the overwhelmingly common case (a quiet queue, or a backlog
+    /// draining faster than any single dispatch takes).
+    fn inflight_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        if self.inflight_dispatches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let member_ids = self.work_db.chain_member_ids(&execution.work_item_id)?;
+        Ok(self
+            .inflight_dispatches
+            .chain_siblings(&member_ids, &execution.work_item_id, &execution.id))
     }
 
     /// Resolve the per-PR single-writer chain check for `execution`,
@@ -2482,7 +2595,7 @@ impl ExecutionCoordinator {
     /// the pipeline could re-defer what an earlier one just bypassed,
     /// wedging the row in a defer loop instead of actually dispatching it.
     async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
-        let siblings = self.live_chain_siblings(&execution.work_item_id).await?;
+        let siblings = self.live_chain_siblings(execution).await?;
         let Some(first_sibling) = siblings.first().cloned() else {
             return Ok(ChainHold::Clear);
         };
@@ -2719,6 +2832,27 @@ impl ExecutionCoordinator {
             crate::dispatch_metrics::record_queue_snapshot(&self.metrics, snapshot);
         }
 
+        // Drop rows whose work item a previous drain already handed off. A
+        // dispatched row keeps `status = 'ready'` until its task reaches
+        // `start_execution_run_on_host`, so `list_ready_executions` still
+        // returns it — and drains overlap freely now that the loop no longer
+        // awaits each dispatch: a kick landing mid-pass re-enters the loop
+        // immediately, and the 15s heartbeat spawns a fresh scheduler as soon
+        // as the previous (now fast) one relinquishes `scheduling_active`.
+        // Without this, such a re-drain would claim a SECOND worker for a row
+        // already dispatching and spawn it twice; neither the chain guard nor
+        // the double-spawn guard would stop it, because both exclude the
+        // execution's own id and so cannot see a row racing itself.
+        //
+        // Filtering here (rather than only at the reservation below) also
+        // keeps `pool_ready_counts` honest — an in-flight row is not a
+        // candidate this pass, so it must not inflate the "beaten N
+        // candidates" the surviving rows report.
+        let executions: Vec<WorkExecution> = executions
+            .into_iter()
+            .filter(|e| !self.inflight_dispatches.is_work_item_dispatching(&e.work_item_id))
+            .collect();
+
         if executions.is_empty() {
             return DrainOutcome::QueueEmpty;
         }
@@ -2909,6 +3043,31 @@ impl ExecutionCoordinator {
                 };
                 self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false)
                     .await;
+                continue;
+            }
+
+            // A duplicate `ready` row for a work item THIS pass already handed
+            // off (the orphan-sweep race that the double-spawn guard exists
+            // for). The pre-loop filter above cannot catch it — that snapshot
+            // predates the reservation an earlier iteration just took — so it
+            // is re-checked per row.
+            //
+            // Skipped before `request_recorded` so the row emits no dispatch
+            // timeline at all: it is not a dispatch attempt, and a second
+            // `request_recorded` for a work item already dispatching would
+            // corrupt the per-execution event stream. Left `ready`; once the
+            // winner is `running`, `schedule_execution`'s DB double-spawn
+            // guard resolves this row as redundant on a later pass.
+            if self
+                .inflight_dispatches
+                .is_work_item_dispatching(&execution.work_item_id)
+            {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool = pool_label,
+                    "spawn_attempt status=ready -> skipped reason=work_item_dispatch_in_flight"
+                );
                 continue;
             }
 
@@ -3649,8 +3808,10 @@ impl ExecutionCoordinator {
     }
 
     /// Shared tail of a successful claim: record the landing slot, clear
-    /// the wait reason, and hand off to `schedule_execution`, releasing
-    /// the slot again if the handoff fails.
+    /// the wait reason, reserve the dispatch, and hand `schedule_execution`
+    /// off to a concurrent task so a slow row cannot stall the rest of the
+    /// drain — releasing the slot again if the reservation or the handoff
+    /// fails.
     ///
     /// `spilled` marks an automation execution that claimed an
     /// interactive (Lower Decks) slot because its own pool was full. It
@@ -3707,29 +3868,102 @@ impl ExecutionCoordinator {
             tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
         }
 
-        match self.schedule_execution(execution, worker_id).await {
-            Ok(()) => {
-                tracing::info!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    worker_id = %worker_id,
-                    spilled,
-                    "spawn_attempt status=ready -> spawned"
-                );
+        // Hand the slow tail off and return to the caller's loop.
+        //
+        // Everything above this point is the serial decision section, and
+        // stays serial: the chain hold, the stagger gate and above all
+        // `claim_worker` are what keep slot accounting race-free, and one
+        // loop deciding them in priority order is what makes "this row beat
+        // those N candidates" true. What must NOT be serial is what follows
+        // — `schedule_execution` inlines `cube repo ensure` (<=60s), the
+        // workspace lease and its fallback (<=30s each) and `cube change
+        // create` before the run starts. Awaiting that here meant one row
+        // hitting a timeout budget stalled every row behind it for 30-60s,
+        // draining a resumed backlog at ~1/minute while slots sat free (the
+        // 2026-07-15 T2692 incident: 14+ minutes between the row's dispatch
+        // decision and its request being recorded, purely because it sorted
+        // behind the backlog).
+        //
+        // The reservation is taken HERE, synchronously, before the caller's
+        // loop advances — the next iteration's chain guard must be able to
+        // see this dispatch, which the DB cannot show until the run
+        // actually starts. See `crate::dispatch_inflight`.
+        //
+        // It can still be refused: `force_dispatch` runs outside this loop
+        // and may have reserved this work item during one of the awaits
+        // above. `try_reserve` is atomic, so exactly one of the two wins;
+        // the loser hands its slot back rather than dispatching a second
+        // worker for the same work item.
+        let Some(reservation) = self.inflight_dispatches.try_reserve(execution) else {
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "spawn_attempt status=ready -> deferred reason=dispatch_already_in_flight"
+            );
+            self.pool_for_worker_id(worker_id)
+                .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
+                .await;
+            return;
+        };
+        let coordinator = Arc::clone(self);
+        let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        let execution = execution.clone();
+        let worker_id = worker_id.to_string();
+        tokio::spawn(async move {
+            // Held for the whole dispatch: the guard de-registers the
+            // reservation on drop, on every path including a panic.
+            let _reservation = reservation;
+            // Bounds concurrent cube subprocesses. Acquired inside the
+            // task, never in the caller's loop, so a saturated cap would
+            // delay only this dispatch rather than re-serializing the
+            // drain. The pools already bound in-flight dispatches below
+            // this cap, so it should never actually bind.
+            let _permit = match dispatch_slots.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // Unreachable — nothing closes the semaphore. Release
+                    // the claim anyway: bailing out silently would strand
+                    // this worker slot forever, since `pool_claim_sweep`
+                    // only reclaims slots whose execution went terminal and
+                    // this row is still `ready`.
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        worker_id = %worker_id,
+                        "dispatch semaphore closed; releasing the claim instead of stranding the slot"
+                    );
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .await;
+                    return;
+                }
+            };
+            match coordinator.schedule_execution(&execution, &worker_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        spilled,
+                        "spawn_attempt status=ready -> spawned"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        "spawn_attempt status=ready -> failed reason=schedule_execution_error"
+                    );
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .await;
+                }
             }
-            Err(err) => {
-                tracing::error!(
-                    ?err,
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    worker_id = %worker_id,
-                    "spawn_attempt status=ready -> failed reason=schedule_execution_error"
-                );
-                self.pool_for_worker_id(worker_id)
-                    .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
-                    .await;
-            }
-        }
+        });
     }
 
     /// Resolve the [`WorkItem`] an execution operates on.
@@ -7233,6 +7467,13 @@ mod tests {
         /// written.
         repos: Mutex<Vec<CubeRepoSummary>>,
         fail_ensure: bool,
+        /// When set, `ensure_repo` for this origin blocks for
+        /// [`Self::slow_ensure_delay`] before returning. Models one item
+        /// burning a chunk of the `cube repo ensure` timeout budget
+        /// ([`CUBE_REPO_ENSURE_TIMEOUT`], 60s in production) while the rest of
+        /// the ready queue waits behind it.
+        slow_ensure_origin: Option<String>,
+        slow_ensure_delay: Duration,
         fail_lease: bool,
         /// Model the anaplian failure-mode A: cube exits non-zero on a
         /// post-lease setup step, surfaced as a typed [`CubeCliError`]
@@ -7291,6 +7532,9 @@ mod tests {
     crate::stub_cube_client! { FakeCubeClient {
         async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
             self.ensure_calls.lock().await.push(origin.to_owned());
+            if self.slow_ensure_origin.as_deref() == Some(origin) {
+                tokio::time::sleep(self.slow_ensure_delay).await;
+            }
             if self.fail_ensure {
                 return Err(anyhow!("cube repo ensure failed"));
             }
@@ -7752,7 +7996,14 @@ mod tests {
         assert_eq!(execution.status, ExecutionStatus::Ready);
 
         let cube = Arc::new(FakeCubeClient::default());
-        let runner = Arc::new(FakeExecutionRunner::default());
+        // `pending: true` keeps the run parked in `Running` so the
+        // post-cap-release assertion below has a stable status to wait
+        // for — the default fake runner completes instantly to
+        // `WaitingHuman`, which would race straight past `Running`.
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
         // Pool has idle slots beyond the cap — the cap, not slot
         // availability, must be what holds the row.
         let coordinator = Arc::new(
@@ -7788,6 +8039,7 @@ mod tests {
         // One worker frees → the next drain dispatches the held row.
         coordinator.worker_pool().release_worker("worker-1", None).await;
         coordinator.drain_ready_queue().await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
         assert!(
             !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
             "row must dispatch once the pool drops below the cap",
@@ -13571,6 +13823,341 @@ mod tests {
             cube.create_calls.lock().await.len(),
             1,
             "create_change must be called when pr_url is absent"
+        );
+    }
+
+    // ── Concurrent dispatch hand-off tests ────────────────────────────────────
+
+    /// Create a `ready` chore execution with an explicit repo remote and
+    /// dispatch priority. `priority` is the ready queue's second sort key
+    /// (`priority DESC`), which is how these tests pin a specific row to the
+    /// head of the line rather than relying on `created_at`/`id` tiebreaks.
+    fn ready_chore_execution(
+        db: &WorkDb,
+        product_id: &str,
+        name: &str,
+        repo_remote_url: &str,
+        priority: i64,
+    ) -> String {
+        let chore = create_test_chore(db, product_id.to_owned(), name);
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url(repo_remote_url)
+                .priority(priority)
+                .build(),
+        )
+        .unwrap()
+        .id
+    }
+
+    /// The head-of-line blocking regression (T2692, 2026-07-15).
+    ///
+    /// A backlog of fast items behind one slow item must drain immediately
+    /// rather than waiting out the slow item's cube timeout budget. The slow
+    /// row is pinned FIRST in the ready queue (highest priority), so with the
+    /// old inline `schedule_execution(...).await` the two fast rows could not
+    /// dispatch until its `ensure_repo` returned — which is exactly the
+    /// ~1/minute drain the incident observed against free slots.
+    ///
+    /// The slow item blocks for a delay far longer than the assertion window,
+    /// so the test fails on the old code by timeout rather than by a flaky
+    /// timing margin.
+    #[tokio::test]
+    async fn fast_items_dispatch_without_waiting_behind_a_slow_one() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+
+        const SLOW_REPO: &str = "git@github.com:spinyfin/slow.git";
+        const FAST_REPO: &str = "git@github.com:spinyfin/mono.git";
+
+        // Priority DESC ⇒ the slow row is the head of the queue.
+        let slow = ready_chore_execution(&db, &product.id, "Slow", SLOW_REPO, 100);
+        let fast_a = ready_chore_execution(&db, &product.id, "Fast A", FAST_REPO, 50);
+        let fast_b = ready_chore_execution(&db, &product.id, "Fast B", FAST_REPO, 50);
+
+        let cube = Arc::new(FakeCubeClient {
+            slow_ensure_origin: Some(SLOW_REPO.to_owned()),
+            slow_ensure_delay: Duration::from_secs(600),
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        // Three free slots: nothing here is a capacity problem. The only
+        // reason a fast row could fail to dispatch is the slow row ahead of
+        // it.
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(3),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        wait_for_execution_status(db.as_ref(), &fast_a, ExecutionStatus::Running).await;
+        wait_for_execution_status(db.as_ref(), &fast_b, ExecutionStatus::Running).await;
+
+        // ...while the slow row is still stuck in its `ensure_repo`.
+        assert_eq!(
+            db.get_execution(&slow).unwrap().status,
+            ExecutionStatus::Ready,
+            "the slow row should still be dispatching — the point is that the fast rows \
+             overtook it rather than queueing behind it",
+        );
+    }
+
+    /// A slow row must not be dispatched twice when a re-drain overlaps its
+    /// hand-off.
+    ///
+    /// A handed-off row keeps `status = 'ready'` until its run starts, so it
+    /// is still returned by `list_ready_executions`. Now that the drain loop
+    /// returns without awaiting dispatch, a kick landing mid-flight re-enters
+    /// the loop and sees that row again — and neither the chain guard nor the
+    /// double-spawn guard would catch the duplicate, since both exclude the
+    /// execution's own id. Only the in-flight filter stops it claiming a
+    /// second slot.
+    #[tokio::test]
+    async fn a_dispatch_in_flight_is_not_dispatched_again_by_a_later_kick() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+
+        const SLOW_REPO: &str = "git@github.com:spinyfin/slow.git";
+        let slow = ready_chore_execution(&db, &product.id, "Slow", SLOW_REPO, 100);
+
+        let cube = Arc::new(FakeCubeClient {
+            slow_ensure_origin: Some(SLOW_REPO.to_owned()),
+            slow_ensure_delay: Duration::from_millis(300),
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(4),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        // Kick repeatedly while the first hand-off is still resolving its
+        // `ensure_repo`, modelling the resume kick / slot-release kick / 15s
+        // heartbeat all landing during a slow dispatch.
+        for _ in 0..6 {
+            coordinator.kick();
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        wait_for_execution_status(db.as_ref(), &slow, ExecutionStatus::Running).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            1,
+            "the row must spawn exactly one worker despite the overlapping kicks",
+        );
+        assert_eq!(
+            cube.lease_calls.lock().await.len(),
+            1,
+            "a re-drain must not claim a second workspace for a dispatch already in flight",
+        );
+    }
+
+    /// Two duplicate `ready` rows for one work item must not annihilate each
+    /// other.
+    ///
+    /// The orphan sweep can leave two `ready` executions on one work item;
+    /// `schedule_execution`'s double-spawn guard resolves that by abandoning
+    /// whichever one finds the other already live. That guard is inherently
+    /// asymmetric against the DB (one row is `running`, the other `ready`) —
+    /// but two rows handed off in the same drain pass are in the IDENTICAL
+    /// state, so a naive in-flight check would have each abandon itself and
+    /// leave the work item with nothing live at all. The chain guard cannot
+    /// prevent it either: it deliberately excludes the caller's own work item.
+    /// Per-work-item reservations are what keep the second row out of flight.
+    #[tokio::test]
+    async fn duplicate_ready_rows_for_one_work_item_do_not_both_abandon() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Duplicated");
+
+        const SLOW_REPO: &str = "git@github.com:spinyfin/slow.git";
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(
+                db.create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(chore.id.clone())
+                        .kind(ExecutionKind::ChoreImplementation)
+                        .status(ExecutionStatus::Ready)
+                        .repo_remote_url(SLOW_REPO)
+                        .build(),
+                )
+                .unwrap()
+                .id,
+            );
+        }
+
+        // Premise guard: this test is only meaningful if the drain really does
+        // see two distinct `ready` rows for one work item in a single pass.
+        assert_ne!(ids[0], ids[1]);
+        let ready = db.list_ready_executions().unwrap();
+        assert_eq!(
+            ready.len(),
+            2,
+            "premise: both duplicate rows must be ready and dispatchable in one pass",
+        );
+
+        // Slow enough that both rows are examined while the first hand-off is
+        // still resolving — the window where both are `ready` and neither is
+        // DB-visible as live.
+        let cube = Arc::new(FakeCubeClient {
+            slow_ensure_origin: Some(SLOW_REPO.to_owned()),
+            slow_ensure_delay: Duration::from_millis(300),
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(4),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        wait_for_execution_status(db.as_ref(), &ids[0], ExecutionStatus::Running).await;
+        sleep(Duration::from_millis(100)).await;
+
+        let statuses: Vec<ExecutionStatus> = ids.iter().map(|id| db.get_execution(id).unwrap().status).collect();
+        assert_eq!(
+            statuses.iter().filter(|s| **s == ExecutionStatus::Running).count(),
+            1,
+            "exactly one duplicate must win the dispatch, got {statuses:?}",
+        );
+        assert!(
+            !statuses.contains(&ExecutionStatus::Abandoned),
+            "the loser must stay `ready` for the DB double-spawn guard to resolve once the \
+             winner is running — abandoning it here risks both rows abandoning and the chore \
+             never running at all; got {statuses:?}",
+        );
+        assert_eq!(
+            runner.calls.lock().await.len(),
+            1,
+            "one work item must spawn one worker",
+        );
+    }
+
+    /// The per-PR single-writer invariant (T1577/T1815) must survive
+    /// concurrent hand-off.
+    ///
+    /// This is the hazard the in-flight registry exists for. The chain guard
+    /// decides liveness from `work_executions.status`, but a handed-off
+    /// dispatch stays `ready` until its run starts — so with a DB-only check,
+    /// two rows on the same chain both see "no live sibling" and both
+    /// dispatch, putting two writers on the one shared jj backing store cube
+    /// gives every same-PR workspace. The serial loop made that impossible for
+    /// free; the registry is what replaces it.
+    ///
+    /// The revision sorts ahead of the chore (`DispatchClass` 4 before 5) and
+    /// is the slow one, so the chore is examined while the revision's dispatch
+    /// is still resolving its `ensure_repo` — precisely the window the DB
+    /// cannot see.
+    #[tokio::test]
+    async fn a_chain_sibling_defers_behind_a_dispatch_still_in_flight() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        const SLOW_REPO: &str = "git@github.com:spinyfin/slow.git";
+        let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_inflight', product_id, 'revision', 'Resolve conflicts', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Both rows are `ready`: neither is live in the DB when the other is
+        // examined. Only the reservation distinguishes them.
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_inflight")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url(SLOW_REPO)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+        let root_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            slow_ensure_origin: Some(SLOW_REPO.to_owned()),
+            slow_ensure_delay: Duration::from_secs(600),
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        // Free slots for both rows: if the chore defers, it is because of the
+        // single-writer guard, not capacity.
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(4),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        // Let the drain hand the revision off and examine the chore behind it.
+        sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            db.get_execution(&root_exec.id).unwrap().status,
+            ExecutionStatus::Ready,
+            "the chain root must stay `ready` — its sibling's dispatch is in flight, and \
+             co-dispatching a second writer onto the shared jj backing store is the \
+             T1577/T1815 corruption the chain guard exists to prevent",
+        );
+        assert_eq!(
+            cube.ensure_calls.lock().await.as_slice(),
+            [SLOW_REPO.to_owned()],
+            "only the revision may dispatch; the chore must not have started one",
+        );
+        assert_eq!(
+            db.get_execution(&revision_exec.id).unwrap().status,
+            ExecutionStatus::Ready,
+            "sanity: the revision is still mid-dispatch, so the deferral above was \
+             decided against an in-flight sibling and not a DB-visible live one",
         );
     }
 

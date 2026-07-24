@@ -36,6 +36,7 @@ pub mod design_detector;
 pub use boss_deterministic_resolvers as deterministic_resolvers;
 pub use boss_dispatch_events as dispatch_events;
 pub mod dispatch_failure_recovery_sweep;
+pub mod dispatch_inflight;
 pub mod dispatch_metrics;
 pub(crate) mod dispatch_spillover;
 pub mod dispatch_stall_escalation;
