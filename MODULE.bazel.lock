@@ -1035,7 +1035,7 @@
           "FILE:@@//tools/boss/trunk_auth/Cargo.toml b587b790d373b83f7d915d79936c7d01de8e2eae3fc6464b75c1942bb9e3d30e",
           "FILE:@@//tools/boss/trunk_client/Cargo.toml 00e773c389042058175ef4fd166bf39817f0f50e8817d55e2fb76e3b7f3d33c8",
           "FILE:@@//tools/boss/cli/Cargo.toml ddb2c13b9df3ec7ed536309ef0f95235aa17cea3e22249705a48e523a02c9a8e",
-          "FILE:@@//tools/boss/engine/event-bus/Cargo.toml 77a529ddf81f4877af12c794f06891064fc8e26b852c6aa596fd8fa0fb41e042",
+          "FILE:@@//tools/boss/engine/event-bus/Cargo.toml 309faa8bd9ae4e1d8ce641d0d977e3e2e300b54a26307de6469621a91d6023af",
           "FILE:@@//tools/boss/engine/design-doc-fetcher/Cargo.toml 0a79020eec188bff6f98a6cd447d9d2c751f2036b436b4e1a11bfd4632ff7ebd",
           "FILE:@@//tools/boss/event-shim/Cargo.toml 128bc37fe2272c0cdb8045976d39f1f083169475af3a8bbfb8f427f6fe56c6a3",
           "FILE:@@//tools/hood/Cargo.toml 1535a68c6e400f6311a47fcb0f590aae06d257d063065f49166533f06dc254a6",
