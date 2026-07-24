@@ -1020,10 +1020,13 @@ enum BlockingSignalOutcome {
 struct ConflictSignalPrefetch {
     /// The PR probe result. Never `Clean` for the caller's `conflict_attempt`
     /// — `try_retire_cleared_blocking_signal` already retires on `Clean`.
+    ///
+    /// This struct intentionally carries only the probe, not a
+    /// has-active-attempt boolean: `conflict_revision_stop_refusal` always
+    /// recomputes ownership itself via `has_active_conflict_attempt`, since
+    /// this call site's parent-attempt lookup has no crz_id to match
+    /// against and would silently bypass the ownership check if reused.
     probe: crate::merge_poller::PrLifecycleProbe,
-    /// Whether the parent chore had a live `conflict_resolutions` attempt
-    /// at probe time (independent of `ci_attempt`).
-    conflict_attempt_active: bool,
 }
 
 /// What [`WorkerCompletionHandler::force_release`] actually did. Surfaced
@@ -4733,11 +4736,16 @@ must not be asked to open one",
         if !self.is_merge_conflict_revision(execution) {
             return None;
         }
-        let has_attempt = match &prefetched {
-            Some(ctx) => ctx.conflict_attempt_active,
-            None => self.has_active_conflict_attempt(execution),
-        };
-        if !has_attempt {
+        // Always recompute ownership via `has_active_conflict_attempt` rather
+        // than trusting `prefetched.conflict_attempt_active` — that flag
+        // comes from `try_retire_cleared_blocking_signal`'s looser "any live
+        // attempt on the parent" check (it has no crz_id to match against at
+        // that call site), so reusing it here would silently skip the
+        // crz_id ownership match on both `NoContribution` call sites, the
+        // exact path the 2026-07-23 incident took. The PR probe is still
+        // reused from `prefetched` below; only the has-attempt boolean is
+        // excluded from reuse.
+        if !self.has_active_conflict_attempt(execution) {
             return None;
         }
         let clearance = match prefetched {
@@ -6099,10 +6107,7 @@ status is otherwise left unchanged for re-dispatch or manual review."
         // (the next thing every caller does) can reuse it instead of
         // re-deriving the parent attempt and re-probing GitHub for state
         // this method just observed.
-        Self::blocking_signal_not_retired(Some(Box::new(ConflictSignalPrefetch {
-            probe,
-            conflict_attempt_active: conflict_attempt.is_some(),
-        })))
+        Self::blocking_signal_not_retired(Some(Box::new(ConflictSignalPrefetch { probe })))
     }
 
     /// On-Stop arm of the metadata-only CI-fix finalize gate (issue
@@ -14137,6 +14142,114 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             queued.len(),
             1,
             "exactly one nudge probe must be queued; got {queued:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_superseded_attempt_not_refused_on_no_contribution_path() {
+        // Regression guard for the crz_id ownership check (finding #8) being
+        // silently bypassed on the `NoContribution` call site — the exact
+        // path the 2026-07-23 incident took. This execution's own attempt
+        // (A, from `conflict_revision_fixture`) is retired/superseded by a
+        // fresh attempt (B) minted for a later base move on the same parent
+        // chore. `has_active_conflict_attempt` must recognize that A no
+        // longer owns the parent's *active* attempt and refuse to fire the
+        // GitHub-authoritative conflict-still-present nudge about B's
+        // conflict — even though `try_retire_cleared_blocking_signal`'s
+        // looser "any live attempt on the parent" prefetch sees B as active.
+        // Before the fix, `conflict_revision_stop_refusal` trusted that
+        // prefetched boolean directly on this call site and fired the
+        // crz-specific refusal anyway, nudging this (wrong) execution about
+        // a conflict it no longer owns.
+        use crate::work::ConflictResolutionInsertInput;
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_dir, db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        // Attempt A (this execution's owning attempt) is retired...
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE conflict_resolutions SET status = 'succeeded' WHERE id = ?1",
+                rusqlite::params![attempt_id],
+            )
+            .unwrap();
+        }
+
+        // ...and superseded by a fresh attempt B for a later base move on
+        // the same parent chore. B is the only `pending`/`running` row now,
+        // so `active_conflict_resolution_for_work_item` returns B.
+        let attempt_b = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product_id.clone(),
+                work_item_id: parent_chore_id.clone(),
+                pr_url: parent_pr_url.to_owned(),
+                pr_number: 966,
+                head_branch: "my-feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base_sha_2".into()),
+                head_sha_before: Some(head.into()),
+            })
+            .unwrap()
+            .unwrap();
+        assert_ne!(attempt_b.id, attempt_id, "attempt B must be a distinct, newer attempt");
+
+        let detector = StubPrDetector::ok(None);
+
+        // SHA-delta gate: head unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // MergeProbe: PR is STILL conflicting (B's conflict, not A's).
+        struct ConflictingMergeProbe;
+        #[async_trait]
+        impl MergeProbe for ConflictingMergeProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe::builder()
+                    .url(url.to_owned())
+                    .state(PrLifecycleState::Open(
+                        crate::merge_poller::OpenPrStatus::conflict_only(),
+                    ))
+                    .labels(Vec::new())
+                    .review(crate::merge_poller::PrReviewState::Unknown)
+                    .build())
+            }
+        }
+
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_merge_probe(Arc::new(ConflictingMergeProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "must still nudge (generically) rather than finalize or crash; got {outcome:?}",
+        );
+
+        let queued = probes.snapshot();
+        assert_eq!(
+            queued.len(),
+            1,
+            "exactly one nudge probe must be queued; got {queued:?}"
+        );
+        assert!(
+            queued[0].1.contains("Do NOT open a new PR"),
+            "must fall through to the generic push-to-existing-PR nudge, NOT the crz-specific \
+             conflict-still-present refusal — this execution's attempt (A) no longer owns the \
+             parent's active attempt (B), so the ownership check must suppress the refusal gate; \
+             got probe text: {}",
+            queued[0].1,
+        );
+        assert!(
+            !queued[0].1.contains("GitHub still reports"),
+            "the crz-specific conflict-still-present probe must NOT fire for a non-owning \
+             attempt; got probe text: {}",
+            queued[0].1,
         );
     }
 
