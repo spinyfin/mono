@@ -1263,4 +1263,29 @@ pub enum FrontendEvent {
     AutomationRunEnqueued {
         automation_id: String,
     },
+
+    // --- Boothby replies (boothby.md, design task 3) ---
+    /// Response to [`FrontendRequest::ListBoothbyPasses`].
+    BoothbyPassesList {
+        passes: Vec<BoothbyPass>,
+    },
+    /// Response to [`FrontendRequest::GetBoothbyState`] and
+    /// [`FrontendRequest::SetBoothbyMode`].
+    BoothbyState {
+        mode: String,
+        open_pass: Option<BoothbyPass>,
+        last_pass: Option<BoothbyPass>,
+    },
+    /// Response to [`FrontendRequest::RunBoothbyPass`]: the pass row that was
+    /// opened. Today's placeholder pass runner (design tasks 4/5 not yet
+    /// wired) finishes essentially instantly, but this reply does not wait
+    /// for that — it confirms the pass opened, not that it finished.
+    BoothbyPassStarted {
+        pass: BoothbyPass,
+    },
+    /// Pushed on [`TOPIC_BOOTHBY_ACTIVITY`] whenever a `boothby_passes` row
+    /// opens or closes.
+    BoothbyActivity {
+        pass: BoothbyPass,
+    },
 }

@@ -17,6 +17,7 @@ impl WorkDb {
             memory: None,
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
+            boothby_event_queue: Arc::default(),
         };
         db.init()?;
         Ok(db)
@@ -36,6 +37,7 @@ impl WorkDb {
             memory: Some(anchor),
             conn: Arc::new(Mutex::new(conn)),
             boothby_action: Arc::default(),
+            boothby_event_queue: Arc::default(),
         };
         db.init()?;
         Ok(db)

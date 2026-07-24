@@ -1435,6 +1435,22 @@ pub async fn serve_with_merge_probe(
         Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
     );
 
+    // Boothby scheduler (boothby.md, design task 3): adaptive-sleep loop
+    // over the cron `boothby.schedule` setting plus the event-trigger queue
+    // fed by `BoothbyEventSink` and the attention-creation hook. Every pass
+    // today reports `nothing_to_do` via `NothingToDoPassRunner` — the brief
+    // composer and session spawn (design tasks 4/5) aren't wired up yet —
+    // but the pass lifecycle, settings, RPCs, and event triggers are fully
+    // live, so `boss boothby run` / the mode RPCs already work end to end.
+    let _boothby_scheduler_handle = crate::boothby_scheduler::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.settings.clone(),
+        server_state.boothby_events.clone(),
+        server_state.boothby_kick.clone(),
+        Arc::new(crate::boothby_scheduler::NothingToDoPassRunner),
+        server_state.clone(),
+    );
+
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
     // by a dropped wakeup (the `status_transition` → `request_recorded`
     // stall class — see `exec_18af3ba5259d32a8_12`, 2026-05-13) is

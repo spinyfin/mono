@@ -411,6 +411,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetCiRemediation { .. }
         | FrontendRequest::GetConflictHotspots { .. }
         | FrontendRequest::GetConflictResolution { .. }
+        | FrontendRequest::GetBoothbyState
         | FrontendRequest::GitHubAuthCancel
         | FrontendRequest::GitHubAuthDisconnect
         | FrontendRequest::GitHubAuthStart
@@ -420,6 +421,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ListAutomationDedupSuppressions { .. }
         | FrontendRequest::ListAutomationRuns { .. }
         | FrontendRequest::ListAutomations { .. }
+        | FrontendRequest::ListBoothbyPasses { .. }
         | FrontendRequest::ListCiRemediations { .. }
         | FrontendRequest::ListConflictResolutions { .. }
         | FrontendRequest::ListEditorialActions { .. }
@@ -430,7 +432,9 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RetryCiRemediation { .. }
         | FrontendRequest::RetryConflictResolution { .. }
         | FrontendRequest::RunAutomation { .. }
+        | FrontendRequest::RunBoothbyPass
         | FrontendRequest::SetAutomationPaused { .. }
+        | FrontendRequest::SetBoothbyMode { .. }
         | FrontendRequest::SetCiBudget { .. }
         | FrontendRequest::SyncProductExternalTracker { .. }
         | FrontendRequest::TriggerPrReview { .. }
