@@ -39,8 +39,10 @@ public enum UpdateMode: String, CaseIterable, Sendable {
 public enum UpdateDownloadState: Equatable, Sendable {
     /// No download in flight and nothing staged this session.
     case idle
-    /// Actively downloading/verifying `version`. `fraction` is best-effort `0...1`.
-    case downloading(version: VersionTuple, fraction: Double)
+    /// Actively downloading/verifying `version`. `progress` is best-effort and
+    /// reflects the download step only (verification that follows it reports no
+    /// further progress).
+    case downloading(version: VersionTuple, progress: DownloadProgress)
     /// `version` is downloaded, verified, and staged under `Updates/<version>/`; the
     /// next safe boundary (quit/startup in automatic mode, or an explicit
     /// "Install & Relaunch") swaps it in.
@@ -73,12 +75,12 @@ public enum UpdateDownloadState: Equatable, Sendable {
 /// reality — match). `.noop` never stages (placeholder/preview/non-bundle models);
 /// tests inject their own closure.
 struct UpdateStager: Sendable {
-    /// Download, verify, and stage `update`, reporting fractional progress. Returns
+    /// Download, verify, and stage `update`, reporting download progress. Returns
     /// the staged version on success (freshly staged or already present), `nil` if
     /// any step failed.
     let stage: @Sendable (
         _ update: AvailableUpdate,
-        _ onProgress: @Sendable @escaping (Double) -> Void
+        _ onProgress: @Sendable @escaping (DownloadProgress) -> Void
     ) async -> VersionTuple?
 
     /// Never stages. Used by placeholder/preview models and non-bundle launches.
@@ -400,16 +402,16 @@ public final class UpdateModel: ObservableObject {
         default: break
         }
         stagingTask?.cancel()
-        downloadState = .downloading(version: version, fraction: 0)
+        downloadState = .downloading(version: version, progress: .determinate(0))
         modelLog.info("update download: staging version=\(version.description, privacy: .public)")
         stagingTask = Task { [weak self] in
             guard let self else { return }
-            let staged = await self.stager.stage(update) { [weak self] fraction in
+            let staged = await self.stager.stage(update) { [weak self] progress in
                 Task { @MainActor in
                     guard let self else { return }
                     // Only advance progress if we're still on this version's download.
                     if case .downloading(let v, _) = self.downloadState, v == version {
-                        self.downloadState = .downloading(version: version, fraction: fraction)
+                        self.downloadState = .downloading(version: version, progress: progress)
                     }
                 }
             }

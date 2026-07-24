@@ -53,6 +53,7 @@ struct UpdateSettingsView: View {
                         downloadStatusIcon
                         Text(download)
                     }
+                    downloadProgressBar
                 }
             }
         }
@@ -62,6 +63,21 @@ struct UpdateSettingsView: View {
 
     // MARK: - Download status
 
+    /// The download progress bar, shown only while a download is in flight.
+    /// Determinate when the server reported a content length, indeterminate
+    /// otherwise. `EmptyView` for every other state.
+    @ViewBuilder
+    private var downloadProgressBar: some View {
+        if case .downloading(_, let progress) = model.downloadState {
+            switch progress {
+            case .determinate(let fraction):
+                ProgressView(value: fraction)
+            case .indeterminate:
+                ProgressView()
+            }
+        }
+    }
+
     /// Reflects the in-app download/stage step (``UpdateModel/downloadState``) so the
     /// user can see "Automatic" actually downloading and the "will install on quit"
     /// state. `nil` when idle.
@@ -69,9 +85,14 @@ struct UpdateSettingsView: View {
         switch model.downloadState {
         case .idle:
             return nil
-        case .downloading(let version, let fraction):
-            let pct = Int((fraction * 100).rounded())
-            return pct > 0 ? "Downloading Boss \(version)… \(pct)%" : "Downloading Boss \(version)…"
+        case .downloading(let version, let progress):
+            switch progress {
+            case .determinate(let fraction):
+                let pct = Int((fraction * 100).rounded())
+                return pct > 0 ? "Downloading Boss \(version)… \(pct)%" : "Downloading Boss \(version)…"
+            case .indeterminate:
+                return "Downloading Boss \(version)…"
+            }
         case .readyToInstall(let version):
             return "Boss \(version) downloaded — will install on quit or relaunch."
         case .installedPendingRelaunch(let version, let willRelaunch):

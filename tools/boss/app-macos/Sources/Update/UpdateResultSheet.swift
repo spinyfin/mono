@@ -110,11 +110,14 @@ struct UpdateResultSheet: View {
             }
 
             // In-app download/stage status (release builds only).
-            if !isDevBuild, let note = downloadStatusNote(for: update) {
-                Text(note)
-                    .font(.caption)
-                    .foregroundStyle(downloadFailed(for: update) ? .orange : .secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            if !isDevBuild {
+                if let note = downloadStatusNote(for: update) {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(downloadFailed(for: update) ? .orange : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                downloadProgressBar(for: update)
             }
 
             Divider()
@@ -221,13 +224,33 @@ struct UpdateResultSheet: View {
         }
     }
 
+    /// The download progress bar, shown only while `update` is actively
+    /// downloading. Determinate when the server reported a content length,
+    /// indeterminate otherwise. `EmptyView` for every other state.
+    @ViewBuilder
+    private func downloadProgressBar(for update: AvailableUpdate) -> some View {
+        if case .downloading(let v, let progress) = updateModel.downloadState, v == update.version {
+            switch progress {
+            case .determinate(let fraction):
+                ProgressView(value: fraction)
+            case .indeterminate:
+                ProgressView()
+            }
+        }
+    }
+
     /// One-line status under the release notes describing the current download/stage
     /// for `update`. `nil` when idle (the button text carries the affordance).
     private func downloadStatusNote(for update: AvailableUpdate) -> String? {
         switch updateModel.downloadState {
-        case .downloading(let v, let fraction) where v == update.version:
-            let pct = Int((fraction * 100).rounded())
-            return pct > 0 ? "Downloading Boss \(update.version)… \(pct)%" : "Downloading Boss \(update.version)…"
+        case .downloading(let v, let progress) where v == update.version:
+            switch progress {
+            case .determinate(let fraction):
+                let pct = Int((fraction * 100).rounded())
+                return pct > 0 ? "Downloading Boss \(update.version)… \(pct)%" : "Downloading Boss \(update.version)…"
+            case .indeterminate:
+                return "Downloading Boss \(update.version)…"
+            }
         case .readyToInstall(let v) where v == update.version:
             return "Boss \(update.version) downloaded and verified. Install & Relaunch to apply it now."
         case .installedPendingRelaunch(let v, let willRelaunch) where v == update.version:

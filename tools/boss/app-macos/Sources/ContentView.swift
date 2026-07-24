@@ -6402,6 +6402,7 @@ private struct UpdateBadgePopover: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
             }
+            downloadProgressBar
 
             HStack(spacing: 8) {
                 Button("Skip This Version") {
@@ -6500,11 +6501,35 @@ private struct UpdateBadgePopover: View {
         }
     }
 
+    /// The download progress bar, shown only while `update` is actively
+    /// downloading. Determinate when the server reported a content length,
+    /// indeterminate otherwise. Renders nothing for every other state.
+    @ViewBuilder
+    private var downloadProgressBar: some View {
+        if case .downloading(let v, let progress) = updateModel.downloadState, v == update.version {
+            Group {
+                switch progress {
+                case .determinate(let fraction):
+                    ProgressView(value: fraction)
+                case .indeterminate:
+                    ProgressView()
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+        }
+    }
+
     private var downloadStatusNote: String? {
         switch updateModel.downloadState {
-        case .downloading(let v, let fraction) where v == update.version:
-            let pct = Int((fraction * 100).rounded())
-            return pct > 0 ? "Downloading… \(pct)%" : "Downloading…"
+        case .downloading(let v, let progress) where v == update.version:
+            switch progress {
+            case .determinate(let fraction):
+                let pct = Int((fraction * 100).rounded())
+                return pct > 0 ? "Downloading… \(pct)%" : "Downloading…"
+            case .indeterminate:
+                return "Downloading…"
+            }
         case .readyToInstall(let v) where v == update.version:
             return "Downloaded and verified. Install & Relaunch to apply."
         case .installedPendingRelaunch(let v, let willRelaunch) where v == update.version:

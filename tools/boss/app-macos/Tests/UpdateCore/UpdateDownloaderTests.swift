@@ -298,10 +298,69 @@ final class UpdateDownloaderTests: XCTestCase {
     func testProgressCallbackInvoked() async throws {
         let log = CallLog()
         let downloader = makeDownloader(current: "1.0.27", runningTeamID: nil)
-        _ = await downloader.download(update("1.0.28"), onProgress: { p in
-            if p >= 1.0 { log.record("done") }
+        _ = await downloader.download(update("1.0.28"), onProgress: { progress in
+            if case .determinate(let fraction) = progress, fraction >= 1.0 { log.record("done") }
         })
         XCTAssertEqual(log.events, ["done"])
+    }
+
+    func testProgressReportsMonotonicDeterminateSequenceStartingAtZeroEndingAtOne() async throws {
+        let samples = ProgressLog()
+        let downloader = UpdateDownloader(
+            updatesDirectory: updatesDir,
+            currentVersion: VersionTuple.parse("1.0.27")!,
+            runningTeamID: nil,
+            assetDownloader: steppedProgressDownloader(steps: [0, 0.25, 0.5, 0.75, 1.0], bytes: 64),
+            bundleOps: passthroughOps(teamID: nil)
+        )
+        guard case .ready = await downloader.download(update("1.0.28"), onProgress: { samples.record($0) })
+        else { return XCTFail("expected .ready") }
+
+        let fractions = samples.events.compactMap { progress -> Double? in
+            guard case .determinate(let fraction) = progress else { return nil }
+            return fraction
+        }
+        XCTAssertEqual(fractions.first, 0, "progress must start at 0")
+        XCTAssertEqual(fractions.last, 1.0, "progress must end at 1")
+        XCTAssertEqual(fractions, fractions.sorted(), "progress must be monotonically non-decreasing")
+    }
+
+    func testProgressReportsIndeterminateWhenNoContentLength() async throws {
+        let samples = ProgressLog()
+        let root = tempRoot!
+        let downloader = UpdateDownloader(
+            updatesDirectory: updatesDir,
+            currentVersion: VersionTuple.parse("1.0.27")!,
+            runningTeamID: nil,
+            assetDownloader: AssetDownloader { _, onProgress in
+                onProgress(.indeterminate)
+                let file = root.appendingPathComponent("dl-\(UUID().uuidString).zip")
+                _ = FileManager.default.createFile(atPath: file.path, contents: Data(count: 64))
+                return file
+            },
+            bundleOps: passthroughOps(teamID: nil)
+        )
+        guard case .ready = await downloader.download(update("1.0.28"), onProgress: { samples.record($0) })
+        else { return XCTFail("expected .ready") }
+
+        XCTAssertEqual(samples.events, [.indeterminate], "an unknown content length must never be approximated as a fraction")
+    }
+
+    func testProgressStopsAfterDownloadFailureLeavingTerminalFailedOutcome() async throws {
+        let samples = ProgressLog()
+        let failing = AssetDownloader { _, onProgress in
+            onProgress(.determinate(0.3))
+            throw URLError(.networkConnectionLost)
+        }
+        let downloader = UpdateDownloader(
+            updatesDirectory: updatesDir, currentVersion: .init(major: 1, minor: 0, patch: 27),
+            runningTeamID: nil, assetDownloader: failing, bundleOps: passthroughOps(teamID: nil)
+        )
+        let outcome = await downloader.download(update("1.0.28"), onProgress: { samples.record($0) })
+
+        guard case .failed = outcome else { return XCTFail("expected .failed, got \(outcome)") }
+        XCTAssertEqual(samples.events, [.determinate(0.3)], "no further progress after the download throws")
+        XCTAssertFalse(exists(updatesDir.appendingPathComponent("1.0.28")), "a failed download must never be staged")
     }
 
     // MARK: Manifest Codable round-trip
@@ -357,7 +416,20 @@ extension UpdateDownloaderTests {
             hook?()
             let file = root.appendingPathComponent("dl-\(UUID().uuidString).zip")
             _ = FileManager.default.createFile(atPath: file.path, contents: Data(count: bytes))
-            onProgress(1.0)
+            onProgress(.determinate(1.0))
+            return file
+        }
+    }
+
+    /// A stub `AssetDownloader` that reports each of `steps` as a determinate
+    /// `DownloadProgress` sample (in order) before writing `bytes` bytes to a temp
+    /// file, mimicking a real transfer's coalesced `didWriteData` callbacks.
+    private func steppedProgressDownloader(steps: [Double], bytes: Int) -> AssetDownloader {
+        let root = tempRoot!
+        return AssetDownloader { _, onProgress in
+            for step in steps { onProgress(.determinate(step)) }
+            let file = root.appendingPathComponent("dl-\(UUID().uuidString).zip")
+            _ = FileManager.default.createFile(atPath: file.path, contents: Data(count: bytes))
             return file
         }
     }
@@ -459,6 +531,22 @@ private final class CallLog: @unchecked Sendable {
     }
 
     func record(_ event: String) {
+        lock.lock(); storage.append(event); lock.unlock()
+    }
+}
+
+// MARK: - Thread-safe progress-sample log
+
+private final class ProgressLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [DownloadProgress] = []
+
+    var events: [DownloadProgress] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+
+    func record(_ event: DownloadProgress) {
         lock.lock(); storage.append(event); lock.unlock()
     }
 }
