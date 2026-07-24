@@ -403,7 +403,11 @@ private struct CommentAgeChip: View {
     let isLiveAnswering: Bool
 
     var body: some View {
-        if isLiveAnswering {
+        // An unparseable `created_at` renders nothing rather than a
+        // confidently wrong "now" — see `Comment.unparseableTimestampSentinel`.
+        if comment.createdAt == Comment.unparseableTimestampSentinel {
+            EmptyView()
+        } else if isLiveAnswering {
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 chipText(now: context.date)
             }

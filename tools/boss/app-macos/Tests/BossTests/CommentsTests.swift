@@ -551,6 +551,13 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(comment.createdAt, Date(timeIntervalSince1970: 1_753_302_417))
     }
 
+    /// A value matching neither the epoch nor ISO-8601 shape must fall back
+    /// to `unparseableTimestampSentinel`, not silently render a confident
+    /// wrong "now" — see `CommentAgeChip`, which renders nothing for it.
+    func testParseWireTimestampFallsBackToSentinelForUnparseableValue() {
+        XCTAssertEqual(Comment.parseWireTimestamp("not-a-timestamp"), Comment.unparseableTimestampSentinel)
+    }
+
     /// Regression for the "every comment reads the same age" bug: two
     /// comments created seconds apart must keep distinct `createdAt` values
     /// across a second `applyList` (e.g. triggered by an unrelated reload),

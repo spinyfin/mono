@@ -232,8 +232,16 @@ extension Comment {
         return c
     }
 
-    /// Lenient parse of an engine `created_at` timestamp; falls back to the
-    /// current instant so a malformed value never drops the comment. Shared
+    /// Sentinel returned by `parseWireTimestamp` when a value matches neither
+    /// the epoch nor ISO-8601 shape. Never a valid `created_at`: real values
+    /// are current UTC instants, orders of magnitude after `distantPast`. Lets
+    /// call sites (e.g. `CommentAgeChip`) detect "unparseable" and render
+    /// nothing rather than a confidently wrong "now".
+    static let unparseableTimestampSentinel = Date.distantPast
+
+    /// Lenient parse of an engine `created_at` timestamp; falls back to
+    /// `unparseableTimestampSentinel` so a malformed value never drops the
+    /// comment but is still distinguishable from a real timestamp. Shared
     /// with [`CommentThreadEntry.from`].
     ///
     /// `work_comments.created_at` is UTC epoch seconds serialised to a string
@@ -248,7 +256,7 @@ extension Comment {
         if let epoch = Int64(trimmed) {
             return Date(timeIntervalSince1970: TimeInterval(epoch))
         }
-        return WorkerStaleness.parse(trimmed) ?? Date()
+        return WorkerStaleness.parse(trimmed) ?? unparseableTimestampSentinel
     }
 }
 
