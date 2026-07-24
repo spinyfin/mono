@@ -46,6 +46,7 @@ use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
 
+mod agent_launch_guard;
 mod app_session;
 mod attentions;
 mod automations;
