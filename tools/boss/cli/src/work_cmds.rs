@@ -945,6 +945,9 @@ pub(crate) async fn run_show_leaf(
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
     let mut task_json = task_json_with_runtime(&item, &runtime)?;
+    // These keys share a namespace with `Task`'s own serialized fields, so a
+    // future `Task` field named `dependencies`/`executions`/`attention_items`/
+    // `attention_groups` would be silently overwritten by the insert below.
     if let serde_json::Value::Object(map) = &mut task_json {
         map.insert(
             "dependencies".to_owned(),
@@ -962,6 +965,8 @@ pub(crate) async fn run_show_leaf(
             "attention_groups".to_owned(),
             serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
         );
+    } else {
+        return Err(CliError::internal(anyhow::anyhow!("task JSON was not an object")));
     }
     print_entity(ctx, &task_json, || {
         print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
@@ -975,7 +980,7 @@ pub(crate) async fn run_show_leaf(
 
 /// Serialise `item` and splice the runtime's `current_execution_id`
 /// / `current_run_id` onto the resulting JSON object so a downstream
-/// `jq .task.current_execution_id` resolves to the engine's view of
+/// `jq .current_execution_id` resolves to the engine's view of
 /// the dispatched execution. Both fields land as `null` when no
 /// execution / run exists yet — the coordinator wants the keys
 /// present so it can distinguish "engine returned null" from "this
