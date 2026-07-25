@@ -804,6 +804,90 @@ pub mod registry;
 pub use claude::ClaudeDriver;
 pub use registry::DriverRegistry;
 
+/// Shared test fixture for crates that need an [`AgentDriver`] stand-in
+/// without a second real driver implementation. Unconditionally compiled
+/// (not `#[cfg(test)]`) so downstream crates can depend on it from their own
+/// `[dev-dependencies]`; this crate's own unit tests use the same fixture.
+pub mod test_support {
+    use std::path::Path;
+
+    use async_trait::async_trait;
+    use boss_engine_structured_output::StructuredOutputKind;
+    use boss_engine_structured_output::fallback::FallbackCandidate;
+    use boss_protocol::{NormalizeError, WorkerEvent};
+
+    use super::{
+        AgentDriver, CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity,
+        ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+        WorkerErrorClass,
+    };
+
+    /// Configurable [`AgentDriver`] stub. Every method beyond
+    /// `descriptor`/`capabilities` is unimplemented (or a harmless no-op for
+    /// the methods that can't panic on the hot paths, like
+    /// `normalize_transcript_entry`) — callers that need this fixture only
+    /// ever exercise capability declaration and menu resolution against it.
+    pub struct StubDriver {
+        pub descriptor: DriverDescriptor,
+        pub caps: CapabilitySet,
+    }
+
+    impl StubDriver {
+        pub fn new(descriptor: DriverDescriptor, caps: CapabilitySet) -> Self {
+            Self { descriptor, caps }
+        }
+    }
+
+    #[async_trait]
+    impl AgentDriver for StubDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            &self.descriptor
+        }
+        fn capabilities(&self) -> CapabilitySet {
+            self.caps.clone()
+        }
+        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+            unimplemented!()
+        }
+        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
+            unimplemented!()
+        }
+        fn progress_fidelity(&self) -> ProgressFidelity {
+            unimplemented!()
+        }
+        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
+            unimplemented!()
+        }
+        fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+            unimplemented!()
+        }
+        fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
+            unimplemented!()
+        }
+        fn agent_rules_preamble(&self) -> &'static str {
+            unimplemented!()
+        }
+        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
+            None
+        }
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            raw
+        }
+        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
+            None
+        }
+        fn classify_error(&self, _: &str) -> WorkerErrorClass {
+            unimplemented!()
+        }
+        fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,7 +1039,7 @@ mod tests {
     fn capability_resolver_returns_ok_plan_when_no_refused_caps() {
         // A driver that provides every capability must always yield Ok for any kind.
         let all_caps = CapabilitySet::new(Capability::all());
-        let driver = StubDriver { caps: all_caps };
+        let driver = StubDriver::new(stub_descriptor(), all_caps);
         let resolver = CapabilityResolver::new(&driver);
         let plan = resolver.check_dispatch(&TaskKind::Design).unwrap();
         assert!(plan.is_full_fidelity(), "full-capability driver must be full-fidelity");
@@ -965,7 +1049,7 @@ mod tests {
     #[test]
     fn capability_resolver_refuses_design_task_without_structured_output() {
         let caps = CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]);
-        let driver = StubDriver { caps };
+        let driver = StubDriver::new(stub_descriptor(), caps);
         let resolver = CapabilityResolver::new(&driver);
         let err = resolver.check_dispatch(&TaskKind::Design).unwrap_err();
         assert!(
@@ -984,7 +1068,7 @@ mod tests {
     fn capability_resolver_refuses_any_kind_without_spawn() {
         // Spawn has Refuse as its global default; any kind without Spawn fails.
         let caps = CapabilitySet::new(Capability::all().filter(|c| *c != Capability::Spawn));
-        let driver = StubDriver { caps };
+        let driver = StubDriver::new(stub_descriptor(), caps);
         let resolver = CapabilityResolver::new(&driver);
         let err = resolver.check_dispatch(&TaskKind::Chore).unwrap_err();
         assert!(
@@ -1000,7 +1084,7 @@ mod tests {
         let caps = CapabilitySet::new(
             Capability::all().filter(|c| *c != Capability::ModelAndEffortMenu && *c != Capability::ProgressObservation),
         );
-        let driver = StubDriver { caps };
+        let driver = StubDriver::new(stub_descriptor(), caps);
         let resolver = CapabilityResolver::new(&driver);
         let plan = resolver.check_dispatch(&TaskKind::Chore).unwrap();
         assert!(!plan.is_full_fidelity());
@@ -1032,77 +1116,27 @@ mod tests {
     }
 
     // ── Test-only stub driver ──────────────────────────────────────────────
+    //
+    // Shared with other crates' tests via `crate::test_support::StubDriver`;
+    // see that module's doc comment.
 
-    use async_trait::async_trait;
-    use boss_protocol::{NormalizeError, WorkerEvent};
-    use std::path::{Path, PathBuf};
+    use crate::test_support::StubDriver;
 
-    static STUB_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
-        name: "stub",
-        label: "Stub Driver",
-        binary: "stub",
-        config_dir: ".stub",
-        agent_rules_filename: "AGENTS.md",
-        initial_prompt_filename: "initial-prompt.txt",
-        model_menu: ModelMenu {
-            engine_default: "stub-model",
-            effort_value_for_level: |_| None,
-            default_model_for_level: |_| "stub-model",
-            prompt_addendum_for_level: |_| None,
-            model_requires_auto_permissions: |_| false,
-        },
-    };
-
-    struct StubDriver {
-        caps: CapabilitySet,
-    }
-
-    #[async_trait]
-    impl AgentDriver for StubDriver {
-        fn descriptor(&self) -> &DriverDescriptor {
-            &STUB_DESCRIPTOR
-        }
-        fn capabilities(&self) -> CapabilitySet {
-            self.caps.clone()
-        }
-        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
-            unimplemented!()
-        }
-        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
-            unimplemented!()
-        }
-        fn progress_fidelity(&self) -> ProgressFidelity {
-            unimplemented!()
-        }
-        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
-            unimplemented!()
-        }
-        fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-            unimplemented!()
-        }
-        fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
-            unimplemented!()
-        }
-        fn agent_rules_preamble(&self) -> &'static str {
-            unimplemented!()
-        }
-        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
-            None
-        }
-        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
-            raw
-        }
-        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
-            None
-        }
-        fn classify_error(&self, _: &str) -> WorkerErrorClass {
-            unimplemented!()
-        }
-        fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
-            Vec::new()
+    fn stub_descriptor() -> DriverDescriptor {
+        DriverDescriptor {
+            name: "stub",
+            label: "Stub Driver",
+            binary: "stub",
+            config_dir: ".stub",
+            agent_rules_filename: "AGENTS.md",
+            initial_prompt_filename: "initial-prompt.txt",
+            model_menu: ModelMenu {
+                engine_default: "stub-model",
+                effort_value_for_level: |_| None,
+                default_model_for_level: |_| "stub-model",
+                prompt_addendum_for_level: |_| None,
+                model_requires_auto_permissions: |_| false,
+            },
         }
     }
 }

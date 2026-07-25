@@ -15,7 +15,7 @@ use boss_engine_driver::{AgentDriver, DriverRegistry};
 pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
 
 /// A resolved driver slug names a driver the current binary's
-/// [`DriverRegistry`] does not recognise. Returned by [`menu_for_driver_in`] /
+/// [`DriverRegistry`] does not recognise. Returned by `menu_for_driver_in` /
 /// [`resolve_spawn_config`] instead of silently falling back to the Claude
 /// menu — a silent fallback is exactly the bug this type exists to prevent
 /// (agent-driver design §Mix-and-match): dispatching an unregistered
@@ -209,45 +209,55 @@ pub fn resolve_spawn_config(
     product_default_driver: Option<&str>,
     kind: Option<&TaskKind>,
 ) -> Result<SpawnConfig, UnknownDriverError> {
-    resolve_spawn_config_in(
-        &DriverRegistry::default(),
-        effort_level,
-        model_override,
-        pool_model_override,
-        product_default_model,
-        task_driver,
-        product_default_driver,
-        kind,
-    )
+    let input = SpawnResolutionInput::builder()
+        .maybe_effort_level(effort_level)
+        .maybe_model_override(model_override)
+        .maybe_pool_model_override(pool_model_override)
+        .maybe_product_default_model(product_default_model)
+        .maybe_task_driver(task_driver)
+        .maybe_product_default_driver(product_default_driver)
+        .maybe_kind(kind)
+        .build();
+    resolve_spawn_config_in(&DriverRegistry::default(), &input)
+}
+
+/// Inputs to [`resolve_spawn_config_in`], grouped into one type per the
+/// repo's builder convention (`CLAUDE.md`, "Builder pattern convention") so
+/// additive fields don't touch every call site. All fields are optional —
+/// see [`resolve_spawn_config`]'s doc comment for what each one means and
+/// how they combine.
+#[derive(Debug, Clone, Default, bon::Builder)]
+pub struct SpawnResolutionInput<'a> {
+    pub effort_level: Option<EffortLevel>,
+    pub model_override: Option<&'a str>,
+    pub pool_model_override: Option<&'a str>,
+    pub product_default_model: Option<&'a str>,
+    pub task_driver: Option<&'a str>,
+    pub product_default_driver: Option<&'a str>,
+    pub kind: Option<&'a TaskKind>,
 }
 
 /// [`resolve_spawn_config`], resolved against a caller-supplied registry
 /// instead of always constructing [`DriverRegistry::default`]. Lets a
 /// caller that also needs the registry for its own purposes (e.g.
 /// `compose_worker_spawn`'s capability gate) build it once and reuse it.
-#[allow(clippy::too_many_arguments)]
 pub fn resolve_spawn_config_in(
     registry: &DriverRegistry,
-    effort_level: Option<EffortLevel>,
-    model_override: Option<&str>,
-    pool_model_override: Option<&str>,
-    product_default_model: Option<&str>,
-    task_driver: Option<&str>,
-    product_default_driver: Option<&str>,
-    kind: Option<&TaskKind>,
+    input: &SpawnResolutionInput,
 ) -> Result<SpawnConfig, UnknownDriverError> {
-    let driver = resolve_driver(task_driver, product_default_driver);
+    let driver = resolve_driver(input.task_driver, input.product_default_driver);
     let menu = menu_for_driver_in(registry, &driver)?;
+    let effort_level = input.effort_level;
 
-    let model = if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
+    let model = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
-    } else if let Some(m) = pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
+    } else if let Some(m) = input.pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
-    } else if kind.is_some_and(is_design_family_kind) {
+    } else if input.kind.is_some_and(is_design_family_kind) {
         "opus".to_owned()
     } else if let Some(level) = effort_level {
         (menu.default_model_for_level)(level).to_owned()
-    } else if let Some(pd) = product_default_model.map(str::trim).filter(|s| !s.is_empty()) {
+    } else if let Some(pd) = input.product_default_model.map(str::trim).filter(|s| !s.is_empty()) {
         pd.to_owned()
     } else {
         menu.engine_default.to_owned()
@@ -463,18 +473,10 @@ mod tests {
     // `DriverRegistry::with_driver` — so per-slug menu resolution is
     // exercised against more than one driver.
 
-    use std::path::Path;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use boss_engine_driver::{
-        Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu, PermissionArtifacts,
-        PermissionInput, ProgressFidelity, ProgressObservationConfig, ProgressObservationWiring,
-        ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
-    };
-    use boss_engine_structured_output::StructuredOutputKind;
-    use boss_engine_structured_output::fallback::FallbackCandidate;
-    use boss_protocol::{NormalizeError, WorkerEvent};
+    use boss_engine_driver::test_support::StubDriver;
+    use boss_engine_driver::{Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu};
 
     /// Effort vocabulary for the stub driver below. Deliberately distinct
     /// from Claude's `low/medium/high/xhigh/max` at every level, and its
@@ -504,80 +506,31 @@ mod tests {
         false
     }
 
-    static STUB_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
-        name: "stub-codex",
-        label: "Stub Codex-shaped Driver",
-        binary: "stub",
-        config_dir: ".stub",
-        agent_rules_filename: "AGENTS.md",
-        initial_prompt_filename: "initial-prompt.txt",
-        model_menu: DriverModelMenu {
-            engine_default: "stub-model",
-            effort_value_for_level: stub_effort_value_for_level,
-            default_model_for_level: stub_default_model_for_level,
-            prompt_addendum_for_level: stub_prompt_addendum_for_level,
-            model_requires_auto_permissions: stub_model_requires_auto_permissions,
-        },
-    };
-
-    /// Minimal second driver, registered only in these tests, whose sole
-    /// purpose is to prove `menu_for_driver` resolves per-slug. Every method
-    /// beyond `descriptor`/`capabilities` is unused by these tests and left
-    /// `unimplemented!()`, mirroring `boss_engine_driver`'s own `StubDriver`
-    /// test fixture.
-    struct StubDriver;
-
-    #[async_trait]
-    impl AgentDriver for StubDriver {
-        fn descriptor(&self) -> &DriverDescriptor {
-            &STUB_DESCRIPTOR
-        }
-        fn capabilities(&self) -> CapabilitySet {
-            CapabilitySet::new([Capability::Spawn])
-        }
-        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
-            unimplemented!()
-        }
-        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
-            unimplemented!()
-        }
-        fn progress_fidelity(&self) -> ProgressFidelity {
-            unimplemented!()
-        }
-        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
-            unimplemented!()
-        }
-        fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-            unimplemented!()
-        }
-        fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
-            unimplemented!()
-        }
-        fn agent_rules_preamble(&self) -> &'static str {
-            unimplemented!()
-        }
-        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
-            unimplemented!()
-        }
-        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
-            raw
-        }
-        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
-            None
-        }
-        fn classify_error(&self, _: &str) -> WorkerErrorClass {
-            unimplemented!()
-        }
-        fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
-            Vec::new()
+    fn stub_descriptor() -> DriverDescriptor {
+        DriverDescriptor {
+            name: "stub-codex",
+            label: "Stub Codex-shaped Driver",
+            binary: "stub",
+            config_dir: ".stub",
+            agent_rules_filename: "AGENTS.md",
+            initial_prompt_filename: "initial-prompt.txt",
+            model_menu: DriverModelMenu {
+                engine_default: "stub-model",
+                effort_value_for_level: stub_effort_value_for_level,
+                default_model_for_level: stub_default_model_for_level,
+                prompt_addendum_for_level: stub_prompt_addendum_for_level,
+                model_requires_auto_permissions: stub_model_requires_auto_permissions,
+            },
         }
     }
 
+    /// Minimal second driver, registered only in these tests, whose sole
+    /// purpose is to prove `menu_for_driver` resolves per-slug. Uses the
+    /// shared [`boss_engine_driver::test_support::StubDriver`] fixture
+    /// instead of a second hand-rolled `AgentDriver` impl.
     fn registry_with_stub() -> DriverRegistry {
-        DriverRegistry::default().with_driver("stub-codex", Arc::new(StubDriver))
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([Capability::Spawn]));
+        DriverRegistry::default().with_driver("stub-codex", Arc::new(driver))
     }
 
     #[test]

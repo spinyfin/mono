@@ -7,7 +7,7 @@ use std::path::Path;
 use boss_engine_gh_invocation::gh_output;
 
 use crate::coordinator::pool_model_override_for_worker_id;
-use crate::effort::{SpawnConfig, resolve_spawn_config_in};
+use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::ExecutionKind;
@@ -615,37 +615,32 @@ pub(crate) async fn compose_worker_spawn(
     // regardless of effort level, and reused below for the capability gate.
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
-    let spawn_config = resolve_spawn_config_in(
-        &registry,
-        row_effort,
-        row_model_override.as_deref(),
-        pool_model_override_for_worker_id(worker_id),
-        product_default_model.as_deref(),
-        row_driver.as_deref(),
-        product_default_driver.as_deref(),
-        work_item_kind,
-    )
-    .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
+    let spawn_input = SpawnResolutionInput::builder()
+        .maybe_effort_level(row_effort)
+        .maybe_model_override(row_model_override.as_deref())
+        .maybe_pool_model_override(pool_model_override_for_worker_id(worker_id))
+        .maybe_product_default_model(product_default_model.as_deref())
+        .maybe_task_driver(row_driver.as_deref())
+        .maybe_product_default_driver(product_default_driver.as_deref())
+        .maybe_kind(work_item_kind)
+        .build();
+    let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
+        .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
 
     // Capability gate: fail closed before the pane spawns when the resolved
     // driver cannot satisfy the work-item kind's requirements. Products and
     // projects do not have a TaskKind; only Task/Chore rows are gated.
     if let Some(kind) = work_item_kind {
-        match registry.resolver(&spawn_config.driver) {
-            Some(resolver) => {
-                resolver
-                    .check_dispatch(kind)
-                    .map_err(|e| anyhow::anyhow!("capability gate: {e}"))?;
-            }
-            None => {
-                anyhow::bail!(
-                    "capability gate: driver '{}' is not registered; \
-                     cannot dispatch {} work item",
-                    spawn_config.driver,
-                    kind,
-                );
-            }
-        }
+        // `spawn_config.driver` was already validated against this same
+        // `registry` by `resolve_spawn_config_in` above (it returns
+        // `UnknownDriverError` and bails before reaching here on an
+        // unregistered slug), so the lookup cannot fail.
+        let resolver = registry
+            .resolver(&spawn_config.driver)
+            .expect("slug validated by resolve_spawn_config_in");
+        resolver
+            .check_dispatch(kind)
+            .map_err(|e| anyhow::anyhow!("capability gate: {e}"))?;
     }
 
     // Per-level prompt addendum lands at the very top of the file
