@@ -35,6 +35,7 @@ impl TopicFilter {
             EventKind::PrReconcileRequested,
             EventKind::DispatchReady,
             EventKind::Timer,
+            EventKind::AutomationMutation,
         ])
     }
 

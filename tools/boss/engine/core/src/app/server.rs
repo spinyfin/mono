@@ -1446,7 +1446,9 @@ pub async fn serve_with_merge_probe(
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),
         automation_triage_dispatcher,
-        server_state.automation_scheduler_kick.clone(),
+        server_state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::AutomationMutation,
+        )),
         Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
     );
 

@@ -33,6 +33,11 @@ pub enum Event {
     DispatchReady,
     /// A timer-wheel deadline elapsed.
     Timer { deadline_id: String },
+    /// An automation was created, updated, enabled, disabled, deleted, or
+    /// the global automation pause toggled. No payload: every subscriber
+    /// today (the automation scheduler) reacts by recomputing its
+    /// min-next-fire sleep from the DB rather than trusting event contents.
+    AutomationMutation,
 }
 
 /// The discriminant of an [`Event`], with no payload — what
@@ -50,6 +55,7 @@ pub enum EventKind {
     PrReconcileRequested,
     DispatchReady,
     Timer,
+    AutomationMutation,
 }
 
 impl EventKind {
@@ -70,6 +76,7 @@ impl EventKind {
             EventKind::PrReconcileRequested => "pr_reconcile_requested",
             EventKind::DispatchReady => "dispatch_ready",
             EventKind::Timer => "timer",
+            EventKind::AutomationMutation => "automation_mutation",
         }
     }
 }
@@ -88,6 +95,7 @@ impl Event {
             Event::PrReconcileRequested { .. } => EventKind::PrReconcileRequested,
             Event::DispatchReady => EventKind::DispatchReady,
             Event::Timer { .. } => EventKind::Timer,
+            Event::AutomationMutation => EventKind::AutomationMutation,
         }
     }
 
@@ -112,6 +120,7 @@ impl Event {
             Event::PrReconcileRequested { pr_url } => pr_url.clone(),
             Event::DispatchReady => String::new(),
             Event::Timer { deadline_id } => deadline_id.clone(),
+            Event::AutomationMutation => String::new(),
         }
     }
 }
