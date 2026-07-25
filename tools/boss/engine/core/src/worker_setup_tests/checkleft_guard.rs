@@ -86,6 +86,11 @@ fn checkleft_push_guard_script_has_the_load_bearing_logic() {
          runs a stale checkleft resolved from a bare PATH lookup",
     );
     assert!(
+        s.contains("probe_repobin_checkleft") && s.contains("--version"),
+        "must probe the repobin dispatch before trusting it, so a broken bazel build \
+         falls back instead of hard-blocking every push",
+    );
+    assert!(
         s.contains("bin") && s.contains("checkleft"),
         "must fall back to the repobin-installed checkleft path",
     );
@@ -327,6 +332,107 @@ fn push_guard_dispatches_through_repobin_exec_when_repobin_is_installed() {
         args,
         vec!["exec", "checkleft", "run"],
         "guard must dispatch via `repobin exec checkleft run`: {argv:?}"
+    );
+}
+
+/// Write an executable fake `repobin` that always exits non-zero and
+/// records its argv (one arg per line) into `argv_out`, modelling a
+/// dispatch/build failure (e.g. a broken bazel target) for every
+/// subcommand, including the `--version` probe.
+fn write_fake_repobin_failing(bin_dir: &Path, argv_out: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let path = bin_dir.join("repobin");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 1\n",
+        shell_quote(&argv_out.display().to_string())
+    );
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+#[test]
+fn push_guard_env_override_wins_over_a_present_repobin() {
+    // BOSS_CHECKLEFT_BIN must beat repobin even when a repobin binary is
+    // installed at <repo-root>/bin/repobin -- the override is for tests and
+    // exceptional cases and must not be silently shadowed by the new
+    // repobin-preferred resolution step.
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    let argv_out = dir.path().join("argv.txt");
+    write_fake_repobin_recording_argv(&bin_dir, &argv_out);
+    let override_checkleft =
+        write_fake_checkleft(dir.path(), "override-checkleft", 1, "error[rustfmt]: needs formatting");
+
+    let decision = run_push_guard("jj git push -b boss/foo --allow-new", dir.path(), &override_checkleft);
+    assert_eq!(
+        decision["decision"], "block",
+        "decision must come from the override checkleft: {decision}"
+    );
+    assert!(
+        decision["reason"].as_str().unwrap_or("").contains("error[rustfmt]"),
+        "block reason must come from the override checkleft, not repobin: {decision}"
+    );
+    assert!(
+        !argv_out.exists(),
+        "repobin must never be invoked once BOSS_CHECKLEFT_BIN is set"
+    );
+}
+
+#[test]
+fn push_guard_dispatches_through_repobin_found_only_on_path() {
+    // The realistic cube-workspace case: no <repo-root>/bin directory at
+    // all (nothing installs one), so repobin must still be found via a
+    // plain PATH search rather than only the <repo-root>/bin/repobin path.
+    let dir = TempDir::new().unwrap();
+    let path_dir = TempDir::new().unwrap();
+    let argv_out = dir.path().join("argv.txt");
+    write_fake_repobin_recording_argv(path_dir.path(), &argv_out);
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
+    assert_eq!(
+        decision["decision"], "approve",
+        "a clean PATH-resolved repobin-dispatched checkleft must allow the push: {decision}"
+    );
+    let argv = std::fs::read_to_string(&argv_out).expect("fake repobin must have recorded its argv");
+    let args: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        args,
+        vec!["exec", "checkleft", "run"],
+        "guard must dispatch via `repobin exec checkleft run` found on PATH: {argv:?}"
+    );
+}
+
+#[test]
+fn push_guard_falls_back_when_repobin_dispatch_fails() {
+    // A repobin whose underlying bazel dispatch is broken (e.g. an
+    // unrelated crate failing to build) must not hard-block every push as
+    // a checkleft "internal error" with no BYPASS_ escape -- the guard
+    // must probe the dispatch first and fall back to the legacy
+    // <repo-root>/bin/checkleft resolution when the probe fails.
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    let argv_out = dir.path().join("argv.txt");
+    write_fake_repobin_failing(&bin_dir, &argv_out);
+    let checkleft = write_fake_checkleft(&bin_dir, "checkleft", 1, "error[rustfmt]: needs formatting");
+    assert!(checkleft.starts_with(&bin_dir));
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[]);
+    assert_eq!(
+        decision["decision"], "block",
+        "must fall back to <repo-root>/bin/checkleft when the repobin dispatch probe fails: {decision}"
+    );
+    assert!(
+        decision["reason"].as_str().unwrap_or("").contains("error[rustfmt]"),
+        "block reason must come from the repo-root checkleft, not a repobin dispatch error: {decision}"
+    );
+    let probed = std::fs::read_to_string(&argv_out).expect("fake repobin must have recorded its argv");
+    assert!(
+        probed.lines().eq(["exec", "checkleft", "--version"]),
+        "guard must only have probed with --version, never attempted `run` on the broken repobin: {probed:?}"
     );
 }
 

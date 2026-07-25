@@ -1068,9 +1068,9 @@ if __name__ == "__main__":
 ///
 /// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
 /// (an override used by tests, used as-is); `repobin exec checkleft` via a
-/// `repobin` binary found at `<repo-root>/bin/repobin` or on `PATH` (repobin
-/// always rebuilds checkleft fresh from the current source tree per
-/// `REPOBIN.toml`, so this can never run a stale binary — see below);
+/// `repobin` binary found at `<repo-root>/bin/repobin` or on `PATH`, but
+/// only once a cheap `repobin exec checkleft --version` probe confirms the
+/// dispatch actually works (see `probe_repobin_checkleft` below);
 /// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
 /// bare `checkleft` on `PATH`.
 ///
@@ -1080,11 +1080,21 @@ if __name__ == "__main__":
 /// checks the repo's current `CHECKS.yaml` configures. That binary still
 /// runs and still exits non-zero, so the gate does not fail open; it fails
 /// *closed* with `error[...]: configured check references unknown
-/// implementation`, blocking every push. `repobin exec` sidesteps this
-/// entirely: it dispatches through the same build-from-source path an
-/// interactive worker gets when it types `checkleft` at a shell backed by a
-/// `repobin`-installed symlink, so the gate always runs the exact checkleft
-/// the current workspace's source tree defines.
+/// implementation`, blocking every push. `repobin exec` sidesteps this by
+/// dispatching a binary that `bazel build` produces from the current source
+/// tree (repobin's dispatch cache is keyed by a content hash of that
+/// target's build witnesses, so a stale build is never served).
+///
+/// The probe step matters because that same `bazel build` can itself fail —
+/// a broken crate elsewhere in the tree, a toolchain problem — and a failed
+/// `repobin exec checkleft run` looks identical, from the gate's point of
+/// view, to a policy failure with no findings on stdout: both exit non-zero
+/// with nothing checkleft-shaped on stdout. Without the probe that reads as
+/// a checkleft internal error and hard-blocks every push with no `BYPASS_`
+/// escape, even though the failure has nothing to do with the change being
+/// pushed. Probing with `--version` first, and falling back to the legacy
+/// `<repo-root>/bin/checkleft` / PATH resolution when it fails, keeps a
+/// broken repobin dispatch from taking down the push gate.
 const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Deterministic pre-push checkleft gate (Claude Code PreToolUse hook).
 
@@ -1105,14 +1115,11 @@ deterministic action is to block a push that checkleft itself rejected.
 The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
 stdout. The checkleft invocation is resolved from (in order) the
 BOSS_CHECKLEFT_BIN env var (used as-is), `repobin exec checkleft` via a
-`repobin` found at `<repo-root>/bin/repobin` or on PATH, `<repo-root>/bin/checkleft`
-(a repobin-installed tool symlink), and finally a bare `checkleft` on PATH.
-repobin is preferred over a direct checkleft lookup because it always rebuilds
-checkleft fresh from the current source tree (per REPOBIN.toml) instead of
-trusting whatever binary happens to sit on PATH -- which can be a stale,
-unrelated build (e.g. an old `cargo install checkleft`) that runs, exits
-non-zero, and blocks every push with "unknown implementation" errors for
-checks it predates.
+`repobin` found at `<repo-root>/bin/repobin` or on PATH -- gated on a
+`repobin exec checkleft --version` probe succeeding first -- then
+`<repo-root>/bin/checkleft` (a repobin-installed tool symlink), and finally a
+bare `checkleft` on PATH. See resolve_checkleft_command()'s docstring for why
+repobin is preferred and why it is probed rather than trusted outright.
 """
 import json
 import os
@@ -1122,12 +1129,21 @@ import shutil
 import subprocess
 import sys
 
-# Warm-cache checkleft runs (including a `repobin exec` dispatch, which is a
-# no-op bazel build when the binary is already up to date) are seconds; cap
-# the wait so a wedged checkleft/bazel invocation can never hang a push
-# attempt. On timeout we fail open (approve) rather than strand the session
-# -- the cube verb gates are the belt for that rare case.
-CHECKLEFT_TIMEOUT_SECONDS = 240
+# The probe (`repobin exec checkleft --version`) is what pays a cold
+# dispatch-cache miss: a full `bazel build //tools/checkleft:checkleft`, which
+# can run into the tens of seconds to a few minutes depending on host
+# contention. Budget generously for it since it runs at most once per push
+# (repobin's dispatch cache is content-hash keyed, so a warm cache after the
+# probe means the subsequent `run` invocation below hits it too). On timeout
+# we fail open (approve) rather than strand the session -- the cube verb
+# gates are the belt for that rare case.
+CHECKLEFT_PROBE_TIMEOUT_SECONDS = 240
+
+# Once the probe above has (if needed) warmed the dispatch cache, the actual
+# `checkleft run` is a fast, already-built invocation -- the PR's own
+# measurements put it at 85-95s -- so this budget stays tight and meaningful
+# instead of being swallowed by a build it no longer has to pay for.
+CHECKLEFT_TIMEOUT_SECONDS = 150
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DELIMS = {"&&", "||", ";", "|", "&"}
@@ -1200,6 +1216,34 @@ def resolve_repobin(root):
     return shutil.which("repobin")
 
 
+def probe_repobin_checkleft(repobin):
+    """Confirm `repobin exec checkleft` can actually dispatch before the
+    gate trusts it for the real `run` invocation.
+
+    `repobin exec checkleft` builds checkleft with `bazel build` on a
+    dispatch-cache miss. If that build fails (a broken crate elsewhere in
+    the tree, a bazel toolchain problem, a missing REPOBIN.toml entry),
+    `repobin exec checkleft run` itself exits non-zero with nothing on
+    stdout -- indistinguishable, from the gate's point of view, from a
+    checkleft "internal error" -- so it would hard-block every push with no
+    BYPASS_ escape, for a failure that has nothing to do with the change
+    being pushed. `--version` is cheap (no CHECKS.yaml / VCS context
+    needed) and shares the same on-disk dispatch cache as `run`, so probing
+    with it first pays the build cost at most once and never twice.
+    """
+    try:
+        proc = subprocess.run(
+            [repobin, "exec", "checkleft", "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=CHECKLEFT_PROBE_TIMEOUT_SECONDS,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def resolve_checkleft_command(root):
     """Return the argv prefix that runs checkleft's `run` subcommand.
 
@@ -1211,13 +1255,18 @@ def resolve_checkleft_command(root):
     `cargo install checkleft`) that still runs and still exits non-zero,
     which fails the gate *closed* with "unknown implementation" errors
     for every check added since that build, rather than failing open.
+
+    The repobin path is only used once `probe_repobin_checkleft` confirms
+    it actually works -- a repobin whose underlying bazel dispatch is
+    broken falls through to the legacy resolution below instead of taking
+    the whole push gate down with it.
     """
     override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
     if override:
         return [override] if os.path.exists(override) else None
 
     repobin = resolve_repobin(root)
-    if repobin:
+    if repobin and probe_repobin_checkleft(repobin):
         return [repobin, "exec", "checkleft"]
 
     candidate = os.path.join(root, "bin", "checkleft")
