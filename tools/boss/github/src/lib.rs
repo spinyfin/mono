@@ -204,7 +204,11 @@ fn github_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 /// the same time series as the `gh` ones without needing a `rateLimit`
 /// selection folded into the query — which a GraphQL *mutation* like
 /// `addProjectV2ItemById` could not carry anyway, `rateLimit` being a
-/// Query-root field.
+/// Query-root field. For the GraphQL bucket specifically, the headers
+/// only give `remaining`/`limit`/`reset` (the gauge); the true per-call
+/// point cost is not recoverable from them, so
+/// [`boss_gh_telemetry::parse_rate_limit_headers`] reports no cost for
+/// that bucket rather than inventing one.
 pub async fn send_instrumented(
     builder: reqwest::RequestBuilder,
     method: &str,
@@ -225,7 +229,7 @@ pub async fn send_instrumented(
         Err(_) => timer.finish_with(boss_gh_telemetry::GhOutcome::Error, None),
         Ok(resp) => {
             let rate_limit =
-                boss_gh_telemetry::parse_rate_limit_headers(|name| resp.headers().get(name)?.to_str().ok());
+                boss_gh_telemetry::parse_rate_limit_headers(api, |name| resp.headers().get(name)?.to_str().ok());
             let status = resp.status();
             // GitHub answers a REST rate-limit rejection with 403 or 429
             // *and* `x-ratelimit-remaining: 0`. Keying on the header as

@@ -70,7 +70,12 @@ impl GhOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimit {
     /// Points this specific query cost. The per-call attribution number.
-    pub cost: i64,
+    /// `None` when the reading has no real per-call cost to report — a
+    /// REST-header-derived reading for a GraphQL-over-HTTP call, whose
+    /// true point cost is not recoverable from `x-ratelimit-*` headers.
+    /// Inventing a value there would corrupt the very series this exists
+    /// to build; see [`crate::classify::parse_rate_limit_headers`].
+    pub cost: Option<i64>,
     /// Points left in the current hourly window after this call.
     pub remaining: i64,
     /// Total points in the window (5000 for a personal token).
@@ -113,7 +118,8 @@ pub struct GhCallSample {
 }
 
 impl GhCallSample {
-    /// Points this call cost, or 0 when no `rateLimit` block came back.
+    /// Points this call cost, or 0 when no `rateLimit` block came back, or
+    /// no per-call cost could be attributed to it.
     ///
     /// A GraphQL call with no reading is genuinely unknown, not free —
     /// it is counted as a call but contributes nothing to the points
@@ -121,6 +127,9 @@ impl GhCallSample {
     /// [`crate::classify::RATE_LIMIT_SELECTION`] is what keeps that
     /// undercount near zero.
     pub fn points(&self) -> u64 {
-        self.rate_limit.map(|rl| rl.cost.max(0) as u64).unwrap_or(0)
+        self.rate_limit
+            .and_then(|rl| rl.cost)
+            .map(|cost| cost.max(0) as u64)
+            .unwrap_or(0)
     }
 }

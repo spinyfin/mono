@@ -38,7 +38,9 @@ pub mod classify;
 pub mod sample;
 pub mod sink;
 
-pub use caller::{UNATTRIBUTED, callers, current as current_caller, scope, scope_blocking};
+pub use caller::{
+    UNATTRIBUTED, callers, current as current_caller, scope, scope_blocking, scope_blocking_if_unattributed,
+};
 pub use classify::{
     GhCallShape, RATE_LIMIT_SELECTION, classify_args, is_rate_limited, normalize_endpoint, parse_rate_limit,
     parse_rate_limit_headers,

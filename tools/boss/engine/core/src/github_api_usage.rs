@@ -153,20 +153,34 @@ pub(crate) fn record_metrics(registry: &Registry, sample: &GhCallSample) {
 
     match sample.rate_limit {
         Some(rl) => {
-            let points = sample.points();
-            registry.counter_inc_by_dynamic(
-                &format!("github_api.points.{caller}"),
-                "Quota units this subsystem spent (GraphQL points; REST requests).",
-                points,
-            );
-            // Only GraphQL points roll into the headline total — the two
-            // buckets are metered separately and a blended sum maps to no
-            // real budget.
+            // The gauge is meaningful even without a per-call cost (e.g. a
+            // GraphQL-over-HTTP call whose headers carry remaining/limit
+            // but not a recoverable point cost), so it updates regardless.
             if sample.api == GhApi::Graphql {
-                GITHUB_API_POINTS_TOTAL.inc_by(registry, points);
                 GITHUB_API_GRAPHQL_REMAINING.set(registry, rl.remaining);
             } else if sample.api == GhApi::Rest {
                 GITHUB_API_REST_REMAINING.set(registry, rl.remaining);
+            }
+            match rl.cost {
+                Some(_) => {
+                    let points = sample.points();
+                    registry.counter_inc_by_dynamic(
+                        &format!("github_api.points.{caller}.{api}"),
+                        "Quota units this subsystem spent against this API bucket.",
+                        points,
+                    );
+                    // Only GraphQL points roll into the headline total — the
+                    // two buckets are metered separately and a blended sum
+                    // maps to no real budget.
+                    if sample.api == GhApi::Graphql {
+                        GITHUB_API_POINTS_TOTAL.inc_by(registry, points);
+                    }
+                }
+                // A reading with no per-call cost is still an unattributed
+                // spend, not a free one — count it as unread so the gap is
+                // visible in `github_api.calls.without_reading` instead of
+                // silently landing as 0 points.
+                None => GITHUB_API_CALLS_WITHOUT_READING.inc(registry),
             }
         }
         None => GITHUB_API_CALLS_WITHOUT_READING.inc(registry),
@@ -194,7 +208,7 @@ pub(crate) fn row_for(sample: GhCallSample) -> GithubApiCallRow {
         endpoint: sample.endpoint,
         outcome: sample.outcome.as_str().to_owned(),
         duration_ms: sample.duration_ms,
-        points_cost: sample.rate_limit.map(|rl| rl.cost),
+        points_cost: sample.rate_limit.and_then(|rl| rl.cost),
         points_remaining: sample.rate_limit.map(|rl| rl.remaining),
         points_limit: sample.rate_limit.map(|rl| rl.limit),
         reset_at_ms: sample.rate_limit.and_then(|rl| rl.reset_at_ms),
@@ -297,7 +311,16 @@ mod tests {
 
     fn rl(cost: i64, remaining: i64) -> Option<RateLimit> {
         Some(RateLimit {
-            cost,
+            cost: Some(cost),
+            remaining,
+            limit: 5000,
+            reset_at_ms: Some(1_784_912_400_000),
+        })
+    }
+
+    fn rl_no_cost(remaining: i64) -> Option<RateLimit> {
+        Some(RateLimit {
+            cost: None,
             remaining,
             limit: 5000,
             reset_at_ms: Some(1_784_912_400_000),
@@ -322,9 +345,12 @@ mod tests {
             &sample("merge_poller.adaptive", GhApi::Graphql, GhOutcome::Ok, rl(2, 4972)),
         );
 
-        assert_eq!(registry.counter_value("github_api.points.merge_poller_sweep"), Some(26));
         assert_eq!(
-            registry.counter_value("github_api.points.merge_poller_adaptive"),
+            registry.counter_value("github_api.points.merge_poller_sweep.graphql"),
+            Some(26)
+        );
+        assert_eq!(
+            registry.counter_value("github_api.points.merge_poller_adaptive.graphql"),
             Some(2),
             "the two poller paths must not share a bucket — separating them is the point",
         );
@@ -340,10 +366,60 @@ mod tests {
         let registry = registry();
         record_metrics(&registry, &sample("ci_watch", GhApi::Rest, GhOutcome::Ok, rl(1, 4900)));
 
-        assert_eq!(registry.counter_value("github_api.points.ci_watch"), Some(1));
+        assert_eq!(registry.counter_value("github_api.points.ci_watch.rest"), Some(1));
         assert_eq!(registry.counter_value("github_api.points.total"), Some(0));
         assert_eq!(registry.gauge_value("github_api.rest.remaining"), Some(4900));
         assert_eq!(registry.gauge_value("github_api.graphql.remaining"), Some(0));
+    }
+
+    #[test]
+    fn points_bucket_separates_graphql_from_rest_for_the_same_caller() {
+        // external_tracker issues both `graphql` and `rest_get`/`rest_patch`
+        // calls through the same `execute_gh`; blending its GraphQL points
+        // and REST request count into one `github_api.points.<caller>`
+        // number would map to no real budget, exactly the objection this
+        // module raises against a blended `github_api.points.total`.
+        let registry = registry();
+        record_metrics(
+            &registry,
+            &sample("external_tracker", GhApi::Graphql, GhOutcome::Ok, rl(5, 4995)),
+        );
+        record_metrics(
+            &registry,
+            &sample("external_tracker", GhApi::Rest, GhOutcome::Ok, rl(1, 4999)),
+        );
+
+        assert_eq!(
+            registry.counter_value("github_api.points.external_tracker.graphql"),
+            Some(5)
+        );
+        assert_eq!(
+            registry.counter_value("github_api.points.external_tracker.rest"),
+            Some(1),
+            "REST request count must stay in its own bucket, not summed with GraphQL points",
+        );
+    }
+
+    #[test]
+    fn a_reading_with_no_cost_updates_the_gauge_but_counts_as_unread() {
+        // A GraphQL-over-HTTP call's headers give remaining/limit but not
+        // a recoverable per-call point cost — the gauge should still move,
+        // but the spend must show up as unattributed rather than as a
+        // silent 0.
+        let registry = registry();
+        record_metrics(
+            &registry,
+            &sample("external_tracker", GhApi::Graphql, GhOutcome::Ok, rl_no_cost(4_950)),
+        );
+
+        assert_eq!(registry.gauge_value("github_api.graphql.remaining"), Some(4_950));
+        assert_eq!(registry.counter_value("github_api.points.total"), Some(0));
+        assert_eq!(
+            registry.counter_value("github_api.points.external_tracker.graphql"),
+            None,
+            "no points counter should be created for a cost-less reading",
+        );
+        assert_eq!(registry.counter_value("github_api.calls.without_reading"), Some(1));
     }
 
     #[test]

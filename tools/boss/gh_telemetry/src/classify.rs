@@ -58,7 +58,18 @@ pub fn classify_args(args: &[&str]) -> GhCallShape {
                 endpoint: "graphql".to_owned(),
             };
         }
-        let method = explicit_method(args).unwrap_or("GET");
+        // `gh api` defaults to POST, not GET, as soon as any field flag is
+        // present — an explicit `-X`/`--method` still wins when given.
+        let method = explicit_method(args).unwrap_or_else(|| {
+            if args
+                .iter()
+                .any(|a| matches!(*a, "-f" | "-F" | "--field" | "--raw-field" | "--input"))
+            {
+                "POST"
+            } else {
+                "GET"
+            }
+        });
         return GhCallShape {
             api: GhApi::Rest,
             verb: format!("api {}", method.to_ascii_uppercase()),
@@ -190,7 +201,7 @@ fn is_hex_sha(segment: &str) -> bool {
 pub fn parse_rate_limit(body: &serde_json::Value) -> Option<RateLimit> {
     let node = body.get("data")?.get("rateLimit")?;
     Some(RateLimit {
-        cost: node.get("cost")?.as_i64()?,
+        cost: Some(node.get("cost")?.as_i64()?),
         remaining: node.get("remaining")?.as_i64()?,
         limit: node.get("limit")?.as_i64()?,
         reset_at_ms: node.get("resetAt").and_then(|v| v.as_str()).and_then(parse_rfc3339_ms),
@@ -204,19 +215,35 @@ pub fn parse_rate_limit(body: &serde_json::Value) -> Option<RateLimit> {
 /// this crate free of any HTTP-client dependency, so both the
 /// `reqwest`-based direct-API paths can share one parser.
 ///
-/// `cost` is 1: the REST bucket meters whole requests rather than
-/// points, and `x-ratelimit-used` is a running window total, not this
-/// call's share. Reporting 1 keeps "sum of cost over a window" a correct
-/// per-caller REST attribution instead of a meaningless sum of
-/// snapshots.
-pub fn parse_rate_limit_headers<'a>(lookup: impl Fn(&str) -> Option<&'a str>) -> Option<RateLimit> {
+/// For [`GhApi::Rest`], `cost` is `Some(1)`: the REST bucket meters whole
+/// requests rather than points, and `x-ratelimit-used` is a running
+/// window total, not this call's share. Reporting 1 keeps "sum of cost
+/// over a window" a correct per-caller REST attribution instead of a
+/// meaningless sum of snapshots.
+///
+/// For [`GhApi::Graphql`] — a GraphQL-over-HTTP call, since these headers
+/// come from a REST-style response envelope regardless of which bucket
+/// the request charged — `cost` is `None`: a GraphQL mutation's true
+/// point cost is not recoverable from `x-ratelimit-*` headers, and
+/// reporting `1` would invent a number that corrupts the very points
+/// series this instrumentation exists to build. `remaining`/`limit`/
+/// `reset_at_ms` are still meaningful (the gauge), so the reading is not
+/// dropped entirely — see [`crate::sample::GhCallSample::points`].
+pub fn parse_rate_limit_headers<'a>(
+    api: crate::sample::GhApi,
+    lookup: impl Fn(&str) -> Option<&'a str>,
+) -> Option<RateLimit> {
     let remaining: i64 = lookup("x-ratelimit-remaining")?.trim().parse().ok()?;
     let limit: i64 = lookup("x-ratelimit-limit")?.trim().parse().ok()?;
     let reset_at_ms = lookup("x-ratelimit-reset")
         .and_then(|v| v.trim().parse::<i64>().ok())
         .map(|secs| secs * 1000);
+    let cost = match api {
+        crate::sample::GhApi::Graphql => None,
+        crate::sample::GhApi::Rest | crate::sample::GhApi::Cli => Some(1),
+    };
     Some(RateLimit {
-        cost: 1,
+        cost,
         remaining,
         limit,
         reset_at_ms,
@@ -309,6 +336,27 @@ mod tests {
     }
 
     #[test]
+    fn field_flag_without_explicit_method_defaults_to_post() {
+        // `gh api` sends POST as soon as any field flag is given, even
+        // with no `-X`/`--method` — defaulting to GET here would silently
+        // mislabel the verb.
+        let shape = classify_args(&["api", "repos/o/r/issues/7/comments", "-f", "body=hi"]);
+        assert_eq!(shape.verb, "api POST");
+    }
+
+    #[test]
+    fn explicit_method_wins_over_the_field_flag_default() {
+        let shape = classify_args(&["api", "-X", "PATCH", "repos/o/r/issues/7", "-f", "state=closed"]);
+        assert_eq!(shape.verb, "api PATCH");
+    }
+
+    #[test]
+    fn no_flags_still_defaults_to_get() {
+        let shape = classify_args(&["api", "repos/o/r/pulls/42"]);
+        assert_eq!(shape.verb, "api GET");
+    }
+
+    #[test]
     fn classifies_porcelain_pr_view() {
         let shape = classify_args(&[
             "pr",
@@ -361,7 +409,7 @@ mod tests {
             } }
         });
         let rl = parse_rate_limit(&body).expect("full block parses");
-        assert_eq!(rl.cost, 3);
+        assert_eq!(rl.cost, Some(3));
         assert_eq!(rl.remaining, 4711);
         assert_eq!(rl.limit, 5000);
         // 2026-07-24T17:00:00Z
@@ -407,14 +455,14 @@ mod tests {
             ("x-ratelimit-used", "127"),
             ("x-ratelimit-reset", "1784912400"),
         ];
-        let rl = parse_rate_limit_headers(|name| {
+        let rl = parse_rate_limit_headers(GhApi::Rest, |name| {
             headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| *v)
         })
         .expect("REST headers parse");
-        assert_eq!(rl.cost, 1, "REST meters whole requests, not points");
+        assert_eq!(rl.cost, Some(1), "REST meters whole requests, not points");
         assert_eq!(rl.remaining, 4873);
         assert_eq!(rl.limit, 5000);
         assert_eq!(rl.reset_at_ms, Some(1_784_912_400_000));
@@ -422,7 +470,28 @@ mod tests {
 
     #[test]
     fn rest_headers_without_remaining_yield_none() {
-        assert_eq!(parse_rate_limit_headers(|_| None), None);
+        assert_eq!(parse_rate_limit_headers(GhApi::Rest, |_| None), None);
+    }
+
+    #[test]
+    fn graphql_over_http_headers_yield_no_cost() {
+        // A GraphQL mutation's true point cost is not recoverable from
+        // REST-style rate-limit headers — reporting cost:1 here would
+        // invent a number rather than leaving the undercount visible.
+        let headers = [
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "4873"),
+            ("x-ratelimit-reset", "1784912400"),
+        ];
+        let rl = parse_rate_limit_headers(GhApi::Graphql, |name| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| *v)
+        })
+        .expect("headers still parse");
+        assert_eq!(rl.cost, None);
+        assert_eq!(rl.remaining, 4873, "the gauge reading must still come through");
     }
 
     #[test]

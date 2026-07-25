@@ -261,8 +261,8 @@ pub(crate) fn record_rate_limit_remaining(remaining: i64, source: &str) {
 /// users of the same personal token like the `boss-release` job — not only
 /// the poller's own last batched probe.
 ///
-/// The batched probe already folds `rateLimit { remaining }` into its
-/// response ([`build_batch_query`]), but that only refreshes the budget
+/// The batched probe already folds [`boss_gh_telemetry::RATE_LIMIT_SELECTION`]
+/// into its response ([`build_batch_query`]), but that only refreshes the budget
 /// when the poller *itself* issues a query. Between two sweeps — and across
 /// the long Cold waits when little is moving — a sibling or the release job
 /// can drain the reserve invisibly, and the next sweep then fires its whole

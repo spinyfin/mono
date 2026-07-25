@@ -11,10 +11,8 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
-        "//tools/boss/bossctl:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/github:__pkg__",
-        "//tools/boss/github_tracker:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )

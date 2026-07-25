@@ -27,7 +27,7 @@
 //! boundary. A subsystem that spawns sub-tasks must set the scope
 //! inside each spawned task, or its calls fall back to
 //! [`UNATTRIBUTED`]. That fallback is deliberately visible: the
-//! `github_api.unattributed.calls` counter is the self-check that says
+//! `github_api.calls.unattributed` counter is the self-check that says
 //! the attribution has a hole in it, so a miss shows up as a number
 //! rather than as silently mis-attributed spend.
 
@@ -63,6 +63,22 @@ pub fn scope_blocking<R>(caller: &'static str, f: impl FnOnce() -> R) -> R {
     GH_CALLER.sync_scope(caller, f)
 }
 
+/// Like [`scope_blocking`], but only applies `caller` when nothing is
+/// already attributed. Use this at a shared helper's own entry point when
+/// the helper is sometimes reached directly (and should self-attribute)
+/// and sometimes reached from inside a caller's own [`scope`]/[`scope_blocking`]
+/// (whose label must win, since it is the more specific one). An
+/// unconditional [`scope_blocking`] here would instead override the
+/// caller's label for the whole nested call tree, diverting that spend
+/// out of the caller's own bucket.
+pub fn scope_blocking_if_unattributed<R>(caller: &'static str, f: impl FnOnce() -> R) -> R {
+    if current() == UNATTRIBUTED {
+        scope_blocking(caller, f)
+    } else {
+        f()
+    }
+}
+
 /// The subsystem currently attributed, or [`UNATTRIBUTED`] outside any
 /// scope.
 pub fn current() -> &'static str {
@@ -76,6 +92,15 @@ pub fn current() -> &'static str {
 /// so a reader can see every consumer of the shared token in one place.
 /// Labels use `a-z0-9._` only — they are embedded verbatim in metric
 /// names, which the registry validates against that charset.
+///
+/// This list is every subsystem that makes its *own* GitHub call. CI
+/// status and merge-conflict state are not on it: both `ci_watch` and
+/// `conflict_watch` (in `boss-engine`'s `ci_watch`/`conflict_watch`
+/// modules) only ever consume the `PrLifecycleProbe` the merge poller's
+/// sweep already fetched — they never shell out to `gh` themselves — so
+/// their spend is attributed to `callers::MERGE_POLLER_SWEEP` /
+/// `callers::MERGE_POLLER_ADAPTIVE`, the calls that actually produced the
+/// probe.
 pub mod callers {
     /// The 60s batched full sweep — one aliased GraphQL query covering
     /// every tracked PR.
@@ -94,10 +119,6 @@ pub mod callers {
     pub const MERGE_POLLER_MERGE_QUEUE: &str = "merge_poller.merge_queue";
     /// The Trunk merge-queue observer riding the poller's loop.
     pub const TRUNK_QUEUE_POLLER: &str = "trunk_queue_poller";
-    /// CI status/check polling.
-    pub const CI_WATCH: &str = "ci_watch";
-    /// Merge-conflict detection.
-    pub const CONFLICT_WATCH: &str = "conflict_watch";
     /// The on-Stop worker-completion path (PR detection/binding).
     pub const COMPLETION: &str = "completion";
     /// `gh pr merge --auto` and its state confirmation.
@@ -165,6 +186,21 @@ mod tests {
         // this exists for can run off any thread, with or without a
         // runtime.
         assert_eq!(scope_blocking("pr_state_check", current), "pr_state_check");
+        assert_eq!(current(), UNATTRIBUTED, "must not leak past the closure");
+    }
+
+    #[test]
+    fn if_unattributed_variant_yields_to_an_already_active_scope() {
+        // Called from inside a caller's own scope (e.g. the merge poller
+        // sweep calling into a shared checker): the caller's label must
+        // win, not be overridden.
+        let observed = scope_blocking("outer", || scope_blocking_if_unattributed("inner", current));
+        assert_eq!(observed, "outer");
+    }
+
+    #[test]
+    fn if_unattributed_variant_applies_its_own_label_outside_any_scope() {
+        assert_eq!(scope_blocking_if_unattributed("inner", current), "inner");
         assert_eq!(current(), UNATTRIBUTED, "must not leak past the closure");
     }
 

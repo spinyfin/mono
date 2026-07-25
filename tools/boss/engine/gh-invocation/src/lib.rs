@@ -158,6 +158,17 @@ static CUBE_PR_CREATE_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("cube pr create regex compiles")
 });
 
+/// Matches a `gh` invocation as a real command token: at the start, after
+/// any number of `VAR=value` env-assignment prefixes, or after a shell
+/// delimiter. Mirrors [`GH_INVOCATION_RE`]'s prefix but does not require a
+/// `pr`/`issue` noun, since [`is_editorial_candidate`] widens to every `gh`
+/// subcommand. Anchoring on the token prevents words that merely end in
+/// "gh" (`through `, `enough `, `high `) from matching a bare
+/// `.contains("gh ")` substring check.
+static GH_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*gh\s").expect("gh token regex compiles")
+});
+
 /// Returns `true` when `command` is a PR-creating `cube pr` invocation
 /// (`cube pr create` or the deprecated `cube pr ensure` alias).
 ///
@@ -177,19 +188,21 @@ pub fn is_cube_pr_create(command: &str) -> bool {
 /// Fast pre-filter for the editorial PreToolUse audit path. Returns `true`
 /// for any `gh` invocation, and for a PR-creating `cube pr {create,ensure}`.
 ///
-/// This is a cheap substring check; the heavier [`classify`] /
+/// This is a cheap regex check ([`GH_TOKEN_RE`]); the heavier [`classify`] /
 /// [`is_cube_pr_create`] parsing follows only when this returns `true`.
 ///
 /// # It gates recording, not verdicts
 ///
-/// The `gh` arm is deliberately just `gh ` — not `gh ` *and* ` pr `/
-/// ` issue ` as it once was. The narrower form left a measurable blind
+/// The `gh` arm is deliberately just "any `gh` token" — not `gh` *and*
+/// ` pr `/` issue ` as it once was. The narrower form left a measurable blind
 /// spot: on 2026-07-24, 302 of 1,545 worker `gh` invocations (~19.5%)
 /// never reached `editorial_actions` at all, 265 of them `gh api` calls
 /// that landed in the log only when their path happened to contain the
 /// literal ` pr `. Since these rows are the only per-command record of
 /// what workers spend against the GitHub API, that gap made ~a fifth of
-/// worker traffic unattributable.
+/// worker traffic unattributable. Widening it to a bare `gh` token still
+/// requires `gh` to begin a shell token (see [`GH_TOKEN_RE`]), so words
+/// that merely end in "gh" (`through `, `enough `, `high `) do not match.
 ///
 /// Widening this predicate cannot change any editorial *verdict*. The
 /// caller inserts a row for every candidate regardless of outcome, but
@@ -200,7 +213,7 @@ pub fn is_cube_pr_create(command: &str) -> bool {
 /// no body or title to inspect and fails open to `allow`. The effect is
 /// strictly "more is recorded", never "more is blocked or rewritten".
 pub fn is_editorial_candidate(command: &str) -> bool {
-    command.contains("gh ")
+    GH_TOKEN_RE.is_match(command)
         || (command.contains("cube ")
             && command.contains(" pr ")
             && (command.contains("create") || command.contains("ensure")))
@@ -416,6 +429,19 @@ mod tests {
             "jj describe -m 'msg'",
             "bazel test //tools/boss/...",
             "cube pr update --branch b",
+        ] {
+            assert!(!is_editorial_candidate(command), "{command} must not be a candidate");
+        }
+    }
+
+    #[test]
+    fn rejects_words_merely_ending_in_gh() {
+        for command in [
+            "jj describe -m 'route this through the shared helper'",
+            "rg 'enough ' src/",
+            "echo thorough review",
+            "echo high priority",
+            "echo walkthrough notes",
         ] {
             assert!(!is_editorial_candidate(command), "{command} must not be a candidate");
         }
