@@ -631,8 +631,11 @@ pub(super) fn workspace_push(
     )?;
 
     // Same push gate `cube pr push` runs before landing an agent/engine-
-    // authored diff on a PR branch.
-    run_checkleft_gate(&cwd)?;
+    // authored diff on a PR branch. No PR body to pass: the PR for
+    // `boss_branch` already exists at this point, so checkleft resolves the
+    // real description itself via its branch/PR-number lookup — see
+    // `cube pr update`'s equivalent call for the full rationale.
+    run_checkleft_gate(&cwd, None)?;
 
     // jj's own tracked remote-bookmark state (refreshed by callers via `cube
     // workspace goto`/`rebase`'s fetch) is the compare-and-swap token here —

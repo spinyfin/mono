@@ -2,6 +2,7 @@ use super::checkleft_tests::CheckleftEnvGuard;
 use super::support::ENV_MUTEX;
 use super::support::{ExpectedCommand, FakeRunner};
 use clap::Parser;
+use tempfile::TempDir;
 
 use crate::cli::Cli;
 
@@ -1208,4 +1209,43 @@ fn pr_number_from_url_returns_none_for_non_numeric_suffix() {
         crate::app::pr::pr_number_from_url("https://github.com/owner/repo/pull/"),
         None
     );
+}
+
+fn pr_create_args(body: Option<&str>, body_file: Option<&str>) -> crate::cli::PrCreateArgs {
+    crate::cli::PrCreateArgs {
+        branch: None,
+        title: None,
+        body: body.map(str::to_string),
+        body_file: body_file.map(str::to_string),
+        draft: false,
+    }
+}
+
+#[test]
+fn resolve_pr_body_uses_inline_body_flag() {
+    let args = pr_create_args(Some("PR body text"), None);
+    let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
+    assert_eq!(resolved.text.as_deref(), Some("PR body text"));
+    assert_eq!(resolved.file_path, None);
+}
+
+#[test]
+fn resolve_pr_body_reads_body_file_from_regular_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("body.md");
+    std::fs::write(&path, "body from file\n").unwrap();
+
+    let path_str = path.to_str().unwrap();
+    let args = pr_create_args(None, Some(path_str));
+    let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
+    assert_eq!(resolved.text.as_deref(), Some("body from file\n"));
+    assert_eq!(resolved.file_path.as_deref(), Some(path_str));
+}
+
+#[test]
+fn resolve_pr_body_is_none_when_neither_flag_supplied() {
+    let args = pr_create_args(None, None);
+    let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
+    assert_eq!(resolved.text, None);
+    assert_eq!(resolved.file_path, None);
 }

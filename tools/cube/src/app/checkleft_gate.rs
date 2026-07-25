@@ -25,9 +25,20 @@ use crate::app::stage::run_stage;
 /// is a no-op, but a clear warning is emitted to stderr so the skip is
 /// visible rather than silent. The only refusal is a checkleft that
 /// actually reported errors. Resolution order: see [`resolve_checkleft_bin`].
-pub(super) fn run_checkleft_gate(cwd: &Path) -> Result<()> {
+///
+/// `pr_description` is the PR body text this push is about to submit, when
+/// known (e.g. `cube pr create --body`/`--body-file`). It is exported to the
+/// checkleft subprocess as `CHECKS_PR_DESCRIPTION`, which checkleft honours
+/// at its highest precedence (see `resolve_pr_description` in
+/// `tools/checkleft/src/main.rs`) — without it, `changeset`-scope checks
+/// that read the PR description have nothing to scan at `pr create` time,
+/// because the PR does not exist yet and no CI env vars are set locally.
+/// Pass `None` when there is no PR body to check (e.g. `cube pr update` /
+/// `cube pr push`, where the PR already exists and checkleft's own
+/// branch→PR lookup resolves the real description).
+pub(super) fn run_checkleft_gate(cwd: &Path, pr_description: Option<&str>) -> Result<()> {
     run_stage("running checkleft push-gate", || {
-        run_checkleft_gate_impl(cwd, resolve_checkleft_bin(cwd))
+        run_checkleft_gate_impl(cwd, resolve_checkleft_bin(cwd), pr_description)
     })
 }
 
@@ -35,7 +46,11 @@ pub(super) fn run_checkleft_gate(cwd: &Path) -> Result<()> {
 /// emits a skip warning and returns `Ok(())` when `checkleft` is `None`.
 /// Separated from [`run_checkleft_gate`] so tests can inject a pre-resolved
 /// binary without modifying global PATH.
-pub(super) fn run_checkleft_gate_impl(cwd: &Path, checkleft: Option<PathBuf>) -> Result<()> {
+pub(super) fn run_checkleft_gate_impl(
+    cwd: &Path,
+    checkleft: Option<PathBuf>,
+    pr_description: Option<&str>,
+) -> Result<()> {
     let Some(checkleft) = checkleft else {
         eprintln!(
             "cube: checkleft not found via CUBE_CHECKLEFT_BIN, {}/bin/checkleft, or PATH \
@@ -45,11 +60,19 @@ pub(super) fn run_checkleft_gate_impl(cwd: &Path, checkleft: Option<PathBuf>) ->
         return Ok(());
     };
 
-    let output = std::process::Command::new(&checkleft)
-        .arg("run")
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .output();
+    let mut command = std::process::Command::new(&checkleft);
+    command.arg("run").current_dir(cwd).stdin(std::process::Stdio::null());
+    if let Some(pr_description) = pr_description {
+        command.env("CHECKS_PR_DESCRIPTION", pr_description);
+    } else {
+        // Explicitly clear rather than merely not-setting: without this, the
+        // subprocess would inherit whatever CHECKS_PR_DESCRIPTION happens to
+        // be set in cube's own environment (e.g. left over from a wrapper or
+        // an earlier step), silently overriding checkleft's own branch->PR
+        // lookup instead of falling through to it as documented.
+        command.env_remove("CHECKS_PR_DESCRIPTION");
+    }
+    let output = command.output();
     let output = match output {
         Ok(output) => output,
         // Could not execute checkleft at all — fail open rather than block

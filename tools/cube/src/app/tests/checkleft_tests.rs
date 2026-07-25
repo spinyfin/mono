@@ -112,7 +112,7 @@ fn checkleft_gate_is_skipped_when_no_checkleft_anywhere() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _env = CheckleftEnvGuard::with_path(std::ffi::OsStr::new(""));
     assert!(
-        run_checkleft_gate(dir.path()).is_ok(),
+        run_checkleft_gate(dir.path(), None).is_ok(),
         "gate must be a no-op when no checkleft binary is present anywhere",
     );
 }
@@ -123,7 +123,7 @@ fn checkleft_gate_proceeds_when_checkleft_clean() {
     write_fake_checkleft(dir.path(), 0, "checks: no findings");
     let checkleft = Some(dir.path().join("bin").join("checkleft"));
     assert!(
-        run_checkleft_gate_impl(dir.path(), checkleft).is_ok(),
+        run_checkleft_gate_impl(dir.path(), checkleft, None).is_ok(),
         "gate must proceed when checkleft exits 0",
     );
 }
@@ -133,8 +133,8 @@ fn checkleft_gate_refuses_with_findings_when_checkleft_fails() {
     let dir = TempDir::new().unwrap();
     write_fake_checkleft(dir.path(), 1, "error[rustfmt]: file needs formatting");
     let checkleft = Some(dir.path().join("bin").join("checkleft"));
-    let err =
-        run_checkleft_gate_impl(dir.path(), checkleft).expect_err("gate must refuse when checkleft exits non-zero");
+    let err = run_checkleft_gate_impl(dir.path(), checkleft, None)
+        .expect_err("gate must refuse when checkleft exits non-zero");
     let CubeError::InvalidArgument(msg) = err else {
         panic!("expected InvalidArgument, got {err:?}");
     };
@@ -179,7 +179,7 @@ fn checkleft_gate_uses_path_fallback_and_blocks_on_errors() {
     );
 
     // Gate execution is independent of PATH; inject the resolved binary.
-    let err = run_checkleft_gate_impl(workspace.path(), resolved)
+    let err = run_checkleft_gate_impl(workspace.path(), resolved, None)
         .expect_err("gate must block when PATH checkleft reports errors");
     let CubeError::InvalidArgument(msg) = err else {
         panic!("expected InvalidArgument, got {err:?}");
@@ -199,8 +199,8 @@ fn checkleft_gate_reports_internal_error_when_only_stderr() {
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_stderr_only(dir.path(), 1, "error: unsupported jj diff summary line: X some/file.rs");
     let checkleft = Some(dir.path().join("bin").join("checkleft"));
-    let err =
-        run_checkleft_gate_impl(dir.path(), checkleft).expect_err("gate must block when checkleft exits non-zero");
+    let err = run_checkleft_gate_impl(dir.path(), checkleft, None)
+        .expect_err("gate must block when checkleft exits non-zero");
     let CubeError::InvalidArgument(msg) = err else {
         panic!("expected InvalidArgument, got {err:?}");
     };
@@ -215,5 +215,82 @@ fn checkleft_gate_reports_internal_error_when_only_stderr() {
     assert!(
         msg.contains("unsupported jj diff summary line"),
         "message must include the stderr detail: {msg}",
+    );
+}
+
+/// Write an executable fake `checkleft` that echoes `CHECKS_PR_DESCRIPTION`
+/// (or "UNSET" when absent) to stdout, then exits 1 so the value shows up in
+/// the gate's refusal message.
+fn write_fake_checkleft_env_echo(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("checkleft");
+    let script = "#!/bin/sh\nprintf 'CHECKS_PR_DESCRIPTION=%s\\n' \"${CHECKS_PR_DESCRIPTION-UNSET}\"\nexit 1\n";
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+#[test]
+fn checkleft_gate_exports_pr_description_to_checkleft_subprocess() {
+    // The bug this closes: `cube pr create` runs the gate before the PR
+    // exists, so checkleft's own env/branch-lookup resolution can't find a
+    // description on its own. The gate must hand it the exact body cube is
+    // about to submit via CHECKS_PR_DESCRIPTION — checkleft already honours
+    // that env var at its highest precedence.
+    let dir = TempDir::new().unwrap();
+    write_fake_checkleft_env_echo(dir.path());
+    let checkleft = Some(dir.path().join("bin").join("checkleft"));
+    let err = run_checkleft_gate_impl(dir.path(), checkleft, Some("PR body mentioning T1234"))
+        .expect_err("fake checkleft always exits 1");
+    let CubeError::InvalidArgument(msg) = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert!(
+        msg.contains("CHECKS_PR_DESCRIPTION=PR body mentioning T1234"),
+        "checkleft subprocess must see the resolved PR body via CHECKS_PR_DESCRIPTION: {msg}",
+    );
+}
+
+#[test]
+fn checkleft_gate_leaves_pr_description_unset_when_none() {
+    // Callers with no PR body to check (cube pr update / pr push) must not
+    // fabricate one — checkleft falls through to its own branch/PR-number
+    // resolution in that case. Deliberately set an ambient
+    // CHECKS_PR_DESCRIPTION in cube's own process env first: `None` must
+    // actively clear it for the subprocess, not merely skip setting it —
+    // otherwise the subprocess would inherit this stale ambient value.
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let prior = std::env::var("CHECKS_PR_DESCRIPTION").ok();
+    // SAFETY: ENV_MUTEX is held for the duration of this mutation and its
+    // restoration below, serializing this against every other test that
+    // touches process env.
+    unsafe {
+        std::env::set_var("CHECKS_PR_DESCRIPTION", "stale ambient value that must not leak");
+    }
+
+    let dir = TempDir::new().unwrap();
+    write_fake_checkleft_env_echo(dir.path());
+    let checkleft = Some(dir.path().join("bin").join("checkleft"));
+    let result = run_checkleft_gate_impl(dir.path(), checkleft, None);
+
+    // SAFETY: see above.
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var("CHECKS_PR_DESCRIPTION", v),
+            None => std::env::remove_var("CHECKS_PR_DESCRIPTION"),
+        }
+    }
+
+    let err = result.expect_err("fake checkleft always exits 1");
+    let CubeError::InvalidArgument(msg) = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert!(
+        msg.contains("CHECKS_PR_DESCRIPTION=UNSET"),
+        "gate must clear an ambient CHECKS_PR_DESCRIPTION when no PR body was given, not \
+         inherit it: {msg}",
     );
 }
