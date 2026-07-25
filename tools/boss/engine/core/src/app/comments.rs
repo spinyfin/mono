@@ -12,6 +12,8 @@ use boss_protocol::{
     THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
 };
 
+use crate::utility_model::UtilityTask;
+
 /// Design § "Buckets 1 & 3 — unified" example nudge text.
 const NUDGE_BODY: &str = "This looks like it wants a doc change — click [Revise] to start one.";
 
@@ -83,28 +85,32 @@ fn spawn_comment_classifier(
     let artifact_id = comment.artifact_id.clone();
 
     tokio::spawn(async move {
-        let Some(api_key) = crate::comment_classifier::resolve_api_key() else {
-            tracing::debug!(
-                comment_id = %comment_id,
-                "comment intent classifier: no API key configured; recording terminal classification failure",
-            );
-            record_classification_failure(
-                &server_state,
-                &work_db,
-                &session_id,
-                &request_id,
-                &ClassifiedCommentRef {
-                    comment_id: &comment_id,
-                    artifact_kind: &artifact_kind,
-                    artifact_id: &artifact_id,
-                },
-                "no API key configured",
-            )
-            .await;
-            return;
+        let call = match server_state.utility_model.resolve(UtilityTask::CommentIntent) {
+            Ok(call) => call,
+            Err(err) => {
+                tracing::debug!(
+                    comment_id = %comment_id,
+                    %err,
+                    "comment intent classifier: no utility-model credential; recording terminal classification failure",
+                );
+                record_classification_failure(
+                    &server_state,
+                    &work_db,
+                    &session_id,
+                    &request_id,
+                    &ClassifiedCommentRef {
+                        comment_id: &comment_id,
+                        artifact_kind: &artifact_kind,
+                        artifact_id: &artifact_id,
+                    },
+                    "no utility-model credential configured",
+                )
+                .await;
+                return;
+            }
         };
 
-        match crate::comment_classifier::classify(&api_key, &body, &anchor).await {
+        match crate::comment_classifier::classify(&call, &body, &anchor).await {
             Ok(result) => match work_db.set_comment_intent(&comment_id, &result.intent, result.confidence) {
                 Ok(classified) => {
                     // Buckets 1&3 (P2b): nudge the operator toward a revision
@@ -685,12 +691,16 @@ fn spawn_followup_classifier(
     comment: &WorkComment,
     followup_body: &str,
 ) {
-    let Some(api_key) = crate::comment_classifier::resolve_api_key() else {
-        tracing::debug!(
-            comment_id = %comment.id,
-            "follow-up classifier: no API key configured; comment stays in awaiting_followup state",
-        );
-        return;
+    let call = match server_state.utility_model.resolve(UtilityTask::CommentIntent) {
+        Ok(call) => call,
+        Err(err) => {
+            tracing::debug!(
+                comment_id = %comment.id,
+                %err,
+                "follow-up classifier: no utility-model credential; comment stays in awaiting_followup state",
+            );
+            return;
+        }
     };
     let server_state = server_state.clone();
     let work_db = work_db.clone();
@@ -702,7 +712,7 @@ fn spawn_followup_classifier(
     tokio::spawn(async move {
         let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
         let result = crate::comment_classifier::classify_followup(
-            &api_key,
+            &call,
             &comment.body,
             &comment.anchor,
             &thread,

@@ -78,6 +78,7 @@ rust_library(
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/engine/transient-error",
+        "//tools/boss/engine/utility-model",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/worker-policy",
         "//tools/boss/github",

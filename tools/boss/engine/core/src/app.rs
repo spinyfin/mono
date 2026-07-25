@@ -279,17 +279,17 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
             tracing::debug!(slot_id, "start_live_status_slot: ServerState already dropped",);
             return;
         };
-        // Snapshot the API key once at slot start — picking it up
-        // lazily inside the task would require sharing the config or
-        // a closure, and the key doesn't change for the worker's
-        // lifetime anyway.
-        let api_key = arc_self.anthropic_api_key.clone();
+        // Hand the slot the engine's utility-model provider rather than a
+        // bare key: the provider owns endpoint, model and credential together,
+        // and is resolved once at startup for the same reason the key used to
+        // be snapshotted here — none of it changes for the worker's lifetime.
+        let utility = arc_self.utility_model.clone();
         let broadcaster: Arc<dyn LiveStatusBroadcaster> = arc_self.clone();
         let resolver: Arc<dyn TranscriptPathResolver> = arc_self.clone();
         self.live_status_manager.start_slot(
             slot_id,
             run_id.to_owned(),
-            api_key,
+            utility,
             self.live_worker_states.clone(),
             broadcaster,
             resolver,
@@ -500,10 +500,20 @@ struct ServerState {
     /// denies rather than an indefinite block).
     editorial_deny_tracker: Arc<crate::editorial_hook::DenyTracker>,
     /// Snapshot of the Anthropic API key captured at engine startup.
-    /// Used by the live-status summarizer for the per-slot task; the
-    /// pane-titlebar summarizer continues to resolve the key
-    /// per-spawn via `cfg.agent()`.
+    /// Reported (as a presence bit only) by the health verb and the
+    /// live-status debug verb. The engine's own inference calls no longer
+    /// read it directly — they go through [`Self::utility_model`], which is
+    /// seeded from this same snapshot.
     anthropic_api_key: Option<String>,
+    /// Where the engine's *own* short inference calls — live status, pane
+    /// title, attentions backstop, comment intent, Planner — get their
+    /// endpoint, model and credential.
+    ///
+    /// An orthogonal axis to any work item's driver, configured independently
+    /// (`BOSS_UTILITY_MODEL_PROVIDER`): a work item dispatched on a non-Claude
+    /// driver still gets its live status summarised by whatever this points
+    /// at. See `boss_engine_utility_model`'s crate docs.
+    utility_model: Arc<dyn crate::utility_model::UtilityModel>,
     /// Live pool sizes clamped at engine startup. Pushed to the macOS
     /// app as `EnginePoolConfig` on every `RegisterAppSession` so the
     /// app's `WorkersWorkspaceModel` slot ranges always mirror the
@@ -714,21 +724,33 @@ impl ServerState {
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
-        // One-time startup signal so the missing-API-key case is
+        // Resolve the engine's own inference provider once, here, and install
+        // it process-wide so paths too deep to thread a handle through (the
+        // attentions backstop, reached from the completion handler with only a
+        // `&WorkDb`) reach the same one. `utility_model()` logs which provider
+        // it picked and why, including the fall-back-to-default case.
+        let utility_model = cfg.utility_model();
+        crate::utility_model::install(utility_model.clone());
+        // One-time startup signal so the missing-credential case is
         // immediately visible in engine stderr — the chore calls out
         // that the summarizer used to drop this silently and the user
         // wants to confirm it's not the failure mode they're hitting.
         // Logged at `info` for the happy path so a `grep "live_status:"`
-        // sweep still shows the engine made a decision.
-        if anthropic_api_key.is_some() {
-            tracing::info!("live_status: ANTHROPIC_API_KEY is configured; summarizer enabled",);
-        } else {
-            tracing::error!(
-                "live_status: ANTHROPIC_API_KEY is NOT configured — \
+        // sweep still shows the engine made a decision. Asked of the
+        // provider rather than of the raw env var, so an operator who has
+        // pointed the summarizer somewhere else gets a truthful answer.
+        match utility_model.resolve(crate::utility_model::UtilityTask::LiveStatus) {
+            Ok(call) => tracing::info!(
+                provider = call.provider.as_str(),
+                model = call.model.as_str(),
+                "live_status: utility model resolved; summarizer enabled",
+            ),
+            Err(err) => tracing::error!(
+                %err,
+                "live_status: no utility-model credential — \
                  every summarizer call will return no_api_key and no \
-                 worker will get a live_status sentence. Set it in the \
-                 engine's agent config or via env to enable.",
-            );
+                 worker will get a live_status sentence.",
+            ),
         }
         // Engine build identity, logged once at startup so the user
         // can grep `live_status:` and confirm which binary is live.
@@ -1097,6 +1119,7 @@ impl ServerState {
                 .staged_proposal_channel_errors(staged_proposal_channel_errors)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
                 .maybe_anthropic_api_key(anthropic_api_key)
+                .utility_model(utility_model)
                 .worker_pool_size(worker_pool_size)
                 .automation_pool_size(automation_pool_size)
                 .review_pool_size(review_pool_size)

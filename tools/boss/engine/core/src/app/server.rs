@@ -910,12 +910,12 @@ pub async fn serve_with_merge_probe(
     // poller starts, so the first design-PR merge it detects can enqueue a
     // populate. Held in a process-wide OnceLock so the merge-trigger hook —
     // deep in the poller's call chain with only a `&WorkDb` — can spawn the
-    // background pass without threading the api key through every signature.
-    // The api key is the same `ANTHROPIC_API_KEY`-sourced value the
-    // live-status summarizer uses; a `None` key degrades auto-populate to
+    // background pass without threading the provider through every signature.
+    // It is the same utility-model provider the live-status summarizer uses;
+    // a provider that resolves no credential degrades auto-populate to
     // "pointer set, tasks not auto-created" with an attention item.
     crate::populator::install(crate::populator::PopulatorConfig {
-        api_key: server_state.anthropic_api_key.clone(),
+        utility: server_state.utility_model.clone(),
         max_tasks: crate::populator::DEFAULT_MAX_TASKS,
         publisher: server_state.publisher.clone(),
     });

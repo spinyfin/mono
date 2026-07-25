@@ -60,6 +60,7 @@ use boss_protocol::{
 use crate::coordinator::ExecutionPublisher;
 use crate::materializer::Materializer;
 use crate::planner::{DecompositionAudit, PLANNER_MODEL, Planner, PlannerOutcome};
+use crate::utility_model::{UtilityModel, UtilityTask};
 use crate::work::{ClaimPlannerRunInput, PlannerRunPatch, WorkDb};
 use boss_design_doc_fetcher::{DocFetchOutcome, fetch_design_doc};
 use boss_engine_planner_validation::{ValidationResult, validate};
@@ -126,14 +127,23 @@ pub trait PopulatorSteps: Send + Sync {
     /// element of the return tuple is the decomposition-gate audit for this
     /// call (design brief: surface the gate's activity to the operator).
     async fn plan(&self, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit);
+
+    /// The model [`Self::plan`] will run on. Recorded on the `planner_runs`
+    /// audit row *before* the (slow) call, so it has to be askable separately
+    /// from making the call. Defaults to the pinned model, which is what every
+    /// test fake wants.
+    fn plan_model(&self) -> String {
+        PLANNER_MODEL.to_owned()
+    }
 }
 
-/// Production [`PopulatorSteps`]: real `gh api` fetch + real Anthropic call.
+/// Production [`PopulatorSteps`]: real `gh api` fetch + real utility-model call.
 pub struct LivePopulatorSteps {
-    /// Anthropic API key, captured from config at engine startup. `None`
-    /// degrades the plan step to [`PlannerOutcome::NoApiKey`] with no network
-    /// call, exactly as `live_status` degrades.
-    pub api_key: Option<String>,
+    /// The engine's utility-model provider, captured from config at engine
+    /// startup. A provider that resolves no credential degrades the plan step
+    /// to [`PlannerOutcome::NoApiKey`] with no network call, exactly as
+    /// `live_status` degrades.
+    pub utility: Arc<dyn UtilityModel>,
 }
 
 #[async_trait]
@@ -143,7 +153,19 @@ impl PopulatorSteps for LivePopulatorSteps {
     }
 
     async fn plan(&self, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
-        Planner::plan(self.api_key.as_deref(), input).await
+        Planner::plan(self.utility.as_ref(), input).await
+    }
+
+    /// Report the model the provider actually resolved, so the audit row is
+    /// truthful when an operator has overridden `BOSS_UTILITY_MODEL_PLANNER`.
+    /// Falls back to the pinned default when no credential resolves — the run
+    /// is about to fail anyway, and recording the default is more useful than
+    /// recording nothing.
+    fn plan_model(&self) -> String {
+        self.utility
+            .resolve(UtilityTask::Planner)
+            .map(|call| call.model)
+            .unwrap_or_else(|_| PLANNER_MODEL.to_owned())
     }
 }
 
@@ -687,7 +709,7 @@ impl Populator {
                 run_id,
                 PlannerRunPatch::builder()
                     .doc_ref(doc_ref_summary.clone())
-                    .model(PLANNER_MODEL)
+                    .model(steps.plan_model())
                     .input_summary(input_summary)
                     .build(),
             );
@@ -1045,13 +1067,13 @@ impl Populator {
 /// Startup-installed configuration for the auto-populate feature. Held in a
 /// process-wide [`OnceLock`] so the merge-trigger hook (deep in the poller's
 /// call chain, which only has a `&WorkDb`) can enqueue a populate without
-/// threading the api key, cap, and publisher through every poller signature.
+/// threading the provider, cap, and publisher through every poller signature.
 /// Contexts that never [`install`] it — the merge-poller unit tests, non-server
 /// callers — make [`enqueue_from_merge`] a no-op, so no test reaches the
 /// network.
 pub struct PopulatorConfig {
-    /// Anthropic API key captured from config at engine startup.
-    pub api_key: Option<String>,
+    /// The engine's utility-model provider, captured at engine startup.
+    pub utility: Arc<dyn UtilityModel>,
     /// Hard cap on tasks per populate.
     pub max_tasks: usize,
     /// The engine's shared event publisher (the same `Arc` handed to the
@@ -1085,7 +1107,7 @@ pub fn enqueue_from_merge(work_db: &WorkDb, ctx: PopulateContext) {
     };
     let db = work_db.clone();
     let steps = LivePopulatorSteps {
-        api_key: config.api_key.clone(),
+        utility: config.utility.clone(),
     };
     let max_tasks = config.max_tasks;
     let publisher = config.publisher.clone();

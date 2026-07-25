@@ -38,13 +38,16 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
+use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
 use crate::work::{WorkDb, WorkItem};
 use boss_protocol::ExecutionKind;
 
-/// Sonnet 4.6: latest released Sonnet at the time of writing — the
-/// design doc explicitly calls it out as the right speed/cost
-/// balance for this kind of micro-prompt.
-const SUMMARY_MODEL: &str = "claude-sonnet-4-6";
+// The model is no longer pinned here: it comes from the `UtilityModel`
+// provider via `UtilityTask::PaneSummary`, whose default is Sonnet 4.6 —
+// the design doc explicitly calls that out as the right speed/cost balance
+// for this kind of micro-prompt. An operator can retarget it
+// (`BOSS_UTILITY_MODEL_PANE_SUMMARY`) independently of any work item's driver.
+
 /// 60 tokens covers 3–7 words plus the rare case where Sonnet adds
 /// a stray article we'll strip back out. Tight enough that a runaway
 /// 20-word summary still gets cut off; loose enough that legitimate
@@ -210,7 +213,7 @@ pub fn derived_title_summary(kind: &ExecutionKind, task_name: &str) -> Option<Op
 /// falling through to Claude only on a miss or basis change. Errors
 /// are swallowed — this function never blocks worker spawn — and a
 /// `None` return tells the caller to display the run id as before.
-pub async fn get_or_generate(db: &WorkDb, api_key: Option<&str>, work_item: &WorkItem) -> Option<String> {
+pub async fn get_or_generate(db: &WorkDb, utility: &dyn UtilityModel, work_item: &WorkItem) -> Option<String> {
     let (name, description) = name_and_description(work_item);
     let basis = compute_basis(name, description);
     let id = item_id(work_item);
@@ -229,8 +232,8 @@ pub async fn get_or_generate(db: &WorkDb, api_key: Option<&str>, work_item: &Wor
         }
     }
 
-    if let Some(api_key) = api_key {
-        match claude_short_summary(api_key, name, description).await {
+    match utility.resolve(UtilityTask::PaneSummary) {
+        Ok(call) => match claude_short_summary(&call, name, description).await {
             Ok(summary) => {
                 if let Err(err) = db.set_pane_summary(id, &summary, &basis) {
                     tracing::warn!(
@@ -245,15 +248,17 @@ pub async fn get_or_generate(db: &WorkDb, api_key: Option<&str>, work_item: &Wor
                 tracing::warn!(
                     work_item_id = id,
                     ?err,
-                    "pane_summary: Claude call failed; returning None so UI uses task_title",
+                    "pane_summary: utility-model call failed; returning None so UI uses task_title",
                 );
             }
+        },
+        Err(err) => {
+            tracing::debug!(
+                work_item_id = id,
+                %err,
+                "pane_summary: no utility-model credential; returning None so UI uses task_title",
+            );
         }
-    } else {
-        tracing::debug!(
-            work_item_id = id,
-            "pane_summary: no ANTHROPIC_API_KEY in config; returning None so UI uses task_title",
-        );
     }
 
     None
@@ -312,18 +317,19 @@ fn build_prompt(name: &str, description: &str) -> String {
     prompt
 }
 
-/// Ask Claude for a short gerund summary via the shared [`crate::claude_client`]
-/// pipeline and pull the first text block out of the response. Errors are
-/// bucketed into `anyhow` because the caller (`get_or_generate`) only logs them.
-pub async fn claude_short_summary(api_key: &str, name: &str, description: &str) -> Result<String> {
+/// Ask for a short gerund summary via the shared [`crate::claude_client`]
+/// pipeline, addressed at whatever the [`UtilityModel`] provider resolved, and
+/// pull the first text block out of the response. Errors are bucketed into
+/// `anyhow` because the caller (`get_or_generate`) only logs them.
+pub async fn claude_short_summary(call: &UtilityCall, name: &str, description: &str) -> Result<String> {
     let request = MessagesRequest::builder()
-        .model(SUMMARY_MODEL)
+        .model(call.model.clone())
         .max_tokens(SUMMARY_MAX_TOKENS)
         .messages(vec![Message::user(build_prompt(name, description))])
         .build();
-    let config = CallConfig::new(SUMMARY_TIMEOUT);
+    let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(call.endpoint.clone());
 
-    let response = claude_client::send_messages(api_key, &request, &config).await?;
+    let response = claude_client::send_messages(&call.api_key, &request, &config).await?;
     let cleaned = clean_summary(response.first_text().unwrap_or_default());
     if cleaned.is_empty() {
         anyhow::bail!("anthropic returned an empty summary");
@@ -380,6 +386,13 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A provider that resolves no credential for any task, so
+    /// `get_or_generate` takes the no-credential branch without a network
+    /// call — the analogue of the `None` API key these tests used to pass.
+    fn keyless_utility() -> crate::utility_model::AnthropicUtilityModel {
+        crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)
+    }
 
     fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
         WorkItem::Task(
@@ -626,11 +639,11 @@ mod tests {
         let basis = compute_basis("Fix fencer scraper", "desc");
         db.set_pane_summary("task-1", "fixing fencer scraper", &basis).unwrap();
 
-        // No API key, but there IS a cache hit — the cached gerund
-        // summary is returned. Cache is checked before the key path,
-        // so a previously-computed gerund still surfaces even without
-        // an API key present on this spawn.
-        let summary = get_or_generate(&db, None, &item).await;
+        // No credential, but there IS a cache hit — the cached gerund
+        // summary is returned. Cache is checked before the provider is
+        // consulted, so a previously-computed gerund still surfaces even when
+        // the utility model is unconfigured on this spawn.
+        let summary = get_or_generate(&db, &keyless_utility(), &item).await;
         assert_eq!(summary.as_deref(), Some("fixing fencer scraper"));
     }
 
@@ -645,7 +658,7 @@ mod tests {
         // key, get_or_generate now returns None (the engine passes
         // the raw task name separately as task_title for the UI).
         let item = sample_task("task-1", "New Name Goes Here", "new desc");
-        let summary = get_or_generate(&db, None, &item).await;
+        let summary = get_or_generate(&db, &keyless_utility(), &item).await;
         assert_eq!(summary.as_deref(), None);
     }
 
@@ -658,7 +671,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let item = sample_task("task-1", "Show short task summary in agent pane", "");
-        let summary = get_or_generate(&db, None, &item).await;
+        let summary = get_or_generate(&db, &keyless_utility(), &item).await;
         assert_eq!(summary.as_deref(), None);
     }
 
@@ -681,19 +694,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let request = MessagesRequest::builder()
-            .model(SUMMARY_MODEL)
-            .max_tokens(SUMMARY_MAX_TOKENS)
-            .messages(vec![Message::user(build_prompt("name", "desc"))])
-            .build();
-        let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(format!("{}/v1/messages", server.uri()));
-        let response = claude_client::send_messages("test-key", &request, &config)
-            .await
-            .expect("mock success");
-        assert_eq!(response.first_text(), Some("fixing the pane titlebar"));
-        assert_eq!(
-            clean_summary(response.first_text().unwrap()),
-            "fixing the pane titlebar"
-        );
+        // Drive the real entry point through a provider pointed at the mock,
+        // so the endpoint/model/credential all come from the seam rather than
+        // from constants this test re-declares.
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
+        assert_eq!(call.model, UtilityTask::PaneSummary.default_model());
+
+        let summary = claude_short_summary(&call, "name", "desc").await.expect("mock success");
+        assert_eq!(summary, "fixing the pane titlebar");
     }
 }

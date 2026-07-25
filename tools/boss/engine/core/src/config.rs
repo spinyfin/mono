@@ -4,6 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
+use boss_engine_utility_model::{self as utility_model, UtilityModel};
+
 use crate::coordinator::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
 /// Environment override for the SQLite state database path.
@@ -363,6 +365,16 @@ impl AgentConfig {
 pub struct RuntimeConfig {
     pub work: WorkConfig,
     agent_cell: OnceLock<Arc<AgentConfig>>,
+    /// Lazily-resolved [`UtilityModel`] provider — where the engine's *own*
+    /// short inference calls (live status, pane title, attentions backstop,
+    /// comment intent, Planner) get their endpoint, model and credential.
+    ///
+    /// Deliberately a separate cell from `agent_cell`: the utility provider is
+    /// an orthogonal axis to any work item's driver, configured independently
+    /// (`BOSS_UTILITY_MODEL_PROVIDER`), so a work item on a non-Claude driver
+    /// still gets its live status summarised by whatever the engine is
+    /// pointed at. See `boss_engine_utility_model`'s crate docs.
+    utility_cell: OnceLock<Arc<dyn UtilityModel>>,
 }
 
 impl RuntimeConfig {
@@ -370,6 +382,7 @@ impl RuntimeConfig {
         Ok(Self {
             work: WorkConfig::load_from_env()?,
             agent_cell: OnceLock::new(),
+            utility_cell: OnceLock::new(),
         })
     }
 
@@ -378,7 +391,11 @@ impl RuntimeConfig {
         if let Some(agent) = agent {
             let _ = cell.set(Arc::new(agent));
         }
-        Self { work, agent_cell: cell }
+        Self {
+            work,
+            agent_cell: cell,
+            utility_cell: OnceLock::new(),
+        }
     }
 
     /// Return a copy of this config with `work` replaced, carrying over any
@@ -392,7 +409,15 @@ impl RuntimeConfig {
         if let Some(agent) = self.agent_cell.get() {
             let _ = cell.set(agent.clone());
         }
-        Self { work, agent_cell: cell }
+        let utility = OnceLock::new();
+        if let Some(provider) = self.utility_cell.get() {
+            let _ = utility.set(provider.clone());
+        }
+        Self {
+            work,
+            agent_cell: cell,
+            utility_cell: utility,
+        }
     }
 
     pub fn agent(&self) -> Result<Arc<AgentConfig>> {
@@ -404,6 +429,36 @@ impl RuntimeConfig {
         match self.agent_cell.set(arc.clone()) {
             Ok(()) => Ok(arc),
             Err(_) => Ok(self.agent_cell.get().expect("OnceLock set after failed insert").clone()),
+        }
+    }
+
+    /// The [`UtilityModel`] provider for the engine's own inference calls.
+    ///
+    /// Infallible on purpose — provider selection never fails, it falls back
+    /// visibly (see [`utility_model::select`]). A *missing credential* is
+    /// reported later, per task, by [`UtilityModel::resolve`], which is what
+    /// lets one feature work while another is unconfigured.
+    ///
+    /// The Anthropic provider is seeded with the already-loaded
+    /// `ANTHROPIC_API_KEY` snapshot so an in-process engine built via
+    /// [`Self::from_parts`] with an injected key resolves the same way a
+    /// production one does. A failure to load `AgentConfig` is not fatal here:
+    /// the provider falls back to reading the env var itself.
+    pub fn utility_model(&self) -> Arc<dyn UtilityModel> {
+        if let Some(provider) = self.utility_cell.get() {
+            return provider.clone();
+        }
+        let base_api_key = self.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        let selection = utility_model::select(base_api_key);
+        selection.log();
+        let provider = selection.provider;
+        match self.utility_cell.set(provider.clone()) {
+            Ok(()) => provider,
+            Err(_) => self
+                .utility_cell
+                .get()
+                .expect("OnceLock set after failed insert")
+                .clone(),
         }
     }
 }

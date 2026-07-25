@@ -49,6 +49,7 @@ members = [
   "tools/boss/engine/timer-wheel",
   "tools/boss/engine/transcript-tail",
   "tools/boss/engine/transient-error",
+  "tools/boss/engine/utility-model",
   "tools/boss/engine/utils",
   "tools/boss/trunk_auth",
   "tools/boss/trunk_client",

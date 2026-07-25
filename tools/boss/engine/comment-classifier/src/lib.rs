@@ -13,11 +13,13 @@
 //! the label.
 //!
 //! Mirrors `crate::attentions_detector`'s backstop-call shape (dedicated
-//! billing env var, JSON-only prompt, `serde_json` parse of the reply) —
+//! billing bucket, JSON-only prompt, `serde_json` parse of the reply) —
 //! this is a classification call, not a doc-rewrite call, so it has no need
-//! for length/diff sanity checks. Transport goes through the shared
-//! [`boss_claude_client`] pipeline like every other Claude call in the
-//! engine.
+//! for length/diff sanity checks. Where the call goes — endpoint, model and
+//! credential — comes from the engine's `UtilityModel` seam
+//! ([`boss_engine_utility_model`]), configured independently of any work
+//! item's driver; transport goes through the shared [`boss_claude_client`]
+//! pipeline like every other Claude call in the engine.
 
 use std::time::Duration;
 
@@ -26,13 +28,15 @@ use serde::Deserialize;
 use boss_protocol::{CommentAnchor, CommentThreadEntry, INTENT_QUESTION, INTENT_REVISION};
 
 use boss_claude_client::{self as claude_client, CallConfig, Message, MessagesRequest};
+use boss_engine_utility_model::UtilityCall;
 
-const CLASSIFIER_API_KEY_ENV: &str = "BOSS_INTENT_CLASSIFIER_API_KEY";
+// The model is no longer pinned here: it comes from the engine's
+// `UtilityModel` provider via `UtilityTask::CommentIntent`, whose default is
+// Haiku 4.5 — design § "Per-comment LLM cost/latency at scale" calls for "a
+// small/cheap model-appropriate call", matching the cheap-classification
+// precedent in `live_status.rs` / `attentions_detector.rs`. The provider also
+// still honours this feature's `BOSS_INTENT_CLASSIFIER_API_KEY` billing bucket.
 
-/// Haiku 4.5 — design § "Per-comment LLM cost/latency at scale" calls for
-/// "a small/cheap model-appropriate call"; matches the cheap-classification
-/// precedent in `live_status.rs` / `attentions_detector.rs`.
-const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
 /// The reply is one small JSON object; this is generous headroom.
 const CLASSIFIER_MAX_TOKENS: u32 = 200;
 /// Design § "The classifier": "a few-hundred-ms-to-low-seconds LLM round
@@ -50,13 +54,6 @@ const CLASSIFIER_MAX_ATTEMPTS: u32 = 3;
 /// background call, not on any request's critical path, so there's no need
 /// for backoff/jitter at this volume.
 const CLASSIFIER_RETRY_DELAY: Duration = Duration::from_secs(2);
-
-/// Resolves the API key for the classifier call: a dedicated billing-bucket
-/// env var, falling back to the shared `ANTHROPIC_API_KEY` — via the shared
-/// pipeline's resolver, same pattern as `crate::attentions_detector`.
-pub fn resolve_api_key() -> Option<String> {
-    claude_client::resolve_api_key(Some(CLASSIFIER_API_KEY_ENV))
-}
 
 /// The classifier's raw JSON reply shape.
 #[derive(Deserialize)]
@@ -154,15 +151,15 @@ shape: {{\"intent\": \"revision\"|\"question\", \"confidence\": \
 /// prompt, parse and validate the reply. Returns `Err(message)` on any
 /// failure (transport, non-2xx, malformed/invalid reply) — callers log and
 /// leave the comment's state unchanged; there is no retry in this phase.
-async fn call_classifier(api_key: &str, prompt: String) -> Result<Classification, String> {
+async fn call_classifier(call: &UtilityCall, prompt: String) -> Result<Classification, String> {
     let request = MessagesRequest::builder()
-        .model(CLASSIFIER_MODEL)
+        .model(call.model.clone())
         .max_tokens(CLASSIFIER_MAX_TOKENS)
         .messages(vec![Message::user(prompt)])
         .build();
-    let config = CallConfig::new(CLASSIFIER_TIMEOUT);
+    let config = CallConfig::new(CLASSIFIER_TIMEOUT).with_endpoint(call.endpoint.clone());
 
-    let response = claude_client::send_messages(api_key, &request, &config)
+    let response = claude_client::send_messages(&call.api_key, &request, &config)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -226,10 +223,10 @@ fn parse_classifier_reply(text: &str) -> Result<Classification, String> {
 /// exhausted — the caller (`spawn_comment_classifier` /
 /// `spawn_followup_classifier`) treats that as the terminal outcome rather
 /// than retrying further itself.
-async fn call_classifier_with_retries(api_key: &str, prompt: String) -> Result<Classification, String> {
+async fn call_classifier_with_retries(call: &UtilityCall, prompt: String) -> Result<Classification, String> {
     let mut last_err = String::new();
     for attempt in 1..=CLASSIFIER_MAX_ATTEMPTS {
-        match call_classifier(api_key, prompt.clone()).await {
+        match call_classifier(call, prompt.clone()).await {
             Ok(classification) => return Ok(classification),
             Err(err) => {
                 last_err = err;
@@ -244,22 +241,22 @@ async fn call_classifier_with_retries(api_key: &str, prompt: String) -> Result<C
 
 /// Make a classification call for a fresh top-level comment, retrying
 /// transient failures (see [`call_classifier_with_retries`]).
-pub async fn classify(api_key: &str, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
-    call_classifier_with_retries(api_key, build_prompt(body, anchor)).await
+pub async fn classify(call: &UtilityCall, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
+    call_classifier_with_retries(call, build_prompt(body, anchor)).await
 }
 
 /// Make a classification call for an operator's follow-up reply (P3c), with
 /// the original comment and the thread's prior turns as context, retrying
 /// transient failures (see [`call_classifier_with_retries`]).
 pub async fn classify_followup(
-    api_key: &str,
+    call: &UtilityCall,
     original_body: &str,
     anchor: &CommentAnchor,
     thread: &[CommentThreadEntry],
     followup_body: &str,
 ) -> Result<Classification, String> {
     call_classifier_with_retries(
-        api_key,
+        call,
         build_followup_prompt(original_body, anchor, thread, followup_body),
     )
     .await
