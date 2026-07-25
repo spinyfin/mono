@@ -532,13 +532,9 @@ dependencies = [
 name = "boss-engine-effort"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "bon",
  "boss-engine-driver",
- "boss-engine-structured-output",
  "boss-protocol",
- "serde_json",
 ]
 
 [[package]]
