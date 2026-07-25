@@ -156,15 +156,20 @@ pub fn hit_lines(hits: &[BossConstructHit]) -> Vec<String> {
 // hit lines stays here. See `boss_pr_review::render_boss_construct_sweep_block`.
 
 /// Pull the `pattern` value out of the named entry (e.g. `boss-work-item-id`)
-/// in the root `CHECKS.yaml`'s `boss-ism/pr-text-leakage` check, without
-/// pulling in a YAML parser dependency for one field. Handles both the
+/// anywhere in the root `CHECKS.yaml`, without pulling in a YAML parser
+/// dependency for one field. Resolves by the first `name: <name>` occurrence
+/// whose value ends exactly at the line terminator, so entry names must be
+/// exact whole-line matches across every check instance — a name that is a
+/// strict prefix of another entry's name (e.g. `boss-work-item-id` vs.
+/// `boss-work-item-id-floored`) does not collide, because the anchor search
+/// requires the trailing newline right after the name. Handles both the
 /// single-quoted scalar form (no escape processing beyond `''`, used by
 /// `boss-work-item-id`) and the double-quoted form with `\\`/`\"` escapes
 /// (used by the other patterns), returning the literal regex source in
 /// either case.
 #[cfg(test)]
 fn extract_pattern_from_checks_yaml_by_name(yaml: &str, name: &str) -> String {
-    let anchor = format!("name: {name}");
+    let anchor = format!("name: {name}\n");
     let anchor_pos = yaml
         .find(&anchor)
         .unwrap_or_else(|| panic!("root CHECKS.yaml must contain a `{name}` pattern entry"));
@@ -232,6 +237,11 @@ mod tests {
         let checks_yaml = include_str!(env!("BOSS_CHECKS_YAML"));
         let cases: &[(&str, &str, &str)] = &[
             ("boss-work-item-id", "see T339 for context", "T5Config is unrelated"),
+            (
+                "boss-work-item-id-floored",
+                "see T339 for context",
+                "2024-01-01T00:00:00 and P25/P75 and T5Config are unrelated",
+            ),
             (
                 "boss-operator-reference",
                 "the operator asked for this",
