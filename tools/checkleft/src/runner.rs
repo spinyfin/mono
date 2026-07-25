@@ -1491,6 +1491,7 @@ fn drop_excluded_findings(result: &mut CheckResult, exclusion: &ExclusionMatcher
 ///   added-line ranges. A file present in the changeset with zero added lines
 ///   (e.g. a content-identical rename) legitimately drops all its line findings.
 fn scope_findings_to_changed_lines(result: &mut CheckResult, changeset: &ChangeSet) {
+    let before = result.findings.len();
     result.findings.retain(|finding| {
         let Some(location) = &finding.location else {
             return true;
@@ -1498,11 +1499,19 @@ fn scope_findings_to_changed_lines(result: &mut CheckResult, changeset: &ChangeS
         let Some(line) = location.line else {
             return true;
         };
-        match changeset.file_diffs.get(location.path.as_path()) {
+        match changeset.changed_lines(location.path.as_path()) {
             None => true,
-            Some(diff) => diff.contains_added_line(line),
+            Some(ranges) => ranges.iter().any(|(start, end)| line >= *start && line <= *end),
         }
     });
+    let suppressed = before - result.findings.len();
+    if suppressed > 0 {
+        tracing::debug!(
+            check = %result.check_id,
+            suppressed,
+            "changed_lines_only suppressed findings on unchanged lines"
+        );
+    }
 }
 
 fn apply_policy_to_result(

@@ -98,14 +98,22 @@ pub(super) fn parse_file_diffs_from_git_patch(patch: &str) -> HashMap<PathBuf, P
             continue;
         }
 
-        if let Some(rest) = line.strip_prefix("--- ") {
-            current_effective_old_path = parse_patch_path(rest);
-            continue;
-        }
+        // The `--- `/`+++ ` file-header forms only occur between a `diff --git`
+        // line and the first `@@` hunk header; once inside a hunk body, a line
+        // starting with `--- `/`+++ ` is content (e.g. a deleted markdown rule or
+        // an added `++ ` comment), not a header, so these branches must not fire.
+        let in_hunk = new_line_counter.is_some();
 
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            current_effective_new_path = parse_patch_path(rest);
-            continue;
+        if !in_hunk {
+            if let Some(rest) = line.strip_prefix("--- ") {
+                current_effective_old_path = parse_patch_path(rest);
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                current_effective_new_path = parse_patch_path(rest);
+                continue;
+            }
         }
 
         if line.starts_with("@@") {
@@ -117,7 +125,7 @@ pub(super) fn parse_file_diffs_from_git_patch(patch: &str) -> HashMap<PathBuf, P
             continue;
         }
 
-        if line.starts_with('+') && !line.starts_with("+++") {
+        if line.starts_with('+') && (in_hunk || !line.starts_with("+++")) {
             current_delta.added_lines = current_delta.added_lines.saturating_add(1);
             if let Some(hunk) = current_hunks.last_mut() {
                 hunk.added_lines = hunk.added_lines.saturating_add(1);
@@ -135,7 +143,7 @@ pub(super) fn parse_file_diffs_from_git_patch(patch: &str) -> HashMap<PathBuf, P
             continue;
         }
 
-        if line.starts_with('-') && !line.starts_with("---") {
+        if line.starts_with('-') && (in_hunk || !line.starts_with("---")) {
             current_delta.removed_lines = current_delta.removed_lines.saturating_add(1);
             if let Some(hunk) = current_hunks.last_mut() {
                 hunk.removed_lines = hunk.removed_lines.saturating_add(1);
@@ -362,5 +370,79 @@ index 1111111..0000000
         assert_eq!(deleted.file_diff.hunks[0].old_start, 1);
         assert_eq!(deleted.file_diff.hunks[0].new_start, 0);
         assert!(deleted.file_diff.added_line_ranges.is_empty());
+    }
+
+    #[test]
+    fn removed_dashes_line_does_not_shift_added_line_ranges() {
+        // Deleting a line whose content is exactly `---` (a markdown horizontal
+        // rule / YAML frontmatter separator) becomes the patch line `----`, which
+        // starts with `---`. It must still be classified as a removal (by the
+        // in-hunk leading `-`), not mistaken for a `--- ` file header or folded
+        // into the context branch, or `added` would be reported one line early.
+        let diffs = parse_file_diffs_from_git_patch(
+            r#"
+diff --git a/notes.md b/notes.md
+index 0000000..1111111 100644
+--- a/notes.md
++++ b/notes.md
+@@ -1,3 +1,3 @@
+-title
+----
+ body
++added
+"#,
+        );
+
+        let diff = diffs.get(&PathBuf::from("notes.md")).expect("notes.md diff");
+        assert_eq!(diff.line_delta.added_lines, 1);
+        assert_eq!(diff.line_delta.removed_lines, 2);
+        // The added line is post-image line 2 (the `body` context line is
+        // post-image line 1); if the `----` removal were miscounted as context,
+        // this would come out as (3, 3) instead.
+        assert_eq!(diff.file_diff.added_line_ranges, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn added_plus_plus_line_is_not_mistaken_for_file_header() {
+        // Adding a line whose content is `++ foo` becomes the patch line
+        // `+++ foo`, which starts with `+++`. Inside a hunk body this must still
+        // be classified as an addition, not mistaken for a `+++ ` file header
+        // (which would silently mis-key `current_effective_new_path`).
+        let diffs = parse_file_diffs_from_git_patch(
+            r#"
+diff --git a/src/lib.rs b/src/lib.rs
+index 0000000..1111111 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,1 +1,2 @@
+ unchanged
++++ foo
+"#,
+        );
+
+        let diff = diffs.get(&PathBuf::from("src/lib.rs")).expect("src/lib.rs diff");
+        assert_eq!(diff.line_delta.added_lines, 1);
+        assert_eq!(diff.file_diff.added_line_ranges, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn deletion_only_hunk_has_no_added_line_ranges() {
+        let diffs = parse_file_diffs_from_git_patch(
+            r#"
+diff --git a/src/lib.rs b/src/lib.rs
+index 0000000..1111111 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,1 @@
+ kept
+-gone1
+-gone2
+"#,
+        );
+
+        let diff = diffs.get(&PathBuf::from("src/lib.rs")).expect("src/lib.rs diff");
+        assert_eq!(diff.line_delta.added_lines, 0);
+        assert_eq!(diff.line_delta.removed_lines, 2);
+        assert!(diff.file_diff.added_line_ranges.is_empty());
     }
 }

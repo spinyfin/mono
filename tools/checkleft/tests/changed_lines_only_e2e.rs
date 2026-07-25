@@ -88,6 +88,7 @@ impl ConfiguredCheck for TwoLineFindingCheck {
                 line: Some(line),
                 column: Some(1),
             }),
+            surface: None,
             remediations: Vec::new(),
             suggested_fix: None,
         };

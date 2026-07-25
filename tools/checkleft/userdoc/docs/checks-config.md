@@ -135,9 +135,9 @@ Keep/drop rules:
 
 - A finding with no `location` (check-level / `scope: changeset` findings) is always kept — it isn't anchored to a file, let alone a line.
 - A finding with a `location` but no `line` (a whole-file finding, e.g. `file/size`'s line-count violation) is always kept — line-scoping only narrows line-anchored findings, and a whole-file property has no changed-line region to test against.
-- A finding with `location.line: Some(n)` is kept iff `n` lies inside one of the file's PR-added line ranges (the file's diff hunks, precisely — not the wider `-U3` context git includes around each hunk).
+- A finding with `location.line: Some(n)` is kept iff `n` lies inside one of the file's PR-added line ranges (the file's `+` lines, precisely — not the wider `-U3` context git includes around each hunk).
 - If the changeset carries no diff data for a file at all (`--all` / whole-repo mode, which never computes hunks), `changed_lines_only` is a no-op for that file — there is no changed-line data available, so every finding is kept, exactly like the file-level scope check's own `--all` no-op.
-- A file present in the changeset but with zero added lines (for example, a rename with no content changes) legitimately produces no changed-line findings for that file when `changed_lines_only` is set — that is not a bug.
+- A file present in the changeset but with zero added lines (for example, a rename with no content changes, or an edit that only deletes lines) legitimately produces no changed-line findings for that file when `changed_lines_only` is set — that is not a bug.
 
 `changed_lines_only` defaults to `false`, so a check that does not set it behaves exactly as before — this is a strictly opt-in, additive filter. It only applies to the _detection_ side: fix application is unaffected, and a whole-file fix (e.g. a formatter rewrite) still rewrites the whole file even when its findings are filtered down to changed lines.
 

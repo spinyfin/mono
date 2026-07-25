@@ -374,6 +374,7 @@ fn changed_lines_finding_at_line(path: &str, line: Option<u32>) -> Finding {
             line,
             column: line.map(|_| 1),
         }),
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     }
@@ -432,6 +433,7 @@ fn changed_lines_filter_keeps_locationless_and_lineless_findings() {
                 severity: Severity::Error,
                 message: "check-level finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
