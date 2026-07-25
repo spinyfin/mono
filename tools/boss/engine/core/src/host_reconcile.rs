@@ -33,15 +33,26 @@
 //!
 //! Runs every [`DEFAULT_INTERVAL`] and fires immediately on boot, so a host
 //! disabled while the engine was down is drained at startup without waiting
-//! for the first interval.
+//! for the first interval. It also subscribes to [`Event::HostDisabled`] —
+//! published by [`crate::host_registry::WorkDb::set_host_enabled`] and
+//! [`crate::work::WorkDb::record_host_dispatch_failure`] on a genuine
+//! enabled → disabled transition — so a disable is drained immediately
+//! instead of waiting up to [`DEFAULT_INTERVAL`] for the next sweep tick.
+//! The periodic sweep remains the backstop: `run_one_pass` re-reads
+//! authoritative DB state every time (an event is a hint, never a command),
+//! so a dropped/missed event, a duplicate event, or the subscription's
+//! mailbox closing are all harmless — the next tick (or the immediate
+//! boot-time pass) still finds and drains the offline-host binding.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use boss_event_bus::{Event, Subscription};
 use boss_protocol::ExecutionKind;
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::sweep_loop::SweepOutcome;
 use crate::work::{HostBoundExecution, WorkDb};
 
 /// How often the host-reconcile sweep runs. Matches the other steady-state
@@ -77,33 +88,79 @@ impl crate::sweep_loop::SweepOutcome for HostReconcileOutcome {
     }
 }
 
-/// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
-/// Fires immediately on spawn so a host disabled while the engine was down
-/// is drained at boot.
+/// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
+/// also running an immediate out-of-band pass whenever `host_disabled`
+/// delivers an [`Event::HostDisabled`]. Fires immediately on spawn so a
+/// host disabled while the engine was down is drained at boot.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     cube_client: Arc<dyn CubeClient>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
+    host_disabled: Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let cube_client = Arc::clone(&cube_client);
-        let coordinator = Arc::clone(&coordinator);
-        let dispatch_events = Arc::clone(&dispatch_events);
-        async move {
-            let outcome = run_one_pass(work_db.as_ref(), cube_client.as_ref(), dispatch_events.as_ref()).await;
-            if outcome.reaped > 0 {
-                // A drain frees the work item's redundant-spawn blocker;
-                // kick the scheduler so the orphan-active sweep's fresh
-                // `ready` execution dispatches to a still-eligible host
-                // immediately instead of waiting for an opportunistic kick.
-                coordinator.kick();
+    tokio::spawn(async move {
+        let mut host_disabled = host_disabled;
+        // Once the bus itself is dropped (engine shutdown path in tests /
+        // process teardown) `recv` resolves to `None` forever; stop polling
+        // that arm so the loop doesn't spin, and rely solely on the
+        // periodic tick from then on.
+        let mut subscription_closed = false;
+        loop {
+            let outcome = one_pass(&work_db, cube_client.as_ref(), &coordinator, dispatch_events.as_ref()).await;
+            if outcome.has_activity() {
+                outcome.log();
             }
-            outcome
+
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                event = host_disabled.recv(), if !subscription_closed => {
+                    match event {
+                        Some(Event::HostDisabled { host_id }) => {
+                            tracing::debug!(
+                                host_id,
+                                "host reconcile: HostDisabled event received; running immediate pass",
+                            );
+                        }
+                        Some(_) => {
+                            tracing::warn!(
+                                "host reconcile: host_disabled subscription received an unexpected \
+                                 event kind (the subscribing filter should have excluded it)",
+                            );
+                        }
+                        None => {
+                            subscription_closed = true;
+                            tracing::warn!(
+                                "host reconcile: host_disabled subscription closed (event bus dropped) — \
+                                 HostDisabled events will no longer trigger an immediate pass; the periodic \
+                                 sweep remains the backstop",
+                            );
+                        }
+                    }
+                }
+            }
         }
     })
+}
+
+/// Run one pass and kick the coordinator if it drained anything. Shared by
+/// the periodic tick and the event-triggered immediate pass.
+async fn one_pass(
+    work_db: &WorkDb,
+    cube_client: &dyn CubeClient,
+    coordinator: &Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+) -> HostReconcileOutcome {
+    let outcome = run_one_pass(work_db, cube_client, dispatch_events).await;
+    if outcome.reaped > 0 {
+        // A drain frees the work item's redundant-spawn blocker; kick the
+        // scheduler so the orphan-active sweep's fresh `ready` execution
+        // dispatches to a still-eligible host immediately instead of
+        // waiting for an opportunistic kick.
+        coordinator.kick();
+    }
+    outcome
 }
 
 /// Run a single host-reconcile pass: drain every non-terminal execution
@@ -829,5 +886,121 @@ mod tests {
             !db.list_orphan_active_candidates(0).unwrap().contains(&wi),
             "a pending-review task must not be re-dispatched as an implementation"
         );
+    }
+
+    // ─── spawn_loop: event-driven immediate drain ──────────────────────────
+
+    /// `spawn_loop`'s periodic tick is pinned to a duration far longer than
+    /// this test's timeout, so any drain observed here must have been
+    /// triggered by the `HostDisabled` event, not the tick (nor the
+    /// boot-time immediate pass, which runs before the host is disabled and
+    /// so has nothing to drain).
+    const NO_TICK_WITHIN_TEST: Duration = Duration::from_secs(3600);
+
+    /// Poll `db` for `exec_id` to reach `Orphaned`, failing the test if it
+    /// doesn't within a short bound — the event-driven pass should be near-
+    /// instant, so this is just slack for scheduling jitter, not a real wait.
+    async fn wait_for_drain(db: &WorkDb, exec_id: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if db.get_execution(exec_id).unwrap().status == ExecutionStatus::Orphaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("execution must be drained shortly after HostDisabled publishes, without waiting for the tick");
+    }
+
+    /// Publishing `Event::HostDisabled` on the same bus `set_host_enabled`
+    /// uses in production must trigger an immediate drain pass — the whole
+    /// point of subscribing rather than relying solely on the periodic
+    /// sweep.
+    #[tokio::test]
+    async fn spawn_loop_drains_immediately_on_host_disabled_event() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "anaplian");
+        let wi = create_test_chore(&db, &product, "event-triggered").id;
+        let exec = running_execution_on_host(&db, &wi, "lease-evt", "anaplian");
+
+        let db = Arc::new(db);
+        let host_disabled = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::HostDisabled,
+        ));
+        let coordinator = crate::test_support::make_coordinator(db.clone(), 1);
+        let dispatch_events: Arc<dyn DispatchEventSink> = Arc::new(RecordingDispatchEventSink::new());
+        let cube: Arc<dyn CubeClient> = Arc::new(FakeCube::default());
+
+        let handle = spawn_loop(
+            db.clone(),
+            cube,
+            coordinator,
+            dispatch_events,
+            NO_TICK_WITHIN_TEST,
+            host_disabled,
+        );
+
+        // Host is still enabled at spawn time, so the immediate boot pass
+        // finds nothing to drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Running);
+
+        // This publishes `Event::HostDisabled` on `db.event_bus()` — the
+        // exact production path.
+        db.set_host_enabled("anaplian", false).unwrap();
+
+        wait_for_drain(&db, &exec).await;
+
+        handle.abort();
+    }
+
+    /// A second `HostDisabled` publish (or any other duplicate trigger) for
+    /// an already-drained host must not error or double-act: `run_one_pass`
+    /// re-reads authoritative DB state every time, so the repeat pass simply
+    /// finds nothing left to drain.
+    #[tokio::test]
+    async fn spawn_loop_is_idempotent_across_repeated_host_disabled_events() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "anaplian");
+        let wi = create_test_chore(&db, &product, "idempotent").id;
+        let exec = running_execution_on_host(&db, &wi, "lease-idem", "anaplian");
+
+        let db = Arc::new(db);
+        let host_disabled = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::HostDisabled,
+        ));
+        let coordinator = crate::test_support::make_coordinator(db.clone(), 1);
+        let dispatch_events: Arc<dyn DispatchEventSink> = Arc::new(RecordingDispatchEventSink::new());
+        let cube: Arc<dyn CubeClient> = Arc::new(FakeCube::default());
+
+        let handle = spawn_loop(
+            db.clone(),
+            cube,
+            coordinator,
+            dispatch_events,
+            NO_TICK_WITHIN_TEST,
+            host_disabled,
+        );
+
+        db.set_host_enabled("anaplian", false).unwrap();
+        wait_for_drain(&db, &exec).await;
+
+        // Simulate a duplicate/racing publish of the same fact (the real
+        // `set_host_enabled` guards against re-publishing on an already-
+        // disabled host, so publish directly to exercise the subscriber's
+        // own idempotency rather than that upstream guard).
+        db.event_bus().publish(Event::HostDisabled {
+            host_id: "anaplian".to_owned(),
+        });
+
+        // Give the extra pass time to run; the execution must stay exactly
+        // where the first drain left it (no re-terminalization, no panic).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Orphaned);
+
+        handle.abort();
     }
 }
