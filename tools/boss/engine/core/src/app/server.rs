@@ -1125,8 +1125,8 @@ pub async fn serve_with_merge_probe(
     // automation slots leak this way, automation dispatch wedges with no
     // self-healing. This sweep walks the pool's OWN claimed slots (not the
     // live-state registry) to close that gap. Runs every 60s and fires on
-    // boot so a pool wedged before a restart self-heals without an
-    // operator restart.
+    // boot so a pool wedged before a restart self-heals without needing a
+    // manual restart.
     let pool_claim_execution_terminal_events = server_state
         .event_bus
         .subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
@@ -1151,7 +1151,7 @@ pub async fn serve_with_merge_probe(
     // claims to the (failed) completion path. This sweep reaps such strands
     // via the same idempotent, run-id-keyed `release_worker_pane` teardown.
     // A pane whose own completion teardown is still running is skipped
-    // outright via the shared `teardown_registry` mark (two-pass
+    // outright via the shared `teardown_registry` mark (elapsed-time
     // confirmation on top of that, for anything unmarked), so an active
     // worker is never reaped. Runs every 60s.
     let terminal_work_execution_terminal_events = server_state

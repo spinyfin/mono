@@ -46,7 +46,7 @@
 //! this exact sweep every ~60s the whole time, and had to be stopped by
 //! hand. [`WorkDb::work_item_row_missing`] tells the two cases apart: a
 //! confirmed-missing row is treated as an orphan and reaped through the
-//! same two-pass path as the O'Brien case (`reason = "work_item_missing"`
+//! same elapsed-time path as the O'Brien case (`reason = "work_item_missing"`
 //! in the emitted [`DispatchEvent`]), while a lookup failure that can't be
 //! confirmed as "row gone" still falls back to the old conservative skip.
 //! Deletion is expected to tear its own live executions down synchronously
@@ -149,9 +149,10 @@ use crate::teardown_registry::{TeardownRegistry, TeardownState};
 use crate::work::WorkDb;
 
 /// How often the terminal-work reconciler runs. 60s mirrors the dead-pid,
-/// stale-worker, and pool-claim sweeps. Because reaping requires a
-/// candidate to persist across two consecutive passes, this interval also
-/// sets the minimum confirmation delay before a strand is reaped.
+/// stale-worker, and pool-claim sweeps. Because a candidate must be
+/// observed as terminal-and-live for at least this long (see
+/// `sweep_loop::confirm_after_delay`), this interval also sets the minimum
+/// confirmation delay before a strand is reaped.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
@@ -190,11 +191,11 @@ impl WorkerReaper for NoopWorkerReaper {
 /// Counts from one sweep pass; logged at `info` when any worker was reaped.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TerminalWorkSweepOutcome {
-    /// Stranded workers (terminal work item / execution, confirmed across
-    /// two passes) that were reaped this pass.
+    /// Stranded workers (terminal work item / execution, confirmed after
+    /// the elapsed-time delay) that were reaped this pass.
     pub reaped: usize,
-    /// Candidates seen terminal+live for the first time; held for one more
-    /// pass before any reap (two-pass confirmation).
+    /// Candidates seen terminal+live for the first time; held until the
+    /// confirmation delay has elapsed.
     pub pending_confirmation: usize,
     /// Live workers left alone because their work item and execution are
     /// both still non-terminal — the normal, healthy case.
@@ -242,6 +243,11 @@ impl crate::sweep_loop::SweepOutcome for TerminalWorkSweepOutcome {
 /// shorten the delay itself. The periodic tick remains the backstop: a
 /// dropped or coalesced event never leaves a strand unreconciled for longer
 /// than `interval`.
+// Every parameter is a distinct collaborator `run_one_pass` needs threaded
+// through unchanged (mirrors the precedent in `live_worker_state.rs` /
+// `spawn_ack_sweep.rs`); bundling them into a struct would only move the
+// field count, not reduce it.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -296,6 +302,9 @@ pub fn spawn_loop(
 /// [`DEFAULT_INTERVAL`] as `min_confirm_delay` in production; tests may pass
 /// a different value together with a paused [`tokio::time`] clock. Returns a
 /// summary; callers may log it.
+// See the `#[allow]` on `spawn_loop` above: each parameter is a distinct
+// collaborator, not incidental plumbing.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -367,7 +376,7 @@ pub async fn run_one_pass(
                     // row is confirmed gone (never existed, or soft-deleted
                     // by `delete_work_item`), not merely unreachable. This is
                     // an orphan, not a degraded-lookup skip — fall through to
-                    // the same two-pass reap path as a terminal work item.
+                    // the same elapsed-time reap path as a terminal work item.
                     Ok(true) => {
                         tracing::warn!(
                             run_id = %run_id,
@@ -449,7 +458,7 @@ pub async fn run_one_pass(
         }
 
         // This slot is a reap candidate this pass. Keyed on `run_id` for the
-        // shared two-pass confirmation helper.
+        // shared elapsed-time confirmation helper.
         candidates.push((
             run_id.clone(),
             ReapCandidate::builder()
@@ -588,7 +597,7 @@ pub async fn run_one_pass(
 /// A live worker slot that is a reap candidate this pass — its bound work
 /// item and/or its execution is terminal. Carries the fields the deferred
 /// per-candidate logging and reap side effects need, since the shared
-/// two-pass confirmation helper splits candidates into confirmed/pending
+/// elapsed-time confirmation helper splits candidates into confirmed/pending
 /// after the per-slot lookups have already been done.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -930,7 +939,7 @@ mod tests {
 
     /// The "Seven" regression: a live worker whose bound work item ROW WAS
     /// DELETED (soft-deleted out from under it, e.g. by `boss task delete`)
-    /// is reaped after two-pass confirmation, its execution is marked
+    /// is reaped after the confirmation delay, its execution is marked
     /// `orphaned` (not just torn down at the pane level), and the emitted
     /// event carries `reason = "work_item_missing"` — distinct from the
     /// O'Brien `work_item_terminal` case, since the row isn't merely
@@ -1145,9 +1154,9 @@ mod tests {
     }
 
     /// A worker that is terminal on pass 1 but whose status flips back to
-    /// active before pass 2 (a reopened task) is NOT reaped — the two-pass
-    /// guard re-checks current terminality each pass rather than trusting
-    /// stale memory.
+    /// active before pass 2 (a reopened task) is NOT reaped — the
+    /// confirmation guard re-checks current terminality each pass rather
+    /// than trusting stale memory.
     #[tokio::test]
     async fn does_not_reap_when_status_reverts_before_confirmation() {
         let (_dir, db, product_id) = setup();

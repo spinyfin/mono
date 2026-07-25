@@ -71,7 +71,7 @@
 //!
 //! Runs every [`DEFAULT_INTERVAL`] and fires once immediately on boot
 //! (same pattern as [`crate::dead_pid_sweep`]) so a pool left wedged by
-//! a crash self-heals at engine startup without an operator restart.
+//! a crash self-heals at engine startup without needing a manual restart.
 
 use std::collections::HashSet;
 use std::sync::Arc;
