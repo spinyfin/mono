@@ -462,7 +462,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
       - If the *output* is coordinator-only (e.g. "rescope these three rows", "mark these memories for deletion", "update the taxonomy"), the row is not filable at all, regardless of how the input is handled. Do it yourself.
     - **When reviewing a design doc's task list before dispatch** (whether you materialize it by hand or a planner does), walk every row against this test before it goes out: does its landing site — the place the deliverable actually lands — sit inside a repo, or inside coordinator-only state? A design doc can correctly *describe* a coordinator-only constraint (e.g. "the memory store must stop being a runbook") without every task derived from it being coordinator-filable — the doc stating the constraint is not the same as assigning an executor to each task, and it is the task list, not the doc, that must pass this gate.
 
-    (P3152 materialized six `project_task` rows — T3386, T3387, T3407–T3410 — whose entire deliverable was an action on the coordinator's private memory store. No cube worker could execute them; the coordinator ended up doing the substance in-session anyway, after the rows were filed and deleted. The design doc that spawned them was correct; the task list it was turned into skipped this gate.)
+    (This gate exists because a planner run once materialized six `project_task` rows whose entire deliverable was an action on the coordinator's private memory store. No cube worker could execute them; the coordinator ended up doing the substance in-session anyway. The design doc that spawned them was correct — the task list it was turned into skipped this gate.)
 
     ## Cross-repo work under a single-repo product
 

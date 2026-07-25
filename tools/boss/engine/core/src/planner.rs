@@ -734,26 +734,26 @@ shared root), which is a normal `dependent` edge.\n\
 other task — the deferral is a scheduling signal, not a different shape of \
 work.\n\
 \n\
-## coordinator-only landing site gate
-
+## coordinator-only landing site gate\n\
+\n\
 Every task you propose is dispatched to a cube worker, which leases a repo \
 workspace. A cube worker cannot read or write coordinator-private state: the \
 Boss coordinator's private memory store, the engine's runtime database, or \
 any artifact under the coordinator's local Application Support directory. A \
 task whose entire deliverable is an action on that state is unexecutable by \
-any worker, no matter how clearly it is briefed.
-
+any worker, no matter how clearly it is briefed.\n\
+\n\
 - **Never emit a `project_task` (or `investigation` task) whose landing \
 site is coordinator-only state.** Recognize this shape: \"update the \
 coordinator's memory/runbook store\", \"prune/mark memory notes for \
 deletion\", \"write to the runtime database\", \"update engine taxonomy \
 state directly\" — none of these land in a repo, so none are worker-filable, \
 even when the surrounding design doc's rationale is entirely legitimate.\n\
-- **Do not silently drop such an item either** — same rule as deferred \
-items above. Omit it from `tasks`, and instead add one line per omitted \
-item to `notes` describing the item and stating plainly that it is \
-coordinator-only work the coordinator must perform directly in-session, not \
-a task to dispatch.\n\
+- **Account for it visibly — never just leave it out.** Unlike a deferred \
+item (which still becomes a `[deferred] `-prefixed task), a coordinator-only \
+item must NOT be emitted as a task at all: omit it from `tasks` and add one \
+line per omitted item to `notes` describing the item and stating that it is \
+coordinator-only work the coordinator must perform directly in-session.\n\
 - A design doc can correctly *describe* a coordinator-only constraint (e.g. \
 \"the memory store must stop being a runbook\") without every task derived \
 from it being coordinator-only — judge each breakdown item on where ITS OWN \
@@ -762,7 +762,7 @@ coordinator state.\n\
 - When only PART of a breakdown item is coordinator-only (e.g. it also \
 touches a repo file), still emit the task but scope its `description` to \
 the repo-side portion only, and note in `notes` that the coordinator-only \
-portion was excluded and why.
+portion was excluded and why.\n
 
 ## task sizing contract — one reviewable PR per task\n\
 \n\
@@ -1090,6 +1090,16 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("[deferred] "));
         assert!(SYSTEM_PROMPT.contains("Do not gate in-scope work on a deferred task"));
         assert!(SYSTEM_PROMPT.contains("stretch goal"));
+    }
+
+    /// The coordinator-only landing site gate must survive edits to this
+    /// 200+ line literal: a cube worker cannot land work in coordinator-only
+    /// state, so such an item must never be emitted as a dispatchable task.
+    #[test]
+    fn system_prompt_encodes_coordinator_only_gate() {
+        assert!(SYSTEM_PROMPT.contains("coordinator-only landing site gate"));
+        assert!(SYSTEM_PROMPT.contains("whose landing site is coordinator-only state"));
+        assert!(SYSTEM_PROMPT.contains("coordinator must perform directly in-session"));
     }
 
     fn response_from(value: Value) -> MessagesResponse {
