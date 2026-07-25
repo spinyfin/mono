@@ -79,6 +79,23 @@ pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
 /// machinery) are gated by this flag.
 pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = true;
 
+/// Default value for [`WorkConfig::enable_dispatch_ready_bus`]. **OFF** by
+/// default. When on, [`crate::coordinator::ExecutionCoordinator::kick`]
+/// routes through the engine event bus (`Event::DispatchReady`) instead of
+/// latching `scheduling_pending`/`scheduling_active` directly, and a
+/// subscriber task re-enters that same double-latch on receipt. This is the
+/// first real producer/consumer wiring of the event bus (see
+/// `engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`)
+/// and is the highest-risk step in that migration — the flag exists so a
+/// bad interaction can be rolled back instantly via
+/// `BOSS_ENABLE_DISPATCH_READY_BUS=false` without a revert; `kick()`'s
+/// legacy direct-latch path stays in the binary unconditionally for exactly
+/// that purpose. The scheduler heartbeat (`spawn_scheduler_heartbeat`)
+/// keeps re-kicking every interval regardless of this flag, so even a
+/// dropped bus event (the bus is best-effort) self-heals within one
+/// heartbeat.
+pub const DEFAULT_ENABLE_DISPATCH_READY_BUS: bool = false;
+
 /// Default value for [`WorkConfig::coordinator_model`]. The Boss coordinator
 /// session (the macOS app's single always-on Claude Code pane) launches on
 /// this model unless overridden. Top-tier models are opt-in only: the
@@ -188,6 +205,13 @@ pub struct WorkConfig {
     /// dispatch event on trip — it just never calls `set_dispatch_paused`.
     #[builder(default = DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)]
     pub enable_spawn_capability_breaker: bool,
+    /// Whether the coordinator's `kick()` routes through the event bus
+    /// (`Event::DispatchReady`) instead of latching scheduling state
+    /// directly. OFF by default — see
+    /// [`DEFAULT_ENABLE_DISPATCH_READY_BUS`]. Configured via
+    /// `BOSS_ENABLE_DISPATCH_READY_BUS`.
+    #[builder(default = DEFAULT_ENABLE_DISPATCH_READY_BUS)]
+    pub enable_dispatch_ready_bus: bool,
     /// Model slug the Boss coordinator session launches with, pushed to the
     /// macOS app as `EnginePoolConfig.coordinator_model` on every
     /// `RegisterAppSession`. Configured via `BOSS_COORDINATOR_MODEL`;
@@ -239,6 +263,8 @@ impl WorkConfig {
             .min(MAX_MERGE_ORDER_STAGGER_SECS);
         let enable_spawn_capability_breaker = lookup_bool(&lookup, "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER")?
             .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
+        let enable_dispatch_ready_bus =
+            lookup_bool(&lookup, "BOSS_ENABLE_DISPATCH_READY_BUS")?.unwrap_or(DEFAULT_ENABLE_DISPATCH_READY_BUS);
         let coordinator_model = lookup_string(&lookup, "BOSS_COORDINATOR_MODEL")
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
@@ -256,6 +282,7 @@ impl WorkConfig {
             .enable_revision_triggered_reviews(enable_revision_triggered_reviews)
             .merge_order_stagger_secs(merge_order_stagger_secs)
             .enable_spawn_capability_breaker(enable_spawn_capability_breaker)
+            .enable_dispatch_ready_bus(enable_dispatch_ready_bus)
             .coordinator_model(coordinator_model)
             .build())
     }
@@ -456,10 +483,10 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_COORDINATOR_MODEL, DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
-        DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MERGE_ORDER_STAGGER_SECS,
-        DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE,
-        MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
+        DEFAULT_COORDINATOR_MODEL, DEFAULT_ENABLE_DISPATCH_READY_BUS, DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS,
+        DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER, DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES,
+        DEFAULT_MERGE_ORDER_STAGGER_SECS, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
+        MAX_AUTOMATION_POOL_SIZE, MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
     };
     use std::ffi::OsString;
 
@@ -716,6 +743,40 @@ mod tests {
         })
         .expect("config loads");
         assert!(config.enable_spawn_capability_breaker);
+    }
+
+    #[test]
+    fn enable_dispatch_ready_bus_defaults_off_and_reads_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        // Absent → defaults OFF: `kick()` keeps its legacy direct-latch
+        // path unconditionally, so the bus wiring is opt-in only.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.enable_dispatch_ready_bus, DEFAULT_ENABLE_DISPATCH_READY_BUS);
+        assert!(!config.enable_dispatch_ready_bus, "dispatch-ready bus defaults off");
+
+        // Explicit "true" opts in.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_DISPATCH_READY_BUS" => Some(OsString::from("true")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(config.enable_dispatch_ready_bus);
+
+        // Explicit "0" is also accepted as false.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_DISPATCH_READY_BUS" => Some(OsString::from("0")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(!config.enable_dispatch_ready_bus);
     }
 
     #[test]

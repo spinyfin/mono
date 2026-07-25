@@ -1025,9 +1025,22 @@ impl ServerState {
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
             execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator);
+            // Explicitly seed the coordinator's single `EventBus` (design
+            // doc: "One engine process, one bus") rather than letting it
+            // fall through to its private `EventBus::new()` default. A
+            // future producer living outside the coordinator reaches this
+            // same bus via `ExecutionCoordinator::event_bus()` (through
+            // `server_state.execution_coordinator`) instead of standing up
+            // a second, unreachable one — see the boot-time wiring check in
+            // `serve_with_merge_probe`.
+            execution_coordinator_inner.set_event_bus(Arc::new(boss_event_bus::EventBus::new()));
             // Bounded merge_order dispatch stagger (direction 2, default off).
             // Already clamped to MAX_MERGE_ORDER_STAGGER_SECS at config load.
             execution_coordinator_inner.set_merge_order_stagger_secs(cfg.work.merge_order_stagger_secs);
+            // DispatchReady bus routing (default off) — see
+            // `config::DEFAULT_ENABLE_DISPATCH_READY_BUS`. `server.rs` spawns
+            // the matching subscriber once the coordinator is behind its `Arc`.
+            execution_coordinator_inner.set_enable_dispatch_ready_bus(cfg.work.enable_dispatch_ready_bus);
             execution_coordinator_inner.set_automation_pool(automation_pool);
             execution_coordinator_inner.set_review_pool(review_pool);
             // Wire the SHA-delta gate's run-start snapshot: when an

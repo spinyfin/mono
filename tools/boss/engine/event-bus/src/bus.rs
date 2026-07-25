@@ -211,8 +211,23 @@ impl EventBus {
         Subscription { mailbox }
     }
 
+    /// Number of live subscribers currently registered, regardless of
+    /// topic filter. Used as a boot-time sanity check that a subscriber
+    /// actually attached to the bus a caller expected it to attach to.
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers
+            .lock()
+            .expect("event bus subscriber lock poisoned")
+            .len()
+    }
+
     /// Fan `event` out to every matching subscriber. Non-blocking: never
     /// awaits, never blocks the caller on a slow or stalled subscriber.
+    ///
+    /// Also prunes subscribers whose receiver has been dropped (e.g. a
+    /// supervised subscriber loop that re-subscribed after a panic-restart,
+    /// leaving its old sender behind) so a long-lived, repeatedly-restarting
+    /// subscriber does not leak dead entries into this list forever.
     pub fn publish(&self, event: Event) {
         let mut subscribers = self.subscribers.lock().expect("event bus subscriber lock poisoned");
         // A dropped `Subscription` leaves its `Mailbox` referenced only by
