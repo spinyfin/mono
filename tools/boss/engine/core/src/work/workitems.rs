@@ -568,13 +568,6 @@ impl WorkDb {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction()?;
                 let now = now_string();
-                // Pre-image, before the tombstone lands. Only read when the
-                // actor is Boothby — every other caller pays nothing.
-                let before = if boothby::is_boothby_actor(actor) {
-                    query_task(&tx, id)?
-                } else {
-                    None
-                };
                 // Pre-delete snapshot for the `ProjectImplDrained` staging
                 // check below — deletion is not a status write, so this
                 // task's own kind/status/project_id (as they stood before
@@ -582,6 +575,12 @@ impl WorkDb {
                 // open trigger task is about to vanish. Cheap: a single
                 // primary-key lookup on the already-open transaction.
                 let task_before_delete = query_task(&tx, id)?;
+                // Pre-image, before the tombstone lands. Only Boothby pays
+                // for this — derived from the same lookup above rather than
+                // querying again.
+                let before = boothby::is_boothby_actor(actor)
+                    .then(|| task_before_delete.clone())
+                    .flatten();
                 let rows = tx.execute(
                     "UPDATE tasks SET deleted_at = ?2, updated_at = ?2
                      WHERE id = ?1 AND deleted_at IS NULL",

@@ -144,20 +144,28 @@ impl crate::sweep_loop::SweepOutcome for ProjectPostmortemSweepOutcome {
 /// `feature_flags` is re-checked every pass (not just at spawn time) so
 /// flipping the `project_postmortem_sweep` kill switch off takes effect
 /// within one `interval` without restarting the engine.
+///
+/// `reconcile_lock` is held for the duration of [`run_one_pass`] and shared
+/// with [`spawn_event_loop`]'s reconcile pass and per-event evaluation, so
+/// this loop's periodic pass can never run concurrently with either of
+/// those — see [`spawn_event_loop`]'s doc comment for why that matters.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     interval: Duration,
     kick_fn: Arc<dyn Fn() + Send + Sync>,
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
         let kick_fn = Arc::clone(&kick_fn);
         let feature_flags = Arc::clone(&feature_flags);
+        let reconcile_lock = Arc::clone(&reconcile_lock);
         async move {
             if !feature_flags.is_enabled("project_postmortem_sweep") {
                 return ProjectPostmortemSweepOutcome::default();
             }
+            let _guard = reconcile_lock.lock().await;
             let outcome = run_one_pass(work_db.as_ref()).await;
             if outcome.postmortems_created > 0 {
                 kick_fn();
@@ -198,23 +206,42 @@ pub fn spawn_loop(
 /// then runs one [`run_one_pass`] before entering the recv loop, so a
 /// `ProjectImplDrained` dropped during the panic/backoff/resubscribe gap is
 /// recovered immediately rather than waiting out the 300 s backstop.
+///
+/// `reconcile_lock` is the same `Arc<tokio::sync::Mutex<()>>` passed to
+/// [`spawn_loop`] and is held across both this function's reconcile pass
+/// and each per-event [`evaluate_project_by_id`] call. Without it, this
+/// loop's boot-time reconcile pass runs genuinely concurrently with
+/// [`spawn_loop`]'s own immediate-on-spawn pass (both fire within
+/// microseconds of each other on the multi-thread tokio runtime), and
+/// [`evaluate_project`]'s dedup gate is a check-then-insert across two
+/// separate connection-mutex acquisitions with no unique constraint behind
+/// it — so two concurrent evaluations of the same drained project can both
+/// observe "no live postmortem" and both insert one. Holding this lock
+/// serializes every reconcile/evaluate call across both loops so at most
+/// one is ever touching the DB for this sweep at a time, closing that
+/// window without changing either loop's timing or semantics.
 pub fn spawn_event_loop(
     work_db: Arc<WorkDb>,
     event_bus: Arc<boss_event_bus::EventBus>,
     kick_fn: Arc<dyn Fn() + Send + Sync>,
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     boss_event_bus::spawn_supervised("project_postmortem_sweep_event", move || {
         let work_db = Arc::clone(&work_db);
         let event_bus = Arc::clone(&event_bus);
         let kick_fn = Arc::clone(&kick_fn);
         let feature_flags = Arc::clone(&feature_flags);
+        let reconcile_lock = Arc::clone(&reconcile_lock);
         async move {
             let mut subscription = event_bus.subscribe(boss_event_bus::TopicFilter::kind(
                 boss_event_bus::EventKind::ProjectImplDrained,
             ));
             if feature_flags.is_enabled("project_postmortem_sweep") {
-                let outcome = run_one_pass(work_db.as_ref()).await;
+                let outcome = {
+                    let _guard = reconcile_lock.lock().await;
+                    run_one_pass(work_db.as_ref()).await
+                };
                 if outcome.postmortems_created > 0 {
                     kick_fn();
                 }
@@ -226,7 +253,11 @@ pub fn spawn_event_loop(
                 if !feature_flags.is_enabled("project_postmortem_sweep") {
                     continue;
                 }
-                match evaluate_project_by_id(work_db.as_ref(), &project_id).await {
+                let result = {
+                    let _guard = reconcile_lock.lock().await;
+                    evaluate_project_by_id(work_db.as_ref(), &project_id).await
+                };
+                match result {
                     Ok(true) => kick_fn(),
                     Ok(false) => {}
                     Err(err) => {
@@ -973,7 +1004,13 @@ mod tests {
             kick_calls_c.fetch_add(1, Ordering::SeqCst);
         });
 
-        let handle = spawn_loop(Arc::clone(&db), Duration::from_secs(300), kick_fn, feature_flags);
+        let handle = spawn_loop(
+            Arc::clone(&db),
+            Duration::from_secs(300),
+            kick_fn,
+            feature_flags,
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
 
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -1210,7 +1247,13 @@ mod tests {
             kick_calls_c.fetch_add(1, Ordering::SeqCst);
         });
 
-        let handle = spawn_event_loop(Arc::clone(&db), Arc::clone(&bus), kick_fn, feature_flags);
+        let handle = spawn_event_loop(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+            kick_fn,
+            feature_flags,
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
         // Give the spawned subscriber loop a chance to reach
         // `event_bus.subscribe(...)` before publishing — the bus has no
         // replay, so a publish before the subscription exists would be
@@ -1275,6 +1318,88 @@ mod tests {
         assert_eq!(
             first.id, second.id,
             "exactly one postmortem must exist after both the event path and the sweep fire for the same drain"
+        );
+    }
+
+    /// Regression test for the boot-time race: `spawn_loop` and
+    /// `spawn_event_loop` each fire a full reconcile pass immediately on
+    /// spawn (`server.rs` spawns them back to back), and on the
+    /// multi-thread tokio runtime those two passes are genuinely
+    /// concurrent, not cooperatively interleaved. Without a shared
+    /// `reconcile_lock`, both passes can observe "no live postmortem" for
+    /// the same drained project and both insert one. Drives the two loops
+    /// exactly as `server.rs` does — same shared lock — under the real
+    /// multi-thread runtime and asserts exactly one postmortem is created.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_boot_reconcile_passes_create_only_one_postmortem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::feature_flags::FeatureFlagsStore;
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let project = create_project_no_seed(&db, &product_id, "Alpha");
+        set_design_doc(&db, &project.id);
+        seed_watermark(&db, 0);
+        let task = create_done_project_task(&db, &product_id, &project.id, "impl", "https://github.com/o/r/pull/1");
+        db.force_completed_at_for_test(&task.id, 1_000).unwrap();
+
+        let bus = Arc::new(boss_event_bus::EventBus::new());
+        let db = Arc::new(db.with_event_bus(Arc::clone(&bus)));
+
+        let flags_dir = tempfile::TempDir::new().unwrap();
+        let feature_flags = Arc::new(FeatureFlagsStore::new(flags_dir.path().join("feature-flags.toml")));
+
+        let kick_calls = Arc::new(AtomicUsize::new(0));
+        let kick_calls_c = Arc::clone(&kick_calls);
+        let kick_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            kick_calls_c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let reconcile_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Spawned back to back, exactly as `app/server.rs` does, sharing
+        // the same `reconcile_lock` so their boot-time passes serialize.
+        let sweep_handle = spawn_loop(
+            Arc::clone(&db),
+            Duration::from_secs(300),
+            Arc::clone(&kick_fn),
+            Arc::clone(&feature_flags),
+            Arc::clone(&reconcile_lock),
+        );
+        let event_handle = spawn_event_loop(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+            kick_fn,
+            feature_flags,
+            reconcile_lock,
+        );
+
+        // Give both loops' immediate boot-time passes a chance to run to
+        // completion under the multi-thread runtime.
+        for _ in 0..200 {
+            if db.last_design_postmortem_for_project(&project.id).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Both passes fire immediately on spawn, so give a second one a
+        // chance to land too before asserting the count.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        sweep_handle.abort();
+        event_handle.abort();
+
+        let all_tasks = db.list_tasks(&product_id, Some(&project.id), None, true).unwrap();
+        let postmortem_count = all_tasks
+            .iter()
+            .filter(|t| t.kind == TaskKind::DesignPostmortem)
+            .count();
+        assert_eq!(
+            postmortem_count, 1,
+            "concurrent boot-time reconcile passes must not double-schedule a postmortem for the same drain"
         );
     }
 }

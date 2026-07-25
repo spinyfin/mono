@@ -6,7 +6,7 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use boss_event_bus::{EventBus, EventKind, TopicFilter};
+use boss_event_bus::{EventKind, TopicFilter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
@@ -423,14 +423,6 @@ struct ServerState {
     /// against the same files the sink populates.
     dispatch_event_root: PathBuf,
     topic_broker: Arc<TopicBroker>,
-    /// In-process typed event bus (design:
-    /// `tools/boss/docs/designs/engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`).
-    /// The events-socket accept loop publishes the hook-observable
-    /// transitions onto it. The merge poller subscribes to the
-    /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
-    /// the broad `pr_reconciler_kick` sweep.
-    #[builder(default = Arc::new(EventBus::new()))]
-    event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,
     /// Live runtime state per allocated worker slot. Updated as hook
     /// events arrive on the events socket; surfaced to bossctl/UI via

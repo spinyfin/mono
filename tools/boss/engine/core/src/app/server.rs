@@ -1404,12 +1404,22 @@ pub async fn serve_with_merge_probe(
     // every pass) so the sweep — which autonomously creates dispatchable
     // work — can be killed without a rebuild or restart; see incident
     // postmortem-archived-fanout-2026-07-20.
+    // Shared between the periodic sweep and its event-driven half below so
+    // their reconcile passes can never run concurrently: both fire a full
+    // pass immediately on spawn (next two statements), and on the
+    // multi-thread runtime those two boot-time passes would otherwise race
+    // `evaluate_project`'s check-then-insert dedup gate and create two
+    // `design_postmortem` tasks for the same drained project. See
+    // `project_postmortem_sweep::spawn_event_loop`'s doc comment.
+    let project_postmortem_reconcile_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     let coord_for_postmortem = server_state.execution_coordinator.clone();
     let _project_postmortem_handle = crate::project_postmortem_sweep::spawn_loop(
         server_state.work_db.clone(),
         Duration::from_secs(crate::project_postmortem_sweep::PROJECT_POSTMORTEM_SWEEP_INTERVAL_SECS),
         Arc::new(move || coord_for_postmortem.kick()),
         server_state.feature_flags.clone(),
+        Arc::clone(&project_postmortem_reconcile_lock),
     );
 
     // Event-driven half of the same reconciler (engine-event-bus design
@@ -1427,6 +1437,7 @@ pub async fn serve_with_merge_probe(
         server_state.event_bus.clone(),
         Arc::new(move || coord_for_postmortem_event.kick()),
         server_state.feature_flags.clone(),
+        project_postmortem_reconcile_lock,
     );
 
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,

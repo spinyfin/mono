@@ -33,8 +33,10 @@
 //! `ProjectImplDrained`, staged by
 //! `work::design_postmortem::stage_project_impl_drained_on_terminal_transition`
 //! from the same status-write paths in `work/updates.rs`, `work/pr_flow.rs`,
-//! and `work/exec_tail.rs`. Host-disable transitions publish directly (no
-//! enclosing transaction).
+//! and `work/exec_tail.rs`, and staged on the deletion path by
+//! `stage_project_impl_drained_on_trigger_task_deleted` from
+//! `work/workitems.rs::delete_work_item_as_actor`. Host-disable transitions
+//! publish directly (no enclosing transaction).
 
 use boss_event_bus::{Event, EventBus};
 
