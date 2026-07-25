@@ -232,6 +232,51 @@ fn marking_queued_item_deferred_abandons_its_pending_execution() {
     );
 }
 
+/// Companion to [`marking_queued_item_deferred_abandons_its_pending_execution`]:
+/// the abandon it exercises must also publish `ExecutionTerminal` for the
+/// abandoned row, same as every other terminal-write producer.
+#[tokio::test]
+async fn marking_queued_item_deferred_publishes_execution_terminal() {
+    let db = WorkDb::open(temp_db_path("deferred-requeue-publishes-terminal")).unwrap();
+    let product = create_test_product_named(&db, "Boss-deferred-requeue-terminal");
+    let chore = create_test_chore(&db, product.id.clone(), "queued work");
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let ready = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.status == ExecutionStatus::Ready)
+        .expect("precondition: the item is queued (ready)");
+
+    let mut sub = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ExecutionTerminal,
+    ));
+
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let event = sub
+        .recv()
+        .await
+        .expect("ExecutionTerminal published after abandoning the pending execution");
+    assert_eq!(
+        event,
+        Event::ExecutionTerminal {
+            execution_id: ready.id.clone(),
+            task_id: chore.id.clone(),
+            host_id: "local".to_owned(),
+            pool_claim: None,
+        }
+    );
+}
+
 /// The primary non-start approval affordance: `boss task update --deferred
 /// false` clears the classification directly (no `RequestExecution`), and a
 /// subsequent reconcile then mints a `ready` execution for the now-ordinary

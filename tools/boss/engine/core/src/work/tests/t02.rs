@@ -257,6 +257,53 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
     assert!(stale_after.finished_at.is_some());
 }
 
+/// The `abandon_stale_and_redispatch` decision in
+/// `request_execution_in_tx_with_live_check` must publish
+/// `ExecutionTerminal` for the row it abandons — same coverage as
+/// [`request_execution_marks_existing_stale_when_no_live_worker`], but
+/// asserting on the event-bus side effect rather than the row state.
+#[tokio::test]
+async fn request_execution_stale_redispatch_publishes_execution_terminal() {
+    let path = temp_db_path("request-stale-publishes-terminal");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Stale chore");
+    let stale = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::WaitingHuman)
+                .build(),
+        )
+        .unwrap();
+    let mut sub = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ExecutionTerminal,
+    ));
+
+    let new_exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_ne!(new_exec.id, stale.id, "expected a brand new execution row");
+
+    let event = sub
+        .recv()
+        .await
+        .expect("ExecutionTerminal published after abandoning the stale execution");
+    assert_eq!(
+        event,
+        Event::ExecutionTerminal {
+            execution_id: stale.id.clone(),
+            task_id: chore.id.clone(),
+            host_id: "local".to_owned(),
+            pool_claim: None,
+        }
+    );
+}
+
 /// Regression for the 2026-07-03 dispatch race: two `dispatch_decision`
 /// evaluations landing within the scheduler pickup window (e.g. the
 /// product-executions reconciler racing the normal `RequestExecution`

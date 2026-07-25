@@ -56,6 +56,7 @@ use boss_protocol::{
     ApplyResult, CreateInvestigationInput, CreateTaskInput, PlannerOutput, ProposedEdge, ProposedTask, TaskKind,
 };
 
+use crate::event_publish::{PendingEvents, commit_and_publish};
 use crate::work::{
     WorkDb, add_dependency_edge_in_tx, insert_investigation_in_tx, insert_task_in_tx, now_string, query_project,
 };
@@ -141,6 +142,13 @@ impl Materializer {
 
         // Wire edges through the shared write path: same-product check +
         // `would_create_cycle` gate + `INSERT OR IGNORE` dedup.
+        //
+        // A dependent handle can resolve to a pre-existing task (the dedup
+        // above), so — unlike the freshly-created-row paths elsewhere in this
+        // module — the engine auto-block inside `add_dependency_edge_in_tx`
+        // can genuinely cancel a live execution here. Stage that through
+        // `pending` and publish it only once `tx` actually commits.
+        let mut pending = PendingEvents::new();
         let mut edges_created = 0usize;
         for edge in &output.edges {
             let dependent_id = handle_to_id
@@ -155,7 +163,7 @@ impl Materializer {
 
             // Count only genuinely-new insertions so re-apply reports 0.
             let already = query_edge(&tx, dependent_id, prerequisite_id, RELATION_BLOCKS)?.is_some();
-            add_dependency_edge_in_tx(&tx, dependent_id, prerequisite_id, RELATION_BLOCKS, &now)
+            add_dependency_edge_in_tx(&mut pending, &tx, dependent_id, prerequisite_id, RELATION_BLOCKS, &now)
                 .with_context(|| format!("materializer: wiring edge {} -> {}", edge.dependent, edge.prerequisite))?;
             if !already {
                 edges_created += 1;
@@ -211,7 +219,7 @@ impl Materializer {
             merge_order_edges_created += 1;
         }
 
-        tx.commit()?;
+        commit_and_publish(tx, pending, db.event_bus())?;
         Ok(ApplyResult {
             created,
             skipped,

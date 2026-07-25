@@ -1381,8 +1381,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        let (edge, reaped) = add_dependency_edge_in_tx(&tx, dependent_id, prerequisite_id, relation, &now)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let (edge, reaped) =
+            add_dependency_edge_in_tx(&mut pending, &tx, dependent_id, prerequisite_id, relation, &now)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok((edge, reaped))
     }
 
@@ -1410,8 +1412,9 @@ impl WorkDb {
         // Human-placed blocks (other blocked_reason / NULL + human actor)
         // stick — the user must clear them.
         let now = now_string();
-        maybe_engine_unblock_dependent(&tx, dependent_id, &now)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        maybe_engine_unblock_dependent(&mut pending, &tx, dependent_id, &now)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(removed)
     }
 
@@ -1460,8 +1463,9 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        let unblocked = maybe_engine_unblock_dependent(&tx, work_item_id, &now)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let unblocked = maybe_engine_unblock_dependent(&mut pending, &tx, work_item_id, &now)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(unblocked)
     }
 

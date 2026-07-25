@@ -135,15 +135,22 @@ impl WorkDb {
             ],
         )?;
 
+        let mut pending = PendingEvents::new();
         if status_changed && previous_status != project.status {
-            cascade_dependents_after_prereq_status_change(&tx, id, project.status.as_str(), &project.updated_at)?;
+            cascade_dependents_after_prereq_status_change(
+                &mut pending,
+                &tx,
+                id,
+                project.status.as_str(),
+                &project.updated_at,
+            )?;
         }
 
         let updated = query_project(&tx, id).require("project", id)?;
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_project_update(&tx, self, actor, &before, &updated, &project.updated_at)?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(WorkItem::Project(updated))
     }
 
@@ -157,6 +164,7 @@ impl WorkDb {
         let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let mut task = query_task(&tx, id).require("task", id)?;
         let previous_status = task.status.clone();
         // Check this before the generic tombstone bail below: an
@@ -325,11 +333,17 @@ impl WorkDb {
         // (`running` / `waiting_human`) is left alone — it self-retires. The
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
-            abandon_pending_executions(&tx, id, &task.updated_at)?;
+            abandon_pending_executions(&mut pending, &tx, id, &task.updated_at)?;
         }
 
         if status_changed && previous_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, id, task.status.as_str(), &task.updated_at)?;
+            cascade_dependents_after_prereq_status_change(
+                &mut pending,
+                &tx,
+                id,
+                task.status.as_str(),
+                &task.updated_at,
+            )?;
         }
 
         // Manual-override suppression for `blocked: ci_failure` /
@@ -359,7 +373,7 @@ impl WorkDb {
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task_to_item(updated))
     }
 }

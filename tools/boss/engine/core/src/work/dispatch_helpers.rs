@@ -625,6 +625,7 @@ pub(crate) fn retired_spawning_attempt_status(conn: &Connection, task: &Task) ->
 /// snapshot the parent PR's HEAD and detect when the revision worker
 /// contributes).
 pub(crate) fn reconcile_revision_execution(
+    pending: &mut PendingEvents,
     conn: &Connection,
     result: &mut ExecutionReconcileResult,
     task: &Task,
@@ -687,7 +688,7 @@ pub(crate) fn reconcile_revision_execution(
 
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
-        abandon_pending_executions(conn, &task.id, &now)?;
+        abandon_pending_executions(pending, conn, &task.id, &now)?;
         resolve_revision_on_parent_close(conn, task, &chain_root_task.id, &now, "reconcile_revision")?;
         return Ok(());
     }
@@ -713,7 +714,7 @@ pub(crate) fn reconcile_revision_execution(
     // alone; it self-retires on Stop.
     if let Some(attempt_status) = retired_spawning_attempt_status(conn, task)? {
         let now = now_string();
-        abandon_pending_executions(conn, &task.id, &now)?;
+        abandon_pending_executions(pending, conn, &task.id, &now)?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
             let settled = conn.execute(
                 "UPDATE tasks
@@ -863,6 +864,7 @@ pub(crate) fn reconcile_revision_execution(
 }
 
 pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
+    pending: &mut PendingEvents,
     conn: &Connection,
     input: RequestExecutionInput,
     is_live: F,
@@ -1225,6 +1227,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                      WHERE id = ?1",
                     params![existing.id, now],
                 )?;
+                stage_execution_terminal(pending, conn, &existing.id, &work_item_id)?;
             }
         } else {
             tracing::info!(
@@ -1930,7 +1933,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1995,7 +1999,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 
@@ -2063,7 +2068,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 
@@ -2139,7 +2145,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 

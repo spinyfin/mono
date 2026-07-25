@@ -77,6 +77,7 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
 /// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
 ///    `Merged` → merged error; `ClosedUnmerged` → closed error; `Open` → insert.
 pub(crate) fn assert_parent_revisable_and_insert(
+    pending: &mut PendingEvents,
     conn: &Connection,
     input: CreateRevisionInput,
     pr_checker: &dyn PrStateChecker,
@@ -124,6 +125,11 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // Declared atomically with the row insert, same as `task create` /
     // `chore create` — this also performs the engine auto-block, so a
     // caller-supplied prerequisite gates the revision immediately.
+    // `new_revision` was just inserted in this same transaction, so it can't
+    // yet have a live execution attached — `add_dependency_edge_in_tx`'s
+    // cancelled-execution channel is guaranteed empty here (mirrors the
+    // create-time-dependency invariant documented on `insert_helpers::
+    // apply_create_time_dependencies`).
     apply_create_time_dependencies(conn, &new_revision.id, &depends_on, &now)?;
 
     // ── 8. Auto-gate: block new revision on chain tail ───────────────────────
@@ -133,7 +139,10 @@ pub(crate) fn assert_parent_revisable_and_insert(
     let has_chain_tail_gate = chain_tail_id.is_some();
     if let Some(tail_id) = chain_tail_id {
         deps::insert_edge(conn, &new_revision.id, &tail_id, RELATION_BLOCKS, &now)?;
-        maybe_engine_block_dependent(conn, &new_revision.id, &now)?;
+        // `new_revision` was just inserted in this same transaction, so it
+        // can't yet have a live execution attached — the cancelled-execution
+        // channel here is guaranteed empty (same invariant as above).
+        maybe_engine_block_dependent(pending, conn, &new_revision.id, &now)?;
     }
 
     // ── 9. Create the initial execution row now ─────────────────────────────
@@ -162,7 +171,7 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // caller must explicitly start it later, exactly as today.
     if task_accepts_execution(&new_revision) {
         let mut result = ExecutionReconcileResult::default();
-        reconcile_revision_execution(conn, &mut result, &new_revision)?;
+        reconcile_revision_execution(pending, conn, &mut result, &new_revision)?;
     }
 
     if has_chain_tail_gate || !depends_on.is_empty() {
