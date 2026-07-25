@@ -114,9 +114,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use boss_event_bus::Event;
 use serde_json::Value;
 
-use boss_protocol::WorkerActivity;
+use boss_protocol::{LiveWorkerState, WorkerActivity};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -186,6 +187,12 @@ pub trait TransientRecoveryReaper: Send + Sync {
     async fn reap_worker(&self, execution_id: &str);
 }
 
+/// Live-worker collaborators used by the transient-recovery loop.
+pub struct RecoveryWorkers {
+    pub nudger: Arc<dyn WorkerNudger>,
+    pub reaper: Arc<dyn TransientRecoveryReaper>,
+}
+
 /// No-op nudger used in tests and contexts without an app session.
 /// Always returns `Err`, which causes the sweep to fall through to
 /// the orphan+respawn path — preserving pre-nudge test behaviour.
@@ -233,15 +240,23 @@ pub struct RecoveryContext<'a> {
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
-/// firing immediately on spawn.
+/// firing immediately on spawn. Between sweeps, `transient_error_idle` —
+/// a subscription to the [`Event::TransientErrorIdle`] topic — reconciles
+/// just the named execution immediately via [`run_for_execution`], so a
+/// worker wedged on a transient API error gets nudged/resumed the moment
+/// the hook-ingress path in `events_socket.rs` observes the trailing
+/// error, instead of waiting for the next `interval` tick. The periodic
+/// sweep remains the correctness backstop for any event the best-effort
+/// bus drops or that predates this subscription (e.g. a worker that
+/// stalled while the engine was offline).
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
-    nudger: Arc<dyn WorkerNudger>,
-    reaper: Arc<dyn TransientRecoveryReaper>,
+    workers: RecoveryWorkers,
     interval: Duration,
+    mut transient_error_idle: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
     let policy = RecoveryPolicy::default();
     tokio::spawn(async move {
@@ -251,6 +266,7 @@ pub fn spawn_loop(
         // original execution ID (not the replacement), so stale entries
         // from completed/orphaned executions are harmless.
         let mut nudged_executions: HashSet<String> = HashSet::new();
+        let mut subscription_closed = false;
         loop {
             let now = boss_engine_utils::epoch_time::now_epoch_secs();
             let cx = RecoveryContext {
@@ -259,8 +275,8 @@ pub fn spawn_loop(
                 coordinator: coordinator.clone(),
                 dispatch_events: dispatch_events.as_ref(),
                 policy: &policy,
-                nudger: nudger.as_ref(),
-                reaper: reaper.as_ref(),
+                nudger: workers.nudger.as_ref(),
+                reaper: workers.reaper.as_ref(),
             };
             let outcome = run_one_pass(&cx, &mut nudged_executions, now).await;
             if outcome.has_activity() {
@@ -271,13 +287,64 @@ pub fn spawn_loop(
                     "transient-recovery sweep: pass complete",
                 );
             }
-            tokio::time::sleep(interval).await;
+
+            // Wait for either the next full-sweep tick or a
+            // TransientErrorIdle event naming one execution to reconcile
+            // immediately. The event arm never resets the sweep timer —
+            // a targeted reconcile is not a full pass.
+            'wait: loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        break 'wait;
+                    }
+                    event = transient_error_idle.recv(), if !subscription_closed => {
+                        match event {
+                            Some(Event::TransientErrorIdle { execution_id }) => {
+                                let now = boss_engine_utils::epoch_time::now_epoch_secs();
+                                let cx = RecoveryContext {
+                                    work_db: work_db.as_ref(),
+                                    live_states: live_states.as_ref(),
+                                    coordinator: coordinator.clone(),
+                                    dispatch_events: dispatch_events.as_ref(),
+                                    policy: &policy,
+                                    nudger: workers.nudger.as_ref(),
+                                    reaper: workers.reaper.as_ref(),
+                                };
+                                let outcome = run_for_execution(&cx, &mut nudged_executions, now, &execution_id).await;
+                                if outcome.has_activity() {
+                                    tracing::info!(
+                                        execution_id,
+                                        nudged = outcome.nudged,
+                                        resumed = outcome.resumed,
+                                        escalated = outcome.escalated,
+                                        "transient-recovery: TransientErrorIdle event reconciled",
+                                    );
+                                }
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "transient-recovery: transient_error_idle subscription received an \
+                                     unexpected event kind (the subscribing filter should have excluded it)",
+                                );
+                            }
+                            None => {
+                                subscription_closed = true;
+                                tracing::warn!(
+                                    "transient-recovery: transient_error_idle subscription closed \
+                                     (event bus dropped) — the periodic sweep remains the backstop",
+                                );
+                            }
+                        }
+                        // continue listening; an event reconcile is not a full sweep
+                    }
+                }
+            }
         }
     })
 }
 
-/// Run a single recovery pass. `now_epoch_secs` is injected so tests
-/// can pin the clock for the grace guard.
+/// Run a single recovery pass over every live worker slot. `now_epoch_secs`
+/// is injected so tests can pin the clock for the grace guard.
 ///
 /// `nudger` is used to send a runtime message into a live idle worker's
 /// REPL instead of tearing it down. `nudged_executions` persists across
@@ -288,6 +355,46 @@ pub async fn run_one_pass(
     nudged_executions: &mut HashSet<String>,
     now_epoch_secs: i64,
 ) -> TransientRecoveryOutcome {
+    let mut outcome = TransientRecoveryOutcome::default();
+    for state in cx.live_states.snapshot() {
+        process_state(cx, nudged_executions, now_epoch_secs, state, &mut outcome).await;
+    }
+    outcome
+}
+
+/// Reconcile the single execution named by a `TransientErrorIdle` event,
+/// bypassing the full live-worker snapshot scan. Mirrors exactly one
+/// iteration of [`run_one_pass`]'s loop: same grace guard, same nudge →
+/// orphan+respawn → escalate decision, and the same re-read of
+/// authoritative DB state that makes duplicate or re-delivered events
+/// safe — an execution the sweep or an earlier event already settled is
+/// terminal by the time this runs, so [`process_state`] no-ops on it.
+/// Returns an all-zero outcome if `execution_id` has no live slot (e.g.
+/// the worker already tore down between the event firing and this call).
+pub async fn run_for_execution(
+    cx: &RecoveryContext<'_>,
+    nudged_executions: &mut HashSet<String>,
+    now_epoch_secs: i64,
+    execution_id: &str,
+) -> TransientRecoveryOutcome {
+    let mut outcome = TransientRecoveryOutcome::default();
+    let Some(state) = cx.live_states.snapshot().into_iter().find(|s| s.run_id == execution_id) else {
+        return outcome;
+    };
+    process_state(cx, nudged_executions, now_epoch_secs, state, &mut outcome).await;
+    outcome
+}
+
+/// Inspect and, if warranted, act on a single live worker slot — the
+/// shared body behind both the full sweep ([`run_one_pass`]) and the
+/// per-execution event reconcile ([`run_for_execution`]).
+async fn process_state(
+    cx: &RecoveryContext<'_>,
+    nudged_executions: &mut HashSet<String>,
+    now_epoch_secs: i64,
+    state: LiveWorkerState,
+    outcome: &mut TransientRecoveryOutcome,
+) {
     let &RecoveryContext {
         work_db,
         live_states,
@@ -299,327 +406,322 @@ pub async fn run_one_pass(
     } = cx;
     let coordinator = cx.coordinator.clone();
 
-    let mut outcome = TransientRecoveryOutcome::default();
     let grace_cutoff = now_epoch_secs - RECOVERY_GRACE_SECS;
 
-    for state in live_states.snapshot() {
-        // Skip slots that are actively progressing or not yet up — only
-        // a wedged-idle / errored / terminated slot can be stalled on an
-        // API error. (A working slot's last transcript entry is a tool
-        // call, never the trailing error, so it would be filtered out
-        // anyway; this just avoids the file read.)
-        if !should_inspect(state.activity) {
-            continue;
-        }
+    // Skip slots that are actively progressing or not yet up — only
+    // a wedged-idle / errored / terminated slot can be stalled on an
+    // API error. (A working slot's last transcript entry is a tool
+    // call, never the trailing error, so it would be filtered out
+    // anyway; this just avoids the file read.)
+    if !should_inspect(state.activity) {
+        return;
+    }
 
-        let execution_id = state.run_id.clone();
-        let execution = match work_db.get_execution(&execution_id) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(execution_id, ?err, "transient-recovery: execution lookup failed");
-                continue;
-            }
-        };
-        // Terminal executions are settled (completion path / dead-PID
-        // sweep / a prior recovery pass handled them).
-        if execution.status.is_terminal() {
-            continue;
+    let execution_id = state.run_id.clone();
+    let execution = match work_db.get_execution(&execution_id) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(execution_id, ?err, "transient-recovery: execution lookup failed");
+            return;
         }
+    };
+    // Terminal executions are settled (completion path / dead-PID
+    // sweep / a prior recovery pass handled them).
+    if execution.status.is_terminal() {
+        return;
+    }
 
-        // Grace guard: don't act on a worker that only just started.
-        let started_epoch = execution.started_epoch();
-        match started_epoch {
-            Some(t) if t < grace_cutoff => {}
-            _ => {
-                outcome.grace_skipped += 1;
-                continue;
-            }
+    // Grace guard: don't act on a worker that only just started.
+    let started_epoch = execution.started_epoch();
+    match started_epoch {
+        Some(t) if t < grace_cutoff => {}
+        _ => {
+            outcome.grace_skipped += 1;
+            return;
         }
+    }
 
-        // Ground truth: the transcript. No path → no signal → leave it
-        // for the other reconcilers.
-        let Some(transcript_path) = work_db.latest_transcript_path(&execution_id).ok().flatten() else {
+    // Ground truth: the transcript. No path → no signal → leave it
+    // for the other reconcilers.
+    let Some(transcript_path) = work_db.latest_transcript_path(&execution_id).ok().flatten() else {
+        outcome.no_error_skipped += 1;
+        return;
+    };
+    let lines = read_transcript_tail(&transcript_path, TRANSCRIPT_TAIL_MAX_BYTES).await;
+    let prior_attempts = execution.transient_failure_count.max(0) as u32;
+
+    // Two shapes of "this worker is stalled" are worth acting on:
+    //
+    //  1. A trailing API-error transcript entry — the classic case
+    //     this module was built for.
+    //  2. Verification failure: `prior_attempts > 0` means this
+    //     execution IS ITSELF the product of an earlier auto-resume
+    //     (nudge or orphan+respawn), and its transcript shows no
+    //     activity whatsoever. A bare resume is not, by itself,
+    //     proof of continuation — the CLI parks at its prompt by
+    //     design, so a resumed session that never produced a single
+    //     hook-visible event never actually got the continuation
+    //     prompt into the model. Gating on `prior_attempts > 0` (and
+    //     not just "empty transcript") keeps this from misfiring on
+    //     an ordinary fresh execution that simply hasn't started
+    //     yet — the grace guard above already covers that case for
+    //     the common short delay, but a resume chain deserves this
+    //     extra check even past grace because leaving it silently
+    //     parked is exactly the bug this closes.
+    let (error_text, class, stall_reason) = match extract_worker_error(&lines) {
+        Some(text) => {
+            // Route through the resolved driver's ControlVerbs
+            // classifier — never call a provider-specific helper
+            // directly. An unresolvable driver fails closed to
+            // Indeterminate (bounded retry, then escalate) rather
+            // than inventing Claude's table for every backend.
+            let class = classify_error_for_execution(work_db, &execution_id, &text);
+            (text, class, "api_error")
+        }
+        None if prior_attempts > 0 && transcript_shows_no_activity(&lines) => (
+            "auto-resume produced no worker activity: no continuation prompt reached the session".to_owned(),
+            ErrorClass::Transient,
+            "no_activity",
+        ),
+        None => {
+            // No trailing API error, and either this isn't a resume
+            // chain or the transcript shows real activity: worker
+            // either finished cleanly or recovered on its own. Not
+            // ours to touch.
             outcome.no_error_skipped += 1;
-            continue;
-        };
-        let lines = read_transcript_tail(&transcript_path, TRANSCRIPT_TAIL_MAX_BYTES).await;
-        let prior_attempts = execution.transient_failure_count.max(0) as u32;
+            return;
+        }
+    };
 
-        // Two shapes of "this worker is stalled" are worth acting on:
-        //
-        //  1. A trailing API-error transcript entry — the classic case
-        //     this module was built for.
-        //  2. Verification failure: `prior_attempts > 0` means this
-        //     execution IS ITSELF the product of an earlier auto-resume
-        //     (nudge or orphan+respawn), and its transcript shows no
-        //     activity whatsoever. A bare resume is not, by itself,
-        //     proof of continuation — the CLI parks at its prompt by
-        //     design, so a resumed session that never produced a single
-        //     hook-visible event never actually got the continuation
-        //     prompt into the model. Gating on `prior_attempts > 0` (and
-        //     not just "empty transcript") keeps this from misfiring on
-        //     an ordinary fresh execution that simply hasn't started
-        //     yet — the grace guard above already covers that case for
-        //     the common short delay, but a resume chain deserves this
-        //     extra check even past grace because leaving it silently
-        //     parked is exactly the bug this closes.
-        let (error_text, class, stall_reason) = match extract_worker_error(&lines) {
-            Some(text) => {
-                // Route through the resolved driver's ControlVerbs
-                // classifier — never call a provider-specific helper
-                // directly. An unresolvable driver fails closed to
-                // Indeterminate (bounded retry, then escalate) rather
-                // than inventing Claude's table for every backend.
-                let class = classify_error_for_execution(work_db, &execution_id, &text);
-                (text, class, "api_error")
-            }
-            None if prior_attempts > 0 && transcript_shows_no_activity(&lines) => (
-                "auto-resume produced no worker activity: no continuation prompt reached the session".to_owned(),
-                ErrorClass::Transient,
-                "no_activity",
-            ),
-            None => {
-                // No trailing API error, and either this isn't a resume
-                // chain or the transcript shows real activity: worker
-                // either finished cleanly or recovered on its own. Not
-                // ours to touch.
-                outcome.no_error_skipped += 1;
-                continue;
-            }
-        };
+    let decision = policy.decide(class, prior_attempts);
+    let clipped = clip(&error_text, ERROR_CLIP_BYTES);
+    let work_item_id = state
+        .work_item_id
+        .clone()
+        .unwrap_or_else(|| execution.work_item_id.clone());
 
-        let decision = policy.decide(class, prior_attempts);
-        let clipped = clip(&error_text, ERROR_CLIP_BYTES);
-        let work_item_id = state
-            .work_item_id
-            .clone()
-            .unwrap_or_else(|| execution.work_item_id.clone());
+    match decision {
+        RecoveryDecision::Resume { attempt, backoff } => {
+            // Prefer a cheap runtime nudge when the worker is alive
+            // and idle. Only nudge once per execution per engine
+            // session: if it didn't clear the error by the next
+            // sweep, fall through to orphan+respawn.
+            let already_nudged = nudged_executions.remove(&execution_id);
+            let try_nudge = !already_nudged && state.activity == WorkerActivity::Idle;
 
-        match decision {
-            RecoveryDecision::Resume { attempt, backoff } => {
-                // Prefer a cheap runtime nudge when the worker is alive
-                // and idle. Only nudge once per execution per engine
-                // session: if it didn't clear the error by the next
-                // sweep, fall through to orphan+respawn.
-                let already_nudged = nudged_executions.remove(&execution_id);
-                let try_nudge = !already_nudged && state.activity == WorkerActivity::Idle;
-
-                if try_nudge {
-                    let msg = if stall_reason == "no_activity" {
-                        "Your previous auto-resume did not reach the model: no continuation \
+            if try_nudge {
+                let msg = if stall_reason == "no_activity" {
+                    "Your previous auto-resume did not reach the model: no continuation \
                          prompt took effect and the session parked with no activity. Please \
                          check for any in-progress work (e.g. `jj diff`) and continue the task \
                          from where it left off.\n"
-                            .to_owned()
-                    } else {
-                        format!(
-                            "Your previous turn ended on a transient Claude API error. \
+                        .to_owned()
+                } else {
+                    format!(
+                        "Your previous turn ended on a transient Claude API error. \
                              Please retry the last step.\n\nError: {clipped}\n"
-                        )
-                    };
-                    match nudger.nudge_worker(&execution_id, msg).await {
-                        Ok(()) => {
-                            nudged_executions.insert(execution_id.clone());
-                            // Visibility (not just the transcript-tail signal):
-                            // write a recovery banner directly onto the live
-                            // slot so `bossctl agents list` / the Agents-tab
-                            // subtitle read "recovering from API error
-                            // (attempt N/M)" instead of a bare `idle` that
-                            // reads as "worker finished, waiting on nothing in
-                            // particular". apply_event clears this the moment
-                            // the worker's next hook event proves it resumed.
-                            if live_states.set_recovery_status(
-                                state.slot_id,
-                                Some(format!(
-                                    "recovering from API error (attempt {attempt}/{max})",
-                                    max = policy.max_attempts(),
-                                )),
-                            ) {
-                                nudger.broadcast_live_states().await;
-                            }
-                            tracing::info!(
-                                execution_id,
-                                work_item_id = %work_item_id,
-                                error = %clipped,
-                                "transient-recovery: nudged live idle worker; will re-check next sweep",
-                            );
-                            dispatch_events
-                                .emit(
-                                    DispatchEvent::new(Stage::TransientRecoveryNudge, Outcome::Ok, &execution_id)
-                                        .with_work_item(&work_item_id)
-                                        .with_details(serde_json::json!({
-                                            "error": clipped,
-                                            "class": stall_reason,
-                                        })),
-                                )
-                                .await;
-                            outcome.nudged += 1;
-                            continue; // leave slot and execution intact
+                    )
+                };
+                match nudger.nudge_worker(&execution_id, msg).await {
+                    Ok(()) => {
+                        nudged_executions.insert(execution_id.clone());
+                        // Visibility (not just the transcript-tail signal):
+                        // write a recovery banner directly onto the live
+                        // slot so `bossctl agents list` / the Agents-tab
+                        // subtitle read "recovering from API error
+                        // (attempt N/M)" instead of a bare `idle` that
+                        // reads as "worker finished, waiting on nothing in
+                        // particular". apply_event clears this the moment
+                        // the worker's next hook event proves it resumed.
+                        if live_states.set_recovery_status(
+                            state.slot_id,
+                            Some(format!(
+                                "recovering from API error (attempt {attempt}/{max})",
+                                max = policy.max_attempts(),
+                            )),
+                        ) {
+                            nudger.broadcast_live_states().await;
                         }
-                        Err(nudge_err) => {
-                            tracing::info!(
-                                execution_id,
-                                work_item_id = %work_item_id,
-                                nudge_err,
-                                "transient-recovery: nudge not available; falling back to orphan+respawn",
-                            );
-                            // Fall through to the orphan+respawn path below.
-                        }
+                        tracing::info!(
+                            execution_id,
+                            work_item_id = %work_item_id,
+                            error = %clipped,
+                            "transient-recovery: nudged live idle worker; will re-check next sweep",
+                        );
+                        dispatch_events
+                            .emit(
+                                DispatchEvent::new(Stage::TransientRecoveryNudge, Outcome::Ok, &execution_id)
+                                    .with_work_item(&work_item_id)
+                                    .with_details(serde_json::json!({
+                                        "error": clipped,
+                                        "class": stall_reason,
+                                    })),
+                            )
+                            .await;
+                        outcome.nudged += 1;
+                        return; // leave slot and execution intact
+                    }
+                    Err(nudge_err) => {
+                        tracing::info!(
+                            execution_id,
+                            work_item_id = %work_item_id,
+                            nudge_err,
+                            "transient-recovery: nudge not available; falling back to orphan+respawn",
+                        );
+                        // Fall through to the orphan+respawn path below.
                     }
                 }
+            }
 
-                // --- Orphan+respawn path ---
-                let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
-                let reason = format!(
-                    "{stall_reason} (auto-resume attempt {attempt}/{max}): {clipped}",
-                    max = policy.max_attempts(),
-                );
-                if let Err(err) =
-                    work_db.request_resume_execution(&execution_id, attempt as i64, dispatch_not_before, &reason)
-                {
-                    tracing::warn!(
-                        execution_id,
-                        ?err,
-                        "transient-recovery: failed to create resume execution; skipping",
-                    );
-                    continue;
-                }
-                tracing::info!(
+            // --- Orphan+respawn path ---
+            let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
+            let reason = format!(
+                "{stall_reason} (auto-resume attempt {attempt}/{max}): {clipped}",
+                max = policy.max_attempts(),
+            );
+            if let Err(err) =
+                work_db.request_resume_execution(&execution_id, attempt as i64, dispatch_not_before, &reason)
+            {
+                tracing::warn!(
                     execution_id,
-                    work_item_id = %work_item_id,
-                    attempt,
-                    max_attempts = policy.max_attempts(),
-                    backoff_secs = backoff.as_secs(),
-                    error = %clipped,
-                    stall_reason,
-                    "transient-recovery: worker stalled; auto-resuming on same workspace",
+                    ?err,
+                    "transient-recovery: failed to create resume execution; skipping",
                 );
-                release_slot(reaper, &execution_id).await;
-                crate::reconcile_audit::append_reconcile_audit_best_effort(
-                    work_db,
-                    &work_item_id,
-                    now_epoch_secs,
-                    &format!(
-                        "{stall_reason}; auto-resuming attempt {attempt}/{max} after {secs}s backoff",
-                        max = policy.max_attempts(),
-                        secs = backoff.as_secs(),
-                    ),
-                );
-                dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::TransientRecovery, Outcome::Ok, &execution_id)
-                            .with_work_item(&work_item_id)
-                            .with_details(serde_json::json!({
-                                "attempt": attempt,
-                                "max_attempts": policy.max_attempts(),
-                                "backoff_secs": backoff.as_secs(),
-                                "class": stall_reason,
-                                "error": clipped,
-                            })),
+                return;
+            }
+            tracing::info!(
+                execution_id,
+                work_item_id = %work_item_id,
+                attempt,
+                max_attempts = policy.max_attempts(),
+                backoff_secs = backoff.as_secs(),
+                error = %clipped,
+                stall_reason,
+                "transient-recovery: worker stalled; auto-resuming on same workspace",
+            );
+            release_slot(reaper, &execution_id).await;
+            crate::reconcile_audit::append_reconcile_audit_best_effort(
+                work_db,
+                &work_item_id,
+                now_epoch_secs,
+                &format!(
+                    "{stall_reason}; auto-resuming attempt {attempt}/{max} after {secs}s backoff",
+                    max = policy.max_attempts(),
+                    secs = backoff.as_secs(),
+                ),
+            );
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::TransientRecovery, Outcome::Ok, &execution_id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "attempt": attempt,
+                            "max_attempts": policy.max_attempts(),
+                            "backoff_secs": backoff.as_secs(),
+                            "class": stall_reason,
+                            "error": clipped,
+                        })),
+                )
+                .await;
+
+            // Immediate kick so other idle slots can pick up work.
+            // This slot itself is free only once the pane teardown
+            // above confirmed; an unconfirmed teardown holds the
+            // claim so a later dispatch cannot land `SlotBusy`.
+            // A deferred kick still fires when the resume's backoff
+            // window expires.
+            coordinator.kick();
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(backoff).await;
+                coordinator.kick();
+            });
+            outcome.resumed += 1;
+        }
+        RecoveryDecision::Escalate { reason } => {
+            let kind = match reason {
+                EscalateReason::Permanent => ATTENTION_KIND_RECOVERY_PERMANENT,
+                EscalateReason::RetriesExhausted => ATTENTION_KIND_RECOVERY_EXHAUSTED,
+            };
+            // The true classified error class, independent of *why* the
+            // policy stopped retrying: `RetriesExhausted` covers both a
+            // confirmed-transient error that never cleared and an
+            // indeterminate one that got the same bounded chances.
+            let class_label = class.as_str();
+            // Settle the execution so it isn't re-inspected; ignore a
+            // race where another reconciler already marked it terminal.
+            match work_db.mark_execution_orphaned(
+                &execution_id,
+                &format!("transient-recovery escalation ({}): {clipped}", reason.as_str()),
+            ) {
+                Ok(orphaned) => {
+                    // Reap termination path: tear down any driver-owned
+                    // state outside the workspace.
+                    crate::driver_teardown::teardown_driver_workspace(
+                        work_db,
+                        &execution_id,
+                        orphaned.workspace_path.as_deref().map(std::path::Path::new),
+                        crate::driver_teardown::TeardownReason::TransientRecoveryReap,
                     )
                     .await;
-
-                // Immediate kick so other idle slots can pick up work.
-                // This slot itself is free only once the pane teardown
-                // above confirmed; an unconfirmed teardown holds the
-                // claim so a later dispatch cannot land `SlotBusy`.
-                // A deferred kick still fires when the resume's backoff
-                // window expires.
-                coordinator.kick();
-                let coordinator = coordinator.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(backoff).await;
-                    coordinator.kick();
-                });
-                outcome.resumed += 1;
-            }
-            RecoveryDecision::Escalate { reason } => {
-                let kind = match reason {
-                    EscalateReason::Permanent => ATTENTION_KIND_RECOVERY_PERMANENT,
-                    EscalateReason::RetriesExhausted => ATTENTION_KIND_RECOVERY_EXHAUSTED,
-                };
-                // The true classified error class, independent of *why* the
-                // policy stopped retrying: `RetriesExhausted` covers both a
-                // confirmed-transient error that never cleared and an
-                // indeterminate one that got the same bounded chances.
-                let class_label = class.as_str();
-                // Settle the execution so it isn't re-inspected; ignore a
-                // race where another reconciler already marked it terminal.
-                match work_db.mark_execution_orphaned(
-                    &execution_id,
-                    &format!("transient-recovery escalation ({}): {clipped}", reason.as_str()),
-                ) {
-                    Ok(orphaned) => {
-                        // Reap termination path: tear down any driver-owned
-                        // state outside the workspace.
-                        crate::driver_teardown::teardown_driver_workspace(
-                            work_db,
-                            &execution_id,
-                            orphaned.workspace_path.as_deref().map(std::path::Path::new),
-                            crate::driver_teardown::TeardownReason::TransientRecoveryReap,
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            execution_id,
-                            ?err,
-                            "transient-recovery: execution already terminal at escalation (benign)",
-                        );
-                    }
                 }
-                let title = match reason {
-                    EscalateReason::RetriesExhausted => "Worker auto-recovery exhausted retries".to_owned(),
-                    _ => "Worker hit a non-retryable Claude API error".to_owned(),
-                };
-                let body = format!(
-                    "The engine stopped auto-resuming this work item.\n\n\
+                Err(err) => {
+                    tracing::debug!(
+                        execution_id,
+                        ?err,
+                        "transient-recovery: execution already terminal at escalation (benign)",
+                    );
+                }
+            }
+            let title = match reason {
+                EscalateReason::RetriesExhausted => "Worker auto-recovery exhausted retries".to_owned(),
+                _ => "Worker hit a non-retryable Claude API error".to_owned(),
+            };
+            let body = format!(
+                "The engine stopped auto-resuming this work item.\n\n\
                      **Reason:** {reason}\n\n\
                      **Error class:** {class_label}\n\n\
                      **Last worker error:** {clipped}\n\n\
                      **Transient resume attempts already made:** {prior_attempts} / {max}\n\n\
                      Resolve this attention item once the underlying problem is fixed to \
                      allow the work item to be re-dispatched.",
-                    reason = reason.as_str(),
-                    max = policy.max_attempts(),
-                );
-                if let Err(err) = work_db.upsert_work_item_attention(&work_item_id, kind, &title, &body) {
-                    tracing::warn!(
-                        execution_id,
-                        work_item_id = %work_item_id,
-                        ?err,
-                        "transient-recovery: failed to raise attention item",
-                    );
-                }
+                reason = reason.as_str(),
+                max = policy.max_attempts(),
+            );
+            if let Err(err) = work_db.upsert_work_item_attention(&work_item_id, kind, &title, &body) {
                 tracing::warn!(
                     execution_id,
                     work_item_id = %work_item_id,
-                    reason = reason.as_str(),
-                    class = class_label,
-                    error = %clipped,
-                    "transient-recovery: escalating worker for human attention (not auto-retried)",
+                    ?err,
+                    "transient-recovery: failed to raise attention item",
                 );
-                release_slot(reaper, &execution_id).await;
-                dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::TransientRecoveryExhausted, Outcome::Error, &execution_id)
-                            .with_work_item(&work_item_id)
-                            .with_details(serde_json::json!({
-                                "reason": reason.as_str(),
-                                "class": class_label,
-                                "prior_attempts": prior_attempts,
-                                "max_attempts": policy.max_attempts(),
-                                "error": clipped,
-                            })),
-                    )
-                    .await;
-                coordinator.kick();
-                outcome.escalated += 1;
             }
+            tracing::warn!(
+                execution_id,
+                work_item_id = %work_item_id,
+                reason = reason.as_str(),
+                class = class_label,
+                error = %clipped,
+                "transient-recovery: escalating worker for human attention (not auto-retried)",
+            );
+            release_slot(reaper, &execution_id).await;
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::TransientRecoveryExhausted, Outcome::Error, &execution_id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "reason": reason.as_str(),
+                            "class": class_label,
+                            "prior_attempts": prior_attempts,
+                            "max_attempts": policy.max_attempts(),
+                            "error": clipped,
+                        })),
+                )
+                .await;
+            coordinator.kick();
+            outcome.escalated += 1;
         }
     }
-
-    outcome
 }
 
 /// True for slot states a stalled-on-error worker can be in. A
@@ -1642,5 +1744,199 @@ mod tests {
                 "unexpected should_inspect verdict for {activity:?}",
             );
         }
+    }
+
+    // ─── event-driven reconcile (TransientErrorIdle) ───────────────────
+
+    /// [`run_for_execution`] must reconcile the named execution the same
+    /// way one iteration of the full sweep would — first preferring the
+    /// cheap nudge path for an alive-idle worker.
+    #[tokio::test]
+    async fn run_for_execution_nudges_the_named_execution() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let policy = RecoveryPolicy::default();
+        let nudger = RecordingNudger::new();
+        let reaper = RecordingReaper::new();
+        let cx = RecoveryContext {
+            work_db: &db,
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &policy,
+            nudger: &nudger,
+            reaper: &reaper,
+        };
+        let mut nudged = HashSet::new();
+
+        let outcome = run_for_execution(&cx, &mut nudged, now(), &exec_id).await;
+
+        assert_eq!(
+            outcome.nudged, 1,
+            "event-driven reconcile should nudge the named execution"
+        );
+        assert_eq!(nudger.nudged_ids().await, vec![exec_id.clone()]);
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
+    }
+
+    /// A `TransientErrorIdle` event naming an execution with no matching
+    /// live slot (already torn down, or the id doesn't exist) must be a
+    /// safe no-op rather than erroring or panicking.
+    #[tokio::test]
+    async fn run_for_execution_with_unknown_execution_id_is_a_no_op() {
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let policy = RecoveryPolicy::default();
+        let reaper = RecordingReaper::new();
+        let cx = RecoveryContext {
+            work_db: &db,
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &policy,
+            nudger: &NoopWorkerNudger,
+            reaper: &reaper,
+        };
+        let mut nudged = HashSet::new();
+
+        let outcome = run_for_execution(&cx, &mut nudged, now(), "no-such-execution").await;
+
+        assert_eq!(outcome, TransientRecoveryOutcome::default());
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// Idempotency: events are hints, not commands — a redelivered (or
+    /// duplicate) `TransientErrorIdle` for an execution an earlier
+    /// delivery already resolved must not act a second time.
+    /// `run_for_execution` re-reads the live-worker snapshot on every
+    /// call, so once the first delivery's orphan+respawn releases the
+    /// slot, a second delivery for the same execution id finds nothing
+    /// to act on.
+    #[tokio::test]
+    async fn run_for_execution_redelivered_after_resume_is_a_safe_no_op() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let policy = RecoveryPolicy::default();
+        let reaper = RecordingReaper::new();
+        let cx = RecoveryContext {
+            work_db: &db,
+            live_states: &live,
+            coordinator: coordinator.clone(),
+            dispatch_events: sink.as_ref(),
+            policy: &policy,
+            // NoopWorkerNudger always fails, so the first delivery falls
+            // straight through to orphan+respawn and settles the
+            // execution in one call.
+            nudger: &NoopWorkerNudger,
+            reaper: &reaper,
+        };
+        let mut nudged = HashSet::new();
+
+        let first = run_for_execution(&cx, &mut nudged, now(), &exec_id).await;
+        assert_eq!(first.resumed, 1, "first delivery should orphan+respawn");
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Orphaned);
+
+        let second = run_for_execution(&cx, &mut nudged, now(), &exec_id).await;
+        assert_eq!(
+            second,
+            TransientRecoveryOutcome::default(),
+            "redelivered event for an already-settled execution must no-op, not resume again",
+        );
+
+        let events = sink.events().await;
+        assert_eq!(
+            events.len(),
+            1,
+            "only the first delivery should have produced a dispatch event",
+        );
+    }
+
+    /// Mirrors `spawn_loop`'s `transient_error_idle.recv(), if
+    /// !subscription_closed` select arm in isolation: a queued event is
+    /// consumed exactly once, the `None` branch (bus dropped) fires
+    /// exactly once, and — critically — once closed the guard routes
+    /// every later loop iteration away from `recv()` instead of
+    /// re-polling a closed subscription forever.
+    #[tokio::test]
+    async fn transient_error_idle_arm_reconciles_once_and_parks_after_close() {
+        use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
+
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(TopicFilter::kind(EventKind::TransientErrorIdle));
+
+        let mut subscription_closed = false;
+        let mut reconciled: Vec<String> = Vec::new();
+        let mut none_branch_hits = 0u32;
+        let mut arm_polls_after_close = 0u32;
+
+        bus.publish(Event::TransientErrorIdle {
+            execution_id: "exec-1".to_owned(),
+        });
+        // Close the sender side (drop the bus) so a later poll of the
+        // same subscription sees the closed-channel `None`.
+        drop(bus);
+
+        for _ in 0..8 {
+            tokio::select! {
+                biased;
+                event = sub.recv(), if !subscription_closed => {
+                    match event {
+                        Some(Event::TransientErrorIdle { execution_id }) => {
+                            reconciled.push(execution_id);
+                        }
+                        Some(_) => {}
+                        None => {
+                            subscription_closed = true;
+                            none_branch_hits += 1;
+                        }
+                    }
+                }
+                _ = tokio::task::yield_now(), if subscription_closed => {
+                    arm_polls_after_close += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            reconciled,
+            vec!["exec-1".to_owned()],
+            "the queued event must be reconciled before the subscription closes",
+        );
+        assert_eq!(
+            none_branch_hits, 1,
+            "the None branch must fire exactly once, not repeatedly"
+        );
+        assert_eq!(
+            arm_polls_after_close, 6,
+            "once closed, the guard must route every remaining iteration away from `recv()` \
+             instead of re-polling it — proof the arm cannot busy-spin",
+        );
     }
 }
